@@ -1,0 +1,64 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# lanekeep's own cache, produced by running the tool on this repo
+.lanekeep/
+
+# Criterion benchmark output. Baselines are published as CI artifacts, not committed.
+/target/criterion/
+
+# Coverage output
+*.profraw
+*.profdata
+/lcov.info
+
+# cargo-fuzz artifacts. Reproducers worth keeping are committed to fuzz/corpus/ explicitly.
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# cargo-mutants output
+/mutants.out/
+/mutants.out.old/
+
+# npm distribution: platform packages are assembled at release time from built binaries
+/npm/**/node_modules/
+/npm/**/*.tgz
+/npm/@lanekeep/*/bin/
+
+# Insta snapshot review leftovers. Accepted snapshots are committed; pending ones are not.
+*.snap.new
+*.pending-snap
+
+# Local environment
+.env
+.env.*
+!.env.example
+/.direnv/
+/.envrc.local
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.shared.json
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+.fuse_hidden*
+.nfs*
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
