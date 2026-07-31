@@ -3,7 +3,7 @@
 # Lints that change with the language version resolve against the declared MSRV
 # rather than the pinned toolchain, so clippy cannot suggest something that fails
 # to compile for a supported user.
-msrv = "1.85"
+msrv = "1.87"
 
 # Nouns that `doc_markdown` mistakes for code identifiers. These are product and
 # format names appearing in prose; backticking them would say "this is an

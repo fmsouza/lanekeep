@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fmsouza/lanekeep"
 homepage = "https://github.com/fmsouza/lanekeep"
@@ -45,6 +45,7 @@ tree-sitter = { version = "0.26" }
 tree-sitter-typescript = { version = "0.23" }
 tree-sitter-javascript = { version = "0.25" }
 streaming-iterator = { version = "0.1" }
+rquickjs = { version = "0.12" }
 
 [workspace.lints.rust]
 # Denied rather than forbidden: lanekeep-cache needs `unsafe` for memory mapping and
