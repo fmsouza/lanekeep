@@ -25,3 +25,14 @@ doc-valid-idents = [
 # Until v1.0 there is no exported API to preserve, so clippy should suggest the
 # right signature rather than the backward-compatible one. Revisit at 1.0.
 avoid-breaking-exported-api = false
+
+# `unwrap_used`, `expect_used` and `panic` are denied in the workspace lints because a
+# rules engine that panics on a malformed input file has failed at its job. In a test,
+# panicking *is* the failure mechanism — `expect("valid")` states the precondition more
+# clearly than a match arm that cannot happen, and forcing `?` into tests would make
+# every assertion helper return a Result for no benefit. These keep the lints strict
+# where they matter without pushing `#[allow]` attributes onto every test module.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = false

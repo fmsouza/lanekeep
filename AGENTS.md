@@ -167,6 +167,11 @@ which cannot name the spellings it is warning you about.
 similar go in `clippy.toml`'s `doc-valid-idents`, not in backticks — backticks would
 claim they are code identifiers.
 
+**`unwrap`, `expect` and `panic!` are denied, but allowed in tests.** The workspace denies
+them because an engine that panics on a malformed input file has failed at its job. In a
+test, panicking *is* the failure mechanism, so `clippy.toml` sets `allow-*-in-tests`.
+Do not add `#[allow]` attributes to test modules; the config already handles it.
+
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
 
