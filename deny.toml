@@ -1,0 +1,62 @@
+# cargo-deny: supply-chain policy.
+#
+# lanekeep runs as a pre-commit hook and inside CI, which makes it a target. The
+# dependency surface is kept deliberately small (docs/architecture.md §13), and this
+# file is where "deliberately small" becomes something CI can check rather than
+# something we assert.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Every known advisory fails the build. Accepting one is an explicit, reviewable
+# entry below with a note saying why — never a silently lowered threshold.
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only. lanekeep is MIT OR Apache-2.0 and ships as a static
+# binary, so a copyleft dependency would change the terms under which users can
+# redistribute it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+]
+# MPL-2.0 is deliberately absent. It is weak, file-level copyleft — workable for a
+# statically linked binary, but it carries obligations the licenses above do not, so
+# taking one on should be a decision someone makes rather than one that slips in.
+# If a dependency genuinely needs it, add it to `exceptions` with a note.
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Nothing may quietly pull in a second implementation of something we already have.
+# Each entry is a dependency we would rather review than discover.
+deny = [
+    # A rules engine has no business making network requests. Architecture §13 states
+    # "no network, ever, in any mode" — this is what stops that being aspirational.
+    { name = "reqwest" },
+    { name = "hyper" },
+    { name = "ureq" },
+    { name = "curl" },
+    { name = "tokio", wrappers = [] },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

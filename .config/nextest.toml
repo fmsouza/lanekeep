@@ -1,0 +1,26 @@
+[profile.default]
+# A test that takes longer than this is either genuinely slow or hung; either way
+# the author should know before CI spends ten minutes finding out.
+slow-timeout = { period = "30s", terminate-after = 4 }
+failure-output = "immediate-final"
+fail-fast = false
+
+[profile.ci]
+# CI reports everything rather than stopping at the first failure: one push should
+# surface every problem, not the first one alphabetically.
+failure-output = "immediate-final"
+fail-fast = false
+retries = 0
+status-level = "fail"
+final-status-level = "flaky"
+
+# Sandbox tests deliberately run rules that hang or allocate without bound. They are
+# expected to be slow and must not be terminated by the harness before the engine's
+# own limits fire — terminating early would mask exactly the behaviour under test.
+[[profile.default.overrides]]
+filter = "test(/sandbox_/)"
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = "test(/sandbox_/)"
+slow-timeout = { period = "60s", terminate-after = 3 }

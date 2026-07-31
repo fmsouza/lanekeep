@@ -1,0 +1,10 @@
+# Pinned rather than floating so a contributor's clippy findings match CI's exactly.
+# A floating "stable" means a new release can turn a green branch red with no change
+# from the author, which is the fastest way to teach people to distrust the gate.
+#
+# Bumping this is a normal pull request. The MSRV in Cargo.toml is a separate promise
+# with its own CI job — this pin is what we develop against, that is what we support.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "minimal"

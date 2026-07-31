@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#
+# Pre-push: the full gate, identical to what CI runs.
+#
+# Catching a failure here costs a minute. Catching it in CI costs a round trip, a
+# red pull request, and a "fix CI" commit in the history.
+
+set -euo pipefail
+
+if ! command -v just >/dev/null 2>&1; then
+    echo "pre-push: 'just' is not installed — run ./scripts/setup-dev.sh" >&2
+    echo "          (or bypass this once with 'git push --no-verify')" >&2
+    exit 1
+fi
+
+exec just check

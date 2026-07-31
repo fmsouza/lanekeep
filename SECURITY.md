@@ -59,8 +59,8 @@ therefore about **confinement**, not absence:
 - Any network request originating from lanekeep.
 - A rule that evades the per-invocation timeout, the global run budget, or the memory ceiling — or
   that causes a breach to be reported as a clean run rather than cancelling it.
-- Code execution reachable from a *source file being analysed*, as opposed to from a rule. Rules
-  are trusted-ish by the person who installed them; analysed source is not trusted at all.
+- Code execution reachable from a *source file being analyzed*, as opposed to from a rule. Rules
+  are trusted-ish by the person who installed them; analyzed source is not trusted at all.
 - Memory-safety failures reachable from untrusted input, including a malformed or deliberately
   crafted cache file.
 - A dependency vulnerability reachable from lanekeep's own code paths.
@@ -74,7 +74,7 @@ therefore about **confinement**, not absence:
   unread code safe to run.
 - Resource exhaustion from a pathological input file, unless it is disproportionate to the input's
   size.
-- Anything requiring an attacker who can already write to the repository being analysed. Such an
+- Anything requiring an attacker who can already write to the repository being analyzed. Such an
   attacker can already modify the source and the CI configuration; lanekeep is not a boundary
   against them.
 

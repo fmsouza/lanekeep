@@ -1,0 +1,14 @@
+[files]
+extend-exclude = [
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "fixtures/**",
+    "*.snap",
+]
+
+[default.extend-words]
+# tree-sitter node kinds and query syntax that read as typos but are not.
+ba = "ba"
+
+[default]
+locale = "en-us"

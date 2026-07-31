@@ -63,7 +63,7 @@ An agent that writes code against your codebase will violate your conventions co
 repeatedly, because those conventions are invisible in the code it was shown. Telling it again in
 the next prompt does not scale. Encoding the convention as a rule does.
 
-That makes the design constraints unusual for a static analyser:
+That makes the design constraints unusual for a static analyzer:
 
 - **It runs in the inner loop.** Agents and developers invoke it after every edit, so a cold run
   on a couple of thousand files has a sub-second budget and a warm run has a sub-25ms one.
