@@ -101,6 +101,14 @@ dependencies = [
 [[package]]
 name = "lanekeep-query"
 version = "0.1.0"
+dependencies = [
+ "lanekeep-core",
+ "lanekeep-lang",
+ "lanekeep-lang-js",
+ "streaming-iterator",
+ "thiserror",
+ "tree-sitter",
+]
 
 [[package]]
 name = "lanekeep-report"
