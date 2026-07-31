@@ -30,6 +30,12 @@ lanekeep-report = { version = "0.1.0", path = "crates/lanekeep-report" }
 lanekeep-rules = { version = "0.1.0", path = "crates/lanekeep-rules" }
 lanekeep-testkit = { version = "0.1.0", path = "crates/lanekeep-testkit" }
 
+# External dependencies are versioned once here so two crates cannot disagree, which
+# would otherwise show up as a duplicate in the dependency graph rather than as an error.
+serde = { version = "1", default-features = false }
+serde_json = { version = "1" }
+thiserror = { version = "2" }
+
 [workspace.lints.rust]
 # Denied rather than forbidden: lanekeep-cache needs `unsafe` for memory mapping and
 # lanekeep-js for the engine FFI boundary. Those crates opt in locally, at the use
