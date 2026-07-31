@@ -318,6 +318,7 @@ dependencies = [
  "lanekeep-js",
  "lanekeep-lang-js",
  "lanekeep-report",
+ "lanekeep-rules",
 ]
 
 [[package]]
@@ -413,6 +414,9 @@ dependencies = [
 [[package]]
 name = "lanekeep-rules"
 version = "0.1.0"
+dependencies = [
+ "lanekeep-testkit",
+]
 
 [[package]]
 name = "lanekeep-testkit"

@@ -42,6 +42,21 @@ const HOST_MODULE_SOURCE: &str = r"
     export function defineConfig(config) { return config; }
 ";
 
+/// Resolves a built-in rule name to its embedded source.
+///
+/// A function rather than a dependency, so this crate stays unaware of which rules ship —
+/// `lanekeep-js` sits below `lanekeep-rules`, and reaching upward for them would invert the
+/// layering for no gain.
+pub type BuiltinSource = fn(&str) -> Option<&'static str>;
+
+/// The default: no built-ins, so a bare `lanekeep-js` resolves only project modules.
+fn no_builtins(_name: &str) -> Option<&'static str> {
+    None
+}
+
+/// The prefix a built-in specifier carries, as in `lanekeep/no-default-export`.
+const BUILTIN_PREFIX: &str = "lanekeep/";
+
 /// Extensions tried for a specifier that does not name one, in order.
 const EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs"];
 
@@ -117,6 +132,7 @@ fn normalize(path: &Path) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct RuleRoot {
     root: PathBuf,
+    builtins: BuiltinSource,
 }
 
 impl RuleRoot {
@@ -131,7 +147,21 @@ impl RuleRoot {
             path: root.display().to_string(),
             detail: e.to_string(),
         })?;
-        Ok(Self { root: canonical })
+        Ok(Self {
+            root: canonical,
+            builtins: no_builtins,
+        })
+    }
+
+    /// Serve built-in rules from embedded sources.
+    ///
+    /// Built-ins resolve before anything on disk, so a project file cannot shadow one —
+    /// a rule whose behavior depended on whether a same-named file happened to exist
+    /// would be impossible to reason about.
+    #[must_use]
+    pub const fn with_builtins(mut self, builtins: BuiltinSource) -> Self {
+        self.builtins = builtins;
+        self
     }
 
     /// The canonical root.
@@ -149,6 +179,18 @@ impl RuleRoot {
     pub fn resolve(&self, base: &str, specifier: &str) -> Result<PathBuf, ResolveError> {
         if specifier == HOST_MODULE {
             return Ok(PathBuf::from(HOST_MODULE));
+        }
+
+        // Built-ins resolve before the filesystem is consulted at all.
+        if let Some(name) = specifier.strip_prefix(BUILTIN_PREFIX) {
+            return if (self.builtins)(name).is_some() {
+                Ok(PathBuf::from(specifier))
+            } else {
+                Err(ResolveError::NotFound {
+                    specifier: specifier.to_owned(),
+                    tried: "no built-in rule by that name".to_owned(),
+                })
+            };
         }
 
         // The entry module arrives as an already-resolved absolute path, because that is
@@ -241,6 +283,20 @@ impl RuleRoot {
     ) -> Result<String, ResolveError> {
         if path == Path::new(HOST_MODULE) {
             return Ok(HOST_MODULE_SOURCE.to_owned());
+        }
+
+        if let Some(name) = path.to_str().and_then(|p| p.strip_prefix(BUILTIN_PREFIX))
+            && let Some(source) = (self.builtins)(name)
+        {
+            // Built-ins are TypeScript like any other rule, so they go through the same
+            // stripping — including its verification step. A built-in that failed to strip
+            // would be a build-time bug in this repository, and should look like one.
+            return strip_types(typescript, javascript, source).map_err(|e| {
+                ResolveError::Unreadable {
+                    path: path.display().to_string(),
+                    detail: e.to_string(),
+                }
+            });
         }
 
         let canonical = path.canonicalize().map_err(|e| ResolveError::Unreadable {
@@ -460,6 +516,85 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Stands in for the real built-in table, so these tests do not depend on which rules
+    /// happen to ship.
+    fn stub_builtins(name: &str) -> Option<&'static str> {
+        match name {
+            "always" => Some("export default { id: 'lanekeep/always' } satisfies unknown;"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn resolves_a_built_in_by_specifier() {
+        let fixture = Fixture::new("builtin-resolve", &[("a.ts", "export const a = 1;")]);
+        let root = fixture.root().with_builtins(stub_builtins);
+        assert_eq!(
+            root.resolve("", "lanekeep/always").expect("resolves"),
+            Path::new("lanekeep/always")
+        );
+    }
+
+    #[test]
+    fn an_unknown_built_in_is_not_found() {
+        // Not "bare specifier": the `lanekeep/` prefix says what the author meant, and an
+        // error about npm resolution would send them somewhere useless.
+        let fixture = Fixture::new("builtin-unknown", &[("a.ts", "export const a = 1;")]);
+        let root = fixture.root().with_builtins(stub_builtins);
+        let error = root
+            .resolve("", "lanekeep/no-such-rule")
+            .expect_err("does not resolve");
+        assert!(
+            matches!(error, ResolveError::NotFound { .. }),
+            "expected NotFound, got {error:?}"
+        );
+        assert!(error.to_string().contains("built-in"), "{error}");
+    }
+
+    #[test]
+    fn a_file_cannot_shadow_a_built_in() {
+        // A rules directory containing `lanekeep/always.ts` must not change what the
+        // specifier means. A rule whose behavior depended on whether a same-named file
+        // happened to exist would be unreasonable to debug.
+        let fixture = Fixture::new(
+            "builtin-shadow",
+            &[("lanekeep/always.ts", "export default 'the wrong one';")],
+        );
+        let root = fixture.root().with_builtins(stub_builtins);
+        let resolved = root.resolve("", "lanekeep/always").expect("resolves");
+        assert_eq!(resolved, Path::new("lanekeep/always"));
+
+        let source = root
+            .read(&resolved, &TypeScript, &JavaScript)
+            .expect("reads");
+        assert!(
+            !source.contains("the wrong one"),
+            "a project file shadowed a built-in: {source}"
+        );
+    }
+
+    #[test]
+    fn a_built_in_is_stripped_of_its_types() {
+        let fixture = Fixture::new("builtin-strip", &[("a.ts", "export const a = 1;")]);
+        let root = fixture.root().with_builtins(stub_builtins);
+        let source = root
+            .read(Path::new("lanekeep/always"), &TypeScript, &JavaScript)
+            .expect("reads");
+        assert!(
+            !source.contains("satisfies"),
+            "type syntax survived stripping: {source}"
+        );
+    }
+
+    #[test]
+    fn built_ins_are_absent_unless_provided() {
+        // The default. A crate embedding `lanekeep-js` without the rules crate resolves
+        // project modules only, rather than silently resolving names to nothing.
+        let fixture = Fixture::new("builtin-default", &[("a.ts", "export const a = 1;")]);
+        let root = fixture.root();
+        assert!(root.resolve("", "lanekeep/always").is_err());
     }
 
     #[test]

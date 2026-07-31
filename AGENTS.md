@@ -170,7 +170,15 @@ claim they are code identifiers.
 **`unwrap`, `expect` and `panic!` are denied, but allowed in tests.** The workspace denies
 them because an engine that panics on a malformed input file has failed at its job. In a
 test, panicking *is* the failure mechanism, so `clippy.toml` sets `allow-*-in-tests`.
-Do not add `#[allow]` attributes to test modules; the config already handles it.
+Do not add `#[allow]` attributes to `#[cfg(test)]` modules; the config already handles it.
+
+The grant reaches `#[test]` functions and `#[cfg(test)]` modules — and nothing else. A
+helper in a `tests/` integration crate is neither, so `fn tester() { ... .expect(...) }`
+fails the gate there while the identical code passes in a unit test module. Restate the
+grant with a crate-level `#![expect(...)]` carrying a `reason`, rather than rewriting test
+scaffolding to thread `Result` through every helper. List only the lints that actually fire
+— `expect` is an error when unfulfilled, and a `panic!` inside a `#[test]` body is already
+covered.
 
 **An MSRV moves when a dependency forces it, never for syntax.** It is a promise to users.
 The floor went 1.85 → 1.87 for rquickjs and 1.87 → 1.88 for `ignore`, both because those
