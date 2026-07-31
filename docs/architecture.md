@@ -76,7 +76,7 @@ lanekeep/
     lanekeep-rules/      # built-in rules
     lanekeep-report/     # human, json, sarif, agent reporters
     lanekeep-cli/        # binary
-    lanekeep-server/     # LSP + MCP                              (M3)
+    lanekeep-server/     # LSP + MCP           (M3 — not created in v1 scope)
     lanekeep-testkit/    # RuleTester: fixture-based snapshot harness
   npm/                   # platform packages + wrapper
   benches/
@@ -156,7 +156,12 @@ key = blake3(
 )
 ```
 
-Value: `{ violations, facts }`.
+Value: `{ violations, facts, suppressions }`.
+
+Suppressions belong in the cache entry because directives are parsed during the map phase, and a
+reduce-phase violation may be reported at a definition site in a file that was not reprocessed
+this run. A cache entry holding only violations and facts would lose the directive and report a
+suppressed violation on the warm path.
 
 Three things people get wrong here, all of which are silent-staleness bugs:
 
@@ -363,7 +368,7 @@ Instrumentation behind `--profile` only. The original allocated a closure and to
 
 ## 14. Milestones
 
-**M0 — walking skeleton.** Workspace, config parsing, discovery, tree-sitter TS/TSX, query compilation, ~6 predicates (`path-matches`, `name-matches`, `numeric-value`, `inside`, `not-inside`, `resolves-to-import`), human + json reporters, `RuleTester`. Acceptance: all four original Pera rules ported as pure declarative rules with identical output.
+**M0 — walking skeleton.** Workspace, config parsing, discovery, tree-sitter TS/TSX, query compilation, ~6 predicates (`path-matches`, `name-matches`, `numeric-value`, `inside`, `not-inside`, `resolves-to-import`), human + json reporters, `RuleTester`. Acceptance: the four built-in rules and a representative set of config-authored `local/*` rules run end-to-end against the fixture corpus, with snapshot-verified output in every reporter.
 
 **M1 — speed.** Cache, `--since` / `--staged`, rayon parallelism, `benches/` in CI with regression gates. Acceptance: budgets in §13 met.
 
@@ -375,12 +380,12 @@ Instrumentation behind `--profile` only. The original allocated a closure and to
 
 ---
 
-## 15. Open decision
+## 15. Resolved decision — tier-1 query language
 
-**Tier-1 query language: tree-sitter S-expression queries, or GritQL.**
+**Resolved: tree-sitter S-expression queries.** See [ADR-0003](adr/0003-tree-sitter-queries-over-gritql.md).
 
 Tree-sitter queries are free, already multi-language, and keep the surface small — complexity gets absorbed into predicates, which are just Rust functions addable without touching the grammar. Their weakness is negation and scope handling, which is precisely what the C3/C4 predicates exist to cover.
 
-GritQL is more expressive and Rust-native, and Biome has already bet on it. Worth an afternoon of evaluation, with one specific question: does its scope and negation handling remove enough predicate work to justify the dependency and the larger surface area?
+GritQL was evaluated and declined for v1. Its principal advantage is the rewrite operator, which serves autofix — and §12's autofix design is template-based replacement of a named capture, which does not need it. Biome's own GritQL plugin remains diagnostic-only, so the most mature adopter has not yet realised the advantage. GritQL is itself built on tree-sitter, so adopting it adds a substantial layer rather than replacing a dependency.
 
-Given there is no plugin escape hatch, this choice sets the tool's expressiveness ceiling. It is the one decision here that deserves a spike rather than a judgement call.
+Given there is no plugin escape hatch, this choice sets the tool's expressiveness ceiling. Adopting GritQL later stays additive: a second compiler behind the existing `query:` field, selected by a per-rule dialect marker.

@@ -84,8 +84,9 @@ Homebrew.
 | --- | --- |
 | [`docs/architecture.md`](docs/architecture.md) | The full design: execution model, predicate vocabulary, cache, milestones |
 | [`docs/adr/`](docs/adr/) | Architecture decision records — what was decided, and why |
-| [`AGENTS.md`](AGENTS.md) | How to work in this repository, for coding agents and humans alike |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, testing, and the pull request process |
+| [`docs/superpowers/specs/`](docs/superpowers/specs/) | Implementation spec: governance, testing, CI/CD, delivery sequence |
+
+`AGENTS.md` and `CONTRIBUTING.md` arrive with the development environment.
 
 ## Security
 
@@ -102,8 +103,12 @@ To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
 ## Contributing
 
-Contributions are welcome, particularly new built-in rules and new predicates. Start with
-[`CONTRIBUTING.md`](CONTRIBUTING.md) and the rule-authoring playbook in `docs/playbooks/`.
+Contributions are welcome, particularly new built-in rules and new predicates. Until the
+contributor guide lands, [`docs/architecture.md`](docs/architecture.md) is the place to start —
+§4 defines the rule format and §6 the predicate vocabulary.
+
+All work ships as squashed pull requests with [Conventional Commits](https://www.conventionalcommits.org/)
+titles. `main` is protected and takes no direct pushes.
 
 ## License
 
