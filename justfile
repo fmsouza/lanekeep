@@ -38,7 +38,7 @@ _require tool:
 check-fast: fmt-check lint test test-scripts
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-scripts docs deny machete typos-check
+check: fmt-check lint test test-scripts docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -108,6 +108,11 @@ typos-fix:
     typos --write-changes
 
 # Verify the crate still builds on the MSRV declared in Cargo.toml.
+#
+# Part of `just check`, and it has to be. The pinned toolchain is far newer than the MSRV,
+# so every other recipe happily accepts syntax that does not exist on the floor we promise —
+# let-chains being the one that caught us out. Without this in the gate, "it passes locally"
+# is false for exactly the failures hardest to guess at.
 msrv:
     #!/usr/bin/env bash
     set -euo pipefail

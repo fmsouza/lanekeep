@@ -54,22 +54,29 @@ impl JsBindingResolver {
     fn declaration_in(scope: Node<'_>, source: &str, name: &str) -> Option<Binding> {
         let mut cursor = scope.walk();
 
+        // Written with `is_some_and` rather than a let-chain: those need Rust 1.88 and the
+        // declared MSRV is 1.87. An MSRV is a promise to users and should move when a
+        // dependency forces it, not for syntax.
+        //
         // Parameters belong to the function, not to its body block.
-        if let Some(params) = scope.child_by_field_name("parameters")
-            && pattern_binds(params, source, name)
+        if scope
+            .child_by_field_name("parameters")
+            .is_some_and(|params| pattern_binds(params, source, name))
         {
             return Some(Binding::Local(BindingKind::Param));
         }
         // An arrow function with a single unparenthesized parameter.
         if scope.kind() == "arrow_function"
-            && let Some(parameter) = scope.child_by_field_name("parameter")
-            && node_text(parameter, source) == name
+            && scope
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| node_text(parameter, source) == name)
         {
             return Some(Binding::Local(BindingKind::Param));
         }
         if scope.kind() == "catch_clause"
-            && let Some(parameter) = scope.child_by_field_name("parameter")
-            && pattern_binds(parameter, source, name)
+            && scope
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| pattern_binds(parameter, source, name))
         {
             return Some(Binding::Local(BindingKind::CatchParam));
         }
