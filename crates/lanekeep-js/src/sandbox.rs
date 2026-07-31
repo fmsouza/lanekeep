@@ -9,6 +9,7 @@ use rquickjs::promise::PromiseState;
 use rquickjs::{CatchResultExt, Context, Ctx, FromJs, Module, Runtime};
 
 use crate::error::SandboxError;
+use crate::host::HostContext;
 use crate::limits::{Budget, Limits, RunClock, Trip};
 use crate::loader::{RuleLoader, RuleResolver, RuleRoot};
 
@@ -226,6 +227,34 @@ impl Sandbox {
         // usage while the context still holds its borrow panics on a double borrow. The
         // split exists for that reason rather than for tidiness.
         outcome.map_err(|raw| self.classify(&raw, timeout))
+    }
+
+    /// Evaluate source with a `ctx` object in scope, the way a rule handler runs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sandbox::eval`].
+    pub fn eval_with_host<T>(&self, host: &HostContext, source: &str) -> Result<T, SandboxError>
+    where
+        T: for<'js> FromJs<'js>,
+    {
+        self.budget.arm(self.limits.rule_timeout);
+        let outcome = self.context.with(|ctx| {
+            let object = match host.build(&ctx) {
+                Ok(object) => object,
+                Err(err) => return Err(capture_failure(&ctx, &err)),
+            };
+            if let Err(err) = ctx.globals().set("ctx", object) {
+                return Err(capture_failure(&ctx, &err));
+            }
+            match ctx.eval::<T, _>(source) {
+                Ok(value) => Ok(value),
+                Err(err) => Err(capture_failure(&ctx, &err)),
+            }
+        });
+        self.budget.disarm();
+
+        outcome.map_err(|raw| self.classify(&raw, self.limits.rule_timeout))
     }
 
     /// Turn a raw failure into something that says what actually happened.
