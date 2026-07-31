@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Superseded runs are cancelled: a force-push should not leave the previous run
+# burning minutes on a diff nobody will look at again. `main` is excluded, because
+# every commit there is a merge someone may need the result of later.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Read-only by default. A job needing more asks for it explicitly, so widening the
+# blast radius is a visible diff rather than an inherited default.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The whole gate, in one job, by invoking the same recipe a developer runs.
+  # There is deliberately no list of steps mirroring the justfile here — a mirror
+  # drifts, and the moment it drifts "passes locally" stops meaning anything.
+  gate:
+    name: gate (just check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just,cargo-nextest,cargo-deny,cargo-machete,typos
+
+      - run: just check
+
+  # Other platforms run the tests only. Formatting, clippy, licensing and spelling
+  # are platform-independent, so running them three times buys nothing but minutes.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just,cargo-nextest
+
+      - run: just test
+
+      # The justfile forces bash, which exists on the Windows runner via Git Bash,
+      # so the shell tooling is exercised on every platform rather than assumed
+      # portable.
+      - run: just test-scripts
+
+  # The MSRV in Cargo.toml is a promise to users. Untested, it is a comment that
+  # silently becomes false the first time someone uses a newer language feature.
+  #
+  # This delegates to `just msrv` rather than installing 1.85 and running `cargo
+  # check`, because that obvious version does not work: rust-toolchain.toml takes
+  # precedence over the installed default, so plain `cargo check` here would test
+  # 1.95.0 and pass regardless of what the MSRV actually is. The recipe reads the
+  # version out of Cargo.toml and invokes `cargo +<version>`, which is the only
+  # form that overrides the pin.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: msrv
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just
+
+      - run: just msrv
+
+  # A single required check to point branch protection at. Adding a job above does
+  # not then require also remembering to update the ruleset, and — importantly — a
+  # skipped or cancelled dependency fails this rather than silently satisfying it.
+  ci-ok:
+    name: ci
+    if: always()
+    needs: [gate, test, msrv]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: ${RESULTS}"
+          for result in ${RESULTS}; do
+            if [ "${result}" != "success" ]; then
+              echo "::error::a required job did not succeed (${RESULTS})"
+              exit 1
+            fi
+          done
+          echo "all required jobs succeeded"
