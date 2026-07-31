@@ -32,12 +32,19 @@ lanekeep-testkit = { version = "0.1.0", path = "crates/lanekeep-testkit" }
 
 # External dependencies are versioned once here so two crates cannot disagree, which
 # would otherwise show up as a duplicate in the dependency graph rather than as an error.
-serde = { version = "1", default-features = false }
+# Default features deliberately left on, which is where `std` comes from. Turning them
+# off builds fine inside lanekeep-core's own test target — serde_json is a dev-dependency
+# and drags `std` back in — and then fails for the first crate that depends on
+# lanekeep-core normally, because `String` has no `Deserialize` without it. lanekeep ships
+# as a CLI binary and has no no_std ambition, so the minimization bought nothing and hid a
+# build failure one crate away.
+serde = { version = "1" }
 serde_json = { version = "1" }
 thiserror = { version = "2" }
 tree-sitter = { version = "0.26" }
 tree-sitter-typescript = { version = "0.23" }
 tree-sitter-javascript = { version = "0.25" }
+streaming-iterator = { version = "0.1" }
 
 [workspace.lints.rust]
 # Denied rather than forbidden: lanekeep-cache needs `unsafe` for memory mapping and

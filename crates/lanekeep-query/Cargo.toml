@@ -11,5 +11,15 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[dependencies]
+lanekeep-core = { workspace = true }
+lanekeep-lang = { workspace = true }
+streaming-iterator = { workspace = true }
+thiserror = { workspace = true }
+tree-sitter = { workspace = true }
+
+[dev-dependencies]
+lanekeep-lang-js = { workspace = true }
+
 [lints]
 workspace = true
