@@ -1,0 +1,38 @@
+version: 2
+
+updates:
+  # Actions are pinned to commit SHAs, which means they cannot float — and equally
+  # that nothing updates them without a pull request. Dependabot reads the version
+  # comment beside each SHA and proposes the bump, which is the only thing that
+  # keeps SHA pinning from quietly becoming SHA rotting.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels: [dependencies, github-actions]
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+      prefix-development: "chore"
+    labels: [dependencies, rust]
+    groups:
+      # Patch and minor bumps arrive as one reviewable pull request rather than a
+      # dozen. Majors stay separate: they are the ones that need reading.
+      minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]

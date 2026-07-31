@@ -1,0 +1,39 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  conventional-commit:
+    name: conventional commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `main` accepts squash merges only, so the pull request title becomes the
+      # commit message on main — and that is what release-plz parses to decide the
+      # next version. A branch of immaculate commits behind a malformed title still
+      # produces a malformed history and a wrong release.
+      #
+      # This runs the same script the commit-msg hook runs. Two implementations of
+      # one rule would eventually disagree, and the disagreement would surface as a
+      # pull request that cannot be merged for reasons that pass locally.
+      - name: Validate title
+        env:
+          # Passed through the environment, never interpolated into the script body.
+          # A title is attacker-controlled text: `${{ ... }}` inside `run` is
+          # substituted before bash sees it, so a title containing shell syntax
+          # would execute. This is the difference between reading a string and
+          # running it.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: ./scripts/lint-commit-msg.sh --message "$PR_TITLE"
