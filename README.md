@@ -18,28 +18,44 @@ from the code it is shown, because they live in your team's heads and your revie
 
 Every rule is a codified answer to **"the agent keeps doing this wrong."**
 
-```yaml
-# lanekeep.yaml
-rules:
-  - id: local/no-numeric-sizes
-    language: typescript
-    severity: error
-    message: "Literal numeric size inside makeStyles"
-    remediation: "Use theme.spacing.*, theme.borderRadius.* or theme.borders.*"
+Rules are TypeScript programs, written in the same language as the code they inspect:
 
-    query: |
-      (pair
-        key: (property_identifier) @prop
-        value: [(number) (unary_expression operand: (number))] @value) @match
+```ts
+import { defineRule } from 'lanekeep'
 
-    where:
-      all:
-        - prop:  { name-matches: "^(padding|margin|gap|width|height|borderRadius)" }
-        - value: { numeric-value: { ne: 0 } }
+export default defineRule({
+  id: 'local/no-numeric-sizes',
+  severity: 'error',
+
+  card: {
+    message: 'Literal numeric size inside makeStyles',
+    remediation: 'Use theme.spacing.*, theme.borderRadius.* or theme.borders.*',
+    examples: { bad: 'padding: 12', good: 'padding: theme.spacing.md' },
+  },
+
+  // Matched in Rust, at native speed. Your code runs only on matches.
+  query: `
+    (pair
+      key: (property_identifier) @prop
+      value: [(number) (unary_expression operand: (number))] @value) @match
+  `,
+
+  check(ctx, m) {
+    if (!/^(padding|margin|gap|borderRadius)/.test(ctx.text(m.prop))) return
+    if (Number(ctx.text(m.value)) === 0) return
+
+    const call = ctx.closestAncestor(m.match, '(call_expression function: (identifier) @f)')
+    if (!call) return
+    if (!ctx.resolvesToImport(call.f, { module: '@rneui/themed', name: 'makeStyles' })) return
+
+    ctx.report(m.match)
+  },
+})
 ```
 
-Rules are **data, not code**. There is no plugin system, no `eval`, and nothing to sandbox,
-because there is nothing to execute. See [Security](#security).
+`check` is ordinary TypeScript. Loop, accumulate state, build data structures, read other files,
+import shared helpers — there is no expressiveness ceiling and no DSL to learn beyond the query
+that gates it.
 
 ## Why it exists
 
@@ -56,54 +72,73 @@ That makes the design constraints unusual for a static analyser:
 - **Every rule carries its own fix.** `message`, `remediation` and `examples` are mandatory
   fields, not documentation — they are the rule card that gets fed back to the agent.
 
-## Design in one diagram
+## How it stays fast with programmable rules
+
+The usual problem with a native tool that runs JavaScript plugins is the boundary between them:
+dispatching into JS once per AST node means tens of thousands of crossings per file.
+
+lanekeep dispatches once per **query match** instead. The tree-sitter query runs in Rust across a
+single shared parse; only matches reach your handler. That is typically two to three orders of
+magnitude fewer crossings, and it is the reason a Rust engine still earns its place once rules are
+TypeScript.
 
 ```
 discover paths (globs, gitignore-aware)
   └─> for each file, in parallel:
-        cache key ──hit──> cached violations + facts
-                  └─miss─> cheap pre-parse reject (path and raw-text predicates)
-                           └─> parse ─> run compiled queries ─> evaluate predicates
-                               └─> emit violations + facts, write cache entry
+        cache key ──hit──> validate tracked deps ──> cached violations + facts
+                  └─miss─> path and raw-text gates reject before any parse
+                           └─> parse ─> match queries in Rust
+                               └─> invoke the TypeScript handler, per match only
   └─> reduce phase: cross-file rules consume facts only, never parse trees
   └─> filter suppressions ─> sort ─> report
 ```
 
-Two invariants hold this up. The reduce phase never touches parse trees, which is what keeps
-cross-file rules parallel and incrementally cacheable. And everything is pure given
-`(bytes, path, ruleset, config)`, which is what makes the cache sound.
+A warm run with no changes executes no JavaScript at all — every file is a cache hit.
 
 ## Installation
 
-Not yet published. When it ships it will be a single static binary, available via npm, cargo and
-Homebrew.
+Not yet published. When it ships it will be a single static binary with the JavaScript engine
+compiled in, available via npm, cargo and Homebrew. **Node.js is not required to run lanekeep**,
+even though rules are written in TypeScript.
 
 ## Documentation
 
 | Document | Purpose |
 | --- | --- |
-| [`docs/architecture.md`](docs/architecture.md) | The full design: execution model, predicate vocabulary, cache, milestones |
-| [`docs/adr/`](docs/adr/) | Architecture decision records — what was decided, and why |
-| [`AGENTS.md`](AGENTS.md) | How to work in this repository, for coding agents and humans alike |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, testing, and the pull request process |
+| [`docs/architecture.md`](docs/architecture.md) | The full design: execution model, host API, cache, milestones |
+
+`AGENTS.md` and `CONTRIBUTING.md` arrive with the development environment.
 
 ## Security
 
-lanekeep is meant to run as a pre-commit hook and inside CI, which makes it a supply-chain
-target. The posture is deliberately narrow enough to state in full:
+lanekeep is meant to run as a pre-commit hook and inside CI, which makes it a supply-chain target.
+Rules are executable code, so the posture is about confinement rather than absence:
 
-- **No code execution.** Rules are data. Nothing is loaded, compiled or evaluated at runtime.
-- **No network access.** Ever, in any mode.
-- **Reads** only files matching resolved `include` globs. **Writes** only under `--fix`, only to
-  matched files, and only within reported ranges.
-- Every built-in rule is reviewed by a maintainer.
+- **No ambient authority.** Rules run in an embedded QuickJS sandbox and reach exactly the host
+  functions lanekeep exposes. `fs`, `process`, `child_process`, network and dynamic import are not
+  restricted — they do not exist in the context.
+- **No network access.** Ever, in any mode, with no configuration that enables it.
+- **Filesystem confinement.** Reads go through a tracked `ctx.readFile`, confined to the project
+  root. Writes happen only under `--fix`, only to matched files, only within reported ranges.
+- **Bounded execution.** A per-invocation timeout, a 15-second global run budget and a per-runtime
+  memory ceiling, none disableable — a rule that hangs a pre-commit hook is indistinguishable from
+  a broken tool. Breaching any of them cancels the run and exits `2`, rather than reporting a
+  partial result as a clean one.
+- **Deterministic by construction.** The sandbox withholds the clock and randomness, so a rule
+  cannot introduce nondeterminism even by accident.
 
-To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
+This bounds blast radius and makes third-party rule sets reviewable. It is not a boundary against
+someone who can already commit to the repository being checked. To report a vulnerability, see
+[`SECURITY.md`](SECURITY.md).
 
 ## Contributing
 
-Contributions are welcome, particularly new built-in rules and new predicates. Start with
-[`CONTRIBUTING.md`](CONTRIBUTING.md) and the rule-authoring playbook in `docs/playbooks/`.
+Contributions are welcome, particularly new built-in rules and new host API surface. Until the
+contributor guide lands, [`docs/architecture.md`](docs/architecture.md) is the place to start —
+§4 defines the rule format and §6 the host API.
+
+All work ships as squashed pull requests with [Conventional Commits](https://www.conventionalcommits.org/)
+titles. `main` is protected and takes no direct pushes.
 
 ## License
 

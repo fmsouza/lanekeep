@@ -62,3 +62,7 @@
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# Design scaffolding kept local to the working copy, not part of the published project
+/docs/adr/
+/docs/superpowers/
