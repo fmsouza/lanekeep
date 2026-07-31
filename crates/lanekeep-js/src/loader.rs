@@ -619,24 +619,30 @@ mod tests {
     fn a_rule_may_not_import_an_absolute_path() {
         // The entry module legitimately arrives as an absolute path, so the resolver has
         // to accept one. This checks that door is only open for the entry — a rule with a
-        // base of its own gets the bare-specifier rejection.
+        // base of its own is refused.
+        //
+        // The absolute path is built from `temp_dir` rather than written literally,
+        // because `Path::is_absolute` is platform-specific: `/etc/passwd` is absolute on
+        // Unix and merely rooted on Windows, while `C:\...` is the reverse. A literal
+        // would take a different branch on each platform and assert a different error.
         let fixture = Fixture::new("absolute", &[("main.ts", "")]);
         let root = fixture.root();
         let base = fixture.entry("main.ts");
 
-        for specifier in ["/etc/passwd", "/tmp/anything.ts"] {
-            let err = root
-                .resolve(&base, specifier)
-                .expect_err("a rule must not import an absolute path");
+        let outside = std::env::temp_dir().join("lanekeep-absolute-probe.ts");
+        let outside = outside.display().to_string();
+
+        // Written by a rule: refused, whichever way the platform classifies it.
+        for specifier in [outside.as_str(), "/etc/passwd", "C:\\Windows\\System32\\x"] {
             assert!(
-                matches!(err, ResolveError::BareSpecifier { .. }),
-                "{specifier} gave {err:?}"
+                root.resolve(&base, specifier).is_err(),
+                "a rule must not import `{specifier}`"
             );
         }
 
-        // And an absolute path outside the root is refused even as an entry point.
+        // As an entry point: still refused, because it is outside the root.
         let err = root
-            .resolve("", "/etc/passwd")
+            .resolve("", &outside)
             .expect_err("an entry outside the root must be refused");
         assert!(matches!(err, ResolveError::EscapesRoot { .. }), "{err:?}");
     }
