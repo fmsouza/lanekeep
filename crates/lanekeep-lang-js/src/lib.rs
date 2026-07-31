@@ -17,7 +17,11 @@ use lanekeep_lang::{Language, LanguageId, LanguageRegistry, RegistryError};
 use crate::binding::JsBindingResolver;
 
 /// The resolver every language in this crate shares.
-static RESOLVER: JsBindingResolver = JsBindingResolver;
+///
+/// Built once rather than per call: the resolver is stateless, and a host context needs to
+/// hold it for the life of a file.
+static RESOLVER: std::sync::LazyLock<Arc<dyn BindingResolver>> =
+    std::sync::LazyLock::new(|| Arc::new(JsBindingResolver));
 
 /// TypeScript without JSX: `.ts`, `.mts`, `.cts`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,8 +36,8 @@ pub struct Tsx;
 pub struct JavaScript;
 
 impl Language for TypeScript {
-    fn resolver(&self) -> Option<&dyn BindingResolver> {
-        Some(&RESOLVER)
+    fn resolver(&self) -> Option<Arc<dyn BindingResolver>> {
+        Some(Arc::clone(&RESOLVER))
     }
 
     fn id(&self) -> LanguageId {
@@ -51,8 +55,8 @@ impl Language for TypeScript {
 }
 
 impl Language for Tsx {
-    fn resolver(&self) -> Option<&dyn BindingResolver> {
-        Some(&RESOLVER)
+    fn resolver(&self) -> Option<Arc<dyn BindingResolver>> {
+        Some(Arc::clone(&RESOLVER))
     }
 
     fn id(&self) -> LanguageId {
@@ -69,8 +73,8 @@ impl Language for Tsx {
 }
 
 impl Language for JavaScript {
-    fn resolver(&self) -> Option<&dyn BindingResolver> {
-        Some(&RESOLVER)
+    fn resolver(&self) -> Option<Arc<dyn BindingResolver>> {
+        Some(Arc::clone(&RESOLVER))
     }
 
     fn id(&self) -> LanguageId {

@@ -22,6 +22,7 @@ lanekeep-cache = { version = "0.1.0", path = "crates/lanekeep-cache" }
 lanekeep-cli = { version = "0.1.0", path = "crates/lanekeep-cli" }
 lanekeep-config = { version = "0.1.0", path = "crates/lanekeep-config" }
 lanekeep-core = { version = "0.1.0", path = "crates/lanekeep-core" }
+lanekeep-engine = { version = "0.1.0", path = "crates/lanekeep-engine" }
 lanekeep-js = { version = "0.1.0", path = "crates/lanekeep-js" }
 lanekeep-lang = { version = "0.1.0", path = "crates/lanekeep-lang" }
 lanekeep-lang-js = { version = "0.1.0", path = "crates/lanekeep-lang-js" }

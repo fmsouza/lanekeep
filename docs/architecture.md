@@ -83,7 +83,8 @@ Rayon's work-stealing handles the one 4k-line file that would otherwise stall a 
 ```
 lanekeep/
   crates/
-    lanekeep-core/       # walker, query evaluation, facts, violations, Rule trait
+    lanekeep-core/       # types, discovery, gates, violations, ordering contract
+    lanekeep-engine/     # the walker: discovery, gates, parsing, handler invocation
     lanekeep-js/         # embedded engine, sandbox, host API, module loader
     lanekeep-query/      # query parsing + compilation
     lanekeep-lang/       # Language trait + registry
@@ -101,6 +102,8 @@ lanekeep/
   benches/
   docs/
 ```
+
+`lanekeep-engine` exists because the walker cannot live in `lanekeep-core`. Running rules requires the sandbox, and the sandbox is built *on* core — putting the walker there would make the two crates mutually dependent. It cannot live in `lanekeep-cli` either, because `lanekeep-testkit` has to run rules too, and a harness reaching into the binary crate would be a worse coupling. So it sits above the sandbox and below both consumers, and core keeps the types, discovery, gates and the ordering contract.
 
 `lanekeep-testkit` is not optional. Without a `RuleTester` equivalent, community rule contributions are unreviewable.
 
