@@ -11,5 +11,16 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[dependencies]
+blake3 = { workspace = true }
+lanekeep-core = { workspace = true }
+lanekeep-js = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+lanekeep-lang-js = { workspace = true }
+
 [lints]
 workspace = true

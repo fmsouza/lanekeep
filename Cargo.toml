@@ -40,6 +40,7 @@ lanekeep-testkit = { version = "0.1.0", path = "crates/lanekeep-testkit" }
 # build failure one crate away.
 serde = { version = "1" }
 serde_json = { version = "1" }
+blake3 = { version = "1" }
 thiserror = { version = "2" }
 tree-sitter = { version = "0.26" }
 tree-sitter-typescript = { version = "0.23" }

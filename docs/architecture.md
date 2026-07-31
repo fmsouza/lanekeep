@@ -396,7 +396,11 @@ Value: `{ violations, facts, suppressions, deps }`.
 
 Three things people get wrong here, all of which are silent-staleness bugs:
 
-- **`ruleset_hash` covers every module in the rule import graph**, not just the entry files. A rule importing a shared helper must invalidate when that helper changes.
+- **`ruleset_hash` covers every module in the rule import graph**, not just the entry files. A rule importing a shared helper must invalidate when that helper changes. The module loader records what it actually read, because nothing else in the system knows the helper was involved.
+
+  It hashes module **source bytes**, not a canonicalized form. An earlier draft required canonicalization so that reformatting would not invalidate while editing a regex would — which was achievable when rules were declarative data and canonicalizing meant normalizing a parsed value. Canonicalizing arbitrary TypeScript would mean shipping a formatter and committing to its output forever. So reformatting a rule *does* invalidate its cached results. That is over-invalidation, costing a recompute; the opposite error — serving results computed by code that no longer exists — is the one this section exists to prevent, and the two are not symmetric.
+
+- **`config_hash` is canonicalized properly**, because configuration values genuinely are structured data. The severity map is ordered, so writing the same entries in a different order hashes the same, and `include`/`exclude` are sorted, since reordering globs changes nothing about which files are selected.
 - **Relative path belongs in the key.** Path gates make results path-sensitive; a moved file with identical bytes is not a cache hit.
 - **Grammar ABI belongs in the key.** A tree-sitter grammar bump changes node shapes and therefore query results.
 
