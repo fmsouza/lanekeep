@@ -106,8 +106,9 @@ even though rules are written in TypeScript.
 | Document | Purpose |
 | --- | --- |
 | [`docs/architecture.md`](docs/architecture.md) | The full design: execution model, host API, cache, milestones |
-
-`AGENTS.md` and `CONTRIBUTING.md` arrive with the development environment.
+| [`AGENTS.md`](AGENTS.md) | How to work in this repository — for coding agents and humans alike |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Setup, commands, and the pull request process |
+| [`SECURITY.md`](SECURITY.md) | Threat model and how to report a vulnerability |
 
 ## Security
 
@@ -133,9 +134,9 @@ someone who can already commit to the repository being checked. To report a vuln
 
 ## Contributing
 
-Contributions are welcome, particularly new built-in rules and new host API surface. Until the
-contributor guide lands, [`docs/architecture.md`](docs/architecture.md) is the place to start —
-§4 defines the rule format and §6 the host API.
+Contributions are welcome, particularly new built-in rules and new host API surface. Start
+with [`CONTRIBUTING.md`](CONTRIBUTING.md) — `./scripts/setup-dev.sh` installs everything and
+wires the git hooks.
 
 All work ships as squashed pull requests with [Conventional Commits](https://www.conventionalcommits.org/)
 titles. `main` is protected and takes no direct pushes.

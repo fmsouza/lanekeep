@@ -1,0 +1,74 @@
+name: Built-in rule proposal
+description: Propose a rule that should ship with lanekeep
+labels: [rule-proposal]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The built-in catalogue is deliberately small. lanekeep's premise is that the rules
+        worth having are project-specific and belong in your own config — so the bar for a
+        built-in is that it is genuinely general, not merely useful.
+
+        Most good rule ideas should be `local/*` rules in your repository. That is not a
+        consolation prize; it is the design working.
+
+  - type: input
+    id: rule-id
+    attributes:
+      label: Proposed rule ID
+      placeholder: lanekeep/no-something
+    validations:
+      required: true
+
+  - type: textarea
+    id: convention
+    attributes:
+      label: What convention does it enforce?
+      description: State it as the rule card would — what is wrong, and what to do instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: generality
+    attributes:
+      label: Why is this general rather than project-specific?
+      description: >-
+        The hardest question, and the one that decides this. Which projects want this
+        without modification? A rule needing options to be useful across projects is
+        usually two rules, or a `local/*` rule.
+    validations:
+      required: true
+
+  - type: textarea
+    id: eslint
+    attributes:
+      label: Why does ESLint not already cover it?
+      description: >-
+        lanekeep is explicitly not for what ESLint handles. If an existing ESLint rule or
+        plugin does this, say why it is insufficient rather than why lanekeep would also
+        be nice.
+    validations:
+      required: true
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Examples
+      description: Code that should trigger it, code that should not, and any edge case that should be exempt.
+      render: typescript
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cross-file
+    attributes:
+      label: Does it need whole-corpus information?
+      description: >-
+        A rule needing to see other files runs in the reduce phase over facts, which is a
+        meaningfully different implementation than a per-file rule.
+      options:
+        - "No — a single file is enough"
+        - "Yes — it must see other files"
+        - "Not sure"
+    validations:
+      required: true

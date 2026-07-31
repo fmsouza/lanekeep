@@ -1,0 +1,12 @@
+# Every change is reviewed by the maintainer.
+* @fmsouza
+
+# Called out separately not because ownership differs, but because these are the files
+# where a mistake is quiet: it passes CI, merges, and surfaces later as a stale cache
+# entry, a nondeterministic diff, or a widened trust boundary nobody noticed.
+/docs/architecture.md   @fmsouza
+/crates/lanekeep-js/    @fmsouza
+/crates/lanekeep-cache/ @fmsouza
+/deny.toml              @fmsouza
+/.github/workflows/     @fmsouza
+/SECURITY.md            @fmsouza
