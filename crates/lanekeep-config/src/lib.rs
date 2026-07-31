@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use lanekeep_core::{Examples, RuleCard, RuleId, Severity};
+use lanekeep_core::{Examples, Gates, RuleCard, RuleId, Severity};
 use lanekeep_js::{Limits, RuleRoot, RunClock, Sandbox};
 use serde::Deserialize;
 use thiserror::Error;
@@ -39,31 +39,6 @@ pub fn hex(hash: &Hash) -> String {
             let _ = write!(out, "{byte:02x}");
             out
         })
-}
-
-/// The pre-parse gates a rule declares.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct Gates {
-    /// Only files matching one of these globs are considered.
-    pub path_matches: Vec<String>,
-    /// Files matching any of these are skipped.
-    pub path_not_matches: Vec<String>,
-    /// Only files whose bytes contain all of these are parsed.
-    pub file_contains: Vec<String>,
-    /// Files whose bytes contain any of these are skipped.
-    pub file_not_contains: Vec<String>,
-}
-
-impl Gates {
-    /// Whether any gate is declared. A rule without gates parses every candidate file.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.path_matches.is_empty()
-            && self.path_not_matches.is_empty()
-            && self.file_contains.is_empty()
-            && self.file_not_contains.is_empty()
-    }
 }
 
 /// A rule as the config declares it.

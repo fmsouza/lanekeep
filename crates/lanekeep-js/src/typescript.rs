@@ -270,10 +270,10 @@ fn strip_node(node: Node<'_>, source: &str, output: &mut Vec<u8>) -> Result<(), 
         // separating comma has to go with it, since `(, a)` does not parse either.
         "required_parameter" if is_this_parameter(node) => {
             let mut end = node.end_byte();
-            if let Some(next) = node.next_sibling() {
-                if next.kind() == "," {
-                    end = next.end_byte();
-                }
+            if let Some(next) = node.next_sibling()
+                && next.kind() == ","
+            {
+                end = next.end_byte();
             }
             blank(output, node.start_byte()..end);
             return Ok(());

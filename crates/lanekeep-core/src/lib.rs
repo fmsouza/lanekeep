@@ -18,12 +18,16 @@
 //! from outside.
 
 pub mod card;
+pub mod discovery;
+pub mod gates;
 pub mod location;
 pub mod rule_id;
 pub mod severity;
 pub mod violation;
 
 pub use card::{CardProblem, Examples, RuleCard};
+pub use discovery::{Discovery, DiscoveryError};
+pub use gates::{CompiledGates, GateError, Gates};
 pub use location::{FilePath, Location, Position};
 pub use rule_id::{Namespace, ParseRuleIdError, RuleId};
 pub use severity::{ParseSeverityError, Severity};
