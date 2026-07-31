@@ -5,6 +5,8 @@
 //! This abstraction exists before it has a second implementor on purpose. Retrofitting it
 //! after a second language arrives is the expensive version of the same work.
 
+pub mod binding;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
@@ -52,6 +54,15 @@ impl fmt::Display for LanguageId {
 pub trait Language: Send + Sync {
     /// Stable identifier, as written in a rule's `language` field.
     fn id(&self) -> LanguageId;
+
+    /// Identifier resolution for this language, when it has any.
+    ///
+    /// Returns `None` for a language with no resolver yet, which is honest rather than a
+    /// placeholder: a rule asking about bindings in such a language gets nothing back
+    /// instead of a confidently wrong answer.
+    fn resolver(&self) -> Option<&dyn binding::BindingResolver> {
+        None
+    }
 
     /// Extensions this language claims, without the leading dot, lowercase.
     ///

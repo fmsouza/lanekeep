@@ -12,9 +12,12 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use rquickjs::function::Opt;
 use rquickjs::{Ctx, Function, Object};
+
+use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 
 use crate::nodes::{Handle, NodeArena};
 
@@ -36,11 +39,26 @@ pub struct Report {
 }
 
 /// Host state for one file, shared with the functions installed on `ctx`.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written: requiring it on `BindingResolver` would burden every language
+/// implementation for the sake of one derive here.
+#[derive(Clone)]
 pub struct HostContext {
     arena: Rc<RefCell<NodeArena>>,
     reports: Rc<RefCell<Vec<Report>>>,
     file_path: Rc<str>,
+    resolver: Option<Arc<dyn BindingResolver>>,
+}
+
+impl std::fmt::Debug for HostContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostContext")
+            .field("file_path", &self.file_path)
+            .field("interned_nodes", &self.arena.borrow().len())
+            .field("reports", &self.reports.borrow().len())
+            .field("has_resolver", &self.resolver.is_some())
+            .finish()
+    }
 }
 
 impl HostContext {
@@ -51,7 +69,20 @@ impl HostContext {
             arena: Rc::new(RefCell::new(NodeArena::new(tree, source))),
             reports: Rc::new(RefCell::new(Vec::new())),
             file_path: Rc::from(file_path),
+            resolver: None,
         }
+    }
+
+    /// Attach a binding resolver, enabling the import-resolution functions.
+    ///
+    /// Without one, those functions return `false` or `undefined` rather than being
+    /// absent. A rule written against a language that has no resolver then behaves as
+    /// though nothing resolves, which is a truthful answer — where a missing function
+    /// would be a `TypeError` blamed on the rule.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn BindingResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     /// The arena, for interning query captures before invoking a handler.
@@ -82,6 +113,19 @@ impl HostContext {
             object.set("fileText", arena.source())?;
         }
 
+        self.install_navigation(ctx, &object)?;
+        self.install_bindings(ctx, &object)?;
+        self.install_reporting(ctx, &object)?;
+
+        Ok(object)
+    }
+
+    /// Reading the tree.
+    fn install_navigation<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        object: &Object<'js>,
+    ) -> rquickjs::Result<()> {
         // --- tree navigation -----------------------------------------------------------
         //
         // Every one of these takes a handle and returns plain data. A handle that does not
@@ -171,6 +215,89 @@ impl HostContext {
             })?,
         )?;
 
+        Ok(())
+    }
+
+    /// Resolving what an identifier refers to.
+    fn install_bindings<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
+        // --- binding resolution ----------------------------------------------------------
+        //
+        // The light semantic layer of §6.4. A rule matching `makeStyles(...)` on identifier
+        // text alone is wrong twice: it misses `import { makeStyles as ms }`, and it fires
+        // on a local `const makeStyles` that has nothing to do with the import.
+
+        let arena = Rc::clone(&self.arena);
+        let resolver = self.resolver.clone();
+        object.set(
+            "resolvesToImport",
+            Function::new(
+                ctx.clone(),
+                move |handle: Handle, module: String, name: Opt<String>| {
+                    let Some(resolver) = resolver.as_deref() else {
+                        return false;
+                    };
+                    match arena.borrow().resolve_binding(handle, resolver) {
+                        Some(Binding::Import {
+                            module: from,
+                            name: imported,
+                        }) => {
+                            from == module
+                                && name.0.is_none_or(|wanted| match &imported {
+                                    ImportedName::Named(actual) => *actual == wanted,
+                                    ImportedName::Default => wanted == "default",
+                                    ImportedName::Namespace => wanted == "*",
+                                })
+                        }
+                        _ => false,
+                    }
+                },
+            )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let resolver = self.resolver.clone();
+        object.set(
+            "isImportedFrom",
+            Function::new(ctx.clone(), move |handle: Handle, pattern: String| {
+                let Some(resolver) = resolver.as_deref() else {
+                    return false;
+                };
+                match arena.borrow().resolve_binding(handle, resolver) {
+                    Some(Binding::Import { module, .. }) => glob_matches(&pattern, &module),
+                    _ => false,
+                }
+            })?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let resolver = self.resolver.clone();
+        object.set(
+            "bindingKind",
+            Function::new(ctx.clone(), move |handle: Handle| {
+                let resolver = resolver.as_deref()?;
+                arena
+                    .borrow()
+                    .resolve_binding(handle, resolver)
+                    .map(|binding| binding.kind_str().to_owned())
+            })?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let resolver = self.resolver.clone();
+        object.set(
+            "isShadowed",
+            Function::new(ctx.clone(), move |handle: Handle| {
+                resolver
+                    .as_deref()
+                    .is_some_and(|resolver| arena.borrow().is_shadowed(handle, resolver))
+            })?,
+        )?;
+
+        Ok(())
+    }
+
+    /// Recording violations.
+    fn install_reporting<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
         // --- reporting -------------------------------------------------------------------
 
         let arena = Rc::clone(&self.arena);
@@ -195,8 +322,49 @@ impl HostContext {
             })?,
         )?;
 
-        Ok(object)
+        Ok(())
     }
+}
+
+/// Match a module specifier against a pattern where `*` stands for any run of characters.
+///
+/// Written out rather than pulled in, because the whole need is `@scope/*` and `*/themed`.
+/// A glob crate would bring a dependency and a dialect — character classes, `**`, escapes —
+/// for a surface this small.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return true;
+    };
+    if !text.starts_with(first) {
+        return false;
+    }
+
+    let mut rest = &text[first.len()..];
+    let segments: Vec<&str> = parts.collect();
+
+    // No `*` at all: the pattern has to account for the whole specifier.
+    if segments.is_empty() {
+        return rest.is_empty();
+    }
+
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.is_empty() {
+            continue;
+        }
+        // The final segment has to sit at the end, or `@scope/*` would match
+        // `@scope/pkg/nested` on a pattern the author meant to be exact after the star.
+        if index == segments.len() - 1 {
+            return rest.ends_with(segment);
+        }
+        match rest.find(segment) {
+            Some(at) => rest = &rest[at + segment.len()..],
+            None => return false,
+        }
+    }
+
+    // The pattern ended with `*`, so whatever is left is matched.
+    true
 }
 
 #[cfg(test)]
@@ -207,13 +375,48 @@ mod tests {
     use super::*;
     use crate::{Limits, Sandbox};
 
-    fn host(source: &str) -> HostContext {
+    fn parse(source: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&TypeScript.grammar())
             .expect("grammar loads");
-        let tree = parser.parse(source, None).expect("parses");
-        HostContext::new(tree, source.to_owned(), "src/example.ts")
+        parser.parse(source, None).expect("parses")
+    }
+
+    fn host(source: &str) -> HostContext {
+        HostContext::new(parse(source), source.to_owned(), "src/example.ts")
+            .with_resolver(Arc::new(lanekeep_lang_js::binding::JsBindingResolver))
+    }
+
+    /// A host with no resolver, for the degraded path.
+    fn host_without_resolver(source: &str) -> HostContext {
+        HostContext::new(parse(source), source.to_owned(), "src/example.ts")
+    }
+
+    /// The handle of the last identifier reading `name`, the way a query capture arrives.
+    fn handle_of(host: &HostContext, name: &str) -> Handle {
+        let mut arena = host.arena().borrow_mut();
+        let source = arena.source().to_owned();
+
+        let path = {
+            let mut best: Option<tree_sitter::Node<'_>> = None;
+            let mut stack = vec![arena.tree().root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "identifier"
+                    && source.get(node.byte_range()) == Some(name)
+                    && best.is_none_or(|b| node.start_byte() > b.start_byte())
+                {
+                    best = Some(node);
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.children(&mut cursor));
+            }
+            arena
+                .path_of(best.unwrap_or_else(|| panic!("no identifier `{name}`")))
+                .expect("has a path")
+        };
+
+        arena.intern_path(path).expect("interns")
     }
 
     /// Evaluate rule-shaped code with `ctx` in scope.
@@ -428,6 +631,141 @@ mod tests {
              typeof fetch === 'undefined' &&
              typeof process === 'undefined'"
         ));
+    }
+
+    // --- binding resolution -------------------------------------------------------------
+
+    #[test]
+    fn resolves_an_import_through_its_alias() {
+        // The case §6.4 exists for. A rule looking for `makeStyles` has to find `ms`.
+        let host = host("import { makeStyles as ms } from '@rneui/themed';\nms();");
+        let handle = handle_of(&host, "ms");
+
+        assert!(run::<bool>(
+            &host,
+            &format!("ctx.resolvesToImport({handle}, '@rneui/themed', 'makeStyles')")
+        ));
+        assert!(!run::<bool>(
+            &host,
+            &format!("ctx.resolvesToImport({handle}, 'somewhere-else', 'makeStyles')")
+        ));
+        assert!(!run::<bool>(
+            &host,
+            &format!("ctx.resolvesToImport({handle}, '@rneui/themed', 'notThatOne')")
+        ));
+    }
+
+    #[test]
+    fn a_local_declaration_does_not_resolve_to_the_import_it_shadows() {
+        // The false positive this prevents: a rule keyed on the name firing on a local
+        // that has nothing to do with the import.
+        let host = host(
+            "import { makeStyles } from '@rneui/themed';\n\
+             function f() { const makeStyles = () => {}; return makeStyles(); }",
+        );
+        let handle = handle_of(&host, "makeStyles");
+
+        assert!(!run::<bool>(
+            &host,
+            &format!("ctx.resolvesToImport({handle}, '@rneui/themed', 'makeStyles')")
+        ));
+        assert_eq!(
+            run::<String>(&host, &format!("ctx.bindingKind({handle})")),
+            "const"
+        );
+        assert!(run::<bool>(&host, &format!("ctx.isShadowed({handle})")));
+    }
+
+    #[test]
+    fn omitting_the_name_matches_any_export_of_the_module() {
+        let host = host("import { a } from 'm';\na();");
+        let handle = handle_of(&host, "a");
+        assert!(run::<bool>(
+            &host,
+            &format!("ctx.resolvesToImport({handle}, 'm')")
+        ));
+    }
+
+    #[test]
+    fn matches_a_module_by_glob() {
+        let host = host("import { a } from '@scope/pkg';\na();");
+        let handle = handle_of(&host, "a");
+
+        assert!(run::<bool>(
+            &host,
+            &format!("ctx.isImportedFrom({handle}, '@scope/*')")
+        ));
+        assert!(run::<bool>(
+            &host,
+            &format!("ctx.isImportedFrom({handle}, '*/pkg')")
+        ));
+        assert!(run::<bool>(
+            &host,
+            &format!("ctx.isImportedFrom({handle}, '@scope/pkg')")
+        ));
+        assert!(!run::<bool>(
+            &host,
+            &format!("ctx.isImportedFrom({handle}, '@other/*')")
+        ));
+    }
+
+    #[test]
+    fn reports_binding_kinds() {
+        for (source, name, expected) in [
+            ("import { a } from 'm';\na();", "a", "import"),
+            ("const b = 1;\nb;", "b", "const"),
+            ("let c = 1;\nc;", "c", "let"),
+            ("function d() {}\nd();", "d", "function"),
+            ("class E {}\nnew E();", "E", "class"),
+            ("function f(p) { return p; }", "p", "param"),
+        ] {
+            let host = host(source);
+            let handle = handle_of(&host, name);
+            assert_eq!(
+                run::<String>(&host, &format!("ctx.bindingKind({handle})")),
+                expected,
+                "for {name} in {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_undeclared_name_has_no_binding_kind() {
+        let host = host("globalThing();");
+        let handle = handle_of(&host, "globalThing");
+        assert!(run::<bool>(
+            &host,
+            &format!("ctx.bindingKind({handle}) === undefined")
+        ));
+    }
+
+    #[test]
+    fn without_a_resolver_nothing_resolves_rather_than_throwing() {
+        // A language with no resolver should make rules see "nothing resolves", not a
+        // TypeError blamed on the rule for calling a function that is missing.
+        let host = host_without_resolver("import { a } from 'm';\na();");
+        assert!(run::<bool>(
+            &host,
+            "ctx.resolvesToImport(0, 'm', 'a') === false &&
+             ctx.isImportedFrom(0, '*') === false &&
+             ctx.isShadowed(0) === false &&
+             ctx.bindingKind(0) === undefined"
+        ));
+    }
+
+    #[test]
+    fn glob_matching_handles_the_shapes_that_appear_in_rules() {
+        assert!(glob_matches("m", "m"));
+        assert!(!glob_matches("m", "mm"));
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("@scope/*", "@scope/pkg"));
+        assert!(!glob_matches("@scope/*", "@other/pkg"));
+        assert!(glob_matches("*/themed", "@rneui/themed"));
+        assert!(!glob_matches("*/themed", "@rneui/other"));
+        assert!(glob_matches("@a/*/c", "@a/b/c"));
+        assert!(!glob_matches("@a/*/c", "@a/b/d"));
+        assert!(glob_matches("", ""));
+        assert!(!glob_matches("", "x"));
     }
 
     #[test]

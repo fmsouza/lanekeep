@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 
+use lanekeep_lang::binding::{Binding, BindingResolver};
 use tree_sitter::{Node, Tree};
 
 /// An opaque reference to a node, as seen from rule code.
@@ -170,6 +171,27 @@ impl NodeArena {
     pub fn byte_range(&self, handle: Handle) -> Option<(usize, usize)> {
         self.node(handle)
             .map(|node| (node.start_byte(), node.end_byte()))
+    }
+
+    /// What the identifier at a handle refers to.
+    ///
+    /// Takes the resolver rather than holding one so the arena stays language-agnostic,
+    /// and does the work internally so the borrowed `Node` never escapes.
+    #[must_use]
+    pub fn resolve_binding(
+        &self,
+        handle: Handle,
+        resolver: &dyn BindingResolver,
+    ) -> Option<Binding> {
+        let node = self.node(handle)?;
+        resolver.resolve(&self.tree, &self.source, node)
+    }
+
+    /// Whether the identifier at a handle shadows an outer binding of the same name.
+    #[must_use]
+    pub fn is_shadowed(&self, handle: Handle, resolver: &dyn BindingResolver) -> bool {
+        self.node(handle)
+            .is_some_and(|node| resolver.is_shadowed(&self.tree, &self.source, node))
     }
 
     /// The tree, for running queries against.

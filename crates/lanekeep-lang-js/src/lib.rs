@@ -7,9 +7,17 @@
 //! angle-bracket type assertion `<T>expr` so the same syntax can open a JSX element.
 //! Parsing a `.tsx` file with the TypeScript grammar produces errors on valid code.
 
+pub mod binding;
+
 use std::sync::Arc;
 
+use lanekeep_lang::binding::BindingResolver;
 use lanekeep_lang::{Language, LanguageId, LanguageRegistry, RegistryError};
+
+use crate::binding::JsBindingResolver;
+
+/// The resolver every language in this crate shares.
+static RESOLVER: JsBindingResolver = JsBindingResolver;
 
 /// TypeScript without JSX: `.ts`, `.mts`, `.cts`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -24,6 +32,10 @@ pub struct Tsx;
 pub struct JavaScript;
 
 impl Language for TypeScript {
+    fn resolver(&self) -> Option<&dyn BindingResolver> {
+        Some(&RESOLVER)
+    }
+
     fn id(&self) -> LanguageId {
         LanguageId::new("typescript")
     }
@@ -39,6 +51,10 @@ impl Language for TypeScript {
 }
 
 impl Language for Tsx {
+    fn resolver(&self) -> Option<&dyn BindingResolver> {
+        Some(&RESOLVER)
+    }
+
     fn id(&self) -> LanguageId {
         LanguageId::new("tsx")
     }
@@ -53,6 +69,10 @@ impl Language for Tsx {
 }
 
 impl Language for JavaScript {
+    fn resolver(&self) -> Option<&dyn BindingResolver> {
+        Some(&RESOLVER)
+    }
+
     fn id(&self) -> LanguageId {
         LanguageId::new("javascript")
     }
