@@ -12,8 +12,13 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+lanekeep-lang = { workspace = true }
 rquickjs = { workspace = true }
 thiserror = { workspace = true }
+tree-sitter = { workspace = true }
+
+[dev-dependencies]
+lanekeep-lang-js = { workspace = true }
 
 [lints]
 workspace = true

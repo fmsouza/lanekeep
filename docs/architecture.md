@@ -223,9 +223,17 @@ Its weakness is raw throughput: QuickJS interprets, where V8 compiles. That is a
 
 ### 5.2 TypeScript
 
-Rule modules are TypeScript. Types are stripped in Rust with `oxc_transform` before evaluation — a syntactic transform, not a type check. Rules are *type-checked in the author's editor* against the types shipped in `packages/lanekeep`; lanekeep itself never type-checks, because doing so would mean shipping a TypeScript compiler and paying its cost on every run.
+Rule modules are TypeScript. Types are stripped before evaluation — a syntactic transform, not a type check. Rules are *type-checked in the author's editor* against the types shipped in `packages/lanekeep`; lanekeep itself never type-checks, because doing so would mean shipping a TypeScript compiler and paying its cost on every run.
 
 This is a deliberate division: the authoring experience is fully typed, the runtime is not.
+
+**Stripping overwrites type syntax with spaces, in place.** Every surviving byte keeps its original offset and newlines inside a blanked span are preserved, so a line and column in the generated JavaScript is the same line and column in the author's source. A stack trace from a rule that threw therefore points at the original TypeScript with no source map to generate, ship, parse, or get subtly wrong.
+
+The stripper reuses the TypeScript grammar already present for §7.2, so it costs no additional dependency. A full TypeScript transformer would handle every construct but roughly triples the dependency graph of a tool that runs as a pre-commit hook — see §13.
+
+**Four constructs are rejected rather than stripped**, because they generate runtime code and so have no type syntax to remove: `enum`, `namespace`, decorators, and constructor parameter properties. Each is rejected with the plain alternative named. Rule modules are small and self-contained, and emitting JavaScript that silently means something else would be far worse than refusing.
+
+Stripping is verified rather than trusted: the output is re-parsed as JavaScript, and a syntax error is reported as a bug in lanekeep rather than in the rule. That turns a whole class of subtle stripping errors into a loud failure at the point of the mistake.
 
 ### 5.3 Module loading
 
