@@ -417,6 +417,14 @@ version = "0.1.0"
 [[package]]
 name = "lanekeep-testkit"
 version = "0.1.0"
+dependencies = [
+ "lanekeep-config",
+ "lanekeep-core",
+ "lanekeep-engine",
+ "lanekeep-js",
+ "lanekeep-lang-js",
+ "thiserror",
+]
 
 [[package]]
 name = "libc"
