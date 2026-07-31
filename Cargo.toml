@@ -45,7 +45,7 @@ tree-sitter = { version = "0.26" }
 tree-sitter-typescript = { version = "0.23" }
 tree-sitter-javascript = { version = "0.25" }
 streaming-iterator = { version = "0.1" }
-rquickjs = { version = "0.12" }
+rquickjs = { version = "0.12", features = ["loader"] }
 
 [workspace.lints.rust]
 # Denied rather than forbidden: lanekeep-cache needs `unsafe` for memory mapping and
