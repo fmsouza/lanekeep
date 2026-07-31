@@ -11,5 +11,9 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[dependencies]
+thiserror = { workspace = true }
+tree-sitter = { workspace = true }
+
 [lints]
 workspace = true

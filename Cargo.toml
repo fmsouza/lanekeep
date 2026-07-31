@@ -35,6 +35,9 @@ lanekeep-testkit = { version = "0.1.0", path = "crates/lanekeep-testkit" }
 serde = { version = "1", default-features = false }
 serde_json = { version = "1" }
 thiserror = { version = "2" }
+tree-sitter = { version = "0.26" }
+tree-sitter-typescript = { version = "0.23" }
+tree-sitter-javascript = { version = "0.25" }
 
 [workspace.lints.rust]
 # Denied rather than forbidden: lanekeep-cache needs `unsafe` for memory mapping and
