@@ -174,6 +174,8 @@ export default defineRule({
 
 `check` is ordinary TypeScript. It may loop, accumulate state, build data structures, read other files through `ctx.readFile`, and call any helper the author writes — including code imported from sibling rule modules. There is no expressiveness ceiling and no escape hatch needed, because the hatch is the whole floor.
 
+An optional `timeout` field raises that rule's per-invocation budget above the default (§6.7). It exists for handlers that legitimately do heavy work, and needing it is a signal worth reading: usually the fix is a tighter query, not a longer clock.
+
 `card.message`, `card.remediation` and `card.examples` are mandatory. They are not documentation — they are the **rule card**, consumed by `lanekeep explain`, by the agent reporter, and by context injection so the agent learns the rule *before* generating rather than after.
 
 ### Cross-file rules
@@ -184,6 +186,9 @@ A rule that needs a whole-corpus view emits facts during the per-file pass and c
 export default defineRule({
   id: 'lanekeep/no-unused-exports',
   query: `(export_statement declaration: (_) @decl) @match`,
+
+  // reduce() sees the whole corpus, so it gets a larger budget than the 1s default
+  timeout: 5_000,
 
   check(ctx, m) {
     ctx.emitFact({
@@ -300,12 +305,27 @@ The light semantic layer that pure syntactic matching gets wrong. Implemented in
 
 ### 6.7 Resource limits
 
-Turing-complete rules can fail to terminate. Two limits, both mandatory and both on by default:
+Turing-complete rules can fail to terminate. Three limits, all mandatory, all on by default, none disableable — a rule that hangs a pre-commit hook is indistinguishable from a broken tool.
 
-- **Execution timeout**, enforced via QuickJS's interrupt handler, applied per handler invocation. Exceeding it fails that rule with a diagnostic naming the rule and file, and the run continues.
-- **Memory ceiling** per runtime, enforced by QuickJS's allocator limit.
+| Limit | Default | Scope |
+|---|---|---|
+| `timeouts.rule` | 1 s | One handler invocation — a single `check` call, or a single `reduce` call |
+| `timeouts.global` | 15 s | Wall clock for the entire run, across all rules and files |
+| `limits.memory` | 64 MiB | Per JavaScript runtime, so per rayon worker |
 
-Both are configurable. Neither can be disabled: a rule that hangs a pre-commit hook is indistinguishable from a broken tool.
+Both timeouts are configurable in `lanekeep.config.ts`, and `timeouts.global` also via `--timeout`. An individual rule may raise its own invocation budget with a `timeout` field in `defineRule` — the escape valve for a `reduce` that legitimately processes a large corpus, without loosening the default for every rule.
+
+The two levels do different jobs. The per-invocation limit fires fast and **names the culprit**: which rule, which file, which phase. The global limit is the backstop for the case no single invocation is pathological but the aggregate is — a thousand rules each taking 20 ms. Keeping the per-rule default well under the global one means the diagnostic almost always comes from the level that can identify the cause.
+
+### 6.8 Breaching a limit cancels the run
+
+Any limit breach aborts the entire run: exit code `2`, a diagnostic naming the rule, file and phase, and no report.
+
+The alternative — skip the offending rule and continue — is tempting and wrong. A timeout is timing-dependent by nature, so a rule that trips on a loaded machine and not on an idle one would make output vary between runs on identical input. That directly contradicts §11's guarantee that an agent reading the output twice must not see reordering as change, and it would let a partial, silently-incomplete result pass for a clean one. A checker that could not finish must not report that it found nothing.
+
+Mechanically: the per-invocation limit uses QuickJS's interrupt handler; the global limit is a deadline shared across workers, checked by the same handler and between files. Tripping either sets an abort flag that every rayon worker observes at its next file boundary.
+
+**Cache entries for files that fully completed are still committed.** Each entry is independently valid — it records the result of running every rule against that file to completion — and discarding them would mean a corpus that times out on a cold run times out identically on every retry, with no way to make progress. Files that were in flight when the run aborted are not written.
 
 ---
 
@@ -404,6 +424,12 @@ export default defineConfig({
     'lanekeep/no-default-export': 'warn',
     'local/no-numeric-sizes': 'error',
   },
+
+  // Defaults shown. Breaching either cancels the run — see §6.8.
+  timeouts: {
+    rule: 1_000,     // ms, per handler invocation
+    global: 15_000,  // ms, wall clock for the whole run
+  },
 })
 ```
 
@@ -440,7 +466,7 @@ minWidth: 44,
 
 Violations sorted `(ruleId, file, line, column)` always. Deterministic output matters more than usual here: an agent reads it twice and must not see reordering as change. This is also why the sandbox withholds randomness and clock access (§6.6) — a rule cannot introduce nondeterminism even by accident.
 
-**Exit codes:** `0` clean or `--warn-only`; `1` violations; `2` runtime error.
+**Exit codes:** `0` clean or `--warn-only`; `1` violations; `2` runtime error, which includes a cancelled run — a breached timeout or memory ceiling (§6.8) never exits `0` or `1`, because a checker that could not finish must not be mistaken for one that found nothing.
 
 ---
 
@@ -452,6 +478,7 @@ lanekeep check [paths...]
         [--since <ref> | --staged]
         [--format human|json|sarif|agent]
         [--warn-only] [--profile] [--no-cache]
+        [--timeout <ms>]        # global budget, default 15000
 lanekeep check --watch          # foreground, incremental, re-runs on change
 lanekeep explain <rule-id>      # prints the rule card
 lanekeep rules [--json]
@@ -469,7 +496,7 @@ Rules are executable code. The posture is therefore about **confinement**, not a
 - **No ambient authority.** Rule code reaches exactly the host functions in §6 and nothing else. `fs`, `process`, `child_process`, network and dynamic import are not restricted — they do not exist in the context.
 - **No network.** Ever, in any mode, with no configuration that enables it.
 - **Filesystem confinement.** Reads happen only through `ctx.readFile`, only within the project root, with traversal rejected. Writes happen only under `--fix`, only to matched files, only within reported ranges.
-- **Bounded execution.** Per-invocation timeout and per-runtime memory ceiling (§6.7), neither disableable.
+- **Bounded execution.** A per-invocation timeout, a 15-second global run budget, and a per-runtime memory ceiling (§6.7). None disableable, and breaching any of them cancels the run rather than degrading to a partial result (§6.8).
 - **Determinism by construction.** No clock, no randomness (§6.6).
 - Every built-in rule is reviewed by a maintainer.
 - Supply chain: npm provenance / sigstore attestations, CI pinned to SHAs, `cargo-deny` + `cargo-audit` in CI, minimal dependency surface. This is a pre-commit-hook-adjacent tool and therefore a target.

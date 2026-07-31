@@ -120,8 +120,10 @@ Rules are executable code, so the posture is about confinement rather than absen
 - **No network access.** Ever, in any mode, with no configuration that enables it.
 - **Filesystem confinement.** Reads go through a tracked `ctx.readFile`, confined to the project
   root. Writes happen only under `--fix`, only to matched files, only within reported ranges.
-- **Bounded execution.** Per-invocation timeout and per-runtime memory ceiling, neither
-  disableable — a rule that hangs a pre-commit hook is indistinguishable from a broken tool.
+- **Bounded execution.** A per-invocation timeout, a 15-second global run budget and a per-runtime
+  memory ceiling, none disableable — a rule that hangs a pre-commit hook is indistinguishable from
+  a broken tool. Breaching any of them cancels the run and exits `2`, rather than reporting a
+  partial result as a clean one.
 - **Deterministic by construction.** The sandbox withholds the clock and randomness, so a rule
   cannot introduce nondeterminism even by accident.
 

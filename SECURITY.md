@@ -39,9 +39,11 @@ therefore about **confinement**, not absence:
 - **Filesystem confinement.** Rules read only through `ctx.readFile`, which is confined to the
   project root and rejects traversal outside it. Writes happen only under `--fix`, only to files
   that matched, and only within the ranges of reported violations.
-- **Bounded execution.** A per-invocation execution timeout and a per-runtime memory ceiling are
-  always enforced and cannot be disabled. Turing-complete rules can fail to terminate, and a rule
-  that hangs a pre-commit hook is indistinguishable from a broken tool.
+- **Bounded execution.** A per-invocation execution timeout (1 s default), a global run budget
+  (15 s default) and a per-runtime memory ceiling are always enforced and cannot be disabled.
+  Turing-complete rules can fail to terminate, and a rule that hangs a pre-commit hook is
+  indistinguishable from a broken tool. Breaching any limit cancels the run and exits `2` — a
+  checker that could not finish is never reported as one that found nothing.
 - **Determinism by construction.** The sandbox withholds `Math.random`, `Date.now` and `new
   Date()`. This is a correctness property as much as a security one — nondeterminism would make
   the cache unsound.
@@ -55,7 +57,8 @@ therefore about **confinement**, not absence:
 - Any read outside the project root, or any write outside `--fix`'s permitted ranges, including
   via path traversal in `ctx.readFile`, `include:`, or a suppression directive.
 - Any network request originating from lanekeep.
-- A rule that evades the execution timeout or memory ceiling.
+- A rule that evades the per-invocation timeout, the global run budget, or the memory ceiling — or
+  that causes a breach to be reported as a clean run rather than cancelling it.
 - Code execution reachable from a *source file being analysed*, as opposed to from a rule. Rules
   are trusted-ish by the person who installed them; analysed source is not trusted at all.
 - Memory-safety failures reachable from untrusted input, including a malformed or deliberately
