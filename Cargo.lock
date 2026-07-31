@@ -97,8 +97,11 @@ dependencies = [
 name = "lanekeep-js"
 version = "0.1.0"
 dependencies = [
+ "lanekeep-lang",
+ "lanekeep-lang-js",
  "rquickjs",
  "thiserror",
+ "tree-sitter",
 ]
 
 [[package]]
