@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#
+# Pre-commit: the fast gate. Format, clippy, tests.
+#
+# Note this checks the working tree, not the index. Verifying the index exactly would
+# mean stashing unstaged changes around the run, and a hook that manipulates the stash
+# can lose work when it fails partway. Checking the working tree is the safer trade:
+# it can pass a commit whose staged subset would fail, which pre-push then catches.
+
+set -euo pipefail
+
+if ! command -v just >/dev/null 2>&1; then
+    echo "pre-commit: 'just' is not installed — run ./scripts/setup-dev.sh" >&2
+    echo "            (or bypass this once with 'git commit --no-verify')" >&2
+    exit 1
+fi
+
+exec just check-fast

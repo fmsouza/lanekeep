@@ -1,0 +1,11 @@
+# Formatting is not a matter of taste here — it is a matter of never discussing it again.
+#
+# Stable options only, deliberately. `imports_granularity`, `group_imports`,
+# `wrap_comments` and friends are nightly-only: setting them on a stable toolchain
+# emits a warning per file and changes nothing. A config that silently does not
+# apply is worse than one that asks for less, so we ask for less rather than adding
+# a nightly toolchain to a project that pins stable for reproducibility.
+edition = "2024"
+max_width = 100
+use_small_heuristics = "Default"
+newline_style = "Unix"

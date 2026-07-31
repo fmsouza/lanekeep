@@ -1,0 +1,83 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fmsouza/lanekeep"
+homepage = "https://github.com/fmsouza/lanekeep"
+authors = ["Fred Souza <1396615+fmsouza@users.noreply.github.com>"]
+keywords = ["linter", "static-analysis", "tree-sitter", "typescript", "conformance"]
+categories = ["development-tools", "development-tools::testing"]
+
+# Internal crate versions are declared once here so a version bump touches one line.
+# Dependency edges are added to each crate as its code needs them, not up front —
+# an unused dependency is a cargo-machete failure, and the intended graph is
+# documented in docs/architecture.md §3.
+[workspace.dependencies]
+lanekeep-cache = { version = "0.1.0", path = "crates/lanekeep-cache" }
+lanekeep-cli = { version = "0.1.0", path = "crates/lanekeep-cli" }
+lanekeep-config = { version = "0.1.0", path = "crates/lanekeep-config" }
+lanekeep-core = { version = "0.1.0", path = "crates/lanekeep-core" }
+lanekeep-js = { version = "0.1.0", path = "crates/lanekeep-js" }
+lanekeep-lang = { version = "0.1.0", path = "crates/lanekeep-lang" }
+lanekeep-lang-js = { version = "0.1.0", path = "crates/lanekeep-lang-js" }
+lanekeep-query = { version = "0.1.0", path = "crates/lanekeep-query" }
+lanekeep-report = { version = "0.1.0", path = "crates/lanekeep-report" }
+lanekeep-rules = { version = "0.1.0", path = "crates/lanekeep-rules" }
+lanekeep-testkit = { version = "0.1.0", path = "crates/lanekeep-testkit" }
+
+[workspace.lints.rust]
+# Denied rather than forbidden: lanekeep-cache needs `unsafe` for memory mapping and
+# lanekeep-js for the engine FFI boundary. Those crates opt in locally, at the use
+# site, with a comment explaining the invariant being upheld. `forbid` cannot be
+# overridden that way, which would push the unsafe somewhere less visible.
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Correctness and clarity lints outside pedantic that are worth having on a tool
+# whose whole value proposition is being trusted to be right.
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+expect_used = "warn"
+unwrap_used = "warn"
+panic = "warn"
+# Silent-failure lints. A rules engine that quietly truncates a number or swallows
+# a conversion produces wrong results with no error, which is the worst outcome.
+cast_possible_truncation = "warn"
+cast_precision_loss = "warn"
+cast_sign_loss = "warn"
+# Noise. `module_name_repetitions` fights the crate-per-concern layout, and
+# `must_use_candidate` on a codebase this size is thousands of annotations.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Benchmarks need symbols to be interpretable in a profiler, so they inherit
+# release optimization without the stripping.
+[profile.bench]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"
+
+# Used by cargo-dist for shipped binaries. Fat LTO costs build time we only pay
+# on release, in exchange for the binary users actually run being the fastest one.
+[profile.dist]
+inherits = "release"
+lto = "fat"
