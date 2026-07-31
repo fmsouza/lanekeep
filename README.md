@@ -101,6 +101,23 @@ Not yet published. When it ships it will be a single static binary with the Java
 compiled in, available via npm, cargo and Homebrew. **Node.js is not required to run lanekeep**,
 even though rules are written in TypeScript.
 
+## What it looks like
+
+```
+$ lanekeep check
+src/also.ts:2:1 error [local/no-default-export] default export
+  → use a named export so the symbol has one canonical name
+src/bad.ts:2:1 error [local/no-default-export] default export
+  → use a named export so the symbol has one canonical name
+
+✖ 2 error(s) across 2 file(s) checked
+```
+
+Exit `0` when clean, `1` when violations are found, `2` when the checker could not run —
+a caller has to be able to tell "your code has problems" from "the tool is broken".
+`--format json` emits a versioned, stable schema on stdout; diagnostics always go to stderr,
+so piping into a parser works even when something fails.
+
 ## Documentation
 
 | Document | Purpose |
