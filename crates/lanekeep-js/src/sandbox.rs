@@ -1,12 +1,16 @@
 //! The sandbox: a JavaScript runtime with no ambient authority and enforced budgets.
 
+use std::path::Path;
 use std::sync::Arc;
 
+use lanekeep_lang::Language;
 use rquickjs::context::intrinsic;
-use rquickjs::{CatchResultExt, Context, Ctx, FromJs, Runtime};
+use rquickjs::promise::PromiseState;
+use rquickjs::{CatchResultExt, Context, Ctx, FromJs, Module, Runtime};
 
 use crate::error::SandboxError;
 use crate::limits::{Budget, Limits, RunClock, Trip};
+use crate::loader::{RuleLoader, RuleResolver, RuleRoot};
 
 /// The intrinsics rule code gets.
 ///
@@ -107,6 +111,60 @@ impl Sandbox {
             limits,
             budget,
         })
+    }
+
+    /// Build a sandbox that can load rule modules from a rules root.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sandbox::new`].
+    pub fn with_modules(
+        limits: Limits,
+        clock: Arc<RunClock>,
+        root: RuleRoot,
+        typescript: Arc<dyn Language>,
+        javascript: Arc<dyn Language>,
+    ) -> Result<Self, SandboxError> {
+        let sandbox = Self::new(limits, clock)?;
+        sandbox.runtime.set_loader(
+            RuleResolver::new(root.clone()),
+            RuleLoader::new(root, typescript, javascript),
+        );
+        Ok(sandbox)
+    }
+
+    /// Import a rule module and return its default export.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError`] on a breached budget, a module that fails to resolve or
+    /// load, or a module that throws while evaluating.
+    pub fn import_default<T>(&self, path: &Path) -> Result<T, SandboxError>
+    where
+        T: for<'js> FromJs<'js>,
+    {
+        self.budget.arm(self.limits.rule_timeout);
+        let outcome = self.context.with(|ctx| {
+            let promise = match Module::import(&ctx, path.display().to_string()) {
+                Ok(promise) => promise,
+                Err(err) => return Err(capture_failure(&ctx, &err)),
+            };
+
+            // The engine is synchronous and the loader does no I/O asynchronously, so an
+            // import settles during this call. Draining the job queue is still required —
+            // module evaluation is scheduled as a job rather than run inline.
+            while promise.state() == PromiseState::Pending && ctx.execute_pending_job() {}
+
+            match promise.finish::<rquickjs::Object<'_>>() {
+                Ok(namespace) => namespace
+                    .get::<_, T>("default")
+                    .map_err(|err| capture_failure(&ctx, &err)),
+                Err(err) => Err(capture_failure(&ctx, &err)),
+            }
+        });
+        self.budget.disarm();
+
+        outcome.map_err(|raw| self.classify(&raw, self.limits.rule_timeout))
     }
 
     /// Build a sandbox with its own run clock, starting now.

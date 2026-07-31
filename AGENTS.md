@@ -172,6 +172,11 @@ them because an engine that panics on a malformed input file has failed at its j
 test, panicking *is* the failure mechanism, so `clippy.toml` sets `allow-*-in-tests`.
 Do not add `#[allow]` attributes to test modules; the config already handles it.
 
+**`Path::is_absolute` is platform-specific, and tests that assume otherwise pass on
+macOS and fail on Windows.** `/etc/passwd` is absolute on Unix and merely *rooted* on
+Windows; `C:\...` is the reverse. Build an absolute path from `std::env::temp_dir()` rather
+than writing a literal, or the same input takes a different code branch on each platform.
+
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
 

@@ -34,6 +34,7 @@
 
 pub mod error;
 pub mod limits;
+pub mod loader;
 pub mod sandbox;
 pub mod typescript;
 
@@ -41,5 +42,6 @@ pub use error::SandboxError;
 pub use limits::{
     DEFAULT_GLOBAL_TIMEOUT, DEFAULT_MEMORY_BYTES, DEFAULT_RULE_TIMEOUT, Limits, RunClock,
 };
+pub use loader::{HOST_MODULE, ResolveError, RuleLoader, RuleResolver, RuleRoot};
 pub use sandbox::Sandbox;
 pub use typescript::{StripError, Unsupported, strip_types};
