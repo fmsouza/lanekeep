@@ -1,0 +1,67 @@
+name: Bug report
+description: Something behaves differently than documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security issues do not belong here.** Report them through
+        [private vulnerability reporting](https://github.com/fmsouza/lanekeep/security)
+        instead — see [SECURITY.md](https://github.com/fmsouza/lanekeep/blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `lanekeep --version`, or the commit if building from source.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >-
+        The smallest input that triggers it — the rule, the source file, and the command.
+        A minimal reproduction is worth more than a description, because it removes the
+        guessing about which detail mattered.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: Include the full output, and the exit code if it was not what you expected.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: cache
+    attributes:
+      label: Does it still happen with `--no-cache`?
+      description: >-
+        A bug that disappears with the cache disabled is a cache-invalidation bug, which
+        is a different and more interesting problem than a wrong rule result.
+      options:
+        - "Yes, same behavior"
+        - "No, it goes away"
+        - "Have not tried"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: macOS 15 arm64 / Ubuntu 24.04 x86_64 / Windows 11
+    validations:
+      required: true
