@@ -7,19 +7,41 @@
 //!
 //! # What is here so far
 //!
-//! Reporting and tree navigation. Binding resolution, tracked file reads and facts arrive
-//! in later milestones.
+//! Reporting, tree navigation, binding resolution and facts. Tracked file reads arrive in a
+//! later milestone.
+//!
+//! # Two contexts, not one
+//!
+//! [`HostContext`] serves the per-file pass and [`ReduceContext`] serves the reduce phase,
+//! and neither is a subset of the other by accident:
+//!
+//! - `emitFact` exists only in the per-file context. A reduce phase that could emit facts
+//!   could feed itself, and there is no second pass for the result to reach.
+//! - `facts` and `files` exist only in the reduce context. If `check` could read the corpus,
+//!   a file's result would depend on files other than itself, and caching that result
+//!   against its own content would be unsound. This is not a stylistic split — it is what
+//!   makes per-file cache entries mean anything.
 
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use rquickjs::function::Opt;
-use rquickjs::{Ctx, Function, Object};
+use rquickjs::{Ctx, Function, Object, Value};
 
 use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 
 use crate::nodes::{Handle, NodeArena};
+
+/// A fact a rule emitted, before the engine attaches the file and rule it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmittedFact {
+    /// The `kind` field, lifted out so the reduce phase can filter without parsing.
+    pub kind: String,
+    /// The whole fact, as `JSON.stringify` rendered it. Always a JSON object.
+    pub data: String,
+}
 
 /// A violation a rule asked for.
 ///
@@ -46,6 +68,7 @@ pub struct Report {
 pub struct HostContext {
     arena: Rc<RefCell<NodeArena>>,
     reports: Rc<RefCell<Vec<Report>>>,
+    facts: Rc<RefCell<Vec<EmittedFact>>>,
     file_path: Rc<str>,
     resolver: Option<Arc<dyn BindingResolver>>,
 }
@@ -56,6 +79,7 @@ impl std::fmt::Debug for HostContext {
             .field("file_path", &self.file_path)
             .field("interned_nodes", &self.arena.borrow().len())
             .field("reports", &self.reports.borrow().len())
+            .field("facts", &self.facts.borrow().len())
             .field("has_resolver", &self.resolver.is_some())
             .finish()
     }
@@ -68,6 +92,7 @@ impl HostContext {
         Self {
             arena: Rc::new(RefCell::new(NodeArena::new(tree, source))),
             reports: Rc::new(RefCell::new(Vec::new())),
+            facts: Rc::new(RefCell::new(Vec::new())),
             file_path: Rc::from(file_path),
             resolver: None,
         }
@@ -106,6 +131,12 @@ impl HostContext {
         std::mem::take(&mut self.reports.borrow_mut())
     }
 
+    /// Take everything emitted so far, in emission order, leaving the context empty.
+    #[must_use]
+    pub fn take_facts(&self) -> Vec<EmittedFact> {
+        std::mem::take(&mut self.facts.borrow_mut())
+    }
+
     /// Build the `ctx` object.
     ///
     /// # Errors
@@ -125,6 +156,7 @@ impl HostContext {
         self.install_navigation(ctx, &object)?;
         self.install_bindings(ctx, &object)?;
         self.install_reporting(ctx, &object)?;
+        self.install_facts(ctx, &object)?;
 
         Ok(object)
     }
@@ -333,6 +365,259 @@ impl HostContext {
 
         Ok(())
     }
+
+    /// Emitting facts for the reduce phase.
+    fn install_facts<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
+        // --- facts -----------------------------------------------------------------------
+
+        let facts = Rc::clone(&self.facts);
+        object.set(
+            "emitFact",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, fact: Value<'js>| -> rquickjs::Result<()> {
+                    let Some(fact_object) = fact.as_object() else {
+                        return Err(throw(&ctx, "ctx.emitFact expects an object"));
+                    };
+
+                    // `kind` is what `ctx.facts('export')` filters on. A fact without one
+                    // could never be retrieved, so emitting it is always a mistake — and a
+                    // silent one, since the rule would look like it was working right up
+                    // until `reduce` found nothing.
+                    let kind = match fact_object.get::<_, String>("kind") {
+                        Ok(kind) if !kind.is_empty() => kind,
+                        _ => {
+                            return Err(throw(
+                                &ctx,
+                                "ctx.emitFact requires a non-empty string `kind` — it is what \
+                                 ctx.facts(kind) selects on, so a fact without one can never \
+                                 be read back",
+                            ));
+                        }
+                    };
+
+                    // `JSON.stringify` is the definition of serializable here rather than a
+                    // check alongside it, so what a rule can emit is exactly what it could
+                    // write to a file — and exactly what a cache entry can hold. A cycle
+                    // throws from inside stringify and surfaces as the rule's error.
+                    let Some(json) = ctx.json_stringify(fact)? else {
+                        return Err(throw(
+                            &ctx,
+                            "ctx.emitFact could not serialize this fact — facts are cached, \
+                             so they have to survive JSON",
+                        ));
+                    };
+
+                    facts.borrow_mut().push(EmittedFact {
+                        kind,
+                        data: json.to_string()?,
+                    });
+                    Ok(())
+                },
+            )?,
+        )?;
+
+        Ok(())
+    }
+}
+
+/// A violation a reduce phase asked for.
+///
+/// Carries a file of its own: a cross-file rule reports at the site the fact came from,
+/// which is by definition not "the file being checked" — there isn't one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReduceReport {
+    /// Path of the file to report against, as the rule gave it.
+    pub file: String,
+    /// One-based line.
+    pub line: u32,
+    /// One-based column.
+    pub column: u32,
+    /// A message overriding the rule card's, when the rule supplied one.
+    pub message: Option<String>,
+}
+
+/// One fact as the reduce phase will see it: payload plus the file it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReduceFact {
+    /// The `kind`, for filtering.
+    pub kind: String,
+    /// The payload as JSON, with `file` merged in.
+    pub json: String,
+}
+
+/// Host state for the reduce phase of one rule.
+///
+/// Built per rule rather than per run, because a rule sees only its own facts — letting one
+/// rule read another's would turn a private payload shape into a contract between rules.
+#[derive(Debug, Clone)]
+pub struct ReduceContext {
+    files: Rc<[String]>,
+    facts: Rc<[ReduceFact]>,
+    reports: Rc<RefCell<Vec<ReduceReport>>>,
+}
+
+impl ReduceContext {
+    /// Build a context over one rule's facts and the discovered file list.
+    #[must_use]
+    pub fn new(files: Vec<String>, facts: Vec<ReduceFact>) -> Self {
+        Self {
+            files: files.into(),
+            facts: facts.into(),
+            reports: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Take everything reported so far, leaving the context empty.
+    #[must_use]
+    pub fn take_reports(&self) -> Vec<ReduceReport> {
+        std::mem::take(&mut self.reports.borrow_mut())
+    }
+
+    /// Build the `ctx` object the reduce phase receives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine error if a property cannot be defined, which would mean a broken
+    /// build rather than anything about a rule.
+    pub fn build<'js>(&self, ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+        let object = Object::new(ctx.clone())?;
+
+        object.set("files", &*self.files)?;
+
+        // No `filePath`, no `root`, no `fileText`, no navigation. There is no file and no
+        // tree here — that is invariant 1, and a context that offered them would be lying
+        // about what the phase can see.
+
+        let facts = Rc::clone(&self.facts);
+        object.set(
+            "facts",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, kind: Opt<String>| -> rquickjs::Result<Value<'js>> {
+                    // One array, one parse. Handing back N separately-parsed objects would
+                    // cost N crossings for a phase whose whole job is bulk work.
+                    let wanted = kind.0;
+                    let mut json = String::from("[");
+                    for fact in facts
+                        .iter()
+                        .filter(|f| wanted.as_ref().is_none_or(|k| *k == f.kind))
+                    {
+                        if json.len() > 1 {
+                            json.push(',');
+                        }
+                        json.push_str(&fact.json);
+                    }
+                    json.push(']');
+
+                    ctx.json_parse(json)
+                },
+            )?,
+        )?;
+
+        let reports = Rc::clone(&self.reports);
+        object.set(
+            "report",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      at: Value<'js>,
+                      message: Opt<String>|
+                      -> rquickjs::Result<()> {
+                    let Some(at) = at.as_object() else {
+                        return Err(throw(
+                            &ctx,
+                            "ctx.report in a reduce phase expects { file, line, column } — \
+                             there is no parse tree here, so there are no nodes to report at",
+                        ));
+                    };
+
+                    let (Ok(file), Ok(line), Ok(column)) = (
+                        at.get::<_, String>("file"),
+                        at.get::<_, u32>("line"),
+                        at.get::<_, u32>("column"),
+                    ) else {
+                        return Err(throw(
+                            &ctx,
+                            "ctx.report in a reduce phase needs `file`, `line` and `column` — \
+                             emit them on the fact during the per-file pass, where the node \
+                             positions are still available",
+                        ));
+                    };
+
+                    reports.borrow_mut().push(ReduceReport {
+                        file,
+                        line,
+                        column,
+                        message: message.0,
+                    });
+                    Ok(())
+                },
+            )?,
+        )?;
+
+        Ok(object)
+    }
+}
+
+/// Throw a `TypeError` carrying a message meant for a rule author.
+///
+/// A real `Error` object, not a thrown string: the sandbox reports a thrown string by
+/// telling the author to throw an `Error` instead, which is sound advice about their code
+/// and nonsense when the host is the one that threw. It would also lose the message.
+fn throw(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
+    rquickjs::Exception::throw_type(ctx, message)
+}
+
+/// Merge a `file` into a fact's serialized payload.
+///
+/// Textual because the input is `JSON.stringify` output — always an object, always with the
+/// braces at the ends — so this is one allocation rather than a parse, an insert and a
+/// re-serialize, per fact, for a phase whose input is the whole corpus.
+///
+/// `file` goes **last** on purpose. A rule is free to put its own `file` in a fact, and JSON
+/// parsing takes the last of duplicate keys — so the host's value wins, and a rule cannot
+/// misattribute a violation by shadowing it.
+#[must_use]
+pub fn merge_file(data: &str, file: &str) -> String {
+    let inner = data
+        .trim()
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or_default()
+        .trim();
+
+    let mut out = String::with_capacity(data.len() + file.len() + 12);
+    out.push('{');
+    if !inner.is_empty() {
+        out.push_str(inner);
+        out.push(',');
+    }
+    out.push_str("\"file\":");
+    escape_json_string(file, &mut out);
+    out.push('}');
+    out
+}
+
+/// Append `text` as a quoted JSON string.
+fn escape_json_string(text: &str, out: &mut String) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // Writing rather than formatting into a temporary: this runs once per
+                // character of every fact's file path.
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// Match a module specifier against a pattern where `*` stands for any run of characters.
@@ -791,5 +1076,312 @@ mod tests {
             host.arena().borrow().is_empty(),
             "reading the root's kind should not intern anything new"
         );
+    }
+
+    // --- facts -------------------------------------------------------------------------
+
+    /// Run source with a per-file `ctx` and return the facts it emitted.
+    fn emitted(source: &str) -> Vec<EmittedFact> {
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        sandbox
+            .eval_with_host::<()>(&host, source)
+            .expect("evaluates");
+        host.take_facts()
+    }
+
+    #[test]
+    fn a_fact_is_captured_with_its_kind_and_payload() {
+        let facts = emitted("ctx.emitFact({ kind: 'export', symbol: 'parse' })");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].kind, "export");
+        assert!(
+            facts[0].data.contains(r#""symbol":"parse""#),
+            "{:?}",
+            facts[0]
+        );
+    }
+
+    #[test]
+    fn facts_are_kept_in_emission_order() {
+        // Within a file, the order a rule emitted in is the only order it can have meant.
+        let facts = emitted(
+            "ctx.emitFact({ kind: 'a', n: 1 }); \
+             ctx.emitFact({ kind: 'b', n: 2 }); \
+             ctx.emitFact({ kind: 'a', n: 3 });",
+        );
+        assert_eq!(
+            facts.iter().map(|f| f.kind.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "a"]
+        );
+    }
+
+    #[test]
+    fn a_fact_without_a_kind_is_rejected() {
+        // Not dropped. A fact with no kind can never be selected by `ctx.facts(kind)`, so
+        // accepting it would leave the rule looking correct until reduce found nothing.
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let error = sandbox
+            .eval_with_host::<()>(&host, "ctx.emitFact({ symbol: 'parse' })")
+            .expect_err("is rejected");
+        assert!(error.to_string().contains("kind"), "{error}");
+        assert!(host.take_facts().is_empty());
+    }
+
+    #[test]
+    fn a_fact_with_an_empty_kind_is_rejected() {
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        assert!(
+            sandbox
+                .eval_with_host::<()>(&host, "ctx.emitFact({ kind: '' })")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_fact_that_is_not_an_object_is_rejected() {
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        for bad in ["'export'", "42", "null", "undefined"] {
+            assert!(
+                sandbox
+                    .eval_with_host::<()>(&host, &format!("ctx.emitFact({bad})"))
+                    .is_err(),
+                "`{bad}` should not be emittable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cyclic_fact_is_rejected_rather_than_hanging() {
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let error = sandbox
+            .eval_with_host::<()>(
+                &host,
+                "const f = { kind: 'x' }; f.self = f; ctx.emitFact(f)",
+            )
+            .expect_err("is rejected");
+        // JSON.stringify's own error. Letting it through unchanged is right: it says
+        // "circular structure", which is more specific than anything this layer knows.
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn the_reduce_surface_is_absent_from_the_per_file_context() {
+        // The invariant that makes per-file cache entries mean anything: a file's result
+        // must not depend on any other file.
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        for absent in ["ctx.facts", "ctx.files"] {
+            let present: bool = sandbox
+                .eval_with_host(&host, &format!("{absent} !== undefined"))
+                .expect("evaluates");
+            assert!(
+                !present,
+                "`{absent}` must not exist during the per-file pass"
+            );
+        }
+    }
+
+    // --- the reduce context ------------------------------------------------------------
+
+    fn reduce_fact(kind: &str, json: &str) -> ReduceFact {
+        ReduceFact {
+            kind: kind.to_owned(),
+            json: json.to_owned(),
+        }
+    }
+
+    /// The reduce phase's budget in these tests. Generous: nothing here is timing-sensitive.
+    fn budget() -> std::time::Duration {
+        std::time::Duration::from_secs(5)
+    }
+
+    #[test]
+    fn facts_come_back_as_objects() {
+        let context = ReduceContext::new(
+            vec!["a.ts".to_owned()],
+            vec![reduce_fact(
+                "export",
+                r#"{"kind":"export","symbol":"parse","file":"a.ts"}"#,
+            )],
+        );
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let symbol: String = sandbox
+            .eval_with_reduce_host(&context, "ctx.facts('export')[0].symbol", budget())
+            .expect("evaluates");
+        assert_eq!(symbol, "parse");
+    }
+
+    #[test]
+    fn facts_filter_by_kind_and_default_to_everything() {
+        let context = ReduceContext::new(
+            vec![],
+            vec![
+                reduce_fact("export", r#"{"kind":"export","file":"a.ts"}"#),
+                reduce_fact("import", r#"{"kind":"import","file":"b.ts"}"#),
+                reduce_fact("export", r#"{"kind":"export","file":"c.ts"}"#),
+            ],
+        );
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let counts: Vec<i32> = sandbox
+            .eval_with_reduce_host(
+                &context,
+                "[ctx.facts('export').length, ctx.facts('import').length, ctx.facts().length]",
+                budget(),
+            )
+            .expect("evaluates");
+        assert_eq!(counts, vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn an_unknown_kind_yields_an_empty_array_rather_than_undefined() {
+        // So `for (const f of ctx.facts('nope'))` is a no-op instead of a TypeError.
+        let context = ReduceContext::new(vec![], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let length: i32 = sandbox
+            .eval_with_reduce_host(&context, "ctx.facts('nope').length", budget())
+            .expect("evaluates");
+        assert_eq!(length, 0);
+    }
+
+    #[test]
+    fn the_file_list_is_visible() {
+        let context = ReduceContext::new(vec!["a.ts".to_owned(), "b.ts".to_owned()], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let files: Vec<String> = sandbox
+            .eval_with_reduce_host(&context, "ctx.files", budget())
+            .expect("evaluates");
+        assert_eq!(files, vec!["a.ts".to_owned(), "b.ts".to_owned()]);
+    }
+
+    #[test]
+    fn reporting_names_a_file_of_its_own() {
+        let context = ReduceContext::new(vec![], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        sandbox
+            .eval_with_reduce_host::<()>(
+                &context,
+                "ctx.report({ file: 'b.ts', line: 4, column: 2 }, 'unused export')",
+                budget(),
+            )
+            .expect("evaluates");
+        assert_eq!(
+            context.take_reports(),
+            vec![ReduceReport {
+                file: "b.ts".to_owned(),
+                line: 4,
+                column: 2,
+                message: Some("unused export".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_message_is_optional() {
+        let context = ReduceContext::new(vec![], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        sandbox
+            .eval_with_reduce_host::<()>(
+                &context,
+                "ctx.report({ file: 'b.ts', line: 1, column: 1 })",
+                budget(),
+            )
+            .expect("evaluates");
+        let reports = context.take_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].message, None);
+    }
+
+    #[test]
+    fn reporting_without_a_position_is_rejected() {
+        // A cross-file violation with no site is unactionable, and defaulting to 1:1 would
+        // point a reader at an unrelated line.
+        let context = ReduceContext::new(vec![], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        for bad in [
+            "ctx.report({ file: 'b.ts' })",
+            "ctx.report({ line: 1, column: 1 })",
+            "ctx.report(3)",
+            "ctx.report('b.ts')",
+        ] {
+            let error = sandbox
+                .eval_with_reduce_host::<()>(&context, bad, budget())
+                .expect_err("is rejected");
+            assert!(!error.to_string().is_empty(), "`{bad}` should be rejected");
+        }
+        assert!(context.take_reports().is_empty());
+    }
+
+    #[test]
+    fn the_per_file_surface_is_absent_from_the_reduce_context() {
+        // Invariant 1: the reduce phase never touches parse trees. A context that offered
+        // navigation would be lying about what the phase can see.
+        let context = ReduceContext::new(vec![], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        for absent in [
+            "ctx.emitFact",
+            "ctx.text",
+            "ctx.kind",
+            "ctx.parent",
+            "ctx.namedChildren",
+            "ctx.filePath",
+            "ctx.fileText",
+            "ctx.root",
+        ] {
+            let present: bool = sandbox
+                .eval_with_reduce_host(&context, &format!("{absent} !== undefined"), budget())
+                .expect("evaluates");
+            assert!(
+                !present,
+                "`{absent}` must not exist during the reduce phase"
+            );
+        }
+    }
+
+    // --- merging the file into a payload -------------------------------------------------
+
+    #[test]
+    fn merge_file_adds_the_field() {
+        assert_eq!(
+            merge_file(r#"{"kind":"export"}"#, "src/a.ts"),
+            r#"{"kind":"export","file":"src/a.ts"}"#
+        );
+    }
+
+    #[test]
+    fn merge_file_handles_an_empty_payload() {
+        assert_eq!(merge_file("{}", "a.ts"), r#"{"file":"a.ts"}"#);
+    }
+
+    #[test]
+    fn merge_file_overrides_a_file_the_rule_supplied() {
+        // Last duplicate key wins in JSON, so the host's value is the one that survives —
+        // a rule cannot misattribute a violation to a file it did not come from.
+        let merged = merge_file(r#"{"kind":"export","file":"lies.ts"}"#, "truth.ts");
+        assert!(merged.ends_with(r#""file":"truth.ts"}"#), "{merged}");
+
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let file: String = sandbox
+            .eval(&format!("JSON.parse({merged:?}).file"))
+            .expect("parses");
+        assert_eq!(file, "truth.ts");
+    }
+
+    #[test]
+    fn merge_file_escapes_the_path() {
+        // A path is untrusted input as far as this function is concerned: it comes from the
+        // filesystem, and a quote in it would otherwise produce a payload that no longer
+        // parses — or worse, one that parses into something else.
+        let awkward = "a\"b\\c\nd.ts";
+        let merged = merge_file("{}", awkward);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let file: String = sandbox
+            .eval(&format!("JSON.parse({merged:?}).file"))
+            .expect("parses");
+        assert_eq!(file, awkward);
     }
 }

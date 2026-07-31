@@ -124,6 +124,7 @@ so piping into a parser works even when something fails.
 | --- | --- |
 | [`docs/architecture.md`](docs/architecture.md) | The full design: execution model, host API, cache, milestones |
 | [`docs/built-in-rules.md`](docs/built-in-rules.md) | The rules lanekeep ships with, and their options |
+| [`docs/cross-file-rules.md`](docs/cross-file-rules.md) | Writing a rule that needs a whole-corpus view |
 | [`AGENTS.md`](AGENTS.md) | How to work in this repository — for coding agents and humans alike |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Setup, commands, and the pull request process |
 | [`SECURITY.md`](SECURITY.md) | Threat model and how to report a vulnerability |

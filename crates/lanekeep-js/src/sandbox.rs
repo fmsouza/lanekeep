@@ -9,7 +9,7 @@ use rquickjs::promise::PromiseState;
 use rquickjs::{CatchResultExt, Context, Ctx, FromJs, Module, Runtime};
 
 use crate::error::SandboxError;
-use crate::host::HostContext;
+use crate::host::{HostContext, ReduceContext};
 use crate::limits::{Budget, Limits, RunClock, Trip};
 use crate::loader::{LoadedModules, RuleLoader, RuleResolver, RuleRoot};
 
@@ -285,6 +285,44 @@ impl Sandbox {
     pub fn eval_with_host_timeout<T>(
         &self,
         host: &HostContext,
+        source: &str,
+        timeout: std::time::Duration,
+    ) -> Result<T, SandboxError>
+    where
+        T: for<'js> FromJs<'js>,
+    {
+        self.budget.arm(timeout);
+        let outcome = self.context.with(|ctx| {
+            let object = match host.build(&ctx) {
+                Ok(object) => object,
+                Err(err) => return Err(capture_failure(&ctx, &err)),
+            };
+            if let Err(err) = ctx.globals().set("ctx", object) {
+                return Err(capture_failure(&ctx, &err));
+            }
+            match ctx.eval::<T, _>(source) {
+                Ok(value) => Ok(value),
+                Err(err) => Err(capture_failure(&ctx, &err)),
+            }
+        });
+        self.budget.disarm();
+
+        outcome.map_err(|raw| self.classify(&raw, timeout))
+    }
+
+    /// Evaluate with a reduce-phase `ctx` in scope, under an explicit budget.
+    ///
+    /// A separate entry point rather than a flag on the one above, because the two contexts
+    /// expose different surfaces on purpose — `facts` and `files` here, `emitFact` and the
+    /// tree there. A single builder that switched on a boolean would make it possible to
+    /// get the wrong one, which is precisely what must not happen.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sandbox::eval`].
+    pub fn eval_with_reduce_host<T>(
+        &self,
+        host: &ReduceContext,
         source: &str,
         timeout: std::time::Duration,
     ) -> Result<T, SandboxError>

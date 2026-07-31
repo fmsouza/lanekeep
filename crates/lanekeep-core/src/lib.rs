@@ -9,8 +9,8 @@
 //!
 //! # What is here so far
 //!
-//! Rule identity, severity, source locations, rule cards, and violations with their
-//! canonical ordering. The engine itself arrives in later milestones.
+//! Rule identity, severity, source locations, rule cards, violations with their canonical
+//! ordering, and the facts a per-file pass hands to the reduce phase.
 //!
 //! These types are foundational in a specific sense: they are what appears in JSON output,
 //! in cache entries, and in suppression comments users type by hand. Getting them wrong is
@@ -19,6 +19,7 @@
 
 pub mod card;
 pub mod discovery;
+pub mod fact;
 pub mod gates;
 pub mod location;
 pub mod rule_id;
@@ -27,6 +28,7 @@ pub mod violation;
 
 pub use card::{CardProblem, Examples, RuleCard};
 pub use discovery::{Discovery, DiscoveryError};
+pub use fact::Fact;
 pub use gates::{CompiledGates, GateError, Gates};
 pub use location::{FilePath, Location, Position};
 pub use rule_id::{Namespace, ParseRuleIdError, RuleId};

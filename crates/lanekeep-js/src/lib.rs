@@ -41,7 +41,9 @@ pub mod sandbox;
 pub mod typescript;
 
 pub use error::SandboxError;
-pub use host::{HostContext, Report};
+pub use host::{
+    EmittedFact, HostContext, ReduceContext, ReduceFact, ReduceReport, Report, merge_file,
+};
 /// Re-exported so consumers can supply languages without depending on `lanekeep-lang` directly.
 pub use lanekeep_lang::Language;
 pub use limits::{
