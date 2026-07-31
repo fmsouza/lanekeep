@@ -23,6 +23,7 @@ lanekeep-engine = { workspace = true }
 lanekeep-js = { workspace = true }
 lanekeep-lang-js = { workspace = true }
 lanekeep-report = { workspace = true }
+lanekeep-rules = { workspace = true }
 
 [lints]
 workspace = true

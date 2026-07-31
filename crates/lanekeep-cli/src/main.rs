@@ -124,7 +124,8 @@ fn config_path(project_root: &Path, given: Option<&Path>) -> anyhow::Result<Path
 /// Load the config and prepare an engine. Shared by every command that needs rules.
 fn prepare(project_root: &Path, config: Option<&Path>) -> anyhow::Result<(Engine, usize)> {
     let root = RuleRoot::new(project_root)
-        .map_err(|e| anyhow::anyhow!("cannot use `{}`: {e}", project_root.display()))?;
+        .map_err(|e| anyhow::anyhow!("cannot use `{}`: {e}", project_root.display()))?
+        .with_builtins(lanekeep_rules::source);
     let config_path = config_path(project_root, config)?;
 
     let sandbox = lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
@@ -197,11 +198,22 @@ fn rules(project_root: &Path, config: Option<&Path>) -> anyhow::Result<ExitCode>
     let (engine, declared) = prepare(project_root, config)?;
 
     let mut stdout = std::io::stdout();
-    writeln!(
-        stdout,
-        "{declared} rule(s) configured, {} enabled",
-        engine.rule_count()
-    )?;
+    for spec in engine.rules() {
+        // Id, severity, then what the rule is for. An agent reading this has to be able to
+        // decide whether a rule is the one it wants without opening the source.
+        writeln!(stdout, "{}  [{}]", spec.id, spec.severity)?;
+        writeln!(stdout, "    {}", spec.card.message)?;
+        writeln!(stdout, "    {}", spec.card.remediation)?;
+    }
+
+    let disabled = declared.saturating_sub(engine.rule_count());
+    if disabled > 0 {
+        // Named separately rather than folded into the count, so "I configured six rules
+        // and five ran" is visible instead of inferable.
+        writeln!(stdout, "\n{declared} rule(s) configured, {disabled} off")?;
+    } else {
+        writeln!(stdout, "\n{declared} rule(s) configured")?;
+    }
     stdout.flush()?;
 
     Ok(ExitCode::SUCCESS)

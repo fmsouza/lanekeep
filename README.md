@@ -105,10 +105,10 @@ even though rules are written in TypeScript.
 
 ```
 $ lanekeep check
-src/also.ts:2:1 error [local/no-default-export] default export
-  → use a named export so the symbol has one canonical name
-src/bad.ts:2:1 error [local/no-default-export] default export
-  → use a named export so the symbol has one canonical name
+src/also.ts:2:1 error [lanekeep/no-default-export] default export
+  → use a named export, so the symbol has one name every importer must use
+src/bad.ts:2:1 error [lanekeep/no-default-export] default export
+  → use a named export, so the symbol has one name every importer must use
 
 ✖ 2 error(s) across 2 file(s) checked
 ```
@@ -123,6 +123,7 @@ so piping into a parser works even when something fails.
 | Document | Purpose |
 | --- | --- |
 | [`docs/architecture.md`](docs/architecture.md) | The full design: execution model, host API, cache, milestones |
+| [`docs/built-in-rules.md`](docs/built-in-rules.md) | The rules lanekeep ships with, and their options |
 | [`AGENTS.md`](AGENTS.md) | How to work in this repository — for coding agents and humans alike |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Setup, commands, and the pull request process |
 | [`SECURITY.md`](SECURITY.md) | Threat model and how to report a vulnerability |

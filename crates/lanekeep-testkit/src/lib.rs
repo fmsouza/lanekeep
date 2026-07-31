@@ -30,6 +30,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lanekeep_core::Violation;
 use lanekeep_engine::Engine;
@@ -60,6 +61,9 @@ pub enum TestError {
     Mismatch(String),
 }
 
+/// Distinguishes testers built in the same process.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
 /// A rule under test, with a throwaway project to run it in.
 ///
 /// The project is removed when the tester is dropped.
@@ -72,8 +76,11 @@ pub struct RuleTester {
 impl RuleTester {
     /// Build a tester for a rule's source.
     ///
-    /// `name` only has to be unique among concurrently running tests; it names the
-    /// temporary directory.
+    /// `name` labels the temporary directory and need not be unique — every tester gets its
+    /// own directory regardless, so a test file with a `fn tester()` helper shared across
+    /// cases works. It has to: two testers sharing a directory would delete each other's
+    /// project mid-run, and the resulting error would point at the config rather than at
+    /// the collision.
     ///
     /// # Errors
     ///
@@ -95,7 +102,52 @@ impl RuleTester {
         rule_source: &str,
         extension: &str,
     ) -> Result<Self, TestError> {
-        let dir = std::env::temp_dir().join(format!("lanekeep-ruletest-{name}"));
+        Self::build(name, rule_source, extension, "rule")
+    }
+
+    /// Build a tester for a *factory* rule — one whose default export returns a rule when
+    /// called with options — using the given options expression.
+    ///
+    /// `options` is JavaScript, spliced into the generated config as `rule(<options>)`.
+    /// Passing the options as source rather than as a serialized value is deliberate: a
+    /// factory takes whatever its author designed, and a harness that only accepted JSON
+    /// could not test one taking a function or a regular expression.
+    ///
+    /// ```no_run
+    /// # use lanekeep_testkit::RuleTester;
+    /// let tester = RuleTester::configured(
+    ///     "restricted",
+    ///     RULE_SOURCE,
+    ///     "{ restrictions: [{ module: 'lodash' }] }",
+    /// )
+    /// .expect("builds");
+    /// # const RULE_SOURCE: &str = "";
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`RuleTester::new`].
+    pub fn configured(name: &str, rule_source: &str, options: &str) -> Result<Self, TestError> {
+        Self::build(name, rule_source, "ts", &format!("rule({options})"))
+    }
+
+    /// Write the throwaway project.
+    ///
+    /// `rule_expr` is what goes in the config's `rules` array — the imported module for a
+    /// plain rule, a call for a factory.
+    fn build(
+        name: &str,
+        rule_source: &str,
+        extension: &str,
+        rule_expr: &str,
+    ) -> Result<Self, TestError> {
+        // Unique per tester: the counter separates testers in one process, the process id
+        // separates the processes nextest spawns per test.
+        let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "lanekeep-ruletest-{name}-{}-{seq}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
 
         let tester = Self {
@@ -105,9 +157,11 @@ impl RuleTester {
         tester.write("rule.ts", rule_source)?;
         tester.write(
             "lanekeep.config.ts",
-            "import { defineConfig } from 'lanekeep';\n\
-             import rule from './rule';\n\
-             export default defineConfig({ include: ['subject/**'], rules: [rule] });\n",
+            &format!(
+                "import {{ defineConfig }} from 'lanekeep';\n\
+                 import rule from './rule';\n\
+                 export default defineConfig({{ include: ['subject/**'], rules: [{rule_expr}] }});\n"
+            ),
         )?;
         Ok(tester)
     }

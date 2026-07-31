@@ -47,7 +47,7 @@ pub use lanekeep_lang::Language;
 pub use limits::{
     DEFAULT_GLOBAL_TIMEOUT, DEFAULT_MEMORY_BYTES, DEFAULT_RULE_TIMEOUT, Limits, RunClock,
 };
-pub use loader::{HOST_MODULE, ResolveError, RuleLoader, RuleResolver, RuleRoot};
+pub use loader::{BuiltinSource, HOST_MODULE, ResolveError, RuleLoader, RuleResolver, RuleRoot};
 pub use nodes::{Handle, NodeArena};
 pub use sandbox::Sandbox;
 pub use typescript::{StripError, Unsupported, strip_types};

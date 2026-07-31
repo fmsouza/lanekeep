@@ -218,6 +218,15 @@ impl Engine {
         self.rules.len()
     }
 
+    /// The rules that will run, in the order the config declared them.
+    ///
+    /// The specs rather than a rendered listing: what a listing should look like is the
+    /// reporter's problem, and an engine that decided it would have to be changed for every
+    /// new output format.
+    pub fn rules(&self) -> impl Iterator<Item = &RuleSpec> {
+        self.rules.iter().map(|prepared| &prepared.spec)
+    }
+
     /// Run over the whole corpus.
     ///
     /// # Errors

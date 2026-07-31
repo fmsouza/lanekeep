@@ -11,5 +11,8 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[dev-dependencies]
+lanekeep-testkit = { workspace = true }
+
 [lints]
 workspace = true
