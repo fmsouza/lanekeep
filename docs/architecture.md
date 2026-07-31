@@ -298,10 +298,22 @@ The light semantic layer that pure syntactic matching gets wrong. Implemented in
 
 ### 6.6 What is deliberately absent
 
-- **`Math.random`, `Date.now`, `new Date()`.** Nondeterminism would break both cache soundness and §11's guarantee that repeated runs produce identical output. A rule needing a date receives one from the host (`ctx.today`), fixed for the run.
-- **Network of any kind.** No `fetch`, no sockets, in any mode.
-- **`process`, `env`, ambient `fs`, `child_process`, dynamic `import()`, `eval`.**
-- **Timers.** `setTimeout` and friends have no meaning in a synchronous single-pass engine.
+Absence is achieved two ways, and the first is much stronger.
+
+**Never installed.** The engine's optional intrinsics are opted into rather than opted out of, so there is no original for a rule to reach: nothing to patch, nothing to restore, no prototype chain leading back.
+
+- **`Date`.** `Date.now()` and `new Date()` read the system clock. A rule needing a date receives `ctx.today`, fixed for the run.
+- **`performance`.** `performance.now()` is a clock under another name, and the one most likely to survive a reviewer thinking "we removed `Date`, so there is no clock."
+- **`WeakRef` and `FinalizationRegistry`.** These make garbage-collection timing observable — nondeterminism that does not look like a clock at all.
+
+**Deleted at startup**, because the base objects are not optional:
+
+- **`Math.random`.** Weaker in principle, since deletion can be undone if a reference escapes. Sufficient in practice: a rule that defines its own `Math.random` has written deterministic code, and the engine's entropy source is unreachable.
+- **`SharedArrayBuffer`, `Atomics`.** Meaningless without threads; removed to keep the surface small rather than against a known attack.
+
+**Never part of this engine**, asserted rather than assumed: `fetch` and every other network API, `process`, `env`, ambient `fs`, `child_process`, `require`, and timers — `setTimeout` and friends have no meaning in a synchronous single-pass engine.
+
+**`eval` and the `Function` constructor are present**, and cannot be removed: the engine's own script evaluation depends on that intrinsic, so omitting it makes the sandbox unable to run anything at all. This grants a rule no capability it lacks — a rule is already arbitrary code — but it does mean reviewing a third-party rule cannot rely on reading its source alone.
 
 ### 6.7 Resource limits
 
