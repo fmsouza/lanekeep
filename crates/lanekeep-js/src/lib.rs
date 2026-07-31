@@ -42,6 +42,8 @@ pub mod typescript;
 
 pub use error::SandboxError;
 pub use host::{HostContext, Report};
+/// Re-exported so consumers can supply languages without depending on `lanekeep-lang` directly.
+pub use lanekeep_lang::Language;
 pub use limits::{
     DEFAULT_GLOBAL_TIMEOUT, DEFAULT_MEMORY_BYTES, DEFAULT_RULE_TIMEOUT, Limits, RunClock,
 };

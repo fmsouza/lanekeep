@@ -11,7 +11,7 @@ use rquickjs::{CatchResultExt, Context, Ctx, FromJs, Module, Runtime};
 use crate::error::SandboxError;
 use crate::host::HostContext;
 use crate::limits::{Budget, Limits, RunClock, Trip};
-use crate::loader::{RuleLoader, RuleResolver, RuleRoot};
+use crate::loader::{LoadedModules, RuleLoader, RuleResolver, RuleRoot};
 
 /// The intrinsics rule code gets.
 ///
@@ -67,6 +67,7 @@ pub struct Sandbox {
     context: Context,
     limits: Limits,
     budget: Arc<Budget>,
+    loaded: Option<LoadedModules>,
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -111,6 +112,7 @@ impl Sandbox {
             context,
             limits,
             budget,
+            loaded: None,
         })
     }
 
@@ -126,12 +128,20 @@ impl Sandbox {
         typescript: Arc<dyn Language>,
         javascript: Arc<dyn Language>,
     ) -> Result<Self, SandboxError> {
-        let sandbox = Self::new(limits, clock)?;
-        sandbox.runtime.set_loader(
-            RuleResolver::new(root.clone()),
-            RuleLoader::new(root, typescript, javascript),
-        );
+        let mut sandbox = Self::new(limits, clock)?;
+        let loader = RuleLoader::new(root.clone(), typescript, javascript);
+        sandbox.loaded = Some(loader.loaded());
+        sandbox.runtime.set_loader(RuleResolver::new(root), loader);
         Ok(sandbox)
+    }
+
+    /// Every module loaded so far, when this sandbox was built with a module root.
+    ///
+    /// The hash of the rule graph is derived from this, so it has to reflect what was
+    /// actually read rather than what the config named.
+    #[must_use]
+    pub fn loaded_modules(&self) -> Option<&LoadedModules> {
+        self.loaded.as_ref()
     }
 
     /// Import a rule module and return its default export.
@@ -227,6 +237,32 @@ impl Sandbox {
         // usage while the context still holds its borrow panics on a double borrow. The
         // split exists for that reason rather than for tidiness.
         outcome.map_err(|raw| self.classify(&raw, timeout))
+    }
+
+    /// Evaluate a synthetic module under a chosen name.
+    ///
+    /// The name matters: the resolver treats it as the importing module's path, so a
+    /// synthetic entry has to sit inside the rules root for relative specifiers in its
+    /// source to resolve. Naming it outside would make every import look like an escape.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sandbox::eval`].
+    pub fn eval_module(&self, name: &str, source: &str) -> Result<(), SandboxError> {
+        self.budget.arm(self.limits.rule_timeout);
+        let outcome = self.context.with(|ctx| {
+            let promise = match Module::evaluate(ctx.clone(), name, source) {
+                Ok(promise) => promise,
+                Err(err) => return Err(capture_failure(&ctx, &err)),
+            };
+            while promise.state() == PromiseState::Pending && ctx.execute_pending_job() {}
+            promise
+                .finish::<()>()
+                .map_err(|err| capture_failure(&ctx, &err))
+        });
+        self.budget.disarm();
+
+        outcome.map_err(|raw| self.classify(&raw, self.limits.rule_timeout))
     }
 
     /// Evaluate source with a `ctx` object in scope, the way a rule handler runs.

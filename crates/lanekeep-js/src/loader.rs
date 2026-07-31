@@ -15,7 +15,10 @@
 //! Traversal is also rejected lexically, before touching the filesystem, so `../../secrets`
 //! produces a message about escaping the root rather than a confusing "not found".
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use lanekeep_lang::Language;
@@ -326,6 +329,16 @@ impl Resolver for RuleResolver {
     }
 }
 
+/// Every module the loader read, with the source it read.
+///
+/// This is what makes `ruleset_hash` cover the whole import graph rather than only the
+/// entry files. A rule that imports a shared helper has to invalidate when that helper
+/// changes, and the only component that knows the helper was involved is the loader.
+///
+/// Ordered, so the hash derived from it does not depend on load order — which varies with
+/// import structure and is not something a user changed.
+pub type LoadedModules = Rc<RefCell<BTreeMap<PathBuf, String>>>;
+
 /// Adapts [`RuleRoot`] to the engine's loader interface.
 ///
 /// `Debug` is hand-written because `Arc<dyn Language>` is not `Debug`, and requiring it on
@@ -335,6 +348,7 @@ pub struct RuleLoader {
     root: RuleRoot,
     typescript: Arc<dyn Language>,
     javascript: Arc<dyn Language>,
+    loaded: LoadedModules,
 }
 
 impl std::fmt::Debug for RuleLoader {
@@ -343,6 +357,7 @@ impl std::fmt::Debug for RuleLoader {
             .field("root", &self.root)
             .field("typescript", &self.typescript.id())
             .field("javascript", &self.javascript.id())
+            .field("loaded", &self.loaded.borrow().len())
             .finish()
     }
 }
@@ -353,7 +368,7 @@ impl RuleLoader {
     /// The languages are supplied rather than assumed so this crate does not have to know
     /// which grammars exist.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         root: RuleRoot,
         typescript: Arc<dyn Language>,
         javascript: Arc<dyn Language>,
@@ -362,7 +377,14 @@ impl RuleLoader {
             root,
             typescript,
             javascript,
+            loaded: Rc::new(RefCell::new(BTreeMap::new())),
         }
+    }
+
+    /// A handle on what this loader has read, for hashing the rule graph.
+    #[must_use]
+    pub fn loaded(&self) -> LoadedModules {
+        Rc::clone(&self.loaded)
     }
 }
 
@@ -381,6 +403,12 @@ impl Loader for RuleLoader {
                 self.javascript.as_ref(),
             )
             .map_err(|err| JsError::new_loading_message(name.to_owned(), err.to_string()))?;
+
+        // Recorded before declaring, so a module that fails to compile still counts as
+        // part of the graph. Otherwise fixing the compile error would not invalidate.
+        self.loaded
+            .borrow_mut()
+            .insert(PathBuf::from(name), source.clone());
 
         Module::declare(ctx.clone(), name, source)
     }
