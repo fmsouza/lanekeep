@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fmsouza/lanekeep"
 homepage = "https://github.com/fmsouza/lanekeep"
@@ -41,6 +41,10 @@ lanekeep-testkit = { version = "0.1.0", path = "crates/lanekeep-testkit" }
 serde = { version = "1" }
 serde_json = { version = "1" }
 blake3 = { version = "1" }
+ignore = { version = "0.4" }
+globset = { version = "0.4" }
+rayon = { version = "1" }
+memchr = { version = "2" }
 thiserror = { version = "2" }
 tree-sitter = { version = "0.26" }
 tree-sitter-typescript = { version = "0.23" }
