@@ -26,24 +26,38 @@ published version receives security fixes.
 ## Threat model
 
 lanekeep is designed to run as a pre-commit hook and inside CI. That makes it a supply-chain
-target, and it is the reason the design deliberately has very little attack surface:
+target.
 
-- **No code execution.** Rules are data, not code. Nothing is `eval`'d, dynamically loaded, or
-  compiled at runtime. There is no plugin system, which means there is nothing to sandbox because
-  there is nothing to execute.
-- **No network access.** In any mode, for any reason.
-- **Constrained filesystem access.** Reads are limited to files matching the resolved `include`
-  globs. Writes happen only under `--fix`, only to files that matched, and only within the ranges
-  of reported violations.
+Rules are TypeScript programs, so they are executable code by design. The security posture is
+therefore about **confinement**, not absence:
+
+- **No ambient authority.** Rules execute in an embedded QuickJS sandbox and can reach only the
+  host functions lanekeep exposes. `fs`, `process`, `child_process`, network APIs and dynamic
+  `import()` are not restricted — they are absent from the context. A rule inherits none of the
+  host process's authority.
+- **No network access.** In any mode, for any reason, with no configuration that enables it.
+- **Filesystem confinement.** Rules read only through `ctx.readFile`, which is confined to the
+  project root and rejects traversal outside it. Writes happen only under `--fix`, only to files
+  that matched, and only within the ranges of reported violations.
+- **Bounded execution.** A per-invocation execution timeout and a per-runtime memory ceiling are
+  always enforced and cannot be disabled. Turing-complete rules can fail to terminate, and a rule
+  that hangs a pre-commit hook is indistinguishable from a broken tool.
+- **Determinism by construction.** The sandbox withholds `Math.random`, `Date.now` and `new
+  Date()`. This is a correctness property as much as a security one — nondeterminism would make
+  the cache unsound.
 - **Reviewed rules.** Every built-in rule is reviewed by a maintainer before it ships.
 
 ### What we consider a vulnerability
 
-- Any code execution reachable from a config file, a rule definition, or a source file being
-  analysed.
+- **Sandbox escape.** Any means by which rule code reaches capability outside the documented host
+  API — spawning a process, opening a socket, loading native code, or obtaining a reference to a
+  host object that was not deliberately exposed.
+- Any read outside the project root, or any write outside `--fix`'s permitted ranges, including
+  via path traversal in `ctx.readFile`, `include:`, or a suppression directive.
 - Any network request originating from lanekeep.
-- Any read outside the resolved `include` set, or any write outside `--fix`'s permitted ranges.
-- Path traversal via `extends:`, `include:`, or a suppression directive.
+- A rule that evades the execution timeout or memory ceiling.
+- Code execution reachable from a *source file being analysed*, as opposed to from a rule. Rules
+  are trusted-ish by the person who installed them; analysed source is not trusted at all.
 - Memory-safety failures reachable from untrusted input, including a malformed or deliberately
   crafted cache file.
 - A dependency vulnerability reachable from lanekeep's own code paths.
@@ -51,6 +65,10 @@ target, and it is the reason the design deliberately has very little attack surf
 ### What we do not
 
 - A rule producing a wrong result. That is a correctness bug — please file it as a normal issue.
+- **A malicious rule doing what rules are allowed to do.** A rule in your repository can report
+  misleading violations, read any file under the project root, and consume its resource budget.
+  The confinement bounds blast radius and makes third-party rule sets reviewable; it does not make
+  unread code safe to run.
 - Resource exhaustion from a pathological input file, unless it is disproportionate to the input's
   size.
 - Anything requiring an attacker who can already write to the repository being analysed. Such an
