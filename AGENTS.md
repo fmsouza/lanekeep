@@ -172,6 +172,12 @@ them because an engine that panics on a malformed input file has failed at its j
 test, panicking *is* the failure mechanism, so `clippy.toml` sets `allow-*-in-tests`.
 Do not add `#[allow]` attributes to test modules; the config already handles it.
 
+**Let-chains (`if let ... && ...`) need Rust 1.88; the MSRV is 1.87.** The pinned toolchain
+is 1.95, so they compile fine everywhere except the one job that checks the floor. Write
+`is_some_and` instead. More generally: an MSRV is a promise to users and moves when a
+dependency forces it, not for syntax — `just check` runs `just msrv` so this fails locally
+rather than in CI.
+
 **`Path::is_absolute` is platform-specific, and tests that assume otherwise pass on
 macOS and fail on Windows.** `/etc/passwd` is absolute on Unix and merely *rooted* on
 Windows; `C:\...` is the reverse. Build an absolute path from `std::env::temp_dir()` rather
