@@ -175,6 +175,19 @@ Do not add `#[allow]` attributes to test modules; the config already handles it.
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
 
+**A stacked pull request conflicts as soon as its parent is squash-merged.** Squashing
+replaces the parent's commits with one new commit that has a different SHA, so git sees the
+child branch and `main` as having added the same files independently. Every file conflicts
+even though no content disagrees. The fix is not to resolve anything by hand:
+
+```bash
+git fetch origin
+git rebase --onto origin/main <last-commit-of-the-parent-branch>
+git push --force-with-lease
+```
+
+That replays only the child's own commits onto the new `main` and drops the duplicate.
+
 ## What not to do
 
 - Do not add a dependency without checking `deny.toml`. Network crates are banned
