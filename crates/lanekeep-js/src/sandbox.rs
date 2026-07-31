@@ -274,7 +274,24 @@ impl Sandbox {
     where
         T: for<'js> FromJs<'js>,
     {
-        self.budget.arm(self.limits.rule_timeout);
+        self.eval_with_host_timeout(host, source, self.limits.rule_timeout)
+    }
+
+    /// Evaluate with `ctx` in scope under an explicit budget, for a rule that declared one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sandbox::eval`].
+    pub fn eval_with_host_timeout<T>(
+        &self,
+        host: &HostContext,
+        source: &str,
+        timeout: std::time::Duration,
+    ) -> Result<T, SandboxError>
+    where
+        T: for<'js> FromJs<'js>,
+    {
+        self.budget.arm(timeout);
         let outcome = self.context.with(|ctx| {
             let object = match host.build(&ctx) {
                 Ok(object) => object,
@@ -290,7 +307,7 @@ impl Sandbox {
         });
         self.budget.disarm();
 
-        outcome.map_err(|raw| self.classify(&raw, self.limits.rule_timeout))
+        outcome.map_err(|raw| self.classify(&raw, timeout))
     }
 
     /// Turn a raw failure into something that says what actually happened.

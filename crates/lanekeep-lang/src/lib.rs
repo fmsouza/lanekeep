@@ -60,7 +60,7 @@ pub trait Language: Send + Sync {
     /// Returns `None` for a language with no resolver yet, which is honest rather than a
     /// placeholder: a rule asking about bindings in such a language gets nothing back
     /// instead of a confidently wrong answer.
-    fn resolver(&self) -> Option<&dyn binding::BindingResolver> {
+    fn resolver(&self) -> Option<Arc<dyn binding::BindingResolver>> {
         None
     }
 

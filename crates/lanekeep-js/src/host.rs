@@ -73,6 +73,15 @@ impl HostContext {
         }
     }
 
+    /// Attach whatever resolver a language provides, if any.
+    #[must_use]
+    pub fn with_resolver_from(self, language: &dyn lanekeep_lang::Language) -> Self {
+        match language.resolver() {
+            Some(resolver) => self.with_resolver(resolver),
+            None => self,
+        }
+    }
+
     /// Attach a binding resolver, enabling the import-resolution functions.
     ///
     /// Without one, those functions return `false` or `undefined` rather than being

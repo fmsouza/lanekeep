@@ -44,6 +44,12 @@ pub fn hex(hash: &Hash) -> String {
 /// A rule as the config declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleSpec {
+    /// Zero-based position in the config's `rules` array.
+    ///
+    /// This is how the engine reaches the handler: the rule object lives in the loaded
+    /// config, and indexing into it is what lets a function cross the boundary without
+    /// ever being extracted as a value.
+    pub index: usize,
     /// Namespaced identifier.
     pub id: RuleId,
     /// Which language's grammar the query compiles against.
@@ -214,6 +220,40 @@ const EXTRACT: &str = r"
     })()
 ";
 
+/// Evaluate the config module into a sandbox, leaving the rule objects reachable.
+///
+/// Separate from [`load`] because every worker needs the ruleset present in its own engine
+/// — a rule's `check` is a function, and a function cannot be moved between runtimes. Each
+/// worker therefore evaluates the same modules rather than receiving extracted values.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when the config sits outside the rules root or fails to
+/// evaluate.
+pub fn evaluate_into(
+    sandbox: &Sandbox,
+    root: &RuleRoot,
+    config_path: &Path,
+) -> Result<(), ConfigError> {
+    let display = config_path.display().to_string();
+    let specifier =
+        relative_specifier(root.path(), config_path).ok_or_else(|| ConfigError::Unreadable {
+            path: display.clone(),
+            detail: "the config file must sit inside the rules root".to_owned(),
+        })?;
+
+    let entry = root.path().join(ENTRY);
+    let source =
+        format!("import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n");
+
+    sandbox
+        .eval_module(&entry.display().to_string(), &source)
+        .map_err(|e| ConfigError::Evaluation {
+            path: display,
+            detail: e.to_string(),
+        })
+}
+
 /// Load and validate a configuration.
 ///
 /// # Errors
@@ -366,6 +406,7 @@ fn build_rule(
         .unwrap_or(Severity::Error);
 
     Ok(RuleSpec {
+        index: position - 1,
         // Config severity wins over what the rule declares, per §9.
         severity: overrides.get(&id).copied().unwrap_or(declared),
         id,
