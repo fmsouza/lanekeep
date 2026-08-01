@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Checks on the workflow files that YAML validity does not cover.
+#
+# Each one here is a mistake that produces a *working* workflow doing the wrong thing
+# quietly. Nothing else catches them: the file parses, the run is green, and the behavior is
+# wrong in a way only a careful reading reveals.
+set -uo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+workflows="${repo_root}/.github/workflows"
+
+passed=0
+failed=0
+
+report() {
+  local name="$1" offenders="$2"
+  if [ -n "${offenders}" ]; then
+    failed=$((failed + 1))
+    echo "FAIL ${name}"
+    # Piped rather than word-split, so a finding containing spaces stays one line.
+    while IFS= read -r line; do
+      [ -n "${line}" ] && echo "  ${line}"
+    done <<<"${offenders}"
+  else
+    passed=$((passed + 1))
+  fi
+}
+
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import yaml" 2>/dev/null; then
+  # Said out loud rather than passing silently. A check that quietly does nothing is the
+  # thing these checks exist to prevent.
+  echo "note: python3 with pyyaml is unavailable — workflow checks skipped"
+  exit 0
+fi
+
+# --- a step must not gate on a variable it sets itself ----------------------------------
+#
+# A step's own `env:` does not exist when its `if:` is evaluated — the condition decides
+# whether the step runs at all. So `if: env.TOKEN != ''` on a step that sets `TOKEN` in its
+# own `env:` reads an undefined variable and is always false.
+#
+# In a publish step that is the worst available failure: the release reports success and
+# publishes nothing, indistinguishable from a deliberate dry run. Decide in one step and
+# branch on its output instead.
+report "no step gates on a variable it sets itself" "$(python3 - "${workflows}" <<'PY'
+import pathlib
+import re
+import sys
+
+import yaml
+
+found = []
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            condition = step.get("if")
+            if not isinstance(condition, str):
+                continue
+            own = set((step.get("env") or {}).keys())
+            for name in re.findall(r"env\.([A-Za-z_][A-Za-z0-9_]*)", condition):
+                if name in own:
+                    found.append(
+                        f"{path.name} :: {job_name} :: {step.get('name', '(unnamed)')} "
+                        f"gates on env.{name}, which it sets itself"
+                    )
+
+print("\n".join(found))
+PY
+)"
+
+# --- every action is pinned to a commit SHA ----------------------------------------------
+#
+# A tag is mutable: `uses: some/action@v4` runs whatever that tag points at today, which is
+# a supply-chain hole in a workflow holding registry tokens. A pin is forty hex characters —
+# checked for what it *is* rather than for what a tag looks like, because a SHA beginning
+# with a digit is indistinguishable from a version otherwise. (This check's first draft got
+# that backwards and flagged every correctly pinned action.)
+report "every action is pinned to a commit SHA" "$(python3 - "${workflows}" <<'PY'
+import pathlib
+import re
+import sys
+
+import yaml
+
+PINNED = re.compile(r"^[^@]+@[0-9a-f]{40}$")
+
+found = []
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            uses = step.get("uses")
+            # A local action — `./.github/actions/x` — has no upstream to pin.
+            if not isinstance(uses, str) or uses.startswith("./"):
+                continue
+            if not PINNED.match(uses):
+                found.append(f"{path.name} :: {job_name} :: {uses}")
+
+print("\n".join(found))
+PY
+)"
+
+# --- no run: block interpolates anything an outsider controls ------------------------------
+#
+# `${{ }}` is substituted before bash sees the script, so text an outsider supplies — a pull
+# request title, a branch name, a tag — becomes shell source. Pass it through `env:` instead.
+#
+# Only the contexts an outsider can actually influence. `${{ matrix.target }}` is written in
+# this repository and interpolating it is fine; flagging it, as this check's first draft did,
+# would make the check something to ignore rather than something to read.
+report "no run: block interpolates outsider-controlled text" "$(python3 - "${workflows}" <<'PY'
+import pathlib
+import re
+import sys
+
+import yaml
+
+# github.event.* covers titles, bodies, branch names on a fork's pull request.
+UNTRUSTED = re.compile(
+    r"\$\{\{\s*(github\.event\b|github\.head_ref\b|github\.ref_name\b|inputs\.)"
+)
+
+found = []
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            script = step.get("run")
+            if isinstance(script, str) and UNTRUSTED.search(script):
+                found.append(
+                    f"{path.name} :: {job_name} :: {step.get('name', '(unnamed)')}"
+                )
+
+print("\n".join(found))
+PY
+)"
+
+echo
+echo "${passed} passed, ${failed} failed"
+[ "${failed}" -eq 0 ]
