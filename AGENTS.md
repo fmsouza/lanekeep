@@ -222,6 +222,20 @@ release: the platform packages published only because the glob `dist-npm/@laneke
 a trailing slash on every match, and the launcher, written without one, was the single line
 that failed.
 
+**macOS ships bash 3.2, and a Mac with Homebrew's bash does not.** `mapfile`, `readarray`,
+`declare -A` and `${var^^}` are all bash 4+, so a script using them passes locally and does
+nothing at all on a macOS runner — the array comes back empty and every downstream assertion
+fails at once. `just test-scripts` now runs the publish suites under `/bin/bash` wherever a 3.x
+one exists, which on any Mac is a real check rather than a skipped one.
+
+**Python's stdout writes CRLF on Windows, and CR-carrying values still compare equal to each
+other.** That is what makes it quiet: a version read from a Python helper matches another value
+from the same helper, so only a comparison against a literal written in the script fails, and
+everything downstream of that silently stops happening. `scripts/test-shell-portability.sh`
+reproduces it everywhere by putting a `python3` that appends a carriage return ahead of the real
+one on `PATH`. Truncating at the first whitespace — `${value%%[[:space:]]*}` — is the fix, since
+none of these values contain any.
+
 **`cargo publish` needs a crate's dev-dependencies on the registry too.** It resolves them when
 it packages, so a crate whose dev-dependency is unpublished cannot go up even though nothing it
 ships uses it. `lanekeep-rules` dev-depends on `lanekeep-testkit` for `RuleTester`, which puts

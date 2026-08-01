@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Checks that repository scripts run where CI runs them, not just where they were written.
+#
+# These scripts run on three platforms and the differences do not announce themselves. A
+# developer on Linux, or on a Mac with a newer bash from Homebrew, sees everything pass and
+# ships something that fails only on a runner. Both of the following cost a release, in the
+# same run, for unrelated reasons:
+#
+#   * macOS ships **bash 3.2**, from 2007, because bash 4 changed license. `mapfile` does not
+#     exist there, so the publication order came back empty and every crates test failed.
+#
+#   * **Windows translates newlines.** Python's text-mode stdout writes CRLF, so a value read
+#     from a Python helper carries a trailing carriage return. Such values still compare equal
+#     to each other, which is what makes it so quiet — only a comparison against a literal
+#     written in the script fails, and then everything downstream of it silently does nothing.
+#
+# Both are reproduced here, on whatever platform this runs on.
+set -uo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+self="$(basename "${BASH_SOURCE[0]}")"
+
+passed=0
+failed=0
+
+report() {
+  local name="$1" offenders="$2"
+  if [ -n "${offenders}" ]; then
+    failed=$((failed + 1))
+    echo "FAIL ${name}"
+    while IFS= read -r line; do
+      [ -n "${line}" ] && echo "  ${line}"
+    done <<<"${offenders}"
+  else
+    passed=$((passed + 1))
+  fi
+}
+
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+
+# --- nothing depends on a bash newer than macOS ships -------------------------------------------
+#
+# Each of these is bash 4+. The replacement for every one is short, and the failure without it
+# is a script that quietly does nothing on the one platform nobody tests on locally.
+#
+#   mapfile / readarray   ->  while IFS= read -r line; do ...; done < <(...)
+#   declare -A            ->  parallel arrays, or a case statement
+#   ${var^^} / ${var,,}   ->  tr '[:lower:]' '[:upper:]'
+#
+# This file is skipped, because naming a construct in order to forbid it is not using it.
+report "no script uses a bash 4 construct" "$(
+  for script in "${repo_root}"/scripts/*.sh; do
+    [ "$(basename "${script}")" = "${self}" ] && continue
+    while IFS= read -r hit; do
+      [ -n "${hit}" ] && echo "$(basename "${script}"):${hit}"
+    done < <(grep -nE '(^|[^[:alnum:]_-])(mapfile|readarray)[[:space:]]|declare[[:space:]]+-A|\$\{[A-Za-z_][A-Za-z0-9_]*\^\^|\$\{[A-Za-z_][A-Za-z0-9_]*,,' "${script}" |
+      grep -vE '^[[:space:]]*[0-9]+:[[:space:]]*#' || true)
+  done
+)"
+
+# --- the scripts survive Windows line endings ------------------------------------------------------
+#
+# Reproduced rather than reasoned about: a `python3` that appends a carriage return to every
+# line, exactly as Python's text-mode stdout does on Windows, placed ahead of the real one on
+# PATH. If the publish scripts still agree with the literals written in their tests, they are
+# robust to it; if they are not, this fails here instead of twenty minutes into CI on the one
+# platform that shows it.
+if command -v python3 >/dev/null 2>&1; then
+  real_python3="$(command -v python3)"
+  mkdir -p "${work}/crlf"
+  cat >"${work}/crlf/python3" <<STUB
+#!/usr/bin/env bash
+# Every line gains a trailing CR, which is what Python does on Windows.
+"${real_python3}" "\$@" | sed 's/\$/\r/'
+STUB
+  chmod +x "${work}/crlf/python3"
+
+  report "the publish scripts tolerate CRLF from python" "$(
+    PATH="${work}/crlf:${PATH}"
+    export PATH
+    for suite in test-publish-npm.sh test-publish-crates.sh; do
+      "${repo_root}/scripts/${suite}" >"${work}/${suite}.log" 2>&1 ||
+        echo "${suite} fails when python3 emits CRLF: $(grep -c '^FAIL' "${work}/${suite}.log" | tr -d ' ') assertion(s)"
+    done
+  )"
+else
+  echo "note: no python3 here, so the CRLF simulation is skipped"
+fi
+
+# --- the scripts actually run under bash 3.2 -----------------------------------------------------
+#
+# The static check above catches what it knows to look for; running them catches the rest. Only
+# possible where a 3.x bash exists — every Mac has one at /bin/bash — so this is a real
+# assertion there and honestly skipped elsewhere rather than faked.
+if [ -x /bin/bash ] && /bin/bash --version 2>/dev/null | head -1 | grep -q 'version 3\.'; then
+  report "the publish scripts' tests pass under bash 3.2" "$(
+    for suite in test-publish-npm.sh test-publish-crates.sh; do
+      /bin/bash "${repo_root}/scripts/${suite}" >/dev/null 2>&1 ||
+        echo "${suite} fails under $(/bin/bash --version | head -1)"
+    done
+  )"
+else
+  echo "note: no bash 3.x here, so the bash 3.2 run is skipped (macOS CI covers it)"
+fi
+
+echo
+echo "${passed} passed, ${failed} failed"
+[ "${failed}" -eq 0 ]

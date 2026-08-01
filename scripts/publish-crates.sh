@@ -62,6 +62,7 @@ section = text.split("[workspace.package]", 1)[1]
 print(re.search(r'^version\s*=\s*"([^"]+)"', section, re.MULTILINE).group(1))
 PY
 )"
+version="$(printf '%s' "${version}" | tr -d '\r')"
 
 # Workspace members in an order where every crate follows everything it depends on.
 #
@@ -71,7 +72,16 @@ PY
 # Ties are broken alphabetically so the sequence is identical on every run — the same property
 # the rest of this project holds output to, and the reason a re-run's log can be compared with
 # the previous one.
-mapfile -t crates < <("${cargo_command}" metadata --format-version 1 --no-deps | python3 -c '
+# Read with a loop rather than `mapfile`, which does not exist before bash 4 — macOS ships 3.2
+# and runs these tests in CI. Carriage returns are stripped because Python's text-mode stdout
+# translates a newline to CRLF on Windows, and a crate name carrying a CR matches nothing.
+crates=()
+while IFS= read -r crate; do
+  # Truncate at the first whitespace. A crate name never contains any, and this is what
+  # removes the trailing carriage return Windows leaves behind.
+  crate="${crate%%[[:space:]]*}"
+  [ -n "${crate}" ] && crates+=("${crate}")
+done < <("${cargo_command}" metadata --format-version 1 --no-deps | python3 -c '
 import json
 import sys
 

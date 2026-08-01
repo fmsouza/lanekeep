@@ -154,7 +154,7 @@ for package in metadata["packages"]:
             problems.append(f"{name} publishes before its {kind} dependency {other}")
 
 print("\n".join(sorted(set(problems))))
-' "${work}/order"
+' "${work}/order" | tr -d '\r'
 )"
 
 # --- a run that died partway resumes -----------------------------------------------------------
@@ -167,7 +167,7 @@ import re, sys
 text = open(sys.argv[1], encoding="utf-8").read()
 section = text.split("[workspace.package]", 1)[1]
 print(re.search(r"^version\s*=\s*\"([^\"]+)\"", section, re.MULTILINE).group(1))
-' "${repo_root}/Cargo.toml")"
+' "${repo_root}/Cargo.toml" | tr -d '\r')"
 
 # Taken from the order the script actually produced rather than written down here. A second
 # hand-maintained list would drift from the manifests exactly as the first one did, and would
