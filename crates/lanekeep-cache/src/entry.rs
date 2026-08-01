@@ -19,6 +19,7 @@
 //! cache that can break a run is worse than no cache.
 
 use lanekeep_core::fact::Fact;
+use lanekeep_core::fix::Fix;
 use lanekeep_core::suppression::{Date, Scope, Suppression};
 use lanekeep_core::tracked::{ContentHash, TrackedRead};
 use lanekeep_core::{FilePath, Location, Position, RuleId, Severity, Violation};
@@ -60,6 +61,16 @@ impl Entry {
             write_str(out, &violation.message);
             write_str(out, &violation.remediation);
             out.push(severity_code(violation.severity));
+            match &violation.fix {
+                Some(fix) => {
+                    out.push(1);
+                    write_len(out, fix.start);
+                    write_len(out, fix.end);
+                    write_str(out, &fix.replacement);
+                    out.push(u8::from(fix.safe));
+                }
+                None => out.push(0),
+            }
         }
 
         write_len(out, self.facts.len());
@@ -135,6 +146,20 @@ impl Entry {
                 message: cursor.read_str()?.to_owned(),
                 remediation: cursor.read_str()?.to_owned(),
                 severity: severity_from(cursor.read_u8()?)?,
+                fix: match cursor.read_u8()? {
+                    0 => None,
+                    1 => Some(Fix {
+                        start: cursor.read_len()?,
+                        end: cursor.read_len()?,
+                        replacement: cursor.read_str()?.to_owned(),
+                        safe: match cursor.read_u8()? {
+                            0 => false,
+                            1 => true,
+                            _ => return None,
+                        },
+                    }),
+                    _ => return None,
+                },
             });
         }
 
@@ -317,6 +342,7 @@ mod tests {
             message: "a message".to_owned(),
             remediation: "a remediation".to_owned(),
             severity: Severity::Error,
+            fix: None,
         }
     }
 
@@ -371,6 +397,44 @@ mod tests {
             ],
             used_suppressions: vec![1],
         }
+    }
+
+    #[test]
+    fn a_fix_survives_a_round_trip() {
+        let mut entry = Entry::default();
+        let mut with_fix = violation("local/a", "src/a.ts", 1);
+        with_fix.fix = Some(Fix {
+            start: 4,
+            end: 9,
+            replacement: "let".to_owned(),
+            safe: true,
+        });
+        entry.violations.push(with_fix.clone());
+        entry.violations.push(violation("local/b", "src/a.ts", 2));
+
+        let decoded = round_trip(&entry).expect("decodes");
+        assert_eq!(decoded.violations[0].fix, with_fix.fix);
+        assert_eq!(decoded.violations[1].fix, None, "absence survives too");
+    }
+
+    #[test]
+    fn a_suggestion_does_not_come_back_as_safe() {
+        // The bit that decides whether `--fix` may rewrite someone's code.
+        let mut entry = Entry::default();
+        let mut suggested = violation("local/a", "src/a.ts", 1);
+        suggested.fix = Some(Fix {
+            start: 0,
+            end: 1,
+            replacement: "x".to_owned(),
+            safe: false,
+        });
+        entry.violations.push(suggested);
+
+        let decoded = round_trip(&entry).expect("decodes");
+        assert_eq!(
+            decoded.violations[0].fix.as_ref().map(|f| f.safe),
+            Some(false)
+        );
     }
 
     #[test]

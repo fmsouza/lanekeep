@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use lanekeep_core::FilePath;
-use lanekeep_engine::Engine;
+use std::collections::BTreeMap;
+
+use lanekeep_engine::{Engine, Outcome};
 use lanekeep_js::RuleRoot;
 use lanekeep_lang_js::{JavaScript, TypeScript};
 use lanekeep_report::{Color, Format, Summary};
@@ -71,6 +73,13 @@ enum Command {
         /// Check only files staged in the index. The pre-commit default.
         #[arg(long)]
         staged: bool,
+
+        /// Apply the safe fixes rules offered, then report what is left.
+        ///
+        /// Only fixes a rule marked as preserving behavior. A fix it did not mark is a
+        /// suggestion, and a suggestion is shown rather than applied.
+        #[arg(long)]
+        fix: bool,
 
         /// Also report suppressions that silenced nothing.
         ///
@@ -139,15 +148,19 @@ fn run() -> anyhow::Result<ExitCode> {
             since,
             staged,
             report_unused_suppressions,
+            fix,
         } => check(CheckOptions {
             project_root: &path,
             config: config.as_deref(),
             format: &format,
-            warn_only,
             timeout,
-            no_cache,
             selection: Selection::from(since, staged),
-            report_unused_suppressions,
+            switches: Switches {
+                warn_only,
+                no_cache,
+                report_unused_suppressions,
+                fix,
+            },
         }),
         Command::Rules { path, config, json } => rules(&path, config.as_deref(), json),
         Command::Explain {
@@ -157,6 +170,95 @@ fn run() -> anyhow::Result<ExitCode> {
             json,
         } => explain(&rule, &path, config.as_deref(), json),
     }
+}
+
+/// Apply the safe fixes, say what happened, and check again.
+///
+/// Checked again because what a fix leaves behind is a different file: reporting the pre-fix
+/// violations would list things that are no longer there. The second pass is a cache miss
+/// for exactly the files that changed, which is what makes it cheap.
+fn fix_and_recheck(
+    project_root: &Path,
+    config: Option<&Path>,
+    caching: bool,
+    outcome: Outcome,
+) -> anyhow::Result<Outcome> {
+    let written = apply_fixes(project_root, &outcome)?;
+    if written.files == 0 {
+        return Ok(outcome);
+    }
+
+    let mut stderr = std::io::stderr();
+    writeln!(
+        stderr,
+        "fixed {} violation(s) in {} file(s)",
+        written.applied, written.files
+    )?;
+    if written.skipped > 0 {
+        // Never silent. A run that fixed three of five things and said it fixed everything
+        // would leave someone believing the file was clean.
+        writeln!(
+            stderr,
+            "  {} fix(es) skipped: another fix had already claimed those bytes",
+            written.skipped
+        )?;
+    }
+
+    let (engine, _) = prepare(project_root, config, caching)?;
+    engine.run().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// What `--fix` wrote.
+struct Written {
+    files: usize,
+    applied: usize,
+    skipped: usize,
+}
+
+/// Apply every safe fix, grouped by file.
+///
+/// Writes happen only here, only to files a rule reported on, and only within the ranges of
+/// nodes those rules matched. A file whose fixes all turn out to be suggestions is not
+/// rewritten at all — not even with identical bytes, which would still update its mtime and
+/// make it look changed to everything else watching the tree.
+fn apply_fixes(project_root: &Path, outcome: &Outcome) -> anyhow::Result<Written> {
+    let mut by_file: BTreeMap<&str, Vec<lanekeep_core::Fix>> = BTreeMap::new();
+    for violation in &outcome.violations {
+        if let Some(fix) = &violation.fix {
+            by_file
+                .entry(violation.location.file.as_str())
+                .or_default()
+                .push(fix.clone());
+        }
+    }
+
+    let mut written = Written {
+        files: 0,
+        applied: 0,
+        skipped: 0,
+    };
+
+    for (file, fixes) in by_file {
+        let path = project_root.join(file);
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            // Vanished, or not text any more. The tree is allowed to change under a run;
+            // what must not happen is writing to a file this no longer understands.
+            continue;
+        };
+
+        let result = lanekeep_core::fix::apply(&source, &fixes);
+        written.skipped += result.skipped;
+        if result.applied == 0 {
+            continue;
+        }
+
+        std::fs::write(&path, &result.source)
+            .map_err(|e| anyhow::anyhow!("cannot write `{}`: {e}", path.display()))?;
+        written.files += 1;
+        written.applied += result.applied;
+    }
+
+    Ok(written)
 }
 
 /// Which files to check.
@@ -280,11 +382,32 @@ struct CheckOptions<'a> {
     project_root: &'a Path,
     config: Option<&'a Path>,
     format: &'a str,
-    warn_only: bool,
     timeout: Option<u64>,
-    no_cache: bool,
     selection: Selection,
+    /// The independent on/off switches, grouped rather than passed loose.
+    ///
+    /// Four bare booleans in a row is the shape that gets silently transposed, and the
+    /// compiler cannot help — every one of them is the same type.
+    switches: Switches,
+}
+
+/// `check`'s boolean flags.
+///
+/// Four of them, which the lint below normally reads as a type that should have been an
+/// enum or a state machine. It is neither: these are independent user-facing switches, and
+/// every combination is meaningful. `--fix --warn-only --no-cache` is a coherent request.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a bag of independent CLI flags is where booleans are the right \
+              representation — the lint is aimed at domain types, where a pile of them \
+              usually means a missing enum"
+)]
+#[derive(Debug, Clone, Copy)]
+struct Switches {
+    warn_only: bool,
+    no_cache: bool,
     report_unused_suppressions: bool,
+    fix: bool,
 }
 
 fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
@@ -292,11 +415,15 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         project_root,
         config,
         format,
-        warn_only,
         timeout,
-        no_cache,
         selection,
-        report_unused_suppressions,
+        switches:
+            Switches {
+                warn_only,
+                no_cache,
+                report_unused_suppressions,
+                fix,
+            },
     } = options;
 
     let format = Format::parse(format).map_err(|got| {
@@ -358,6 +485,12 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         None => engine.run(),
     }
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let outcome = if fix {
+        fix_and_recheck(project_root, config, !no_cache, outcome)?
+    } else {
+        outcome
+    };
 
     let color = Color::resolve(
         std::io::stdout().is_terminal(),

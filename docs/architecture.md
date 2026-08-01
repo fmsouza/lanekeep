@@ -272,7 +272,8 @@ This is a stronger position than a conventional plugin system offers, where a pl
 
 | Function | Notes |
 |---|---|
-| `ctx.report(node \| loc, overrides?)` | Emit a violation. `overrides` may adjust message, severity, or supply a fix. |
+| `ctx.report(node, message?)` | Emit a violation. |
+| `ctx.report(node, { message?, fix? })` | The same, with a replacement offered. `fix` is `{ node, text, safe? }`. |
 | `ctx.loc(node)` | `{ file, line, column }` |
 
 ### 6.2 Tree navigation
@@ -539,6 +540,26 @@ Two things follow from caching, and both are easy to get wrong:
 
 The date is read once per run, from the host, in UTC. Once per run so two files checked a millisecond apart cannot disagree about what day it is; UTC because a deadline that moved with the reader's time zone would expire twice in some places and not at all in others. The sandbox still has no clock — a rule cannot observe the date, only a directive can be compared against it.
 
+### 10.1 Fixes
+
+A fix is a byte range and the text to put there — template-based replacement of a capture, not a general edit script. A rule that matched a node knows that node's extent, and replacing it covers almost every automatic fix worth having.
+
+```ts
+ctx.report(m.decl, {
+  fix: { node: m.decl, text: 'let ' + name, safe: true },
+})
+```
+
+The range comes from a **node**, never from offsets a rule computed. Offsets a rule works out itself are offsets it can get wrong, and a fix at the wrong offsets rewrites the wrong code.
+
+**`safe` defaults to false.** A fix a rule did not mark is a *suggestion*: shown, never applied. The distinction is the author's to make and is not checkable, which is exactly why the default is the cautious one — the cautious mistake costs a manual edit, the other one silently rewrites someone's code.
+
+`--fix` applies the safe ones and then **checks again**, because what a fix leaves behind is a different file and reporting the pre-fix violations would list things that are no longer there. The second pass is a cache miss for exactly the files that changed.
+
+Two fixes touching the same bytes cannot both apply — the second would be editing text the first replaced. One is applied and the other skipped, chosen by start offset so the outcome does not depend on the order rules happened to run in, and the skipped count is always reported. A run that fixed three of five things and said it fixed everything would leave someone believing the file was clean.
+
+A reduce-phase violation carries no fix: there is no parse tree in that phase, so no node to replace and no range to compute. Cross-file findings are fixed by hand.
+
 ---
 
 ## 11. Output
@@ -585,7 +606,7 @@ Rules are executable code. The posture is therefore about **confinement**, not a
 
 - **No ambient authority.** Rule code reaches exactly the host functions in §6 and nothing else. `fs`, `process`, `child_process`, network and dynamic import are not restricted — they do not exist in the context.
 - **No network.** Ever, in any mode, with no configuration that enables it.
-- **Filesystem confinement.** Reads happen only through `ctx.readFile`, only within the project root, with traversal rejected. Writes happen only under `--fix`, only to matched files, only within reported ranges.
+- **Filesystem confinement.** Reads happen only through `ctx.readFile`, only within the project root, with traversal rejected. Writes happen only under `--fix`, only to files a rule reported on, and only within the byte range of a node that rule matched.
 - **Bounded execution.** A per-invocation timeout, a 15-second global run budget, and a per-runtime memory ceiling (§6.7). None disableable, and breaching any of them cancels the run rather than degrading to a partial result (§6.8).
 - **Determinism by construction.** No clock, no randomness (§6.6).
 - Every built-in rule is reviewed by a maintainer.

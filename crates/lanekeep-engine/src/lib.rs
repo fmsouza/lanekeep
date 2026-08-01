@@ -561,6 +561,10 @@ impl Engine {
                         .unwrap_or_else(|| rule.spec.card.message.clone()),
                     remediation: rule.spec.card.remediation.clone(),
                     severity: rule.spec.severity,
+                    // A reduce phase has no parse tree, so there is no node to replace and
+                    // nothing to compute a byte range from. A cross-file finding is fixed by
+                    // hand.
+                    fix: None,
                 });
             }
         }
@@ -744,6 +748,7 @@ impl Engine {
                     "fix the directive, or remove it and fix what it was hiding",
                 ),
                 severity: Severity::Error,
+                fix: None,
             });
         }
 
@@ -770,6 +775,7 @@ impl Engine {
                      expiry",
                 ),
                 severity: Severity::Error,
+                fix: None,
             });
         }
 
@@ -881,6 +887,7 @@ impl Engine {
                     .unwrap_or_else(|| rule.spec.card.message.clone()),
                 remediation: rule.spec.card.remediation.clone(),
                 severity: rule.spec.severity,
+                fix: report.fix,
             });
         }
 
@@ -1083,6 +1090,7 @@ fn unused_violations(directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Vio
                     "remove it: whatever it was accepting is no longer reported",
                 ),
                 severity: Severity::Warn,
+                fix: None,
             });
         }
     }
@@ -2119,6 +2127,7 @@ export default defineRule({
                     message: "from the cache".to_owned(),
                     remediation: "nothing".to_owned(),
                     severity: Severity::Error,
+                    fix: None,
                 }],
                 facts: Vec::new(),
                 dependencies: Vec::new(),

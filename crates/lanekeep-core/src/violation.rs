@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::fix::Fix;
 use crate::location::Location;
 use crate::rule_id::RuleId;
 use crate::severity::Severity;
@@ -20,6 +21,13 @@ pub struct Violation {
     pub remediation: String,
     /// Severity as resolved by config, not as the rule declared it.
     pub severity: Severity,
+    /// A replacement the rule offered, if it offered one.
+    ///
+    /// Not part of the canonical sort: two violations differing only in their fix are the
+    /// same finding, and letting a fix change their order would make output depend on
+    /// something a reader cannot see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<Fix>,
 }
 
 /// Sort violations into lanekeep's canonical order: `(ruleId, file, line, column)`.
@@ -61,6 +69,7 @@ mod tests {
             message: "message".to_owned(),
             remediation: "remediation".to_owned(),
             severity: Severity::Error,
+            fix: None,
         }
     }
 

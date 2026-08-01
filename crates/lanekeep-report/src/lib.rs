@@ -462,6 +462,7 @@ mod tests {
             message: "something is wrong".to_owned(),
             remediation: "do it the other way".to_owned(),
             severity,
+            fix: None,
         }
     }
 
