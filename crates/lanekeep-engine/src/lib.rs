@@ -37,8 +37,9 @@ use std::sync::Arc;
 
 use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
 use lanekeep_config::{Config, ConfigError, RuleSpec};
+use lanekeep_core::suppression::{self, Date, Suppressions};
 use lanekeep_core::{
-    CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, Severity,
+    CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, RuleId, Severity,
     TrackedRead, Violation,
 };
 use lanekeep_js::{
@@ -129,6 +130,11 @@ pub struct Engine {
     caching: bool,
     /// Whether reduce phases run.
     reducing: bool,
+    /// The date `expires:` is compared against.
+    ///
+    /// Fixed once for the run, so two files checked a millisecond apart cannot disagree
+    /// about what day it is. Supplied by the host because the sandbox has no clock.
+    today: Date,
     limits: Limits,
     rules_root: RuleRoot,
     config_path: PathBuf,
@@ -251,6 +257,7 @@ impl Engine {
             run_key,
             caching: true,
             reducing: true,
+            today: suppression::today(),
             // Canonicalized here so every tracked read compares against the same absolute
             // root. Falling back to the path as given keeps a non-existent root a discovery
             // problem rather than turning it into a confusing read failure later.
@@ -270,6 +277,15 @@ impl Engine {
     #[must_use]
     pub const fn without_cache(mut self) -> Self {
         self.caching = false;
+        self
+    }
+
+    /// Fix the date `expires:` is compared against.
+    ///
+    /// For tests, which otherwise could not assert anything about expiry without waiting.
+    #[must_use]
+    pub const fn with_today(mut self, today: Date) -> Self {
+        self.today = today;
         self
     }
 
@@ -368,6 +384,7 @@ impl Engine {
         let mut files_parsed = 0;
         let mut dependencies = BTreeMap::new();
         let mut fresh = Store::empty();
+        let mut directives: BTreeMap<FilePath, Vec<suppression::Suppression>> = BTreeMap::new();
         for result in results {
             let outcome = result?;
             violations.extend(outcome.violations);
@@ -375,6 +392,9 @@ impl Engine {
             files_parsed += usize::from(outcome.parsed);
             if let Some(entry) = outcome.entry {
                 fresh.insert(entry.0, entry.1);
+            }
+            if !outcome.suppressions.is_empty() {
+                directives.insert(outcome.path.clone(), outcome.suppressions);
             }
             if !outcome.reads.is_empty() {
                 dependencies.insert(outcome.path, outcome.reads);
@@ -411,7 +431,16 @@ impl Engine {
         // shared sink, or grouping by rule before reducing, would silently lose it. The
         // cost is one sort of a small vector, once per run.
         lanekeep_core::fact::sort(&mut facts);
-        violations.extend(self.reduce(&clock, files, &facts)?);
+
+        // A cross-file rule reports at a site in some other file, which may well have been a
+        // cache hit this run — so its directives come from the outcome, whether they were
+        // parsed now or restored from the entry.
+        let reduced = self.reduce(&clock, files, &facts)?;
+        violations.extend(
+            reduced
+                .into_iter()
+                .filter(|violation| !suppressed_elsewhere(&directives, violation)),
+        );
 
         lanekeep_core::sort(&mut violations);
         Ok(Outcome {
@@ -564,9 +593,21 @@ impl Engine {
         // The cache is consulted after the path gates and the read, because the key needs
         // the file's bytes — but before the content gates and the parse, which is where the
         // saving is. A hit costs one hash and one dependency check.
+        // A file whose bytes mention `expires:` has a result that depends on what day it is,
+        // so today goes into its key and its entry lives for one day. Folding today into
+        // every key instead would invalidate the whole cache daily for the sake of the
+        // handful of files that carry an expiring suppression — and leaving it out entirely
+        // would serve an expired suppression as though it still held, which is the one thing
+        // an expiry exists to prevent.
+        let dated = memchr::memmem::find(&bytes, b"expires:").is_some();
         let key = self.caching.then(|| {
-            self.run_key
-                .for_file(path.as_str(), &lanekeep_cache::hash_bytes(&bytes))
+            let content = lanekeep_cache::hash_bytes(&bytes);
+            if dated {
+                self.run_key
+                    .for_dated_file(path.as_str(), &content, &self.today.to_string())
+            } else {
+                self.run_key.for_file(path.as_str(), &content)
+            }
         });
 
         if let Some(key) = key
@@ -593,12 +634,27 @@ impl Engine {
             return Ok(FileOutcome::skipped(path.clone()));
         };
 
+        // Parsed once per file, whatever rules ran: a directive is a property of the file,
+        // not of any rule.
+        let directives = suppression::parse(&source);
+
         let mut outcome = FileOutcome::parsed(path.clone());
         for rule in admitted {
             let (violations, facts) = self.run_rule(worker, &files, rule, path, &source)?;
             outcome.violations.extend(violations);
             outcome.facts.extend(facts);
         }
+
+        // Applied after every rule has run, so a directive covers whatever any of them
+        // reported at that line.
+        outcome
+            .violations
+            .retain(|violation| !is_suppressed(&directives, violation));
+        outcome
+            .violations
+            .extend(self.directive_violations(&directives, path));
+
+        outcome.suppressions = directives.valid;
         outcome.reads = files.dependencies();
         outcome.entry = key.map(|key| {
             (
@@ -607,11 +663,69 @@ impl Engine {
                     violations: outcome.violations.clone(),
                     facts: outcome.facts.clone(),
                     dependencies: outcome.reads.clone(),
+                    suppressions: outcome.suppressions.clone(),
                 },
             )
         });
 
         Ok(outcome)
+    }
+
+    /// Violations about the directives themselves.
+    ///
+    /// A suppression that does not work has to say so. A malformed directive silences
+    /// nothing while looking like it does, and an expired one is a deadline the author set
+    /// and then passed — reporting both is the whole reason the fields are checked rather
+    /// than best-effort parsed.
+    fn directive_violations(&self, directives: &Suppressions, path: &FilePath) -> Vec<Violation> {
+        let mut violations = Vec::new();
+
+        // Parsed once here rather than per violation. `SUPPRESSION_RULE` is a literal this
+        // crate controls, so a failure would be a build-time mistake — falling back to the
+        // rules' own namespace keeps that from being a panic in a checker.
+        let Ok(rule_id) = SUPPRESSION_RULE.parse::<RuleId>() else {
+            return violations;
+        };
+
+        for bad in &directives.malformed {
+            violations.push(Violation {
+                rule_id: rule_id.clone(),
+                location: Location::new(path.clone(), Position::new(bad.line, bad.column)),
+                message: bad.problem.clone(),
+                remediation: String::from(
+                    "fix the directive, or remove it and fix what it was hiding",
+                ),
+                severity: Severity::Error,
+            });
+        }
+
+        for suppression in &directives.valid {
+            let Some(expires) = suppression.expires else {
+                continue;
+            };
+            if expires >= self.today {
+                continue;
+            }
+
+            violations.push(Violation {
+                rule_id: rule_id.clone(),
+                location: Location::new(
+                    path.clone(),
+                    Position::new(suppression.line, suppression.column),
+                ),
+                message: format!(
+                    "suppression expired on {expires} — \"{}\"",
+                    suppression.reason
+                ),
+                remediation: String::from(
+                    "fix what it was suppressing, or decide it is permanent and drop the \
+                     expiry",
+                ),
+                severity: Severity::Error,
+            });
+        }
+
+        violations
     }
 
     fn run_rule(
@@ -793,6 +907,8 @@ struct FileOutcome {
     facts: Vec<Fact>,
     /// What this file's rules read beyond it.
     reads: Vec<TrackedRead>,
+    /// The file's suppression directives, for filtering reduce-phase violations.
+    suppressions: Vec<suppression::Suppression>,
     /// What to store for this file, when caching is on.
     entry: Option<(CacheKey, CacheEntry)>,
     /// Whether the file was parsed at all, for the "n files checked" count.
@@ -807,6 +923,7 @@ impl FileOutcome {
             violations: Vec::new(),
             facts: Vec::new(),
             reads: Vec::new(),
+            suppressions: Vec::new(),
             entry: None,
             parsed: false,
         }
@@ -818,6 +935,7 @@ impl FileOutcome {
             violations: Vec::new(),
             facts: Vec::new(),
             reads: Vec::new(),
+            suppressions: Vec::new(),
             entry: None,
             parsed: true,
         }
@@ -833,6 +951,7 @@ impl FileOutcome {
             violations: entry.violations.clone(),
             facts: entry.facts.clone(),
             reads: entry.dependencies.clone(),
+            suppressions: entry.suppressions.clone(),
             entry: Some((key, entry)),
             parsed: true,
         }
@@ -845,10 +964,35 @@ impl FileOutcome {
             violations: Vec::new(),
             facts: Vec::new(),
             reads: Vec::new(),
+            suppressions: Vec::new(),
             entry: key.map(|key| (key, CacheEntry::default())),
             parsed: false,
         }
     }
+}
+
+/// Whether a directive in this file silences this violation.
+fn is_suppressed(directives: &Suppressions, violation: &Violation) -> bool {
+    directives
+        .covering(&violation.rule_id, violation.location.position.line)
+        .is_some()
+}
+
+/// Whether a violation reported into some other file is silenced there.
+///
+/// A cross-file rule reports at the site a fact came from, so the directives that matter are
+/// that file's, not the one the rule happened to be reducing over.
+fn suppressed_elsewhere(
+    directives: &BTreeMap<FilePath, Vec<suppression::Suppression>>,
+    violation: &Violation,
+) -> bool {
+    directives
+        .get(&violation.location.file)
+        .is_some_and(|found| {
+            found.iter().any(|suppression| {
+                suppression.covers(&violation.rule_id, violation.location.position.line)
+            })
+        })
 }
 
 /// The engine version a cache key uses: major.minor only.
@@ -861,6 +1005,12 @@ fn engine_version() -> &'static str {
         None => FULL,
     }
 }
+
+/// The id violations about suppressions are reported under.
+///
+/// A real namespaced id, so it sorts, suppresses and serializes like any other — and so a
+/// consumer parsing output does not meet a special case.
+const SUPPRESSION_RULE: &str = "lanekeep/suppression";
 
 /// Position of a rule in the config's `rules` array, which is how the handler is reached.
 fn rule_index(spec: &RuleSpec) -> usize {
@@ -1878,6 +2028,7 @@ export default defineRule({
                 }],
                 facts: Vec::new(),
                 dependencies: Vec::new(),
+                suppressions: Vec::new(),
             },
         );
         doctored.save(&project.dir);
@@ -2188,5 +2339,319 @@ export default defineRule({
         fs::remove_file(project.dir.join("src/b.ts")).expect("removes");
         project.run().expect("runs");
         assert_eq!(project.cache().len(), 1);
+    }
+
+    // --- suppressions ----------------------------------------------------------------------
+
+    impl Project {
+        /// Run with a fixed date, so an expiry can be asserted without waiting for one.
+        fn run_on(&self, today: &str) -> Result<Outcome, RunError> {
+            let date = Date::parse(today).expect("valid date");
+            self.build().map(|engine| engine.with_today(date))?.run()
+        }
+    }
+
+    fn messages(outcome: &Outcome) -> Vec<&str> {
+        outcome
+            .violations
+            .iter()
+            .map(|v| v.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_next_line_directive_silences_the_line_below_it() {
+        let project = Project::new(
+            "suppress-next-line",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: legacy entry point\n\
+                     debugger;\n",
+                ),
+            ],
+        );
+        assert!(
+            project.run().expect("runs").violations.is_empty(),
+            "the directive did not silence the violation"
+        );
+    }
+
+    #[test]
+    fn a_directive_silences_only_the_line_it_names() {
+        let project = Project::new(
+            "suppress-scope",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: legacy\n\
+                     debugger;\n\
+                     debugger;\n",
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert_eq!(outcome.violations[0].location.position.line, 3);
+    }
+
+    #[test]
+    fn a_file_directive_silences_every_line() {
+        let project = Project::new(
+            "suppress-file",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-file local/no-debugger reason: generated fixture\n\
+                     debugger;\n\
+                     debugger;\n",
+                ),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+    }
+
+    #[test]
+    fn a_directive_naming_another_rule_silences_nothing() {
+        let project = Project::new(
+            "suppress-other-rule",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/something-else reason: unrelated\n\
+                     debugger;\n",
+                ),
+            ],
+        );
+        assert_eq!(project.run().expect("runs").violations.len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_directive_is_reported() {
+        // The failure this exists to prevent: a directive that looks like it works, does
+        // not, and says nothing. Both the missing reason and the violation it failed to
+        // suppress have to surface.
+        let project = Project::new(
+            "suppress-malformed",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger\ndebugger;\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 2, "{:?}", messages(&outcome));
+        assert!(
+            messages(&outcome)
+                .iter()
+                .any(|m| m.contains("no `reason:`")),
+            "{:?}",
+            messages(&outcome)
+        );
+        assert!(
+            outcome
+                .violations
+                .iter()
+                .any(|v| v.rule_id.to_string() == "lanekeep/suppression"),
+            "reported under the wrong id"
+        );
+    }
+
+    #[test]
+    fn an_expired_directive_is_reported_and_still_silences() {
+        // It expired, which is worth saying — but suddenly reporting everything it covered
+        // would turn a deadline into an avalanche on the day it passed.
+        let project = Project::new(
+            "suppress-expired",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: pending rewrite expires: 2026-01-01\n\
+                     debugger;\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run_on("2026-08-01").expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0]
+                .message
+                .contains("expired on 2026-01-01"),
+            "{:?}",
+            messages(&outcome)
+        );
+        assert!(
+            outcome.violations[0].message.contains("pending rewrite"),
+            "the reason should be quoted back: {:?}",
+            messages(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_directive_that_has_not_expired_is_quiet() {
+        let project = Project::new(
+            "suppress-unexpired",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: pending expires: 2026-12-31\n\
+                     debugger;\n",
+                ),
+            ],
+        );
+        assert!(
+            project
+                .run_on("2026-08-01")
+                .expect("runs")
+                .violations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_directive_expires_the_day_after_its_date() {
+        // On the date itself it still holds: an expiry is a deadline, and a deadline of the
+        // 31st is not missed on the 31st.
+        let project = Project::new(
+            "suppress-boundary",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-file local/no-debugger reason: x expires: 2026-08-01\n\
+                     debugger;\n",
+                ),
+            ],
+        );
+        assert!(
+            project
+                .run_on("2026-08-01")
+                .expect("runs")
+                .violations
+                .is_empty()
+        );
+        assert_eq!(
+            project.run_on("2026-08-02").expect("runs").violations.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_expiring_directive_is_not_served_stale_from_the_cache() {
+        // The cache-soundness case. A file cached the day before expiry must not keep its
+        // suppressed result the day after — an expiry that a warm run ignored would never
+        // expire at all, which is the one thing an expiry exists to prevent.
+        let project = Project::new(
+            "suppress-cache-date",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-file local/no-debugger reason: x expires: 2026-08-01\n\
+                     debugger;\n",
+                ),
+            ],
+        );
+
+        assert!(
+            project
+                .run_on("2026-08-01")
+                .expect("runs")
+                .violations
+                .is_empty()
+        );
+        let after = project.run_on("2026-08-02").expect("runs");
+        assert_eq!(
+            after.violations.len(),
+            1,
+            "a warm run served an expired suppression: {:?}",
+            messages(&after)
+        );
+    }
+
+    #[test]
+    fn suppressions_survive_a_warm_run() {
+        let project = Project::new(
+            "suppress-warm",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-file local/no-debugger reason: generated\ndebugger;\n",
+                ),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+        assert!(
+            project.run().expect("runs").violations.is_empty(),
+            "the warm run reported what the cold one suppressed"
+        );
+    }
+
+    #[test]
+    fn a_cross_file_violation_is_silenced_by_the_directive_where_it_lands() {
+        // A reduce-phase violation is reported at the site a fact came from, in a file the
+        // rule was never "checking" — and possibly one that was a cache hit. The directives
+        // that matter are that file's.
+        let project = Project::new(
+            "suppress-cross-file",
+            &[
+                ("rule.ts", UNUSED_EXPORTS_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "export function used() {}\n\
+                     // lanekeep-ignore-next-line local/no-unused-exports reason: public API\n\
+                     export function spare() {}\n",
+                ),
+                ("src/b.ts", "import { used } from './a';\nused();\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert!(
+            outcome.violations.is_empty(),
+            "a cross-file violation ignored the directive at its site: {:?}",
+            messages(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_cross_file_violation_survives_a_directive_for_another_rule() {
+        let project = Project::new(
+            "suppress-cross-file-other",
+            &[
+                ("rule.ts", UNUSED_EXPORTS_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "export function used() {}\n\
+                     // lanekeep-ignore-next-line local/unrelated reason: x\n\
+                     export function spare() {}\n",
+                ),
+                ("src/b.ts", "import { used } from './a';\nused();\n"),
+            ],
+        );
+        assert_eq!(project.run().expect("runs").violations.len(), 1);
     }
 }

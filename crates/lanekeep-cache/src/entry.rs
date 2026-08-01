@@ -19,6 +19,7 @@
 //! cache that can break a run is worse than no cache.
 
 use lanekeep_core::fact::Fact;
+use lanekeep_core::suppression::{Date, Scope, Suppression};
 use lanekeep_core::tracked::{ContentHash, TrackedRead};
 use lanekeep_core::{FilePath, Location, Position, RuleId, Severity, Violation};
 
@@ -31,6 +32,13 @@ pub struct Entry {
     pub facts: Vec<Fact>,
     /// Files this file's rules read, and what they hashed to.
     pub dependencies: Vec<TrackedRead>,
+
+    /// The file's suppression directives.
+    ///
+    /// Stored because a reduce-phase violation can be reported at a site in a file that was
+    /// not reprocessed this run. Without them, the warm path would drop the directive and
+    /// report a violation the author had already accepted.
+    pub suppressions: Vec<Suppression>,
 }
 
 impl Entry {
@@ -54,6 +62,32 @@ impl Entry {
             write_str(out, &fact.kind);
             write_str(out, &fact.data);
             out.extend_from_slice(&fact.sequence.to_le_bytes());
+        }
+
+        write_len(out, self.suppressions.len());
+        for suppression in &self.suppressions {
+            out.push(match suppression.scope {
+                Scope::NextLine => 0,
+                Scope::File => 1,
+            });
+            out.extend_from_slice(&suppression.line.to_le_bytes());
+            out.extend_from_slice(&suppression.column.to_le_bytes());
+            write_str(out, &suppression.reason);
+
+            write_len(out, suppression.rules.len());
+            for rule in &suppression.rules {
+                write_str(out, &rule.to_string());
+            }
+
+            match suppression.expires {
+                Some(date) => {
+                    out.push(1);
+                    out.extend_from_slice(&date.year.to_le_bytes());
+                    out.push(date.month);
+                    out.push(date.day);
+                }
+                None => out.push(0),
+            }
         }
 
         write_len(out, self.dependencies.len());
@@ -103,6 +137,42 @@ impl Entry {
             });
         }
 
+        let mut suppressions = Vec::with_capacity(cursor.peek_len()?);
+        for _ in 0..cursor.read_len()? {
+            let scope = match cursor.read_u8()? {
+                0 => Scope::NextLine,
+                1 => Scope::File,
+                _ => return None,
+            };
+            let line = cursor.read_u32()?;
+            let column = cursor.read_u32()?;
+            let reason = cursor.read_str()?.to_owned();
+
+            let mut rules = Vec::with_capacity(cursor.peek_len()?);
+            for _ in 0..cursor.read_len()? {
+                rules.push(cursor.read_str()?.parse().ok()?);
+            }
+
+            let expires = match cursor.read_u8()? {
+                0 => None,
+                1 => Some(Date {
+                    year: u16::from_le_bytes(cursor.take(2)?.try_into().ok()?),
+                    month: cursor.read_u8()?,
+                    day: cursor.read_u8()?,
+                }),
+                _ => return None,
+            };
+
+            suppressions.push(Suppression {
+                scope,
+                rules,
+                reason,
+                expires,
+                line,
+                column,
+            });
+        }
+
         let mut dependencies = Vec::with_capacity(cursor.peek_len()?);
         for _ in 0..cursor.read_len()? {
             let path = FilePath::new(cursor.read_str()?);
@@ -120,6 +190,7 @@ impl Entry {
             violations,
             facts,
             dependencies,
+            suppressions,
         })
     }
 }
@@ -249,7 +320,57 @@ mod tests {
                 TrackedRead::found(FilePath::new("package.json"), ContentHash::new([7; 32])),
                 TrackedRead::absent(FilePath::new("tsconfig.json")),
             ],
+            suppressions: vec![
+                Suppression {
+                    scope: Scope::NextLine,
+                    rules: vec!["local/a".parse().expect("valid id")],
+                    reason: "legacy".to_owned(),
+                    expires: None,
+                    line: 4,
+                    column: 3,
+                },
+                Suppression {
+                    scope: Scope::File,
+                    rules: vec![
+                        "local/a".parse().expect("valid id"),
+                        "lanekeep/no-default-export".parse().expect("valid id"),
+                    ],
+                    reason: "generated".to_owned(),
+                    expires: Some(Date {
+                        year: 2026,
+                        month: 12,
+                        day: 31,
+                    }),
+                    line: 1,
+                    column: 1,
+                },
+            ],
         }
+    }
+
+    #[test]
+    fn suppressions_survive_a_round_trip() {
+        // A reduce-phase violation can land on a file that was a cache hit. Without these,
+        // the warm path would drop the directive and report a violation the author had
+        // already accepted.
+        let entry = populated();
+        let decoded = round_trip(&entry).expect("decodes");
+        assert_eq!(decoded.suppressions, entry.suppressions);
+    }
+
+    #[test]
+    fn an_expiry_survives_as_an_expiry() {
+        let entry = populated();
+        let decoded = round_trip(&entry).expect("decodes");
+        assert_eq!(decoded.suppressions[0].expires, None);
+        assert_eq!(
+            decoded.suppressions[1].expires,
+            Some(Date {
+                year: 2026,
+                month: 12,
+                day: 31
+            })
+        );
     }
 
     fn round_trip(entry: &Entry) -> Option<Entry> {
