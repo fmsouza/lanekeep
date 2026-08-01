@@ -70,7 +70,7 @@ import re, sys
 text = open(sys.argv[1], encoding="utf-8").read()
 section = text.split("[workspace.package]", 1)[1]
 print(re.search(r"^version\s*=\s*\"([^\"]+)\"", section, re.MULTILINE).group(1))
-' "${repo_root}/Cargo.toml")"
+' "${repo_root}/Cargo.toml" | tr -d '\r')"
 
 reset() {
   local version="${1:-${workspace_version}}"

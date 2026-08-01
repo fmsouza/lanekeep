@@ -46,7 +46,10 @@ as_path() {
 }
 
 field() {
-  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+  # Carriage returns are stripped because Python's text-mode stdout translates a newline to
+  # CRLF on Windows, and a version carrying a CR compares equal to nothing.
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2" |
+    tr -d '\r'
 }
 
 publish() {
@@ -96,6 +99,7 @@ section = text.split("[workspace.package]", 1)[1]
 print(re.search(r'^version\s*=\s*"([^"]+)"', section, re.MULTILINE).group(1))
 PY
 )"
+workspace_version="$(printf '%s' "${workspace_version}" | tr -d '\r')"
 launcher_version="$(field "${dist}/lanekeep/package.json" version)"
 if [ "${launcher_version}" != "${workspace_version}" ]; then
   echo "error: npm would publish ${launcher_version}, but Cargo.toml says ${workspace_version}" >&2
