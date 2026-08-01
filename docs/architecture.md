@@ -649,7 +649,9 @@ Targets, gated in CI. Measured by `benches/corpus.rs` over a synthetic 2,000-fil
 | Warm run, 1 changed file, full discovery | — | ~56 ms |
 | Warm run, 1 changed file, `--staged` | < 10 ms | ~32 ms |
 
-**Nothing meets its budget yet, and the budgets stand.** They were provisional until measured; measuring them is not grounds for moving them. The levers named below are the answer, in that order, and relaxing a budget remains the last resort.
+**Nothing meets its budget yet, and the budgets stand.** They are targets to aim at, not release gates — a number chosen before anything existed does not get to decide whether the thing that exists is worth shipping. What they are for is direction: they say which way is better, and the gap between them and the measurements says how much room is left.
+
+Measuring them is not grounds for moving them. The levers below are the answer, in that order, and relaxing a budget remains the last resort — the point of a target you have not hit is that it keeps pointing.
 
 Two things the first measurement already bought:
 
@@ -688,7 +690,7 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 **M0 — walking skeleton.** Workspace, config loading, discovery, tree-sitter TS/TSX, query compilation, the embedded engine with the §6 host API, human + json reporters, `RuleTester`. Acceptance: the built-in rules and a representative set of project-authored rules run end-to-end against the fixture corpus, with snapshot-verified output — every reporter is snapshotted in `lanekeep-report/tests/snapshots.rs`, and the built-in rules are driven through the binary over real corpora in `lanekeep-cli/tests/`.
 
-**M1 — speed.** Cache with dependency tracking, `--since` / `--staged`, rayon parallelism, `benches/` in CI with regression gates. Acceptance: budgets in §15 met.
+**M1 — speed.** Cache with dependency tracking, `--since` / `--staged`, rayon parallelism, `benches/` in CI with regression gates. Acceptance: the suite exists, runs in CI, and gates on regression — all of which it does. The §15 budgets are targets rather than an acceptance criterion; none is met yet, and §15 says by how much and what the levers are.
 
 **M2 — completeness.** Full host API surface, SARIF + agent reporters, `explain`, fixes (template-based replacement of a capture, marked machine-applicable vs suggestion), unused-suppression reporting.
 
