@@ -113,6 +113,13 @@ src/bad.ts:2:1 error [lanekeep/no-default-export] default export
 ✖ 2 error(s) across 2 file(s) checked
 ```
 
+To find out what a rule wants without opening its source:
+
+```
+$ lanekeep explain lanekeep/no-default-export
+$ lanekeep rules --json
+```
+
 For fast feedback on what you touched:
 
 ```

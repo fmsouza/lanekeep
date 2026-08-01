@@ -82,6 +82,28 @@ enum Command {
         /// Config file.
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Emit the listing as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print one rule's card: what it checks, and what to do about it.
+    Explain {
+        /// The rule id, as it appears in output — `lanekeep/no-default-export`.
+        rule: String,
+
+        /// Project root.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Config file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Emit the card as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -118,7 +140,13 @@ fn run() -> anyhow::Result<ExitCode> {
             no_cache,
             &Selection::from(since, staged),
         ),
-        Command::Rules { path, config } => rules(&path, config.as_deref()),
+        Command::Rules { path, config, json } => rules(&path, config.as_deref(), json),
+        Command::Explain {
+            rule,
+            path,
+            config,
+            json,
+        } => explain(&rule, &path, config.as_deref(), json),
     }
 }
 
@@ -332,10 +360,23 @@ fn check(
     ))
 }
 
-fn rules(project_root: &Path, config: Option<&Path>) -> anyhow::Result<ExitCode> {
+fn rules(project_root: &Path, config: Option<&Path>, as_json: bool) -> anyhow::Result<ExitCode> {
     let (engine, declared) = prepare(project_root, config, false)?;
-
     let mut stdout = std::io::stdout();
+
+    if as_json {
+        let listing: Vec<serde_json::Value> = engine.rules().map(rule_json).collect();
+        let document = serde_json::json!({
+            "version": 1,
+            "declared": declared,
+            "enabled": engine.rule_count(),
+            "rules": listing,
+        });
+        writeln!(stdout, "{}", serde_json::to_string_pretty(&document)?)?;
+        stdout.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     for spec in engine.rules() {
         // Id, severity, then what the rule is for. An agent reading this has to be able to
         // decide whether a rule is the one it wants without opening the source.
@@ -354,5 +395,100 @@ fn rules(project_root: &Path, config: Option<&Path>) -> anyhow::Result<ExitCode>
     }
     stdout.flush()?;
 
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One rule as JSON, shared by `rules --json` and `explain --json`.
+fn rule_json(spec: &lanekeep_config::RuleSpec) -> serde_json::Value {
+    serde_json::json!({
+        "id": spec.id.to_string(),
+        "severity": spec.severity.to_string(),
+        "language": spec.language.clone(),
+        "message": spec.card.message.clone(),
+        "remediation": spec.card.remediation.clone(),
+        "examples": {
+            "bad": spec.card.examples.bad.clone(),
+            "good": spec.card.examples.good.clone(),
+        },
+        "query": spec.query.clone(),
+        "crossFile": spec.has_reduce,
+    })
+}
+
+/// Print one rule's card.
+///
+/// The card exists to be read by whoever has to act on a violation, which is increasingly an
+/// agent rather than a person — so this is the command that turns a rule id in a diagnostic
+/// into something actionable without opening the rule's source.
+fn explain(
+    rule: &str,
+    project_root: &Path,
+    config: Option<&Path>,
+    as_json: bool,
+) -> anyhow::Result<ExitCode> {
+    let (engine, _) = prepare(project_root, config, false)?;
+
+    let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
+        // Naming what is configured, rather than only what is missing. A rule id is easy to
+        // mistype and the answer is always in the list, so printing the list is more useful
+        // than any guess at what was meant.
+        let configured: Vec<String> = engine.rules().map(|spec| spec.id.to_string()).collect();
+        let near: Vec<&String> = configured
+            .iter()
+            .filter(|id| {
+                // A suffix match catches the common mistake by a wide margin: writing
+                // `no-default-export` for `lanekeep/no-default-export`.
+                id.ends_with(rule) || id.contains(rule) || rule.contains(id.as_str())
+            })
+            .collect();
+
+        anyhow::bail!(
+            "no rule `{rule}` is configured{}\n  configured: {}",
+            if near.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n  did you mean: {}",
+                    near.iter()
+                        .map(|id| id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+            if configured.is_empty() {
+                "none".to_owned()
+            } else {
+                configured.join(", ")
+            },
+        );
+    };
+
+    let mut stdout = std::io::stdout();
+
+    if as_json {
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string_pretty(&rule_json(spec))?
+        )?;
+        stdout.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    writeln!(stdout, "{}  [{}]", spec.id, spec.severity)?;
+    writeln!(stdout, "\n{}", spec.card.message)?;
+    writeln!(stdout, "\nFix: {}", spec.card.remediation)?;
+    writeln!(stdout, "\nBad:  {}", spec.card.examples.bad)?;
+    writeln!(stdout, "Good: {}", spec.card.examples.good)?;
+
+    if spec.has_reduce {
+        // Worth stating: it changes what `--since` and `--staged` do with the rule.
+        writeln!(
+            stdout,
+            "\nThis rule reads the whole corpus, so --since and --staged skip it."
+        )?;
+    }
+
+    stdout.flush()?;
     Ok(ExitCode::SUCCESS)
 }
