@@ -17,7 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ use rquickjs::module::{Declared, Module};
 use rquickjs::{Ctx, Error as JsError};
 use thiserror::Error;
 
+use crate::files::normalize;
 use crate::typescript::strip_types;
 
 /// The specifier that resolves to lanekeep's own module.
@@ -103,29 +104,6 @@ pub enum ResolveError {
         /// The underlying reason.
         detail: String,
     },
-}
-
-/// Resolve a specifier lexically, without consulting the filesystem for `..`.
-///
-/// `Path::join` followed by `canonicalize` would also work, but only for paths that exist —
-/// and a traversal attempt should be rejected with a message about escaping the root
-/// whether or not the target happens to be there.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    // Popping past the start is what an escape looks like lexically. Keep
-                    // the marker so the caller's containment check fails.
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 /// Where rule modules live, and what may be imported.

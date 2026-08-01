@@ -24,6 +24,7 @@ pub mod gates;
 pub mod location;
 pub mod rule_id;
 pub mod severity;
+pub mod tracked;
 pub mod violation;
 
 pub use card::{CardProblem, Examples, RuleCard};
@@ -33,4 +34,5 @@ pub use gates::{CompiledGates, GateError, Gates};
 pub use location::{FilePath, Location, Position};
 pub use rule_id::{Namespace, ParseRuleIdError, RuleId};
 pub use severity::{ParseSeverityError, Severity};
+pub use tracked::{ContentHash, TrackedRead};
 pub use violation::{Violation, any_failing, sort};

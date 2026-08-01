@@ -7,8 +7,7 @@
 //!
 //! # What is here so far
 //!
-//! Reporting, tree navigation, binding resolution and facts. Tracked file reads arrive in a
-//! later milestone.
+//! Reporting, tree navigation, binding resolution, facts, and tracked file reads.
 //!
 //! # Two contexts, not one
 //!
@@ -32,6 +31,7 @@ use rquickjs::{Ctx, Function, Object, Value};
 
 use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 
+use crate::files::FileAccess;
 use crate::nodes::{Handle, NodeArena};
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
@@ -71,6 +71,7 @@ pub struct HostContext {
     facts: Rc<RefCell<Vec<EmittedFact>>>,
     file_path: Rc<str>,
     resolver: Option<Arc<dyn BindingResolver>>,
+    files: Option<Rc<FileAccess>>,
 }
 
 impl std::fmt::Debug for HostContext {
@@ -81,6 +82,7 @@ impl std::fmt::Debug for HostContext {
             .field("reports", &self.reports.borrow().len())
             .field("facts", &self.facts.borrow().len())
             .field("has_resolver", &self.resolver.is_some())
+            .field("has_file_access", &self.files.is_some())
             .finish()
     }
 }
@@ -95,6 +97,7 @@ impl HostContext {
             facts: Rc::new(RefCell::new(Vec::new())),
             file_path: Rc::from(file_path),
             resolver: None,
+            files: None,
         }
     }
 
@@ -116,6 +119,18 @@ impl HostContext {
     #[must_use]
     pub fn with_resolver(mut self, resolver: Arc<dyn BindingResolver>) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    /// Allow tracked reads of other files in the project.
+    ///
+    /// Without one, `readFile` and `fileExists` are absent rather than present-and-failing.
+    /// A rule reaching for them then gets a `TypeError` naming the function, which is the
+    /// truthful answer — where a stub returning `undefined` would look like an empty project
+    /// and produce a rule that silently checks nothing.
+    #[must_use]
+    pub fn with_file_access(mut self, files: Rc<FileAccess>) -> Self {
+        self.files = Some(files);
         self
     }
 
@@ -157,6 +172,7 @@ impl HostContext {
         self.install_bindings(ctx, &object)?;
         self.install_reporting(ctx, &object)?;
         self.install_facts(ctx, &object)?;
+        self.install_reads(ctx, &object)?;
 
         Ok(object)
     }
@@ -413,6 +429,44 @@ impl HostContext {
                         data: json.to_string()?,
                     });
                     Ok(())
+                },
+            )?,
+        )?;
+
+        Ok(())
+    }
+
+    /// Reading other files in the project.
+    fn install_reads<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
+        // --- tracked reads -----------------------------------------------------------------
+
+        let Some(files) = self.files.clone() else {
+            return Ok(());
+        };
+
+        let reader = Rc::clone(&files);
+        object.set(
+            "readFile",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, path: String| -> rquickjs::Result<Option<String>> {
+                    // A refusal throws; an absence returns `undefined`. The distinction is
+                    // the point: "not there" is an ordinary answer a rule should handle,
+                    // and "you tried to leave the project" is a bug in the rule.
+                    reader.read(&path).map_err(|e| throw(&ctx, &e.to_string()))
+                },
+            )?,
+        )?;
+
+        let reader = Rc::clone(&files);
+        object.set(
+            "fileExists",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, path: String| -> rquickjs::Result<bool> {
+                    reader
+                        .exists(&path)
+                        .map_err(|e| throw(&ctx, &e.to_string()))
                 },
             )?,
         )?;

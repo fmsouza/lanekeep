@@ -30,16 +30,19 @@
 //! One parse per file, not per rule. Parsing is the dominant cost, and a file with twenty
 //! applicable rules must not pay it twenty times.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use lanekeep_config::{Config, ConfigError, RuleSpec};
 use lanekeep_core::{
     CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, Severity,
-    Violation,
+    TrackedRead, Violation,
 };
 use lanekeep_js::{
-    HostContext, Limits, ReduceContext, ReduceFact, RuleRoot, RunClock, Sandbox, SandboxError,
+    FileAccess, HostContext, Limits, ReduceContext, ReduceFact, RuleRoot, RunClock, Sandbox,
+    SandboxError,
 };
 use lanekeep_lang::{Language, LanguageRegistry};
 use lanekeep_query::{CompileError, CompiledQuery};
@@ -116,6 +119,9 @@ struct Prepared {
 pub struct Engine {
     rules: Vec<Prepared>,
     discovery: Discovery,
+    /// The project root, canonicalized once. Every tracked read is checked against it, and
+    /// canonicalizing per file would put a syscall on the hot path for a constant.
+    root: PathBuf,
     limits: Limits,
     rules_root: RuleRoot,
     config_path: PathBuf,
@@ -133,7 +139,7 @@ impl std::fmt::Debug for Engine {
 }
 
 /// What a run produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Outcome {
     /// Violations, in canonical order.
     pub violations: Vec<Violation>,
@@ -141,6 +147,13 @@ pub struct Outcome {
     pub files_discovered: usize,
     /// How many were actually parsed, after gates.
     pub files_parsed: usize,
+
+    /// What each checked file's rules read beyond that file, in path order.
+    ///
+    /// Exactly the shape a cache entry needs: dependencies belong to the file whose result
+    /// they affect, not to the run. A file with no tracked reads has no entry here rather
+    /// than an empty one, so the common case costs nothing.
+    pub dependencies: BTreeMap<FilePath, Vec<TrackedRead>>,
 }
 
 impl Engine {
@@ -206,6 +219,12 @@ impl Engine {
 
         Ok(Self {
             rules,
+            // Canonicalized here so every tracked read compares against the same absolute
+            // root. Falling back to the path as given keeps a non-existent root a discovery
+            // problem rather than turning it into a confusing read failure later.
+            root: project_root
+                .canonicalize()
+                .unwrap_or_else(|_| project_root.to_path_buf()),
             discovery,
             limits: config.limits,
             rules_root,
@@ -257,6 +276,9 @@ impl Engine {
                 // worker's whole share. Building one per file would pay engine startup
                 // thousands of times; sharing one across workers is impossible, since the
                 // runtime is single-threaded by construction.
+                // The sandbox is per worker — one engine startup per thread rather than
+                // per file. File access is not: it is per file, so one file's reads cannot
+                // be recorded against another's whatever rayon does with chunk boundaries.
                 || self.worker(&clock),
                 |worker, path| match worker {
                     Ok(sandbox) => self.check_file(sandbox, path),
@@ -268,11 +290,15 @@ impl Engine {
         let mut violations = Vec::new();
         let mut facts = Vec::new();
         let mut files_parsed = 0;
+        let mut dependencies = BTreeMap::new();
         for result in results {
             let outcome = result?;
             violations.extend(outcome.violations);
             facts.extend(outcome.facts);
             files_parsed += usize::from(outcome.parsed);
+            if !outcome.reads.is_empty() {
+                dependencies.insert(outcome.path, outcome.reads);
+            }
         }
 
         // Into the one order every run will see, before any rule looks at them.
@@ -291,6 +317,7 @@ impl Engine {
             violations,
             files_discovered: files.len(),
             files_parsed,
+            dependencies,
         })
     }
 
@@ -398,8 +425,12 @@ impl Engine {
         Ok(sandbox)
     }
 
-    /// Check one file. Returns its violations and whether it was parsed at all.
+    /// Check one file. Returns its violations, facts and tracked reads.
     fn check_file(&self, sandbox: &Sandbox, path: &FilePath) -> Result<FileOutcome, RunError> {
+        // A fresh set of tracked reads for this file, sharing the root already canonicalized
+        // at preparation.
+        let files = Rc::new(FileAccess::rooted(self.root.clone()));
+
         // Path gates first: rejecting here costs no read at all.
         let admitted: Vec<&Prepared> = self
             .rules
@@ -407,7 +438,7 @@ impl Engine {
             .filter(|rule| rule.gates.admits_path(path))
             .collect();
         if admitted.is_empty() {
-            return Ok(FileOutcome::skipped());
+            return Ok(FileOutcome::skipped(path.clone()));
         }
 
         let absolute = self.discovery.root().join(path.as_str());
@@ -416,7 +447,7 @@ impl Engine {
             // tree is allowed to change under a run; what must not happen is a partial
             // result being reported as complete, and a missing file contributes nothing
             // either way.
-            return Ok(FileOutcome::skipped());
+            return Ok(FileOutcome::skipped(path.clone()));
         };
 
         // Content gates: one read, a substring scan, and a parse saved.
@@ -425,20 +456,21 @@ impl Engine {
             .filter(|rule| rule.gates.admits_content(&bytes))
             .collect();
         if admitted.is_empty() {
-            return Ok(FileOutcome::skipped());
+            return Ok(FileOutcome::skipped(path.clone()));
         }
 
         let Ok(source) = String::from_utf8(bytes) else {
             // Not valid UTF-8, so not source this tool can reason about.
-            return Ok(FileOutcome::skipped());
+            return Ok(FileOutcome::skipped(path.clone()));
         };
 
-        let mut outcome = FileOutcome::parsed();
+        let mut outcome = FileOutcome::parsed(path.clone());
         for rule in admitted {
-            let (violations, facts) = self.run_rule(sandbox, rule, path, &source)?;
+            let (violations, facts) = self.run_rule(sandbox, &files, rule, path, &source)?;
             outcome.violations.extend(violations);
             outcome.facts.extend(facts);
         }
+        outcome.reads = files.dependencies();
 
         Ok(outcome)
     }
@@ -446,6 +478,7 @@ impl Engine {
     fn run_rule(
         &self,
         sandbox: &Sandbox,
+        files: &Rc<FileAccess>,
         rule: &Prepared,
         path: &FilePath,
         source: &str,
@@ -462,7 +495,8 @@ impl Engine {
         // has ended — the two-phase shape the arena's ownership of the tree forces.
         let mut matches: Vec<Vec<(String, Vec<u32>)>> = Vec::new();
         let host = HostContext::new(tree, source.to_owned(), path.as_str())
-            .with_resolver_from(rule.language.as_ref());
+            .with_resolver_from(rule.language.as_ref())
+            .with_file_access(Rc::clone(files));
 
         {
             let arena = host.arena().borrow();
@@ -551,26 +585,34 @@ impl Engine {
 
 /// What checking one file produced.
 struct FileOutcome {
+    /// The file this is about, so the run can key dependencies by it.
+    path: FilePath,
     violations: Vec<Violation>,
     facts: Vec<Fact>,
+    /// What this file's rules read beyond it.
+    reads: Vec<TrackedRead>,
     /// Whether the file was parsed at all, for the "n files checked" count.
     parsed: bool,
 }
 
 impl FileOutcome {
     /// A file that never reached a parser — gated out, unreadable, or not UTF-8.
-    const fn skipped() -> Self {
+    const fn skipped(path: FilePath) -> Self {
         Self {
+            path,
             violations: Vec::new(),
             facts: Vec::new(),
+            reads: Vec::new(),
             parsed: false,
         }
     }
 
-    const fn parsed() -> Self {
+    const fn parsed(path: FilePath) -> Self {
         Self {
+            path,
             violations: Vec::new(),
             facts: Vec::new(),
+            reads: Vec::new(),
             parsed: true,
         }
     }
@@ -1222,5 +1264,255 @@ export default defineRule({
         let outcome = project.run().expect("runs");
         assert_eq!(outcome.violations.len(), 1);
         assert_eq!(outcome.violations[0].location.file.as_str(), "src/a.ts");
+    }
+
+    // --- tracked reads -------------------------------------------------------------------
+
+    /// A rule that reads a sibling file and reports when it says so.
+    const READING_RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/reads-config',
+  query: '(export_statement) @stmt',
+  card: {
+    message: 'config says no',
+    remediation: 'change the config, or the code',
+    examples: { bad: 'export const a = 1;', good: 'const a = 1;' },
+  },
+  check(ctx, m) {
+    const raw = ctx.readFile('policy.json');
+    if (raw && JSON.parse(raw).forbidExports) ctx.report(m.stmt);
+  },
+});
+";
+
+    #[test]
+    fn a_rule_can_read_another_file() {
+        let project = Project::new(
+            "reads-allowed",
+            &[
+                ("rule.ts", READING_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("policy.json", r#"{"forbidExports":true}"#),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", outcome.violations);
+    }
+
+    #[test]
+    fn what_the_file_says_changes_the_result() {
+        // Otherwise the test above would pass on a `readFile` that returned nothing.
+        let project = Project::new(
+            "reads-content",
+            &[
+                ("rule.ts", READING_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("policy.json", r#"{"forbidExports":false}"#),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+    }
+
+    #[test]
+    fn a_read_is_recorded_against_the_file_that_made_it() {
+        // The shape a cache entry needs. A dependency recorded against the run, or leaked
+        // from the previous file on the same worker, would invalidate the wrong entries.
+        //
+        // Enough files that workers necessarily handle several each: with only two, rayon
+        // puts them on separate workers with separate `FileAccess`, and a missing reset
+        // between files cannot show. `FileAccess::clear` is covered deterministically by
+        // its own unit test; this covers the engine actually calling it.
+        let mut layout: Vec<(String, String)> = vec![
+            ("rule.ts".to_owned(), READING_RULE.to_owned()),
+            ("lanekeep.config.ts".to_owned(), config("")),
+            (
+                "policy.json".to_owned(),
+                r#"{"forbidExports":false}"#.to_owned(),
+            ),
+        ];
+        // Odd files export and therefore read; even files do neither.
+        for i in 0..24 {
+            let body = if i % 2 == 0 {
+                format!("const v{i} = {i};\n")
+            } else {
+                format!("export const v{i} = {i};\n")
+            };
+            layout.push((format!("src/f{i:02}.ts"), body));
+        }
+        let borrowed: Vec<(&str, &str)> = layout
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+
+        let project = Project::new("reads-attributed", &borrowed);
+        let outcome = project.run().expect("runs");
+
+        for i in 0..24 {
+            let file = FilePath::new(format!("src/f{i:02}.ts"));
+            let deps = outcome.dependencies.get(&file);
+            if i % 2 == 0 {
+                assert!(
+                    deps.is_none(),
+                    "src/f{i:02}.ts read nothing but has {deps:?}"
+                );
+            } else {
+                let deps = deps.unwrap_or_else(|| panic!("src/f{i:02}.ts should have read"));
+                assert_eq!(deps.len(), 1);
+                assert_eq!(deps[0].path.as_str(), "policy.json");
+                assert!(deps[0].hash.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_recorded_as_a_dependency_too() {
+        // The case that makes a cache wrong rather than cold: the answer "not there" has to
+        // be invalidated when the file appears.
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/wants-config',
+  query: '(export_statement) @stmt',
+  card: { message: 'no config', remediation: 'add one', examples: { bad: 'a', good: 'b' } },
+  check(ctx, m) {
+    if (!ctx.fileExists('tsconfig.json')) ctx.report(m.stmt);
+  },
+});
+";
+        let project = Project::new(
+            "reads-absent",
+            &[
+                ("rule.ts", RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1);
+
+        let deps = outcome
+            .dependencies
+            .get(&FilePath::new("src/a.ts"))
+            .expect("the miss is a dependency");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].path.as_str(), "tsconfig.json");
+        assert_eq!(deps[0].hash, None, "absence is recorded as absence");
+    }
+
+    #[test]
+    fn reading_outside_the_project_aborts_the_run() {
+        // Not a rule that reports nothing: a rule reaching outside the project is a rule
+        // doing something it must never do, and a run that continued would be reporting a
+        // result produced by code that tried.
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/escapes',
+  query: '(export_statement) @stmt',
+  card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },
+  check(ctx) { ctx.readFile('../../../etc/passwd'); },
+});
+";
+        let project = Project::new(
+            "reads-escape",
+            &[
+                ("rule.ts", RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+
+        let error = project.run().expect_err("aborts");
+        let rendered = error.to_string();
+        assert!(rendered.contains("outside the project root"), "{rendered}");
+        assert!(rendered.contains("local/escapes"), "{rendered}");
+    }
+
+    #[test]
+    fn reading_the_same_file_from_two_files_records_it_under_both() {
+        let project = Project::new(
+            "reads-shared",
+            &[
+                ("rule.ts", READING_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("policy.json", r#"{"forbidExports":false}"#),
+                ("src/a.ts", "export const a = 1;\n"),
+                ("src/b.ts", "export const b = 1;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        for file in ["src/a.ts", "src/b.ts"] {
+            let deps = outcome
+                .dependencies
+                .get(&FilePath::new(file))
+                .unwrap_or_else(|| panic!("{file} should depend on the policy"));
+            assert_eq!(deps[0].path.as_str(), "policy.json");
+        }
+
+        // The same bytes, so the same hash — a cache must not see two different
+        // dependencies on one file.
+        let a = &outcome.dependencies[&FilePath::new("src/a.ts")][0];
+        let b = &outcome.dependencies[&FilePath::new("src/b.ts")][0];
+        assert_eq!(a.hash, b.hash);
+    }
+
+    #[test]
+    fn dependencies_are_the_same_on_every_run() {
+        let project = Project::new(
+            "reads-deterministic",
+            &[
+                ("rule.ts", READING_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("policy.json", r#"{"forbidExports":false}"#),
+                ("src/a.ts", "export const a = 1;\n"),
+                ("src/b.ts", "export const b = 1;\n"),
+                ("src/c.ts", "export const c = 1;\n"),
+            ],
+        );
+        let first = project.run().expect("runs").dependencies;
+        assert!(!first.is_empty());
+        for attempt in 0..4 {
+            assert_eq!(
+                project.run().expect("runs").dependencies,
+                first,
+                "dependencies changed on attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_read_surface_is_absent_from_the_reduce_phase() {
+        // Reduce reads would be run-level dependencies, not per-file ones, and storing them
+        // in a per-file entry would attribute them to whichever file came last. Until the
+        // cache can express that, the functions are not there to be misused.
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/reduce-reads',
+  query: '(export_statement) @stmt',
+  card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },
+  check() {},
+  reduce(ctx) {
+    const absent = ctx.readFile === undefined && ctx.fileExists === undefined;
+    ctx.report({ file: 'probe.ts', line: absent ? 1 : 2, column: 1 });
+  },
+});
+";
+        let project = Project::new(
+            "reads-reduce",
+            &[
+                ("rule.ts", RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1);
+        assert_eq!(
+            outcome.violations[0].location.position.line, 1,
+            "reads must not be reachable from a reduce phase"
+        );
     }
 }
