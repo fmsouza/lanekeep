@@ -61,10 +61,47 @@ publish() {
     return 0
   fi
 
+  # Restore the executable bit immediately before packing.
+  #
+  # `build-npm-packages.sh` sets it, and it does not survive the trip between jobs:
+  # `actions/upload-artifact` zips its input and `download-artifact` unpacks it without
+  # permissions, so what arrives here is 0644. npm packs whatever mode it finds — it does not
+  # normalize, and it does not infer one from `bin` — so the published tarball ships a binary
+  # nobody can execute, and every `lanekeep` invocation dies with `EACCES`.
+  #
+  # v0.1.0 shipped exactly that. Nothing catches it before someone installs the published
+  # package: the artifact is fine when built, fine when packaged, and wrong only after a
+  # round trip that happens between two jobs neither script can see.
+  local binary
+  for binary in "${directory}"/bin/*; do
+    [ -f "${binary}" ] && chmod +x "${binary}"
+  done
+
   echo "publish ${name}@${version}"
   "${npm_command}" publish "$(as_path "${directory}")" \
     --access public --provenance ${extra[@]+"${extra[@]}"}
 }
+
+# The two registries learn the version from different places: npm from the tag, by way of the
+# packaging script, and crates.io from the workspace manifest. If those ever disagree, one
+# release ships under two different numbers, and neither registry lets a number be reused. It
+# costs nothing to notice here, before anything is published.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+workspace_version="$(python3 - "${repo_root}/Cargo.toml" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+section = text.split("[workspace.package]", 1)[1]
+print(re.search(r'^version\s*=\s*"([^"]+)"', section, re.MULTILINE).group(1))
+PY
+)"
+launcher_version="$(field "${dist}/lanekeep/package.json" version)"
+if [ "${launcher_version}" != "${workspace_version}" ]; then
+  echo "error: npm would publish ${launcher_version}, but Cargo.toml says ${workspace_version}" >&2
+  echo "       the tag and the workspace manifest have to agree before either registry sees it" >&2
+  exit 1
+fi
 
 # Platform packages first. The launcher lists them as optional dependencies, so publishing
 # it first opens a window in which `npm install lanekeep` resolves a launcher whose binaries

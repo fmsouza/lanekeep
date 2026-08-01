@@ -1,6 +1,6 @@
 ---
 source: crates/lanekeep-report/tests/snapshots.rs
-expression: "rendered(Format::Sarif)"
+expression: normalized
 ---
 {
   "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -124,7 +124,7 @@ expression: "rendered(Format::Sarif)"
               }
             }
           ],
-          "version": "0.1.0"
+          "version": "[version]"
         }
       }
     }

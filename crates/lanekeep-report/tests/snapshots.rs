@@ -188,7 +188,36 @@ fn json_when_clean() {
 
 #[test]
 fn sarif() {
-    insta::assert_snapshot!(rendered(Format::Sarif));
+    // The version is filtered out. It is the one field that changes on every release, for
+    // reasons that have nothing to do with the reporter, and leaving it in makes each version
+    // bump fail this test — including the automated ones, where nobody is expecting a snapshot
+    // review. What the snapshot is for is the document's shape: that the field exists, in the
+    // right place, in the right object.
+    //
+    // Which version it holds is asserted below, where a wrong answer is a real failure rather
+    // than a diff to accept.
+    // Replaced here rather than with an insta filter, which would mean enabling a feature and
+    // pulling in a regex engine to rewrite one known string. Substituting the crate's actual
+    // version is also narrower than a pattern: it cannot touch SARIF's own `"version": "2.1.0"`,
+    // which is part of the shape and must stay pinned.
+    let normalized = rendered(Format::Sarif).replace(
+        &format!(r#""version": "{}""#, env!("CARGO_PKG_VERSION")),
+        r#""version": "[version]""#,
+    );
+    insta::assert_snapshot!(normalized);
+}
+
+#[test]
+fn sarif_reports_the_crate_version() {
+    // A consumer uses this to tell one run's findings from another's. Pinning it in the
+    // snapshot would only pin whatever was last accepted; comparing it to the crate version
+    // catches the case that actually matters, where the two drift apart.
+    let rendered = rendered(Format::Sarif);
+    let expected = format!(r#""version": "{}""#, env!("CARGO_PKG_VERSION"));
+    assert!(
+        rendered.contains(&expected),
+        "sarif should report {expected}, got:\n{rendered}"
+    );
 }
 
 #[test]

@@ -37,6 +37,17 @@ if [ "$1" = "view" ]; then
   grep -qxF "$2" "${NPM_PUBLISHED}" 2>/dev/null && exit 0
   exit 1
 fi
+if [ "$1" = "publish" ]; then
+  # npm packs whatever mode it finds, so record the mode this publish would have shipped.
+  for file in "$2"/bin/*; do
+    [ -f "${file}" ] || continue
+    if [ -x "${file}" ]; then
+      printf 'mode exec %s\n' "${file}" >>"${NPM_LOG}"
+    else
+      printf 'mode noexec %s\n' "${file}" >>"${NPM_LOG}"
+    fi
+  done
+fi
 exit 0
 STUB
 chmod +x "${work}/npm"
@@ -51,19 +62,35 @@ export NPM_PUBLISHED="${work}/published"
 cd "${work}" || exit 1
 dist="dist-npm"
 
+# The version the workspace manifest declares. The fixtures use it rather than a literal so
+# they keep matching after a release bump — publish-npm.sh refuses to publish a version that
+# disagrees with Cargo.toml, and a hardcoded fixture would turn every bump into a test failure.
+workspace_version="$(python3 -c '
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+section = text.split("[workspace.package]", 1)[1]
+print(re.search(r"^version\s*=\s*\"([^\"]+)\"", section, re.MULTILINE).group(1))
+' "${repo_root}/Cargo.toml")"
+
 reset() {
-  local version="${1:-0.1.0}"
+  local version="${1:-${workspace_version}}"
   rm -rf "${dist}"
   : >"${NPM_LOG}"
   : >"${NPM_PUBLISHED}"
   for name in darwin-arm64 linux-arm64 linux-x64 win32-x64; do
-    mkdir -p "${dist}/@lanekeep/${name}"
+    mkdir -p "${dist}/@lanekeep/${name}/bin"
     printf '{"name":"@lanekeep/%s","version":"%s"}\n' "${name}" "${version}" \
       >"${dist}/@lanekeep/${name}/package.json"
+    # Deliberately not executable. This is the state `download-artifact` hands over — it
+    # unzips without permissions — and reproducing it is the whole point of the fixture.
+    printf 'binary' >"${dist}/@lanekeep/${name}/bin/lanekeep"
+    chmod 644 "${dist}/@lanekeep/${name}/bin/lanekeep"
   done
-  mkdir -p "${dist}/lanekeep"
+  mkdir -p "${dist}/lanekeep/bin"
   printf '{"name":"lanekeep","version":"%s"}\n' "${version}" \
     >"${dist}/lanekeep/package.json"
+  printf '#!/usr/bin/env node\n' >"${dist}/lanekeep/bin/lanekeep"
+  chmod 644 "${dist}/lanekeep/bin/lanekeep"
 }
 
 # The paths handed to `npm publish`, in order.
@@ -87,6 +114,23 @@ check "no path can be read as a git shorthand" "0" \
 check "the launcher specifically is a path" "1" \
   "$(published_paths | grep -cE '^\./.*/lanekeep$' | tr -d ' ')"
 
+# --- the binary ships executable --------------------------------------------------------------
+#
+# v0.1.0 published a binary at 0644 and every invocation of it died with EACCES. npm packs the
+# mode it finds and infers nothing from `bin`, and the `chmod +x` applied at packaging time is
+# undone by the artifact round trip between the package and publish jobs. Nothing between those
+# two points can see the problem, so it is asserted here, at the moment npm would pack.
+#
+# The executable bit only exists where the filesystem has one; asserting it elsewhere tests the
+# runner rather than the script.
+if [ "$(uname -s 2>/dev/null || echo unknown)" != "unknown" ] &&
+  ! uname -s | grep -qiE 'mingw|msys|cygwin'; then
+  check "nothing is published without the executable bit" "0" \
+    "$(grep -c '^mode noexec ' "${NPM_LOG}" | tr -d ' ')"
+  check "every published binary is executable" "5" \
+    "$(grep -c '^mode exec ' "${NPM_LOG}" | tr -d ' ')"
+fi
+
 # --- ordering ------------------------------------------------------------------------------
 #
 # The launcher declares the platform packages as optional dependencies. Publishing it first
@@ -96,9 +140,10 @@ check "the launcher publishes last" "0" \
 
 # --- an already-published version is skipped ------------------------------------------------
 reset
-printf '%s\n' "@lanekeep/darwin-arm64@0.1.0" "@lanekeep/linux-arm64@0.1.0" \
-  "@lanekeep/linux-x64@0.1.0" "@lanekeep/win32-x64@0.1.0" "lanekeep@0.1.0" \
-  >"${NPM_PUBLISHED}"
+for name in darwin-arm64 linux-arm64 linux-x64 win32-x64; do
+  echo "@lanekeep/${name}@${workspace_version}" >>"${NPM_PUBLISHED}"
+done
+echo "lanekeep@${workspace_version}" >>"${NPM_PUBLISHED}"
 "${script}" "${dist}" >/dev/null 2>&1
 check "a fully published release succeeds" "0" "$?"
 check "and publishes nothing again" "0" "$(published_paths | wc -l | tr -d ' ')"
@@ -108,8 +153,9 @@ check "and publishes nothing again" "0" "$(published_paths | wc -l | tr -d ' ')"
 # Four platform packages up, launcher not. Without the skip, the re-run dies on the first
 # platform package and the launcher is unreachable at this version forever.
 reset
-printf '%s\n' "@lanekeep/darwin-arm64@0.1.0" "@lanekeep/linux-arm64@0.1.0" \
-  "@lanekeep/linux-x64@0.1.0" "@lanekeep/win32-x64@0.1.0" >"${NPM_PUBLISHED}"
+for name in darwin-arm64 linux-arm64 linux-x64 win32-x64; do
+  echo "@lanekeep/${name}@${workspace_version}" >>"${NPM_PUBLISHED}"
+done
 "${script}" "${dist}" >/dev/null 2>&1
 check "a partial release resumes" "0" "$?"
 check "and publishes only what is missing" "1" "$(published_paths | wc -l | tr -d ' ')"
@@ -123,6 +169,16 @@ rm -rf "${dist:?}/@lanekeep"
 check "no platform packages fails the publish" "1" "$?"
 check "and the launcher is not published alone" "0" \
   "$(published_paths | wc -l | tr -d ' ')"
+
+# --- a version the manifest disagrees with is refused ------------------------------------------
+#
+# npm learns the version from the tag and crates.io from Cargo.toml. A mismatch ships one
+# release under two numbers, and neither registry lets a number be reused, so this has to fail
+# before anything is published rather than halfway through.
+reset 9.9.9
+"${script}" "${dist}" >/dev/null 2>&1
+check "a version Cargo.toml disagrees with is refused" "1" "$?"
+check "and nothing is published" "0" "$(published_paths | wc -l | tr -d ' ')"
 
 # --- flags reach npm --------------------------------------------------------------------------
 reset
