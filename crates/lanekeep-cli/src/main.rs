@@ -74,6 +74,13 @@ enum Command {
         #[arg(long)]
         staged: bool,
 
+        /// Report where the run spent its time, per rule.
+        ///
+        /// The split between query matching and handler execution is what tells an author
+        /// whether their query or their code is the problem.
+        #[arg(long)]
+        profile: bool,
+
         /// Apply the safe fixes rules offered, then report what is left.
         ///
         /// Only fixes a rule marked as preserving behavior. A fix it did not mark is a
@@ -87,6 +94,17 @@ enum Command {
         /// about code that has changed, and nothing else will ever say so.
         #[arg(long)]
         report_unused_suppressions: bool,
+    },
+
+    /// Write a starter config and a first rule.
+    Init {
+        /// Project root. Defaults to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Overwrite an existing config.
+        #[arg(long)]
+        force: bool,
     },
 
     /// List the rules a project has configured.
@@ -149,6 +167,7 @@ fn run() -> anyhow::Result<ExitCode> {
             staged,
             report_unused_suppressions,
             fix,
+            profile,
         } => check(CheckOptions {
             project_root: &path,
             config: config.as_deref(),
@@ -160,8 +179,10 @@ fn run() -> anyhow::Result<ExitCode> {
                 no_cache,
                 report_unused_suppressions,
                 fix,
+                profile,
             },
         }),
+        Command::Init { path, force } => init(&path, force),
         Command::Rules { path, config, json } => rules(&path, config.as_deref(), json),
         Command::Explain {
             rule,
@@ -311,6 +332,156 @@ impl Selection {
     }
 }
 
+/// Print where the run spent its time, per rule.
+///
+/// Sorted by total cost, because the reason to ask is to find the expensive one. Ties break
+/// on rule id so the table does not reorder between runs over the same corpus for reasons
+/// nobody can see.
+fn write_profile(
+    timings: &BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming>,
+) -> anyhow::Result<()> {
+    let mut ranked: Vec<_> = timings.iter().collect();
+    ranked.sort_by(|(a_id, a), (b_id, b)| b.total().cmp(&a.total()).then_with(|| a_id.cmp(b_id)));
+
+    let mut stderr = std::io::stderr();
+    writeln!(stderr, "\nprofile — where the run spent its time\n")?;
+    writeln!(
+        stderr,
+        "  {:<40} {:>9} {:>9} {:>9} {:>9}",
+        "rule", "query", "handler", "total", "matches"
+    )?;
+
+    for (id, timing) in ranked {
+        writeln!(
+            stderr,
+            "  {:<40} {:>9.1?} {:>9.1?} {:>9.1?} {:>9}",
+            id.to_string(),
+            timing.query,
+            timing.handler,
+            timing.total(),
+            timing.matches
+        )?;
+    }
+
+    // The split is the whole point, so say what it means rather than leaving two columns to
+    // be interpreted.
+    writeln!(
+        stderr,
+        "\n  query time is a rule matching more than it needs — narrow the query\n  \
+         handler time is the rule's own code\n"
+    )?;
+    stderr.flush()?;
+    Ok(())
+}
+
+/// The config a fresh project starts with.
+///
+/// A built-in rule and a local one, because the second is the thing worth showing: lanekeep
+/// exists for conventions a model cannot infer, and every one of those is project-authored.
+/// A starter that only configured built-ins would teach the wrong lesson about what the tool
+/// is for.
+const STARTER_CONFIG: &str = r"import { defineConfig } from 'lanekeep'
+import noDefaultExport from 'lanekeep/no-default-export'
+
+import noDebugger from './lanekeep/rules/no-debugger'
+
+export default defineConfig({
+  include: ['src/**/*.{ts,tsx}'],
+  exclude: ['**/*.{test,spec}.{ts,tsx}'],
+
+  rules: [noDefaultExport, noDebugger],
+})
+";
+
+/// The rule a fresh project starts with.
+///
+/// Deliberately trivial, and deliberately complete: a card with both examples, a gate, a
+/// query and a handler. Someone editing this to write their first real rule should be
+/// changing parts, not discovering which parts exist.
+const STARTER_RULE: &str = r"import { defineRule } from 'lanekeep'
+
+export default defineRule({
+  id: 'local/no-debugger',
+  severity: 'error',
+
+  // The card is not documentation. It is fed back to whoever has to act on the
+  // violation — increasingly an agent — so `remediation` is the field worth the effort.
+  card: {
+    message: 'debugger statement',
+    remediation: 'remove it before committing',
+    examples: {
+      bad: 'function pay() { debugger; }',
+      good: 'function pay() { /* ... */ }',
+    },
+  },
+
+  // Cheap and exact: a file whose bytes never contain `debugger` is never parsed.
+  gates: {
+    fileContains: ['debugger'],
+  },
+
+  // The query is the gate that matters. Rust matches it; only matches reach `check`,
+  // which is what keeps a JavaScript rule affordable.
+  query: '(debugger_statement) @stmt',
+
+  check(ctx, m) {
+    ctx.report(m.stmt)
+  },
+})
+";
+
+/// Write a starter config and rule.
+///
+/// Refuses to overwrite without `--force`. A config is a file someone has edited by the time
+/// they run this again, and silently replacing it would destroy work that nothing else has a
+/// copy of.
+fn init(project_root: &Path, force: bool) -> anyhow::Result<ExitCode> {
+    let config = project_root.join("lanekeep.config.ts");
+    let rule = project_root.join("lanekeep/rules/no-debugger.ts");
+
+    let existing: Vec<&Path> = [config.as_path(), rule.as_path()]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect();
+
+    if !existing.is_empty() && !force {
+        anyhow::bail!(
+            "{} already exist(s):\n{}\n  pass --force to overwrite",
+            if existing.len() == 1 {
+                "a file"
+            } else {
+                "files"
+            },
+            existing
+                .iter()
+                .map(|p| format!("    {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    for (path, contents) in [(&config, STARTER_CONFIG), (&rule, STARTER_RULE)] {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("cannot create `{}`: {e}", parent.display()))?;
+        }
+        std::fs::write(path, contents)
+            .map_err(|e| anyhow::anyhow!("cannot write `{}`: {e}", path.display()))?;
+    }
+
+    let mut stdout = std::io::stdout();
+    writeln!(stdout, "created {}", config.display())?;
+    writeln!(stdout, "created {}", rule.display())?;
+    writeln!(
+        stdout,
+        "\nrun `lanekeep check` to try it, and `lanekeep explain local/no-debugger` to see \
+         what a rule card looks like"
+    )?;
+    stdout.flush()?;
+
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Resolve the config path, defaulting to the first candidate that exists.
 fn config_path(project_root: &Path, given: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(path) = given {
@@ -408,6 +579,7 @@ struct Switches {
     no_cache: bool,
     report_unused_suppressions: bool,
     fix: bool,
+    profile: bool,
 }
 
 fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
@@ -423,6 +595,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
                 no_cache,
                 report_unused_suppressions,
                 fix,
+                profile,
             },
     } = options;
 
@@ -451,6 +624,8 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     // not give a smaller answer — it gives a wrong one. Skipping is the only sound option,
     // and it has to be said out loud: a rule that quietly stops running is worse than one
     // that never ran, because the clean output reads as "fixed".
+    let engine = if profile { engine.profiling() } else { engine };
+
     let engine = if report_unused_suppressions {
         engine.reporting_unused_suppressions()
     } else {
@@ -519,6 +694,11 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     let mut stdout = std::io::stdout();
     stdout.write_all(rendered.as_bytes())?;
     stdout.flush()?;
+
+    if let Some(timings) = &outcome.timings {
+        // To stderr, so `--profile --format json` still pipes a clean document.
+        write_profile(timings)?;
+    }
 
     let code = lanekeep_report::exit_code(&outcome.violations, warn_only);
     Ok(ExitCode::from(

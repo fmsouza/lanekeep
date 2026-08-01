@@ -149,6 +149,19 @@ export default parse
 $ lanekeep check --report-unused-suppressions
 ```
 
+To start from nothing:
+
+```
+$ lanekeep init          # a config plus a first rule, both runnable
+```
+
+To find out where a run spent its time — the split says whether the query or the code is
+the problem:
+
+```
+$ lanekeep check --profile
+```
+
 To find out what a rule wants without opening its source:
 
 ```
