@@ -126,8 +126,10 @@ skipped and named on stderr rather than quietly producing one.
 
 Exit `0` when clean, `1` when violations are found, `2` when the checker could not run —
 a caller has to be able to tell "your code has problems" from "the tool is broken".
-`--format json` emits a versioned, stable schema on stdout; diagnostics always go to stderr,
-so piping into a parser works even when something fails.
+Four output formats: `human` (default), `json` (versioned, stable schema), `sarif` (GitHub
+code scanning), and `agent` — token-minimal, grouped by rule rather than by file, with each
+rule's card stated once instead of once per violation. Diagnostics always go to stderr, so
+piping into a parser works even when something fails.
 
 ## Documentation
 

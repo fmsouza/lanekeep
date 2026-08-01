@@ -244,8 +244,9 @@ fn check(
     no_cache: bool,
     selection: &Selection,
 ) -> anyhow::Result<ExitCode> {
-    let format = Format::parse(format)
-        .map_err(|got| anyhow::anyhow!("unknown --format `{got}`\n  expected: human, json"))?;
+    let format = Format::parse(format).map_err(|got| {
+        anyhow::anyhow!("unknown --format `{got}`\n  expected: human, json, sarif, agent")
+    })?;
 
     // Rejected rather than accepted and ignored. A user passing `--timeout 0` has a
     // reason, and silently not applying it would surface much later as an unexplained
@@ -301,6 +302,14 @@ fn check(
         std::io::stdout().is_terminal(),
         std::env::var("NO_COLOR").ok().as_deref(),
     );
+    // Cards for every configured rule. The agent and SARIF reporters describe a rule as
+    // well as its violations, and a `Violation` carries the message and remediation but not
+    // the examples.
+    let cards: lanekeep_report::Cards = engine
+        .rules()
+        .map(|spec| (spec.id.clone(), spec.card.clone()))
+        .collect();
+
     let rendered = lanekeep_report::render(
         format,
         color,
@@ -310,6 +319,7 @@ fn check(
             files_parsed: outcome.files_parsed,
             warn_only,
         },
+        &cards,
     );
 
     let mut stdout = std::io::stdout();
