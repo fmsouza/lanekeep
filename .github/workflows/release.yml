@@ -161,24 +161,51 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # Which registries this run can publish to, decided once and stated out loud.
+      #
+      # A step's own `env:` is not available to that step's `if:` — the condition is
+      # evaluated to decide whether the step runs at all, before its environment exists. So
+      # `if: env.NPM_TOKEN != ''` on a step that sets `NPM_TOKEN` in its own `env:` reads an
+      # undefined variable and is *always* false. That is the worst possible failure here: a
+      # release that reports success and publishes nothing, indistinguishable from a
+      # deliberate dry run.
+      #
+      # Deciding in one step and branching on its output avoids the question entirely, keeps
+      # the secrets scoped to the step that reads them, and puts the answer in the log where
+      # someone cutting a release can see it.
+      - name: Decide what this run may publish
+        id: gates
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          npm="${NPM_TOKEN:+yes}"
+          crates="${CARGO_REGISTRY_TOKEN:+yes}"
+          echo "npm=${npm:-no}" >> "${GITHUB_OUTPUT}"
+          echo "crates=${crates:-no}" >> "${GITHUB_OUTPUT}"
+
+          echo "npm:       ${npm:-no (dry run)}"
+          echo "crates.io: ${crates:-no (dry run)}"
+          if [ -z "${npm}" ] && [ -z "${crates}" ]; then
+            echo "::notice::no registry secrets configured — this run publishes nothing"
+          fi
+
       # Platform packages first. The launcher depends on them, so publishing it first would
       # leave a window where `npm install lanekeep` resolves to a launcher whose binaries do
       # not exist yet.
       - name: Publish platform packages
-        if: env.NPM_TOKEN != ''
+        if: steps.gates.outputs.npm == 'yes'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for package in dist-npm/@lanekeep/*/; do
             npm publish "${package}" --access public --provenance
           done
 
       - name: Publish launcher
-        if: env.NPM_TOKEN != ''
+        if: steps.gates.outputs.npm == 'yes'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish dist-npm/lanekeep --access public --provenance
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -189,7 +216,7 @@ jobs:
       # dependencies are not yet on it. `--no-verify` is deliberately absent: a crate that
       # cannot build from its own published form is a crate nobody can use.
       - name: Publish crates
-        if: env.CARGO_REGISTRY_TOKEN != ''
+        if: steps.gates.outputs.crates == 'yes'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
