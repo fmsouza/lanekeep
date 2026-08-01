@@ -145,7 +145,14 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     permissions:
+      # `contents` for the release itself.
       contents: write
+      # `id-token` is what `npm publish --provenance` needs: npm mints a signed attestation
+      # linking the published tarball to this workflow run and this commit, and it gets the
+      # OIDC token to do that from Actions. Without this the publish *fails* — which is a
+      # failure no dry run can surface, because the step it would fail in is skipped when no
+      # secrets are configured.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
