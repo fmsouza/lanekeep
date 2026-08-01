@@ -9,63 +9,41 @@
 [workspace]
 # One version across every crate. They are released together and only make sense together —
 # `lanekeep-cli` 0.2 against `lanekeep-core` 0.1 is a combination nobody wants to support.
+# `version.workspace = true` in each manifest is what enforces that; this file only has to
+# avoid working against it.
 dependencies_update = false
-git_release_enable = true
-git_tag_enable = true
 publish = false
 semver_check = true
+
+# One tag and one release for the whole workspace, named the way `release.yml` expects.
+#
+# release-plz defaults to `{{ package }}-v{{ version }}` for a workspace with more than one
+# public crate, and that default is wrong here in a way that stayed quiet until the first real
+# run. The version before this one disabled *releases* for the eleven library crates and never
+# disabled *tags*, so the workspace default applied to all twelve: twelve tags nobody reads,
+# and a release called `lanekeep-cli-v0.1.1`. Meanwhile `release.yml` triggers on `v*` and
+# attaches its archives to `v0.1.1`. The two halves of the release never met — an empty
+# release on the releases page, and binaries on a tag release-plz had not heard of.
+#
+# So both are off by default and turned on for exactly one crate, with the names spelled out
+# rather than inherited. `scripts/test-release-config.sh` fails if a second crate enables
+# either, which is how the duplicates would come back.
+git_release_enable = false
+git_tag_enable = false
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
 
 # The changelog is for people deciding whether to upgrade, so it lists what changed for
 # them. Chores and CI changes did not.
 [changelog]
 sort_commits = "oldest"
 
+# The binary is what users install, so its release is the one the whole workspace rides on.
+# Every other crate ships as part of it rather than announcing its own.
+#
+# The eleven without tags are still tracked: release-plz works out a crate's previous version
+# from the registry rather than from a tag, and all twelve are on crates.io.
 [[package]]
 name = "lanekeep-cli"
-# The binary is what users install, so its release is the one worth announcing.
 git_release_enable = true
-
-# Everything below ships as part of the release rather than announcing its own.
-[[package]]
-name = "lanekeep-core"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-cache"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-config"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-engine"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-js"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-lang"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-lang-js"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-query"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-report"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-rules"
-git_release_enable = false
-
-[[package]]
-name = "lanekeep-testkit"
-git_release_enable = false
+git_tag_enable = true
