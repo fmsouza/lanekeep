@@ -284,8 +284,12 @@ This is a stronger position than a conventional plugin system offers, where a pl
 | `ctx.kind(node)` | Node kind |
 | `ctx.parent(node)` / `ctx.children(node)` | |
 | `ctx.ancestors(node)` | Lazy, outermost-last |
-| `ctx.closestAncestor(node, query)` | Nearest ancestor matching a query; returns its captures |
+| `ctx.closestAncestor(node, query)` | Nearest ancestor the query matches *at*; returns its captures, or `undefined` |
 | `ctx.querySubtree(node, query)` | Run a query scoped to a subtree |
+
+`closestAncestor` matches *at* an ancestor, not *within* one: the query runs rooted at each ancestor in turn and a match counts only if it captured that ancestor. Without that rule, a query matching anything anywhere inside would make the outermost ancestor the answer every time, which is never what a rule walking upward wants. It returns `undefined` rather than an empty object when nothing matches, because an empty object is truthy and `if (!ctx.closestAncestor(...))` would silently take the wrong branch.
+
+Queries passed to either are compiled once per file and cached by source, including the failures — a rule calling `querySubtree` inside a handler calls it once per match with the same string, and compiling per call would make the second-cheapest operation in the host the most expensive one.
 
 Nodes cross the boundary as opaque integer handles into the Rust-side tree, never as materialized JavaScript objects. Materializing an AST is the cost that makes native tooling with JS plugins slow; the query gate plus handle-passing avoids paying it.
 

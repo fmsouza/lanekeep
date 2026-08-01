@@ -244,10 +244,24 @@ impl CompiledQuery {
         &self,
         tree: &'tree Tree,
         source: &[u8],
+        visit: impl FnMut(QueryMatch<'_, 'tree>),
+    ) {
+        self.for_each_match_in(tree.root_node(), source, visit);
+    }
+
+    /// The same, scoped to one node's subtree.
+    ///
+    /// What `ctx.querySubtree` is built on: a rule that has already matched a function and
+    /// wants to look inside it should not have to filter the whole file's matches by
+    /// position, which is both slower and easy to get subtly wrong at boundaries.
+    pub fn for_each_match_in<'tree>(
+        &self,
+        node: Node<'tree>,
+        source: &[u8],
         mut visit: impl FnMut(QueryMatch<'_, 'tree>),
     ) {
         let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&self.query, tree.root_node(), source);
+        let mut matches = cursor.matches(&self.query, node, source);
 
         while let Some(m) = matches.next() {
             let captures = m

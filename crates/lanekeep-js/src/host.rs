@@ -22,6 +22,7 @@
 //!   makes per-file cache entries mean anything.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -32,6 +33,7 @@ use rquickjs::{Ctx, Function, Object, Value};
 use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 
 use lanekeep_core::fix::Fix;
+use lanekeep_query::CompiledQuery;
 
 use crate::files::FileAccess;
 use crate::nodes::{Handle, NodeArena};
@@ -90,7 +92,23 @@ pub struct HostContext {
     file_path: Rc<str>,
     resolver: Option<Arc<dyn BindingResolver>>,
     files: Option<Rc<FileAccess>>,
+    /// The grammar `querySubtree` and `closestAncestor` compile against.
+    language: Option<Arc<dyn lanekeep_lang::Language>>,
+    /// Queries compiled so far this file, by source.
+    ///
+    /// A rule that calls `querySubtree` inside a handler calls it once per match, with the
+    /// same query string every time. Compiling per call would make the second-cheapest
+    /// operation in the host the most expensive one. Failures are cached too, so a bad
+    /// query is reported once rather than recompiled on every match.
+    queries: QueryCache,
 }
+
+/// Queries compiled so far for one file, by source.
+///
+/// A named type because it appears in three signatures, and because the shape — a shared,
+/// mutable map whose values are *either* a compiled query or the reason it did not compile —
+/// says more with a name than inline.
+type QueryCache = Rc<RefCell<BTreeMap<String, Result<Rc<CompiledQuery>, String>>>>;
 
 impl std::fmt::Debug for HostContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,6 +119,8 @@ impl std::fmt::Debug for HostContext {
             .field("facts", &self.facts.borrow().len())
             .field("has_resolver", &self.resolver.is_some())
             .field("has_file_access", &self.files.is_some())
+            .field("has_language", &self.language.is_some())
+            .field("compiled_queries", &self.queries.borrow().len())
             .finish()
     }
 }
@@ -116,6 +136,8 @@ impl HostContext {
             file_path: Rc::from(file_path),
             resolver: None,
             files: None,
+            language: None,
+            queries: Rc::new(RefCell::new(BTreeMap::new())),
         }
     }
 
@@ -126,6 +148,17 @@ impl HostContext {
             Some(resolver) => self.with_resolver(resolver),
             None => self,
         }
+    }
+
+    /// Attach the grammar `querySubtree` and `closestAncestor` compile queries against.
+    ///
+    /// Without one they are absent rather than present-and-failing. A rule reaching for them
+    /// then gets a `TypeError` naming the function, which is the truthful answer — a stub
+    /// returning nothing would look like a query that matched nothing.
+    #[must_use]
+    pub fn with_language(mut self, language: Arc<dyn lanekeep_lang::Language>) -> Self {
+        self.language = Some(language);
+        self
     }
 
     /// Attach a binding resolver, enabling the import-resolution functions.
@@ -191,6 +224,7 @@ impl HostContext {
         self.install_reporting(ctx, &object)?;
         self.install_facts(ctx, &object)?;
         self.install_reads(ctx, &object)?;
+        self.install_queries(ctx, &object)?;
 
         Ok(object)
     }
@@ -482,6 +516,70 @@ impl HostContext {
         Ok(())
     }
 
+    /// Running queries from inside a handler.
+    fn install_queries<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
+        // --- scoped queries --------------------------------------------------------------
+
+        let Some(language) = self.language.clone() else {
+            return Ok(());
+        };
+
+        let arena = Rc::clone(&self.arena);
+        let queries = Rc::clone(&self.queries);
+        let grammar = Arc::clone(&language);
+        object.set(
+            "querySubtree",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      handle: Handle,
+                      source: String|
+                      -> rquickjs::Result<Value<'js>> {
+                    let compiled = compile(&queries, grammar.as_ref(), &source)
+                        .map_err(|problem| throw(&ctx, &problem))?;
+
+                    let matches = arena.borrow().query_subtree(handle, &compiled);
+                    let interned = intern_matches(&arena, matches);
+                    captures_to_js(&ctx, interned)
+                },
+            )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let queries = Rc::clone(&self.queries);
+        object.set(
+            "closestAncestor",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      handle: Handle,
+                      source: String|
+                      -> rquickjs::Result<Value<'js>> {
+                    let compiled = compile(&queries, language.as_ref(), &source)
+                        .map_err(|problem| throw(&ctx, &problem))?;
+
+                    let found = arena.borrow().closest_ancestor_paths(handle, &compiled);
+                    let Some(captures) = found else {
+                        // Nothing matched. `undefined` rather than an empty object, so
+                        // `if (!ctx.closestAncestor(...))` reads correctly — an empty object
+                        // is truthy in JavaScript and would silently take the wrong branch.
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+
+                    let interned = intern_matches(&arena, vec![captures]);
+                    let one = interned.into_iter().next().unwrap_or_default();
+                    let object = Object::new(ctx.clone())?;
+                    for (name, handle) in one {
+                        object.set(name, handle)?;
+                    }
+                    Ok(object.into_value())
+                },
+            )?,
+        )?;
+
+        Ok(())
+    }
+
     /// Reading other files in the project.
     fn install_reads<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
         // --- tracked reads -----------------------------------------------------------------
@@ -707,6 +805,58 @@ fn read_fix<'js>(
         // rewrites code silently.
         safe: fix.get::<_, bool>("safe").unwrap_or(false),
     }))
+}
+
+/// Compile a query, or return the failure this file already saw for it.
+fn compile(
+    cache: &QueryCache,
+    language: &dyn lanekeep_lang::Language,
+    source: &str,
+) -> Result<Rc<CompiledQuery>, String> {
+    if let Some(found) = cache.borrow().get(source) {
+        return found.clone();
+    }
+
+    let compiled = CompiledQuery::compile(language, source)
+        .map(Rc::new)
+        .map_err(|e| e.to_string());
+    cache
+        .borrow_mut()
+        .insert(source.to_owned(), compiled.clone());
+    compiled
+}
+
+/// Turn capture paths into handles, once the tree borrow has ended.
+fn intern_matches(
+    arena: &Rc<RefCell<NodeArena>>,
+    matches: Vec<Vec<(String, Vec<u32>)>>,
+) -> Vec<Vec<(String, Handle)>> {
+    let mut arena = arena.borrow_mut();
+    matches
+        .into_iter()
+        .map(|captures| {
+            captures
+                .into_iter()
+                .filter_map(|(name, path)| arena.intern_path(path).map(|handle| (name, handle)))
+                .collect()
+        })
+        .collect()
+}
+
+/// Render matches as an array of `{ captureName: handle }`.
+fn captures_to_js<'js>(
+    ctx: &Ctx<'js>,
+    matches: Vec<Vec<(String, Handle)>>,
+) -> rquickjs::Result<Value<'js>> {
+    let array = rquickjs::Array::new(ctx.clone())?;
+    for (index, captures) in matches.into_iter().enumerate() {
+        let object = Object::new(ctx.clone())?;
+        for (name, handle) in captures {
+            object.set(name, handle)?;
+        }
+        array.set(index, object)?;
+    }
+    Ok(array.into_value())
 }
 
 /// Throw a `TypeError` carrying a message meant for a rule author.
@@ -1532,5 +1682,125 @@ mod tests {
             .eval(&format!("JSON.parse({merged:?}).file"))
             .expect("parses");
         assert_eq!(file, awkward);
+    }
+
+    // --- scoped queries ------------------------------------------------------------------
+
+    /// A host with a language attached, so the query functions exist.
+    fn host_with_language(source: &str) -> HostContext {
+        HostContext::new(parse(source), source.to_owned(), "src/example.ts")
+            .with_resolver(Arc::new(lanekeep_lang_js::binding::JsBindingResolver))
+            .with_language(Arc::new(TypeScript))
+    }
+
+    #[test]
+    fn a_subtree_query_finds_only_what_is_inside() {
+        // The point of scoping: a rule that matched a function and wants to look inside it
+        // should not have to filter the whole file's matches by position.
+        let source = "function a() { const x = 1; }\nfunction b() { const y = 2; const z = 3; }\n";
+        let host = host_with_language(source);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+
+        let names: Vec<String> = sandbox
+            .eval_with_host(
+                &host,
+                "const fns = ctx.querySubtree(ctx.root, '(function_declaration) @fn');\n\
+                 const inner = ctx.querySubtree(fns[1].fn, '(variable_declarator name: (identifier) @name)');\n\
+                 inner.map((m) => ctx.text(m.name))",
+            )
+            .expect("evaluates");
+
+        assert_eq!(names, vec!["y".to_owned(), "z".to_owned()]);
+    }
+
+    #[test]
+    fn a_subtree_query_with_no_matches_is_an_empty_array() {
+        // So `for (const m of ctx.querySubtree(...))` is a no-op rather than a TypeError.
+        let host = host_with_language("const a = 1;\n");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let length: i32 = sandbox
+            .eval_with_host(
+                &host,
+                "ctx.querySubtree(ctx.root, '(debugger_statement) @d').length",
+            )
+            .expect("evaluates");
+        assert_eq!(length, 0);
+    }
+
+    #[test]
+    fn an_invalid_query_is_reported_to_the_rule() {
+        let host = host_with_language("const a = 1;\n");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let error = sandbox
+            .eval_with_host::<()>(&host, "ctx.querySubtree(ctx.root, '(((')")
+            .expect_err("is rejected");
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn closest_ancestor_finds_the_nearest_one() {
+        // Nearest, not outermost — the whole reason a rule walks upward.
+        let source = "function outer() { function inner() { const x = 1; } }\n";
+        let host = host_with_language(source);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+
+        let name: String = sandbox
+            .eval_with_host(
+                &host,
+                "const decls = ctx.querySubtree(ctx.root, '(variable_declarator name: (identifier) @n)');\n\
+                 const found = ctx.closestAncestor(decls[0].n, '(function_declaration name: (identifier) @name) @fn');\n\
+                 ctx.text(found.name)",
+            )
+            .expect("evaluates");
+
+        assert_eq!(name, "inner");
+    }
+
+    #[test]
+    fn closest_ancestor_returns_undefined_when_nothing_matches() {
+        // `undefined` rather than an empty object: an empty object is truthy, so
+        // `if (!ctx.closestAncestor(...))` would silently take the wrong branch.
+        let host = host_with_language("const a = 1;\n");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let absent: bool = sandbox
+            .eval_with_host(
+                &host,
+                "const d = ctx.querySubtree(ctx.root, '(variable_declarator name: (identifier) @n)');\n\
+                 ctx.closestAncestor(d[0].n, '(class_declaration) @c') === undefined",
+            )
+            .expect("evaluates");
+        assert!(absent);
+    }
+
+    #[test]
+    fn closest_ancestor_does_not_match_the_node_itself_from_inside() {
+        // A query matching something *within* an ancestor must not make that ancestor the
+        // answer — otherwise the outermost node matches every time.
+        let source = "function outer() { function inner() { const x = 1; } }\n";
+        let host = host_with_language(source);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+
+        let name: String = sandbox
+            .eval_with_host(
+                &host,
+                "const d = ctx.querySubtree(ctx.root, '(variable_declarator name: (identifier) @n)');\n\
+                 const found = ctx.closestAncestor(d[0].n, '(statement_block) @block');\n\
+                 ctx.kind(found.block)",
+            )
+            .expect("evaluates");
+        assert_eq!(name, "statement_block");
+    }
+
+    #[test]
+    fn the_query_functions_are_absent_without_a_language() {
+        // A stub returning nothing would look like a query that matched nothing.
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        for absent in ["ctx.querySubtree", "ctx.closestAncestor"] {
+            let present: bool = sandbox
+                .eval_with_host(&host, &format!("{absent} !== undefined"))
+                .expect("evaluates");
+            assert!(!present, "`{absent}` should not exist without a language");
+        }
     }
 }

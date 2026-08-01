@@ -1,0 +1,48 @@
+#!/usr/bin/env node
+/**
+ * Hand control to the platform binary.
+ *
+ * lanekeep's exit code is load-bearing — 0 clean, 1 violations, 2 could not run — so this
+ * wrapper's whole job is to pass it through unchanged, along with stdio and any signal that
+ * killed the child.
+ *
+ * A `spawnSync` with inherited stdio rather than an `execve`: replacing the process would be
+ * marginally cleaner on Unix, Node has no way to do it without a native dependency, and a
+ * native dependency in the package whose entire point is not needing one is the wrong trade.
+ * The cost is one idle Node process for the duration of a run.
+ */
+
+const { spawnSync } = require('node:child_process')
+
+const { resolveBinary } = require('../resolve.js')
+
+let binary
+try {
+  binary = resolveBinary()
+} catch (error) {
+  process.stderr.write(`${error.message}\n`)
+  // 2, not 1: lanekeep could not run, which is not the same as finding violations. A
+  // pre-commit hook that read a broken install as "your code has problems" would be worse
+  // than useless — it would block on something the author cannot fix by editing code.
+  process.exit(2)
+}
+
+const result = spawnSync(binary, process.argv.slice(2), {
+  stdio: 'inherit',
+  windowsHide: true,
+})
+
+if (result.error) {
+  process.stderr.write(`lanekeep could not start: ${result.error.message}\n`)
+  process.exit(2)
+}
+
+if (result.signal) {
+  // Re-raised rather than turned into an exit code, so a caller that distinguishes a killed
+  // process from a failing one still can. Windows reports none, so this never fires there.
+  process.kill(process.pid, result.signal)
+}
+
+// `null` means the child died from a signal the platform did not name. The run did not
+// finish, so 2 is the honest answer.
+process.exit(result.status ?? 2)
