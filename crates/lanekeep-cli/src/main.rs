@@ -71,6 +71,13 @@ enum Command {
         /// Check only files staged in the index. The pre-commit default.
         #[arg(long)]
         staged: bool,
+
+        /// Also report suppressions that silenced nothing.
+        ///
+        /// Hygiene: a suppression whose violation no longer exists documents a decision
+        /// about code that has changed, and nothing else will ever say so.
+        #[arg(long)]
+        report_unused_suppressions: bool,
     },
 
     /// List the rules a project has configured.
@@ -131,15 +138,17 @@ fn run() -> anyhow::Result<ExitCode> {
             no_cache,
             since,
             staged,
-        } => check(
-            &path,
-            config.as_deref(),
-            &format,
+            report_unused_suppressions,
+        } => check(CheckOptions {
+            project_root: &path,
+            config: config.as_deref(),
+            format: &format,
             warn_only,
             timeout,
             no_cache,
-            &Selection::from(since, staged),
-        ),
+            selection: Selection::from(since, staged),
+            report_unused_suppressions,
+        }),
         Command::Rules { path, config, json } => rules(&path, config.as_deref(), json),
         Command::Explain {
             rule,
@@ -263,15 +272,33 @@ fn prepare(
     Ok((engine, declared))
 }
 
-fn check(
-    project_root: &Path,
-    config: Option<&Path>,
-    format: &str,
+/// Everything `check` was asked for.
+///
+/// A struct rather than eight parameters: the flags are all independent booleans and paths,
+/// which is exactly the shape that gets silently transposed at a call site.
+struct CheckOptions<'a> {
+    project_root: &'a Path,
+    config: Option<&'a Path>,
+    format: &'a str,
     warn_only: bool,
     timeout: Option<u64>,
     no_cache: bool,
-    selection: &Selection,
-) -> anyhow::Result<ExitCode> {
+    selection: Selection,
+    report_unused_suppressions: bool,
+}
+
+fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
+    let CheckOptions {
+        project_root,
+        config,
+        format,
+        warn_only,
+        timeout,
+        no_cache,
+        selection,
+        report_unused_suppressions,
+    } = options;
+
     let format = Format::parse(format).map_err(|got| {
         anyhow::anyhow!("unknown --format `{got}`\n  expected: human, json, sarif, agent")
     })?;
@@ -297,6 +324,12 @@ fn check(
     // not give a smaller answer — it gives a wrong one. Skipping is the only sound option,
     // and it has to be said out loud: a rule that quietly stops running is worse than one
     // that never ran, because the clean output reads as "fixed".
+    let engine = if report_unused_suppressions {
+        engine.reporting_unused_suppressions()
+    } else {
+        engine
+    };
+
     let engine = if selection.is_narrowed() && !cross_file.is_empty() {
         let mut stderr = std::io::stderr();
         writeln!(

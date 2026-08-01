@@ -521,7 +521,7 @@ minWidth: 44,
 - Rule IDs whitespace- or comma-separated, and **namespaced** — a bare id is rejected rather than silently matching nothing.
 - `reason:` mandatory. A suppression is a decision to accept a violation, and the next person to read it cannot tell whether that decision still holds without one.
 - Directive must be a standalone token, so prose mentioning it doesn't match.
-- `--report-unused-suppressions` — hygiene. A suppression whose violation no longer exists is debt.
+- `--report-unused-suppressions` — hygiene. A suppression whose violation no longer exists documents a decision about code that has changed, and nothing else will ever say so. Reported as a **warning**: turning on a hygiene report must not fail a build that was passing. Off by default, because debt is worth surfacing on request rather than in everyone's inner loop.
 - Optional `expires: YYYY-MM-DD` — surfaces as a violation past the date. Makes "temporary" suppressions actually temporary.
 
 **A directive that does not work says so.** A missing `reason:`, a bare rule id, an unreadable `expires:`, a directive naming no rules — each is reported as a violation of `lanekeep/suppression` rather than skipped. The failure this guards against is a comment that looks like it silences something, does not, and never says so: the author moves on believing the violation is handled.
@@ -534,7 +534,7 @@ Directives are found by scanning for a standalone token rather than by walking c
 
 Two things follow from caching, and both are easy to get wrong:
 
-- **Directives live in the cache entry**, because a reduce-phase violation is reported at a site in a file that may not have been reprocessed this run. Without them the warm path would drop the directive and report a violation the author had already accepted.
+- **Directives live in the cache entry**, because a reduce-phase violation is reported at a site in a file that may not have been reprocessed this run. Without them the warm path would drop the directive and report a violation the author had already accepted. The entry also records *which* directives fired: a warm run sees the survivors and not what was hidden, so without it every suppression in a cached file would suddenly look unused.
 - **A file carrying `expires:` has the date in its cache key.** An expiry that a warm run ignored would never expire, which is the one thing an expiry exists to prevent — so those files get an entry that lives for a day. Folding the date into *every* key would invalidate the whole cache daily for the sake of the handful of files that have one.
 
 The date is read once per run, from the host, in UTC. Once per run so two files checked a millisecond apart cannot disagree about what day it is; UTC because a deadline that moved with the reader's time zone would expire twice in some places and not at all in others. The sandbox still has no clock — a rule cannot observe the date, only a directive can be compared against it.

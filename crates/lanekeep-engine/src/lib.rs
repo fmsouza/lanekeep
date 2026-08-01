@@ -130,6 +130,8 @@ pub struct Engine {
     caching: bool,
     /// Whether reduce phases run.
     reducing: bool,
+    /// Whether directives that silenced nothing are reported.
+    reporting_unused: bool,
     /// The date `expires:` is compared against.
     ///
     /// Fixed once for the run, so two files checked a millisecond apart cannot disagree
@@ -257,6 +259,7 @@ impl Engine {
             run_key,
             caching: true,
             reducing: true,
+            reporting_unused: false,
             today: suppression::today(),
             // Canonicalized here so every tracked read compares against the same absolute
             // root. Falling back to the path as given keeps a non-existent root a discovery
@@ -277,6 +280,17 @@ impl Engine {
     #[must_use]
     pub const fn without_cache(mut self) -> Self {
         self.caching = false;
+        self
+    }
+
+    /// Report suppressions that silenced nothing.
+    ///
+    /// Off by default because it is hygiene rather than correctness: a suppression whose
+    /// violation no longer exists is debt, and debt is worth surfacing on request rather
+    /// than in everyone's inner loop.
+    #[must_use]
+    pub const fn reporting_unused_suppressions(mut self) -> Self {
+        self.reporting_unused = true;
         self
     }
 
@@ -384,7 +398,7 @@ impl Engine {
         let mut files_parsed = 0;
         let mut dependencies = BTreeMap::new();
         let mut fresh = Store::empty();
-        let mut directives: BTreeMap<FilePath, Vec<suppression::Suppression>> = BTreeMap::new();
+        let mut directives: BTreeMap<FilePath, FileDirectives> = BTreeMap::new();
         for result in results {
             let outcome = result?;
             violations.extend(outcome.violations);
@@ -394,7 +408,13 @@ impl Engine {
                 fresh.insert(entry.0, entry.1);
             }
             if !outcome.suppressions.is_empty() {
-                directives.insert(outcome.path.clone(), outcome.suppressions);
+                directives.insert(
+                    outcome.path.clone(),
+                    FileDirectives {
+                        suppressions: outcome.suppressions,
+                        used: outcome.used_suppressions,
+                    },
+                );
             }
             if !outcome.reads.is_empty() {
                 dependencies.insert(outcome.path, outcome.reads);
@@ -436,11 +456,24 @@ impl Engine {
         // cache hit this run — so its directives come from the outcome, whether they were
         // parsed now or restored from the entry.
         let reduced = self.reduce(&clock, files, &facts)?;
-        violations.extend(
-            reduced
-                .into_iter()
-                .filter(|violation| !suppressed_elsewhere(&directives, violation)),
-        );
+        for violation in reduced {
+            // A cross-file violation can be the only thing a directive ever silences, so
+            // usage is recorded here too — otherwise it would be reported as unused.
+            match covering_elsewhere(&directives, &violation) {
+                Some((file, index)) => {
+                    if let Some(found) = directives.get_mut(&file)
+                        && !found.used.contains(&index)
+                    {
+                        found.used.push(index);
+                    }
+                }
+                None => violations.push(violation),
+            }
+        }
+
+        if self.reporting_unused {
+            violations.extend(unused_violations(&directives));
+        }
 
         lanekeep_core::sort(&mut violations);
         Ok(Outcome {
@@ -646,10 +679,24 @@ impl Engine {
         }
 
         // Applied after every rule has run, so a directive covers whatever any of them
-        // reported at that line.
-        outcome
-            .violations
-            .retain(|violation| !is_suppressed(&directives, violation));
+        // reported at that line. Which directive fired is recorded rather than discarded:
+        // it is the only moment the information exists, since a warm run sees the survivors
+        // and not what was hidden.
+        let mut used = Vec::new();
+        outcome.violations.retain(|violation| {
+            match directives.covering(&violation.rule_id, violation.location.position.line) {
+                Some(index) => {
+                    let index = u32::try_from(index).unwrap_or(u32::MAX);
+                    if !used.contains(&index) {
+                        used.push(index);
+                    }
+                    false
+                }
+                None => true,
+            }
+        });
+        used.sort_unstable();
+        outcome.used_suppressions = used;
         outcome
             .violations
             .extend(self.directive_violations(&directives, path));
@@ -664,6 +711,7 @@ impl Engine {
                     facts: outcome.facts.clone(),
                     dependencies: outcome.reads.clone(),
                     suppressions: outcome.suppressions.clone(),
+                    used_suppressions: outcome.used_suppressions.clone(),
                 },
             )
         });
@@ -909,6 +957,8 @@ struct FileOutcome {
     reads: Vec<TrackedRead>,
     /// The file's suppression directives, for filtering reduce-phase violations.
     suppressions: Vec<suppression::Suppression>,
+    /// Indices of the directives that silenced something.
+    used_suppressions: Vec<u32>,
     /// What to store for this file, when caching is on.
     entry: Option<(CacheKey, CacheEntry)>,
     /// Whether the file was parsed at all, for the "n files checked" count.
@@ -924,6 +974,7 @@ impl FileOutcome {
             facts: Vec::new(),
             reads: Vec::new(),
             suppressions: Vec::new(),
+            used_suppressions: Vec::new(),
             entry: None,
             parsed: false,
         }
@@ -936,6 +987,7 @@ impl FileOutcome {
             facts: Vec::new(),
             reads: Vec::new(),
             suppressions: Vec::new(),
+            used_suppressions: Vec::new(),
             entry: None,
             parsed: true,
         }
@@ -952,6 +1004,7 @@ impl FileOutcome {
             facts: entry.facts.clone(),
             reads: entry.dependencies.clone(),
             suppressions: entry.suppressions.clone(),
+            used_suppressions: entry.used_suppressions.clone(),
             entry: Some((key, entry)),
             parsed: true,
         }
@@ -965,34 +1018,75 @@ impl FileOutcome {
             facts: Vec::new(),
             reads: Vec::new(),
             suppressions: Vec::new(),
+            used_suppressions: Vec::new(),
             entry: key.map(|key| (key, CacheEntry::default())),
             parsed: false,
         }
     }
 }
 
-/// Whether a directive in this file silences this violation.
-fn is_suppressed(directives: &Suppressions, violation: &Violation) -> bool {
-    directives
-        .covering(&violation.rule_id, violation.location.position.line)
-        .is_some()
+/// One file's directives, and which of them silenced something.
+struct FileDirectives {
+    suppressions: Vec<suppression::Suppression>,
+    /// Indices into `suppressions`. Carried from the cache entry on a warm run.
+    used: Vec<u32>,
 }
 
-/// Whether a violation reported into some other file is silenced there.
+/// Which directive silences a violation reported into some other file.
 ///
 /// A cross-file rule reports at the site a fact came from, so the directives that matter are
 /// that file's, not the one the rule happened to be reducing over.
-fn suppressed_elsewhere(
-    directives: &BTreeMap<FilePath, Vec<suppression::Suppression>>,
+fn covering_elsewhere(
+    directives: &BTreeMap<FilePath, FileDirectives>,
     violation: &Violation,
-) -> bool {
-    directives
-        .get(&violation.location.file)
-        .is_some_and(|found| {
-            found.iter().any(|suppression| {
-                suppression.covers(&violation.rule_id, violation.location.position.line)
-            })
-        })
+) -> Option<(FilePath, u32)> {
+    let found = directives.get(&violation.location.file)?;
+    let index = found.suppressions.iter().position(|suppression| {
+        suppression.covers(&violation.rule_id, violation.location.position.line)
+    })?;
+
+    Some((
+        violation.location.file.clone(),
+        u32::try_from(index).unwrap_or(u32::MAX),
+    ))
+}
+
+/// Violations for directives that silenced nothing.
+///
+/// A suppression whose violation no longer exists is debt: it documents a decision about
+/// code that has changed, and the next person to read it has no way to tell it is stale.
+///
+/// Reported as warnings rather than errors. Turning on a hygiene report should not fail a
+/// build that was passing — the point is to show the debt, not to refuse to proceed until it
+/// is paid.
+fn unused_violations(directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Violation> {
+    let Ok(rule_id) = SUPPRESSION_RULE.parse::<RuleId>() else {
+        return Vec::new();
+    };
+
+    let mut violations = Vec::new();
+    for (file, found) in directives {
+        for (index, suppression) in found.suppressions.iter().enumerate() {
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            if found.used.contains(&index) {
+                continue;
+            }
+
+            violations.push(Violation {
+                rule_id: rule_id.clone(),
+                location: Location::new(
+                    file.clone(),
+                    Position::new(suppression.line, suppression.column),
+                ),
+                message: format!("suppression silenced nothing — \"{}\"", suppression.reason),
+                remediation: String::from(
+                    "remove it: whatever it was accepting is no longer reported",
+                ),
+                severity: Severity::Warn,
+            });
+        }
+    }
+    violations
 }
 
 /// The engine version a cache key uses: major.minor only.
@@ -2029,6 +2123,7 @@ export default defineRule({
                 facts: Vec::new(),
                 dependencies: Vec::new(),
                 suppressions: Vec::new(),
+                used_suppressions: Vec::new(),
             },
         );
         doctored.save(&project.dir);
@@ -2653,5 +2748,186 @@ export default defineRule({
             ],
         );
         assert_eq!(project.run().expect("runs").violations.len(), 1);
+    }
+
+    // --- unused suppressions ---------------------------------------------------------------
+
+    impl Project {
+        fn run_reporting_unused(&self) -> Result<Outcome, RunError> {
+            self.build()
+                .map(Engine::reporting_unused_suppressions)?
+                .run()
+        }
+    }
+
+    #[test]
+    fn a_suppression_that_silenced_nothing_is_reported() {
+        let project = Project::new(
+            "unused-reported",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: was needed once\n\
+                     const a = 1;\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run_reporting_unused().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0].message.contains("silenced nothing"),
+            "{:?}",
+            messages(&outcome)
+        );
+        assert!(
+            outcome.violations[0].message.contains("was needed once"),
+            "the reason should be quoted back: {:?}",
+            messages(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_suppression_that_did_its_job_is_not_reported() {
+        let project = Project::new(
+            "unused-used",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: legacy\ndebugger;\n",
+                ),
+            ],
+        );
+        assert!(
+            project
+                .run_reporting_unused()
+                .expect("runs")
+                .violations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unused_suppressions_are_quiet_without_the_flag() {
+        // Hygiene, on request. It must not appear in everyone's inner loop.
+        let project = Project::new(
+            "unused-off",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: stale\nconst a = 1;\n",
+                ),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+    }
+
+    #[test]
+    fn an_unused_suppression_is_a_warning_not_an_error() {
+        // Turning on a hygiene report must not fail a build that was passing.
+        let project = Project::new(
+            "unused-severity",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: stale\nconst a = 1;\n",
+                ),
+            ],
+        );
+        let outcome = project.run_reporting_unused().expect("runs");
+        assert_eq!(outcome.violations[0].severity, Severity::Warn);
+        assert!(!lanekeep_core::any_failing(&outcome.violations));
+    }
+
+    #[test]
+    fn usage_survives_a_warm_run() {
+        // The case this needed a cache field for: a warm run sees the survivors and not what
+        // was hidden, so without the recorded usage every suppression in a cached file would
+        // suddenly look unused.
+        let project = Project::new(
+            "unused-warm",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger reason: legacy\ndebugger;\n",
+                ),
+            ],
+        );
+
+        assert!(
+            project
+                .run_reporting_unused()
+                .expect("runs")
+                .violations
+                .is_empty()
+        );
+        let warm = project.run_reporting_unused().expect("runs");
+        assert!(
+            warm.violations.is_empty(),
+            "a warm run called a used suppression unused: {:?}",
+            messages(&warm)
+        );
+    }
+
+    #[test]
+    fn a_suppression_used_only_by_a_cross_file_rule_is_not_unused() {
+        // A directive can be the only thing standing between a reduce-phase violation and
+        // the report. Counting usage only during the per-file pass would call it unused.
+        let project = Project::new(
+            "unused-cross-file",
+            &[
+                ("rule.ts", UNUSED_EXPORTS_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "export function used() {}\n\
+                     // lanekeep-ignore-next-line local/no-unused-exports reason: public API\n\
+                     export function spare() {}\n",
+                ),
+                ("src/b.ts", "import { used } from './a';\nused();\n"),
+            ],
+        );
+
+        let outcome = project.run_reporting_unused().expect("runs");
+        assert!(
+            outcome.violations.is_empty(),
+            "a directive used by a cross-file rule was called unused: {:?}",
+            messages(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_malformed_directive_is_not_also_reported_as_unused() {
+        // It already has a violation saying what is wrong with it. A second one saying it
+        // silenced nothing would be true, unhelpful, and confusing.
+        let project = Project::new(
+            "unused-malformed",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "// lanekeep-ignore-next-line local/no-debugger\nconst a = 1;\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run_reporting_unused().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0].message.contains("no `reason:`"),
+            "{:?}",
+            messages(&outcome)
+        );
     }
 }

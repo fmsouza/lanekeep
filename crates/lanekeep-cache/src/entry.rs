@@ -39,6 +39,13 @@ pub struct Entry {
     /// not reprocessed this run. Without them, the warm path would drop the directive and
     /// report a violation the author had already accepted.
     pub suppressions: Vec<Suppression>,
+
+    /// Indices into `suppressions` of the directives that silenced something.
+    ///
+    /// Recorded because a warm run never sees what a directive suppressed — the entry holds
+    /// the violations that survived, and the ones it hid are gone. Without this, every
+    /// suppression in a cached file would look unused.
+    pub used_suppressions: Vec<u32>,
 }
 
 impl Entry {
@@ -88,6 +95,11 @@ impl Entry {
                 }
                 None => out.push(0),
             }
+        }
+
+        write_len(out, self.used_suppressions.len());
+        for index in &self.used_suppressions {
+            out.extend_from_slice(&index.to_le_bytes());
         }
 
         write_len(out, self.dependencies.len());
@@ -173,6 +185,17 @@ impl Entry {
             });
         }
 
+        let mut used_suppressions = Vec::with_capacity(cursor.peek_len()?);
+        for _ in 0..cursor.read_len()? {
+            let index = cursor.read_u32()?;
+            // An index past the end would be an entry claiming a directive that is not
+            // there. Refusing is one more way this stays total.
+            if index as usize >= suppressions.len() {
+                return None;
+            }
+            used_suppressions.push(index);
+        }
+
         let mut dependencies = Vec::with_capacity(cursor.peek_len()?);
         for _ in 0..cursor.read_len()? {
             let path = FilePath::new(cursor.read_str()?);
@@ -191,6 +214,7 @@ impl Entry {
             facts,
             dependencies,
             suppressions,
+            used_suppressions,
         })
     }
 }
@@ -345,7 +369,28 @@ mod tests {
                     column: 1,
                 },
             ],
+            used_suppressions: vec![1],
         }
+    }
+
+    #[test]
+    fn which_suppressions_were_used_survives_a_round_trip() {
+        // A warm run never sees what a directive suppressed, so without this every
+        // suppression in a cached file would look unused.
+        let entry = populated();
+        assert_eq!(
+            round_trip(&entry).expect("decodes").used_suppressions,
+            entry.used_suppressions
+        );
+    }
+
+    #[test]
+    fn a_used_index_past_the_end_is_refused() {
+        let mut entry = populated();
+        entry.used_suppressions = vec![99];
+        let mut bytes = Vec::new();
+        entry.encode(&mut bytes);
+        assert_eq!(Entry::decode(&bytes), None);
     }
 
     #[test]

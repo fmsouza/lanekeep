@@ -113,6 +113,19 @@ src/bad.ts:2:1 error [lanekeep/no-default-export] default export
 ✖ 2 error(s) across 2 file(s) checked
 ```
 
+Suppressions carry a mandatory reason and an optional expiry, and a directive that does not
+work says so — a missing reason, a bare rule id, or an unreadable date is reported rather
+than silently doing nothing:
+
+```ts
+// lanekeep-ignore-next-line lanekeep/no-default-export reason: legacy entry point
+export default parse
+```
+
+```
+$ lanekeep check --report-unused-suppressions
+```
+
 To find out what a rule wants without opening its source:
 
 ```

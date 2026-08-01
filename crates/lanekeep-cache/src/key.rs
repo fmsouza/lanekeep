@@ -16,7 +16,7 @@ use lanekeep_core::ContentHash;
 /// Bumped when the encoding changes. Because it feeds the key, an old file simply misses
 /// rather than being misread — the cache is disposable, so a format change costs one cold
 /// run and needs no migration.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Everything about a run that every file's key shares.
 ///
