@@ -34,8 +34,7 @@ out="${work}/out"
 
 # --- a complete set of binaries packages cleanly ---------------------------------------
 artifacts="${work}/dist"
-for triple in aarch64-apple-darwin x86_64-apple-darwin \
-  aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+for triple in aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
   mkdir -p "${artifacts}/${triple}"
   printf 'binary' >"${artifacts}/${triple}/lanekeep"
 done

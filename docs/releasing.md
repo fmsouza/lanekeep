@@ -64,6 +64,21 @@ more thing to forget, and forgetting it publishes a launcher that pulls the prev
 release's binaries. `scripts/test-build-npm-packages.sh` covers the assembly and the
 launcher's platform resolution, and runs as part of `just check`.
 
+## Which platforms are prebuilt
+
+macOS on Apple silicon, Linux on x86-64 and arm64, Windows on x86-64. Each is built on a
+runner of its own architecture and smoke-tested before it ships.
+
+**Intel macOS is not among them.** Building it natively needs a `macos-13` runner, and
+GitHub no longer reliably provides one — a release that waits indefinitely on a runner that
+never arrives is worse than one platform fewer. It could be cross-compiled from an ARM
+runner, since Apple ships both SDKs, but GitHub's ARM macOS runners have no Rosetta and so
+nothing could execute the result before publishing it. Shipping a binary nobody has run once
+is how a broken one reaches a user.
+
+Anyone on an Intel Mac gets `cargo install lanekeep-cli`, and the npm launcher names that as
+the remedy rather than failing obscurely.
+
 ## Adding a platform
 
 Three places, and all three are checked:

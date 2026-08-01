@@ -111,6 +111,10 @@ A single static binary with the JavaScript engine compiled in. **Node.js is not 
 run lanekeep**, even though rules are written in TypeScript — it is required only to install
 it from npm, where it picks which binary to fetch.
 
+Prebuilt for macOS on Apple silicon, Linux on x86-64 and arm64, and Windows on x86-64.
+Intel macOS is not prebuilt — `cargo install lanekeep-cli` builds it from source, and the
+npm launcher says so rather than failing obscurely.
+
 See [`docs/releasing.md`](docs/releasing.md) for how a release is cut.
 
 ## What it looks like
