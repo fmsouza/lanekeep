@@ -25,5 +25,8 @@ lanekeep-lang-js = { workspace = true }
 lanekeep-report = { workspace = true }
 lanekeep-rules = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

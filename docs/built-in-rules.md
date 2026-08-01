@@ -122,6 +122,110 @@ every other directory, which would rot the first time someone adds one.
 know what to do instead, not merely that something is banned — the reason is the part of the
 message that tells it.
 
+
+---
+
+## `lanekeep/no-unused-exports`
+
+Exports nobody in the corpus imports.
+
+Dead exported code is worse than dead private code: it is part of a module's surface, so a
+reader has to assume something depends on it, and an agent will happily wire new code up to
+it. Nothing in the exporting file reveals the problem — which is why this is a
+[cross-file rule](cross-file-rules.md) rather than a query.
+
+```ts
+import noUnusedExports from 'lanekeep/no-unused-exports'
+
+export default defineConfig({
+  rules: [noUnusedExports({ entryPoints: ['src/index.ts', 'src/cli.ts'] })],
+})
+```
+
+### Options
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `entryPoints` | `string[]` | Files whose exports are consumed from outside the corpus. Defaults to `[]`. |
+
+**Set `entryPoints`.** A library's public API is imported by its users, not by itself, so
+without this the rule reports every exported symbol of every package — true of the corpus,
+and useless as advice.
+
+### What counts as a use
+
+Matching is by `(resolved module, symbol)`, not by symbol name. A rule that treated any
+`parse` imported anywhere as covering every exported `parse` would go quiet on a codebase
+with common names, which is every codebase.
+
+- `import { x } from './a'` uses `a.ts`'s `x`.
+- `import { x as y } from './a'` uses `x` — the name, not the alias. It is `x` that `a.ts`
+  publishes.
+- `import * as ns from './a'` and `export * from './a'` consume the whole module without
+  naming anything, so everything in `a.ts` counts as used. The alternative would be
+  reporting exports that are demonstrably reachable.
+- `export { internal as published }` is reported under `published`, the name it publishes.
+- A specifier that resolves to nothing in the corpus — a package, an excluded file — is
+  ignored rather than guessed at.
+
+Relative specifiers resolve without extensions (`./a` finds `a.ts`), through directories
+(`./thing` finds `thing/index.ts`), and across `..`. There is no `node_modules` lookup and
+no `tsconfig` path mapping: a specifier that does not start with `.` names something outside
+the corpus, and a rule reasoning about the corpus has nothing to say about it.
+
+---
+
+## `lanekeep/no-circular-imports`
+
+Import cycles.
+
+A cycle is the architectural failure that hides best. Everything compiles, the bundler
+copes, and then one module observes a half-initialized binding from another and produces an
+error miles from its cause — usually only under a particular import order, which is why it
+survives review and shows up in production.
+
+```ts
+import noCircularImports from 'lanekeep/no-circular-imports'
+
+export default defineConfig({
+  rules: [noCircularImports()],
+})
+```
+
+### Options
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `maxDepth` | `number` | Longest cycle to look for. Defaults to `24`. |
+
+A cycle spanning more files than `maxDepth` is not reported. Cycles get harder to act on the
+longer they are, and an unbounded search on a pathological graph is the one way this rule
+could become the slowest thing in a run.
+
+### What it reports
+
+One violation per cycle, not per member — `a → b → c → a` is one problem, and reporting it
+three times would leave the reader to work out they are the same thing. The violation is
+anchored at the import that closes the cycle: the single edge whose removal breaks it.
+
+`export ... from` counts as an edge. It is an import with different syntax, and a cycle
+through one fails at runtime the same way.
+
+A module importing itself is not reported. It is a different mistake, and "extract what both
+modules need into a third" is not advice that applies to it.
+
+## Composing them
+
+The two cross-file rules share their module resolution, which is exported as
+`lanekeep/paths` and available to project rules too:
+
+```ts
+import { resolveImport, dirname, join } from 'lanekeep/paths'
+```
+
+Two rules resolving `./a` differently would not look like a bug — each would be individually
+plausible — so the resolution has one definition.
+
 ---
 
 ## Adding one
@@ -132,7 +236,9 @@ needed something a project rule cannot have would be evidence the host API is wr
 1. Write `crates/lanekeep-rules/rules/<name>.ts`, importing only from `lanekeep`.
 2. Add it to `BUILT_INS` in [`crates/lanekeep-rules/src/lib.rs`](../crates/lanekeep-rules/src/lib.rs).
 3. Test it in `crates/lanekeep-rules/tests/<name>.rs` with `RuleTester`, which runs the real
-   engine over a throwaway project — real config loading, real gates, real sandbox.
+   engine over a throwaway project — real config loading, real gates, real sandbox. A
+   cross-file rule needs more than one file, so those live in
+   `crates/lanekeep-cli/tests/<name>.rs` and drive the built binary over a real corpus.
 
 Cover the forms that do not look like the obvious one. Every gap found while writing these
 two rules was a form that read differently in source but meant the same thing.
