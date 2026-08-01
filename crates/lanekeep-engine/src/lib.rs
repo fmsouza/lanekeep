@@ -35,9 +35,12 @@ use std::sync::Arc;
 
 use lanekeep_config::{Config, ConfigError, RuleSpec};
 use lanekeep_core::{
-    CompiledGates, Discovery, DiscoveryError, FilePath, Location, Position, Severity, Violation,
+    CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, Severity,
+    Violation,
 };
-use lanekeep_js::{HostContext, Limits, RuleRoot, RunClock, Sandbox, SandboxError};
+use lanekeep_js::{
+    HostContext, Limits, ReduceContext, ReduceFact, RuleRoot, RunClock, Sandbox, SandboxError,
+};
 use lanekeep_lang::{Language, LanguageRegistry};
 use lanekeep_query::{CompileError, CompiledQuery};
 use rayon::prelude::*;
@@ -247,7 +250,7 @@ impl Engine {
     pub fn run_over(&self, files: &[FilePath]) -> Result<Outcome, RunError> {
         let clock = RunClock::start(self.limits.global_timeout);
 
-        let results: Vec<Result<(Vec<Violation>, bool), RunError>> = files
+        let results: Vec<Result<FileOutcome, RunError>> = files
             .par_iter()
             .map_init(
                 // One sandbox per worker, created on first use and reused for that
@@ -263,12 +266,25 @@ impl Engine {
             .collect();
 
         let mut violations = Vec::new();
+        let mut facts = Vec::new();
         let mut files_parsed = 0;
         for result in results {
-            let (found, parsed) = result?;
-            violations.extend(found);
-            files_parsed += usize::from(parsed);
+            let outcome = result?;
+            violations.extend(outcome.violations);
+            facts.extend(outcome.facts);
+            files_parsed += usize::from(outcome.parsed);
         }
+
+        // Into the one order every run will see, before any rule looks at them.
+        //
+        // Rayon's `collect` into a `Vec` already preserves input order, so on today's code
+        // path this sort changes nothing — which is exactly why it is easy to delete and
+        // must not be. The ordering guarantee belongs to the engine, not to a property of
+        // whichever collection strategy it happens to use: switching to `for_each` with a
+        // shared sink, or grouping by rule before reducing, would silently lose it. The
+        // cost is one sort of a small vector, once per run.
+        lanekeep_core::fact::sort(&mut facts);
+        violations.extend(self.reduce(&clock, files, &facts)?);
 
         lanekeep_core::sort(&mut violations);
         Ok(Outcome {
@@ -276,6 +292,86 @@ impl Engine {
             files_discovered: files.len(),
             files_parsed,
         })
+    }
+
+    /// Run the reduce phase for every rule that has one.
+    ///
+    /// Single-threaded, and deliberately so: there is one pass per rule, each already sees
+    /// the whole corpus, and a rule's `reduce` is the one place a rule is allowed to be
+    /// expensive. Parallelizing across rules would buy little and would need one sandbox per
+    /// worker with the whole fact set copied into each.
+    fn reduce(
+        &self,
+        clock: &Arc<RunClock>,
+        files: &[FilePath],
+        facts: &[Fact],
+    ) -> Result<Vec<Violation>, RunError> {
+        let reducing: Vec<&Prepared> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.spec.has_reduce)
+            .collect();
+        if reducing.is_empty() {
+            // The common case. Building a sandbox to do nothing would put engine startup on
+            // the critical path of every run that has no cross-file rule at all.
+            return Ok(Vec::new());
+        }
+
+        let sandbox = self.worker(clock)?;
+        let paths: Vec<String> = files.iter().map(|f| f.as_str().to_owned()).collect();
+        let mut violations = Vec::new();
+
+        for rule in reducing {
+            // A rule sees only its own facts. Letting one read another's would make an
+            // internal payload shape into a contract between rules, and would make the
+            // result depend on the order rules happened to be declared in.
+            let own: Vec<ReduceFact> = facts
+                .iter()
+                .filter(|fact| fact.rule_id == rule.spec.id)
+                .map(|fact| ReduceFact {
+                    kind: fact.kind.clone(),
+                    json: lanekeep_js::merge_file(&fact.data, fact.file.as_str()),
+                })
+                .collect();
+
+            let host = ReduceContext::new(paths.clone(), own);
+            let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
+            let call = format!(
+                "globalThis.__lanekeepConfig.rules[{}].reduce(ctx)",
+                rule_index(&rule.spec)
+            );
+
+            sandbox
+                .eval_with_reduce_host::<()>(&host, &call, timeout)
+                .map_err(|e: SandboxError| RunError::Rule {
+                    rule: rule.spec.id.to_string(),
+                    // No single file is at fault in a reduce phase, and naming one would be
+                    // a lie the reader would then go and look at.
+                    file: "<reduce>".to_owned(),
+                    detail: e.to_string(),
+                })?;
+
+            for report in host.take_reports() {
+                // The path is the rule's, normalized but not checked against the corpus. A
+                // cross-file rule may legitimately report at a file the walker excluded —
+                // a config, a generated file. Autofix will need to disagree: it must never
+                // write to a path a rule invented. That check belongs with the writing.
+                violations.push(Violation {
+                    rule_id: rule.spec.id.clone(),
+                    location: Location::new(
+                        FilePath::new(&report.file),
+                        Position::new(report.line, report.column),
+                    ),
+                    message: report
+                        .message
+                        .unwrap_or_else(|| rule.spec.card.message.clone()),
+                    remediation: rule.spec.card.remediation.clone(),
+                    severity: rule.spec.severity,
+                });
+            }
+        }
+
+        Ok(violations)
     }
 
     fn worker(&self, clock: &Arc<RunClock>) -> Result<Sandbox, RunError> {
@@ -303,11 +399,7 @@ impl Engine {
     }
 
     /// Check one file. Returns its violations and whether it was parsed at all.
-    fn check_file(
-        &self,
-        sandbox: &Sandbox,
-        path: &FilePath,
-    ) -> Result<(Vec<Violation>, bool), RunError> {
+    fn check_file(&self, sandbox: &Sandbox, path: &FilePath) -> Result<FileOutcome, RunError> {
         // Path gates first: rejecting here costs no read at all.
         let admitted: Vec<&Prepared> = self
             .rules
@@ -315,7 +407,7 @@ impl Engine {
             .filter(|rule| rule.gates.admits_path(path))
             .collect();
         if admitted.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok(FileOutcome::skipped());
         }
 
         let absolute = self.discovery.root().join(path.as_str());
@@ -324,7 +416,7 @@ impl Engine {
             // tree is allowed to change under a run; what must not happen is a partial
             // result being reported as complete, and a missing file contributes nothing
             // either way.
-            return Ok((Vec::new(), false));
+            return Ok(FileOutcome::skipped());
         };
 
         // Content gates: one read, a substring scan, and a parse saved.
@@ -333,20 +425,22 @@ impl Engine {
             .filter(|rule| rule.gates.admits_content(&bytes))
             .collect();
         if admitted.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok(FileOutcome::skipped());
         }
 
         let Ok(source) = String::from_utf8(bytes) else {
             // Not valid UTF-8, so not source this tool can reason about.
-            return Ok((Vec::new(), false));
+            return Ok(FileOutcome::skipped());
         };
 
-        let mut violations = Vec::new();
+        let mut outcome = FileOutcome::parsed();
         for rule in admitted {
-            violations.extend(self.run_rule(sandbox, rule, path, &source)?);
+            let (violations, facts) = self.run_rule(sandbox, rule, path, &source)?;
+            outcome.violations.extend(violations);
+            outcome.facts.extend(facts);
         }
 
-        Ok((violations, true))
+        Ok(outcome)
     }
 
     fn run_rule(
@@ -355,13 +449,13 @@ impl Engine {
         rule: &Prepared,
         path: &FilePath,
         source: &str,
-    ) -> Result<Vec<Violation>, RunError> {
+    ) -> Result<(Vec<Violation>, Vec<Fact>), RunError> {
         let mut parser = tree_sitter::Parser::new();
         if parser.set_language(&rule.language.grammar()).is_err() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let Some(tree) = parser.parse(source, None) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
 
         // Collect capture paths while the tree is borrowed, then intern once the borrow
@@ -386,7 +480,7 @@ impl Engine {
         }
 
         if matches.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
@@ -423,6 +517,22 @@ impl Engine {
                 })?;
         }
 
+        let facts = host
+            .take_facts()
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, emitted)| Fact {
+                rule_id: rule.spec.id.clone(),
+                file: path.clone(),
+                kind: emitted.kind,
+                data: emitted.data,
+                // Emission order within the file. The engine assigns it rather than
+                // trusting the rule, so a rule cannot reorder its own facts relative to
+                // another file's and change what `reduce` sees.
+                sequence: u32::try_from(sequence).unwrap_or(u32::MAX),
+            })
+            .collect();
+
         for report in host.take_reports() {
             violations.push(Violation {
                 rule_id: rule.spec.id.clone(),
@@ -435,7 +545,34 @@ impl Engine {
             });
         }
 
-        Ok(violations)
+        Ok((violations, facts))
+    }
+}
+
+/// What checking one file produced.
+struct FileOutcome {
+    violations: Vec<Violation>,
+    facts: Vec<Fact>,
+    /// Whether the file was parsed at all, for the "n files checked" count.
+    parsed: bool,
+}
+
+impl FileOutcome {
+    /// A file that never reached a parser — gated out, unreadable, or not UTF-8.
+    const fn skipped() -> Self {
+        Self {
+            violations: Vec::new(),
+            facts: Vec::new(),
+            parsed: false,
+        }
+    }
+
+    const fn parsed() -> Self {
+        Self {
+            violations: Vec::new(),
+            facts: Vec::new(),
+            parsed: true,
+        }
     }
 }
 
@@ -788,5 +925,302 @@ mod tests {
         let outcome = project.run().expect("runs");
         assert!(outcome.violations.is_empty());
         assert_eq!(outcome.files_parsed, 1, "no gates means it is still parsed");
+    }
+
+    // --- the reduce phase ----------------------------------------------------------------
+
+    /// A cross-file rule: every exported symbol nobody imports.
+    ///
+    /// The smallest rule that genuinely cannot work per-file — whether an export is unused
+    /// is not a property of the file that declares it.
+    const UNUSED_EXPORTS_RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/no-unused-exports',
+  query: `
+    (export_statement declaration: (function_declaration name: (identifier) @name)) @stmt
+    (import_statement (import_clause (named_imports (import_specifier name: (identifier) @imported))))
+  `,
+  card: {
+    message: 'unused export',
+    remediation: 'delete it, or import it somewhere',
+    examples: { bad: 'export function unused() {}', good: 'function used() {}' },
+  },
+  check(ctx, m) {
+    if (m.imported) {
+      ctx.emitFact({ kind: 'import', symbol: ctx.text(m.imported) });
+      return;
+    }
+    ctx.emitFact({
+      kind: 'export',
+      symbol: ctx.text(m.name),
+      line: ctx.line(m.stmt),
+      column: ctx.column(m.stmt),
+    });
+  },
+  reduce(ctx) {
+    const imported = new Set(ctx.facts('import').map((f) => f.symbol));
+    for (const e of ctx.facts('export')) {
+      if (!imported.has(e.symbol)) {
+        ctx.report({ file: e.file, line: e.line, column: e.column }, `'${e.symbol}' is exported but never imported`);
+      }
+    }
+  },
+});
+";
+
+    #[test]
+    fn a_reduce_phase_sees_facts_from_every_file() {
+        let project = Project::new(
+            "reduce-cross-file",
+            &[
+                ("rule.ts", UNUSED_EXPORTS_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "export function used() {}\nexport function spare() {}\n",
+                ),
+                ("src/b.ts", "import { used } from './a';\nused();\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        let found: Vec<(&str, u32, &str)> = outcome
+            .violations
+            .iter()
+            .map(|v| {
+                (
+                    v.location.file.as_str(),
+                    v.location.position.line,
+                    v.message.as_str(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            found,
+            vec![("src/a.ts", 2, "'spare' is exported but never imported")],
+            "only the export nobody imports should be reported"
+        );
+    }
+
+    #[test]
+    fn a_rule_with_no_reduce_still_runs() {
+        // The common path must not regress: no reduce phase, no sandbox built for one.
+        let project = Project::new(
+            "reduce-absent",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1);
+    }
+
+    #[test]
+    fn a_reduce_phase_with_no_facts_reports_nothing() {
+        let project = Project::new(
+            "reduce-empty",
+            &[
+                ("rule.ts", UNUSED_EXPORTS_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+    }
+
+    #[test]
+    fn the_file_list_reaches_the_reduce_phase() {
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/counts-files',
+  query: '(debugger_statement) @stmt',
+  card: {
+    message: 'file count',
+    remediation: 'nothing to do',
+    examples: { bad: 'a', good: 'b' },
+  },
+  check() {},
+  reduce(ctx) {
+    ctx.report({ file: ctx.files[0], line: ctx.files.length, column: 1 });
+  },
+});
+";
+        let project = Project::new(
+            "reduce-files",
+            &[
+                ("rule.ts", RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+                ("src/b.ts", "const b = 1;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1);
+        // Discovery sorts, so `files[0]` is `src/a.ts` on every run and every platform.
+        assert_eq!(outcome.violations[0].location.file.as_str(), "src/a.ts");
+        assert_eq!(outcome.violations[0].location.position.line, 2);
+    }
+
+    #[test]
+    fn a_rule_does_not_see_another_rules_facts() {
+        // Otherwise a payload shape becomes a contract between rules, and the result starts
+        // depending on the order rules were declared in.
+        const EMITTER: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/emitter',
+  query: '(export_statement) @stmt',
+  card: { message: 'emitter', remediation: 'x', examples: { bad: 'a', good: 'b' } },
+  check(ctx, m) { ctx.emitFact({ kind: 'thing', from: 'emitter' }); },
+});
+";
+        const READER: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/reader',
+  query: '(export_statement) @stmt',
+  card: { message: 'reader', remediation: 'x', examples: { bad: 'a', good: 'b' } },
+  check() {},
+  reduce(ctx) {
+    ctx.report({ file: 'seen.ts', line: ctx.facts().length + 1, column: 1 });
+  },
+});
+";
+        let project = Project::new(
+            "reduce-isolation",
+            &[
+                ("emitter.ts", EMITTER),
+                ("reader.ts", READER),
+                (
+                    "lanekeep.config.ts",
+                    "import { defineConfig } from 'lanekeep';\n\
+                     import emitter from './emitter';\n\
+                     import reader from './reader';\n\
+                     export default defineConfig({ include: ['src/**/*.ts'], rules: [emitter, reader] });\n",
+                ),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1);
+        assert_eq!(
+            outcome.violations[0].location.position.line, 1,
+            "the reader saw the emitter's facts"
+        );
+    }
+
+    #[test]
+    fn a_reduce_phase_that_throws_aborts_the_run() {
+        // Same posture as a `check` that throws: a partial result reported as a complete
+        // one is worse than no result.
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/throws-in-reduce',
+  query: '(debugger_statement) @stmt',
+  card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },
+  check() {},
+  reduce() { throw new Error('reduce exploded'); },
+});
+";
+        let project = Project::new(
+            "reduce-throws",
+            &[
+                ("rule.ts", RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+            ],
+        );
+
+        let error = project.run().expect_err("aborts");
+        let rendered = error.to_string();
+        assert!(rendered.contains("reduce exploded"), "{rendered}");
+        assert!(
+            rendered.contains("local/throws-in-reduce"),
+            "the error should name the rule: {rendered}"
+        );
+    }
+
+    #[test]
+    fn facts_reach_reduce_in_the_same_order_on_every_run() {
+        // The determinism invariant at the level a rule can observe: `ctx.facts()` is in
+        // (file, sequence) order, so a rule that takes the first match — or builds a
+        // "first seen wins" map — gives the same answer every run.
+        //
+        // This asserts the property, not the mechanism. Two things currently produce it,
+        // rayon's order-preserving `collect` and the explicit sort, so removing either one
+        // alone leaves this passing. The sort's own coverage is in `lanekeep_core::fact`,
+        // where shuffled input makes its absence visible.
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/first-fact-wins',
+  query: '(export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name)))',
+  card: { message: 'first', remediation: 'x', examples: { bad: 'a', good: 'b' } },
+  check(ctx, m) { ctx.emitFact({ kind: 'sym', symbol: ctx.text(m.name) }); },
+  reduce(ctx) {
+    const all = ctx.facts('sym');
+    ctx.report({ file: 'order.ts', line: 1, column: 1 }, all.map((f) => `${f.file}:${f.symbol}`).join(','));
+  },
+});
+";
+        let files: Vec<(String, String)> = (0..12)
+            .map(|i| {
+                (
+                    format!("src/f{i:02}.ts"),
+                    format!("export const s{i:02} = {i};\n"),
+                )
+            })
+            .collect();
+
+        let mut layout: Vec<(&str, &str)> = vec![("rule.ts", RULE)];
+        let config_source = config("");
+        layout.push(("lanekeep.config.ts", &config_source));
+        for (path, contents) in &files {
+            layout.push((path, contents));
+        }
+
+        let project = Project::new("reduce-determinism", &layout);
+
+        let first = project.run().expect("runs").violations[0].message.clone();
+        for attempt in 0..4 {
+            let again = project.run().expect("runs").violations[0].message.clone();
+            assert_eq!(again, first, "fact order changed on attempt {attempt}");
+        }
+
+        // And it is the canonical order, not merely a repeatable one.
+        assert!(
+            first.starts_with("src/f00.ts:s00,src/f01.ts:s01,"),
+            "facts are not in (file, sequence) order: {first}"
+        );
+    }
+
+    #[test]
+    fn a_rule_cannot_misattribute_a_fact_to_another_file() {
+        // The host sets `file`, last, so a rule's own `file` key loses to it.
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/lying-fact',
+  query: '(export_statement) @stmt',
+  card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },
+  check(ctx, m) { ctx.emitFact({ kind: 'e', file: 'somewhere-else.ts' }); },
+  reduce(ctx) {
+    for (const f of ctx.facts('e')) ctx.report({ file: f.file, line: 1, column: 1 });
+  },
+});
+";
+        let project = Project::new(
+            "reduce-misattribution",
+            &[
+                ("rule.ts", RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1);
+        assert_eq!(outcome.violations[0].location.file.as_str(), "src/a.ts");
     }
 }

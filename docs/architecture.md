@@ -197,7 +197,8 @@ export default defineRule({
     ctx.emitFact({
       kind: 'export',
       symbol: ctx.text(m.decl),
-      at: ctx.loc(m.match),
+      line: ctx.line(m.match),
+      column: ctx.column(m.match),
     })
   },
 
@@ -206,13 +207,21 @@ export default defineRule({
       ctx.facts('import').flatMap(f => f.symbols),
     )
     for (const e of ctx.facts('export')) {
-      if (!imported.has(e.symbol)) ctx.report(e.at, { file: e.file })
+      if (!imported.has(e.symbol)) {
+        ctx.report({ file: e.file, line: e.line, column: e.column })
+      }
     }
   },
 })
 ```
 
 `reduce` receives facts and the discovered file list. It never receives parse trees — that is invariant 1 from §2, and it is what keeps cross-file rules incremental.
+
+Positions travel as plain numbers rather than as an opaque location object, because a fact has to survive JSON to be cacheable. The same constraint is why `reduce` reports at `{ file, line, column }`: there are no nodes in that phase to report at, so the position has to be captured during the per-file pass, while the tree is still there.
+
+`file` is attached by the host, not by the rule, and it is attached last — so a rule that puts its own `file` in a fact cannot make a violation appear to come from somewhere it did not.
+
+A rule sees only its own facts. Reading another rule's would turn a private payload shape into a contract between rules, and would make results depend on the order rules were declared in.
 
 ---
 
@@ -303,9 +312,12 @@ The light semantic layer that pure syntactic matching gets wrong. Implemented in
 
 | Function | Notes |
 |---|---|
-| `ctx.emitFact(fact)` | Per-file phase. Must be JSON-serializable — facts are cached. |
-| `ctx.facts(kind?)` | Reduce phase only. Aggregated across the corpus. |
+| `ctx.emitFact(fact)` | Per-file phase only. Needs a non-empty string `kind`; must survive `JSON.stringify`, because facts are cached. |
+| `ctx.facts(kind?)` | Reduce phase only. This rule's facts, in `(file, emission)` order, each with `file` attached. Omit `kind` for all of them. |
 | `ctx.files` | Reduce phase only. The discovered file list. |
+| `ctx.report(at, message?)` | Reduce phase form. `at` is `{ file, line, column }` — there are no nodes here. |
+
+The split is enforced, not conventional. `emitFact` does not exist in the reduce context and `facts`/`files` do not exist in the per-file context, because a `check` that could read the corpus would make a file's result depend on files other than itself — and caching that result against its own content would then be unsound.
 
 ### 6.6 What is deliberately absent
 
