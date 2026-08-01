@@ -25,6 +25,7 @@
 //! `ctx.parent(a)` and `ctx.parent(b)` for siblings — yields the same number. Rules compare
 //! handles with `===`, and that has to mean what it appears to mean.
 
+use lanekeep_query::CompiledQuery;
 use std::collections::HashMap;
 
 use lanekeep_lang::binding::{Binding, BindingResolver};
@@ -279,6 +280,80 @@ impl NodeArena {
             .into_iter()
             .filter_map(|i| self.intern_child(&path, i))
             .collect()
+    }
+
+    /// Matches of a query, scoped to one node's subtree.
+    ///
+    /// Two-phase like everything else here: capture paths are collected while the tree is
+    /// borrowed, then interned once that borrow has ended. The arena owns the tree, so a
+    /// handle cannot be minted while a `Node` derived from it is alive.
+    #[must_use]
+    pub fn query_subtree(
+        &self,
+        handle: Handle,
+        query: &CompiledQuery,
+    ) -> Vec<Vec<(String, Vec<u32>)>> {
+        let Some(path) = self.paths.get(handle as usize) else {
+            return Vec::new();
+        };
+        let Some(node) = self.node_at(path) else {
+            return Vec::new();
+        };
+
+        let mut found = Vec::new();
+        query.for_each_match_in(node, self.source.as_bytes(), |m| {
+            found.push(
+                m.captures
+                    .iter()
+                    .filter_map(|(name, node)| {
+                        self.path_of(*node).map(|path| ((*name).to_owned(), path))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        });
+        found
+    }
+
+    /// The nearest ancestor a query matches at, with that match's captures.
+    ///
+    /// "Matches at" rather than "matches within": the query runs rooted at each ancestor in
+    /// turn, and a match counts only if it captured that ancestor. Without that, a query
+    /// matching anything anywhere inside would make the outermost ancestor the answer every
+    /// time, which is never what a rule walking upward wants.
+    #[must_use]
+    pub fn closest_ancestor_paths(
+        &self,
+        handle: Handle,
+        query: &CompiledQuery,
+    ) -> Option<Vec<(String, Vec<u32>)>> {
+        let path = self.paths.get(handle as usize)?.clone();
+
+        // Innermost first, so the closest ancestor wins.
+        for depth in (0..path.len()).rev() {
+            let Some(ancestor) = self.node_at(&path[..depth]) else {
+                continue;
+            };
+
+            let mut matched: Option<Vec<(String, Vec<u32>)>> = None;
+            query.for_each_match_in(ancestor, self.source.as_bytes(), |m| {
+                if matched.is_some() || !m.captures.iter().any(|(_, node)| *node == ancestor) {
+                    return;
+                }
+                matched = Some(
+                    m.captures
+                        .iter()
+                        .filter_map(|(name, node)| {
+                            self.path_of(*node).map(|p| ((*name).to_owned(), p))
+                        })
+                        .collect(),
+                );
+            });
+
+            if matched.is_some() {
+                return matched;
+            }
+        }
+        None
     }
 
     /// Ancestors, innermost first, ending at the root.

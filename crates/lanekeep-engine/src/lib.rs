@@ -803,6 +803,7 @@ impl Engine {
         let mut matches: Vec<Vec<(String, Vec<u32>)>> = Vec::new();
         let host = HostContext::new(tree, source.to_owned(), path.as_str())
             .with_resolver_from(rule.language.as_ref())
+            .with_language(Arc::clone(&rule.language))
             .with_file_access(Rc::clone(files));
 
         {

@@ -15,6 +15,7 @@ categories.workspace = true
 blake3 = { workspace = true }
 lanekeep-core = { workspace = true }
 lanekeep-lang = { workspace = true }
+lanekeep-query = { workspace = true }
 rquickjs = { workspace = true }
 thiserror = { workspace = true }
 tree-sitter = { workspace = true }
