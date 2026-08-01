@@ -31,9 +31,25 @@ trap 'rm -rf "${work}"' EXIT
 cat >"${work}/cargo" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${CARGO_LOG}"
+# `publish -p <crate>`, so the crate is the third argument.
+crate="$3"
+if [ -n "${CARGO_FAIL_CRATE:-}" ] && [ "${crate}" = "${CARGO_FAIL_CRATE}" ]; then
+  counter="${CARGO_COUNTS}/${crate}"
+  seen=$(cat "${counter}" 2>/dev/null || echo 0)
+  seen=$((seen + 1))
+  echo "${seen}" >"${counter}"
+  if [ "${seen}" -le "${CARGO_FAIL_TIMES:-0}" ]; then
+    echo "${CARGO_FAIL_MESSAGE}" >&2
+    exit 101
+  fi
+fi
 exit 0
 STUB
 chmod +x "${work}/cargo"
+
+# The message crates.io actually returns when the new-crate limit is hit.
+RATE_LIMITED="error: failed to publish: the remote server responded with an error \
+(status 429 Too Many Requests): You have published too many new crates in a short period of time."
 
 # Stands in for the crates.io lookup, so the tests never touch the network.
 cat >"${work}/probe" <<'STUB'
@@ -48,9 +64,22 @@ export CRATES_PROBE="${work}/probe"
 export CARGO_LOG="${work}/log"
 export CRATES_PUBLISHED="${work}/published"
 
+export CARGO_COUNTS="${work}/counts"
+# Nothing in these tests may actually sleep.
+export CRATES_RETRY_INTERVAL=0
+
 reset() {
   : >"${CARGO_LOG}"
   : >"${CRATES_PUBLISHED}"
+  rm -rf "${CARGO_COUNTS}"
+  mkdir -p "${CARGO_COUNTS}"
+  unset CARGO_FAIL_CRATE CARGO_FAIL_TIMES CARGO_FAIL_MESSAGE
+  unset CRATES_MAX_ATTEMPTS
+}
+
+# How many times cargo was asked to publish a given crate.
+attempts_for() {
+  grep -c "^publish -p $1\( \|$\)" "${CARGO_LOG}" | tr -d ' '
 }
 
 # The crates handed to `cargo publish -p`, in order.
@@ -131,6 +160,50 @@ reset
 "${script}" >/dev/null 2>&1
 check "publishing never passes --no-verify" "0" \
   "$(grep -c -- '--no-verify' "${CARGO_LOG}" | tr -d ' ')"
+
+# --- a rate limit is waited out -------------------------------------------------------------------
+#
+# crates.io allows a burst of new crates and then about one per ten minutes. v0.1.1 published
+# five and was refused the sixth. The limit is documented and temporary, so the run waits rather
+# than handing someone a job to re-run every ten minutes.
+reset
+export CARGO_FAIL_CRATE=lanekeep-config
+export CARGO_FAIL_TIMES=2
+export CARGO_FAIL_MESSAGE="${RATE_LIMITED}"
+"${script}" >/dev/null 2>&1
+check "a rate-limited crate is retried until it lands" "0" "$?"
+check "and took three attempts" "3" "$(attempts_for lanekeep-config)"
+check "while the rest publish once each" "1" "$(attempts_for lanekeep-cli)"
+check "and every crate still gets published" "12" \
+  "$(publish_order | sort -u | wc -l | tr -d ' ')"
+
+# --- anything else fails immediately ------------------------------------------------------------
+#
+# A crate that will not build from its published form, a bad token, a dependency not yet on the
+# registry: none of those improve after ten minutes, and retrying them turns a clear failure into
+# a job that looks hung.
+reset
+export CARGO_FAIL_CRATE=lanekeep-engine
+export CARGO_FAIL_TIMES=99
+export CARGO_FAIL_MESSAGE="error[E0432]: unresolved import"
+"${script}" >/dev/null 2>&1
+check "a non-rate-limit failure fails the run" "1" "$?"
+check "and is not retried" "1" "$(attempts_for lanekeep-engine)"
+check "and nothing after it is attempted" "0" "$(attempts_for lanekeep-cli)"
+
+# --- retrying gives up ------------------------------------------------------------------------------
+#
+# Bounded, so a limit that never lifts fails the job instead of holding a runner until it is
+# killed for running too long.
+reset
+export CARGO_FAIL_CRATE=lanekeep-core
+export CARGO_FAIL_TIMES=99
+export CARGO_FAIL_MESSAGE="${RATE_LIMITED}"
+export CRATES_MAX_ATTEMPTS=3
+"${script}" >/dev/null 2>&1
+check "a limit that never lifts fails the run" "1" "$?"
+check "after the attempt bound" "3" "$(attempts_for lanekeep-core)"
+reset
 
 # --- flags ------------------------------------------------------------------------------------------
 reset
