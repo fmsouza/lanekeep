@@ -31,6 +31,8 @@ use rquickjs::{Ctx, Function, Object, Value};
 
 use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 
+use lanekeep_core::fix::Fix;
+
 use crate::files::FileAccess;
 use crate::nodes::{Handle, NodeArena};
 
@@ -72,6 +74,8 @@ pub struct Report {
     pub column: u32,
     /// A message overriding the rule card's, when the rule supplied one.
     pub message: Option<String>,
+    /// A replacement the rule offered.
+    pub fix: Option<Fix>,
 }
 
 /// Host state for one file, shared with the functions installed on `ctx`.
@@ -375,22 +379,50 @@ impl HostContext {
         let reports = Rc::clone(&self.reports);
         object.set(
             "report",
-            // `Opt` rather than `Option`: an `Option` parameter still requires the caller
-            // to pass something, so `ctx.report(node)` would fail on arity. `Opt` is what
-            // makes the argument genuinely optional.
-            Function::new(ctx.clone(), move |handle: Handle, message: Opt<String>| {
-                // A report at an unresolvable handle is dropped rather than recorded at a
-                // made-up position. Reporting at 1:1 would point a reader at an unrelated
-                // line, which is worse than the rule appearing not to fire.
-                if let Some((line, column)) = arena.borrow().position(handle) {
+            // The second argument is either a message or an options object. A union rather
+            // than two functions, because `ctx.report(node, 'why')` is the overwhelmingly
+            // common call and should stay the short one — and because a rule that wants a
+            // fix usually wants a specific message too.
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      handle: Handle,
+                      options: Opt<Value<'js>>|
+                      -> rquickjs::Result<()> {
+                    // A report at an unresolvable handle is dropped rather than recorded at
+                    // a made-up position. Reporting at 1:1 would point a reader at an
+                    // unrelated line, which is worse than the rule appearing not to fire.
+                    let Some((line, column)) = arena.borrow().position(handle) else {
+                        return Ok(());
+                    };
+
+                    let (message, fix) = match options.0 {
+                        None => (None, None),
+                        Some(value) if value.is_string() => (value.get::<String>().ok(), None),
+                        Some(value) => {
+                            let Some(object) = value.as_object() else {
+                                return Err(throw(
+                                    &ctx,
+                                    "ctx.report expects a message string or an options \
+                                     object — { message?, fix? }",
+                                ));
+                            };
+                            let message = object.get::<_, String>("message").ok();
+                            let fix = read_fix(&ctx, object, &arena)?;
+                            (message, fix)
+                        }
+                    };
+
                     reports.borrow_mut().push(Report {
                         node: Some(handle),
                         line,
                         column,
-                        message: message.0,
+                        message,
+                        fix,
                     });
-                }
-            })?,
+                    Ok(())
+                },
+            )?,
         )?;
 
         Ok(())
@@ -626,6 +658,55 @@ impl ReduceContext {
 
         Ok(object)
     }
+}
+
+/// Read a `fix` off a report's options object.
+///
+/// `{ node, text, safe? }`. The range comes from a node handle rather than from raw offsets:
+/// a rule already has the node it matched, and offsets it computed itself are offsets it can
+/// get wrong — the one mistake that would let a fix corrupt a file.
+fn read_fix<'js>(
+    ctx: &Ctx<'js>,
+    options: &Object<'js>,
+    arena: &Rc<RefCell<NodeArena>>,
+) -> rquickjs::Result<Option<Fix>> {
+    let Ok(value) = options.get::<_, Value<'js>>("fix") else {
+        return Ok(None);
+    };
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+
+    let Some(fix) = value.as_object() else {
+        return Err(throw(
+            &ctx.clone(),
+            "ctx.report's `fix` expects { node, text, safe? }",
+        ));
+    };
+
+    let (Ok(handle), Ok(replacement)) =
+        (fix.get::<_, Handle>("node"), fix.get::<_, String>("text"))
+    else {
+        return Err(throw(
+            &ctx.clone(),
+            "ctx.report's `fix` needs a `node` to replace and the `text` to put there",
+        ));
+    };
+
+    let Some((start, end)) = arena.borrow().byte_range(handle) else {
+        // The same posture as reporting at an unresolvable handle: drop the fix rather than
+        // guess at a range. A fix at the wrong offsets would rewrite the wrong code.
+        return Ok(None);
+    };
+
+    Ok(Some(Fix {
+        start,
+        end,
+        replacement,
+        // Absent means suggestion. The cautious mistake costs a manual edit; the other one
+        // rewrites code silently.
+        safe: fix.get::<_, bool>("safe").unwrap_or(false),
+    }))
 }
 
 /// Throw a `TypeError` carrying a message meant for a rule author.

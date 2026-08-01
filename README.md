@@ -113,6 +113,17 @@ src/bad.ts:2:1 error [lanekeep/no-default-export] default export
 ✖ 2 error(s) across 2 file(s) checked
 ```
 
+Rules may offer a fix, applied with `--fix`:
+
+```
+$ lanekeep check --fix
+fixed 2 violation(s) in 2 file(s)
+```
+
+Only fixes a rule marked as behavior-preserving are applied. Anything else is a suggestion —
+shown, never written — because the cautious mistake costs a manual edit and the other one
+rewrites your code silently.
+
 Suppressions carry a mandatory reason and an optional expiry, and a directive that does not
 work says so — a missing reason, a bare rule id, or an unreadable date is reported rather
 than silently doing nothing:
