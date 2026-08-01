@@ -82,7 +82,12 @@ fi
 # else here, so the Windows archive is built with Python. These assert it is a real zip with the
 # contents and the mode it should have — the executable bit lives in the zip's own metadata, not
 # on any filesystem, so it survives being unpacked anywhere.
-zip_check="$(python3 - "${out}/lanekeep-9.9.9-x86_64-pc-windows-msvc.zip" <<'PY'
+#
+# The heredoc is redirected to a file rather than captured with `$(...)`. bash 3.2 — which is
+# what macOS has — parses command substitution without understanding heredocs inside it, so a
+# lone apostrophe in a Python comment reads as an opening quote and the script dies with
+# "unexpected EOF while looking for matching `''". At statement level it parses fine.
+python3 - "${out}/lanekeep-9.9.9-x86_64-pc-windows-msvc.zip" >"${work}/zip-check" <<'PY'
 import sys
 import zipfile
 
@@ -112,8 +117,7 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
 
     print("; ".join(problems))
 PY
-)"
-check "the zip holds what it should, executable" "" "${zip_check}"
+check "the zip holds what it should, executable" "" "$(cat "${work}/zip-check")"
 
 # --- checksums ------------------------------------------------------------------------------------
 check "a checksum file is written" "0" "$([ -s "${out}/SHA256SUMS" ] && echo 0 || echo 1)"

@@ -228,6 +228,20 @@ nothing at all on a macOS runner — the array comes back empty and every downst
 fails at once. `just test-scripts` now runs the publish suites under `/bin/bash` wherever a 3.x
 one exists, which on any Mac is a real check rather than a skipped one.
 
+**bash 3.2 cannot parse a heredoc inside `$(...)` that contains an apostrophe.** It scans
+command substitution without understanding the heredoc, so a `'` in an embedded Python comment
+— `ZipInfo's`, `the zip's metadata` — reads as an opening quote and the *whole file* fails to
+parse with "unexpected EOF while looking for matching `''". Newer bash is perfectly happy, so
+nothing but a 3.2 parse notices. Redirect the heredoc to a file at statement level and read it
+back, rather than capturing it with `$(...)`.
+
+`scripts/test-shell-portability.sh` runs `bash -n` over every script with a 3.x bash when one
+exists, which is what catches this. It found a latent instance in `test-workflows.sh` that had
+never fired: that script exits early when pyyaml is missing, which is the case on the macOS
+runner, so bash never reached the offending line. Worth knowing separately — **the workflow
+checks do not run on macOS at all**, only in the ubuntu `gate` job. That is fine, since they
+are static checks on YAML, but it is not what the run log looks like.
+
 **Python's stdout writes CRLF on Windows, and CR-carrying values still compare equal to each
 other.** That is what makes it quiet: a version read from a Python helper matches another value
 from the same helper, so only a comparison against a literal written in the script fails, and
