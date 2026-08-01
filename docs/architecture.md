@@ -613,7 +613,17 @@ If the cold budget proves unreachable, the levers in order are: better gate usag
 
 The remaining warm cost is reading and hashing every file to discover what changed, plus loading and rewriting a whole-corpus cache file. Beating it needs either a cheaper staleness check than content hashing, or a cache format that can be written in part.
 
-**The gate is deliberately loose and the report deliberately precise.** A hosted runner is shared and throttled, so a gate set at the budget would fail for reasons nothing in this repository caused — and a flaky gate is one people re-run rather than read. The exact numbers print against their budgets on every run, which is what shows a 20% regression; the gate fires only past 4×, which runner variance does not explain.
+**The report is absolute; the gate is relative.** Absolute numbers cannot be gated on a hosted runner: this suite's first CI run measured a cold pass at 10.9 s against 1.5 s on a developer machine, seven times slower, on hardware that varies between runs. Any absolute threshold loose enough not to flake there is too loose to catch anything.
+
+So the two jobs are separated. The report prints every scenario against its budget, exactly, on every run — that is what shows a 20% regression to someone reading the log, and it is why the budgets stay in the table even though none is met. The gate asserts only machine-independent ratios, chosen to be the claims the design rests on:
+
+| Gate | Threshold | Developer machine | Hosted runner |
+|---|---|---|---|
+| warm run ÷ cold run | ≤ 25% | ~4% | ~1% |
+| selected 1-file run ÷ warm run | ≤ 1.5 | ~0.6 | ~0.9 |
+| cold run, absolute ceiling | < 60 s | 1.5 s | 10.9 s |
+
+The first is the cache's entire purpose, and it is the check that caught a warm run starting a QuickJS engine per worker. The second says a file selection must not cost more than no selection. The ceiling is not a budget — it is 75× the budget — and exists so an infinite loop or a quadratic blowup fails the job instead of running until the runner gives up.
 
 Instrumentation behind `--profile` only, reporting per-rule time split between query matching and handler execution — the split that tells an author whether their query or their code is the problem.
 

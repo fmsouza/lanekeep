@@ -10,22 +10,37 @@
 //! It is also zero dependencies, which for a gate that exists to catch a regression in this
 //! repository is worth more than distribution plots.
 //!
-//! # Why the gate is loose and the report is precise
+//! # The report is absolute, the gate is relative
 //!
-//! A hosted runner is shared, throttled, and several times slower than a developer machine
-//! on a bad day. A gate set at the budget would fail for reasons nothing in this repository
-//! caused, and a flaky gate is one people learn to re-run rather than read.
+//! §15's budgets are absolute numbers, and absolute numbers cannot be gated on a hosted
+//! runner. This suite's first CI run measured a cold pass at 10.9 s against 1.5 s on a
+//! developer machine — seven times slower, on hardware that varies run to run. Any absolute
+//! threshold loose enough not to flake there is too loose to catch anything.
 //!
-//! So: the measured numbers are printed exactly, against the budget, every run — that is
-//! what a human reads to see a 20% regression. The gate fails only past
-//! [`GATE_MULTIPLIER`]×, which no amount of runner variance explains and no honest change
-//! produces by accident.
+//! So the two jobs are separated:
+//!
+//! **The report** prints every scenario against its §15 budget, exactly, every run. That is
+//! what a human reads to see a 20% regression, and it is why the budgets stay in the table
+//! even though none is met yet.
+//!
+//! **The gate** asserts only machine-independent *ratios* — properties that hold on any
+//! hardware because both sides move together. They are chosen to be the claims the design
+//! actually rests on, so a change that breaks one has broken something real:
+//!
+//! - A warm run must cost a small fraction of a cold one. This is the cache's entire
+//!   purpose, and it is what caught the sandbox being built per worker on a warm run.
+//! - Checking one selected file must not cost more than checking everything warm. If it
+//!   does, `--staged` is not an optimization.
+//!
+//! Plus one absolute ceiling so deep enough breakage — an accidental infinite loop, a
+//! quadratic blowup — fails instead of hanging the job.
 
 #![expect(
     clippy::expect_used,
     clippy::print_stdout,
     clippy::format_push_string,
     clippy::format_collect,
+    clippy::panic,
     reason = "A benchmark is test scaffolding that `clippy.toml`'s allow-*-in-tests does \
               not reach, and its whole output is a printed report. The string building \
               here runs once at setup, not in anything measured — optimizing it would \
@@ -47,12 +62,32 @@ const FILES: usize = 2_000;
 /// Rules in the synthetic ruleset. §15 specifies "~20 rules".
 const RULES: usize = 20;
 
-/// How far past budget is a regression rather than a slow machine.
+/// The most a warm run may cost, as a fraction of a cold one.
 ///
-/// Four. A hosted runner is routinely two to three times slower than a developer machine,
-/// and the point of the gate is to catch something that got an order of magnitude worse, not
-/// to police the last 20% — which the printed numbers do better, because a human reads them.
-const GATE_MULTIPLIER: u32 = 4;
+/// The cache's whole purpose. Machine-independent because both numbers move with the
+/// hardware — measured at ~4% on a developer machine and ~1% on a hosted runner, so 25% is
+/// loose enough never to flake and tight enough that losing an order of magnitude fires it.
+/// This is the check that would have caught a warm run starting a QuickJS engine per worker.
+const WARM_FRACTION_OF_COLD: f64 = 0.25;
+
+/// The most a one-file selected run may cost, as a fraction of a warm full run.
+///
+/// Deliberately generous. Measured at 0.57 on a developer machine but 0.89 on a hosted
+/// runner, because on slow hardware both are dominated by loading and rewriting the whole
+/// cache file and the selection's advantage shrinks toward nothing. A limit of 1.0 would
+/// have 11% of margin on CI, which is a flake waiting to happen.
+///
+/// At 1.5 it still catches what it is for: a selection that re-checks everything, or one
+/// that costs materially more than no selection at all. Tightening it needs a cache format
+/// that can be written in part, not a smaller number here.
+const SELECTED_FRACTION_OF_WARM: f64 = 1.5;
+
+/// An absolute ceiling on the cold run, well past any plausible hardware.
+///
+/// Not a budget — §15's budget is 800 ms and this is 75 times that. It exists so an
+/// accidental infinite loop or a quadratic blowup fails the job instead of running until
+/// the runner's own timeout, with no indication of what went wrong.
+const COLD_CEILING: Duration = Duration::from_secs(60);
 
 /// One scenario's budget, from architecture §15.
 struct Budget {
@@ -127,26 +162,46 @@ fn main() {
     let measured = [cold, warm, warm_one_all, warm_one_selected];
     report(&measured);
 
-    let breached: Vec<&Budget> = BUDGETS
-        .iter()
-        .zip(&measured)
-        .filter(|(budget, taken)| {
-            budget
-                .limit
-                .is_some_and(|limit| **taken > limit * GATE_MULTIPLIER)
-        })
-        .map(|(budget, _)| budget)
-        .collect();
+    gate(&measured);
+}
+
+/// The machine-independent checks.
+///
+/// Ratios rather than absolute times, so the same thresholds hold on a laptop and on a
+/// throttled two-core runner. See the module documentation for why absolute budgets are
+/// reported but not gated.
+fn gate(measured: &[Duration]) {
+    let [cold, warm, _, selected] = measured else {
+        panic!(
+            "expected one measurement per scenario, got {}",
+            measured.len()
+        );
+    };
+
+    let warm_ratio = warm.as_secs_f64() / cold.as_secs_f64();
+    let selected_ratio = selected.as_secs_f64() / warm.as_secs_f64();
+
+    println!("  warm / cold          {:>6.2}%", warm_ratio * 100.0);
+    println!("  selected / warm      {selected_ratio:>7.2}x\n");
 
     assert!(
-        breached.is_empty(),
-        "{} scenario(s) past {GATE_MULTIPLIER}x budget: {}",
-        breached.len(),
-        breached
-            .iter()
-            .map(|b| b.name)
-            .collect::<Vec<_>>()
-            .join(", ")
+        *cold < COLD_CEILING,
+        "a cold run took {cold:.1?}, past the {COLD_CEILING:.0?} ceiling — this is not slow \
+         hardware, something is looping or quadratic"
+    );
+
+    assert!(
+        warm_ratio <= WARM_FRACTION_OF_COLD,
+        "a warm run cost {:.1}% of a cold one, over the {:.0}% the cache exists to deliver \
+         (cold {cold:.1?}, warm {warm:.1?})",
+        warm_ratio * 100.0,
+        WARM_FRACTION_OF_COLD * 100.0,
+    );
+
+    assert!(
+        selected_ratio <= SELECTED_FRACTION_OF_WARM,
+        "checking one selected file cost {selected:.1?}, more than checking everything warm \
+         at {warm:.1?} — a file selection that costs more than no selection is not one"
     );
 }
 
@@ -175,7 +230,7 @@ fn report(measured: &[Duration]) {
             ),
         }
     }
-    println!("\n  gate fails past {GATE_MULTIPLIER}x budget\n");
+    println!("\n  budgets are reported, not gated — the gate is on ratios below\n");
 }
 
 /// The best of several attempts.
