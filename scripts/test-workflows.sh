@@ -136,6 +136,43 @@ print("\n".join(found))
 PY
 )"
 
+# --- a job publishing with provenance must be able to mint an OIDC token ------------------
+#
+# `npm publish --provenance` asks npm to sign an attestation linking the tarball to this
+# workflow run, and it needs `id-token: write` to get the token that proves the run's
+# identity. Without it the publish fails outright.
+#
+# That failure is invisible until the first real release: the step is skipped whenever the
+# registry secrets are absent, so no dry run ever reaches it.
+report "provenance publishing has id-token: write" "$(python3 - "${workflows}" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+found = []
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    for job_name, job in (document.get("jobs") or {}).items():
+        publishes = any(
+            "--provenance" in str(step.get("run") or "")
+            for step in job.get("steps") or []
+        )
+        if not publishes:
+            continue
+
+        permissions = job.get("permissions")
+        granted = permissions.get("id-token") if isinstance(permissions, dict) else None
+        if granted != "write":
+            found.append(
+                f"{path.name} :: {job_name} publishes with --provenance "
+                f"but does not grant id-token: write"
+            )
+
+print("\n".join(found))
+PY
+)"
+
 echo
 echo "${passed} passed, ${failed} failed"
 [ "${failed}" -eq 0 ]
