@@ -630,28 +630,45 @@ impl Engine {
         // The cache is consulted after the path gates and the read, because the key needs
         // the file's bytes — but before the content gates and the parse, which is where the
         // saving is. A hit costs one hash and one dependency check.
-        // A file whose bytes mention `expires:` has a result that depends on what day it is,
-        // so today goes into its key and its entry lives for one day. Folding today into
-        // every key instead would invalidate the whole cache daily for the sake of the
-        // handful of files that carry an expiring suppression — and leaving it out entirely
-        // would serve an expired suppression as though it still held, which is the one thing
-        // an expiry exists to prevent.
-        let dated = memchr::memmem::find(&bytes, b"expires:").is_some();
-        let key = self.caching.then(|| {
+        // A file's result can depend on what day it is, two ways: an expiring suppression in
+        // its bytes, or a rule that read `ctx.today` while checking it. Such a file gets a
+        // key with the date folded in, so its entry lives for one day; every other file gets
+        // a dateless key and its entry survives indefinitely.
+        //
+        // Folding the date into every key instead would invalidate the whole corpus daily
+        // for the sake of a handful of files. Leaving it out entirely would serve yesterday's
+        // answer — an expiry that never expires, a date comparison frozen at whenever the
+        // cache was written.
+        //
+        // The expiry is visible in the bytes, so it is known now. Whether a rule reads the
+        // date is not knowable until the rules have run, which is why both keys exist and
+        // the lookup tries the dated one first: a file that was date-dependent last run has
+        // its entry there, and if the date has moved that key simply misses.
+        let keys = self.caching.then(|| {
             let content = lanekeep_cache::hash_bytes(&bytes);
-            if dated {
+            (
+                self.run_key.for_file(path.as_str(), &content),
                 self.run_key
-                    .for_dated_file(path.as_str(), &content, &self.today.to_string())
-            } else {
-                self.run_key.for_file(path.as_str(), &content)
-            }
+                    .for_dated_file(path.as_str(), &content, &self.today.to_string()),
+            )
         });
+        let has_expiry = memchr::memmem::find(&bytes, b"expires:").is_some();
 
-        if let Some(key) = key
-            && let Some(entry) = cache.get(&key)
-            && lanekeep_cache::validate(entry, &self.root)
-        {
-            return Ok(FileOutcome::cached(path.clone(), key, entry.clone()));
+        if let Some((plain, dated)) = keys {
+            // Dated first. A file with an expiring suppression is *only* ever stored dated,
+            // so trying the plain key for it would be a lookup that can never hit.
+            let candidates: &[CacheKey] = if has_expiry {
+                &[dated]
+            } else {
+                &[dated, plain]
+            };
+            for key in candidates {
+                if let Some(entry) = cache.get(key)
+                    && lanekeep_cache::validate(entry, &self.root)
+                {
+                    return Ok(FileOutcome::cached(path.clone(), *key, entry.clone()));
+                }
+            }
         }
 
         // Content gates: one read, a substring scan, and a parse saved.
@@ -662,8 +679,12 @@ impl Engine {
         if admitted.is_empty() {
             // Still worth an entry: "nothing applies to this file" is a result, and
             // recomputing the gates every run for a file that never matches is the cost the
-            // cache exists to remove.
-            return Ok(FileOutcome::empty_entry(path.clone(), key));
+            // cache exists to remove. No rule ran, so nothing read the date — unless the
+            // file carries an expiry, which is a property of its bytes.
+            return Ok(FileOutcome::empty_entry(
+                path.clone(),
+                keys.map(|(plain, dated)| if has_expiry { dated } else { plain }),
+            ));
         }
 
         let Ok(source) = String::from_utf8(bytes) else {
@@ -677,9 +698,11 @@ impl Engine {
 
         let mut outcome = FileOutcome::parsed(path.clone());
         for rule in admitted {
-            let (violations, facts) = self.run_rule(worker, &files, rule, path, &source)?;
+            let (violations, facts, read_the_date) =
+                self.run_rule(worker, &files, rule, path, &source)?;
             outcome.violations.extend(violations);
             outcome.facts.extend(facts);
+            outcome.read_the_date |= read_the_date;
         }
 
         // Applied after every rule has run, so a directive covers whatever any of them
@@ -707,9 +730,12 @@ impl Engine {
 
         outcome.suppressions = directives.valid;
         outcome.reads = files.dependencies();
-        outcome.entry = key.map(|key| {
+        // Dated if anything about this file's result depended on the date: an expiring
+        // directive, or a rule that read `ctx.today`.
+        let date_dependent = has_expiry || outcome.read_the_date;
+        outcome.entry = keys.map(|(plain, dated)| {
             (
-                key,
+                if date_dependent { dated } else { plain },
                 CacheEntry {
                     violations: outcome.violations.clone(),
                     facts: outcome.facts.clone(),
@@ -789,13 +815,13 @@ impl Engine {
         rule: &Prepared,
         path: &FilePath,
         source: &str,
-    ) -> Result<(Vec<Violation>, Vec<Fact>), RunError> {
+    ) -> Result<(Vec<Violation>, Vec<Fact>, bool), RunError> {
         let mut parser = tree_sitter::Parser::new();
         if parser.set_language(&rule.language.grammar()).is_err() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), false));
         }
         let Some(tree) = parser.parse(source, None) else {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), false));
         };
 
         // Collect capture paths while the tree is borrowed, then intern once the borrow
@@ -804,6 +830,7 @@ impl Engine {
         let host = HostContext::new(tree, source.to_owned(), path.as_str())
             .with_resolver_from(rule.language.as_ref())
             .with_language(Arc::clone(&rule.language))
+            .with_today(&self.today.to_string())
             .with_file_access(Rc::clone(files));
 
         {
@@ -822,7 +849,7 @@ impl Engine {
         }
 
         if matches.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), false));
         }
 
         // Only now, with matches in hand, is a sandbox needed. Everything above — parsing,
@@ -892,7 +919,7 @@ impl Engine {
             });
         }
 
-        Ok((violations, facts))
+        Ok((violations, facts, host.date_was_read()))
     }
 }
 
@@ -967,6 +994,8 @@ struct FileOutcome {
     suppressions: Vec<suppression::Suppression>,
     /// Indices of the directives that silenced something.
     used_suppressions: Vec<u32>,
+    /// Whether any rule read `ctx.today` while checking this file.
+    read_the_date: bool,
     /// What to store for this file, when caching is on.
     entry: Option<(CacheKey, CacheEntry)>,
     /// Whether the file was parsed at all, for the "n files checked" count.
@@ -983,6 +1012,7 @@ impl FileOutcome {
             reads: Vec::new(),
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
+            read_the_date: false,
             entry: None,
             parsed: false,
         }
@@ -996,6 +1026,7 @@ impl FileOutcome {
             reads: Vec::new(),
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
+            read_the_date: false,
             entry: None,
             parsed: true,
         }
@@ -1013,6 +1044,9 @@ impl FileOutcome {
             reads: entry.dependencies.clone(),
             suppressions: entry.suppressions.clone(),
             used_suppressions: entry.used_suppressions.clone(),
+            // A cache hit ran no rules, so nothing read the date this time. Whether the
+            // entry was dated is already settled by the key it was found under.
+            read_the_date: false,
             entry: Some((key, entry)),
             parsed: true,
         }
@@ -1027,6 +1061,7 @@ impl FileOutcome {
             reads: Vec::new(),
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
+            read_the_date: false,
             entry: key.map(|key| (key, CacheEntry::default())),
             parsed: false,
         }
@@ -2939,5 +2974,147 @@ export default defineRule({
             "{:?}",
             messages(&outcome)
         );
+    }
+
+    // --- ctx.today and the cache -----------------------------------------------------------
+
+    /// A rule that reports only when the date it is given starts with a given year.
+    const DATE_RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/dated',
+  query: '(export_statement) @stmt',
+  card: { message: 'dated', remediation: 'x', examples: { bad: 'a', good: 'b' } },
+  check(ctx, m) {
+    if (ctx.today.startsWith('2027')) ctx.report(m.stmt, `it is ${ctx.today}`);
+  },
+});
+";
+
+    #[test]
+    fn a_rule_can_read_the_date() {
+        let project = Project::new(
+            "today-read",
+            &[
+                ("rule.ts", DATE_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+        let outcome = project.run_on("2027-03-04").expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(outcome.violations[0].message.contains("2027-03-04"));
+    }
+
+    #[test]
+    fn a_result_that_read_the_date_is_not_served_across_days() {
+        // The cache-soundness case for `ctx.today`. Without tracking the read, the answer
+        // computed in 2026 would be served in 2027 forever — a date comparison frozen at
+        // whenever the cache happened to be written.
+        let project = Project::new(
+            "today-cache",
+            &[
+                ("rule.ts", DATE_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+
+        assert!(
+            project
+                .run_on("2026-12-31")
+                .expect("runs")
+                .violations
+                .is_empty()
+        );
+        let later = project.run_on("2027-01-01").expect("runs");
+        assert_eq!(
+            later.violations.len(),
+            1,
+            "a warm run served a date-dependent result from another day: {:?}",
+            messages(&later)
+        );
+    }
+
+    #[test]
+    fn a_result_that_ignored_the_date_survives_across_days() {
+        // The other half, and the reason the read is tracked rather than assumed: dating
+        // every entry would re-key the whole corpus daily.
+        //
+        // Asserted on the stored *bytes*, not the entry count. A re-keyed entry replaces the
+        // one it supersedes, so the count is identical either way — it was the count I
+        // reached for first, and it proved nothing.
+        let project = Project::new(
+            "today-undated",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+
+        project.run_on("2026-12-31").expect("runs");
+        let before = fs::read(Store::path_for(&project.dir)).expect("reads");
+
+        let outcome = project.run_on("2027-01-01").expect("runs");
+        assert_eq!(outcome.violations.len(), 1);
+
+        let after = fs::read(Store::path_for(&project.dir)).expect("reads");
+        assert_eq!(
+            before, after,
+            "a result that never read the date was re-keyed across days"
+        );
+    }
+
+    #[test]
+    fn a_result_that_read_the_date_is_re_keyed_across_days() {
+        // The converse, on the same evidence. Together these pin both directions: dateless
+        // entries keep their key, dated ones do not.
+        let project = Project::new(
+            "today-dated-key",
+            &[
+                ("rule.ts", DATE_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+
+        project.run_on("2026-12-31").expect("runs");
+        let before = fs::read(Store::path_for(&project.dir)).expect("reads");
+
+        project.run_on("2027-01-01").expect("runs");
+        let after = fs::read(Store::path_for(&project.dir)).expect("reads");
+        assert_ne!(
+            before, after,
+            "a result that read the date kept its key across days"
+        );
+    }
+
+    #[test]
+    fn loc_reaches_a_reduce_phase_through_a_fact() {
+        // The shape `ctx.loc` exists for: emit it on a fact, report at it later, no glue.
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/loc-through-facts',
+  query: '(export_statement) @stmt',
+  card: { message: 'via loc', remediation: 'x', examples: { bad: 'a', good: 'b' } },
+  check(ctx, m) { ctx.emitFact({ kind: 'site', at: ctx.loc(m.stmt) }); },
+  reduce(ctx) {
+    for (const f of ctx.facts('site')) ctx.report(f.at, 'reported at a remembered place');
+  },
+});
+";
+        let project = Project::new(
+            "loc-facts",
+            &[
+                ("rule.ts", RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const x = 1;\nexport const a = 1;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert_eq!(outcome.violations[0].location.file.as_str(), "src/a.ts");
+        assert_eq!(outcome.violations[0].location.position.line, 2);
     }
 }
