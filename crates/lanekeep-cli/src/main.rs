@@ -55,6 +55,13 @@ enum Command {
         /// Global wall-clock budget in milliseconds.
         #[arg(long)]
         timeout: Option<u64>,
+
+        /// Recompute everything, ignoring and not writing the cache.
+        ///
+        /// For diagnosing a suspected stale result. If one is ever found this way, the
+        /// cache key is missing an input — that is a bug, not a reason to keep the flag on.
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// List the rules a project has configured.
@@ -90,7 +97,15 @@ fn run() -> anyhow::Result<ExitCode> {
             format,
             warn_only,
             timeout,
-        } => check(&path, config.as_deref(), &format, warn_only, timeout),
+            no_cache,
+        } => check(
+            &path,
+            config.as_deref(),
+            &format,
+            warn_only,
+            timeout,
+            no_cache,
+        ),
         Command::Rules { path, config } => rules(&path, config.as_deref()),
     }
 }
@@ -122,7 +137,11 @@ fn config_path(project_root: &Path, given: Option<&Path>) -> anyhow::Result<Path
 }
 
 /// Load the config and prepare an engine. Shared by every command that needs rules.
-fn prepare(project_root: &Path, config: Option<&Path>) -> anyhow::Result<(Engine, usize)> {
+fn prepare(
+    project_root: &Path,
+    config: Option<&Path>,
+    caching: bool,
+) -> anyhow::Result<(Engine, usize)> {
     let root = RuleRoot::new(project_root)
         .map_err(|e| anyhow::anyhow!("cannot use `{}`: {e}", project_root.display()))?
         .with_builtins(lanekeep_rules::source);
@@ -145,6 +164,12 @@ fn prepare(project_root: &Path, config: Option<&Path>) -> anyhow::Result<(Engine
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    let engine = if caching {
+        engine
+    } else {
+        engine.without_cache()
+    };
+
     Ok((engine, declared))
 }
 
@@ -154,6 +179,7 @@ fn check(
     format: &str,
     warn_only: bool,
     timeout: Option<u64>,
+    no_cache: bool,
 ) -> anyhow::Result<ExitCode> {
     let format = Format::parse(format)
         .map_err(|got| anyhow::anyhow!("unknown --format `{got}`\n  expected: human, json"))?;
@@ -166,7 +192,7 @@ fn check(
         "--timeout must be greater than zero"
     );
 
-    let (engine, _) = prepare(project_root, config)?;
+    let (engine, _) = prepare(project_root, config, !no_cache)?;
     let outcome = engine.run().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let color = Color::resolve(
@@ -195,7 +221,7 @@ fn check(
 }
 
 fn rules(project_root: &Path, config: Option<&Path>) -> anyhow::Result<ExitCode> {
-    let (engine, declared) = prepare(project_root, config)?;
+    let (engine, declared) = prepare(project_root, config, false)?;
 
     let mut stdout = std::io::stdout();
     for spec in engine.rules() {

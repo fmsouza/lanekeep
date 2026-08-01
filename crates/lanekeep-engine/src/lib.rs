@@ -35,14 +35,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
 use lanekeep_config::{Config, ConfigError, RuleSpec};
 use lanekeep_core::{
     CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, Severity,
     TrackedRead, Violation,
 };
 use lanekeep_js::{
-    FileAccess, HostContext, Limits, ReduceContext, ReduceFact, RuleRoot, RunClock, Sandbox,
-    SandboxError,
+    FileAccess, HOST_API_VERSION, HostContext, Limits, ReduceContext, ReduceFact, RuleRoot,
+    RunClock, Sandbox, SandboxError,
 };
 use lanekeep_lang::{Language, LanguageRegistry};
 use lanekeep_query::{CompileError, CompiledQuery};
@@ -122,6 +123,10 @@ pub struct Engine {
     /// The project root, canonicalized once. Every tracked read is checked against it, and
     /// canonicalizing per file would put a syscall on the hot path for a constant.
     root: PathBuf,
+    /// Everything constant about this run that a cache key depends on.
+    run_key: RunKey,
+    /// Whether results may be read from and written to the cache.
+    caching: bool,
     limits: Limits,
     rules_root: RuleRoot,
     config_path: PathBuf,
@@ -217,8 +222,32 @@ impl Engine {
             });
         }
 
+        // Every registered grammar, so a tree-sitter bump invalidates rather than silently
+        // reusing results computed against different node shapes.
+        let mut grammars: Vec<GrammarKey> = registry
+            .languages()
+            .map(|language| GrammarKey {
+                id: language.id().to_string(),
+                abi: u32::try_from(language.grammar_abi()).unwrap_or(u32::MAX),
+            })
+            .collect();
+        grammars.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let run_key = RunKey::new(
+            // Major.minor only: a patch release changes nothing a rule can observe, and
+            // invalidating every cache on one would make patch upgrades expensive for
+            // nothing.
+            engine_version(),
+            HOST_API_VERSION,
+            &config.ruleset_hash,
+            &config.config_hash,
+            &grammars,
+        );
+
         Ok(Self {
             rules,
+            run_key,
+            caching: true,
             // Canonicalized here so every tracked read compares against the same absolute
             // root. Falling back to the path as given keeps a non-existent root a discovery
             // problem rather than turning it into a confusing read failure later.
@@ -232,6 +261,13 @@ impl Engine {
             typescript,
             javascript,
         })
+    }
+
+    /// Turn the cache off, for `--no-cache` and for tests that need a cold run.
+    #[must_use]
+    pub const fn without_cache(mut self) -> Self {
+        self.caching = false;
+        self
     }
 
     /// How many rules will actually run. Rules set to `off` are dropped at preparation.
@@ -269,6 +305,15 @@ impl Engine {
     pub fn run_over(&self, files: &[FilePath]) -> Result<Outcome, RunError> {
         let clock = RunClock::start(self.limits.global_timeout);
 
+        // Loaded once, before any worker starts. Shared read-only across the pool: a cache
+        // that workers wrote to concurrently would need a lock on the hot path, and the
+        // whole point is to be faster than recomputing.
+        let cache = if self.caching {
+            Store::load(&self.root)
+        } else {
+            Store::empty()
+        };
+
         let results: Vec<Result<FileOutcome, RunError>> = files
             .par_iter()
             .map_init(
@@ -281,7 +326,7 @@ impl Engine {
                 // be recorded against another's whatever rayon does with chunk boundaries.
                 || self.worker(&clock),
                 |worker, path| match worker {
-                    Ok(sandbox) => self.check_file(sandbox, path),
+                    Ok(sandbox) => self.check_file(sandbox, &cache, path),
                     Err(e) => Err(e.clone()),
                 },
             )
@@ -291,14 +336,25 @@ impl Engine {
         let mut facts = Vec::new();
         let mut files_parsed = 0;
         let mut dependencies = BTreeMap::new();
+        let mut fresh = Store::empty();
         for result in results {
             let outcome = result?;
             violations.extend(outcome.violations);
             facts.extend(outcome.facts);
             files_parsed += usize::from(outcome.parsed);
+            if let Some(entry) = outcome.entry {
+                fresh.insert(entry.0, entry.1);
+            }
             if !outcome.reads.is_empty() {
                 dependencies.insert(outcome.path, outcome.reads);
             }
+        }
+
+        if self.caching {
+            // Only what this run produced, so an entry for a file that no longer exists ages
+            // out rather than accumulating forever. A file that was gated out or unreadable
+            // contributes nothing and is simply absent next run.
+            fresh.save(&self.root);
         }
 
         // Into the one order every run will see, before any rule looks at them.
@@ -426,7 +482,12 @@ impl Engine {
     }
 
     /// Check one file. Returns its violations, facts and tracked reads.
-    fn check_file(&self, sandbox: &Sandbox, path: &FilePath) -> Result<FileOutcome, RunError> {
+    fn check_file(
+        &self,
+        sandbox: &Sandbox,
+        cache: &Store,
+        path: &FilePath,
+    ) -> Result<FileOutcome, RunError> {
         // A fresh set of tracked reads for this file, sharing the root already canonicalized
         // at preparation.
         let files = Rc::new(FileAccess::rooted(self.root.clone()));
@@ -450,13 +511,31 @@ impl Engine {
             return Ok(FileOutcome::skipped(path.clone()));
         };
 
+        // The cache is consulted after the path gates and the read, because the key needs
+        // the file's bytes — but before the content gates and the parse, which is where the
+        // saving is. A hit costs one hash and one dependency check.
+        let key = self.caching.then(|| {
+            self.run_key
+                .for_file(path.as_str(), &lanekeep_cache::hash_bytes(&bytes))
+        });
+
+        if let Some(key) = key
+            && let Some(entry) = cache.get(&key)
+            && lanekeep_cache::validate(entry, &self.root)
+        {
+            return Ok(FileOutcome::cached(path.clone(), key, entry.clone()));
+        }
+
         // Content gates: one read, a substring scan, and a parse saved.
         let admitted: Vec<&Prepared> = admitted
             .into_iter()
             .filter(|rule| rule.gates.admits_content(&bytes))
             .collect();
         if admitted.is_empty() {
-            return Ok(FileOutcome::skipped(path.clone()));
+            // Still worth an entry: "nothing applies to this file" is a result, and
+            // recomputing the gates every run for a file that never matches is the cost the
+            // cache exists to remove.
+            return Ok(FileOutcome::empty_entry(path.clone(), key));
         }
 
         let Ok(source) = String::from_utf8(bytes) else {
@@ -471,6 +550,16 @@ impl Engine {
             outcome.facts.extend(facts);
         }
         outcome.reads = files.dependencies();
+        outcome.entry = key.map(|key| {
+            (
+                key,
+                CacheEntry {
+                    violations: outcome.violations.clone(),
+                    facts: outcome.facts.clone(),
+                    dependencies: outcome.reads.clone(),
+                },
+            )
+        });
 
         Ok(outcome)
     }
@@ -591,6 +680,8 @@ struct FileOutcome {
     facts: Vec<Fact>,
     /// What this file's rules read beyond it.
     reads: Vec<TrackedRead>,
+    /// What to store for this file, when caching is on.
+    entry: Option<(CacheKey, CacheEntry)>,
     /// Whether the file was parsed at all, for the "n files checked" count.
     parsed: bool,
 }
@@ -603,6 +694,7 @@ impl FileOutcome {
             violations: Vec::new(),
             facts: Vec::new(),
             reads: Vec::new(),
+            entry: None,
             parsed: false,
         }
     }
@@ -613,8 +705,47 @@ impl FileOutcome {
             violations: Vec::new(),
             facts: Vec::new(),
             reads: Vec::new(),
+            entry: None,
             parsed: true,
         }
+    }
+
+    /// A file whose result came back from the cache.
+    ///
+    /// Counted as parsed, because from outside the run it was checked — reporting a warm
+    /// run as having checked nothing would make the number useless.
+    fn cached(path: FilePath, key: CacheKey, entry: CacheEntry) -> Self {
+        Self {
+            path,
+            violations: entry.violations.clone(),
+            facts: entry.facts.clone(),
+            reads: entry.dependencies.clone(),
+            entry: Some((key, entry)),
+            parsed: true,
+        }
+    }
+
+    /// A file that no rule's content gates admitted.
+    fn empty_entry(path: FilePath, key: Option<CacheKey>) -> Self {
+        Self {
+            path,
+            violations: Vec::new(),
+            facts: Vec::new(),
+            reads: Vec::new(),
+            entry: key.map(|key| (key, CacheEntry::default())),
+            parsed: false,
+        }
+    }
+}
+
+/// The engine version a cache key uses: major.minor only.
+fn engine_version() -> &'static str {
+    // Trimmed at the second dot. A patch release changes nothing a rule can observe, so
+    // invalidating every cache in the world on one would cost users time for nothing.
+    const FULL: &str = env!("CARGO_PKG_VERSION");
+    match FULL.match_indices('.').nth(1) {
+        Some((at, _)) => FULL.split_at(at).0,
+        None => FULL,
     }
 }
 
@@ -1513,6 +1644,385 @@ export default defineRule({
         assert_eq!(
             outcome.violations[0].location.position.line, 1,
             "reads must not be reachable from a reduce phase"
+        );
+    }
+
+    // --- the cache -----------------------------------------------------------------------
+
+    impl Project {
+        /// Run with the cache disabled, for comparing against a warm run.
+        fn run_cold(&self) -> Result<Outcome, RunError> {
+            self.build().map(Engine::without_cache)?.run()
+        }
+
+        /// The engine, without running it.
+        fn build(&self) -> Result<Engine, RunError> {
+            let root = RuleRoot::new(&self.dir).expect("canonicalizes");
+            let config_path = self.dir.join("lanekeep.config.ts");
+            let sandbox =
+                lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
+                    .expect("sandbox");
+            let config = lanekeep_config::load(&sandbox, &root, &config_path)
+                .unwrap_or_else(|e| panic!("config failed to load: {e}"));
+            Engine::prepare(
+                &config,
+                &self.dir,
+                root,
+                &config_path,
+                &lanekeep_lang_js::registry(),
+                Arc::new(TypeScript),
+                Arc::new(JavaScript),
+            )
+        }
+
+        fn cache(&self) -> Store {
+            Store::load(&self.dir)
+        }
+    }
+
+    fn rendered(outcome: &Outcome) -> Vec<String> {
+        outcome
+            .violations
+            .iter()
+            .map(|v| {
+                format!(
+                    "{}:{}:{} {} {}",
+                    v.location.file.as_str(),
+                    v.location.position.line,
+                    v.location.position.column,
+                    v.rule_id,
+                    v.message
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_warm_run_agrees_with_a_cold_one() {
+        let project = Project::new(
+            "cache-agrees",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\nconst a = 1;\n"),
+                ("src/b.ts", "const b = 1;\ndebugger;\n"),
+                ("src/c.ts", "const c = 1;\n"),
+            ],
+        );
+
+        let cold = rendered(&project.run().expect("runs"));
+        let warm = rendered(&project.run().expect("runs"));
+        assert_eq!(warm, cold, "the cache changed the answer");
+        assert!(!cold.is_empty(), "the fixture should report something");
+    }
+
+    #[test]
+    fn a_run_writes_a_cache() {
+        let project = Project::new(
+            "cache-written",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+        assert!(project.cache().is_empty(), "nothing before the first run");
+        project.run().expect("runs");
+        assert!(!project.cache().is_empty(), "the run stored nothing");
+    }
+
+    #[test]
+    fn a_cached_result_is_actually_used() {
+        // Agreeing with a cold run proves nothing on its own — a cache that was never read
+        // would agree too. So doctor the stored entry and show the doctored value comes
+        // back: that can only happen through the cache.
+        let project = Project::new(
+            "cache-used",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+
+        let store = project.cache();
+        let key = *store
+            .keys()
+            .next()
+            .expect("the run stored an entry for the file");
+
+        let mut doctored = Store::empty();
+        doctored.insert(
+            key,
+            lanekeep_cache::Entry {
+                violations: vec![Violation {
+                    rule_id: "local/no-debugger".parse().expect("valid id"),
+                    location: Location::new(FilePath::new("src/a.ts"), Position::new(7, 3)),
+                    message: "from the cache".to_owned(),
+                    remediation: "nothing".to_owned(),
+                    severity: Severity::Error,
+                }],
+                facts: Vec::new(),
+                dependencies: Vec::new(),
+            },
+        );
+        doctored.save(&project.dir);
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(
+            rendered(&outcome),
+            vec!["src/a.ts:7:3 local/no-debugger from the cache"],
+            "the cached entry was not used"
+        );
+    }
+
+    #[test]
+    fn editing_a_file_invalidates_it() {
+        let project = Project::new(
+            "cache-edited",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+
+        project.write("src/a.ts", "debugger;\n");
+        assert_eq!(
+            project.run().expect("runs").violations.len(),
+            1,
+            "an edited file kept its stale result"
+        );
+    }
+
+    #[test]
+    fn moving_a_file_invalidates_it() {
+        // Path gates make results path-sensitive, so identical bytes at a new path are not
+        // a hit. This fixture's rule has no path gate, but the key must not depend on that.
+        let project = Project::new(
+            "cache-moved",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+        project.run().expect("runs");
+
+        fs::remove_file(project.dir.join("src/a.ts")).expect("removes");
+        project.write("src/moved.ts", "debugger;\n");
+
+        let outcome = project.run().expect("runs");
+        assert_eq!(
+            outcome.violations[0].location.file.as_str(),
+            "src/moved.ts",
+            "the violation followed the old path"
+        );
+    }
+
+    #[test]
+    fn editing_a_tracked_dependency_invalidates_the_files_that_read_it() {
+        // The reason tracked effects exist. Nothing about `src/a.ts` changed, and its result
+        // still has to be recomputed.
+        let project = Project::new(
+            "cache-dependency",
+            &[
+                ("rule.ts", READING_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("policy.json", r#"{"forbidExports":false}"#),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+
+        project.write("policy.json", r#"{"forbidExports":true}"#);
+        assert_eq!(
+            project.run().expect("runs").violations.len(),
+            1,
+            "a changed dependency did not invalidate"
+        );
+    }
+
+    #[test]
+    fn a_dependency_that_appears_invalidates() {
+        // The case a cache is wrong rather than merely cold without: a rule was told a file
+        // was absent, and creating it has to reopen the question.
+        const RULE: &str = r"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/wants-config',
+  query: '(export_statement) @stmt',
+  card: { message: 'no config', remediation: 'add one', examples: { bad: 'a', good: 'b' } },
+  check(ctx, m) {
+    if (!ctx.fileExists('tsconfig.json')) ctx.report(m.stmt);
+  },
+});
+";
+        let project = Project::new(
+            "cache-appeared",
+            &[
+                ("rule.ts", RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "export const a = 1;\n"),
+            ],
+        );
+        assert_eq!(project.run().expect("runs").violations.len(), 1);
+
+        project.write("tsconfig.json", "{}");
+        assert!(
+            project.run().expect("runs").violations.is_empty(),
+            "a dependency that appeared did not invalidate"
+        );
+    }
+
+    #[test]
+    fn changing_the_ruleset_invalidates_everything() {
+        let project = Project::new(
+            "cache-ruleset",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+        assert_eq!(project.run().expect("runs").violations.len(), 1);
+
+        // Same file, different rule: it now reports nothing.
+        project.write(
+            "rule.ts",
+            &DEBUGGER_RULE.replace("ctx.report(m.stmt);", "/* nothing */"),
+        );
+        assert!(
+            project.run().expect("runs").violations.is_empty(),
+            "an edited rule kept its stale results"
+        );
+    }
+
+    #[test]
+    fn changing_the_config_invalidates_everything() {
+        let project = Project::new(
+            "cache-config",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+        assert_eq!(project.run().expect("runs").violations.len(), 1);
+
+        project.write(
+            "lanekeep.config.ts",
+            &config(", severity: { 'local/no-debugger': 'off' }"),
+        );
+        assert!(
+            project.run().expect("runs").violations.is_empty(),
+            "a config change did not invalidate"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_cache_still_produces_the_right_answer() {
+        // Disposability, end to end: garbage on disk costs a recompute and nothing else.
+        let project = Project::new(
+            "cache-corrupt",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+        let expected = rendered(&project.run().expect("runs"));
+
+        let path = Store::path_for(&project.dir);
+        fs::write(&path, b"\x00\x01\x02 not a cache").expect("writes");
+
+        assert_eq!(rendered(&project.run().expect("runs")), expected);
+    }
+
+    #[test]
+    fn caching_can_be_turned_off() {
+        let project = Project::new(
+            "cache-off",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+        let outcome = project.run_cold().expect("runs");
+        assert_eq!(outcome.violations.len(), 1);
+        assert!(
+            project.cache().is_empty(),
+            "a run with caching off wrote a cache"
+        );
+    }
+
+    #[test]
+    fn facts_survive_a_warm_run() {
+        // The reduce phase runs every time, over facts that may all have come from the
+        // cache. A cache that dropped them would make cross-file rules go quiet on the
+        // second run — reporting on a cold run and nothing on a warm one is the worst
+        // possible failure, because it looks like the problem was fixed.
+        let project = Project::new(
+            "cache-facts",
+            &[
+                ("rule.ts", UNUSED_EXPORTS_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "export function used() {}\nexport function spare() {}\n",
+                ),
+                ("src/b.ts", "import { used } from './a';\nused();\n"),
+            ],
+        );
+
+        let cold = rendered(&project.run().expect("runs"));
+        assert_eq!(cold.len(), 1, "{cold:?}");
+        assert_eq!(rendered(&project.run().expect("runs")), cold);
+        assert_eq!(rendered(&project.run().expect("runs")), cold);
+    }
+
+    #[test]
+    fn a_cache_file_does_not_churn() {
+        // Byte-identical across runs over unchanged input. A file that rewrote itself every
+        // run would be a spurious diff for anyone who commits it.
+        let project = Project::new(
+            "cache-stable",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+                ("src/b.ts", "const b = 1;\n"),
+            ],
+        );
+        project.run().expect("runs");
+        let first = fs::read(Store::path_for(&project.dir)).expect("reads");
+        project.run().expect("runs");
+        let second = fs::read(Store::path_for(&project.dir)).expect("reads");
+        assert_eq!(first, second, "the cache file churned");
+    }
+
+    #[test]
+    fn entries_for_deleted_files_do_not_accumulate() {
+        let project = Project::new(
+            "cache-prune",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+                ("src/b.ts", "debugger;\n"),
+            ],
+        );
+        project.run().expect("runs");
+        assert_eq!(project.cache().len(), 2);
+
+        fs::remove_file(project.dir.join("src/b.ts")).expect("removes");
+        project.run().expect("runs");
+        assert_eq!(
+            project.cache().len(),
+            1,
+            "an entry outlived the file it was for"
         );
     }
 }
