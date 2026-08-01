@@ -401,15 +401,22 @@ A warm run with no changes executes **no JavaScript at all** — every file is a
 
 ```rust
 key = blake3(
+    format_version,               // the on-disk encoding
     engine_version_major_minor,   // bump breaks cache intentionally
     host_api_version,             // adding or changing a ctx function invalidates
-    grammar_id, grammar_abi,      // per language
+    every (grammar_id, grammar_abi) in the registry, sorted
     ruleset_hash,                 // hash of all rule module sources in the graph
     config_hash,                  // severity, include/exclude, options
     file_relative_path,           // path gates exist — path is an input
     file_content_hash,            // blake3 of bytes
 )
 ```
+
+Every field is length-prefixed before hashing. Without that, `("ab", "c")` and `("a", "bc")` hash alike and two genuinely different runs share a key — the one failure a cache must not have.
+
+Grammars enter the key as the **whole registry**, not the one language a given file used. A file's rules can involve more than one grammar, and working out which is harder to get right than accepting that a tree-sitter bump invalidates everything. That over-invalidates by the files using the other languages, which costs a recompute.
+
+`host_api_version` is a constant in `lanekeep-js` and nothing bumps it automatically. A `ctx` function added without bumping it serves results computed by a build where the function did not exist — the rule could not have called it, so its verdict was reached without evidence it would have used.
 
 Value: `{ violations, facts, suppressions, deps }`.
 
@@ -439,7 +446,13 @@ Dependencies are keyed by the file whose result they affect, not by the run, and
 
 ### 8.3 Storage
 
-Single memory-mapped file under `.lanekeep/cache`, not per-file entries (inode churn dominates at 2k+ files). Writes go to a temporary file committed by atomic rename. Cache is disposable — corrupt or unreadable means full recompute, never an error.
+Single file under `.lanekeep/cache`, not per-file entries (inode churn dominates at 2k+ files). Writes go to a temporary file committed by atomic rename, so a reader sees the whole previous cache or the whole new one and never a torn write. Cache is disposable — corrupt, truncated, or written by a different build means full recompute, never an error.
+
+The file is **read whole rather than memory-mapped**, which is a deliberate change from this document's original plan. The mapping APIs require `unsafe`, and the workspace denies `unsafe_code`; trading a lint that holds everywhere for a performance claim nothing has measured would be the wrong way round. A whole-file read is one sequential I/O of a few megabytes. If a benchmark ever puts it on the critical path, that is the moment to revisit both decisions together — not before.
+
+The encoding is hand-written and length-prefixed. Decoding is total: every path returns "not an entry" rather than failing, because a cache that can break a run is worse than no cache. One damaged entry discards the whole file, so which results survive never depends on which byte was damaged.
+
+The stored bytes are a function of the entries alone — insertion order does not leak — so a run over unchanged input rewrites an identical file.
 
 ### 8.4 Incremental entry points
 

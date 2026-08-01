@@ -34,6 +34,20 @@ use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 use crate::files::FileAccess;
 use crate::nodes::{Handle, NodeArena};
 
+/// The version of the `ctx` surface this build exposes.
+///
+/// **Bump this whenever `ctx` gains, loses or changes a function.** It is a cache-key input,
+/// and it has to be: a result computed by a build where `ctx.readFile` did not exist is not
+/// a valid result for a build where it does — the rule could not have called something that
+/// was not there, so its cached verdict was reached without evidence it would have used.
+///
+/// Nothing detects this automatically. A function added without bumping it serves stale
+/// results silently, which is the failure mode the whole cache design is arranged against.
+///
+/// History:
+/// - `1` — reporting, navigation, binding resolution, `emitFact`, `readFile`, `fileExists`.
+pub const HOST_API_VERSION: u32 = 1;
+
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmittedFact {

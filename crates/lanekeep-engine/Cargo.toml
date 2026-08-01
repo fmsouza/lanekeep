@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+lanekeep-cache = { workspace = true }
 lanekeep-config = { workspace = true }
 lanekeep-core = { workspace = true }
 lanekeep-js = { workspace = true }
