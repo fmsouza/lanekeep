@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
 use lanekeep_config::{Config, ConfigError, RuleSpec};
@@ -118,6 +119,14 @@ struct Prepared {
 }
 
 /// Everything a run needs, built once and shared across workers.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent run modes — caching, reducing, unused reporting, profiling — \
+              every combination of which is meaningful and reachable from the CLI. The lint \
+              is aimed at a type where a pile of bools stands in for a missing enum; these \
+              are orthogonal switches, and an enum over their sixteen combinations would be \
+              strictly worse to read and to set."
+)]
 pub struct Engine {
     rules: Vec<Prepared>,
     discovery: Discovery,
@@ -132,6 +141,8 @@ pub struct Engine {
     reducing: bool,
     /// Whether directives that silenced nothing are reported.
     reporting_unused: bool,
+    /// Whether per-rule timings are collected.
+    profiling: bool,
     /// The date `expires:` is compared against.
     ///
     /// Fixed once for the run, so two files checked a millisecond apart cannot disagree
@@ -153,6 +164,33 @@ impl std::fmt::Debug for Engine {
     }
 }
 
+/// Where a run spent its time, per rule.
+///
+/// The split is the point. A rule that is slow in `query` has a query matching more than it
+/// needs and wants narrowing; a rule that is slow in `handler` has code to look at. Reporting
+/// one total would leave an author guessing which, and the two have nothing in common as
+/// fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RuleTiming {
+    /// Time matching this rule's query, in Rust.
+    pub query: Duration,
+    /// Time inside its handler, in the sandbox.
+    pub handler: Duration,
+    /// How many matches crossed the boundary.
+    ///
+    /// The number the query gate exists to keep small — §7.2 — so it belongs beside the
+    /// times rather than being inferred from them.
+    pub matches: u64,
+}
+
+impl RuleTiming {
+    /// Everything this rule cost.
+    #[must_use]
+    pub const fn total(&self) -> Duration {
+        self.query.saturating_add(self.handler)
+    }
+}
+
 /// What a run produced.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Outcome {
@@ -162,6 +200,12 @@ pub struct Outcome {
     pub files_discovered: usize,
     /// How many were actually parsed, after gates.
     pub files_parsed: usize,
+
+    /// Where the run spent its time, per rule, when `--profile` asked.
+    ///
+    /// Absent otherwise: timing every match costs a clock read per invocation, which is
+    /// exactly the kind of thing that should not be on the path a warm run takes.
+    pub timings: Option<BTreeMap<RuleId, RuleTiming>>,
 
     /// What each checked file's rules read beyond that file, in path order.
     ///
@@ -260,6 +304,7 @@ impl Engine {
             caching: true,
             reducing: true,
             reporting_unused: false,
+            profiling: false,
             today: suppression::today(),
             // Canonicalized here so every tracked read compares against the same absolute
             // root. Falling back to the path as given keeps a non-existent root a discovery
@@ -280,6 +325,16 @@ impl Engine {
     #[must_use]
     pub const fn without_cache(mut self) -> Self {
         self.caching = false;
+        self
+    }
+
+    /// Collect per-rule timings.
+    ///
+    /// Off by default because measuring costs a clock read per handler invocation, and the
+    /// path a warm run takes is the one place that matters most.
+    #[must_use]
+    pub const fn profiling(mut self) -> Self {
+        self.profiling = true;
         self
     }
 
@@ -399,6 +454,7 @@ impl Engine {
         let mut dependencies = BTreeMap::new();
         let mut fresh = Store::empty();
         let mut directives: BTreeMap<FilePath, FileDirectives> = BTreeMap::new();
+        let mut timings: BTreeMap<RuleId, RuleTiming> = BTreeMap::new();
         for result in results {
             let outcome = result?;
             violations.extend(outcome.violations);
@@ -406,6 +462,12 @@ impl Engine {
             files_parsed += usize::from(outcome.parsed);
             if let Some(entry) = outcome.entry {
                 fresh.insert(entry.0, entry.1);
+            }
+            for (rule, timing) in outcome.timings {
+                let entry = timings.entry(rule).or_default();
+                entry.query = entry.query.saturating_add(timing.query);
+                entry.handler = entry.handler.saturating_add(timing.handler);
+                entry.matches += timing.matches;
             }
             if !outcome.suppressions.is_empty() {
                 directives.insert(
@@ -480,6 +542,7 @@ impl Engine {
             violations,
             files_discovered: files.len(),
             files_parsed,
+            timings: self.profiling.then_some(timings),
             dependencies,
         })
     }
@@ -698,11 +761,14 @@ impl Engine {
 
         let mut outcome = FileOutcome::parsed(path.clone());
         for rule in admitted {
-            let (violations, facts, read_the_date) =
+            let (violations, facts, read_the_date, timing) =
                 self.run_rule(worker, &files, rule, path, &source)?;
             outcome.violations.extend(violations);
             outcome.facts.extend(facts);
             outcome.read_the_date |= read_the_date;
+            if self.profiling {
+                outcome.timings.push((rule.spec.id.clone(), timing));
+            }
         }
 
         // Applied after every rule has run, so a directive covers whatever any of them
@@ -815,14 +881,19 @@ impl Engine {
         rule: &Prepared,
         path: &FilePath,
         source: &str,
-    ) -> Result<(Vec<Violation>, Vec<Fact>, bool), RunError> {
+    ) -> Result<(Vec<Violation>, Vec<Fact>, bool, RuleTiming), RunError> {
         let mut parser = tree_sitter::Parser::new();
         if parser.set_language(&rule.language.grammar()).is_err() {
-            return Ok((Vec::new(), Vec::new(), false));
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
         }
         let Some(tree) = parser.parse(source, None) else {
-            return Ok((Vec::new(), Vec::new(), false));
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
         };
+
+        // Only when asked. A clock read per invocation is cheap and not free, and this is
+        // the hot path.
+        let mut timing = RuleTiming::default();
+        let clock = |on: bool| on.then(std::time::Instant::now);
 
         // Collect capture paths while the tree is borrowed, then intern once the borrow
         // has ended — the two-phase shape the arena's ownership of the tree forces.
@@ -833,6 +904,7 @@ impl Engine {
             .with_today(&self.today.to_string())
             .with_file_access(Rc::clone(files));
 
+        let query_started = clock(self.profiling);
         {
             let arena = host.arena().borrow();
             rule.query
@@ -848,8 +920,13 @@ impl Engine {
                 });
         }
 
+        if let Some(started) = query_started {
+            timing.query = started.elapsed();
+            timing.matches = matches.len() as u64;
+        }
+
         if matches.is_empty() {
-            return Ok((Vec::new(), Vec::new(), false));
+            return Ok((Vec::new(), Vec::new(), false, timing));
         }
 
         // Only now, with matches in hand, is a sandbox needed. Everything above — parsing,
@@ -881,13 +958,17 @@ impl Engine {
                 rule_index(&rule.spec)
             );
 
-            sandbox
-                .eval_with_host_timeout::<()>(&host, &call, timeout)
-                .map_err(|e: SandboxError| RunError::Rule {
-                    rule: rule.spec.id.to_string(),
-                    file: path.as_str().to_owned(),
-                    detail: e.to_string(),
-                })?;
+            let handler_started = clock(self.profiling);
+            let outcome = sandbox.eval_with_host_timeout::<()>(&host, &call, timeout);
+            if let Some(started) = handler_started {
+                timing.handler = timing.handler.saturating_add(started.elapsed());
+            }
+
+            outcome.map_err(|e: SandboxError| RunError::Rule {
+                rule: rule.spec.id.to_string(),
+                file: path.as_str().to_owned(),
+                detail: e.to_string(),
+            })?;
         }
 
         let facts = host
@@ -919,7 +1000,7 @@ impl Engine {
             });
         }
 
-        Ok((violations, facts, host.date_was_read()))
+        Ok((violations, facts, host.date_was_read(), timing))
     }
 }
 
@@ -996,6 +1077,8 @@ struct FileOutcome {
     used_suppressions: Vec<u32>,
     /// Whether any rule read `ctx.today` while checking this file.
     read_the_date: bool,
+    /// Per-rule timings, when profiling.
+    timings: Vec<(RuleId, RuleTiming)>,
     /// What to store for this file, when caching is on.
     entry: Option<(CacheKey, CacheEntry)>,
     /// Whether the file was parsed at all, for the "n files checked" count.
@@ -1013,6 +1096,7 @@ impl FileOutcome {
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
             read_the_date: false,
+            timings: Vec::new(),
             entry: None,
             parsed: false,
         }
@@ -1027,6 +1111,7 @@ impl FileOutcome {
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
             read_the_date: false,
+            timings: Vec::new(),
             entry: None,
             parsed: true,
         }
@@ -1047,6 +1132,7 @@ impl FileOutcome {
             // A cache hit ran no rules, so nothing read the date this time. Whether the
             // entry was dated is already settled by the key it was found under.
             read_the_date: false,
+            timings: Vec::new(),
             entry: Some((key, entry)),
             parsed: true,
         }
@@ -1062,6 +1148,7 @@ impl FileOutcome {
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
             read_the_date: false,
+            timings: Vec::new(),
             entry: key.map(|key| (key, CacheEntry::default())),
             parsed: false,
         }
