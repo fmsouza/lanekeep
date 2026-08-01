@@ -25,7 +25,12 @@ check() {
 }
 
 work="$(mktemp -d)"
-trap 'rm -rf "${work}"; rm -rf "${repo_root}/npm/@lanekeep"' EXIT
+# Only the temporary directory. The script writes nowhere else, which is the property
+# this test would otherwise be quietly violating — an earlier version rewrote the tracked
+# launcher manifest and left a release version committed.
+trap 'rm -rf "${work}"' EXIT
+
+out="${work}/out"
 
 # --- a complete set of binaries packages cleanly ---------------------------------------
 artifacts="${work}/dist"
@@ -37,16 +42,16 @@ done
 mkdir -p "${artifacts}/x86_64-pc-windows-msvc"
 printf 'binary' >"${artifacts}/x86_64-pc-windows-msvc/lanekeep.exe"
 
-"${script}" 9.9.9 "${artifacts}" >/dev/null 2>&1
+"${script}" 9.9.9 "${artifacts}" "${out}" >/dev/null 2>&1
 check "a complete set packages" "0" "$?"
 
 check "the launcher takes the version" "9.9.9" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
-    "${repo_root}/npm/lanekeep/package.json")"
+    "${out}/lanekeep/package.json")"
 
 check "a platform package takes the version" "9.9.9" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
-    "${repo_root}/npm/@lanekeep/darwin-arm64/package.json")"
+    "${out}/@lanekeep/darwin-arm64/package.json")"
 
 # Every optional dependency must be pinned to this release. A launcher pointing at last
 # release's binaries installs and then runs the wrong version.
@@ -55,29 +60,37 @@ check "optional dependencies are pinned to the same version" "1" \
 import json, sys
 package = json.load(open(sys.argv[1]))
 print(len(set(package["optionalDependencies"].values())))' \
-    "${repo_root}/npm/lanekeep/package.json")"
+    "${out}/lanekeep/package.json")"
 
 check "a platform package declares its os" "darwin" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["os"][0])' \
-    "${repo_root}/npm/@lanekeep/darwin-arm64/package.json")"
+    "${out}/@lanekeep/darwin-arm64/package.json")"
 
 check "a platform package declares its cpu" "arm64" \
   "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cpu"][0])' \
-    "${repo_root}/npm/@lanekeep/darwin-arm64/package.json")"
+    "${out}/@lanekeep/darwin-arm64/package.json")"
 
 check "the windows binary keeps its extension" "0" \
-  "$([ -f "${repo_root}/npm/@lanekeep/win32-x64/bin/lanekeep.exe" ] && echo 0 || echo 1)"
+  "$([ -f "${out}/@lanekeep/win32-x64/bin/lanekeep.exe" ] && echo 0 || echo 1)"
 
-check "a unix binary is executable" "0" \
-  "$([ -x "${repo_root}/npm/@lanekeep/linux-x64/bin/lanekeep" ] && echo 0 || echo 1)"
+check "a unix binary is present" "0" \
+  "$([ -s "${out}/@lanekeep/linux-x64/bin/lanekeep" ] && echo 0 || echo 1)"
+
+# The executable bit only exists where the filesystem has one. Asserting it on Windows tests
+# the runner, not the script — and the packaging that matters there is the `.exe` name.
+if [ "$(uname -s 2>/dev/null || echo unknown)" != "unknown" ] &&
+  ! uname -s | grep -qiE 'mingw|msys|cygwin'; then
+  check "a unix binary is executable" "0" \
+    "$([ -x "${out}/@lanekeep/linux-x64/bin/lanekeep" ] && echo 0 || echo 1)"
+fi
 
 # --- a missing binary fails loudly ------------------------------------------------------
-rm -rf "${repo_root}/npm/@lanekeep"
+rm -rf "${out}"
 missing="${work}/partial"
 mkdir -p "${missing}/aarch64-apple-darwin"
 printf 'binary' >"${missing}/aarch64-apple-darwin/lanekeep"
 
-"${script}" 9.9.9 "${missing}" >/dev/null 2>&1
+"${script}" 9.9.9 "${missing}" "${out}" >/dev/null 2>&1
 check "a missing platform binary fails the build" "1" "$?"
 
 # --- the launcher resolves platforms ------------------------------------------------------
@@ -131,6 +144,14 @@ process.stdout.write(binaryName("linux"));
 else
   echo "note: node not found, skipping launcher tests"
 fi
+
+# The template is not build output and must not carry a release version.
+check "the committed launcher keeps its placeholder version" "0.0.0" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
+    "${repo_root}/npm/lanekeep/package.json")"
+
+check "the script writes nothing into npm/" "0" \
+  "$([ ! -d "${repo_root}/npm/@lanekeep" ] && echo 0 || echo 1)"
 
 echo
 echo "${passed} passed, ${failed} failed"

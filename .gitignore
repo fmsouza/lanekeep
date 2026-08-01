@@ -27,6 +27,8 @@
 /npm/**/node_modules/
 /npm/**/*.tgz
 /npm/@lanekeep/*/bin/
+# Assembled npm packages, written at release time from built binaries.
+/dist-npm/
 
 # Insta snapshot review leftovers. Accepted snapshots are committed; pending ones are not.
 *.snap.new

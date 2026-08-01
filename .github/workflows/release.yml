@@ -58,7 +58,12 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Deliberately uncached, for two reasons. A binary someone will download should be
+      # built from a clean tree rather than from whatever a cache happened to hold — a
+      # release is the one build where a stale artifact is worst. And `Swatinem/rust-cache`
+      # is LGPL-3.0, which `deny.toml`'s allow-list does not include; adding it there to
+      # save a few minutes on a job that runs once per release would be relaxing a check to
+      # make a change pass.
 
       # The `dist` profile, not `release`: it turns on LTO and strips symbols, which is
       # what a shipped binary wants and what a developer's `cargo build --release` should
@@ -121,12 +126,12 @@ jobs:
       - name: Assemble npm packages
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: ./scripts/build-npm-packages.sh "${VERSION}" dist
+        run: ./scripts/build-npm-packages.sh "${VERSION}" dist dist-npm
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npm-packages
-          path: npm/
+          path: dist-npm/
           if-no-files-found: error
           retention-days: 7
 
@@ -149,7 +154,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: npm-packages
-          path: npm
+          path: dist-npm
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
@@ -165,7 +170,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for package in npm/@lanekeep/*/; do
+          for package in dist-npm/@lanekeep/*/; do
             npm publish "${package}" --access public --provenance
           done
 
@@ -174,7 +179,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish npm/lanekeep --access public --provenance
+        run: npm publish dist-npm/lanekeep --access public --provenance
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:

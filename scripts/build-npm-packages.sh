@@ -7,20 +7,27 @@
 #
 # Run from the repository root:
 #
-#   ./scripts/build-npm-packages.sh 0.1.0 dist/
+#   ./scripts/build-npm-packages.sh 0.1.0 dist/ [output-dir]
 #
 # where `dist/` holds one directory per target triple, each containing the built binary.
 # That is the layout the release workflow's download-artifact step produces.
 #
-# Writes into npm/@lanekeep/, which is gitignored: these packages are build output, and a
-# checked-in copy would go stale the moment a version moved.
+# Output goes to a directory of its own — `dist-npm/` by default — and never back into
+# `npm/`. `npm/lanekeep/package.json` is a *template*: its version is `0.0.0` in the
+# repository and is only ever rewritten in a copy. Rewriting it in place would leave a
+# release version committed, which is both a confusing diff and a thing someone would
+# eventually publish by accident.
 set -euo pipefail
 
-version="${1:?usage: build-npm-packages.sh <version> <artifacts-dir>}"
-artifacts="${2:?usage: build-npm-packages.sh <version> <artifacts-dir>}"
+version="${1:?usage: build-npm-packages.sh <version> <artifacts-dir> [output-dir]}"
+artifacts="${2:?usage: build-npm-packages.sh <version> <artifacts-dir> [output-dir]}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-out="${repo_root}/npm"
+out="${3:-${repo_root}/dist-npm}"
+
+rm -rf "${out}"
+mkdir -p "${out}"
+cp -R "${repo_root}/npm/lanekeep" "${out}/lanekeep"
 
 # target triple : npm platform : npm cpu : binary name
 targets=(
@@ -70,9 +77,9 @@ JSON
   built=$((built + 1))
 done
 
-# The launcher's own version, and the versions it depends on, are rewritten from the tag
-# rather than committed. A committed version is one more thing to forget on a release, and
-# forgetting it publishes a launcher that pulls last release's binaries.
+# The launcher's own version, and the versions it depends on, are written from the tag — into
+# the copy, never into the template. A committed version is one more thing to forget on a
+# release, and forgetting it publishes a launcher that pulls last release's binaries.
 launcher="${out}/lanekeep/package.json"
 python3 - "${launcher}" "${version}" <<'PY'
 import json
