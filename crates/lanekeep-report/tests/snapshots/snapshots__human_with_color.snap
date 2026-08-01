@@ -1,0 +1,14 @@
+---
+source: crates/lanekeep-report/tests/snapshots.rs
+expression: "render(Format::Human, Color::Always, &corpus(), summary(), &cards())"
+---
+[31msrc/a.ts:2:1[0m [31merror[0m [2m[lanekeep/no-default-export][0m default export
+  [2m→[0m use a named export, so the symbol has one name every importer must use
+[31msrc/a.ts:9:1[0m [31merror[0m [2m[lanekeep/no-default-export][0m default export
+  [2m→[0m use a named export, so the symbol has one name every importer must use
+[31msrc/deep/c.ts:4:7[0m [31merror[0m [2m[lanekeep/no-default-export][0m default export
+  [2m→[0m use a named export, so the symbol has one name every importer must use
+[33msrc/b.ts:1:1[0m [33mwarn[0m [2m[lanekeep/no-restricted-imports][0m importing 'lodash/merge' is restricted — use the standard library
+  [2m→[0m import something permitted here, or move this code where it is allowed
+
+[31m✖ 3 error(s), 1 warning(s) across 3 file(s) checked[0m

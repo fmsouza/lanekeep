@@ -1,0 +1,72 @@
+---
+source: crates/lanekeep-report/tests/snapshots.rs
+expression: "rendered(Format::Json)"
+---
+{
+  "version": 1,
+  "ok": false,
+  "total": 4,
+  "files_discovered": 12,
+  "files_parsed": 3,
+  "warn_only": false,
+  "violations": [
+    {
+      "rule_id": "lanekeep/no-default-export",
+      "location": {
+        "file": "src/a.ts",
+        "position": {
+          "line": 2,
+          "column": 1
+        }
+      },
+      "message": "default export",
+      "remediation": "use a named export, so the symbol has one name every importer must use",
+      "severity": "error"
+    },
+    {
+      "rule_id": "lanekeep/no-default-export",
+      "location": {
+        "file": "src/a.ts",
+        "position": {
+          "line": 9,
+          "column": 1
+        }
+      },
+      "message": "default export",
+      "remediation": "use a named export, so the symbol has one name every importer must use",
+      "severity": "error",
+      "fix": {
+        "start": 120,
+        "end": 134,
+        "replacement": "export function",
+        "safe": true
+      }
+    },
+    {
+      "rule_id": "lanekeep/no-default-export",
+      "location": {
+        "file": "src/deep/c.ts",
+        "position": {
+          "line": 4,
+          "column": 7
+        }
+      },
+      "message": "default export",
+      "remediation": "use a named export, so the symbol has one name every importer must use",
+      "severity": "error"
+    },
+    {
+      "rule_id": "lanekeep/no-restricted-imports",
+      "location": {
+        "file": "src/b.ts",
+        "position": {
+          "line": 1,
+          "column": 1
+        }
+      },
+      "message": "importing 'lodash/merge' is restricted — use the standard library",
+      "remediation": "import something permitted here, or move this code where it is allowed",
+      "severity": "warn"
+    }
+  ]
+}
