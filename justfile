@@ -83,6 +83,7 @@ test-scripts:
     @./scripts/test-publish-crates.sh
     @./scripts/test-shell-portability.sh
     @./scripts/test-workflows.sh
+    @./scripts/test-release-config.sh
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 docs:

@@ -16,7 +16,16 @@ separate, so each is reviewable on its own and none can happen by accident.
 
 Nothing publishes on a push to a branch. Nothing publishes without a tag.
 
-`release-plz.yml` is steps 1 and 2; `release.yml` is step 3. They share no state but the tag.
+`release-plz.yml` is steps 1 and 2; `release.yml` is step 3. **They share no state but the tag
+name**, and nothing makes them agree on it, so it is pinned in both directions: release-plz is
+configured to tag `v{{ version }}`, `release.yml` triggers on `v*`, and
+`scripts/test-release-config.sh` fails if either drifts.
+
+That is not hypothetical. release-plz defaults to `{{ package }}-v{{ version }}` for a
+workspace with more than one public crate, and v0.1.1 shipped with that default half-overridden
+— releases were disabled for the eleven library crates but tagging never was. The result was
+twelve tags nobody reads and a release called `lanekeep-cli-v0.1.1`, while `release.yml`
+attached its binaries to `v0.1.1`. Both halves succeeded; the release was still wrong.
 
 ## What has to exist first
 
