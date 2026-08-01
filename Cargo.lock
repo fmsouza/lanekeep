@@ -319,6 +319,7 @@ dependencies = [
  "lanekeep-lang-js",
  "lanekeep-report",
  "lanekeep-rules",
+ "serde_json",
 ]
 
 [[package]]

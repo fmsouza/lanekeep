@@ -187,6 +187,18 @@ convenient — that code was rewritten instead. `just check` runs `just msrv`, s
 fails locally rather than costing a CI round trip; without it, every other recipe runs on a
 toolchain far newer than the floor and happily accepts syntax that does not exist there.
 
+**A tree-sitter query matches children in tree order.** `(import_statement source: (string)
+(import_clause ...))` can never match, because the grammar puts `import_clause` first — and
+the error is exactly that, "this pattern can never match", which is easy to read as "this
+node type does not exist". Check the grammar's child order before rewriting the node names.
+
+**A raw control character in a rule's source reports a parse failure somewhere else.** A NUL
+written into a template literal made the stripper report an error at the enclosing
+`return`, twenty lines earlier, because that is where the outermost `ERROR` node starts.
+Nothing is visible in an editor. If a rule fails to strip at a line that looks fine, dump the
+`ERROR` node positions from the tree rather than reading the reported one — and write
+control characters as escapes (`\u0000`), never literally.
+
 **`Path::is_absolute` is platform-specific, and tests that assume otherwise pass on
 macOS and fail on Windows.** `/etc/passwd` is absolute on Unix and merely *rooted* on
 Windows; `C:\...` is the reverse. Build an absolute path from `std::env::temp_dir()` rather
