@@ -76,6 +76,45 @@ if [ "$(uname -s 2>/dev/null || echo unknown)" != "unknown" ] &&
     "$([ -x "${inner}/lanekeep" ] && echo 0 || echo 1)"
 fi
 
+# --- the zip, which is built without `zip` -----------------------------------------------------
+#
+# git-bash ships no `zip`, and this script has to run on the same three platforms as everything
+# else here, so the Windows archive is built with Python. These assert it is a real zip with the
+# contents and the mode it should have — the executable bit lives in the zip's own metadata, not
+# on any filesystem, so it survives being unpacked anywhere.
+zip_check="$(python3 - "${out}/lanekeep-9.9.9-x86_64-pc-windows-msvc.zip" <<'PY'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    names = sorted(archive.namelist())
+    problems = []
+
+    expected = [
+        "lanekeep-9.9.9-x86_64-pc-windows-msvc/LICENSE-APACHE",
+        "lanekeep-9.9.9-x86_64-pc-windows-msvc/LICENSE-MIT",
+        "lanekeep-9.9.9-x86_64-pc-windows-msvc/README.md",
+        "lanekeep-9.9.9-x86_64-pc-windows-msvc/lanekeep.exe",
+    ]
+    if names != expected:
+        problems.append(f"contents were {names}")
+
+    binary = archive.getinfo("lanekeep-9.9.9-x86_64-pc-windows-msvc/lanekeep.exe")
+    if not (binary.external_attr >> 16) & 0o111:
+        problems.append("the binary is not marked executable")
+
+    # Reproducible: every entry carries ZipInfo's fixed default rather than the time it was
+    # built. Asserted as that exact value, because entries written moments apart would share a
+    # timestamp anyway and "they all match" would pass on a build that embeds the clock.
+    stamps = {info.date_time for info in archive.infolist()}
+    if stamps != {(1980, 1, 1, 0, 0, 0)}:
+        problems.append(f"entries are timestamped {sorted(stamps)}, not the fixed default")
+
+    print("; ".join(problems))
+PY
+)"
+check "the zip holds what it should, executable" "" "${zip_check}"
+
 # --- checksums ------------------------------------------------------------------------------------
 check "a checksum file is written" "0" "$([ -s "${out}/SHA256SUMS" ] && echo 0 || echo 1)"
 
