@@ -1,0 +1,29 @@
+{
+  "name": "lanekeep",
+  "version": "9.9.9",
+  "description": "Deterministic, AST-based architectural conformance checking",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fmsouza/lanekeep.git"
+  },
+  "homepage": "https://github.com/fmsouza/lanekeep#readme",
+  "bin": {
+    "lanekeep": "bin/lanekeep"
+  },
+  "files": [
+    "bin/lanekeep",
+    "resolve.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@lanekeep/darwin-arm64": "9.9.9",
+    "@lanekeep/darwin-x64": "9.9.9",
+    "@lanekeep/linux-arm64": "9.9.9",
+    "@lanekeep/linux-x64": "9.9.9",
+    "@lanekeep/win32-x64": "9.9.9"
+  }
+}

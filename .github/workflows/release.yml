@@ -1,0 +1,196 @@
+# Build and publish a release.
+#
+# Runs on a `v*` tag. Nothing here fires on a push to a branch, and nothing publishes
+# without the tag existing — a release is a deliberate act, and a workflow that could
+# publish by accident is one that eventually will.
+#
+# Publishing needs two secrets that are deliberately absent until someone adds them:
+# `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN`. Without them the build and packaging still run and
+# the artifacts are still attached to the release — so a dry run is the default, and the
+# first real publish is a decision someone makes rather than one this file makes for them.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (dry run: nothing is published)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # One job per target. Cross-compilation would be fewer jobs and more ways to be subtly
+  # wrong — a binary that links against the wrong libc is a bug reported by a user rather
+  # than by CI.
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # The `dist` profile, not `release`: it turns on LTO and strips symbols, which is
+      # what a shipped binary wants and what a developer's `cargo build --release` should
+      # not have to pay for.
+      - name: Build
+        run: cargo build --profile dist --target ${{ matrix.target }} -p lanekeep-cli
+
+      # A binary that cannot answer `--version` is a binary nobody should be shipping, and
+      # this is the last moment it costs nothing to find out.
+      - name: Smoke test
+        if: matrix.target != 'aarch64-unknown-linux-gnu' || runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/dist/lanekeep"
+          [ -f "${binary}.exe" ] && binary="${binary}.exe"
+          "${binary}" --version
+          "${binary}" --help > /dev/null
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/dist/lanekeep
+            target/${{ matrix.target }}/dist/lanekeep.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  # Assemble the npm packages from every platform's binary, and attach them to the run.
+  # Separate from publishing so the assembly is verifiable without a token.
+  package:
+    name: package
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+
+      - name: Resolve version
+        id: version
+        env:
+          # Through `env:`, never interpolated into the script. A tag is
+          # attacker-controllable in the general case, and `${{ }}` is substituted before
+          # bash sees it.
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${REF_NAME#v}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "resolved version ${version}"
+
+      - name: Assemble npm packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build-npm-packages.sh "${VERSION}" dist
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-packages
+          path: npm/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that publishes anything. Gated on the tag *and* on the secrets existing, so
+  # a fork, a dry run, and a repository nobody has configured all stop here rather than
+  # failing halfway through a partial release.
+  publish:
+    name: publish
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-packages
+          path: npm
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # Platform packages first. The launcher depends on them, so publishing it first would
+      # leave a window where `npm install lanekeep` resolves to a launcher whose binaries do
+      # not exist yet.
+      - name: Publish platform packages
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for package in npm/@lanekeep/*/; do
+            npm publish "${package}" --access public --provenance
+          done
+
+      - name: Publish launcher
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish npm/lanekeep --access public --provenance
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      # Crates publish in dependency order, because crates.io rejects a crate whose
+      # dependencies are not yet on it. `--no-verify` is deliberately absent: a crate that
+      # cannot build from its own published form is a crate nobody can use.
+      - name: Publish crates
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          for crate in lanekeep-core lanekeep-lang lanekeep-lang-js lanekeep-query \
+            lanekeep-js lanekeep-cache lanekeep-config lanekeep-engine lanekeep-report \
+            lanekeep-rules lanekeep-testkit lanekeep-cli; do
+            echo "publishing ${crate}"
+            cargo publish -p "${crate}"
+          done

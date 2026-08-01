@@ -1,0 +1,125 @@
+# The nightly build.
+#
+# CI on a pull request tells you the change is fine. This tells you the *world* is still
+# fine: a dependency that yanked a version, a new clippy lint on the stable channel, a
+# transitive advisory published since the last merge. None of those arrive with a commit, so
+# nothing else would ever catch them.
+#
+# It builds the release binaries too, which is the other thing a pull request never does —
+# a cross-platform build that only runs on tags breaks on a tag, which is the worst moment.
+name: Nightly
+
+on:
+  schedule:
+    # 04:00 UTC. Late enough that a day's merges have landed, early enough that a European
+    # morning starts with the answer.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The same gate a pull request runs, against today's toolchain and today's crates.io.
+  gate:
+    name: gate (just check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just,cargo-nextest,cargo-deny,cargo-machete,typos
+
+      # Deliberately uncached. A nightly run exists to find what changed underneath the
+      # project, and a cache is precisely what would hide it.
+      - run: just check
+
+  # Against the newest dependencies the manifests permit, not the ones in the lockfile. This
+  # is what finds a semver-compatible release that broke something — the failure mode a
+  # committed lockfile is designed to hide from pull requests, and should not hide forever.
+  latest-dependencies:
+    name: latest dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just,cargo-nextest
+
+      - run: cargo update
+      - run: just test
+
+  # An advisory published overnight affects a project that has not changed. Nothing else
+  # would report it until the next pull request, which might be weeks away.
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: cargo-deny
+
+      - run: cargo deny check advisories
+
+  # The release build, nightly, so a cross-platform break is found on an ordinary morning
+  # rather than while cutting a release.
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --profile dist --target ${{ matrix.target }} -p lanekeep-cli
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/dist/lanekeep"
+          [ -f "${binary}.exe" ] && binary="${binary}.exe"
+          "${binary}" --version

@@ -77,6 +77,7 @@ test-doc:
 # a false reject blocks everyone. It is not too small to test.
 test-scripts:
     @./scripts/test-lint-commit-msg.sh
+    @./scripts/test-build-npm-packages.sh
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 docs:
