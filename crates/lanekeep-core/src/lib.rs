@@ -18,6 +18,7 @@
 //! from outside.
 
 pub mod card;
+pub mod changed;
 pub mod discovery;
 pub mod fact;
 pub mod gates;
@@ -28,6 +29,7 @@ pub mod tracked;
 pub mod violation;
 
 pub use card::{CardProblem, Examples, RuleCard};
+pub use changed::ChangeError;
 pub use discovery::{Discovery, DiscoveryError};
 pub use fact::Fact;
 pub use gates::{CompiledGates, GateError, Gates};

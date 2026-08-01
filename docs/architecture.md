@@ -456,9 +456,17 @@ The stored bytes are a function of the entries alone — insertion order does no
 
 ### 8.4 Incremental entry points
 
-- `--since <ref>` — files changed vs a git ref.
-- `--staged` — files in the index. Pre-commit hook default.
+- `--since <ref>` — files changed vs a git ref, including untracked ones. A file you just created is a file you just changed.
+- `--staged` — files in the index. Pre-commit hook default, and not the same as the working tree: what is about to be committed is what should be checked.
 - Neither flag — full discovery, but warm cache makes it cheap.
+
+Both are **intersected with discovery** rather than used in place of it, so `include` and `exclude` stay in force. A selection that overrode them would let `--staged` check a vendored directory the config had deliberately excluded.
+
+Both **skip cross-file rules**, and say so on stderr naming the rules that did not run. A reduce phase consumes facts from every file, so running one over a subset does not give a smaller answer — it gives a wrong one. `no-unused-exports` over three changed files would report every export in them as unused, because the importers were never looked at.
+
+Computing them properly would mean processing the whole corpus, which is what the flag exists to avoid. Skipping is the only option that is both fast and never wrong. Staying quiet about it is not an option at all: a rule that silently stops running turns a clean result into a false "fixed".
+
+A ref that does not resolve is an error. Checking everything instead would be a surprising amount of work done silently; checking nothing would look like a clean run.
 
 ---
 

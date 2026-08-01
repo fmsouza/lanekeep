@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use lanekeep_core::FilePath;
 use lanekeep_engine::Engine;
 use lanekeep_js::RuleRoot;
 use lanekeep_lang_js::{JavaScript, TypeScript};
@@ -62,6 +63,14 @@ enum Command {
         /// cache key is missing an input — that is a bug, not a reason to keep the flag on.
         #[arg(long)]
         no_cache: bool,
+
+        /// Check only files changed against a git ref.
+        #[arg(long, value_name = "REF", conflicts_with = "staged")]
+        since: Option<String>,
+
+        /// Check only files staged in the index. The pre-commit default.
+        #[arg(long)]
+        staged: bool,
     },
 
     /// List the rules a project has configured.
@@ -98,6 +107,8 @@ fn run() -> anyhow::Result<ExitCode> {
             warn_only,
             timeout,
             no_cache,
+            since,
+            staged,
         } => check(
             &path,
             config.as_deref(),
@@ -105,8 +116,59 @@ fn run() -> anyhow::Result<ExitCode> {
             warn_only,
             timeout,
             no_cache,
+            &Selection::from(since, staged),
         ),
         Command::Rules { path, config } => rules(&path, config.as_deref()),
+    }
+}
+
+/// Which files to check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selection {
+    /// Everything discovery finds.
+    All,
+    /// Files changed against a git ref.
+    Since(String),
+    /// Files staged in the index.
+    Staged,
+}
+
+impl Selection {
+    fn from(since: Option<String>, staged: bool) -> Self {
+        match (since, staged) {
+            (Some(reference), _) => Self::Since(reference),
+            (None, true) => Self::Staged,
+            (None, false) => Self::All,
+        }
+    }
+
+    const fn is_narrowed(&self) -> bool {
+        !matches!(self, Self::All)
+    }
+
+    /// How the flag would be written, for a message that has to name it.
+    const fn flag(&self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Since(_) => "--since",
+            Self::Staged => "--staged",
+        }
+    }
+
+    /// The files this selection names, or `None` for everything.
+    ///
+    /// # Errors
+    ///
+    /// Fails if git cannot answer.
+    fn resolve(&self, project_root: &Path) -> anyhow::Result<Option<Vec<FilePath>>> {
+        match self {
+            Self::All => Ok(None),
+            Self::Since(reference) => Ok(Some(lanekeep_core::changed::since(
+                project_root,
+                reference,
+            )?)),
+            Self::Staged => Ok(Some(lanekeep_core::changed::staged(project_root)?)),
+        }
     }
 }
 
@@ -180,6 +242,7 @@ fn check(
     warn_only: bool,
     timeout: Option<u64>,
     no_cache: bool,
+    selection: &Selection,
 ) -> anyhow::Result<ExitCode> {
     let format = Format::parse(format)
         .map_err(|got| anyhow::anyhow!("unknown --format `{got}`\n  expected: human, json"))?;
@@ -193,7 +256,46 @@ fn check(
     );
 
     let (engine, _) = prepare(project_root, config, !no_cache)?;
-    let outcome = engine.run().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let selected = selection.resolve(project_root)?;
+    let cross_file: Vec<String> = engine
+        .rules()
+        .filter(|spec| spec.has_reduce)
+        .map(|spec| spec.id.to_string())
+        .collect();
+
+    // A cross-file rule consumes facts from every file, so running one over a subset does
+    // not give a smaller answer — it gives a wrong one. Skipping is the only sound option,
+    // and it has to be said out loud: a rule that quietly stops running is worse than one
+    // that never ran, because the clean output reads as "fixed".
+    let engine = if selection.is_narrowed() && !cross_file.is_empty() {
+        let mut stderr = std::io::stderr();
+        writeln!(
+            stderr,
+            "note: {} does not run cross-file rules, because they need the whole corpus\n               not run: {}\n               run `lanekeep check` with no file selection to include them",
+            selection.flag(),
+            cross_file.join(", "),
+        )?;
+        engine.without_reduce()
+    } else {
+        engine
+    };
+
+    let outcome = match selected {
+        // Intersected with discovery rather than used directly, so `include` and `exclude`
+        // stay in force — `--staged` must not check a file the config excluded.
+        Some(selected) => {
+            let wanted: std::collections::BTreeSet<&FilePath> = selected.iter().collect();
+            let files: Vec<FilePath> = engine
+                .discover()
+                .into_iter()
+                .filter(|file| wanted.contains(file))
+                .collect();
+            engine.run_over(&files)
+        }
+        None => engine.run(),
+    }
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let color = Color::resolve(
         std::io::stdout().is_terminal(),
