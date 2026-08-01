@@ -136,6 +136,18 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-npm-packages.sh "${VERSION}" dist dist-npm
 
+      - name: Assemble release archives
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build-release-archives.sh "${VERSION}" dist dist-archives
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-archives
+          path: dist-archives/
+          if-no-files-found: error
+          retention-days: 7
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npm-packages
@@ -170,6 +182,11 @@ jobs:
         with:
           name: npm-packages
           path: dist-npm
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-archives
+          path: dist-archives
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
@@ -225,3 +242,25 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: ./scripts/publish-crates.sh
+
+      # Last, because a releases page advertising a version that is on neither registry is
+      # worse than one that appears a minute later.
+      #
+      # release-plz normally creates the release when it tags; this creates one if it is
+      # absent, so a tag pushed by hand — which is how every release so far has happened —
+      # still gets its binaries. `--clobber` makes a re-run replace assets rather than fail on
+      # the ones already there, which is the same resumability the registry publishes have.
+      #
+      # The tag goes through `env:`. A ref name is attacker-controllable in the general case
+      # and `${{ }}` is substituted before bash sees the script.
+      - name: Attach the archives to the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "no release for ${TAG} yet — creating one"
+            gh release create "${TAG}" --title "${TAG}" --generate-notes
+          fi
+          gh release upload "${TAG}" dist-archives/* --clobber
+          echo "attached $(find dist-archives -type f | wc -l | tr -d ' ') file(s) to ${TAG}"

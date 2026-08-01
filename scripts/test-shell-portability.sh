@@ -94,6 +94,18 @@ fi
 # possible where a 3.x bash exists — every Mac has one at /bin/bash — so this is a real
 # assertion there and honestly skipped elsewhere rather than faked.
 if [ -x /bin/bash ] && /bin/bash --version 2>/dev/null | head -1 | grep -q 'version 3\.'; then
+  # Parsing first, and every script rather than the two that get run. It costs nothing and it
+  # catches a whole class the static grep above cannot see — bash 3.2 parses `$(...)` without
+  # understanding a heredoc inside it, so a single apostrophe in an embedded Python comment
+  # ("ZipInfo's") reads as an opening quote and the file fails to parse at all. Newer bash is
+  # perfectly happy with it, so nothing short of this notices.
+  report "every script parses under bash 3.2" "$(
+    for script in "${repo_root}"/scripts/*.sh; do
+      /bin/bash -n "${script}" 2>&1 | head -1 |
+        sed "s|^|$(basename "${script}"): |;s|^\(.*\): $|\1|" | grep -v ': *$' || true
+    done
+  )"
+
   report "the publish scripts' tests pass under bash 3.2" "$(
     for suite in test-publish-npm.sh test-publish-crates.sh; do
       /bin/bash "${repo_root}/scripts/${suite}" >/dev/null 2>&1 ||

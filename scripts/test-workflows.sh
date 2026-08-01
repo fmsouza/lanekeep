@@ -12,6 +12,15 @@ workflows="${repo_root}/.github/workflows"
 passed=0
 failed=0
 
+# Python output goes through a file rather than `$(...)`.
+#
+# bash 3.2 — macOS's — parses command substitution without understanding a heredoc inside it,
+# so an apostrophe in an embedded Python comment reads as an opening quote and the whole file
+# fails to parse. Nothing here caught that: this script exits early where pyyaml is missing,
+# which is the case on the macOS runner, so it never reached the offending line.
+findings="$(mktemp)"
+trap 'rm -f "${findings}"' EXIT
+
 report() {
   local name="$1" offenders="$2"
   if [ -n "${offenders}" ]; then
@@ -42,7 +51,7 @@ fi
 # In a publish step that is the worst available failure: the release reports success and
 # publishes nothing, indistinguishable from a deliberate dry run. Decide in one step and
 # branch on its output instead.
-report "no step gates on a variable it sets itself" "$(python3 - "${workflows}" <<'PY'
+python3 - "${workflows}" >"${findings}" <<'PY'
 import pathlib
 import re
 import sys
@@ -67,7 +76,7 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
 
 print("\n".join(found))
 PY
-)"
+report "no step gates on a variable it sets itself" "$(cat "${findings}")"
 
 # --- every action is pinned to a commit SHA ----------------------------------------------
 #
@@ -76,7 +85,7 @@ PY
 # checked for what it *is* rather than for what a tag looks like, because a SHA beginning
 # with a digit is indistinguishable from a version otherwise. (This check's first draft got
 # that backwards and flagged every correctly pinned action.)
-report "every action is pinned to a commit SHA" "$(python3 - "${workflows}" <<'PY'
+python3 - "${workflows}" >"${findings}" <<'PY'
 import pathlib
 import re
 import sys
@@ -99,7 +108,7 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
 
 print("\n".join(found))
 PY
-)"
+report "every action is pinned to a commit SHA" "$(cat "${findings}")"
 
 # --- no run: block interpolates anything an outsider controls ------------------------------
 #
@@ -109,7 +118,7 @@ PY
 # Only the contexts an outsider can actually influence. `${{ matrix.target }}` is written in
 # this repository and interpolating it is fine; flagging it, as this check's first draft did,
 # would make the check something to ignore rather than something to read.
-report "no run: block interpolates outsider-controlled text" "$(python3 - "${workflows}" <<'PY'
+python3 - "${workflows}" >"${findings}" <<'PY'
 import pathlib
 import re
 import sys
@@ -134,7 +143,7 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
 
 print("\n".join(found))
 PY
-)"
+report "no run: block interpolates outsider-controlled text" "$(cat "${findings}")"
 
 # --- a job publishing with provenance must be able to mint an OIDC token ------------------
 #
@@ -144,7 +153,7 @@ PY
 #
 # That failure is invisible until the first real release: the step is skipped whenever the
 # registry secrets are absent, so no dry run ever reaches it.
-report "provenance publishing has id-token: write" "$(python3 - "${workflows}" <<'PY'
+python3 - "${workflows}" >"${findings}" <<'PY'
 import pathlib
 import sys
 
@@ -171,7 +180,7 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
 
 print("\n".join(found))
 PY
-)"
+report "provenance publishing has id-token: write" "$(cat "${findings}")"
 
 echo
 echo "${passed} passed, ${failed} failed"
