@@ -294,8 +294,12 @@ Nodes cross the boundary as opaque integer handles into the Rust-side tree, neve
 |---|---|
 | `ctx.filePath` | Path relative to project root |
 | `ctx.fileText` | Full source text |
-| `ctx.readFile(path)` | **Tracked.** Records the read as a cache dependency (§8.2). Confined to the project root; traversal outside it is an error. |
-| `ctx.fileExists(path)` | Tracked identically |
+| `ctx.readFile(path)` | **Tracked.** Records the read as a cache dependency (§8.2). Returns the text, or `undefined` if nothing is there. Confined to the project root. |
+| `ctx.fileExists(path)` | Tracked identically. True for anything present, text or not. |
+
+Absence is an ordinary answer, not an error: a rule asking whether a config is present should not have to catch to find out. Three things *are* errors, because each is a bug in the rule rather than a fact about the project — a path that escapes the root, an absolute path, and reading something that is not UTF-8 as text.
+
+Both are per-file only. A reduce phase has no `readFile`: its reads would be run-level dependencies, and recording them in a per-file cache entry would attribute them to whichever file happened to be checked last.
 
 ### 6.4 Binding resolution
 
@@ -426,6 +430,12 @@ Suppressions live in the entry because directives are parsed during the per-file
 `ctx.readFile` makes results depend on files other than the one being checked. Purity is therefore replaced by **tracked effects**: every read is recorded in the entry as `deps: [(path, content_hash)]`, and a cache hit additionally requires every recorded dependency to still hash identically.
 
 This is the standard build-system approach, and it is what allows a rule to cross-reference other files without giving up incrementality.
+
+**Absence is a dependency.** A rule told that `tsconfig.json` does not exist has depended on that answer as much as one that read it, so a miss is recorded with a null hash rather than not recorded at all. Skipping it produces a cache that is correct on every test anyone thinks to write and wrong on the one case that matters: adding a file changes nothing until something unrelated invalidates the entry.
+
+**Reads are memoized within a file.** Reading the same path twice returns the same bytes even if something rewrites it in between. Otherwise a rule could see a file change under it and report differently on two runs over identical input, and the entry would record one of the two hashes with no way to say which answer used it.
+
+Dependencies are keyed by the file whose result they affect, not by the run, and each file's reads are collected independently — so no ordering between files can move a dependency onto the wrong entry.
 
 ### 8.3 Storage
 

@@ -366,6 +366,8 @@ dependencies = [
 name = "lanekeep-js"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "lanekeep-core",
  "lanekeep-lang",
  "lanekeep-lang-js",
  "rquickjs",

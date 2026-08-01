@@ -33,6 +33,7 @@
 //! arrive in later milestones.
 
 pub mod error;
+pub mod files;
 pub mod host;
 pub mod limits;
 pub mod loader;
@@ -41,6 +42,7 @@ pub mod sandbox;
 pub mod typescript;
 
 pub use error::SandboxError;
+pub use files::{FileAccess, ReadError};
 pub use host::{
     EmittedFact, HostContext, ReduceContext, ReduceFact, ReduceReport, Report, merge_file,
 };

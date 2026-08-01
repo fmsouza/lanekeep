@@ -187,6 +187,12 @@ convenient — that code was rewritten instead. `just check` runs `just msrv`, s
 fails locally rather than costing a CI round trip; without it, every other recipe runs on a
 toolchain far newer than the floor and happily accepts syntax that does not exist there.
 
+**`rayon`'s `map_init` runs its initializer per chunk, not per thread.** State built there
+is not reliably shared across the items one worker handles — with a small input, rayon splits
+down to single items and every item gets its own. A design that relies on per-worker state
+being shared is therefore untestable at small scale and only wrong at large scale. Either
+make the state per item, or accept that a test cannot distinguish the two.
+
 **A tree-sitter query matches children in tree order.** `(import_statement source: (string)
 (import_clause ...))` can never match, because the grammar puts `import_clause` first — and
 the error is exactly that, "this pattern can never match", which is easy to read as "this

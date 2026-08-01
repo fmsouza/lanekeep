@@ -59,6 +59,7 @@ export default defineRule({
 | `ctx.facts`, `ctx.files` | **no** | yes |
 | the tree — `ctx.text`, `ctx.kind`, `ctx.parent`, … | yes | **no** |
 | `ctx.report` | at a node | at `{ file, line, column }` |
+| `ctx.readFile`, `ctx.fileExists` | yes | **no** |
 
 Two rules explain the whole table:
 
@@ -109,6 +110,49 @@ export default defineRule({
 Breaching it cancels the run and exits `2`. It does not skip the rule: a timeout is
 timing-dependent, so a rule that trips on a loaded machine and not on an idle one would make
 output vary between runs on identical input.
+
+## The other way to be cross-file: reading a file
+
+Facts are for reasoning about the *corpus* — the files lanekeep parses. For everything else
+there is `ctx.readFile`, during the per-file pass:
+
+```ts
+check(ctx, m) {
+  const raw = ctx.readFile('package.json')
+  if (!raw) return
+  const pkg = JSON.parse(raw)
+  if (pkg.type !== 'module') ctx.report(m.stmt, 'this package is not ESM')
+}
+```
+
+Use it for the files that are not source: `package.json`, `tsconfig.json`, a generated
+manifest, a codeowners file.
+
+Reads are **tracked**. Every one is recorded as `(path, content_hash)` and becomes part of
+the cache entry for the file being checked, so editing `package.json` reinvalidates exactly
+the files whose rules read it. That is what lets a rule depend on another file without giving
+up incrementality — see [`architecture.md`](architecture.md) §8.2.
+
+Being told a file is *not* there is also recorded. A rule that branches on
+`ctx.fileExists('tsconfig.json')` has depended on the answer either way, and creating the
+file has to invalidate it.
+
+Reads are **confined** to the project root. A path that escapes it, an absolute path, or a
+symlink pointing outside all raise — those are bugs in the rule, not facts about the project.
+A file that simply is not there returns `undefined`, which is an ordinary answer to handle:
+
+```ts
+const raw = ctx.readFile('optional.json')   // undefined if absent
+if (ctx.fileExists('generated.d.ts')) { /* ... */ }
+```
+
+Reading the same path twice in one file returns the same bytes, even if something rewrites it
+in between — a rule that saw a file change under it could report differently on two runs over
+identical input.
+
+`readFile` and `fileExists` exist only in `check`, not in `reduce`. A reduce phase's reads
+would be run-level dependencies, and putting them in a per-file cache entry would attribute
+them to whichever file was checked last.
 
 ## When you do not need this
 
