@@ -126,6 +126,10 @@ msrv:
 # ---------------------------------------------------------------------------
 
 # Run the benchmark suite against the fixture corpus.
+#
+# Prints each scenario against its budget from docs/architecture.md §15, and fails only
+# past 4x — see the bench's own documentation for why the gate is loose and the report is
+# not.
 bench *ARGS:
     cargo bench --workspace {{ ARGS }}
 

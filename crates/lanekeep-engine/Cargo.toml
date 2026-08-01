@@ -25,5 +25,11 @@ tree-sitter = { workspace = true }
 [dev-dependencies]
 lanekeep-lang-js = { workspace = true }
 
+[[bench]]
+name = "corpus"
+# No harness: this is a budget gate, not a statistical comparison against a stored
+# baseline. See the bench's own documentation for why criterion is the wrong shape here.
+harness = false
+
 [lints]
 workspace = true

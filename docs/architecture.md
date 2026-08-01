@@ -589,23 +589,33 @@ Cheap now, breaking changes later. Lock all five before writing much code.
 
 ## 15. Performance budget
 
-Targets, gated in CI with regression thresholds:
+Targets, gated in CI. Measured by `benches/corpus.rs` over a synthetic 2,000-file, 20-rule corpus.
 
-| Scenario | Budget |
-|---|---|
-| Cold full run, ~2k files, ~20 rules | < 800 ms |
-| Warm run, no changes | < 25 ms |
-| Warm run, 1 changed file | < 10 ms |
+| Scenario | Budget | Measured (dev machine) |
+|---|---|---|
+| Cold full run, ~2k files, ~20 rules | < 800 ms | ~1.5 s |
+| Warm run, no changes | < 25 ms | ~56 ms |
+| Warm run, 1 changed file, full discovery | — | ~56 ms |
+| Warm run, 1 changed file, `--staged` | < 10 ms | ~32 ms |
+
+**Nothing meets its budget yet, and the budgets stand.** They were provisional until measured; measuring them is not grounds for moving them. The levers named below are the answer, in that order, and relaxing a budget remains the last resort.
+
+Two things the first measurement already bought:
+
+- **A warm run built a sandbox per worker and evaluated every rule module into it**, then executed no JavaScript because every file was a cache hit. Making the sandbox lazy — built on the first match that actually needs one — took a warm run from ~263 ms to ~56 ms. §7.3's claim that a warm run runs no JavaScript was true; it was paying to be *able* to.
+- **A subset run discarded the cache entries for every file it did not look at.** `--staged` left the next full run cold, which is the opposite of what an incremental entry point is for. A run now prunes only when it saw the whole corpus.
+
+**Why "1 changed file, full discovery" has no budget.** Finding which file changed means reading and hashing all of them, so that scenario is the row above plus one file's work and can never beat it. §15's 10 ms describes the pre-commit workflow, and the pre-commit workflow is `--staged` — which is where the budget now sits.
 
 The cold budget is looser than a pure-Rust engine would allow, and that difference is the honest price of programmable rules: handler invocation and QuickJS interpretation cost real time on every match. The query gate (§7.2) is what keeps that cost bounded to matches rather than nodes.
 
-The warm budgets are unaffected, because a warm run executes no JavaScript at all (§7.3).
+If the cold budget proves unreachable, the levers in order are: better gate usage in built-in rules, bytecode caching across runs, then a faster engine behind the §5.1 trait.
 
-These numbers are provisional until M1 measures them. If the cold budget proves unreachable, the levers in order are: better gate usage in built-in rules, bytecode caching across runs, then a faster engine behind the §5.1 trait. Relaxing the budget is the last resort, not the first.
+The remaining warm cost is reading and hashing every file to discover what changed, plus loading and rewriting a whole-corpus cache file. Beating it needs either a cheaper staleness check than content hashing, or a cache format that can be written in part.
+
+**The gate is deliberately loose and the report deliberately precise.** A hosted runner is shared and throttled, so a gate set at the budget would fail for reasons nothing in this repository caused — and a flaky gate is one people re-run rather than read. The exact numbers print against their budgets on every run, which is what shows a 20% regression; the gate fires only past 4×, which runner variance does not explain.
 
 Instrumentation behind `--profile` only, reporting per-rule time split between query matching and handler execution — the split that tells an author whether their query or their code is the problem.
-
-`benches/` runs on a fixed corpus, in CI, with a hard failure on regression beyond threshold.
 
 ---
 
