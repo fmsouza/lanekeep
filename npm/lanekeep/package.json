@@ -21,7 +21,6 @@
   },
   "optionalDependencies": {
     "@lanekeep/darwin-arm64": "0.0.0",
-    "@lanekeep/darwin-x64": "0.0.0",
     "@lanekeep/linux-arm64": "0.0.0",
     "@lanekeep/linux-x64": "0.0.0",
     "@lanekeep/win32-x64": "0.0.0"

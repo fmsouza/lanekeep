@@ -64,6 +64,11 @@ more thing to forget, and forgetting it publishes a launcher that pulls the prev
 release's binaries. `scripts/test-build-npm-packages.sh` covers the assembly and the
 launcher's platform resolution, and runs as part of `just check`.
 
+## Which platforms are prebuilt
+
+macOS on Apple silicon, Linux on x86-64 and arm64, Windows on x86-64. Each is built on a
+runner of its own architecture and smoke-tested before it ships.
+
 ## Adding a platform
 
 Three places, and all three are checked:

@@ -20,7 +20,6 @@ const { existsSync } = require('node:fs')
  */
 const PACKAGES = {
   'darwin-arm64': '@lanekeep/darwin-arm64',
-  'darwin-x64': '@lanekeep/darwin-x64',
   'linux-arm64': '@lanekeep/linux-arm64',
   'linux-x64': '@lanekeep/linux-x64',
   'win32-x64': '@lanekeep/win32-x64',

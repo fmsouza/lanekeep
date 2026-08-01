@@ -28,9 +28,19 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # One job per target. Cross-compilation would be fewer jobs and more ways to be subtly
-  # wrong — a binary that links against the wrong libc is a bug reported by a user rather
-  # than by CI.
+  # One job per target, each built natively. Cross-compilation would be fewer jobs and more
+  # ways to be subtly wrong — a binary that links against the wrong libc is a bug reported by
+  # a user rather than by CI.
+  #
+  # No Intel macOS. Building it natively needs a `macos-13` runner, and GitHub no longer
+  # reliably provides one — a release that waits forever on a runner that never arrives is
+  # worse than one platform fewer. An Intel Mac user gets a message naming what is available
+  # and `cargo install lanekeep-cli`, which builds from source.
+  #
+  # It could be cross-compiled from an ARM runner: Apple ships both SDKs and the target is a
+  # `rustup target add` away. What that would cost is the smoke test — GitHub's ARM macOS
+  # runners have no Rosetta, so nothing could execute the binary before shipping it. Adding
+  # a platform nobody has run once is how a broken binary reaches a user.
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -40,8 +50,6 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-13
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
