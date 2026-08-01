@@ -318,6 +318,7 @@ dependencies = [
  "anyhow",
  "clap",
  "lanekeep-config",
+ "lanekeep-core",
  "lanekeep-engine",
  "lanekeep-js",
  "lanekeep-lang-js",

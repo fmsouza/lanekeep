@@ -113,6 +113,17 @@ src/bad.ts:2:1 error [lanekeep/no-default-export] default export
 ✖ 2 error(s) across 2 file(s) checked
 ```
 
+For fast feedback on what you touched:
+
+```
+$ lanekeep check --staged     # what is about to be committed
+$ lanekeep check --since main # what changed against a ref
+```
+
+Both are intersected with the config's `include`/`exclude`, and both skip cross-file rules —
+a whole-corpus rule over a subset gives a wrong answer, not a smaller one, so they are
+skipped and named on stderr rather than quietly producing one.
+
 Exit `0` when clean, `1` when violations are found, `2` when the checker could not run —
 a caller has to be able to tell "your code has problems" from "the tool is broken".
 `--format json` emits a versioned, stable schema on stdout; diagnostics always go to stderr,

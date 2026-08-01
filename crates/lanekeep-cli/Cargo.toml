@@ -19,6 +19,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 lanekeep-config = { workspace = true }
+lanekeep-core = { workspace = true }
 lanekeep-engine = { workspace = true }
 lanekeep-js = { workspace = true }
 lanekeep-lang-js = { workspace = true }

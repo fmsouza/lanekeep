@@ -127,6 +127,8 @@ pub struct Engine {
     run_key: RunKey,
     /// Whether results may be read from and written to the cache.
     caching: bool,
+    /// Whether reduce phases run.
+    reducing: bool,
     limits: Limits,
     rules_root: RuleRoot,
     config_path: PathBuf,
@@ -248,6 +250,7 @@ impl Engine {
             rules,
             run_key,
             caching: true,
+            reducing: true,
             // Canonicalized here so every tracked read compares against the same absolute
             // root. Falling back to the path as given keeps a non-existent root a discovery
             // problem rather than turning it into a confusing read failure later.
@@ -268,6 +271,30 @@ impl Engine {
     pub const fn without_cache(mut self) -> Self {
         self.caching = false;
         self
+    }
+
+    /// Skip every reduce phase.
+    ///
+    /// For a run over a deliberately partial corpus. A cross-file rule consumes facts from
+    /// every file, so running one over a subset does not give a smaller answer — it gives a
+    /// wrong one. `no-unused-exports` over three changed files would report every export in
+    /// them as unused, because the importers were never looked at.
+    ///
+    /// Skipping is therefore the only sound option, and the caller that narrowed the corpus
+    /// is the one that has to say so to the user.
+    #[must_use]
+    pub const fn without_reduce(mut self) -> Self {
+        self.reducing = false;
+        self
+    }
+
+    /// The files discovery selects, before any gate.
+    ///
+    /// For a caller narrowing the corpus: intersecting with this is what keeps `include` and
+    /// `exclude` in force, so `--staged` cannot check a file the config excluded.
+    #[must_use]
+    pub fn discover(&self) -> Vec<FilePath> {
+        self.discovery.walk()
     }
 
     /// How many rules will actually run. Rules set to `off` are dropped at preparation.
@@ -389,6 +416,10 @@ impl Engine {
         files: &[FilePath],
         facts: &[Fact],
     ) -> Result<Vec<Violation>, RunError> {
+        if !self.reducing {
+            return Ok(Vec::new());
+        }
+
         let reducing: Vec<&Prepared> = self
             .rules
             .iter()
