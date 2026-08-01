@@ -1,0 +1,86 @@
+name: release-plz
+
+# The version bump and the changelog, proposed as an ordinary pull request.
+#
+# This workflow decides *what* the next version is. It never publishes: publishing is
+# `release.yml`, gated on the tag this creates. Keeping them apart means the bump is
+# reviewable like any other change, and a publish needs a tag rather than a merge.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One at a time. Two runs racing would open two release pull requests for the same commits,
+# and the loser would sit there proposing a version that no longer makes sense.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz:
+    name: release-plz
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # release-plz reads the commits since the last tag to decide the next version, so a
+          # shallow clone would have it propose a version from an incomplete history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      # Which token this run uses, decided once and said out loud — the same shape as
+      # `release.yml`'s publish gate, and for the same reason.
+      #
+      # This one matters more than it looks. A tag pushed with the default `GITHUB_TOKEN`
+      # **does not trigger other workflows**: GitHub suppresses that deliberately, to stop a
+      # workflow from setting itself off forever. So with the default token, release-plz
+      # creates the tag and the release, `release.yml` never runs, and nothing is ever
+      # published — a release that looks complete on the releases page and exists on neither
+      # registry.
+      #
+      # A personal access token or GitHub App token in `RELEASE_PLZ_TOKEN` avoids that. When
+      # one is absent this run still does the useful part, and says plainly that the tag will
+      # need pushing by hand.
+      - name: Decide which token this run uses
+        id: token
+        env:
+          RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+        run: |
+          if [ -n "${RELEASE_PLZ_TOKEN}" ]; then
+            echo "elevated=yes" >> "${GITHUB_OUTPUT}"
+            echo "token: RELEASE_PLZ_TOKEN — the tag it pushes will trigger release.yml"
+          else
+            echo "elevated=no" >> "${GITHUB_OUTPUT}"
+            echo "token: GITHUB_TOKEN — a tag it pushes will NOT trigger release.yml"
+            echo "::warning::RELEASE_PLZ_TOKEN is not set. A tag pushed with GITHUB_TOKEN \
+            does not trigger release.yml, so nothing will publish. Push the tag by hand, or \
+            add the secret. See docs/releasing.md."
+          fi
+
+      # Opens or updates the release pull request: the version bump and the changelog, for
+      # review. Nothing here is irreversible — closing the pull request undoes all of it.
+      - name: Open the release pull request
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # Once the release pull request is merged, this is what tags the commit and creates the
+      # GitHub release. `release-plz.toml` sets `publish = false`, so it does not touch a
+      # registry — `release.yml` does that, on the tag.
+      - name: Tag and create the GitHub release
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
