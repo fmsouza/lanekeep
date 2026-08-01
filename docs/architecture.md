@@ -534,6 +534,10 @@ minWidth: 44,
 | `sarif` | Free GitHub code-scanning integration. |
 | `agent` | Token-minimal, remediation-first, grouped by rule rather than by file. Includes rule cards for violated rules only. |
 
+The `agent` format is a different document from the human one, not a terser rendering of it. Twelve violations of one rule are one thing to learn and one fix to apply; grouped by file they read as twelve problems. The card is stated once per rule rather than once per violation, which is the single largest saving available, and the remediation precedes the locations because the locations are only useful once the fix is known. A per-violation message that differs from the card's is kept — it says something the card does not.
+
+`sarif` emits the required properties plus what GitHub actually reads. It describes each rule once and references it by index, and deliberately omits a rule-level `problem.severity`: severity is per violation here, since the same rule is an error in one config and a warning in another, and inventing a rule-level default to fill a field nothing requires is how a report starts lying.
+
 Violations sorted `(ruleId, file, line, column)` always. Deterministic output matters more than usual here: an agent reads it twice and must not see reordering as change. This is also why the sandbox withholds randomness and clock access (§6.6) — a rule cannot introduce nondeterminism even by accident.
 
 **Exit codes:** `0` clean or `--warn-only`; `1` violations; `2` runtime error, which includes a cancelled run — a breached timeout or memory ceiling (§6.8) never exits `0` or `1`, because a checker that could not finish must not be mistaken for one that found nothing.
