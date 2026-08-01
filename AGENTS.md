@@ -213,6 +213,22 @@ than writing a literal, or the same input takes a different code branch on each 
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
 
+**`npm publish dist-npm/lanekeep` does not publish a directory.** npm reads a bare `<a>/<b>`
+as a GitHub shorthand, so that command tries to clone
+`ssh://git@github.com/dist-npm/lanekeep.git` and dies with a public-key error naming a
+repository that does not exist — which reads like a credentials problem and is not one.
+A leading `./` or a trailing `/` is enough to make it a path. This shipped in v0.1.0's first
+release: the platform packages published only because the glob `dist-npm/@lanekeep/*/` leaves
+a trailing slash on every match, and the launcher, written without one, was the single line
+that failed.
+
+**A registry publish must be resumable, because neither registry can take a version back.**
+crates.io is append-only and npm refuses to republish a version, so a multi-package release
+that dies partway cannot simply be re-run — it stops on the first thing already published and
+never reaches the one that failed, stranding the release at that version permanently. Both
+publish scripts therefore skip what the registry already has. v0.1.0 spent a cycle stuck with
+four platform packages up and no launcher, which is exactly the state that motivated it.
+
 **A stacked pull request conflicts as soon as its parent is squash-merged.** Squashing
 replaces the parent's commits with one new commit that has a different SHA, so git sees the
 child branch and `main` as having added the same files independently. Every file conflicts

@@ -78,6 +78,8 @@ test-doc:
 test-scripts:
     @./scripts/test-lint-commit-msg.sh
     @./scripts/test-build-npm-packages.sh
+    @./scripts/test-publish-npm.sh
+    @./scripts/test-publish-crates.sh
     @./scripts/test-workflows.sh
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
