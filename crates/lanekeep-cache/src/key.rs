@@ -16,7 +16,7 @@ use lanekeep_core::ContentHash;
 /// Bumped when the encoding changes. Because it feeds the key, an old file simply misses
 /// rather than being misread — the cache is disposable, so a format change costs one cold
 /// run and needs no migration.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Everything about a run that every file's key shares.
 ///
@@ -65,6 +65,21 @@ impl RunKey {
         }
 
         Self { prefix }
+    }
+
+    /// The key for a file whose result depends on the date.
+    ///
+    /// Only for a file carrying an expiring suppression. Folding the date into every key
+    /// would invalidate the whole cache daily for the sake of the handful of files that
+    /// have one — and leaving it out entirely would serve an expired suppression as though
+    /// it were still in force, which is the one thing an expiry exists to prevent.
+    #[must_use]
+    pub fn for_dated_file(&self, path: &str, content: &ContentHash, today: &str) -> CacheKey {
+        let mut hasher = self.prefix.clone();
+        write_field(&mut hasher, path.as_bytes());
+        write_field(&mut hasher, content.as_bytes());
+        write_field(&mut hasher, today.as_bytes());
+        CacheKey(*hasher.finalize().as_bytes())
     }
 
     /// The key for one file.
@@ -261,6 +276,25 @@ mod tests {
         assert_ne!(
             run().for_file("src/ab.ts", &content(1)),
             run().for_file("src/a", &content(1))
+        );
+    }
+
+    #[test]
+    fn a_dated_key_changes_with_the_date() {
+        // An expiring suppression served from a cache written yesterday would never expire.
+        let content = content(1);
+        assert_ne!(
+            run().for_dated_file("src/a.ts", &content, "2026-08-01"),
+            run().for_dated_file("src/a.ts", &content, "2026-08-02")
+        );
+    }
+
+    #[test]
+    fn a_dated_key_differs_from_an_undated_one() {
+        let content = content(1);
+        assert_ne!(
+            run().for_file("src/a.ts", &content),
+            run().for_dated_file("src/a.ts", &content, "2026-08-01")
         );
     }
 

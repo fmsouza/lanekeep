@@ -363,6 +363,7 @@ dependencies = [
  "lanekeep-lang",
  "lanekeep-lang-js",
  "lanekeep-query",
+ "memchr",
  "rayon",
  "thiserror",
  "tree-sitter",

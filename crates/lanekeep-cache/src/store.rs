@@ -27,7 +27,7 @@ use crate::entry::Entry;
 use crate::key::{CacheKey, FORMAT_VERSION};
 
 /// Identifies the file as ours before anything else is believed about it.
-const MAGIC: &[u8; 8] = b"LKCACHE\x01";
+const MAGIC: &[u8; 8] = b"LKCACHE\x02";
 
 /// Where the cache lives, relative to the project root.
 const CACHE_PATH: &str = ".lanekeep/cache";
@@ -223,6 +223,7 @@ mod tests {
             }],
             facts: Vec::new(),
             dependencies: vec![TrackedRead::absent(FilePath::new("tsconfig.json"))],
+            suppressions: Vec::new(),
         }
     }
 

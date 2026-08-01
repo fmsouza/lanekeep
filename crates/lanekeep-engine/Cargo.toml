@@ -18,6 +18,7 @@ lanekeep-core = { workspace = true }
 lanekeep-js = { workspace = true }
 lanekeep-lang = { workspace = true }
 lanekeep-query = { workspace = true }
+memchr = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 tree-sitter = { workspace = true }
