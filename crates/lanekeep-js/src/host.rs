@@ -21,13 +21,14 @@
 //!   against its own content would be unsound. This is not a stylistic split — it is what
 //!   makes per-file cache entries mean anything.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use rquickjs::function::Opt;
+use rquickjs::object::Accessor;
 use rquickjs::{Ctx, Function, Object, Value};
 
 use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
@@ -94,6 +95,14 @@ pub struct HostContext {
     files: Option<Rc<FileAccess>>,
     /// The grammar `querySubtree` and `closestAncestor` compile against.
     language: Option<Arc<dyn lanekeep_lang::Language>>,
+    /// The date a rule sees as `ctx.today`, if the host supplied one.
+    today: Option<Rc<str>>,
+    /// Whether anything actually read `ctx.today` while checking this file.
+    ///
+    /// Tracked rather than assumed, because reading the date makes a file's result depend on
+    /// what day it is. Assuming every file might read it would date every cache entry and
+    /// invalidate the whole corpus daily; assuming none does would serve yesterday's answer.
+    date_read: Rc<Cell<bool>>,
     /// Queries compiled so far this file, by source.
     ///
     /// A rule that calls `querySubtree` inside a handler calls it once per match, with the
@@ -120,6 +129,8 @@ impl std::fmt::Debug for HostContext {
             .field("has_resolver", &self.resolver.is_some())
             .field("has_file_access", &self.files.is_some())
             .field("has_language", &self.language.is_some())
+            .field("has_today", &self.today.is_some())
+            .field("date_read", &self.date_read.get())
             .field("compiled_queries", &self.queries.borrow().len())
             .finish()
     }
@@ -137,6 +148,8 @@ impl HostContext {
             resolver: None,
             files: None,
             language: None,
+            today: None,
+            date_read: Rc::new(Cell::new(false)),
             queries: Rc::new(RefCell::new(BTreeMap::new())),
         }
     }
@@ -148,6 +161,26 @@ impl HostContext {
             Some(resolver) => self.with_resolver(resolver),
             None => self,
         }
+    }
+
+    /// Supply the date rules see as `ctx.today`.
+    ///
+    /// Fixed for the run by the caller, not read here: two files checked a millisecond apart
+    /// must not disagree about what day it is. Without one, `ctx.today` is absent rather than
+    /// empty — a rule comparing against `undefined` would silently take a branch nobody
+    /// intended, where a missing property is a `TypeError` naming what it reached for.
+    #[must_use]
+    pub fn with_today(mut self, today: &str) -> Self {
+        self.today = Some(Rc::from(today));
+        self
+    }
+
+    /// Whether anything read `ctx.today` while checking this file.
+    ///
+    /// The caller needs this to decide whether the result may be cached across days.
+    #[must_use]
+    pub fn date_was_read(&self) -> bool {
+        self.date_read.get()
     }
 
     /// Attach the grammar `querySubtree` and `closestAncestor` compile queries against.
@@ -225,6 +258,20 @@ impl HostContext {
         self.install_facts(ctx, &object)?;
         self.install_reads(ctx, &object)?;
         self.install_queries(ctx, &object)?;
+
+        // `ctx.today` is a property backed by a getter, so reading it can be *observed*. A
+        // plain value would be indistinguishable from an unread one, and the cache would
+        // have to guess which files depend on the date.
+        if let Some(today) = self.today.clone() {
+            let date_read = Rc::clone(&self.date_read);
+            object.prop(
+                "today",
+                Accessor::from(move || {
+                    date_read.set(true);
+                    today.to_string()
+                }),
+            )?;
+        }
 
         Ok(object)
     }
@@ -408,6 +455,33 @@ impl HostContext {
     /// Recording violations.
     fn install_reporting<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
         // --- reporting -------------------------------------------------------------------
+
+        // --- positions -------------------------------------------------------------------
+
+        let arena = Rc::clone(&self.arena);
+        let file_path = Rc::clone(&self.file_path);
+        object.set(
+            "loc",
+            // `{ file, line, column }`, which is exactly the shape a fact carries and the
+            // shape a reduce phase reports at. A rule that emits `at: ctx.loc(m.node)` and
+            // later calls `ctx.report(f.at)` needs no glue between the two.
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
+                    let Some((line, column)) = arena.borrow().position(handle) else {
+                        // The same posture as reporting at an unresolvable handle: nothing,
+                        // rather than a made-up position a reader would go and look at.
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+
+                    let object = Object::new(ctx.clone())?;
+                    object.set("file", &*file_path)?;
+                    object.set("line", line)?;
+                    object.set("column", column)?;
+                    Ok(object.into_value())
+                },
+            )?,
+        )?;
 
         let arena = Rc::clone(&self.arena);
         let reports = Rc::clone(&self.reports);
@@ -1801,6 +1875,92 @@ mod tests {
                 .eval_with_host(&host, &format!("{absent} !== undefined"))
                 .expect("evaluates");
             assert!(!present, "`{absent}` should not exist without a language");
+        }
+    }
+
+    // --- ctx.loc and ctx.today -----------------------------------------------------------
+
+    #[test]
+    fn loc_gives_the_shape_a_fact_and_a_reduce_report_both_use() {
+        // A rule that emits `at: ctx.loc(node)` and later calls `ctx.report(f.at)` needs no
+        // glue between the two, which is the whole reason this returns an object.
+        let source = "const alpha = 1;\nconst beta = 2;\n";
+        let host = host(source);
+        let handle = handle_of(&host, "beta");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+
+        let rendered: String = sandbox
+            .eval_with_host(
+                &host,
+                &format!("const l = ctx.loc({handle}); `${{l.file}}:${{l.line}}:${{l.column}}`"),
+            )
+            .expect("evaluates");
+        assert_eq!(rendered, "src/example.ts:2:7");
+    }
+
+    #[test]
+    fn loc_at_an_unresolvable_handle_is_undefined() {
+        // The same posture as reporting at one: nothing, rather than a made-up position a
+        // reader would go and look at.
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let absent: bool = sandbox
+            .eval_with_host(&host, "ctx.loc(9999) === undefined")
+            .expect("evaluates");
+        assert!(absent);
+    }
+
+    #[test]
+    fn today_is_what_the_host_supplied() {
+        let host = host("const a = 1;").with_today("2026-08-01");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let today: String = sandbox
+            .eval_with_host(&host, "ctx.today")
+            .expect("evaluates");
+        assert_eq!(today, "2026-08-01");
+    }
+
+    #[test]
+    fn today_is_absent_when_the_host_supplied_none() {
+        // Absent rather than empty: a rule comparing against `undefined` would silently take
+        // a branch nobody intended, where a missing property is a `TypeError` naming what it
+        // reached for.
+        let host = host("const a = 1;");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let absent: bool = sandbox
+            .eval_with_host(&host, "ctx.today === undefined")
+            .expect("evaluates");
+        assert!(absent);
+    }
+
+    #[test]
+    fn reading_today_is_observed_and_not_reading_it_is_not() {
+        // The property the cache depends on. A plain value would be indistinguishable from
+        // an unread one, and every file would have to be treated as date-dependent.
+        let unread = host("const a = 1;").with_today("2026-08-01");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        sandbox
+            .eval_with_host::<i32>(&unread, "1 + 1")
+            .expect("evaluates");
+        assert!(!unread.date_was_read(), "nothing read the date");
+
+        let read = host("const a = 1;").with_today("2026-08-01");
+        sandbox
+            .eval_with_host::<String>(&read, "ctx.today")
+            .expect("evaluates");
+        assert!(read.date_was_read(), "the read was not observed");
+    }
+
+    #[test]
+    fn today_does_not_bring_a_clock_with_it() {
+        // The invariant it sits next to: a rule gets a date, not the ability to observe time.
+        let host = host("const a = 1;").with_today("2026-08-01");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        for absent in ["Date", "performance"] {
+            let present: bool = sandbox
+                .eval_with_host(&host, &format!("typeof {absent} !== 'undefined'"))
+                .expect("evaluates");
+            assert!(!present, "`{absent}` must not exist");
         }
     }
 }

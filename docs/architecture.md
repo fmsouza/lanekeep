@@ -334,7 +334,7 @@ Absence is achieved two ways, and the first is much stronger.
 
 **Never installed.** The engine's optional intrinsics are opted into rather than opted out of, so there is no original for a rule to reach: nothing to patch, nothing to restore, no prototype chain leading back.
 
-- **`Date`.** `Date.now()` and `new Date()` read the system clock. A rule needing a date receives `ctx.today`, fixed for the run.
+- **`Date`.** `Date.now()` and `new Date()` read the system clock. A rule needing a date receives `ctx.today` — a `YYYY-MM-DD` string, fixed once for the run in UTC, so two files checked a millisecond apart cannot disagree about what day it is and a deadline does not move with the reader's time zone. It is a *date*, not a clock: nothing in the sandbox can observe time passing.
 - **`performance`.** `performance.now()` is a clock under another name, and the one most likely to survive a reviewer thinking "we removed `Date`, so there is no clock."
 - **`WeakRef` and `FinalizationRegistry`.** These make garbage-collection timing observable — nondeterminism that does not look like a clock at all.
 
@@ -540,7 +540,9 @@ Directives are found by scanning for a standalone token rather than by walking c
 Two things follow from caching, and both are easy to get wrong:
 
 - **Directives live in the cache entry**, because a reduce-phase violation is reported at a site in a file that may not have been reprocessed this run. Without them the warm path would drop the directive and report a violation the author had already accepted. The entry also records *which* directives fired: a warm run sees the survivors and not what was hidden, so without it every suppression in a cached file would suddenly look unused.
-- **A file carrying `expires:` has the date in its cache key.** An expiry that a warm run ignored would never expire, which is the one thing an expiry exists to prevent — so those files get an entry that lives for a day. Folding the date into *every* key would invalidate the whole cache daily for the sake of the handful of files that have one.
+- **A file whose result depended on the date has the date in its cache key.** Two ways that happens: an expiring suppression in the file's bytes, or a rule that read `ctx.today` while checking it. Either way the entry lives for a day; every other file gets a dateless key and its entry survives indefinitely. Folding the date into *every* key would re-key the whole corpus daily for the sake of a handful of files, and leaving it out would serve yesterday's answer — an expiry that never expires, a date comparison frozen at whenever the cache was written.
+
+  The expiry is visible in the bytes and so is known before the rules run; whether a rule reads `ctx.today` is not knowable until they have. So both keys are computed and the lookup tries the dated one first — a file that was date-dependent last run has its entry there, and if the date has moved that key simply misses. `ctx.today` is a property backed by a getter for exactly this reason: a plain value would be indistinguishable from an unread one, and every file would have to be treated as date-dependent.
 
 The date is read once per run, from the host, in UTC. Once per run so two files checked a millisecond apart cannot disagree about what day it is; UTC because a deadline that moved with the reader's time zone would expire twice in some places and not at all in others. The sandbox still has no clock — a rule cannot observe the date, only a directive can be compared against it.
 
