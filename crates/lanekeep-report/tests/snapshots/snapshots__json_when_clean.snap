@@ -1,0 +1,13 @@
+---
+source: crates/lanekeep-report/tests/snapshots.rs
+expression: "render(Format::Json, Color::Never, &[], summary(), &Cards::new())"
+---
+{
+  "version": 1,
+  "ok": true,
+  "total": 0,
+  "files_discovered": 12,
+  "files_parsed": 3,
+  "warn_only": false,
+  "violations": []
+}

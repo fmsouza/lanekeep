@@ -1,0 +1,133 @@
+---
+source: crates/lanekeep-report/tests/snapshots.rs
+expression: "rendered(Format::Sarif)"
+---
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/a.ts"
+                },
+                "region": {
+                  "startColumn": 1,
+                  "startLine": 2
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "default export"
+          },
+          "ruleId": "lanekeep/no-default-export",
+          "ruleIndex": 0
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/a.ts"
+                },
+                "region": {
+                  "startColumn": 1,
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "default export"
+          },
+          "ruleId": "lanekeep/no-default-export",
+          "ruleIndex": 0
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/deep/c.ts"
+                },
+                "region": {
+                  "startColumn": 7,
+                  "startLine": 4
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "default export"
+          },
+          "ruleId": "lanekeep/no-default-export",
+          "ruleIndex": 0
+        },
+        {
+          "level": "warning",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/b.ts"
+                },
+                "region": {
+                  "startColumn": 1,
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "importing 'lodash/merge' is restricted — use the standard library"
+          },
+          "ruleId": "lanekeep/no-restricted-imports",
+          "ruleIndex": 1
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/fmsouza/lanekeep",
+          "name": "lanekeep",
+          "rules": [
+            {
+              "fullDescription": {
+                "text": "use a named export, so the symbol has one name every importer must use"
+              },
+              "help": {
+                "text": "use a named export, so the symbol has one name every importer must use"
+              },
+              "id": "lanekeep/no-default-export",
+              "name": "lanekeep/no-default-export",
+              "shortDescription": {
+                "text": "default export"
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "import something permitted here, or move this code where it is allowed"
+              },
+              "help": {
+                "text": "import something permitted here, or move this code where it is allowed"
+              },
+              "id": "lanekeep/no-restricted-imports",
+              "name": "lanekeep/no-restricted-imports",
+              "shortDescription": {
+                "text": "restricted import"
+              }
+            }
+          ],
+          "version": "0.1.0"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

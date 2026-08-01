@@ -231,7 +231,11 @@ A rule sees only its own facts. Reading another rule's would turn a private payl
 
 QuickJS, embedded via `rquickjs`. Chosen over V8 and Boa for a combination of reasons: it compiles into a static binary at roughly a megabyte rather than tens, it starts in microseconds rather than milliseconds — which matters when the warm-run budget is 25 ms — and its runtime is straightforwardly one-per-thread, which is what rayon wants.
 
-Its weakness is raw throughput: QuickJS interprets, where V8 compiles. That is affordable here precisely because of the query gate (§7) — JavaScript runs proportional to matches, and matches are a tiny fraction of nodes. If measurement at M1 shows handler execution dominating, the engine sits behind a trait and can be swapped without touching a rule.
+Its weakness is raw throughput: QuickJS interprets, where V8 compiles. That is affordable here precisely because of the query gate (§7) — JavaScript runs proportional to matches, and matches are a tiny fraction of nodes.
+
+**There is no engine trait, and deliberately so.** An earlier draft of this section claimed one; there never was. A trait with a single implementor is speculative abstraction — it fixes the shape of a boundary before anything has pushed against it, and the shape a second engine would actually want is not knowable from the first. What exists instead is containment: every line that knows QuickJS exists lives in `lanekeep-js`, behind `Sandbox` and the host context, and no other crate names `rquickjs` at all. Swapping the engine means rewriting one crate against an interface its callers already use, which is the work a trait would have front-loaded on a guess.
+
+M1 measured handler execution at roughly three times query matching on a synthetic corpus (§15), which is real but not the dominant cost — the dominant cost is starting the engine and evaluating rule modules, which is why that is now done lazily. Nothing so far argues for a different engine.
 
 ### 5.2 TypeScript
 
@@ -645,7 +649,9 @@ Targets, gated in CI. Measured by `benches/corpus.rs` over a synthetic 2,000-fil
 | Warm run, 1 changed file, full discovery | — | ~56 ms |
 | Warm run, 1 changed file, `--staged` | < 10 ms | ~32 ms |
 
-**Nothing meets its budget yet, and the budgets stand.** They were provisional until measured; measuring them is not grounds for moving them. The levers named below are the answer, in that order, and relaxing a budget remains the last resort.
+**Nothing meets its budget yet, and the budgets stand.** They are targets to aim at, not release gates — a number chosen before anything existed does not get to decide whether the thing that exists is worth shipping. What they are for is direction: they say which way is better, and the gap between them and the measurements says how much room is left.
+
+Measuring them is not grounds for moving them. The levers below are the answer, in that order, and relaxing a budget remains the last resort — the point of a target you have not hit is that it keeps pointing.
 
 Two things the first measurement already bought:
 
@@ -682,9 +688,9 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 ## 16. Milestones
 
-**M0 — walking skeleton.** Workspace, config loading, discovery, tree-sitter TS/TSX, query compilation, the embedded engine with the §6 host API, human + json reporters, `RuleTester`. Acceptance: the built-in rules and a representative set of project-authored rules run end-to-end against the fixture corpus, with snapshot-verified output.
+**M0 — walking skeleton.** Workspace, config loading, discovery, tree-sitter TS/TSX, query compilation, the embedded engine with the §6 host API, human + json reporters, `RuleTester`. Acceptance: the built-in rules and a representative set of project-authored rules run end-to-end against the fixture corpus, with snapshot-verified output — every reporter is snapshotted in `lanekeep-report/tests/snapshots.rs`, and the built-in rules are driven through the binary over real corpora in `lanekeep-cli/tests/`.
 
-**M1 — speed.** Cache with dependency tracking, `--since` / `--staged`, rayon parallelism, `benches/` in CI with regression gates. Acceptance: budgets in §15 met.
+**M1 — speed.** Cache with dependency tracking, `--since` / `--staged`, rayon parallelism, `benches/` in CI with regression gates. Acceptance: the suite exists, runs in CI, and gates on regression — all of which it does. The §15 budgets are targets rather than an acceptance criterion; none is met yet, and §15 says by how much and what the levers are.
 
 **M2 — completeness.** Full host API surface, SARIF + agent reporters, `explain`, fixes (template-based replacement of a capture, marked machine-applicable vs suggestion), unused-suppression reporting.
 

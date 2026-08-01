@@ -1,0 +1,5 @@
+---
+source: crates/lanekeep-report/tests/snapshots.rs
+expression: "render(Format::Human, Color::Never, &[], summary(), &Cards::new())"
+---
+✔ no violations in 12 file(s)
