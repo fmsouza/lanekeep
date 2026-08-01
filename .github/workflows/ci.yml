@@ -112,10 +112,36 @@ jobs:
   # A single required check to point branch protection at. Adding a job above does
   # not then require also remembering to update the ruleset, and — importantly — a
   # skipped or cancelled dependency fails this rather than silently satisfying it.
+  # The performance gate. Separate from `gate` because it needs a release build, which
+  # takes long enough that pinning it to the debug-build job would slow every other check
+  # down for no reason.
+  #
+  # The numbers print whether or not the gate fires — a regression that stays under the
+  # threshold is still visible to anyone reading the log, which is the point.
+  bench:
+    name: bench (budgets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just
+
+      - run: just bench
+
   ci-ok:
     name: ci
     if: always()
-    needs: [gate, test, msrv]
+    needs: [gate, test, msrv, bench]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every job succeeded

@@ -321,7 +321,7 @@ impl Engine {
     /// but every one of them aborts the run, so the choice does not change the outcome.
     pub fn run(&self) -> Result<Outcome, RunError> {
         let files = self.discovery.walk();
-        self.run_over(&files)
+        self.run_files(&files, Coverage::Whole)
     }
 
     /// Run over an explicit file list, for `--since` and `--staged`.
@@ -330,6 +330,11 @@ impl Engine {
     ///
     /// As [`Engine::run`].
     pub fn run_over(&self, files: &[FilePath]) -> Result<Outcome, RunError> {
+        self.run_files(files, Coverage::Partial)
+    }
+
+    /// The shared body of [`Engine::run`] and [`Engine::run_over`].
+    fn run_files(&self, files: &[FilePath], coverage: Coverage) -> Result<Outcome, RunError> {
         let clock = RunClock::start(self.limits.global_timeout);
 
         // Loaded once, before any worker starts. Shared read-only across the pool: a cache
@@ -348,14 +353,13 @@ impl Engine {
                 // worker's whole share. Building one per file would pay engine startup
                 // thousands of times; sharing one across workers is impossible, since the
                 // runtime is single-threaded by construction.
-                // The sandbox is per worker — one engine startup per thread rather than
-                // per file. File access is not: it is per file, so one file's reads cannot
-                // be recorded against another's whatever rayon does with chunk boundaries.
-                || self.worker(&clock),
-                |worker, path| match worker {
-                    Ok(sandbox) => self.check_file(sandbox, &cache, path),
-                    Err(e) => Err(e.clone()),
-                },
+                // The sandbox is per worker and built on first use — one engine startup
+                // per thread that needs one, rather than per file, and none at all for a
+                // worker whose files all hit the cache. That last part is what makes a warm
+                // run cheap: starting QuickJS and evaluating every rule module, per worker,
+                // to then execute no JavaScript, was most of a warm run's cost.
+                || Worker::new(self, &clock),
+                |worker, path| self.check_file(worker, &cache, path),
             )
             .collect();
 
@@ -378,10 +382,24 @@ impl Engine {
         }
 
         if self.caching {
-            // Only what this run produced, so an entry for a file that no longer exists ages
-            // out rather than accumulating forever. A file that was gated out or unreadable
-            // contributes nothing and is simply absent next run.
-            fresh.save(&self.root);
+            match coverage {
+                // The run saw everything, so what it did not produce an entry for no longer
+                // exists. Saving only fresh entries is what ages deleted files out.
+                Coverage::Whole => fresh.save(&self.root),
+                // The run saw a subset. Saving only what it produced would discard the
+                // entries for every file it never looked at — so `--staged` would leave the
+                // next full run cold, which is the opposite of what an incremental entry
+                // point is for.
+                Coverage::Partial => {
+                    let mut merged = cache;
+                    for key in fresh.keys().copied().collect::<Vec<_>>() {
+                        if let Some(entry) = fresh.get(&key) {
+                            merged.insert(key, entry.clone());
+                        }
+                    }
+                    merged.save(&self.root);
+                }
+            }
         }
 
         // Into the one order every run will see, before any rule looks at them.
@@ -431,7 +449,7 @@ impl Engine {
             return Ok(Vec::new());
         }
 
-        let sandbox = self.worker(clock)?;
+        let sandbox = self.build_sandbox(clock)?;
         let paths: Vec<String> = files.iter().map(|f| f.as_str().to_owned()).collect();
         let mut violations = Vec::new();
 
@@ -488,7 +506,8 @@ impl Engine {
         Ok(violations)
     }
 
-    fn worker(&self, clock: &Arc<RunClock>) -> Result<Sandbox, RunError> {
+    /// Build the sandbox a worker uses, evaluating the ruleset into it.
+    fn build_sandbox(&self, clock: &Arc<RunClock>) -> Result<Sandbox, RunError> {
         let sandbox = Sandbox::with_modules(
             self.limits,
             Arc::clone(clock),
@@ -515,7 +534,7 @@ impl Engine {
     /// Check one file. Returns its violations, facts and tracked reads.
     fn check_file(
         &self,
-        sandbox: &Sandbox,
+        worker: &mut Worker<'_>,
         cache: &Store,
         path: &FilePath,
     ) -> Result<FileOutcome, RunError> {
@@ -576,7 +595,7 @@ impl Engine {
 
         let mut outcome = FileOutcome::parsed(path.clone());
         for rule in admitted {
-            let (violations, facts) = self.run_rule(sandbox, &files, rule, path, &source)?;
+            let (violations, facts) = self.run_rule(worker, &files, rule, path, &source)?;
             outcome.violations.extend(violations);
             outcome.facts.extend(facts);
         }
@@ -597,7 +616,7 @@ impl Engine {
 
     fn run_rule(
         &self,
-        sandbox: &Sandbox,
+        worker: &mut Worker<'_>,
         files: &Rc<FileAccess>,
         rule: &Prepared,
         path: &FilePath,
@@ -636,6 +655,10 @@ impl Engine {
         if matches.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+
+        // Only now, with matches in hand, is a sandbox needed. Everything above — parsing,
+        // query matching — is Rust, and a file that matches nothing never starts one.
+        let sandbox = worker.sandbox()?;
 
         let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
         let mut violations = Vec::new();
@@ -700,6 +723,65 @@ impl Engine {
         }
 
         Ok((violations, facts))
+    }
+}
+
+/// Whether a run looked at the whole corpus or a chosen subset.
+///
+/// The distinction only matters when saving: a run that saw everything may prune, and a run
+/// that saw a subset must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coverage {
+    /// Everything discovery selected.
+    Whole,
+    /// An explicit subset, from `--since` or `--staged`.
+    Partial,
+}
+
+/// One rayon worker's reusable state.
+///
+/// The sandbox is built on first use rather than up front. Starting QuickJS and evaluating
+/// every rule module into it costs real time, and a worker whose files all hit the cache —
+/// or whose queries match nothing — never executes a line of JavaScript and does not need
+/// one.
+struct Worker<'a> {
+    engine: &'a Engine,
+    clock: Arc<RunClock>,
+    sandbox: Option<Sandbox>,
+    /// A failure to build, remembered so it is reported once per worker rather than
+    /// retried for every remaining file.
+    failed: Option<RunError>,
+}
+
+impl<'a> Worker<'a> {
+    fn new(engine: &'a Engine, clock: &Arc<RunClock>) -> Self {
+        Self {
+            engine,
+            clock: Arc::clone(clock),
+            sandbox: None,
+            failed: None,
+        }
+    }
+
+    /// This worker's sandbox, building it if this is the first rule that needs one.
+    fn sandbox(&mut self) -> Result<&Sandbox, RunError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+
+        if self.sandbox.is_none() {
+            match self.engine.build_sandbox(&self.clock) {
+                Ok(sandbox) => self.sandbox = Some(sandbox),
+                Err(error) => {
+                    self.failed = Some(error.clone());
+                    return Err(error);
+                }
+            }
+        }
+
+        self.sandbox.as_ref().ok_or_else(|| RunError::Worker {
+            detail: "sandbox was not built".to_owned(),
+        })
     }
 }
 
@@ -2055,5 +2137,56 @@ export default defineRule({
             1,
             "an entry outlived the file it was for"
         );
+    }
+
+    #[test]
+    fn a_partial_run_does_not_discard_other_files_entries() {
+        // `--staged` saving only what it processed would wipe the cache for every file it
+        // never looked at, leaving the next full run cold — the opposite of what an
+        // incremental entry point is for.
+        let project = Project::new(
+            "cache-partial",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+                ("src/b.ts", "const b = 1;\n"),
+                ("src/c.ts", "const c = 1;\n"),
+            ],
+        );
+        project.run().expect("runs");
+        assert_eq!(project.cache().len(), 3);
+
+        let engine = project.build().expect("prepares");
+        engine
+            .run_over(&[FilePath::new("src/a.ts")])
+            .expect("runs over one file");
+
+        assert_eq!(
+            project.cache().len(),
+            3,
+            "a partial run discarded entries for files it did not look at"
+        );
+    }
+
+    #[test]
+    fn a_full_run_still_prunes() {
+        // The other half: pruning has to keep working, or entries for deleted files
+        // accumulate forever.
+        let project = Project::new(
+            "cache-prune-still",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+                ("src/b.ts", "const b = 1;\n"),
+            ],
+        );
+        project.run().expect("runs");
+        assert_eq!(project.cache().len(), 2);
+
+        fs::remove_file(project.dir.join("src/b.ts")).expect("removes");
+        project.run().expect("runs");
+        assert_eq!(project.cache().len(), 1);
     }
 }
