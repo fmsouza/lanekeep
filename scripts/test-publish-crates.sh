@@ -30,6 +30,12 @@ trap 'rm -rf "${work}"' EXIT
 
 cat >"${work}/cargo" <<'STUB'
 #!/usr/bin/env bash
+# `metadata` is a read-only question about this workspace, and the publication order is
+# computed from its answer. Passing it through to the real cargo is what makes these tests
+# assert the *actual* dependency order rather than a fixture's.
+if [ "$1" = "metadata" ]; then
+  exec "${REAL_CARGO}" "$@"
+fi
 printf '%s\n' "$*" >>"${CARGO_LOG}"
 # `publish -p <crate>`, so the crate is the third argument.
 crate="$3"
@@ -59,6 +65,7 @@ exit 1
 STUB
 chmod +x "${work}/probe"
 
+export REAL_CARGO="$(command -v cargo)"
 export CARGO="${work}/cargo"
 export CRATES_PROBE="${work}/probe"
 export CARGO_LOG="${work}/log"
@@ -100,8 +107,6 @@ check "every crate is published" "12" "$(publish_order | wc -l | tr -d ' ')"
 check "the core crate goes first" "lanekeep-core" "$(publish_order | head -1)"
 check "the binary goes last" "lanekeep-cli" "$(publish_order | tail -1)"
 
-# A few edges that would break the run if they inverted.
-order="$(publish_order | tr '\n' ' ')"
 before() {
   local first="$1" second="$2" a b
   a="$(publish_order | grep -nxF "${first}" | cut -d: -f1)"
@@ -113,6 +118,44 @@ check "the engine follows the sandbox" "yes" "$(before lanekeep-js lanekeep-engi
 check "the rules follow the engine" "yes" "$(before lanekeep-engine lanekeep-rules)"
 check "the language registry precedes its grammars" "yes" \
   "$(before lanekeep-lang lanekeep-lang-js)"
+
+# The edge that broke v0.1.1. lanekeep-rules dev-depends on lanekeep-testkit, and cargo
+# resolves dev-dependencies when it packages, so testkit has to be on the registry first. The
+# hand-written list this replaced had them the other way around and the release died on the
+# tenth of twelve crates.
+check "the testkit precedes the rules that dev-depend on it" "yes" \
+  "$(before lanekeep-testkit lanekeep-rules)"
+
+# The general form, and the one that will still hold after someone adds a crate: no crate is
+# published before something it depends on. Named edges pin the cases we already know about;
+# this pins the ones nobody has thought of. Both are worth having — a failure here says the
+# ordering is wrong, and a failure above says which edge.
+check "no crate precedes anything it depends on" "" "$(
+  publish_order >"${work}/order"
+  "${REAL_CARGO}" metadata --format-version 1 --no-deps 2>/dev/null | python3 -c '
+import json
+import sys
+
+order = [line.strip() for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+position = {name: index for index, name in enumerate(order)}
+metadata = json.load(sys.stdin)
+members = {package["name"] for package in metadata["packages"]}
+
+problems = []
+for package in metadata["packages"]:
+    name = package["name"]
+    if name not in position:
+        problems.append(f"{name} was never published")
+        continue
+    for dependency in package["dependencies"]:
+        other = dependency["name"]
+        if other in members and other != name and position.get(other, -1) > position[name]:
+            kind = dependency["kind"] or "normal"
+            problems.append(f"{name} publishes before its {kind} dependency {other}")
+
+print("\n".join(sorted(set(problems))))
+' "${work}/order"
+)"
 
 # --- a run that died partway resumes -----------------------------------------------------------
 #
@@ -126,23 +169,20 @@ section = text.split("[workspace.package]", 1)[1]
 print(re.search(r"^version\s*=\s*\"([^\"]+)\"", section, re.MULTILINE).group(1))
 ' "${repo_root}/Cargo.toml")"
 
-for crate in lanekeep-core lanekeep-lang lanekeep-lang-js lanekeep-query lanekeep-js \
-  lanekeep-cache; do
-  echo "${crate}" >>"${CRATES_PUBLISHED}"
-done
+# Taken from the order the script actually produced rather than written down here. A second
+# hand-maintained list would drift from the manifests exactly as the first one did, and would
+# pass while doing so.
+head -6 "${work}/order" >"${CRATES_PUBLISHED}"
+seventh="$(sed -n '7p' "${work}/order")"
 
 "${script}" >/dev/null 2>&1
 check "a partial release resumes" "0" "$?"
 check "and publishes only the remainder" "6" "$(publish_order | wc -l | tr -d ' ')"
-check "starting where it stopped" "lanekeep-config" "$(publish_order | head -1)"
+check "starting where it stopped" "${seventh}" "$(publish_order | head -1)"
 
 # --- a complete release is a no-op ---------------------------------------------------------------
 reset
-for crate in lanekeep-core lanekeep-lang lanekeep-lang-js lanekeep-query lanekeep-js \
-  lanekeep-cache lanekeep-config lanekeep-engine lanekeep-report lanekeep-rules \
-  lanekeep-testkit lanekeep-cli; do
-  echo "${crate}" >>"${CRATES_PUBLISHED}"
-done
+cp "${work}/order" "${CRATES_PUBLISHED}"
 "${script}" >/dev/null 2>&1
 check "a fully published release succeeds" "0" "$?"
 check "and publishes nothing again" "0" "$(publish_order | wc -l | tr -d ' ')"

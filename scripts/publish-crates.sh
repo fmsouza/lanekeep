@@ -4,9 +4,14 @@
 #
 #   ./scripts/publish-crates.sh [--dry-run]
 #
-# The order is hand-written because crates.io rejects a crate whose dependencies are not yet
-# on it, and a topological sort computed here would be one more thing that can disagree with
-# the manifests without saying so.
+# The order is computed from the manifests, because crates.io rejects a crate whose
+# dependencies are not yet on it.
+#
+# It used to be hand-written, on the theory that a computed sort was one more thing that could
+# disagree with the manifests. It was the list that disagreed: it placed lanekeep-rules before
+# lanekeep-testkit, which lanekeep-rules dev-depends on, and cargo resolves dev-dependencies
+# when it packages. v0.1.1 failed on the tenth of twelve crates with nine already published and
+# no way to take them back. Asking cargo cannot drift.
 #
 # Skipping what is already published is what makes a failure survivable. crates.io is
 # append-only: a version cannot be replaced, and yanking does not free the number. A
@@ -58,20 +63,55 @@ print(re.search(r'^version\s*=\s*"([^"]+)"', section, re.MULTILINE).group(1))
 PY
 )"
 
-crates=(
-  lanekeep-core
-  lanekeep-lang
-  lanekeep-lang-js
-  lanekeep-query
-  lanekeep-js
-  lanekeep-cache
-  lanekeep-config
-  lanekeep-engine
-  lanekeep-report
-  lanekeep-rules
-  lanekeep-testkit
-  lanekeep-cli
-)
+# Workspace members in an order where every crate follows everything it depends on.
+#
+# Dev-dependencies count: cargo resolves them at package time, so a crate whose dev-dependency
+# is not yet on the registry cannot be published even though nothing it ships uses it.
+#
+# Ties are broken alphabetically so the sequence is identical on every run — the same property
+# the rest of this project holds output to, and the reason a re-run's log can be compared with
+# the previous one.
+mapfile -t crates < <("${cargo_command}" metadata --format-version 1 --no-deps | python3 -c '
+import json
+import sys
+
+metadata = json.load(sys.stdin)
+members = {
+    package["name"]: package
+    for package in metadata["packages"]
+    # `publish = []` means "never publish this", and cargo would refuse it anyway.
+    if package.get("publish") != []
+}
+
+blocked_by = {
+    name: {
+        dependency["name"]
+        for dependency in package["dependencies"]
+        if dependency["name"] in members and dependency["name"] != name
+    }
+    for name, package in members.items()
+}
+
+ordered = []
+while blocked_by:
+    ready = sorted(
+        name for name, blockers in blocked_by.items() if blockers <= set(ordered)
+    )
+    if not ready:
+        remaining = ", ".join(sorted(blocked_by))
+        print(f"error: dependency cycle among {remaining}", file=sys.stderr)
+        raise SystemExit(1)
+    for name in ready:
+        ordered.append(name)
+        del blocked_by[name]
+
+print("\n".join(ordered))
+')
+
+if [ "${#crates[@]}" -eq 0 ]; then
+  echo "error: could not determine the publication order from cargo metadata" >&2
+  exit 1
+fi
 
 # Is this exact version already on crates.io? The registry is the authority; asking it
 # beats parsing whatever `cargo publish` prints when it refuses.

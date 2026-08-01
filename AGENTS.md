@@ -222,6 +222,14 @@ release: the platform packages published only because the glob `dist-npm/@laneke
 a trailing slash on every match, and the launcher, written without one, was the single line
 that failed.
 
+**`cargo publish` needs a crate's dev-dependencies on the registry too.** It resolves them when
+it packages, so a crate whose dev-dependency is unpublished cannot go up even though nothing it
+ships uses it. `lanekeep-rules` dev-depends on `lanekeep-testkit` for `RuleTester`, which puts
+testkit earlier in the publication order than the dependency arrows in `[dependencies]` suggest.
+The publication order is computed from `cargo metadata` for exactly this reason — a
+hand-maintained list had them backwards and v0.1.1 died on the tenth of twelve crates, with nine
+already published and no way to take them back.
+
 **A registry publish must be resumable, because neither registry can take a version back.**
 crates.io is append-only and npm refuses to republish a version, so a multi-package release
 that dies partway cannot simply be re-run — it stops on the first thing already published and
