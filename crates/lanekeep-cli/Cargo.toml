@@ -27,6 +27,7 @@ lanekeep-languages = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-mini = { workspace = true }
 lanekeep-report = { workspace = true }
+lanekeep-server = { workspace = true }
 lanekeep-rules = { workspace = true }
 serde_json = { workspace = true }
 
