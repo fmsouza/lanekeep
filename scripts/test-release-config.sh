@@ -62,6 +62,13 @@ print(f"tag_name={workspace.get('git_tag_name')}")
 print(f"release_name={workspace.get('git_release_name')}")
 print(f"tagging={','.join(sorted(tagging))}")
 print(f"releasing={','.join(sorted(releasing))}")
+
+writing = [p["name"] for p in packages if resolves_to(p, "changelog_update")]
+print(f"workspace_changelog_default={workspace.get('changelog_update')}")
+print(f"writing={','.join(sorted(writing))}")
+for package in packages:
+    if resolves_to(package, "changelog_update"):
+        print(f"changelog_path={package.get('changelog_path')}")
 PY
 
 value() { grep "^$1=" "${work}/report" | cut -d= -f2-; }
@@ -80,6 +87,65 @@ check "releasing is off by default" "False" "$(value workspace_release_default)"
 # so a tag not spelled this way is a tag it never sees.
 check "the tag is named for the version alone" "v{{ version }}" "$(value tag_name)"
 check "the release is named for the version alone" "v{{ version }}" "$(value release_name)"
+
+# --- one changelog, at the root, covering everything ----------------------------------------
+#
+# Per-crate changelogs feed a loop: release-plz writes them into `crates/*/`, then counts a
+# changed file under a crate as a change to that crate and proposes a release for it. v0.2.0
+# shipped and the very next run proposed 0.2.1 with no code change at all.
+check "changelogs are off by default" "False" "$(value workspace_changelog_default)"
+check "exactly one crate writes a changelog" "lanekeep-cli" "$(value writing)"
+check "and writes it to the repository root" "CHANGELOG.md" "$(value changelog_path)"
+
+# `changelog_include` has to name every *other* workspace crate, compared against what cargo
+# reports rather than against a copy written down here. A crate added later and forgotten
+# would vanish from the changelog and from the GitHub release body, which is generated from
+# it — a change that appears in neither, with nothing to say so.
+python3 - "${config}" >"${work}/coverage" <<'PY'
+import json
+import subprocess
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+
+workspace = config.get("workspace", {})
+writers = [
+    package
+    for package in config.get("package", [])
+    if package.get("changelog_update", workspace.get("changelog_update", False))
+]
+if len(writers) != 1:
+    print(f"expected exactly one changelog writer, found {len(writers)}")
+    raise SystemExit(0)
+
+writer = writers[0]
+included = set(writer.get("changelog_include", []))
+
+metadata = subprocess.run(
+    ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+    capture_output=True,
+    text=True,
+    check=True,
+)
+members = {
+    package["name"]
+    for package in json.loads(metadata.stdout)["packages"]
+    if package.get("publish") != []
+}
+
+problems = []
+missing = sorted((members - {writer["name"]}) - included)
+if missing:
+    problems.append(f"not covered by the changelog: {', '.join(missing)}")
+unknown = sorted(included - members)
+if unknown:
+    problems.append(f"named but not in the workspace: {', '.join(unknown)}")
+
+print("; ".join(problems))
+PY
+check "the changelog covers every other crate" "" "$(tr -d '\r' <"${work}/coverage")"
 
 # And the other half: release.yml has to actually fire on that name. Both YAML spellings —
 # `tags: ["v*"]` and a block list — because which one is used is not the point.

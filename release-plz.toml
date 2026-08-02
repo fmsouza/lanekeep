@@ -33,6 +33,17 @@ git_tag_enable = false
 git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
 
+# One changelog, at the repository root, rather than twelve inside `crates/`.
+#
+# Per-crate changelogs are release-plz's default and they feed a loop here: it writes them
+# into `crates/*/`, then counts a changed file under a crate as a change to that crate, and
+# proposes a release for it. Merging that release writes the changelogs again. v0.2.0 shipped
+# and the next run proposed 0.2.1 with no code change at all.
+#
+# Twelve of them were also the wrong shape for this project. The crates share one version and
+# are released together, so twelve near-identical files documented one thing twelve times.
+changelog_update = false
+
 # The changelog is for people deciding whether to upgrade, so it lists what changed for
 # them. Chores and CI changes did not.
 [changelog]
@@ -47,3 +58,28 @@ sort_commits = "oldest"
 name = "lanekeep-cli"
 git_release_enable = true
 git_tag_enable = true
+
+# The one crate that writes a changelog, and it writes the workspace's — to the root, which
+# is outside `crates/` and so cannot be mistaken for a change to any crate.
+#
+# `changelog_include` is what makes it the *workspace's* rather than this crate's. Without it
+# release-plz records only commits touching `lanekeep-cli`, and a root changelog that omitted
+# every engine and sandbox change would be worse than none: it would look complete.
+#
+# This is also where the GitHub release body comes from — release-plz reads the changelog to
+# write it — so a crate missing here is a change that appears in neither.
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = [
+  "lanekeep-cache",
+  "lanekeep-config",
+  "lanekeep-core",
+  "lanekeep-engine",
+  "lanekeep-js",
+  "lanekeep-lang",
+  "lanekeep-lang-js",
+  "lanekeep-query",
+  "lanekeep-report",
+  "lanekeep-rules",
+  "lanekeep-testkit",
+]
