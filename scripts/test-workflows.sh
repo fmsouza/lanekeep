@@ -182,6 +182,49 @@ print("\n".join(found))
 PY
 report "provenance publishing has id-token: write" "$(cat "${findings}")"
 
+# --- deciding whether to commit must account for untracked files ---------------------------
+#
+# `git diff` reports on tracked files only. A workflow that writes a file into a checkout and
+# then asks `git diff --quiet` whether to commit gets "nothing to do" whenever that file is
+# new — so it announces success and pushes nothing, which is the exact opposite of its job and
+# looks identical to there genuinely being no change.
+#
+# Staging first and comparing `--cached` covers both cases. This fired on the Homebrew tap
+# step, where the only run that would have hit it is the one against a tap with no formula in
+# it yet — the first one.
+python3 - "${workflows}" >"${findings}" <<'PY'
+import pathlib
+import re
+import sys
+
+import yaml
+
+found = []
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    for job_name, job in (document.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            script = step.get("run")
+            if not isinstance(script, str):
+                continue
+            # Only where the answer decides a commit; a diff used to *show* something is fine.
+            if "git commit" not in script:
+                continue
+            for line in script.splitlines():
+                # A comment explaining the trap is not the trap. This check's first draft
+                # flagged the very comment documenting the fix.
+                if line.lstrip().startswith("#"):
+                    continue
+                if re.search(r"git diff\b", line) and "--cached" not in line and "--staged" not in line:
+                    found.append(
+                        f"{path.name} :: {job_name} :: {step.get('name', '(unnamed)')} "
+                        f"decides on `git diff` without staging, so a new file reads as no change"
+                    )
+
+print("\n".join(found))
+PY
+report "committing decisions account for untracked files" "$(cat "${findings}")"
+
 echo
 echo "${passed} passed, ${failed} failed"
 [ "${failed}" -eq 0 ]

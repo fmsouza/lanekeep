@@ -276,6 +276,12 @@ never reaches the one that failed, stranding the release at that version permane
 publish scripts therefore skip what the registry already has. v0.1.0 spent a cycle stuck with
 four platform packages up and no launcher, which is exactly the state that motivated it.
 
+**`git diff` does not see an untracked file, so it cannot decide whether to commit one.** A
+workflow that writes a file into a checkout and asks `git diff --quiet` whether to push gets
+"nothing to do" whenever that file is new — announcing success while doing the opposite of its
+job. Stage first and compare `git diff --cached`. This was latent in the Homebrew tap step: the
+only run that would have hit it is the first one, against a tap with no formula in it yet.
+
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
 and re-checks forever — pinning a core while the output looks exactly like a tool that is

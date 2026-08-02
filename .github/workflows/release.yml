@@ -283,14 +283,20 @@ jobs:
           cp dist-homebrew/lanekeep.rb tap/Formula/lanekeep.rb
 
           cd tap
-          if git diff --quiet; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Staged *before* the comparison, because `git diff` alone does not see an
+          # untracked file. On a tap that has no formula yet, copying one in leaves it
+          # untracked, `git diff --quiet` reports nothing to do, and the step announces
+          # "already current" and pushes nothing — succeeding while doing the opposite of
+          # its job.
+          git add Formula/lanekeep.rb
+          if git diff --cached --quiet; then
             echo "the formula is already current"
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/lanekeep.rb
           git commit -m "lanekeep ${TAG}"
           git push
 
