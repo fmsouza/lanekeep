@@ -35,18 +35,30 @@ Publishing is gated on secrets, and each is absent until someone adds it:
 | --- | --- |
 | `NPM_TOKEN` | `npm publish`, with provenance |
 | `CARGO_REGISTRY_TOKEN` | `cargo publish` |
-| `RELEASE_PLZ_TOKEN` | Letting the tag release-plz pushes trigger `release.yml` |
+| `RELEASE_PLZ_TOKEN` | Letting release-plz open the release pull request, and letting the tag it pushes trigger `release.yml` |
 
 `NPM_TOKEN` must be a granular access token with **Bypass 2FA** enabled. Without it npm
 answers `EOTP` and asks for a one-time password, which nothing in CI can supply. crates.io
 requires a **verified email address** on the account before it accepts any publish at all.
 
-`RELEASE_PLZ_TOKEN` is the one whose absence is quiet. A tag pushed with the default
-`GITHUB_TOKEN` **does not trigger other workflows** — GitHub suppresses that so a workflow
-cannot set itself off forever. So without it, release-plz tags and creates the release,
-`release.yml` never runs, and the releases page advertises a version that is on neither
-registry. `release-plz.yml` says which token it used on every run, and warns when it is the
-default one. A tag pushed by hand always triggers `release.yml`.
+`RELEASE_PLZ_TOKEN` is the one to get right, because the default token cannot do two
+separate things and neither is obvious from the failure.
+
+**It cannot open the release pull request** unless the repository allows it —
+Settings → Actions → General → Workflow permissions → *Allow GitHub Actions to create and
+approve pull requests*. Without that, the run fails with a 403 reading "GitHub Actions is not
+permitted to create or approve pull requests", which looks like a bug in release-plz and is a
+repository setting.
+
+**It cannot trigger `release.yml` from the tag it pushes.** GitHub suppresses that so a
+workflow cannot set itself off forever. So even with the setting enabled and the release pull
+request merged, the tag lands, the GitHub release appears, and nothing publishes — a releases
+page advertising a version that is on neither registry.
+
+A fine-grained PAT in `RELEASE_PLZ_TOKEN`, with contents and pull-requests write, is the one
+fix for both. `release-plz.yml` prints which token it used on every run and spells out both
+consequences when it is the default. A tag pushed by hand always triggers `release.yml`, which
+is how every release so far has happened.
 
 **A tag with no registry secrets set still builds and packages everything** — it just
 publishes nothing. That is the intended way to rehearse a release, and it means the first real publish

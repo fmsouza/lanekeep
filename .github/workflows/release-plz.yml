@@ -57,14 +57,35 @@ jobs:
         run: |
           if [ -n "${RELEASE_PLZ_TOKEN}" ]; then
             echo "elevated=yes" >> "${GITHUB_OUTPUT}"
-            echo "token: RELEASE_PLZ_TOKEN — the tag it pushes will trigger release.yml"
-          else
-            echo "elevated=no" >> "${GITHUB_OUTPUT}"
-            echo "token: GITHUB_TOKEN — a tag it pushes will NOT trigger release.yml"
-            echo "::warning::RELEASE_PLZ_TOKEN is not set. A tag pushed with GITHUB_TOKEN \
-            does not trigger release.yml, so nothing will publish. Push the tag by hand, or \
-            add the secret. See docs/releasing.md."
+            echo "token: RELEASE_PLZ_TOKEN"
+            echo "  it can open the release pull request"
+            echo "  the tag it pushes will trigger release.yml"
+            exit 0
           fi
+
+          echo "elevated=no" >> "${GITHUB_OUTPUT}"
+          echo "token: GITHUB_TOKEN — two things this run cannot do"
+          echo
+          echo "  1. Open the release pull request, unless the repository allows it."
+          echo "     Settings > Actions > General > Workflow permissions >"
+          echo "     'Allow GitHub Actions to create and approve pull requests'."
+          echo "     Without it the next step fails with a 403 reading"
+          echo "     'GitHub Actions is not permitted to create or approve pull requests'."
+          echo
+          echo "  2. Trigger release.yml from the tag it pushes. GitHub suppresses that so a"
+          echo "     workflow cannot set itself off forever, so nothing would publish even"
+          echo "     once the pull request merged. The tag needs pushing by hand."
+          echo
+          echo "  RELEASE_PLZ_TOKEN — a fine-grained PAT with contents and pull-requests"
+          echo "  write — is the one fix for both. See docs/releasing.md."
+
+          # A warning rather than a failure: a run with no token still does no harm, and the
+          # step that needs one fails on its own with the 403 quoted above. What this exists
+          # to prevent is reading that 403 as a bug in release-plz.
+          echo "::warning::RELEASE_PLZ_TOKEN is not set. This run cannot open the release \
+          pull request (403 unless the repository allows Actions to create pull requests), \
+          and a tag pushed with GITHUB_TOKEN does not trigger release.yml. See \
+          docs/releasing.md."
 
       # Opens or updates the release pull request: the version bump and the changelog, for
       # review. Nothing here is irreversible — closing the pull request undoes all of it.
