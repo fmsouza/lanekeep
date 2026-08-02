@@ -285,6 +285,53 @@ Two things fix it, and both are needed:
 
 The same binaries feed npm, the archives and Homebrew, so all four channels get the floor.
 
+## Go
+
+`go get -tool github.com/fmsouza/lanekeep/cmd/lanekeep`, then `go tool lanekeep`. That pins
+lanekeep in `go.mod` beside every other tool a Go project depends on, which is the thing
+`package.json` and `requirements.txt` already do for the other two.
+
+**There is no publish step, and that is the whole design.** Go has no registry — a module
+version *is* a git tag — so putting `go.mod` at the repository root makes the `v*` tags the
+release already pushes into the module's versions. Nothing new is uploaded, nothing can drift
+out of step, and there is no fifth token to manage.
+
+**Why a launcher rather than the binary.** Go's tooling installs and pins only things written
+in Go: `go install` compiles a Go package and the `tool` directive records one. So a Go
+project cannot depend on a Rust binary directly, and `cmd/lanekeep` is the adapter. It is the
+same shape as the npm launcher, with one difference — npm expresses "install only this
+platform's package" through `optionalDependencies` and Go has no equivalent, so a module
+carrying every platform's binary would be tens of megabytes committed to git forever. The
+binary is fetched on first use and cached under the user cache directory, keyed by version.
+
+The version comes from `debug.ReadBuildInfo()` rather than being written down, for the reason
+the npm launcher's is rewritten from the tag: a committed version is one more thing to forget,
+and forgetting it fetches the previous release under this release's name.
+
+### What it trusts
+
+The module is verified by Go's checksum database, so the launcher that runs is the launcher in
+this repository. The binary it fetches is verified against the `SHA256SUMS` published with the
+same release — **weaker than Homebrew's**, where the checksum is pinned in the formula out of
+band, because here the archive and its checksums come from one place.
+
+That is a consequence of Go's model rather than a shortcut: a release's checksums cannot exist
+when its tag is created, and the tag is what fixes the module's contents. Embedding them would
+need a second tag cut after the binaries are built.
+
+Two ways to skip the fetch entirely, both first-class:
+
+- `LANEKEEP_BINARY=/path/to/lanekeep` — nothing is downloaded and nothing is verified, because
+  the choice was made by whoever set it. This is the answer for air-gapped CI.
+- Install by any other route. The launcher checks its cache before reaching out.
+
+A checksum mismatch **refuses to install**. Reporting the mismatch and running the binary
+anyway would be worse than not checking at all.
+
+`cmd/lanekeep` has its own tests, run by `just test-go`, which is part of `just check` and is
+skipped where no Go toolchain exists — the same trade the bash 3.2 checks make. They never
+touch the network: the download path is driven through a local server.
+
 ## How the npm distribution works
 
 One package per platform, plus a launcher that depends on all of them as
@@ -307,19 +354,23 @@ runner of its own architecture and smoke-tested before it ships.
 
 ## Adding a platform
 
-Five places, and all five are checked:
+Six places, and all six are checked:
 
 1. A matrix entry in `release.yml` — with a `glibc` floor, if it is a `linux-gnu` target.
 2. A row in `scripts/build-npm-packages.sh`.
 3. A row in `scripts/build-release-archives.sh`.
 4. A row in `scripts/build-python-wheels.sh`, with the wheel platform tag.
-5. An entry in `npm/lanekeep/resolve.js` and in the launcher's `optionalDependencies`.
+5. A row in `cmd/lanekeep/main.go`'s `triples`, keyed by `GOOS/GOARCH`.
+6. An entry in `npm/lanekeep/resolve.js` and in the launcher's `optionalDependencies`.
 
 Every packaging script fails if a platform it expects was not built, and a test asserts the
 launcher's list and the resolver's agree — an install that succeeds and then cannot run is the
 failure this prevents. Miss (3) and the release simply has no archive for that platform, which
 is why that script errors on a missing binary rather than skipping it. Miss the `glibc` in (1)
-and `scripts/test-workflows.sh` fails.
+and `scripts/test-workflows.sh` fails; so does getting (5) wrong in either direction, since it
+compares the launcher's table against the release matrix — a triple the release does not build
+is a 404 on someone's first run, and one it builds but the launcher omits sends a user to
+compile from source while a binary sits on the releases page.
 
 Picking the tag in (4) is the one step with no single right answer: it has to be what pip
 matches on that platform and no broader. The Linux tags are checked against the binary, so an

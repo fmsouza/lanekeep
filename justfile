@@ -35,10 +35,10 @@ _require tool:
 # ---------------------------------------------------------------------------
 
 # Pre-commit gate. Fast enough to run on every commit without being resented.
-check-fast: fmt-check lint test test-scripts
+check-fast: fmt-check lint test test-scripts test-go
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-scripts docs deny machete typos-check msrv
+check: fmt-check lint test test-scripts test-go docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -87,6 +87,28 @@ test-scripts:
     @./scripts/test-shell-portability.sh
     @./scripts/test-workflows.sh
     @./scripts/test-release-config.sh
+
+# The Go launcher: formatting, vet, and its own tests.
+#
+# Skipped where Go is absent rather than failing. It is one distribution lane, and making
+# the Rust gate require a Go toolchain would cost every contributor for something most of
+# them never touch — the same trade `test-shell-portability.sh` makes for bash 3.2. CI has
+# Go on every runner, so it is a real check there.
+test-go:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v go >/dev/null 2>&1; then
+        echo "note: no go toolchain here, so the launcher tests are skipped (CI covers them)"
+        exit 0
+    fi
+    unformatted="$(gofmt -l ./cmd)"
+    if [ -n "${unformatted}" ]; then
+        echo "error: not gofmt'd:" >&2
+        echo "${unformatted}" >&2
+        exit 1
+    fi
+    go vet ./...
+    go test ./...
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 docs:
