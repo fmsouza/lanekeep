@@ -263,6 +263,48 @@ print("\n".join(found))
 PY
 report "every Linux release target pins a glibc floor" "$(cat "${findings}")"
 
+# --- the Go launcher knows exactly the platforms the release builds ---------------------------
+#
+# `cmd/lanekeep` maps GOOS/GOARCH to a release triple and fetches the archive named for it. A
+# triple it claims that the release does not build is a 404 on first run, which reads to a Go
+# user as the tool being broken. A platform the release builds but the launcher omits is a
+# user told to compile from source while a binary sits on the releases page.
+#
+# The launcher's own test pins the table against a literal, which catches an edit to the table.
+# This catches the other direction: the release matrix changing and the table not.
+python3 - "${workflows}" "${repo_root}/cmd/lanekeep/main.go" >"${findings}" <<'PY'
+import pathlib
+import re
+import sys
+
+import yaml
+
+workflows, launcher = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+
+document = yaml.safe_load((workflows / "release.yml").read_text(encoding="utf-8")) or {}
+include = (
+    ((document.get("jobs") or {}).get("build") or {}).get("strategy") or {}
+).get("matrix", {}).get("include") or []
+built = {str(entry["target"]) for entry in include if entry.get("target")}
+
+source = launcher.read_text(encoding="utf-8")
+# The `triples` map literal, read as `"goos/goarch": "triple"` pairs.
+block = re.search(r"var triples = map\[string\]string\{(.*?)\n\}", source, re.DOTALL)
+claimed = set(re.findall(r'"[^"]+"\s*:\s*"([^"]+)"', block.group(1))) if block else set()
+
+found = []
+if not block:
+    found.append("cmd/lanekeep/main.go has no `triples` map to check")
+else:
+    for triple in sorted(claimed - built):
+        found.append(f"the Go launcher offers {triple}, which release.yml does not build")
+    for triple in sorted(built - claimed):
+        found.append(f"release.yml builds {triple}, which the Go launcher does not offer")
+
+print("\n".join(found))
+PY
+report "the Go launcher offers exactly the built platforms" "$(cat "${findings}")"
+
 echo
 echo "${passed} passed, ${failed} failed"
 [ "${failed}" -eq 0 ]

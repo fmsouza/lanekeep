@@ -106,12 +106,23 @@ brew install fmsouza/tap/lanekeep    # macOS and Linux, system-wide
 cargo install lanekeep-cli           # from source
 ```
 
+For a Go project, pin it in `go.mod` alongside your other tools:
+
+```bash
+go get -tool github.com/fmsouza/lanekeep/cmd/lanekeep
+```
+
+then `go tool lanekeep check ./...`. Go can only install and pin things written in Go, so
+that package is a small launcher which fetches the real binary on first use, verifies it
+against the release's published checksums, and caches it. Set `LANEKEEP_BINARY` to an
+already-installed lanekeep and it fetches nothing.
+
 Or download a binary from the [releases page](https://github.com/fmsouza/lanekeep/releases).
 
-A single static binary with the JavaScript engine compiled in. **Neither Node.js nor Python is
-required to run lanekeep**, even though rules are written in TypeScript — a runtime is needed
-only to install it from that ecosystem's index, where it picks which binary to fetch. Nothing
-is pulled in as a dependency either way.
+A single static binary with the JavaScript engine compiled in. **No runtime is required to run
+lanekeep**, even though rules are written in TypeScript — Node, Python or Go is needed only to
+install it from that ecosystem, where it picks which binary to fetch. Nothing is pulled in as a
+dependency any of those ways.
 
 Prebuilt for macOS on Apple silicon, Linux on x86-64 and arm64, and Windows on x86-64. The
 Linux binaries are built against glibc 2.17, so they run on anything from RHEL 7 onwards.

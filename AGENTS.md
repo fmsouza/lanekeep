@@ -27,6 +27,7 @@ passes here it passes there.
 | `just check-fast` | Format, clippy, tests. What pre-commit runs. |
 | `just check` | The full gate. What pre-push and CI run. |
 | `just test` | Rust tests via nextest |
+| `just test-go` | The Go launcher's tests, skipped where Go is absent |
 | `just test -- <filter>` | A subset — `just test -- cache::` |
 | `just fmt` | Apply formatting |
 | `just snapshot` | Review pending insta snapshots |
@@ -115,6 +116,7 @@ crates/
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
   lanekeep-testkit   RuleTester
   lanekeep-cli       the binary
+cmd/lanekeep/        the Go launcher, so `go tool lanekeep` works
 docs/                architecture, playbooks
 scripts/             repository tooling, with its own tests
 .githooks/           committed hooks, activated by `just setup`
