@@ -18,11 +18,11 @@
 //! Without that, a rule whose handler was misspelled would load cleanly and silently never
 //! fire — the worst failure this tool can have, because it looks exactly like passing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use lanekeep_core::{Examples, Gates, RuleCard, RuleId, Severity};
+use lanekeep_core::{Examples, Gates, Namespace, RuleCard, RuleId, Severity};
 use lanekeep_js::{Limits, RuleRoot, RunClock, Sandbox};
 use serde::Deserialize;
 use thiserror::Error;
@@ -52,8 +52,13 @@ pub struct RuleSpec {
     pub index: usize,
     /// Namespaced identifier.
     pub id: RuleId,
-    /// Which language's grammar the query compiles against.
-    pub language: String,
+    /// Which languages' grammars the query compiles against, and which files the rule runs on.
+    ///
+    /// A rule runs on a file only when the file's own language is one of these, and it is
+    /// then parsed with *that* grammar. Running every rule against every file with a single
+    /// declared grammar is what used to turn a `.tsx` file into a tree of `ERROR` nodes —
+    /// silently, since a query simply matches nothing inside one.
+    pub languages: Vec<String>,
     /// Severity as the rule declares it, before config overrides.
     pub severity: Severity,
     /// The rule card.
@@ -144,6 +149,8 @@ struct RawConfig {
     #[serde(default)]
     exclude: Vec<String>,
     #[serde(default)]
+    namespaces: Vec<String>,
+    #[serde(default)]
     severity: BTreeMap<String, String>,
     #[serde(default)]
     timeouts: RawTimeouts,
@@ -160,7 +167,7 @@ struct RawTimeouts {
 #[derive(Debug, Deserialize)]
 struct RawRule {
     id: Option<String>,
-    language: Option<String>,
+    language: Option<RawLanguages>,
     severity: Option<String>,
     card: Option<RawCard>,
     query: Option<String>,
@@ -169,6 +176,23 @@ struct RawRule {
     timeout: Option<u64>,
     has_check: bool,
     has_reduce: bool,
+}
+
+/// `language: 'tsx'` and `language: ['typescript', 'tsx']` are both ordinary things to write.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawLanguages {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RawLanguages {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(language) => vec![language],
+            Self::Many(languages) => languages,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +226,7 @@ const EXTRACT: &str = r"
         const rules = Array.isArray(c.rules) ? c.rules : [];
         return JSON.stringify({
             include: c.include ?? [],
+            namespaces: c.namespaces ?? [],
             exclude: c.exclude ?? [],
             severity: c.severity ?? {},
             timeouts: c.timeouts ?? {},
@@ -299,9 +324,29 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
 fn build(sandbox: &Sandbox, raw: RawConfig, display: &str) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
+    // Namespaces this project claims, beyond the two lanekeep defines. Validated for shape
+    // here so a malformed one is reported against `namespaces` rather than against whichever
+    // rule happened to use it first.
+    let mut declared = BTreeSet::new();
+    for namespace in &raw.namespaces {
+        RuleId::namespace_from_str(namespace).map_err(|e| ConfigError::Shape {
+            path: display.to_owned(),
+            detail: format!("`namespaces` contains an invalid entry: {e}"),
+        })?;
+        if namespace == Namespace::LANEKEEP {
+            return Err(ConfigError::Shape {
+                path: display.to_owned(),
+                detail: "`lanekeep` is reserved for rules shipped with lanekeep — a rule's \
+                         origin should be readable from its ID"
+                    .to_owned(),
+            });
+        }
+        declared.insert(namespace.clone());
+    }
+
     let mut rules = Vec::with_capacity(raw.rules.len());
     for (index, rule) in raw.rules.into_iter().enumerate() {
-        rules.push(build_rule(rule, index + 1, display, &overrides)?);
+        rules.push(build_rule(rule, index + 1, display, &overrides, &declared)?);
     }
 
     let mut limits = Limits::default();
@@ -351,6 +396,7 @@ fn build_rule(
     position: usize,
     display: &str,
     overrides: &BTreeMap<RuleId, Severity>,
+    declared: &BTreeSet<String>,
 ) -> Result<RuleSpec, ConfigError> {
     let fail = |detail: String| ConfigError::Rule {
         position,
@@ -363,6 +409,23 @@ fn build_rule(
         .ok_or_else(|| fail("missing `id`".to_owned()))?
         .parse::<RuleId>()
         .map_err(|e| fail(e.to_string()))?;
+
+    // A namespace nobody declared is a typo, and this is the only layer that can tell.
+    // Parsing accepts any well-formed namespace so a team can use its own; declaring it is
+    // what keeps `lanekep/foo` from becoming a valid ID that quietly matches nothing.
+    if !id.namespace().is_built_in() && !declared.contains(id.namespace().as_str()) {
+        let mut known: Vec<String> = Namespace::built_ins()
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect();
+        known.extend(declared.iter().map(|n| format!("`{n}`")));
+        return Err(fail(format!(
+            "rule namespace `{}` is not declared — add it to `namespaces` in the config, \
+             or use one of {}",
+            id.namespace(),
+            known.join(", ")
+        )));
+    }
 
     // The check that JSON extraction exists to make possible. A rule whose handler is
     // missing or misspelled would otherwise load cleanly and never report, which is
@@ -410,7 +473,13 @@ fn build_rule(
         // Config severity wins over what the rule declares, per §9.
         severity: overrides.get(&id).copied().unwrap_or(declared),
         id,
-        language: raw.language.unwrap_or_else(|| "typescript".to_owned()),
+        // Both TypeScript dialects by default, because a rule written for TypeScript is
+        // meant for the TypeScript in the project — and in any React codebase most of that
+        // lives in `.tsx`, which the TypeScript grammar cannot parse.
+        languages: raw.language.map_or_else(
+            || vec!["typescript".to_owned(), "tsx".to_owned()],
+            RawLanguages::into_vec,
+        ),
         card,
         query,
         gates: raw.gates,
@@ -640,6 +709,120 @@ mod tests {
         assert_eq!(config.rules[0].id.to_string(), "local/example");
         assert_eq!(config.rules[0].card.message, "no");
         assert!(!config.rules[0].has_reduce);
+    }
+
+    /// A team can group its rules under its own namespace, which `local/` alone does not
+    /// allow — everything project-authored ends up in one bucket regardless of who wrote it.
+    #[test]
+    fn a_declared_namespace_is_accepted() {
+        let fixture = Fixture::new(
+            "declared-namespace",
+            &[
+                ("rule.ts", &rule("pera/no-numeric-sizes")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("namespaces: ['pera'], rules: [rule]"),
+                ),
+            ],
+        );
+
+        let config = fixture.load_config().expect("loads");
+        assert_eq!(config.rules[0].id.to_string(), "pera/no-numeric-sizes");
+        assert!(!config.rules[0].id.is_built_in());
+    }
+
+    /// And the property that made a closed set worth having in the first place: a namespace
+    /// nobody declared is a typo, and it fails at load rather than becoming a valid ID that
+    /// silently matches nothing.
+    #[test]
+    fn an_undeclared_namespace_is_rejected() {
+        let fixture = Fixture::new(
+            "undeclared-namespace",
+            &[
+                ("rule.ts", &rule("lanekep/no-default-export")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("an undeclared namespace should be refused")
+            .to_string();
+        assert!(error.contains("lanekep"), "{error}");
+        assert!(
+            error.contains("namespaces"),
+            "should say how to fix it: {error}"
+        );
+    }
+
+    /// `lanekeep/` stays reserved, so a rule's origin is readable from its ID alone.
+    #[test]
+    fn the_lanekeep_namespace_cannot_be_claimed() {
+        let fixture = Fixture::new(
+            "reserved-namespace",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("namespaces: ['lanekeep'], rules: [rule]"),
+                ),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("claiming the reserved namespace should be refused")
+            .to_string();
+        assert!(error.contains("reserved"), "{error}");
+    }
+
+    /// A rule with no language of its own targets both TypeScript dialects, because in a
+    /// React codebase most TypeScript is `.tsx`.
+    #[test]
+    fn a_rule_defaults_to_both_typescript_dialects() {
+        let fixture = Fixture::new(
+            "default-languages",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let config = fixture.load_config().expect("loads");
+        assert_eq!(config.rules[0].languages, ["typescript", "tsx"]);
+    }
+
+    /// One or several, both spelled the way a rule author would write them.
+    #[test]
+    fn a_rule_may_declare_one_language_or_several() {
+        for (declaration, expected) in [
+            ("language: 'tsx',", vec!["tsx"]),
+            (
+                "language: ['typescript', 'tsx'],",
+                vec!["typescript", "tsx"],
+            ),
+        ] {
+            let module = format!(
+                "import {{ defineRule }} from 'lanekeep';\n\
+                 export default defineRule({{\n\
+                   id: 'local/example',\n\
+                 {declaration}\n\
+                   query: '(identifier) @id',\n\
+                   card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
+                   check(ctx, m) {{ ctx.report(m.id); }},\n\
+                 }});\n"
+            );
+            let fixture = Fixture::new(
+                "language-forms",
+                &[
+                    ("rule.ts", &module),
+                    ("lanekeep.config.ts", &config_with("rules: [rule]")),
+                ],
+            );
+
+            let config = fixture.load_config().expect("loads");
+            assert_eq!(config.rules[0].languages, expected, "{declaration}");
+        }
     }
 
     #[test]

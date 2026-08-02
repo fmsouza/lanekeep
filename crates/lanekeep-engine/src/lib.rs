@@ -111,11 +111,28 @@ pub enum RunError {
 }
 
 /// A rule prepared for execution: metadata plus everything compiled.
+///
+/// The query is compiled once per language the rule targets, because a query is compiled
+/// against a grammar and the grammars differ. Which one a given file uses is decided by the
+/// file, not by the rule — see [`Prepared::for_language`].
 struct Prepared {
     spec: RuleSpec,
-    query: CompiledQuery,
     gates: CompiledGates,
-    language: Arc<dyn Language>,
+    /// Compiled query per language, in the order the rule declared them.
+    compiled: Vec<(Arc<dyn Language>, CompiledQuery)>,
+}
+
+impl Prepared {
+    /// The grammar and query to use for a file of the given language, or `None` when this
+    /// rule does not target it — in which case the rule does not run on that file at all.
+    ///
+    /// Running it anyway is what the old behavior did, and it does not fail loudly: the file
+    /// parses into a tree of `ERROR` nodes and every query quietly matches nothing.
+    fn for_language(&self, id: &str) -> Option<&(Arc<dyn Language>, CompiledQuery)> {
+        self.compiled
+            .iter()
+            .find(|(language, _)| language.id().as_str() == id)
+    }
 }
 
 /// Everything a run needs, built once and shared across workers.
@@ -153,6 +170,11 @@ pub struct Engine {
     config_path: PathBuf,
     typescript: Arc<dyn Language>,
     javascript: Arc<dyn Language>,
+    /// Extension to language id, so a file can be matched to a grammar without the registry.
+    ///
+    /// Lowercased keys, because the registry lowercases too — whether `Button.TSX` gets
+    /// checked should not depend on how someone typed it.
+    languages_by_extension: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -242,26 +264,44 @@ impl Engine {
             .collect::<Vec<_>>()
             .join(", ");
 
+        let mut languages_by_extension = BTreeMap::new();
+        for language in registry.languages() {
+            for extension in language.extensions() {
+                languages_by_extension
+                    .insert(extension.to_ascii_lowercase(), language.id().to_string());
+            }
+        }
+
         let mut rules = Vec::with_capacity(config.rules.len());
         for spec in &config.rules {
             if !spec.severity.is_enabled() {
                 continue;
             }
 
-            let language = registry.by_id(&spec.language).cloned().ok_or_else(|| {
-                RunError::UnknownLanguage {
-                    rule: spec.id.to_string(),
-                    language: spec.language.clone(),
-                    known: known.clone(),
-                }
-            })?;
+            let mut compiled = Vec::with_capacity(spec.languages.len());
+            for id in &spec.languages {
+                let language =
+                    registry
+                        .by_id(id)
+                        .cloned()
+                        .ok_or_else(|| RunError::UnknownLanguage {
+                            rule: spec.id.to_string(),
+                            language: id.clone(),
+                            known: known.clone(),
+                        })?;
 
-            let query = CompiledQuery::compile(language.as_ref(), &spec.query).map_err(
-                |e: CompileError| RunError::Query {
-                    rule: spec.id.to_string(),
-                    detail: e.to_string(),
-                },
-            )?;
+                // Compiled against this grammar specifically. A query that is valid for one
+                // dialect and not another is a rule bug, and this is where it surfaces —
+                // at config load, naming the rule, rather than as silence at run time.
+                let query = CompiledQuery::compile(language.as_ref(), &spec.query).map_err(
+                    |e: CompileError| RunError::Query {
+                        rule: spec.id.to_string(),
+                        detail: e.to_string(),
+                    },
+                )?;
+
+                compiled.push((language, query));
+            }
 
             let gates = CompiledGates::compile(&spec.gates).map_err(|e| RunError::Gates {
                 rule: spec.id.to_string(),
@@ -270,9 +310,8 @@ impl Engine {
 
             rules.push(Prepared {
                 spec: spec.clone(),
-                query,
                 gates,
-                language,
+                compiled,
             });
         }
 
@@ -318,7 +357,19 @@ impl Engine {
             config_path: config_path.to_path_buf(),
             typescript,
             javascript,
+            languages_by_extension,
         })
+    }
+
+    /// Which language parses this file, or `None` when nothing registered claims it.
+    fn language_of(&self, path: &FilePath) -> Option<&str> {
+        let extension = Path::new(path.as_str())
+            .extension()?
+            .to_str()?
+            .to_ascii_lowercase();
+        self.languages_by_extension
+            .get(extension.as_str())
+            .map(String::as_str)
     }
 
     /// Turn the cache off, for `--no-cache` and for tests that need a cold run.
@@ -882,8 +933,18 @@ impl Engine {
         path: &FilePath,
         source: &str,
     ) -> Result<(Vec<Violation>, Vec<Fact>, bool, RuleTiming), RunError> {
+        // The grammar is chosen by the file, not by the rule. A rule that does not target
+        // this file's language does not run on it at all — previously it ran anyway, against
+        // a grammar that could not parse the file, and matched nothing without saying so.
+        let Some(language_id) = self.language_of(path) else {
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
+        };
+        let Some((language, compiled_query)) = rule.for_language(language_id) else {
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
+        };
+
         let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&rule.language.grammar()).is_err() {
+        if parser.set_language(&language.grammar()).is_err() {
             return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
         }
         let Some(tree) = parser.parse(source, None) else {
@@ -899,25 +960,24 @@ impl Engine {
         // has ended — the two-phase shape the arena's ownership of the tree forces.
         let mut matches: Vec<Vec<(String, Vec<u32>)>> = Vec::new();
         let host = HostContext::new(tree, source.to_owned(), path.as_str())
-            .with_resolver_from(rule.language.as_ref())
-            .with_language(Arc::clone(&rule.language))
+            .with_resolver_from(language.as_ref())
+            .with_language(Arc::clone(language))
             .with_today(&self.today.to_string())
             .with_file_access(Rc::clone(files));
 
         let query_started = clock(self.profiling);
         {
             let arena = host.arena().borrow();
-            rule.query
-                .for_each_match(arena.tree(), source.as_bytes(), |m| {
-                    let captures = m
-                        .captures
-                        .iter()
-                        .filter_map(|(name, node)| {
-                            arena.path_of(*node).map(|path| ((*name).to_owned(), path))
-                        })
-                        .collect();
-                    matches.push(captures);
-                });
+            compiled_query.for_each_match(arena.tree(), source.as_bytes(), |m| {
+                let captures = m
+                    .captures
+                    .iter()
+                    .filter_map(|(name, node)| {
+                        arena.path_of(*node).map(|path| ((*name).to_owned(), path))
+                    })
+                    .collect();
+                matches.push(captures);
+            });
         }
 
         if let Some(started) = query_started {
@@ -1333,12 +1393,160 @@ mod tests {
           check(ctx, m) { ctx.report(m.stmt); },\n\
         });\n";
 
+    /// A rule matching `x.y`, which is the shape that vanishes when JSX fails to parse.
+    fn member_rule_for(language: &str) -> String {
+        let declaration = if language.is_empty() {
+            String::new()
+        } else {
+            format!("  language: {language},\n")
+        };
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: 'local/member',\n\
+             {declaration}\
+               query: '(member_expression) @m',\n\
+               card: {{\n\
+                 message: 'member expression',\n\
+                 remediation: 'n/a',\n\
+                 examples: {{ bad: 'a.b', good: 'b' }},\n\
+               }},\n\
+               check(ctx, m) {{ ctx.report(m.m); }},\n\
+             }});\n"
+        )
+    }
+
+    fn config_for(include: &str) -> String {
+        format!(
+            "import {{ defineConfig }} from 'lanekeep';\n\
+             import rule from './rule';\n\
+             export default defineConfig({{ include: ['{include}'], rules: [rule] }});\n"
+        )
+    }
+
     fn config(extra: &str) -> String {
         format!(
             "import {{ defineConfig }} from 'lanekeep';\n\
              import rule from './rule';\n\
              export default defineConfig({{ include: ['src/**/*.ts'], rules: [rule]{extra} }});\n"
         )
+    }
+
+    /// A rule with no `language` of its own has to see inside JSX.
+    ///
+    /// The default used to be `typescript` alone, and the engine parsed every file with the
+    /// rule's grammar whatever the file was. So a `.tsx` file went through the TypeScript
+    /// grammar, every JSX element became an `ERROR` node, and a query simply matched nothing
+    /// inside it — with no error, no warning, and no way to tell from the output. On a React
+    /// codebase that is most of the code.
+    #[test]
+    fn a_default_rule_sees_inside_jsx() {
+        let project = Project::new(
+            "jsx-default",
+            &[
+                ("rule.ts", &member_rule_for("")),
+                ("lanekeep.config.ts", &config_for("src/**/*.tsx")),
+                (
+                    "src/Component.tsx",
+                    "export const C = () => <View style={styles.used} />;\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+
+        assert_eq!(
+            outcome.violations.len(),
+            1,
+            "a member expression inside JSX was not seen: {:?}",
+            outcome.violations
+        );
+    }
+
+    /// And the same rule still works on plain TypeScript, each file through its own grammar.
+    #[test]
+    fn a_default_rule_still_sees_plain_typescript() {
+        let project = Project::new(
+            "ts-default",
+            &[
+                ("rule.ts", &member_rule_for("")),
+                ("lanekeep.config.ts", &config_for("src/**/*.ts")),
+                ("src/plain.ts", "const x = styles.used;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+
+        assert_eq!(outcome.violations.len(), 1, "{:?}", outcome.violations);
+    }
+
+    /// A rule that names one language is not run on files belonging to another.
+    ///
+    /// Previously it was run on everything and the mismatch showed up as an unparsable tree
+    /// rather than as a skip, which is the failure this whole change is about.
+    #[test]
+    fn a_rule_does_not_run_on_a_language_it_does_not_name() {
+        let project = Project::new(
+            "single-language",
+            &[
+                ("rule.ts", &member_rule_for("'typescript'")),
+                ("lanekeep.config.ts", &config_for("src/**/*.tsx")),
+                (
+                    "src/Component.tsx",
+                    "export const C = () => <View style={styles.used} />;\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+
+        assert!(
+            outcome.violations.is_empty(),
+            "a typescript-only rule ran on a tsx file: {:?}",
+            outcome.violations
+        );
+    }
+
+    /// Naming several languages runs the rule against each, compiled per grammar.
+    #[test]
+    fn a_rule_may_name_several_languages() {
+        let project = Project::new(
+            "many-languages",
+            &[
+                ("rule.ts", &member_rule_for("['typescript', 'tsx']")),
+                ("lanekeep.config.ts", &config_for("src/**/*.{ts,tsx}")),
+                ("src/plain.ts", "const x = styles.used;\n"),
+                (
+                    "src/Component.tsx",
+                    "export const C = () => <View style={styles.used} />;\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+
+        assert_eq!(outcome.violations.len(), 2, "{:?}", outcome.violations);
+    }
+
+    /// An unknown language is still an error, however it is spelled.
+    #[test]
+    fn an_unknown_language_in_a_list_is_reported() {
+        let project = Project::new(
+            "unknown-in-list",
+            &[
+                ("rule.ts", &member_rule_for("['typescript', 'klingon']")),
+                ("lanekeep.config.ts", &config_for("src/**/*.ts")),
+                ("src/plain.ts", "const x = styles.used;\n"),
+            ],
+        );
+
+        let error = project
+            .run()
+            .expect_err("should refuse an unknown language");
+        assert!(
+            error.to_string().contains("klingon"),
+            "the error should name it: {error}"
+        );
     }
 
     #[test]

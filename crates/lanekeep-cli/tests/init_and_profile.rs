@@ -158,6 +158,60 @@ fn force_overwrites() {
     assert!(project.read("lanekeep.config.ts").contains("defineConfig"));
 }
 
+#[test]
+fn init_keeps_the_cache_out_of_git() {
+    // The cache is a multi-megabyte binary the first run drops into the working tree. Left
+    // unmentioned it gets committed, which is how it went into the first project I tried
+    // this on.
+    let project = Project::new("gitignore", &[]);
+    std::fs::create_dir_all(project.dir.join(".git")).expect("fake repo");
+
+    project.run(&["init"]);
+
+    assert!(project.exists(".gitignore"));
+    assert!(
+        project.read(".gitignore").contains(".lanekeep/"),
+        "{}",
+        project.read(".gitignore")
+    );
+}
+
+#[test]
+fn init_appends_rather_than_replacing_an_existing_gitignore() {
+    let project = Project::new("gitignore-append", &[(".gitignore", "node_modules\n")]);
+    std::fs::create_dir_all(project.dir.join(".git")).expect("fake repo");
+
+    project.run(&["init"]);
+
+    let written = project.read(".gitignore");
+    assert!(written.contains("node_modules"), "{written}");
+    assert!(written.contains(".lanekeep/"), "{written}");
+}
+
+#[test]
+fn init_does_not_repeat_an_entry_that_is_already_there() {
+    let project = Project::new("gitignore-twice", &[(".gitignore", ".lanekeep/\n")]);
+    std::fs::create_dir_all(project.dir.join(".git")).expect("fake repo");
+
+    project.run(&["init"]);
+
+    assert_eq!(
+        project.read(".gitignore").matches(".lanekeep/").count(),
+        1,
+        "the entry was added twice"
+    );
+}
+
+#[test]
+fn init_writes_no_gitignore_outside_a_repository() {
+    // Nothing to ignore for, and a stray .gitignore is noise.
+    let project = Project::new("gitignore-none", &[]);
+
+    project.run(&["init"]);
+
+    assert!(!project.exists(".gitignore"));
+}
+
 // --- profile -------------------------------------------------------------------------------
 
 const CONFIG: &str = "import { defineConfig } from 'lanekeep';\n\

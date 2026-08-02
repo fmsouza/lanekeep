@@ -137,7 +137,7 @@ import { defineRule } from 'lanekeep'
 
 export default defineRule({
   id: 'local/no-numeric-sizes',
-  language: 'typescript',
+  language: ['typescript', 'tsx'],
   severity: 'error',
 
   card: {
@@ -423,6 +423,8 @@ key = blake3(
 
 Every field is length-prefixed before hashing. Without that, `("ab", "c")` and `("a", "bc")` hash alike and two genuinely different runs share a key — the one failure a cache must not have.
 
+**A rule declares which languages it targets, and the file decides which grammar parses it.** `language` accepts one or several and defaults to `['typescript', 'tsx']`; a rule does not run on a file whose language it does not name, and the query is compiled once per language against that grammar. Choosing the grammar from the *rule* instead would parse a `.tsx` file with the TypeScript grammar, turning every JSX element into an `ERROR` node — and a query matches nothing inside one, silently, which on a React codebase means most of the code goes unchecked with no diagnostic.
+
 Grammars enter the key as the **whole registry**, not the one language a given file used. A file's rules can involve more than one grammar, and working out which is harder to get right than accepting that a tree-sitter bump invalidates everything. That over-invalidates by the files using the other languages, which costs a recompute.
 
 `host_api_version` is a constant in `lanekeep-js` and nothing bumps it automatically. A `ctx` function added without bumping it serves results computed by a build where the function did not exist — the rule could not have called it, so its verdict was reached without evidence it would have used.
@@ -630,7 +632,9 @@ Rules are executable code. The posture is therefore about **confinement**, not a
 
 Cheap now, breaking changes later. Lock all five before writing much code.
 
-1. **Namespaced rule IDs from day one.** `lanekeep/<id>` for built-ins, `local/<id>` for project-authored. Bare IDs in v1 would break every config file, every suppression comment, and every consumer parsing JSON output when namespaces arrive. This is the expensive one.
+1. **Namespaced rule IDs from day one.** `lanekeep/<id>` for built-ins, `local/<id>` for project-authored, and any namespace a project declares in `namespaces:` for its own — `pera/<id>`. Bare IDs in v1 would break every config file, every suppression comment, and every consumer parsing JSON output when namespaces arrive. This is the expensive one.
+
+    The set was originally closed to the two lanekeep defines, so that `lanekep/foo` was a typo rather than a valid ID matching nothing. Declaring keeps that property while letting a team group its own rules: an undeclared namespace fails at config load, naming the ones that exist. `lanekeep/` stays reserved, so a rule's origin is still readable from its ID alone.
 2. **The host API is versioned and in the cache key** (§8.1), so adding a `ctx` function invalidates correctly rather than silently serving results computed without it.
 3. **Tracked effects from the start.** Retrofitting dependency tracking onto a cache that assumed purity means every existing entry is unsound. `deps` ships with the first cache.
 4. **Nodes cross the boundary as handles, never as objects.** Materializing an AST for JavaScript is a decision that cannot be walked back once rules depend on the object shape.

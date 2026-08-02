@@ -16,38 +16,52 @@ use thiserror::Error;
 
 /// Where a rule came from.
 ///
-/// Closed rather than open: an unknown namespace is a typo, not an extension point. Adding
-/// a variant later is additive and cannot invalidate an existing ID, whereas accepting
-/// arbitrary namespaces now would make `lanekep/foo` a valid ID that silently never matches
-/// anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Namespace {
-    /// A rule shipped with lanekeep and reviewed by a maintainer.
-    Lanekeep,
-    /// A rule authored in the project being checked.
-    Local,
-}
+/// Open at the syntax level and closed at the config level, which is not the same thing as
+/// being open. Parsing accepts any well-formed namespace so that a team can group its rules
+/// under its own name — `pera/no-numeric-sizes` rather than a `local/` bucket shared with
+/// everything else. What keeps a typo from becoming a valid-but-inert ID is that the config
+/// refuses a namespace nobody declared: `lanekep/foo` fails at load, naming the namespaces
+/// that do exist.
+///
+/// `lanekeep` stays reserved for rules shipped here, so a rule's origin is still readable
+/// from its ID alone — the property §14.1 locked in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Namespace(String);
 
 impl Namespace {
+    /// Rules shipped with lanekeep and reviewed by a maintainer.
+    pub const LANEKEEP: &'static str = "lanekeep";
+    /// The default for rules authored in the project being checked.
+    pub const LOCAL: &'static str = "local";
+
     /// The namespace as it appears in a rule ID.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Lanekeep => "lanekeep",
-            Self::Local => "local",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
-    /// Every namespace, for diagnostics that need to list the valid options.
+    /// Whether this is one of the two lanekeep defines, which never need declaring.
     #[must_use]
-    pub const fn all() -> &'static [Self] {
-        &[Self::Lanekeep, Self::Local]
+    pub fn is_built_in(&self) -> bool {
+        self.0 == Self::LANEKEEP || self.0 == Self::LOCAL
+    }
+
+    /// Whether this is the reserved namespace for rules shipped with lanekeep.
+    #[must_use]
+    pub fn is_lanekeep(&self) -> bool {
+        self.0 == Self::LANEKEEP
+    }
+
+    /// The namespaces that need no declaring, for diagnostics that list the valid options.
+    #[must_use]
+    pub const fn built_ins() -> &'static [&'static str] {
+        &[Self::LANEKEEP, Self::LOCAL]
     }
 }
 
 impl fmt::Display for Namespace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.0)
     }
 }
 
@@ -68,15 +82,15 @@ pub enum ParseRuleIdError {
     #[error("rule ID `{0}` contains more than one `/`")]
     TooManySeparators(String),
 
-    /// The namespace is not one lanekeep knows.
-    #[error("unknown rule namespace `{namespace}` in `{id}`: expected one of {expected}")]
-    UnknownNamespace {
-        /// The namespace as written.
-        namespace: String,
+    /// The namespace is not spelled like a namespace.
+    #[error("invalid rule namespace `{name}` in `{id}`: {reason}")]
+    InvalidNamespace {
+        /// The namespace portion as written.
+        name: String,
         /// The whole ID as written.
         id: String,
-        /// Comma-separated list of valid namespaces.
-        expected: String,
+        /// What specifically is wrong.
+        reason: &'static str,
     },
 
     /// Nothing after the separator.
@@ -107,8 +121,8 @@ pub struct RuleId {
 impl RuleId {
     /// Which namespace this rule belongs to.
     #[must_use]
-    pub const fn namespace(&self) -> Namespace {
-        self.namespace
+    pub const fn namespace(&self) -> &Namespace {
+        &self.namespace
     }
 
     /// The name portion, without the namespace or separator.
@@ -119,8 +133,8 @@ impl RuleId {
 
     /// Whether this is a rule shipped with lanekeep.
     #[must_use]
-    pub const fn is_built_in(&self) -> bool {
-        matches!(self.namespace, Namespace::Lanekeep)
+    pub fn is_built_in(&self) -> bool {
+        self.namespace.is_lanekeep()
     }
 
     /// Build an ID from parts, validating the name.
@@ -135,6 +149,22 @@ impl RuleId {
             namespace,
             name: name.to_owned(),
         })
+    }
+
+    /// A namespace from its written form, validating its shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseRuleIdError`] when it is empty or not lowercase kebab-case.
+    pub fn namespace_from_str(namespace: &str) -> Result<Namespace, ParseRuleIdError> {
+        let id = format!("{namespace}/x");
+        validate_name(namespace, &id).map_err(|e| match e {
+            ParseRuleIdError::InvalidName { name, id, reason } => {
+                ParseRuleIdError::InvalidNamespace { name, id, reason }
+            }
+            other => other,
+        })?;
+        Ok(Namespace(namespace.to_owned()))
     }
 }
 
@@ -192,26 +222,22 @@ impl FromStr for RuleId {
             return Err(ParseRuleIdError::TooManySeparators(s.to_owned()));
         }
 
-        let namespace = match namespace {
-            "lanekeep" => Namespace::Lanekeep,
-            "local" => Namespace::Local,
-            other => {
-                let expected = Namespace::all()
-                    .iter()
-                    .map(|n| format!("`{}`", n.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(ParseRuleIdError::UnknownNamespace {
-                    namespace: other.to_owned(),
-                    id: s.to_owned(),
-                    expected,
-                });
+        // A namespace is spelled like a name, so a malformed one is caught here and an
+        // *undeclared* one is caught by the config, which is the only place that knows what
+        // this project declared.
+        if namespace.is_empty() {
+            return Err(ParseRuleIdError::MissingNamespace(s.to_owned()));
+        }
+        validate_name(namespace, s).map_err(|e| match e {
+            ParseRuleIdError::InvalidName { name, id, reason } => {
+                ParseRuleIdError::InvalidNamespace { name, id, reason }
             }
-        };
+            other => other,
+        })?;
 
         validate_name(name, s)?;
         Ok(Self {
-            namespace,
+            namespace: Namespace(namespace.to_owned()),
             name: name.to_owned(),
         })
     }
@@ -263,6 +289,14 @@ impl<'de> Deserialize<'de> for RuleId {
 mod tests {
     use super::*;
 
+    fn local() -> Namespace {
+        RuleId::namespace_from_str("local").expect("valid")
+    }
+
+    fn lanekeep_ns() -> Namespace {
+        RuleId::namespace_from_str("lanekeep").expect("valid")
+    }
+
     fn parse(s: &str) -> Result<RuleId, ParseRuleIdError> {
         s.parse()
     }
@@ -270,7 +304,7 @@ mod tests {
     #[test]
     fn parses_a_built_in_id() {
         let id = parse("lanekeep/no-default-export").expect("valid");
-        assert_eq!(id.namespace(), Namespace::Lanekeep);
+        assert!(id.namespace().is_lanekeep());
         assert_eq!(id.name(), "no-default-export");
         assert!(id.is_built_in());
     }
@@ -278,7 +312,7 @@ mod tests {
     #[test]
     fn parses_a_project_id() {
         let id = parse("local/no-numeric-sizes").expect("valid");
-        assert_eq!(id.namespace(), Namespace::Local);
+        assert_eq!(id.namespace().as_str(), "local");
         assert_eq!(id.name(), "no-numeric-sizes");
         assert!(!id.is_built_in());
     }
@@ -309,20 +343,23 @@ mod tests {
         assert!(msg.contains("local/no-default-export"), "{msg}");
     }
 
+    /// A namespace nobody declared is the config's business — it is the only layer that
+    /// knows what this project declared. What is rejected here is a namespace that is not
+    /// shaped like one at all.
     #[test]
-    fn rejects_an_unknown_namespace() {
-        let err = parse("lanekep/no-default-export").expect_err("typo in namespace");
-        match err {
-            ParseRuleIdError::UnknownNamespace {
-                namespace,
-                expected,
-                ..
-            } => {
-                assert_eq!(namespace, "lanekep");
-                assert!(expected.contains("lanekeep"), "{expected}");
-                assert!(expected.contains("local"), "{expected}");
-            }
-            other => panic!("wrong error: {other:?}"),
+    fn accepts_a_project_namespace() {
+        let id = parse("pera/no-numeric-sizes").expect("a team may use its own namespace");
+        assert_eq!(id.namespace().as_str(), "pera");
+        assert!(!id.is_built_in());
+    }
+
+    #[test]
+    fn rejects_a_malformed_namespace() {
+        for bad in ["Pera/no-x", "pera_wallet/no-x", "-pera/no-x", "/no-x"] {
+            assert!(
+                parse(bad).is_err(),
+                "`{bad}` is not shaped like a namespace and should be refused"
+            );
         }
     }
 
@@ -340,7 +377,7 @@ mod tests {
         ));
         assert!(matches!(
             parse("/rule"),
-            Err(ParseRuleIdError::UnknownNamespace { .. })
+            Err(ParseRuleIdError::MissingNamespace(_))
         ));
         assert!(matches!(
             parse(""),
@@ -348,7 +385,7 @@ mod tests {
         ));
         assert!(matches!(
             parse("/"),
-            Err(ParseRuleIdError::UnknownNamespace { .. })
+            Err(ParseRuleIdError::MissingNamespace(_))
         ));
     }
 
@@ -374,11 +411,11 @@ mod tests {
 
     #[test]
     fn constructor_validates_the_same_way_as_parsing() {
-        assert!(RuleId::new(Namespace::Local, "ok-name").is_ok());
-        assert!(RuleId::new(Namespace::Local, "Bad_Name").is_err());
-        assert!(RuleId::new(Namespace::Local, "").is_err());
+        assert!(RuleId::new(local(), "ok-name").is_ok());
+        assert!(RuleId::new(local(), "Bad_Name").is_err());
+        assert!(RuleId::new(local(), "").is_err());
 
-        let built = RuleId::new(Namespace::Lanekeep, "no-default-export").expect("valid");
+        let built = RuleId::new(lanekeep_ns(), "no-default-export").expect("valid");
         let parsed = parse("lanekeep/no-default-export").expect("valid");
         assert_eq!(built, parsed);
     }

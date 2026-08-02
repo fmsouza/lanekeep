@@ -794,7 +794,7 @@ impl ReduceContext {
                 ctx.clone(),
                 move |ctx: Ctx<'js>,
                       at: Value<'js>,
-                      message: Opt<String>|
+                      message: Opt<Value<'js>>|
                       -> rquickjs::Result<()> {
                     let Some(at) = at.as_object() else {
                         return Err(throw(
@@ -817,11 +817,45 @@ impl ReduceContext {
                         ));
                     };
 
+                    // A bare string or `{ message }`, because the per-file `ctx.report` takes
+                    // options as its second argument and nobody remembers that this one is
+                    // different. Accepting both costs nothing and removes a papercut whose
+                    // only symptom was a type-conversion error naming neither argument.
+                    let message = match message.0 {
+                        None => None,
+                        Some(value) if value.is_undefined() || value.is_null() => None,
+                        Some(value) => {
+                            if let Some(text) = value.as_string() {
+                                Some(text.to_string()?)
+                            } else if let Some(options) = value.as_object() {
+                                match options.get::<_, Value<'js>>("message") {
+                                    Ok(found) if found.is_string() => found
+                                        .as_string()
+                                        .map(rquickjs::String::to_string)
+                                        .transpose()?,
+                                    _ => {
+                                        return Err(throw(
+                                            &ctx,
+                                            "ctx.report in a reduce phase takes a message: \
+                                             either a string, or { message }",
+                                        ));
+                                    }
+                                }
+                            } else {
+                                return Err(throw(
+                                    &ctx,
+                                    "ctx.report in a reduce phase takes a message: either a \
+                                     string, or { message }",
+                                ));
+                            }
+                        }
+                    };
+
                     reports.borrow_mut().push(ReduceReport {
                         file,
                         line,
                         column,
-                        message: message.0,
+                        message,
                     });
                     Ok(())
                 },
@@ -1571,6 +1605,51 @@ mod tests {
     /// The reduce phase's budget in these tests. Generous: nothing here is timing-sensitive.
     fn budget() -> std::time::Duration {
         std::time::Duration::from_secs(5)
+    }
+
+    /// The per-file `ctx.report` takes `(node, { message })` and this one takes a location
+    /// and a message, so both spellings of the second argument have to work. Rejecting the
+    /// object form produced a type-conversion error naming neither argument, which is a
+    /// remarkably unhelpful thing to be told.
+    #[test]
+    fn a_reduce_report_takes_a_string_or_an_options_object() {
+        for expression in [
+            r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, 'plain string')",
+            r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { message: 'plain string' })",
+        ] {
+            let context = ReduceContext::new(vec!["a.ts".to_owned()], vec![]);
+            let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+            sandbox
+                .eval_with_reduce_host::<()>(&context, expression, budget())
+                .unwrap_or_else(|e| panic!("{expression} should be accepted: {e}"));
+
+            let reports = context.take_reports();
+            assert_eq!(reports.len(), 1, "{expression}");
+            assert_eq!(
+                reports[0].message.as_deref(),
+                Some("plain string"),
+                "{expression}"
+            );
+        }
+    }
+
+    /// Anything else is refused rather than quietly dropped, so a rule reporting with the
+    /// wrong shape hears about it.
+    #[test]
+    fn a_reduce_report_refuses_a_message_that_is_neither() {
+        let context = ReduceContext::new(vec!["a.ts".to_owned()], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let error = sandbox
+            .eval_with_reduce_host::<()>(
+                &context,
+                r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { detail: 'wrong key' })",
+                budget(),
+            )
+            .expect_err("should refuse");
+        assert!(
+            error.to_string().contains("message"),
+            "the error should say what it wanted: {error}"
+        );
     }
 
     #[test]
