@@ -250,6 +250,14 @@ reproduces it everywhere by putting a `python3` that appends a carriage return a
 one on `PATH`. Truncating at the first whitespace — `${value%%[[:space:]]*}` — is the fix, since
 none of these values contain any.
 
+**The grammar that parses a file is chosen by the file, not by the rule.** It was the other
+way round until a real migration exposed it: a rule declaring `language: 'typescript'` — which
+was the default — parsed `.tsx` files with the TypeScript grammar, every JSX element became an
+`ERROR` node, and queries matched nothing inside them. Silently: no error, no warning, a tree
+that "parsed". On a React Native codebase that hid most of the code and produced 2218 false
+positives in one rule. `language` now takes one or several and defaults to
+`['typescript', 'tsx']`, and a rule does not run on a file whose language it does not name.
+
 **`cargo publish` needs a crate's dev-dependencies on the registry too.** It resolves them when
 it packages, so a crate whose dev-dependency is unpublished cannot go up even though nothing it
 ships uses it. `lanekeep-rules` dev-depends on `lanekeep-testkit` for `RuleTester`, which puts

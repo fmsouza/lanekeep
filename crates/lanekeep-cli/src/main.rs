@@ -469,9 +469,14 @@ fn init(project_root: &Path, force: bool) -> anyhow::Result<ExitCode> {
             .map_err(|e| anyhow::anyhow!("cannot write `{}`: {e}", path.display()))?;
     }
 
+    let ignored = ignore_the_cache(project_root)?;
+
     let mut stdout = std::io::stdout();
     writeln!(stdout, "created {}", config.display())?;
     writeln!(stdout, "created {}", rule.display())?;
+    if ignored {
+        writeln!(stdout, "added .lanekeep/ to .gitignore")?;
+    }
     writeln!(
         stdout,
         "\nrun `lanekeep check` to try it, and `lanekeep explain local/no-debugger` to see \
@@ -480,6 +485,49 @@ fn init(project_root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     stdout.flush()?;
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Add `.lanekeep/` to the project's `.gitignore`, if it is not already covered.
+///
+/// The cache is a multi-megabyte binary that the first `lanekeep check` drops into the
+/// working tree. Left untracked and unmentioned, it gets committed — which is a large,
+/// meaningless diff, and machine-specific content in the repository.
+///
+/// Appended rather than created from scratch when a `.gitignore` already exists, and never
+/// written at all outside a git repository, where the file would be noise.
+fn ignore_the_cache(project_root: &Path) -> anyhow::Result<bool> {
+    const ENTRY: &str = ".lanekeep/";
+
+    if !project_root.join(".git").exists() {
+        return Ok(false);
+    }
+
+    let path = project_root.join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    // Matched on whole lines: a `.gitignore` mentioning `.lanekeep/cache` covers a different
+    // thing, and appending a second entry that covers the first is only confusing.
+    if existing
+        .lines()
+        .any(|line| line.trim() == ENTRY || line.trim() == ".lanekeep")
+    {
+        return Ok(false);
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str("# lanekeep's content-addressed cache\n");
+    updated.push_str(ENTRY);
+    updated.push('\n');
+
+    std::fs::write(&path, updated)
+        .map_err(|e| anyhow::anyhow!("cannot write `{}`: {e}", path.display()))?;
+    Ok(true)
 }
 
 /// Resolve the config path, defaulting to the first candidate that exists.
@@ -749,7 +797,7 @@ fn rule_json(spec: &lanekeep_config::RuleSpec) -> serde_json::Value {
     serde_json::json!({
         "id": spec.id.to_string(),
         "severity": spec.severity.to_string(),
-        "language": spec.language.clone(),
+        "languages": spec.languages.clone(),
         "message": spec.card.message.clone(),
         "remediation": spec.card.remediation.clone(),
         "examples": {
