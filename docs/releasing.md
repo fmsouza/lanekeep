@@ -94,6 +94,54 @@ push would have done.
 
 [environment]: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment
 
+## When release-plz proposes nothing
+
+release-plz decides what to release from **changes to the packages**. A pull request that
+touches only `scripts/`, `.github/` or `docs/` changes no package, so it proposes no release —
+correctly, since the crate source really is identical.
+
+That is not the same as nothing having changed for users. v0.3.2 is the case in point: the
+glibc floor fix lived entirely in build tooling, so the crate source was untouched while the
+*binaries every channel ships* were not. release-plz cannot see that, and no configuration
+would teach it to.
+
+So a release-tooling change that alters the shipped artifacts needs a version bump written by
+hand:
+
+1. `[workspace.package] version` in `Cargo.toml`, and the fifteen internal dependency lines
+   beneath it — they carry the version too.
+2. `cargo update --workspace` to refresh `Cargo.lock`.
+3. A `CHANGELOG.md` entry, since release-plz is not writing one.
+4. Open it as an ordinary pull request titled `chore: release vX.Y.Z`.
+
+Merging that tags, and the tag triggers `release.yml` exactly as a release-plz-authored one
+would. Nothing else needs touching: the packaging scripts read the version from `Cargo.toml`
+rather than restating it, and `publish-pypi.sh` refuses outright if the wheels and the manifest
+ever disagree.
+
+### The window where release-plz proposes too much
+
+The opposite failure, and it bit immediately after v0.3.2. release-plz determines the next
+version by comparing a package's packaged files against the newest version **on crates.io** —
+and the registry lags this repository by the length of the publish approval. Merging a release
+pull request tags at once; nothing reaches crates.io until someone approves the `release`
+environment.
+
+Every push to `main` inside that window sees a registry version one behind the manifest, finds
+the packaged `Cargo.lock` differs, and proposes a further release. After v0.3.2 it opened one
+for 0.3.3 whose entire changelog was "update Cargo.lock dependencies" — a version identical to
+the one still waiting to go out, and no index lets a number be reused.
+
+`release_commits` in `release-plz.toml` closes it: only `feat`, `fix`, `perf` and `revert`
+propose a release, and the commit sitting in that window is always a `chore: release`. The
+filtered commits still appear in the changelog — this decides whether to *release*, not what to
+record. `scripts/test-release-config.sh` asserts which commit types the pattern admits, by
+matching real subjects rather than comparing the regex to a literal.
+
+`git_only = true` fixes the same lag by reading versions from tags instead of the registry, and
+is the wrong fix here: only `lanekeep-cli` is tagged, deliberately, so the other fourteen crates
+would have no tag to read and release-plz would treat them as never released.
+
 ## The changelog
 
 **One `CHANGELOG.md`, at the repository root.** release-plz defaults to one per crate, and

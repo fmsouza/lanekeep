@@ -15,6 +15,37 @@ dependencies_update = false
 publish = false
 semver_check = true
 
+# Only these commit types are worth a release. Anything else proposes nothing.
+#
+# Without this, release-plz proposes a release whenever a package's *packaged files* differ
+# from the newest version on crates.io — regardless of what the commits say. That comparison
+# is against the registry, and the registry lags this repository by the length of the publish
+# approval: merging a release pull request tags immediately, but nothing reaches crates.io
+# until someone approves the `release` environment.
+#
+# Every push to `main` inside that window therefore saw a version on the registry one behind
+# the manifest, found the packaged `Cargo.lock` differed, and proposed a further release. That
+# is what happened after v0.3.2: a pull request bumping to 0.3.3 whose only entry was "update
+# Cargo.lock dependencies", which would have published a version byte-identical to the one
+# still waiting to go out. No index lets a number be reused, so merging it would have burnt
+# 0.3.3 on nothing.
+#
+# `release_commits` gates the bump itself rather than the changelog text, so with the release
+# commit being a `chore` there is nothing to propose and the window closes. The filtered
+# commits still appear in the changelog — this decides whether to *release*, not what to
+# record.
+#
+# `git_only = true` also fixes the lag, by reading versions from tags instead of the registry,
+# and is the wrong fix here: only `lanekeep-cli` is tagged, deliberately — see the tag section
+# below — so the other fourteen crates would have no tag to read and release-plz would treat
+# them as never released.
+#
+# The types left out are the ones this project already says are not worth a changelog entry.
+# A change that ships different bytes without a `feat`, `fix` or `perf` — the glibc floor,
+# which lived entirely in build tooling — needs a version bump written by hand, which
+# `docs/releasing.md` describes.
+release_commits = "^(feat|fix|perf|revert)"
+
 # One tag and one release for the whole workspace, named the way `release.yml` expects.
 #
 # release-plz defaults to `{{ package }}-v{{ version }}` for a workspace with more than one

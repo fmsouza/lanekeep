@@ -288,6 +288,24 @@ and re-checks forever — pinning a core while the output looks exactly like a t
 working. `crates/lanekeep-cli/src/watch.rs` filters by path *component* rather than substring,
 so `target/` is ignored and `src/target.ts` is not.
 
+**release-plz compares against the registry, and the registry lags a gated publish.** It works
+out the next version by diffing a package's packaged files against the newest version on
+crates.io. Merging a release pull request tags immediately, but nothing is published until
+someone approves the `release` environment — so for the length of that approval the registry is
+one version behind the manifest. Any push to `main` in that window finds the packaged
+`Cargo.lock` differs and proposes *another* release: after v0.3.2 it opened one for 0.3.3 whose
+whole changelog was "update Cargo.lock dependencies". Merging it would have published a version
+identical to the one still waiting to go out, and no index lets a number be reused.
+
+`release_commits` is the fix — only `feat`, `fix`, `perf` and `revert` propose a release, and
+the commit in that window is always a `chore: release`. Not `git_only`, which reads versions
+from tags and would strand the fourteen crates this repository deliberately leaves untagged.
+
+The mirror-image trap is worth holding at the same time: **a change that ships different bytes
+without touching crate source proposes nothing at all.** The glibc fix lived entirely in build
+tooling, so release-plz saw no package change while every binary it shipped was different. That
+one needs a version bump by hand; `docs/releasing.md` has the steps.
+
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,
 so the build machine silently decides the oldest distribution the release supports. When
