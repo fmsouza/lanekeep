@@ -698,7 +698,9 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 **M2 — completeness.** Full host API surface, SARIF + agent reporters, `explain`, fixes (template-based replacement of a capture, marked machine-applicable vs suggestion), unused-suppression reporting.
 
-**M3 — loops.** `--watch`, then `server` (LSP + MCP).
+**M3 — loops.** `--watch` **done**; `server` (LSP + MCP) outstanding.
+
+`--watch` is a foreground loop, and the trap it exists to avoid is that lanekeep writes its cache into `.lanekeep/` *inside the root it watches*. A watcher reacting to every event under the root sees its own write, re-checks, writes again, and never stops — at full CPU, while looking like it is working. The filter that prevents it is the part with tests.
 
 **M4 — second language. Done.** Python was the cheapest proof that the `Language` trait abstraction actually holds, and it held: `lanekeep-core` is untouched. `lanekeep-lang-python` implements `Language` and `BindingResolver` and nothing above it needed to know.
 
