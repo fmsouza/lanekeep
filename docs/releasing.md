@@ -85,6 +85,23 @@ push would have done.
 
 [environment]: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment
 
+## The changelog
+
+**One `CHANGELOG.md`, at the repository root.** release-plz defaults to one per crate, and
+that shape feeds a loop here: it writes them into `crates/*/`, then counts a changed file
+under a crate as a change to that crate, and proposes a release for it. v0.2.0 shipped and
+the next run proposed 0.2.1 with no code change at all — only the changelogs it had just
+written. Twelve files were also the wrong shape for a workspace whose crates share one
+version and release together: one thing documented twelve times.
+
+`lanekeep-cli` is the only crate that writes one, and `changelog_include` names every other
+crate so it records the whole workspace rather than just the binary. That matters twice over,
+because **the GitHub release body is generated from the changelog** — a crate missing from
+that list is a change that appears in neither.
+
+`scripts/test-release-config.sh` compares the list against `cargo metadata`, so a crate added
+later and forgotten fails the gate instead of quietly disappearing from the release notes.
+
 ## Publishing order
 
 Both registries care about order, in opposite directions:
