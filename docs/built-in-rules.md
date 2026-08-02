@@ -20,12 +20,19 @@ Built-ins resolve before the filesystem is consulted, so a file at
 `lanekeep/no-default-export.ts` in your project does not shadow one. A rule whose behavior
 depended on whether a same-named file happened to exist would be unreasonable to debug.
 
-Built-in ids are namespaced `lanekeep/`, project rule ids are namespaced `local/`. That is
-one of the one-way doors in [`architecture.md`](architecture.md) §14 — it is what lets a
-suppression comment, a config override, or a JSON consumer name a rule unambiguously
-forever.
+Built-in ids are namespaced `lanekeep/`. Project rules use `local/`, or a namespace the
+project declares in its config — `namespaces: ['acme']` allows `acme/no-numeric-sizes`.
+`lanekeep/` stays reserved, so a rule's origin is readable from its id alone. That is one of
+the one-way doors in [`architecture.md`](architecture.md) §14 — it is what lets a suppression
+comment, a config override, or a JSON consumer name a rule unambiguously forever.
+
+**Every rule targets one or more languages**, and a rule does not run on a file whose language
+it does not name. The rules below are grouped by the language they are about; each says which.
+A rule that names no language defaults to `['typescript', 'tsx']`.
 
 ---
+
+# TypeScript and JavaScript
 
 ## `lanekeep/no-default-export`
 
@@ -214,6 +221,85 @@ through one fails at runtime the same way.
 A module importing itself is not reported. It is a different mistake, and "extract what both
 modules need into a third" is not advice that applies to it.
 
+# Python
+
+Both Python rules resolve identifiers rather than matching text, which is what keeps them
+from firing on a project that has taken the name for something of its own.
+
+## `lanekeep/no-broad-except`
+
+Catch what the block can actually raise.
+
+A bare `except:` catches `KeyboardInterrupt` and `SystemExit` too, so it swallows the user
+pressing Ctrl-C. `except Exception:` is narrower and still catches every bug in the block — a
+typo'd attribute, a `None` where an object was expected — and reports whatever the handler
+decided the failure was. The error the code was written to handle and the error nobody
+anticipated come out identical.
+
+Takes no options.
+
+```ts
+import noBroadExcept from 'lanekeep/no-broad-except'
+
+export default defineConfig({ rules: [noBroadExcept] })
+```
+
+```python
+try:
+    parse(raw)
+except:                    # reported — also catches Ctrl-C
+    return None
+
+try:
+    parse(raw)
+except Exception:          # reported — catches every bug in the block
+    return None
+
+try:
+    parse(raw)
+except Exception as err:   # reported — binding it does not narrow it
+    return None
+
+try:
+    parse(raw)
+except ValueError:         # fine — names what this block raises
+    return None
+```
+
+A project that defines or imports its own `Exception` is not catching the builtin, and is not
+reported. That is `ctx.bindingKind` doing the work a text match could not.
+
+## `lanekeep/no-mutable-default-argument`
+
+Defaults are evaluated once, at definition.
+
+`def f(items=[])` builds one list when the function is defined, and every call that omits
+`items` shares it. The second call sees what the first appended. It reads as a per-call
+default and is not one, which is what makes it a rule rather than a review comment: the code
+looks right, and the bug surfaces later and somewhere else.
+
+Takes no options.
+
+```ts
+import noMutableDefaultArgument from 'lanekeep/no-mutable-default-argument'
+
+export default defineConfig({ rules: [noMutableDefaultArgument] })
+```
+
+```python
+def add(item, items=[]):        # reported
+def f(opts={}):                 # reported
+def f(seen={1}):                # reported
+def f(items=list()):            # reported — the constructor spelling
+def add(item, items=None):      # fine
+def f(a=1, b='x', c=(), d=False):  # fine — none of these are mutable
+```
+
+A project that defines its own `list`, `dict` or `set` is not calling the builtin, and is not
+reported.
+
+---
+
 ## Composing them
 
 The two cross-file rules share their module resolution, which is exported as
@@ -234,7 +320,7 @@ A built-in gets no privileged path into the engine, which is the point: a built-
 needed something a project rule cannot have would be evidence the host API is wrong.
 
 1. Write `crates/lanekeep-rules/rules/<name>.ts`, importing only from `lanekeep`.
-2. Add it to `BUILT_INS` in [`crates/lanekeep-rules/src/lib.rs`](../crates/lanekeep-rules/src/lib.rs).
+2. Add it to `BUILT_IN_RULES` in [`crates/lanekeep-rules/src/lib.rs`](../crates/lanekeep-rules/src/lib.rs).
 3. Test it in `crates/lanekeep-rules/tests/<name>.rs` with `RuleTester`, which runs the real
    engine over a throwaway project — real config loading, real gates, real sandbox. A
    cross-file rule needs more than one file, so those live in
