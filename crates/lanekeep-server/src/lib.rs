@@ -17,6 +17,7 @@
 
 pub mod jsonrpc;
 pub mod lsp;
+pub mod mcp;
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
