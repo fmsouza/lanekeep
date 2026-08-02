@@ -64,9 +64,24 @@ is how every release so far has happened.
 publishes nothing. That is the intended way to rehearse a release, and it means the first real publish
 is a decision someone makes rather than one the workflow makes for them.
 
-The `publish` job also uses a `release` [environment], so a required reviewer can be
-configured on it. Worth doing before the first release: it turns publishing into something
-that needs a human, on the one workflow where an accident is not undoable.
+The `publish` job uses a `release` [environment] with a **required reviewer**, so publishing
+waits for a human. With `RELEASE_PLZ_TOKEN` set the rest of the chain runs unattended —
+merging the release pull request tags, and the tag triggers `release.yml` — and this is the
+one point that stops and asks. Worth keeping: neither registry lets a version be reused, so
+an accidental publish is not undoable.
+
+Self-review is permitted, because the reviewer is also the person who merges the release
+pull request; forbidding it would make the gate impossible to pass rather than careful.
+
+`release-plz.yml` also accepts a `workflow_dispatch`, which is how to retry a run that failed
+for a reason outside the code:
+
+```sh
+gh workflow run release-plz --ref main
+```
+
+It decides what to do from the commits and the registry, so a dispatch does the same work the
+push would have done.
 
 [environment]: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment
 

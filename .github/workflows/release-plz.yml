@@ -8,6 +8,11 @@ name: release-plz
 on:
   push:
     branches: [main]
+  # Run it by hand. release-plz decides what to do from the commits and the registry, so a
+  # dispatch on `main` is the same work the push would have done — which makes this the way
+  # to retry after a run failed for a reason outside the code, a missing token being the one
+  # that has actually happened.
+  workflow_dispatch:
 
 permissions:
   contents: read
