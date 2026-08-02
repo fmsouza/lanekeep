@@ -108,6 +108,7 @@ changelog_include = [
   "lanekeep-engine",
   "lanekeep-js",
   "lanekeep-lang",
+  "lanekeep-lang-go",
   "lanekeep-lang-js",
   "lanekeep-lang-python",
   "lanekeep-languages",

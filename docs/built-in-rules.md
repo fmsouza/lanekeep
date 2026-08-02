@@ -300,6 +300,84 @@ reported.
 
 ---
 
+# Go
+
+Both Go rules are about *implicit* structure — a dependency the code does not state, and an
+ordering nothing writes down. Neither is a style preference: each produces a failure that
+surfaces far from its cause.
+
+## `lanekeep/no-context-in-struct`
+
+Pass a context, do not store one.
+
+```go
+// bad
+type Client struct {
+	ctx context.Context
+}
+
+// good
+type Client struct{}
+
+func (c *Client) Do(ctx context.Context) error { return nil }
+```
+
+The context package says it directly: do not store Contexts inside a struct type. A stored
+context outlives the call it was scoped to, so cancellation and deadlines stop meaning what
+the caller intended — a long-lived client holds the context of whichever request happened to
+build it, and cancelling that request cancels work belonging to every other.
+
+Both `context.Context` and `*context.Context` are reported; they differ by a `pointer_type` in
+the tree, so each needs its own query pattern.
+
+A qualifier that is not an import does not fire — a package-level name that happens to read
+`context` is not the standard library.
+
+### What it cannot tell apart
+
+`ctx.bindingKind` says whether a name is an import; it does not say *which module*. A package
+aliased to `context` and exposing a `Context` is therefore reported like the real one:
+
+```go
+import context "example.com/app/context"   // reported, though it is a different package
+```
+
+Distinguishing them needs the host API to expose an import's module, which bumps the host API
+version and so the cache key — a larger change than this rule justifies on its own. The case
+is narrow, and where it occurs it is usually the same mistake under a different import path.
+A test pins the behavior, so tightening the rule later fails loudly rather than silently.
+
+## `lanekeep/no-package-init`
+
+Wire things up where the wiring is visible.
+
+```go
+// bad
+func init() {
+	registry["pg"] = newPostgres()
+}
+
+// good
+func Register(r map[string]Driver) {
+	r["pg"] = newPostgres()
+}
+```
+
+An `init` function runs when the package is imported, before `main`, in an order the language
+decides. Nothing calls it, so nothing in the code says when it happens — a reader tracing
+startup finds no edge leading to it. Two packages registering into a shared map depend on an
+order neither states, and the failure moves when an unrelated import is added.
+
+It is also how a package acquires hidden startup cost: an import that looks free opens a
+connection or reads a file.
+
+Every `init` in a file is reported; Go permits several, which is what makes the ordering hard
+to reason about in the first place. A *method* named `init`, or a variable holding a function
+literal, is not reported — neither is called implicitly, so neither has the property the rule
+objects to.
+
+---
+
 ## Composing them
 
 The two cross-file rules share their module resolution, which is exported as
