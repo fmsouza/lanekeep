@@ -105,6 +105,20 @@ enum Command {
         watch: bool,
     },
 
+    /// Serve diagnostics to an editor or an agent host, over stdio.
+    ///
+    /// JSON-RPC 2.0 on stdin and stdout. Nothing is printed to stdout that is not a
+    /// protocol message — a stray line there desynchronizes the client for good.
+    Server {
+        /// Project root.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Config file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
     /// Write a starter config and a first rule.
     Init {
         /// Project root. Defaults to the current directory.
@@ -216,6 +230,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 },
             })
         }
+        Command::Server { path, config } => server(&path, config.as_deref()),
         Command::Init { path, force } => init(&path, force),
         Command::Rules { path, config, json } => rules(&path, config.as_deref(), json),
         Command::Explain {
@@ -662,6 +677,34 @@ struct Switches {
     report_unused_suppressions: bool,
     fix: bool,
     profile: bool,
+}
+
+/// Serve LSP over stdio until the client disconnects.
+///
+/// The engine is rebuilt on every check rather than held: a rule file or the config can
+/// change while the editor is open, and a server answering from the ruleset it started with
+/// would report violations the project no longer has.
+fn server(project_root: &Path, config: Option<&Path>) -> anyhow::Result<ExitCode> {
+    let root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+
+    lanekeep_server::serve_lsp(&mut input, &mut output, &root, || {
+        // Every failure becomes a string the server logs and carries on from. An editor
+        // session should survive a config typo, not end on one.
+        let (engine, _) = prepare(project_root, config, true).map_err(|e| e.to_string())?;
+        engine
+            .run()
+            .map(|outcome| outcome.violations)
+            .map_err(|e| e.to_string())
+    })?;
+
+    Ok(ExitCode::SUCCESS)
 }
 
 fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {

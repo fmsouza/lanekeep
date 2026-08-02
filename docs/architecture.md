@@ -698,9 +698,13 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 **M2 — completeness.** Full host API surface, SARIF + agent reporters, `explain`, fixes (template-based replacement of a capture, marked machine-applicable vs suggestion), unused-suppression reporting.
 
-**M3 — loops.** `--watch` **done**; `server` (LSP + MCP) outstanding.
+**M3 — loops.** `--watch` **done**; `server` **LSP done, MCP outstanding**.
 
 `--watch` is a foreground loop, and the trap it exists to avoid is that lanekeep writes its cache into `.lanekeep/` *inside the root it watches*. A watcher reacting to every event under the root sees its own write, re-checks, writes again, and never stops — at full CPU, while looking like it is working. The filter that prevents it is the part with tests.
+
+`server` is hand-written JSON-RPC over stdio, because `deny.toml` denies `tokio` and that rules out every async LSP crate. The constraint turned out to be the right shape: a server that reads a message, answers it, and reads the next has nothing to schedule. It also made the MCP half cheaper than expected — both protocols are JSON-RPC 2.0 over stdio, differing only in framing and method set, so `lanekeep-server::jsonrpc` already carries both framings and MCP adds a dispatch table rather than a transport.
+
+Diagnostics publish on open and on save, not per keystroke: a check reads from disk, and the buffer an editor holds mid-edit is not there yet. Publishing against stale bytes puts squiggles under the wrong characters, which is worse than a save-length delay on a warm cache.
 
 **M4 — second language. Done.** Python was the cheapest proof that the `Language` trait abstraction actually holds, and it held: `lanekeep-core` is untouched. `lanekeep-lang-python` implements `Language` and `BindingResolver` and nothing above it needed to know.
 

@@ -437,6 +437,7 @@ dependencies = [
  "lanekeep-languages",
  "lanekeep-report",
  "lanekeep-rules",
+ "lanekeep-server",
  "notify",
  "notify-debouncer-mini",
  "serde_json",
@@ -561,6 +562,15 @@ name = "lanekeep-rules"
 version = "0.3.0"
 dependencies = [
  "lanekeep-testkit",
+]
+
+[[package]]
+name = "lanekeep-server"
+version = "0.3.0"
+dependencies = [
+ "lanekeep-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

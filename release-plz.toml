@@ -82,6 +82,7 @@ changelog_include = [
   "lanekeep-languages",
   "lanekeep-query",
   "lanekeep-report",
+  "lanekeep-server",
   "lanekeep-rules",
   "lanekeep-testkit",
 ]

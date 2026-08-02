@@ -111,6 +111,7 @@ crates/
   lanekeep-cache     content-addressed store with dependency tracking
   lanekeep-rules     built-in rules, authored in TypeScript
   lanekeep-report    human, json, sarif, agent reporters
+  lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
   lanekeep-testkit   RuleTester
   lanekeep-cli       the binary
 docs/                architecture, playbooks
