@@ -23,6 +23,7 @@ lanekeep-core = { workspace = true }
 lanekeep-engine = { workspace = true }
 lanekeep-js = { workspace = true }
 lanekeep-lang-js = { workspace = true }
+lanekeep-languages = { workspace = true }
 lanekeep-report = { workspace = true }
 lanekeep-rules = { workspace = true }
 serde_json = { workspace = true }

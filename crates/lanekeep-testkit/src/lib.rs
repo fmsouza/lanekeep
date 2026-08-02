@@ -199,7 +199,7 @@ impl RuleTester {
             &self.dir,
             root,
             &config_path,
-            &lanekeep_lang_js::registry(),
+            &lanekeep_languages::registry(),
             Arc::new(TypeScript),
             Arc::new(JavaScript),
         )

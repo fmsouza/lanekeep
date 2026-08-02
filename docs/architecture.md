@@ -700,4 +700,8 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 **M3 — loops.** `--watch`, then `server` (LSP + MCP).
 
-**M4 — second language.** Python is the cheapest proof that the `Language` trait abstraction actually holds. If adding it requires touching `lanekeep-core`, the abstraction was wrong and it is far better to learn that at M4 than at M10.
+**M4 — second language. Done.** Python was the cheapest proof that the `Language` trait abstraction actually holds, and it held: `lanekeep-core` is untouched. `lanekeep-lang-python` implements `Language` and `BindingResolver` and nothing above it needed to know.
+
+Two things did change, and both are the abstraction working rather than leaking. `lanekeep-lang` gained binding kinds — `assignment`, `loop`, `context-manager`, `comprehension` — because Python binds names in ways JavaScript has no word for, and answering `ctx.bindingKind` with `var` for all three would have been untrue. And `lanekeep-languages` was added as the composition root: the CLI and the testkit both need to know which languages exist, and no crate below them can hold that answer without inverting the dependency the trait exists to create.
+
+What Python does *not* share with JavaScript is the interesting part. It has no block scope, so resolving a name means walking a scope's whole body rather than its direct children — the JavaScript resolver can look at direct children only because a block *is* a scope there. And a class body is opaque to functions nested inside it, so `def m(self): return LIMIT` does not see a class-level `LIMIT`. Neither rule could be expressed by reusing the JavaScript resolver, which is the evidence that mattered: the trait is the boundary, not a shared implementation.

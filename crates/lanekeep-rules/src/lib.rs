@@ -35,12 +35,20 @@
 /// does not depend on declaration order changing under an edit.
 const BUILT_IN_RULES: &[(&str, &str)] = &[
     (
+        "no-broad-except",
+        include_str!("../rules/no-broad-except.ts"),
+    ),
+    (
         "no-circular-imports",
         include_str!("../rules/no-circular-imports.ts"),
     ),
     (
         "no-default-export",
         include_str!("../rules/no-default-export.ts"),
+    ),
+    (
+        "no-mutable-default-argument",
+        include_str!("../rules/no-mutable-default-argument.ts"),
     ),
     (
         "no-restricted-imports",

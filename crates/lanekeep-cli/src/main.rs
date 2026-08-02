@@ -578,7 +578,7 @@ fn prepare(
         project_root,
         root,
         &config_path,
-        &lanekeep_lang_js::registry(),
+        &lanekeep_languages::registry(),
         Arc::new(TypeScript),
         Arc::new(JavaScript),
     )

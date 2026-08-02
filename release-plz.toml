@@ -78,6 +78,8 @@ changelog_include = [
   "lanekeep-js",
   "lanekeep-lang",
   "lanekeep-lang-js",
+  "lanekeep-lang-python",
+  "lanekeep-languages",
   "lanekeep-query",
   "lanekeep-report",
   "lanekeep-rules",
