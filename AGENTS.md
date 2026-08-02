@@ -106,6 +106,7 @@ crates/
   lanekeep-lang      Language trait and registry
   lanekeep-lang-js   TS/TSX/JS/JSX grammars, binding resolution
   lanekeep-lang-python  Python grammar, binding resolution
+  lanekeep-lang-go      Go grammar, binding resolution
   lanekeep-languages    the set of supported languages, assembled in one place
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking

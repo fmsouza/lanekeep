@@ -53,6 +53,18 @@ pub enum BindingKind {
     ContextManager,
     /// A comprehension's own target, which is scoped to the comprehension.
     Comprehension,
+
+    // --- Go ------------------------------------------------------------------------------
+    //
+    // Same reasoning as above, one language further out. Go names things JavaScript has no
+    // word for, and the nearest existing kind would be a lie in each case: a struct is not a
+    // `class`, a method receiver is not quite a `param`, and a type parameter is neither.
+    /// `type T struct{}`, `type T interface{}`, or a `type T = U` alias.
+    Type,
+    /// The receiver of a method — the `r` in `func (r *Repo) Get()`.
+    Receiver,
+    /// A generic type parameter — the `T` in `func F[T any]()` or `type S[T any] struct{}`.
+    TypeParam,
 }
 
 impl BindingKind {
@@ -71,6 +83,9 @@ impl BindingKind {
             Self::Loop => "loop",
             Self::ContextManager => "context-manager",
             Self::Comprehension => "comprehension",
+            Self::Type => "type",
+            Self::Receiver => "receiver",
+            Self::TypeParam => "type-param",
         }
     }
 }

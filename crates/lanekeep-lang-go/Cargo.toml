@@ -1,6 +1,6 @@
 [package]
-name = "lanekeep-languages"
-description = "The set of languages lanekeep supports, assembled in one place."
+name = "lanekeep-lang-go"
+description = "Go language support for lanekeep."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,9 +13,8 @@ categories.workspace = true
 
 [dependencies]
 lanekeep-lang = { workspace = true }
-lanekeep-lang-js = { workspace = true }
-lanekeep-lang-go = { workspace = true }
-lanekeep-lang-python = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-go = { workspace = true }
 
 [lints]
 workspace = true

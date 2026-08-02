@@ -43,12 +43,20 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
         include_str!("../rules/no-circular-imports.ts"),
     ),
     (
+        "no-context-in-struct",
+        include_str!("../rules/no-context-in-struct.ts"),
+    ),
+    (
         "no-default-export",
         include_str!("../rules/no-default-export.ts"),
     ),
     (
         "no-mutable-default-argument",
         include_str!("../rules/no-mutable-default-argument.ts"),
+    ),
+    (
+        "no-package-init",
+        include_str!("../rules/no-package-init.ts"),
     ),
     (
         "no-restricted-imports",
