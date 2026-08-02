@@ -141,10 +141,24 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-release-archives.sh "${VERSION}" dist dist-archives
 
+      # From the archives' own SHA256SUMS, so the formula cannot disagree with what a user
+      # verifies a download against.
+      - name: Generate the Homebrew formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build-homebrew-formula.sh "${VERSION}" dist-archives dist-homebrew/lanekeep.rb
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-archives
           path: dist-archives/
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: homebrew-formula
+          path: dist-homebrew/
           if-no-files-found: error
           retention-days: 7
 
@@ -188,6 +202,11 @@ jobs:
           name: release-archives
           path: dist-archives
 
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: homebrew-formula
+          path: dist-homebrew
+
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "22"
@@ -210,14 +229,18 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           npm="${NPM_TOKEN:+yes}"
           crates="${CARGO_REGISTRY_TOKEN:+yes}"
+          brew="${HOMEBREW_TAP_TOKEN:+yes}"
           echo "npm=${npm:-no}" >> "${GITHUB_OUTPUT}"
           echo "crates=${crates:-no}" >> "${GITHUB_OUTPUT}"
+          echo "brew=${brew:-no}" >> "${GITHUB_OUTPUT}"
 
           echo "npm:       ${npm:-no (dry run)}"
           echo "crates.io: ${crates:-no (dry run)}"
+          echo "homebrew:  ${brew:-no (tap not configured)}"
           if [ -z "${npm}" ] && [ -z "${crates}" ]; then
             echo "::notice::no registry secrets configured — this run publishes nothing"
           fi
@@ -242,6 +265,34 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: ./scripts/publish-crates.sh
+
+      # After the registries, because the formula points at release assets and a tap updated
+      # ahead of them would offer a download that 404s.
+      #
+      # A separate secret from RELEASE_PLZ_TOKEN: that one is scoped to this repository, and
+      # pushing to the tap needs a token that reaches a different one. Absent, the step is
+      # skipped and the gate above says so.
+      - name: Update the Homebrew tap
+        if: steps.gates.outputs.brew == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/fmsouza/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp dist-homebrew/lanekeep.rb tap/Formula/lanekeep.rb
+
+          cd tap
+          if git diff --quiet; then
+            echo "the formula is already current"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/lanekeep.rb
+          git commit -m "lanekeep ${TAG}"
+          git push
 
       # Last, because a releases page advertising a version that is on neither registry is
       # worse than one that appears a minute later.

@@ -36,7 +36,7 @@ So rules are TypeScript programs. Everything below follows from holding that alo
 
 ### Distribution
 
-Single static Rust binary with the JavaScript engine compiled in — no Node.js required to run lanekeep, even though rules are written in TypeScript. Shipped via npm (platform packages + thin wrapper, the esbuild/swc/Biome pattern), cargo, and Homebrew.
+Single static Rust binary with the JavaScript engine compiled in — no Node.js required to run lanekeep, even though rules are written in TypeScript. Shipped via npm (platform packages + thin wrapper, the esbuild/swc/Biome pattern), cargo, and Homebrew — the last from a tap rather than homebrew-core, whose notability requirements a new project does not meet.
 
 ---
 
