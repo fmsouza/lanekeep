@@ -119,9 +119,15 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
+      # Into a virtualenv, because Ubuntu 24.04's system Python is externally managed (PEP 668)
+      # and a bare `pip install` there fails outright.
       - name: Install cargo-zigbuild
         if: matrix.glibc != ''
-        run: pip install --quiet cargo-zigbuild==0.23.0 ziglang==0.16.0
+        shell: bash
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/zig"
+          "${RUNNER_TEMP}/zig/bin/pip" install --quiet cargo-zigbuild==0.23.0 ziglang==0.16.0
+          echo "${RUNNER_TEMP}/zig/bin" >> "${GITHUB_PATH}"
 
       - name: Build
         shell: bash

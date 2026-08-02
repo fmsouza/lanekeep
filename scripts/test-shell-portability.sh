@@ -91,6 +91,23 @@ STUB
         echo "${suite} fails when python3 emits CRLF: $(grep -c '^FAIL' "${work}/${suite}.log" | tr -d ' ') assertion(s)"
     done
   )"
+  # --- and Windows' stdout *encoding*, which is a different failure ---------------------------
+  #
+  # Python's stdout on Windows is cp1252, not UTF-8. Any text carrying a character it cannot
+  # represent — an em dash, of which this repository's prose has thousands — dies with
+  # UnicodeEncodeError partway through, so the output is truncated at the first one rather than
+  # mangled. That reads as "the assertion is wrong" rather than "the write failed".
+  #
+  # Simulated with PYTHONIOENCODING rather than a stub, because it is the same switch Windows
+  # flips. A helper reading a wheel's METADATA — which embeds the README — passed on Linux and
+  # macOS and failed four assertions on Windows, which cost a CI round trip to learn.
+  report "the test suites tolerate a cp1252 stdout" "$(
+    for suite in test-publish-npm.sh test-publish-crates.sh test-publish-pypi.sh \
+      test-build-python-wheels.sh; do
+      PYTHONIOENCODING=cp1252 "${repo_root}/scripts/${suite}" >"${work}/${suite}.cp1252.log" 2>&1 ||
+        echo "${suite} fails when stdout cannot encode UTF-8: $(grep -c '^FAIL' "${work}/${suite}.cp1252.log" | tr -d ' ') assertion(s)"
+    done
+  )"
 else
   echo "note: no python3 here, so the CRLF simulation is skipped"
 fi

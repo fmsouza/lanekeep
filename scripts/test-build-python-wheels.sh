@@ -138,7 +138,11 @@ elif query.startswith("mode:"):
     info = z.getinfo(query[5:])
     print(oct((info.external_attr >> 16) & 0o7777)[2:])
 elif query.startswith("read:"):
-    sys.stdout.write(z.read(query[5:]).decode("utf-8"))
+    # Bytes straight out, rather than decoding to text and letting stdout re-encode. On
+    # Windows that encoder is cp1252, and METADATA embeds the README — which is full of em
+    # dashes — so a text write dies with UnicodeEncodeError partway through the file. Writing
+    # bytes also sidesteps the newline translation that would otherwise put a CR on every line.
+    sys.stdout.buffer.write(z.read(query[5:]))
 PY
 }
 

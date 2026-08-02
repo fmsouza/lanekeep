@@ -88,9 +88,17 @@ jobs:
       # would compile it from source on every release for no gain. Pinned, because the whole
       # point of this step is that the toolchain stops being whatever the runner happens to
       # have.
+      #
+      # Into a virtualenv rather than `pip install` bare: Ubuntu 24.04 marks its system Python
+      # externally managed (PEP 668), and a bare install there fails outright. A venv is
+      # unambiguous on every image and costs a second.
       - name: Install cargo-zigbuild
         if: matrix.glibc != ''
-        run: pip install --quiet cargo-zigbuild==0.23.0 ziglang==0.16.0
+        shell: bash
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/zig"
+          "${RUNNER_TEMP}/zig/bin/pip" install --quiet cargo-zigbuild==0.23.0 ziglang==0.16.0
+          echo "${RUNNER_TEMP}/zig/bin" >> "${GITHUB_PATH}"
 
       # The `dist` profile, not `release`: it turns on LTO and strips symbols, which is
       # what a shipped binary wants and what a developer's `cargo build --release` should
@@ -334,8 +342,9 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
-          pip install --quiet twine==7.0.0
-          ./scripts/publish-pypi.sh dist-wheels
+          python3 -m venv "${RUNNER_TEMP}/twine"
+          "${RUNNER_TEMP}/twine/bin/pip" install --quiet twine==7.0.0
+          TWINE="${RUNNER_TEMP}/twine/bin/twine" ./scripts/publish-pypi.sh dist-wheels
 
       # After the registries, because the formula points at release assets and a tap updated
       # ahead of them would offer a download that 404s.

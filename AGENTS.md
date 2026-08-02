@@ -303,6 +303,15 @@ Linux targets now build with `cargo zigbuild --target <triple>.2.17`, and
 more than it claims. Nothing but a wheel's `manylinux` tag ever forced the number to be written
 down, which is why this surfaced with the PyPI lane and not before.
 
+**Python's stdout on Windows is cp1252, not UTF-8, and this repository's prose is full of em
+dashes.** Distinct from the CRLF trap above and with a different symptom: `sys.stdout.write` of
+any text carrying one dies with `UnicodeEncodeError` partway through, so the output is
+*truncated at the first non-ASCII character* rather than mangled. A helper that read a wheel's
+METADATA — which embeds the README — passed everywhere but Windows, where four assertions failed
+because the text simply stopped. `sys.stdout.buffer.write(...)` of the raw bytes is the fix, and
+it avoids the newline translation as well. Reading is already safe as long as every
+`read_text`/`open` names `encoding="utf-8"`, which they must.
+
 **A shell stub that pipes a command through `sed` reports `sed`'s exit status.** The CRLF
 simulation in `test-shell-portability.sh` wrapped `python3` that way, so every invocation
 appeared to succeed regardless of what it did. Any script whose control flow turns on python's
