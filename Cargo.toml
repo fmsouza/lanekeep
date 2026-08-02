@@ -54,6 +54,8 @@ memchr = { version = "2" }
 clap = { version = "4", features = ["derive"] }
 anyhow = { version = "1" }
 thiserror = { version = "2" }
+notify = { version = "8.2" }
+notify-debouncer-mini = { version = "0.7" }
 tree-sitter = { version = "0.26" }
 tree-sitter-typescript = { version = "0.23" }
 tree-sitter-javascript = { version = "0.25" }

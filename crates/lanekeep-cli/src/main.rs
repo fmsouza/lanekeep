@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+mod watch;
+
 use clap::{Parser, Subcommand};
 use lanekeep_core::FilePath;
 use std::collections::BTreeMap;
@@ -94,6 +96,13 @@ enum Command {
         /// about code that has changed, and nothing else will ever say so.
         #[arg(long)]
         report_unused_suppressions: bool,
+
+        /// Re-check whenever the project changes, until interrupted.
+        ///
+        /// A foreground loop, not a daemon: it holds nothing a fresh run would not rebuild,
+        /// and Ctrl-C ends it. The warm cache is what makes each re-run fast.
+        #[arg(long, conflicts_with = "fix")]
+        watch: bool,
     },
 
     /// Write a starter config and a first rule.
@@ -168,20 +177,45 @@ fn run() -> anyhow::Result<ExitCode> {
             report_unused_suppressions,
             fix,
             profile,
-        } => check(CheckOptions {
-            project_root: &path,
-            config: config.as_deref(),
-            format: &format,
-            timeout,
-            selection: Selection::from(since, staged),
-            switches: Switches {
-                warn_only,
-                no_cache,
-                report_unused_suppressions,
-                fix,
-                profile,
-            },
-        }),
+            watch,
+        } => {
+            let options = || CheckOptions {
+                project_root: &path,
+                config: config.as_deref(),
+                format: &format,
+                timeout,
+                selection: Selection::from(since.clone(), staged),
+                switches: Switches {
+                    warn_only,
+                    no_cache,
+                    report_unused_suppressions,
+                    fix,
+                    profile,
+                },
+            };
+
+            if watch {
+                // The exit code of any single pass is not the loop's: a violation is
+                // something to show and wait past, not a reason to stop watching. What the
+                // loop reports is whether it could watch at all.
+                return watch::watch(&path, || check(options()).map(|_| ()));
+            }
+
+            check(CheckOptions {
+                project_root: &path,
+                config: config.as_deref(),
+                format: &format,
+                timeout,
+                selection: Selection::from(since, staged),
+                switches: Switches {
+                    warn_only,
+                    no_cache,
+                    report_unused_suppressions,
+                    fix,
+                    profile,
+                },
+            })
+        }
         Command::Init { path, force } => init(&path, force),
         Command::Rules { path, config, json } => rules(&path, config.as_deref(), json),
         Command::Explain {

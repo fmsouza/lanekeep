@@ -275,6 +275,12 @@ never reaches the one that failed, stranding the release at that version permane
 publish scripts therefore skip what the registry already has. v0.1.0 spent a cycle stuck with
 four platform packages up and no launcher, which is exactly the state that motivated it.
 
+**A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
+inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
+and re-checks forever — pinning a core while the output looks exactly like a tool that is
+working. `crates/lanekeep-cli/src/watch.rs` filters by path *component* rather than substring,
+so `target/` is ignored and `src/target.ts` is not.
+
 **A stacked pull request conflicts as soon as its parent is squash-merged.** Squashing
 replaces the parent's commits with one new commit that has a different SHA, so git sees the
 child branch and `main` as having added the same files independently. Every file conflicts
