@@ -117,6 +117,10 @@ enum Command {
         /// Config file.
         #[arg(long)]
         config: Option<PathBuf>,
+
+        /// Which protocol to speak: `lsp` for an editor, `mcp` for an agent host.
+        #[arg(long, default_value = "lsp")]
+        protocol: String,
     },
 
     /// Write a starter config and a first rule.
@@ -230,7 +234,11 @@ fn run() -> anyhow::Result<ExitCode> {
                 },
             })
         }
-        Command::Server { path, config } => server(&path, config.as_deref()),
+        Command::Server {
+            path,
+            config,
+            protocol,
+        } => server(&path, config.as_deref(), &protocol),
         Command::Init { path, force } => init(&path, force),
         Command::Rules { path, config, json } => rules(&path, config.as_deref(), json),
         Command::Explain {
@@ -679,12 +687,12 @@ struct Switches {
     profile: bool,
 }
 
-/// Serve LSP over stdio until the client disconnects.
+/// Serve LSP or MCP over stdio until the client disconnects.
 ///
-/// The engine is rebuilt on every check rather than held: a rule file or the config can
-/// change while the editor is open, and a server answering from the ruleset it started with
-/// would report violations the project no longer has.
-fn server(project_root: &Path, config: Option<&Path>) -> anyhow::Result<ExitCode> {
+/// The engine is rebuilt on every call rather than held: a rule file or the config can change
+/// while the session is open, and a server answering from the ruleset it started with would
+/// report violations the project no longer has.
+fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow::Result<ExitCode> {
     let root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
@@ -694,17 +702,112 @@ fn server(project_root: &Path, config: Option<&Path>) -> anyhow::Result<ExitCode
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
 
-    lanekeep_server::serve_lsp(&mut input, &mut output, &root, || {
-        // Every failure becomes a string the server logs and carries on from. An editor
-        // session should survive a config typo, not end on one.
-        let (engine, _) = prepare(project_root, config, true).map_err(|e| e.to_string())?;
-        engine
-            .run()
-            .map(|outcome| outcome.violations)
-            .map_err(|e| e.to_string())
-    })?;
+    match protocol {
+        "lsp" => {
+            lanekeep_server::serve_lsp(&mut input, &mut output, &root, || {
+                // Every failure becomes a string the server logs and carries on from. An
+                // editor session should survive a config typo, not end on one.
+                let (engine, _) = prepare(project_root, config, true).map_err(|e| e.to_string())?;
+                engine
+                    .run()
+                    .map(|outcome| outcome.violations)
+                    .map_err(|e| e.to_string())
+            })?;
+        }
+        "mcp" => {
+            let mut tools = Project {
+                project_root,
+                config,
+            };
+            lanekeep_server::mcp::serve(&mut input, &mut output, &mut tools)?;
+        }
+        other => anyhow::bail!("unknown --protocol `{other}`\n  expected: lsp, mcp"),
+    }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// The MCP tools, run against a real project.
+struct Project<'a> {
+    project_root: &'a Path,
+    config: Option<&'a Path>,
+}
+
+impl lanekeep_server::mcp::Tools for Project<'_> {
+    fn check(&mut self) -> Result<String, String> {
+        let (engine, _) =
+            prepare(self.project_root, self.config, true).map_err(|e| e.to_string())?;
+        let outcome = engine.run().map_err(|e| e.to_string())?;
+
+        let cards: lanekeep_report::Cards = engine
+            .rules()
+            .map(|spec| (spec.id.clone(), spec.card.clone()))
+            .collect();
+
+        // The `agent` format, which exists for exactly this consumer — grouped by rule, with
+        // the remediation stated once and an example either way. Never colored: escape codes
+        // in a model's context are noise it pays for.
+        Ok(lanekeep_report::render(
+            Format::Agent,
+            Color::Never,
+            &outcome.violations,
+            Summary {
+                files_discovered: outcome.files_discovered,
+                files_parsed: outcome.files_parsed,
+                warn_only: false,
+            },
+            &cards,
+        ))
+    }
+
+    fn rules(&mut self) -> Result<String, String> {
+        use std::fmt::Write as _;
+
+        let (engine, _) =
+            prepare(self.project_root, self.config, false).map_err(|e| e.to_string())?;
+
+        let mut out = String::new();
+        for spec in engine.rules() {
+            let _ = writeln!(
+                out,
+                "{} [{}] — {}",
+                spec.id, spec.severity, spec.card.message
+            );
+        }
+        if out.is_empty() {
+            out.push_str("no rules are configured\n");
+        }
+        Ok(out)
+    }
+
+    fn explain(&mut self, rule: &str) -> Result<String, String> {
+        use std::fmt::Write as _;
+
+        let (engine, _) =
+            prepare(self.project_root, self.config, false).map_err(|e| e.to_string())?;
+
+        let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
+            // The list, not only the miss. A rule id is easy to mistype and the answer is
+            // always in the list, which is more use to a model than any guess at the intent.
+            let configured: Vec<String> = engine.rules().map(|spec| spec.id.to_string()).collect();
+            return Err(format!(
+                "no rule `{rule}` is configured\n  configured: {}",
+                if configured.is_empty() {
+                    "none".to_owned()
+                } else {
+                    configured.join(", ")
+                }
+            ));
+        };
+
+        let mut out = String::new();
+        let _ = writeln!(out, "{} [{}]", spec.id, spec.severity);
+        let _ = writeln!(out, "{}", spec.card.message);
+        let _ = writeln!(out, "Fix: {}", spec.card.remediation);
+        let _ = writeln!(out, "Bad:  {}", spec.card.examples.bad);
+        let _ = writeln!(out, "Good: {}", spec.card.examples.good);
+        Ok(out)
+    }
 }
 
 fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {

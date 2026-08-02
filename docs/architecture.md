@@ -605,7 +605,7 @@ lanekeep check [paths...]
 lanekeep check --watch          # foreground, incremental, re-runs on change
 lanekeep explain <rule-id>      # prints the rule card
 lanekeep rules [--json]
-lanekeep server                 # M3 — LSP + MCP, launched by editors/agent hosts
+lanekeep server [--protocol lsp|mcp]   # launched by editors/agent hosts
 ```
 
 One-shot is the default and CI runs it unchanged. `--watch` is a foreground loop, not a background daemon. `server` is explicit and separate. The warm cache is what makes one-shot fast; process persistence is an optimization for editors, not a requirement for speed.
@@ -698,11 +698,13 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 **M2 — completeness.** Full host API surface, SARIF + agent reporters, `explain`, fixes (template-based replacement of a capture, marked machine-applicable vs suggestion), unused-suppression reporting.
 
-**M3 — loops.** `--watch` **done**; `server` **LSP done, MCP outstanding**.
+**M3 — loops. Done.** `--watch`, and `server` speaking both LSP and MCP.
 
 `--watch` is a foreground loop, and the trap it exists to avoid is that lanekeep writes its cache into `.lanekeep/` *inside the root it watches*. A watcher reacting to every event under the root sees its own write, re-checks, writes again, and never stops — at full CPU, while looking like it is working. The filter that prevents it is the part with tests.
 
-`server` is hand-written JSON-RPC over stdio, because `deny.toml` denies `tokio` and that rules out every async LSP crate. The constraint turned out to be the right shape: a server that reads a message, answers it, and reads the next has nothing to schedule. It also made the MCP half cheaper than expected — both protocols are JSON-RPC 2.0 over stdio, differing only in framing and method set, so `lanekeep-server::jsonrpc` already carries both framings and MCP adds a dispatch table rather than a transport.
+`server` is hand-written JSON-RPC over stdio, because `deny.toml` denies `tokio` and that rules out every async LSP crate. The constraint turned out to be the right shape: a server that reads a message, answers it, and reads the next has nothing to schedule. It also made the MCP half cheaper than expected — both protocols are JSON-RPC 2.0 over stdio, differing only in framing and method set, so `lanekeep-server::jsonrpc` carries both framings and MCP added a dispatch table rather than a transport.
+
+MCP exposes three tools, one per thing the CLI already does: `lanekeep_check`, `lanekeep_rules`, `lanekeep_explain`. They return the `agent` reporter's text unchanged, because that format exists for exactly this consumer. The distinction MCP draws between a failing *tool* and a failing *call* is load-bearing and is tested: a rule that throws comes back as `isError: true` with the message as content, because it is a result the model should act on, while a malformed argument is a JSON-RPC error for the host.
 
 Diagnostics publish on open and on save, not per keystroke: a check reads from disk, and the buffer an editor holds mid-edit is not there yet. Publishing against stale bytes puts squiggles under the wrong characters, which is worse than a save-length delay on a warm cache.
 
