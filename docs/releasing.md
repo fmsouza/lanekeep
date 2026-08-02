@@ -36,6 +36,7 @@ Publishing is gated on secrets, and each is absent until someone adds it:
 | `NPM_TOKEN` | `npm publish`, with provenance |
 | `CARGO_REGISTRY_TOKEN` | `cargo publish` |
 | `RELEASE_PLZ_TOKEN` | Letting release-plz open the release pull request, and letting the tag it pushes trigger `release.yml` |
+| `HOMEBREW_TAP_TOKEN` | Pushing the generated formula to the tap |
 
 `NPM_TOKEN` must be a granular access token with **Bypass 2FA** enabled. Without it npm
 answers `EOTP` and asks for a one-time password, which nothing in CI can supply. crates.io
@@ -145,6 +146,38 @@ directory the files were downloaded into.
 The upload creates the release if release-plz has not already — which is what makes a
 hand-pushed tag produce a complete release — and uses `--clobber`, so re-running replaces
 assets rather than failing on the ones already there.
+
+## Homebrew
+
+`brew install fmsouza/tap/lanekeep`, from a tap this repository pushes to rather than from
+homebrew-core — core has notability requirements a new project does not meet, and a tap needs
+nobody's approval.
+
+`scripts/build-homebrew-formula.sh` generates the formula from the archives' own `SHA256SUMS`
+rather than recomputing hashes. That file is what a user verifies a download against, so a
+formula built from anything else could disagree with it, and the disagreement would only
+surface as a failed install.
+
+**No Intel macOS.** The release does not build that binary, so the formula does not claim it —
+a URL for an archive that was never uploaded 404s at install time, which reads as Homebrew
+being broken rather than as a platform we do not ship. The formula's header names
+`cargo install lanekeep-cli` instead, which is what the npm launcher does too.
+
+The tap push needs its own secret. `RELEASE_PLZ_TOKEN` is scoped to this repository; reaching
+`fmsouza/homebrew-tap` needs a token that reaches a different one. Without it the step is
+skipped and the publish gate says `homebrew: no (tap not configured)`.
+
+**Setting the tap up**, once:
+
+1. Create a public repository named `fmsouza/homebrew-tap`. The `homebrew-` prefix is what
+   makes `brew install fmsouza/tap/lanekeep` resolve; the tap is then referred to without it.
+2. Give it a `Formula/` directory — the workflow creates it if absent, but an empty repository
+   with a README reads better to anyone who finds it.
+3. Create a fine-grained PAT with **contents: write** on that repository alone, and add it as
+   `HOMEBREW_TAP_TOKEN` here.
+
+The formula is regenerated on every release and pushed only when it differs, so a re-run of a
+release that already updated the tap is a no-op rather than an empty commit.
 
 ## How the npm distribution works
 
