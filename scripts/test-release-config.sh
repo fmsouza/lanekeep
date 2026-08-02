@@ -63,6 +63,34 @@ print(f"release_name={workspace.get('git_release_name')}")
 print(f"tagging={','.join(sorted(tagging))}")
 print(f"releasing={','.join(sorted(releasing))}")
 
+print(f"release_commits={workspace.get('release_commits', '')}")
+
+# Which commit types the regex actually admits, checked by matching rather than by reading
+# the pattern. A regex is easy to write and easy to get subtly wrong, and the two failure
+# directions are opposite: too narrow silently stops releasing, too broad brings back the
+# spurious release pull requests.
+import re
+
+pattern = workspace.get("release_commits")
+if pattern:
+    expression = re.compile(pattern)
+    subjects = {
+        "feat": "feat(cli): add --watch",
+        "feat-breaking": "feat(js)!: replace the node handle representation",
+        "fix": "fix(cache): include tracked reads in the entry key",
+        "perf": "perf(engine): reuse the query cursor",
+        "revert": "revert: the node handle change",
+        "chore-release": "chore: release v0.3.2",
+        "chore": "chore: tidy the justfile",
+        "docs": "docs: explain the reduce phase",
+        "ci": "ci: pin the runner image",
+        "test": "test: cover the python resolver",
+        "style": "style: reformat",
+        "refactor": "refactor(core): extract the walker",
+    }
+    matched = [name for name, subject in sorted(subjects.items()) if expression.match(subject)]
+    print(f"release_commits_matches={','.join(matched)}")
+
 writing = [p["name"] for p in packages if resolves_to(p, "changelog_update")]
 print(f"workspace_changelog_default={workspace.get('changelog_update')}")
 print(f"writing={','.join(sorted(writing))}")
@@ -151,6 +179,19 @@ check "the changelog covers every other crate" "" "$(tr -d '\r' <"${work}/covera
 # `tags: ["v*"]` and a block list — because which one is used is not the point.
 check "release.yml triggers on the tag release-plz creates" "0" \
   "$(grep -qE "tags:.*v\*|^[[:space:]]*-[[:space:]]*['\"]?v\*" "${workflow}" && echo 0 || echo 1)"
+
+# --- only meaningful commits propose a release --------------------------------------------------
+#
+# release-plz otherwise proposes one whenever a package's packaged files differ from the newest
+# version *on crates.io*, and the registry lags this repository by the length of the publish
+# approval. Every push to `main` in that window proposed a further release: after v0.3.2 it
+# opened one for 0.3.3 whose only entry was "update Cargo.lock dependencies", which would have
+# published a version identical to the one still waiting to go out.
+#
+# Asserted by matching real subjects rather than by comparing the pattern to a literal, because
+# the point is which commits it admits, not how the regex is spelled.
+check "a release is proposed for meaningful changes only" \
+  "feat,feat-breaking,fix,perf,revert" "$(value release_commits_matches)"
 
 echo
 echo "${passed} passed, ${failed} failed"
