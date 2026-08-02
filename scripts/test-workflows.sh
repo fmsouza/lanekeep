@@ -225,6 +225,44 @@ print("\n".join(found))
 PY
 report "committing decisions account for untracked files" "$(cat "${findings}")"
 
+# --- every Linux release target states its glibc floor ---------------------------------------
+#
+# A dynamically linked binary cannot run against a glibc older than the one it was built
+# against, so the build machine's glibc becomes the oldest distribution the release supports.
+# Nothing about that is visible: the build is green, and the smoke test runs on the machine
+# that built it, which is the one machine where the floor is never wrong.
+#
+# It moved under us once. `ubuntu-latest` rolled from 22.04 to 24.04 and took lanekeep's floor
+# from 2.35 to 2.39, so v0.3.1's Linux binary does not start on Ubuntu 22.04, Debian 12 or
+# RHEL 9 — on npm, on the releases page and in Homebrew alike. The fix is a versioned target
+# triple through zigbuild; this makes leaving it off a new Linux target fail here instead.
+python3 - "${workflows}" >"${findings}" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+found = []
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.yml")):
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    for job_name, job in (document.get("jobs") or {}).items():
+        include = ((job.get("strategy") or {}).get("matrix") or {}).get("include") or []
+        for entry in include:
+            target = str(entry.get("target", ""))
+            # Only the gnu targets. A musl target links its libc statically and has no floor
+            # to state, so demanding one there would be noise.
+            if "linux-gnu" not in target:
+                continue
+            if not entry.get("glibc"):
+                found.append(
+                    f"{path.name} :: {job_name} :: {target} sets no `glibc`, so its floor is "
+                    f"whatever the runner image ships"
+                )
+
+print("\n".join(found))
+PY
+report "every Linux release target pins a glibc floor" "$(cat "${findings}")"
+
 echo
 echo "${passed} passed, ${failed} failed"
 [ "${failed}" -eq 0 ]

@@ -50,10 +50,21 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+          # `glibc` pins the oldest glibc the Linux binaries may require. Without it the
+          # floor is whatever the runner image happens to ship, which is not a decision
+          # anyone made: `ubuntu-latest` rolled from 22.04 to 24.04 and took the floor from
+          # 2.35 to 2.39 with it, so v0.3.1's Linux binary does not start on Ubuntu 22.04,
+          # Debian 12 or RHEL 9. Every check stayed green, because the smoke test runs on
+          # the machine that built it — the one machine where the floor is never wrong.
+          #
+          # 2.17 is the manylinux2014 baseline, which is what the Python wheels claim and
+          # `build-python-wheels.sh` verifies against the binary before tagging one.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            glibc: "2.17"
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            glibc: "2.17"
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
@@ -73,11 +84,33 @@ jobs:
       # save a few minutes on a job that runs once per release would be relaxing a check to
       # make a change pass.
 
+      # Both from PyPI, which ship them as prebuilt wheels — `cargo install cargo-zigbuild`
+      # would compile it from source on every release for no gain. Pinned, because the whole
+      # point of this step is that the toolchain stops being whatever the runner happens to
+      # have.
+      - name: Install cargo-zigbuild
+        if: matrix.glibc != ''
+        run: pip install --quiet cargo-zigbuild==0.23.0 ziglang==0.16.0
+
       # The `dist` profile, not `release`: it turns on LTO and strips symbols, which is
       # what a shipped binary wants and what a developer's `cargo build --release` should
       # not have to pay for.
+      #
+      # Linux goes through zigbuild, whose target triple takes a glibc suffix — that suffix
+      # is the only thing in this repository that states the floor rather than inheriting it.
+      # zig writes its output to the same `target/<triple>/dist/` path cargo would, so
+      # everything downstream is unchanged.
       - name: Build
-        run: cargo build --profile dist --target ${{ matrix.target }} -p lanekeep-cli
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          GLIBC: ${{ matrix.glibc }}
+        run: |
+          if [ -n "${GLIBC}" ]; then
+            cargo zigbuild --profile dist --target "${TARGET}.${GLIBC}" -p lanekeep-cli
+          else
+            cargo build --profile dist --target "${TARGET}" -p lanekeep-cli
+          fi
 
       # A binary that cannot answer `--version` is a binary nobody should be shipping, and
       # this is the last moment it costs nothing to find out.
@@ -136,6 +169,15 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-npm-packages.sh "${VERSION}" dist dist-npm
 
+      # Early, because this is the step that verifies the Linux binaries' glibc floor against
+      # the manylinux tag they are about to carry. It is the only check in the release that
+      # looks at what the binaries actually require, so failing here costs nothing and failing
+      # later costs a version number.
+      - name: Assemble Python wheels
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build-python-wheels.sh "${VERSION}" dist dist-wheels
+
       - name: Assemble release archives
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -166,6 +208,13 @@ jobs:
         with:
           name: npm-packages
           path: dist-npm/
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: python-wheels
+          path: dist-wheels/
           if-no-files-found: error
           retention-days: 7
 
@@ -207,6 +256,11 @@ jobs:
           name: homebrew-formula
           path: dist-homebrew
 
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: python-wheels
+          path: dist-wheels
+
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "22"
@@ -230,18 +284,22 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: |
           npm="${NPM_TOKEN:+yes}"
           crates="${CARGO_REGISTRY_TOKEN:+yes}"
           brew="${HOMEBREW_TAP_TOKEN:+yes}"
+          pypi="${PYPI_TOKEN:+yes}"
           echo "npm=${npm:-no}" >> "${GITHUB_OUTPUT}"
           echo "crates=${crates:-no}" >> "${GITHUB_OUTPUT}"
           echo "brew=${brew:-no}" >> "${GITHUB_OUTPUT}"
+          echo "pypi=${pypi:-no}" >> "${GITHUB_OUTPUT}"
 
           echo "npm:       ${npm:-no (dry run)}"
           echo "crates.io: ${crates:-no (dry run)}"
+          echo "pypi:      ${pypi:-no (dry run)}"
           echo "homebrew:  ${brew:-no (tap not configured)}"
-          if [ -z "${npm}" ] && [ -z "${crates}" ]; then
+          if [ -z "${npm}" ] && [ -z "${crates}" ] && [ -z "${pypi}" ]; then
             echo "::notice::no registry secrets configured — this run publishes nothing"
           fi
 
@@ -265,6 +323,19 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: ./scripts/publish-crates.sh
+
+      # PyPI takes the wheels as they were built — there is no launcher and no ordering
+      # constraint, because a wheel names its own platform in its filename and pip picks by
+      # that. The one thing that matters is resuming a partial upload, which the script does
+      # per file; see the note there for why per version is not good enough.
+      - name: Publish Python wheels
+        if: steps.gates.outputs.pypi == 'yes'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          pip install --quiet twine==7.0.0
+          ./scripts/publish-pypi.sh dist-wheels
 
       # After the registries, because the formula points at release assets and a tap updated
       # ahead of them would offer a download that 404s.

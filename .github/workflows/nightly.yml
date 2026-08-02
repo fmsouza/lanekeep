@@ -100,8 +100,13 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+          # Pinned to the same floor the release pins, so this rehearses the build that
+          # actually ships rather than a different one. It matters most here: a runner image
+          # rolling underneath the project is precisely the kind of change nightly exists to
+          # catch, and it is how the floor moved to 2.39 unnoticed in the first place.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            glibc: "2.17"
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
@@ -114,8 +119,31 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
+      - name: Install cargo-zigbuild
+        if: matrix.glibc != ''
+        run: pip install --quiet cargo-zigbuild==0.23.0 ziglang==0.16.0
+
       - name: Build
-        run: cargo build --profile dist --target ${{ matrix.target }} -p lanekeep-cli
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          GLIBC: ${{ matrix.glibc }}
+        run: |
+          if [ -n "${GLIBC}" ]; then
+            cargo zigbuild --profile dist --target "${TARGET}.${GLIBC}" -p lanekeep-cli
+          else
+            cargo build --profile dist --target "${TARGET}" -p lanekeep-cli
+          fi
+
+      # The floor the binary actually came out with, asserted rather than assumed. The
+      # release checks this too, when it tags a wheel `manylinux_2_17`; doing it nightly is
+      # what makes a zigbuild or toolchain regression show up on an ordinary morning.
+      - name: Check the glibc floor
+        if: matrix.glibc != ''
+        env:
+          TARGET: ${{ matrix.target }}
+          GLIBC: ${{ matrix.glibc }}
+        run: python3 scripts/check_glibc_floor.py "target/${TARGET}/dist/lanekeep" "${GLIBC}"
 
       - name: Smoke test
         shell: bash

@@ -11,8 +11,8 @@ separate, so each is reviewable on its own and none can happen by accident.
 2. **Merging it creates a tag.** That is the decision point. Everything before it is
    reversible by closing a pull request.
 3. **The tag runs `release.yml`**, which builds every platform binary, assembles the npm
-   packages and the downloadable archives, publishes to both registries, and attaches the
-   archives to the release.
+   packages, the Python wheels and the downloadable archives, publishes to every configured
+   index, and attaches the archives to the release.
 
 Nothing publishes on a push to a branch. Nothing publishes without a tag.
 
@@ -35,12 +35,20 @@ Publishing is gated on secrets, and each is absent until someone adds it:
 | --- | --- |
 | `NPM_TOKEN` | `npm publish`, with provenance |
 | `CARGO_REGISTRY_TOKEN` | `cargo publish` |
+| `PYPI_TOKEN` | `twine upload` of the wheels |
 | `RELEASE_PLZ_TOKEN` | Letting release-plz open the release pull request, and letting the tag it pushes trigger `release.yml` |
 | `HOMEBREW_TAP_TOKEN` | Pushing the generated formula to the tap |
 
 `NPM_TOKEN` must be a granular access token with **Bypass 2FA** enabled. Without it npm
 answers `EOTP` and asks for a one-time password, which nothing in CI can supply. crates.io
 requires a **verified email address** on the account before it accepts any publish at all.
+
+`PYPI_TOKEN` is an API token from [PyPI account settings]. Before the project exists there is
+nothing to scope a token *to*, so the first one has to be account-scoped ("Entire account");
+once `lanekeep` is on the index, replace it with one scoped to that project alone. The token
+is used as the password with `__token__` as the username, which is what `release.yml` sets.
+
+[PyPI account settings]: https://pypi.org/manage/account/token/
 
 `RELEASE_PLZ_TOKEN` is the one to get right, because the default token cannot do two
 separate things and neither is obvious from the failure.
@@ -105,7 +113,8 @@ later and forgotten fails the gate instead of quietly disappearing from the rele
 
 ## Publishing order
 
-Both registries care about order, in opposite directions:
+Two of the three care about order, in opposite directions. PyPI does not: a wheel names its
+own platform, so there is no resolution step to leave half-satisfied.
 
 - **npm**: platform packages first, then the launcher. The launcher declares them as optional
   dependencies, so publishing it first leaves a window where `npm install lanekeep` resolves
@@ -121,7 +130,7 @@ Both registries care about order, in opposite directions:
   resolves them when it packages, so a crate whose dev-dependency is unpublished cannot go up
   even though nothing it ships uses it.
 
-Both publishes **skip anything already on the registry**, because neither registry lets a
+All three publishes **skip anything already on the index**, because none of them lets a
 version be replaced. Without that, a release that dies partway can never be finished: the
 re-run stops on the first thing already published and never reaches the one that failed, so
 the only way forward is a fresh version number. crates.io additionally rate-limits *new*
@@ -179,6 +188,55 @@ skipped and the publish gate says `homebrew: no (tap not configured)`.
 The formula is regenerated on every release and pushed only when it differs, so a re-run of a
 release that already updated the tap is a no-op rather than an empty commit.
 
+## PyPI
+
+`pip install lanekeep`, so a Python project can pin it in `requirements.txt` or
+`pyproject.toml` the way a Node project pins it in `package.json`. lanekeep checks Python
+code; this is the other half of that, and without it a Python team's only options were an npm
+package needing Node or a `cargo install` needing Rust.
+
+**One project, four wheels, no launcher.** The npm distribution needs a launcher because
+npm has no notion of a platform-specific package that resolves automatically; a wheel names
+its platform in its own filename and pip picks by that tag. There is nothing to resolve at
+run time and nothing to get wrong.
+
+**Nothing importable ships.** No package directory, no `__init__.py`, no console-script shim.
+The binary goes in `lanekeep-<version>.data/scripts/`, which is the one location an installer
+puts onto `PATH`, executable. `import lanekeep` does not work and is not meant to — a Python
+module that only re-exec'd the binary would be a second thing to keep in step with the first.
+
+`scripts/build-python-wheels.sh` assembles them and `scripts/publish-pypi.sh` uploads them,
+both covered by tests that `just check` runs. The upload **skips per file, not per version**,
+which is the distinction that makes a partial release resumable: a run that died halfway
+leaves the version on the index with only some of its wheels, so asking "is 0.3.1 published?"
+answers yes and skips exactly the work still outstanding.
+
+### The glibc floor
+
+The Linux wheels are tagged `manylinux_2_17`, and that tag is a promise: it says the binary
+runs against glibc 2.17 and newer. Overstating it is worse than shipping nothing, because the
+install succeeds and the failure arrives later as a linker error naming a library the user did
+not know they had.
+
+Nothing used to state a floor at all, so it was inherited from whatever the runner label
+pointed at. `ubuntu-latest` rolled from 22.04 to 24.04, the floor went 2.35 → 2.39, and
+**v0.3.1's Linux binary does not start on Ubuntu 22.04, Debian 12 or RHEL 9** — on npm, on the
+releases page and in Homebrew alike. Every check was green. The smoke test runs on the machine
+that built the binary, which is the one machine where the floor is never wrong.
+
+Two things fix it, and both are needed:
+
+- **The build states the floor.** Linux targets go through `cargo zigbuild` with a versioned
+  target triple — `--target x86_64-unknown-linux-gnu.2.17` — which is the only place in this
+  repository where the floor is declared rather than inherited. `scripts/test-workflows.sh`
+  fails if a `linux-gnu` target is added without one.
+- **The floor is checked against the binary.** `scripts/check_glibc_floor.py` parses the ELF's
+  `.gnu.version_r` and refuses to tag a wheel whose binary needs more than it claims. It runs
+  in the release, before anything is published, and nightly, so a toolchain regression surfaces
+  on an ordinary morning.
+
+The same binaries feed npm, the archives and Homebrew, so all four channels get the floor.
+
 ## How the npm distribution works
 
 One package per platform, plus a launcher that depends on all of them as
@@ -201,17 +259,23 @@ runner of its own architecture and smoke-tested before it ships.
 
 ## Adding a platform
 
-Four places, and all four are checked:
+Five places, and all five are checked:
 
-1. A matrix entry in `release.yml`.
+1. A matrix entry in `release.yml` — with a `glibc` floor, if it is a `linux-gnu` target.
 2. A row in `scripts/build-npm-packages.sh`.
 3. A row in `scripts/build-release-archives.sh`.
-4. An entry in `npm/lanekeep/resolve.js` and in the launcher's `optionalDependencies`.
+4. A row in `scripts/build-python-wheels.sh`, with the wheel platform tag.
+5. An entry in `npm/lanekeep/resolve.js` and in the launcher's `optionalDependencies`.
 
-Both packaging scripts fail if a platform they expect was not built, and a test asserts the
+Every packaging script fails if a platform it expects was not built, and a test asserts the
 launcher's list and the resolver's agree — an install that succeeds and then cannot run is the
 failure this prevents. Miss (3) and the release simply has no archive for that platform, which
-is why that script errors on a missing binary rather than skipping it.
+is why that script errors on a missing binary rather than skipping it. Miss the `glibc` in (1)
+and `scripts/test-workflows.sh` fails.
+
+Picking the tag in (4) is the one step with no single right answer: it has to be what pip
+matches on that platform and no broader. The Linux tags are checked against the binary, so an
+overstatement fails the build rather than the install.
 
 ## Nightly
 

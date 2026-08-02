@@ -288,6 +288,28 @@ and re-checks forever — pinning a core while the output looks exactly like a t
 working. `crates/lanekeep-cli/src/watch.rs` filters by path *component* rather than substring,
 so `target/` is ignored and `src/target.ts` is not.
 
+**A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
+A dynamically linked binary cannot run against a glibc older than the one it was built against,
+so the build machine silently decides the oldest distribution the release supports. When
+`ubuntu-latest` rolled from 22.04 to 24.04, lanekeep's floor went 2.35 → 2.39 and v0.3.1's
+Linux binary stopped starting on Ubuntu 22.04, Debian 12 and RHEL 9 — on npm, on the releases
+page and in Homebrew at once. Nothing went red, and nothing would have: the smoke test runs on
+the machine that built the binary, which is the one machine where the floor is never wrong.
+
+Two symbols did it, `pidfd_getpid` and `pidfd_spawnp`, pulled in by Rust's std rather than by
+anything here. Chasing individual symbols is the wrong fix; stating the floor is the right one.
+Linux targets now build with `cargo zigbuild --target <triple>.2.17`, and
+`scripts/check_glibc_floor.py` parses the ELF's `.gnu.version_r` and fails if the result needs
+more than it claims. Nothing but a wheel's `manylinux` tag ever forced the number to be written
+down, which is why this surfaced with the PyPI lane and not before.
+
+**A shell stub that pipes a command through `sed` reports `sed`'s exit status.** The CRLF
+simulation in `test-shell-portability.sh` wrapped `python3` that way, so every invocation
+appeared to succeed regardless of what it did. Any script whose control flow turns on python's
+exit code could fail all of its cases there and still be reported as tolerating CRLF. `set -o
+pipefail` in the stub is the fix. Worth remembering generally: a stub is test code, and test
+code that always passes is worse than none.
+
 **A stacked pull request conflicts as soon as its parent is squash-merged.** Squashing
 replaces the parent's commits with one new commit that has a different SHA, so git sees the
 child branch and `main` as having added the same files independently. Every file conflicts
