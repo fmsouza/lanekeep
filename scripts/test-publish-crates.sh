@@ -89,6 +89,18 @@ attempts_for() {
   grep -c "^publish -p $1\( \|$\)" "${CARGO_LOG}" | tr -d ' '
 }
 
+# How many publishable crates the workspace has, asked rather than written down. Hardcoding
+# it is the same mistake as hardcoding the publication order: it goes stale the moment a
+# crate is added, and the test then fails for a reason that has nothing to do with the code
+# it is testing.
+total_crates="$("${REAL_CARGO}" metadata --format-version 1 --no-deps 2>/dev/null | python3 -c '
+import json
+import sys
+
+metadata = json.load(sys.stdin)
+print(sum(1 for package in metadata["packages"] if package.get("publish") != []))
+' | tr -d "\r")"
+
 # The crates handed to `cargo publish -p`, in order.
 publish_order() {
   grep '^publish -p ' "${CARGO_LOG}" | awk '{print $3}'
@@ -98,7 +110,7 @@ publish_order() {
 reset
 "${script}" >/dev/null 2>&1
 check "a clean run succeeds" "0" "$?"
-check "every crate is published" "12" "$(publish_order | wc -l | tr -d ' ')"
+check "every crate is published" "${total_crates}" "$(publish_order | wc -l | tr -d ' ')"
 
 # --- dependency order ------------------------------------------------------------------------
 #
@@ -159,8 +171,8 @@ print("\n".join(sorted(set(problems))))
 
 # --- a run that died partway resumes -----------------------------------------------------------
 #
-# The whole reason the skip exists. Six crates already up, six to go: a re-run must publish
-# the remaining six and not stop on the first one it cannot republish.
+# The whole reason the skip exists. Six crates already up and the rest to go: a re-run must
+# publish the remainder and not stop on the first one it cannot republish.
 reset
 version="$(python3 -c '
 import re, sys
@@ -177,7 +189,7 @@ seventh="$(sed -n '7p' "${work}/order")"
 
 "${script}" >/dev/null 2>&1
 check "a partial release resumes" "0" "$?"
-check "and publishes only the remainder" "6" "$(publish_order | wc -l | tr -d ' ')"
+check "and publishes only the remainder" "$((total_crates - 6))" "$(publish_order | wc -l | tr -d ' ')"
 check "starting where it stopped" "${seventh}" "$(publish_order | head -1)"
 
 # --- a complete release is a no-op ---------------------------------------------------------------
@@ -214,7 +226,7 @@ export CARGO_FAIL_MESSAGE="${RATE_LIMITED}"
 check "a rate-limited crate is retried until it lands" "0" "$?"
 check "and took three attempts" "3" "$(attempts_for lanekeep-config)"
 check "while the rest publish once each" "1" "$(attempts_for lanekeep-cli)"
-check "and every crate still gets published" "12" \
+check "and every crate still gets published" "${total_crates}" \
   "$(publish_order | sort -u | wc -l | tr -d ' ')"
 
 # --- anything else fails immediately ------------------------------------------------------------
@@ -248,7 +260,7 @@ reset
 # --- flags ------------------------------------------------------------------------------------------
 reset
 "${script}" --dry-run >/dev/null 2>&1
-check "--dry-run is forwarded" "12" "$(grep -c -- '--dry-run' "${CARGO_LOG}" | tr -d ' ')"
+check "--dry-run is forwarded" "${total_crates}" "$(grep -c -- '--dry-run' "${CARGO_LOG}" | tr -d ' ')"
 
 reset
 "${script}" --nonsense >/dev/null 2>&1

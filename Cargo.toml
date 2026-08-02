@@ -25,7 +25,9 @@ lanekeep-core = { version = "0.2.1", path = "crates/lanekeep-core" }
 lanekeep-engine = { version = "0.2.1", path = "crates/lanekeep-engine" }
 lanekeep-js = { version = "0.2.1", path = "crates/lanekeep-js" }
 lanekeep-lang = { version = "0.2.1", path = "crates/lanekeep-lang" }
+lanekeep-languages = { version = "0.2.1", path = "crates/lanekeep-languages" }
 lanekeep-lang-js = { version = "0.2.1", path = "crates/lanekeep-lang-js" }
+lanekeep-lang-python = { version = "0.2.1", path = "crates/lanekeep-lang-python" }
 lanekeep-query = { version = "0.2.1", path = "crates/lanekeep-query" }
 lanekeep-report = { version = "0.2.1", path = "crates/lanekeep-report" }
 lanekeep-rules = { version = "0.2.1", path = "crates/lanekeep-rules" }
@@ -55,6 +57,7 @@ thiserror = { version = "2" }
 tree-sitter = { version = "0.26" }
 tree-sitter-typescript = { version = "0.23" }
 tree-sitter-javascript = { version = "0.25" }
+tree-sitter-python = { version = "0.25" }
 streaming-iterator = { version = "0.1" }
 rquickjs = { version = "0.12", features = ["loader"] }
 

@@ -1,6 +1,6 @@
 [package]
-name = "lanekeep-testkit"
-description = "Fixture-based rule testing harness for lanekeep."
+name = "lanekeep-languages"
+description = "The set of languages lanekeep supports, assembled in one place."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,13 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-lanekeep-config = { workspace = true }
-lanekeep-core = { workspace = true }
-lanekeep-engine = { workspace = true }
-lanekeep-js = { workspace = true }
+lanekeep-lang = { workspace = true }
 lanekeep-lang-js = { workspace = true }
-lanekeep-languages = { workspace = true }
-thiserror = { workspace = true }
+lanekeep-lang-python = { workspace = true }
 
 [lints]
 workspace = true

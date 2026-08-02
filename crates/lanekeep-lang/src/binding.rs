@@ -37,8 +37,22 @@ pub enum BindingKind {
     Function,
     /// `class X {}`
     Class,
-    /// `catch (e)`
+    /// `catch (e)`, and Python's `except E as e`.
     CatchParam,
+
+    // --- forms with no JavaScript equivalent -------------------------------------------
+    //
+    // Python binds by assigning, and has no keyword to distinguish `const` from `let`. The
+    // kinds below say *how* a name came to be bound, which is the question a rule can act
+    // on — reusing `var` for all of them would answer it with something untrue.
+    /// `x = 1`, an augmented assignment, or a walrus `x := 1`.
+    Assignment,
+    /// The target of a `for` statement or a `for` clause.
+    Loop,
+    /// `with open(p) as f`.
+    ContextManager,
+    /// A comprehension's own target, which is scoped to the comprehension.
+    Comprehension,
 }
 
 impl BindingKind {
@@ -53,6 +67,10 @@ impl BindingKind {
             Self::Function => "function",
             Self::Class => "class",
             Self::CatchParam => "catch-param",
+            Self::Assignment => "assignment",
+            Self::Loop => "loop",
+            Self::ContextManager => "context-manager",
+            Self::Comprehension => "comprehension",
         }
     }
 }
