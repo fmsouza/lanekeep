@@ -97,23 +97,26 @@ A warm run with no changes executes no JavaScript at all — every file is a cac
 
 ## Installation
 
-Not yet published. The distribution is built and tested — one npm package per platform plus a
-launcher that resolves the right one, and every crate publishable to crates.io — but no
-version has been released yet.
-
-When it ships:
+Pick whichever matches the project you are adding it to:
 
 ```bash
-npm install --save-dev lanekeep    # or: cargo install lanekeep-cli
+npm install --save-dev lanekeep      # Node
+pip install lanekeep                 # Python
+brew install fmsouza/tap/lanekeep    # macOS and Linux, system-wide
+cargo install lanekeep-cli           # from source
 ```
 
-A single static binary with the JavaScript engine compiled in. **Node.js is not required to
-run lanekeep**, even though rules are written in TypeScript — it is required only to install
-it from npm, where it picks which binary to fetch.
+Or download a binary from the [releases page](https://github.com/fmsouza/lanekeep/releases).
 
-Prebuilt for macOS on Apple silicon, Linux on x86-64 and arm64, and Windows on x86-64.
-Intel macOS is not prebuilt — `cargo install lanekeep-cli` builds it from source, and the
-npm launcher says so rather than failing obscurely.
+A single static binary with the JavaScript engine compiled in. **Neither Node.js nor Python is
+required to run lanekeep**, even though rules are written in TypeScript — a runtime is needed
+only to install it from that ecosystem's index, where it picks which binary to fetch. Nothing
+is pulled in as a dependency either way.
+
+Prebuilt for macOS on Apple silicon, Linux on x86-64 and arm64, and Windows on x86-64. The
+Linux binaries are built against glibc 2.17, so they run on anything from RHEL 7 onwards.
+Intel macOS is not prebuilt — `cargo install lanekeep-cli` builds it from source, and both the
+npm launcher and the Homebrew formula say so rather than failing obscurely.
 
 See [`docs/releasing.md`](docs/releasing.md) for how a release is cut.
 

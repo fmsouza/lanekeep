@@ -80,8 +80,10 @@ test-scripts:
     @./scripts/test-build-npm-packages.sh
     @./scripts/test-build-release-archives.sh
     @./scripts/test-build-homebrew-formula.sh
+    @./scripts/test-build-python-wheels.sh
     @./scripts/test-publish-npm.sh
     @./scripts/test-publish-crates.sh
+    @./scripts/test-publish-pypi.sh
     @./scripts/test-shell-portability.sh
     @./scripts/test-workflows.sh
     @./scripts/test-release-config.sh

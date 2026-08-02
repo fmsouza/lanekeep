@@ -36,7 +36,9 @@ So rules are TypeScript programs. Everything below follows from holding that alo
 
 ### Distribution
 
-Single static Rust binary with the JavaScript engine compiled in — no Node.js required to run lanekeep, even though rules are written in TypeScript. Shipped via npm (platform packages + thin wrapper, the esbuild/swc/Biome pattern), cargo, and Homebrew — the last from a tap rather than homebrew-core, whose notability requirements a new project does not meet.
+Single static Rust binary with the JavaScript engine compiled in — no Node.js required to run lanekeep, even though rules are written in TypeScript. Shipped via npm (platform packages + thin wrapper, the esbuild/swc/Biome pattern), PyPI (one platform wheel per target, no wrapper — a wheel names its own platform and pip picks by that tag), cargo, and Homebrew — the last from a tap rather than homebrew-core, whose notability requirements a new project does not meet.
+
+A checker that reads Python should be installable by a Python project on its own terms; the alternative was telling a `pip`/`uv` team to install Node. The Linux binaries are built against glibc 2.17 so the `manylinux_2_17` tag those wheels carry is true, and that floor is asserted against the binary rather than assumed — see [`docs/releasing.md`](releasing.md).
 
 ---
 

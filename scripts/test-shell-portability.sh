@@ -71,6 +71,12 @@ if command -v python3 >/dev/null 2>&1; then
   mkdir -p "${work}/crlf"
   cat >"${work}/crlf/python3" <<STUB
 #!/usr/bin/env bash
+# \`pipefail\`, or this stub reports the exit status of \`sed\` — which is always zero — and
+# every python3 invocation appears to succeed no matter what it did. That made the simulation
+# silently weaker than it looked: a script whose control flow turns on python's exit code,
+# like the glibc floor check, could fail every one of its cases here and still be reported
+# as tolerating CRLF.
+set -o pipefail
 # Every line gains a trailing CR, which is what Python does on Windows.
 "${real_python3}" "\$@" | sed 's/\$/\r/'
 STUB
@@ -79,9 +85,27 @@ STUB
   report "the publish scripts tolerate CRLF from python" "$(
     PATH="${work}/crlf:${PATH}"
     export PATH
-    for suite in test-publish-npm.sh test-publish-crates.sh; do
+    for suite in test-publish-npm.sh test-publish-crates.sh test-publish-pypi.sh \
+      test-build-python-wheels.sh; do
       "${repo_root}/scripts/${suite}" >"${work}/${suite}.log" 2>&1 ||
         echo "${suite} fails when python3 emits CRLF: $(grep -c '^FAIL' "${work}/${suite}.log" | tr -d ' ') assertion(s)"
+    done
+  )"
+  # --- and Windows' stdout *encoding*, which is a different failure ---------------------------
+  #
+  # Python's stdout on Windows is cp1252, not UTF-8. Any text carrying a character it cannot
+  # represent — an em dash, of which this repository's prose has thousands — dies with
+  # UnicodeEncodeError partway through, so the output is truncated at the first one rather than
+  # mangled. That reads as "the assertion is wrong" rather than "the write failed".
+  #
+  # Simulated with PYTHONIOENCODING rather than a stub, because it is the same switch Windows
+  # flips. A helper reading a wheel's METADATA — which embeds the README — passed on Linux and
+  # macOS and failed four assertions on Windows, which cost a CI round trip to learn.
+  report "the test suites tolerate a cp1252 stdout" "$(
+    for suite in test-publish-npm.sh test-publish-crates.sh test-publish-pypi.sh \
+      test-build-python-wheels.sh; do
+      PYTHONIOENCODING=cp1252 "${repo_root}/scripts/${suite}" >"${work}/${suite}.cp1252.log" 2>&1 ||
+        echo "${suite} fails when stdout cannot encode UTF-8: $(grep -c '^FAIL' "${work}/${suite}.cp1252.log" | tr -d ' ') assertion(s)"
     done
   )"
 else
@@ -107,7 +131,8 @@ if [ -x /bin/bash ] && /bin/bash --version 2>/dev/null | head -1 | grep -q 'vers
   )"
 
   report "the publish scripts' tests pass under bash 3.2" "$(
-    for suite in test-publish-npm.sh test-publish-crates.sh; do
+    for suite in test-publish-npm.sh test-publish-crates.sh test-publish-pypi.sh \
+      test-build-python-wheels.sh; do
       /bin/bash "${repo_root}/scripts/${suite}" >/dev/null 2>&1 ||
         echo "${suite} fails under $(/bin/bash --version | head -1)"
     done
