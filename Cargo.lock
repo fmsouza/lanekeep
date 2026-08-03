@@ -438,6 +438,7 @@ dependencies = [
  "lanekeep-report",
  "lanekeep-rules",
  "lanekeep-server",
+ "lanekeep-testkit",
  "notify",
  "notify-debouncer-mini",
  "serde_json",

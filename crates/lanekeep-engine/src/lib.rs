@@ -3302,6 +3302,18 @@ export default defineRule({
 
     // --- suppressions ----------------------------------------------------------------------
 
+    /// The directive tokens, assembled rather than written.
+    ///
+    /// lanekeep checks its own source, and directives are found by scanning bytes rather
+    /// than by walking comments — so a token written out in a fixture below would be a
+    /// directive in *this* file too, either reported as malformed or silently silencing its
+    /// rule for four thousand lines. Assembling it leaves the fixture's bytes exactly as the
+    /// scanner should see them while this file carries no directive of its own.
+    const NEXT_LINE: &str = concat!("lanekeep", "-ignore-next-line");
+
+    /// The whole-file token. Assembled for the same reason as [`NEXT_LINE`].
+    const WHOLE_FILE: &str = concat!("lanekeep", "-ignore-file");
+
     impl Project {
         /// Run with a fixed date, so an expiry can be asserted without waiting for one.
         fn run_on(&self, today: &str) -> Result<Outcome, RunError> {
@@ -3327,8 +3339,10 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: legacy entry point\n\
-                     debugger;\n",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: legacy entry point\n\
+                         debugger;\n"
+                    ),
                 ),
             ],
         );
@@ -3347,9 +3361,11 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: legacy\n\
-                     debugger;\n\
-                     debugger;\n",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: legacy\n\
+                         debugger;\n\
+                         debugger;\n"
+                    ),
                 ),
             ],
         );
@@ -3367,9 +3383,11 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-file local/no-debugger reason: generated fixture\n\
-                     debugger;\n\
-                     debugger;\n",
+                    &format!(
+                        "// {WHOLE_FILE} local/no-debugger reason: generated fixture\n\
+                         debugger;\n\
+                         debugger;\n"
+                    ),
                 ),
             ],
         );
@@ -3385,8 +3403,10 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/something-else reason: unrelated\n\
-                     debugger;\n",
+                    &format!(
+                        "// {NEXT_LINE} local/something-else reason: unrelated\n\
+                         debugger;\n"
+                    ),
                 ),
             ],
         );
@@ -3405,7 +3425,7 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger\ndebugger;\n",
+                    &format!("// {NEXT_LINE} local/no-debugger\ndebugger;\n"),
                 ),
             ],
         );
@@ -3439,8 +3459,10 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: pending rewrite expires: 2026-01-01\n\
-                     debugger;\n",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: pending rewrite expires: 2026-01-01\n\
+                         debugger;\n"
+                    ),
                 ),
             ],
         );
@@ -3470,8 +3492,10 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: pending expires: 2026-12-31\n\
-                     debugger;\n",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: pending expires: 2026-12-31\n\
+                         debugger;\n"
+                    ),
                 ),
             ],
         );
@@ -3495,8 +3519,10 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-file local/no-debugger reason: x expires: 2026-08-01\n\
-                     debugger;\n",
+                    &format!(
+                        "// {WHOLE_FILE} local/no-debugger reason: x expires: 2026-08-01\n\
+                         debugger;\n"
+                    ),
                 ),
             ],
         );
@@ -3525,8 +3551,10 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-file local/no-debugger reason: x expires: 2026-08-01\n\
-                     debugger;\n",
+                    &format!(
+                        "// {WHOLE_FILE} local/no-debugger reason: x expires: 2026-08-01\n\
+                         debugger;\n"
+                    ),
                 ),
             ],
         );
@@ -3556,7 +3584,7 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-file local/no-debugger reason: generated\ndebugger;\n",
+                    &format!("// {WHOLE_FILE} local/no-debugger reason: generated\ndebugger;\n"),
                 ),
             ],
         );
@@ -3579,9 +3607,11 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "export function used() {}\n\
-                     // lanekeep-ignore-next-line local/no-unused-exports reason: public API\n\
-                     export function spare() {}\n",
+                    &format!(
+                        "export function used() {{}}\n\
+                         // {NEXT_LINE} local/no-unused-exports reason: public API\n\
+                         export function spare() {{}}\n"
+                    ),
                 ),
                 ("src/b.ts", "import { used } from './a';\nused();\n"),
             ],
@@ -3604,9 +3634,11 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "export function used() {}\n\
-                     // lanekeep-ignore-next-line local/unrelated reason: x\n\
-                     export function spare() {}\n",
+                    &format!(
+                        "export function used() {{}}\n\
+                         // {NEXT_LINE} local/unrelated reason: x\n\
+                         export function spare() {{}}\n"
+                    ),
                 ),
                 ("src/b.ts", "import { used } from './a';\nused();\n"),
             ],
@@ -3633,8 +3665,10 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: was needed once\n\
-                     const a = 1;\n",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: was needed once\n\
+                         const a = 1;\n"
+                    ),
                 ),
             ],
         );
@@ -3662,7 +3696,7 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: legacy\ndebugger;\n",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: legacy\ndebugger;\n"),
                 ),
             ],
         );
@@ -3685,7 +3719,7 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: stale\nconst a = 1;\n",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: stale\nconst a = 1;\n"),
                 ),
             ],
         );
@@ -3702,7 +3736,7 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: stale\nconst a = 1;\n",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: stale\nconst a = 1;\n"),
                 ),
             ],
         );
@@ -3723,7 +3757,7 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger reason: legacy\ndebugger;\n",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: legacy\ndebugger;\n"),
                 ),
             ],
         );
@@ -3754,9 +3788,11 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "export function used() {}\n\
-                     // lanekeep-ignore-next-line local/no-unused-exports reason: public API\n\
-                     export function spare() {}\n",
+                    &format!(
+                        "export function used() {{}}\n\
+                         // {NEXT_LINE} local/no-unused-exports reason: public API\n\
+                         export function spare() {{}}\n"
+                    ),
                 ),
                 ("src/b.ts", "import { used } from './a';\nused();\n"),
             ],
@@ -3781,7 +3817,7 @@ export default defineRule({
                 ("lanekeep.config.ts", &config("")),
                 (
                     "src/a.ts",
-                    "// lanekeep-ignore-next-line local/no-debugger\nconst a = 1;\n",
+                    &format!("// {NEXT_LINE} local/no-debugger\nconst a = 1;\n"),
                 ),
             ],
         );

@@ -1,0 +1,26 @@
+{
+  "$schema": "./schema/lanekeep.schema.json",
+
+  "include": [
+    "crates/**/*.rs",
+    "crates/lanekeep-rules/rules/*.ts",
+    "crates/lanekeep-rules/modules/*.ts",
+    "lanekeep/rules/*.ts",
+    "lanekeep/modules/*.ts",
+    "packages/lanekeep/*.ts",
+    "scripts/*.py",
+    "cmd/**/*.go"
+  ],
+  "exclude": [
+    "**/target/**",
+    "packages/lanekeep/builtin.d.ts"
+  ],
+
+  "rules": [
+    "lanekeep/no-broad-except",
+    "lanekeep/no-mutable-default-argument",
+    "lanekeep/no-package-init",
+    "lanekeep/no-context-in-struct",
+    { "rule": "lanekeep/no-circular-imports", "options": {} }
+  ]
+}

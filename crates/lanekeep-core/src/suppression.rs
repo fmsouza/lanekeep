@@ -1,18 +1,24 @@
-//! Suppression directives: `lanekeep-ignore-next-line` and `lanekeep-ignore-file`.
+//! Suppression directives: a next-line form and a whole-file form.
+//!
+//! Each is a comment carrying its form's token, the rule ids it silences, and a mandatory
+//! `reason:` — optionally followed by `expires:` and a date. The two tokens are the
+//! `NEXT_LINE` and `WHOLE_FILE` constants below, and this file cannot spell either of them
+//! out, for the reason under "Scanning text, not the tree". So the shape, with the tokens
+//! stood in for:
 //!
 //! ```text
-//! // lanekeep-ignore-next-line local/no-numeric-sizes reason: legacy API requires exact 44
+//! // <next-line-token> local/no-numeric-sizes reason: legacy API requires exact 44
 //! minWidth: 44,
 //!
-//! // lanekeep-ignore-file local/no-primitive-components reason: generated fixture
+//! // <whole-file-token> local/no-primitive-components reason: generated fixture
 //! ```
 //!
 //! # A suppression that does not work must say so
 //!
 //! The failure mode this module is arranged against is a directive that looks like it
-//! silences something and does not — a typo in the rule id, a missing `reason:`, a
-//! `lanekeep-ignore-nextline`. The author moves on believing the violation is handled, and
-//! nothing ever tells them otherwise.
+//! silences something and does not — a typo in the rule id, a missing `reason:`, a token
+//! with a hyphen dropped out of it. The author moves on believing the violation is handled,
+//! and nothing ever tells them otherwise.
 //!
 //! So a malformed directive is **reported**, not skipped. Every field that could be
 //! mistyped is either required or checked, and the diagnostic names what was wrong.
@@ -32,14 +38,25 @@
 //! The cost is that a directive inside a string literal counts. That is a strange thing to
 //! write and the consequence is a suppression that does nothing visible, which the unused
 //! report surfaces.
+//!
+//! It also applies to this file, which lanekeep checks along with the rest of its own
+//! source. A token spelled out here — in prose, in a doc example, in a test fixture — is a
+//! directive, not a description of one: either a malformed one that gets reported, or a
+//! well-formed one quietly silencing the rule it names, for the whole file if it is the
+//! whole-file form. So the two constants below are assembled from pieces, and everything
+//! needing a token builds it from them. Nothing in this file writes one out.
 
 use crate::rule_id::RuleId;
 
 /// The token introducing a directive that covers the following line.
-const NEXT_LINE: &str = "lanekeep-ignore-next-line";
+///
+/// Assembled rather than written, per the module documentation. The value is byte-for-byte
+/// what the scanner looks for; only this file's own source differs.
+const NEXT_LINE: &str = concat!("lanekeep", "-ignore-next-line");
 
-/// The token introducing a directive that covers the whole file.
-const WHOLE_FILE: &str = "lanekeep-ignore-file";
+/// The token introducing a directive that covers the whole file. Assembled for the same
+/// reason as `NEXT_LINE`.
+const WHOLE_FILE: &str = concat!("lanekeep", "-ignore-file");
 
 /// What a directive covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,9 +224,9 @@ pub fn parse(source: &str) -> Suppressions {
 /// Locate a directive token in a line, if it stands alone.
 ///
 /// "Stands alone" means not adjacent to a word character on either side, which is what stops
-/// prose about `lanekeep-ignore-next-line-ish` from matching. `lanekeep-ignore-file` is
-/// checked first because it is not a prefix of the other, so order is only a matter of
-/// finding the earlier one.
+/// prose about a token with `-ish` appended from matching. Neither token is a prefix of the
+/// other, so which one is looked for first does not matter — only which one sits earlier in
+/// the line.
 fn find_directive(text: &str) -> Option<(Scope, usize)> {
     let next_line = standalone(text, NEXT_LINE).map(|at| (Scope::NextLine, at));
     let whole_file = standalone(text, WHOLE_FILE).map(|at| (Scope::File, at));
@@ -229,8 +246,8 @@ fn standalone(text: &str, token: &str) -> Option<usize> {
         let after = text[at + token.len()..].chars().next();
 
         let bounded = !before.is_some_and(is_word)
-            // A trailing `-` would make this `lanekeep-ignore-file-later`, which is not the
-            // directive and must not be treated as one.
+            // A trailing `-` would make this the token with `-later` appended, which is not
+            // the directive and must not be treated as one.
             && !after.is_some_and(|c| is_word(c) || c == '-');
 
         if bounded {
@@ -379,6 +396,11 @@ fn from_unix_days(days: i64) -> Date {
 mod tests {
     use super::*;
 
+    // Every fixture here builds its directive from `NEXT_LINE` or `WHOLE_FILE` rather than
+    // writing the token out. The bytes handed to `parse` are unchanged — which is the point,
+    // since these tests are about scanning bytes — while this file stays free of directives.
+    // See the module documentation.
+
     fn rule(id: &str) -> RuleId {
         id.parse().expect("valid id")
     }
@@ -407,7 +429,9 @@ mod tests {
 
     #[test]
     fn a_next_line_directive_parses() {
-        let found = only("// lanekeep-ignore-next-line local/a reason: legacy\nminWidth: 44,\n");
+        let found = only(&format!(
+            "// {NEXT_LINE} local/a reason: legacy\nminWidth: 44,\n"
+        ));
         assert_eq!(found.scope, Scope::NextLine);
         assert_eq!(found.rules, vec![rule("local/a")]);
         assert_eq!(found.reason, "legacy");
@@ -417,14 +441,18 @@ mod tests {
 
     #[test]
     fn a_file_directive_parses() {
-        let found = only("// lanekeep-ignore-file local/a reason: generated fixture\n");
+        let found = only(&format!(
+            "// {WHOLE_FILE} local/a reason: generated fixture\n"
+        ));
         assert_eq!(found.scope, Scope::File);
         assert_eq!(found.reason, "generated fixture");
     }
 
     #[test]
     fn several_rules_may_be_named() {
-        let found = only("// lanekeep-ignore-next-line local/a, local/b lanekeep/c reason: x\n");
+        let found = only(&format!(
+            "// {NEXT_LINE} local/a, local/b lanekeep/c reason: x\n"
+        ));
         assert_eq!(
             found.rules,
             vec![rule("local/a"), rule("local/b"), rule("lanekeep/c")]
@@ -433,9 +461,9 @@ mod tests {
 
     #[test]
     fn an_expiry_parses_and_leaves_the_reason_intact() {
-        let found = only(
-            "// lanekeep-ignore-file local/a reason: waiting on the rewrite expires: 2026-12-31\n",
-        );
+        let found = only(&format!(
+            "// {WHOLE_FILE} local/a reason: waiting on the rewrite expires: 2026-12-31\n"
+        ));
         assert_eq!(found.reason, "waiting on the rewrite");
         assert_eq!(
             found.expires,
@@ -450,34 +478,36 @@ mod tests {
     #[test]
     fn a_reason_may_contain_a_colon() {
         // Splitting on the `reason:` keyword rather than on whitespace is what allows this.
-        let found = only("// lanekeep-ignore-file local/a reason: see ticket ABC-1: the API\n");
+        let found = only(&format!(
+            "// {WHOLE_FILE} local/a reason: see ticket ABC-1: the API\n"
+        ));
         assert_eq!(found.reason, "see ticket ABC-1: the API");
     }
 
     #[test]
     fn a_missing_reason_is_malformed() {
         // The failure this module exists for: a directive that looks like it works.
-        let text = problem("// lanekeep-ignore-next-line local/a\n");
+        let text = problem(&format!("// {NEXT_LINE} local/a\n"));
         assert!(text.contains("no `reason:`"), "{text}");
     }
 
     #[test]
     fn an_empty_reason_is_malformed() {
-        let text = problem("// lanekeep-ignore-next-line local/a reason:   \n");
+        let text = problem(&format!("// {NEXT_LINE} local/a reason:   \n"));
         assert!(text.contains("empty"), "{text}");
     }
 
     #[test]
     fn naming_no_rules_is_malformed() {
         // A blanket suppression would hide violations nobody chose to accept.
-        let text = problem("// lanekeep-ignore-next-line reason: everything\n");
+        let text = problem(&format!("// {NEXT_LINE} reason: everything\n"));
         assert!(text.contains("names no rules"), "{text}");
     }
 
     #[test]
     fn a_bare_rule_id_is_malformed() {
         // Namespacing is a one-way door, and a bare id here would silently silence nothing.
-        let text = problem("// lanekeep-ignore-next-line no-default-export reason: x\n");
+        let text = problem(&format!("// {NEXT_LINE} no-default-export reason: x\n"));
         assert!(text.contains("not a rule id"), "{text}");
         assert!(text.contains("namespaced"), "{text}");
     }
@@ -494,7 +524,7 @@ mod tests {
             "2026-12-32",
         ] {
             let text = problem(&format!(
-                "// lanekeep-ignore-file local/a reason: x expires: {bad}\n"
+                "// {WHOLE_FILE} local/a reason: x expires: {bad}\n"
             ));
             assert!(text.contains("unreadable"), "`{bad}` gave: {text}");
         }
@@ -504,11 +534,11 @@ mod tests {
     fn prose_mentioning_the_directive_does_not_match() {
         // §10: the directive must be a standalone token.
         for prose in [
-            "// use lanekeep-ignore-next-liner for this\n",
-            "// see lanekeep-ignore-file-format docs\n",
-            "// xlanekeep-ignore-file local/a reason: x\n",
+            format!("// use {NEXT_LINE}r for this\n"),
+            format!("// see {WHOLE_FILE}-format docs\n"),
+            format!("// x{WHOLE_FILE} local/a reason: x\n"),
         ] {
-            let found = parse(prose);
+            let found = parse(&prose);
             assert!(
                 found.is_empty(),
                 "prose matched as a directive: {prose:?} -> {found:?}"
@@ -518,19 +548,19 @@ mod tests {
 
     #[test]
     fn a_directive_is_found_wherever_it_sits_on_the_line() {
-        let found = only("const a = 1; // lanekeep-ignore-next-line local/a reason: x\n");
+        let found = only(&format!("const a = 1; // {NEXT_LINE} local/a reason: x\n"));
         assert_eq!(found.line, 1);
         assert!(found.column > 1, "column should point at the directive");
     }
 
     #[test]
     fn several_directives_in_one_file_all_parse() {
-        let found = parse(
-            "// lanekeep-ignore-file local/a reason: one\n\
+        let found = parse(&format!(
+            "// {WHOLE_FILE} local/a reason: one\n\
              const x = 1;\n\
-             // lanekeep-ignore-next-line local/b reason: two\n\
-             const y = 2;\n",
-        );
+             // {NEXT_LINE} local/b reason: two\n\
+             const y = 2;\n"
+        ));
         assert_eq!(found.valid.len(), 2);
         assert_eq!(found.valid[0].line, 1);
         assert_eq!(found.valid[1].line, 3);
@@ -539,11 +569,11 @@ mod tests {
     #[test]
     fn a_malformed_directive_does_not_stop_the_others() {
         // One bad comment must not stop a file from being checked.
-        let found = parse(
-            "// lanekeep-ignore-next-line local/a\n\
+        let found = parse(&format!(
+            "// {NEXT_LINE} local/a\n\
              const x = 1;\n\
-             // lanekeep-ignore-next-line local/b reason: fine\n",
-        );
+             // {NEXT_LINE} local/b reason: fine\n"
+        ));
         assert_eq!(found.valid.len(), 1);
         assert_eq!(found.malformed.len(), 1);
     }
@@ -552,7 +582,7 @@ mod tests {
 
     #[test]
     fn next_line_covers_the_following_line_only() {
-        let found = only("// lanekeep-ignore-next-line local/a reason: x\nconst y = 1;\n");
+        let found = only(&format!("// {NEXT_LINE} local/a reason: x\nconst y = 1;\n"));
         assert!(found.covers(&rule("local/a"), 2));
         assert!(!found.covers(&rule("local/a"), 1), "not its own line");
         assert!(
@@ -563,14 +593,14 @@ mod tests {
 
     #[test]
     fn a_directive_covers_only_the_rules_it_names() {
-        let found = only("// lanekeep-ignore-next-line local/a reason: x\n");
+        let found = only(&format!("// {NEXT_LINE} local/a reason: x\n"));
         assert!(found.covers(&rule("local/a"), 2));
         assert!(!found.covers(&rule("local/b"), 2));
     }
 
     #[test]
     fn file_scope_covers_every_line() {
-        let found = only("// lanekeep-ignore-file local/a reason: x\n");
+        let found = only(&format!("// {WHOLE_FILE} local/a reason: x\n"));
         for line in [1, 2, 500] {
             assert!(found.covers(&rule("local/a"), line));
         }
@@ -579,12 +609,12 @@ mod tests {
     #[test]
     fn covering_reports_which_directive_matched() {
         // The index, not a boolean, so a caller can tell which directives went unused.
-        let found = parse(
-            "// lanekeep-ignore-next-line local/a reason: one\n\
+        let found = parse(&format!(
+            "// {NEXT_LINE} local/a reason: one\n\
              const x = 1;\n\
-             // lanekeep-ignore-next-line local/b reason: two\n\
-             const y = 2;\n",
-        );
+             // {NEXT_LINE} local/b reason: two\n\
+             const y = 2;\n"
+        ));
         assert_eq!(found.covering(&rule("local/a"), 2), Some(0));
         assert_eq!(found.covering(&rule("local/b"), 4), Some(1));
         assert_eq!(found.covering(&rule("local/c"), 2), None);
