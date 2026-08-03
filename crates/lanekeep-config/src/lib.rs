@@ -30,6 +30,8 @@ use thiserror::Error;
 /// A 32-byte content hash.
 pub type Hash = [u8; 32];
 
+mod json;
+
 /// Render a hash the way it appears in diagnostics and cache paths.
 #[must_use]
 pub fn hex(hash: &Hash) -> String {
@@ -245,6 +247,28 @@ const EXTRACT: &str = r"
     })()
 ";
 
+/// The entry module the loader evaluates, whichever format the config is written in.
+///
+/// Both formats converge here, and that is the point: a JSON config is compiled into the
+/// same module a TypeScript one is imported by, so extraction, validation, hashing and the
+/// cache key never learn which format they came from. Two loaders would be two behaviors
+/// eventually, and the divergence would show up as a rule that runs under one form and not
+/// the other.
+fn entry_source(root: &RuleRoot, config_path: &Path, display: &str) -> Result<String, ConfigError> {
+    if json::is_json(config_path) {
+        return json::entry_source(config_path);
+    }
+
+    let specifier =
+        relative_specifier(root.path(), config_path).ok_or_else(|| ConfigError::Unreadable {
+            path: display.to_owned(),
+            detail: "the config file must sit inside the rules root".to_owned(),
+        })?;
+    Ok(format!(
+        "import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n"
+    ))
+}
+
 /// Evaluate the config module into a sandbox, leaving the rule objects reachable.
 ///
 /// Separate from [`load`] because every worker needs the ruleset present in its own engine
@@ -261,15 +285,8 @@ pub fn evaluate_into(
     config_path: &Path,
 ) -> Result<(), ConfigError> {
     let display = config_path.display().to_string();
-    let specifier =
-        relative_specifier(root.path(), config_path).ok_or_else(|| ConfigError::Unreadable {
-            path: display.clone(),
-            detail: "the config file must sit inside the rules root".to_owned(),
-        })?;
-
     let entry = root.path().join(ENTRY);
-    let source =
-        format!("import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n");
+    let source = entry_source(root, config_path, &display)?;
 
     sandbox
         .eval_module(&entry.display().to_string(), &source)
@@ -288,15 +305,8 @@ pub fn evaluate_into(
 pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Config, ConfigError> {
     let display = config_path.display().to_string();
 
-    let specifier =
-        relative_specifier(root.path(), config_path).ok_or_else(|| ConfigError::Unreadable {
-            path: display.clone(),
-            detail: "the config file must sit inside the rules root".to_owned(),
-        })?;
-
     let entry = root.path().join(ENTRY);
-    let source =
-        format!("import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n");
+    let source = entry_source(root, config_path, &display)?;
     sandbox
         .eval_module(&entry.display().to_string(), &source)
         .map_err(|e| ConfigError::Evaluation {
@@ -610,6 +620,8 @@ pub fn sandbox_for(
 #[must_use]
 pub fn default_config_paths(project_root: &Path) -> Vec<PathBuf> {
     [
+        // First, so a project holding both is not silently checked against the other one.
+        "lanekeep.json",
         "lanekeep.config.ts",
         "lanekeep.config.js",
         "lanekeep.config.mjs",
