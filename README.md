@@ -12,7 +12,7 @@ lanekeep enforces the conventions that live in your team's heads and your review
 the ones a language model cannot infer from the code it is shown. Every rule is a codified answer
 to **"the agent keeps doing this wrong."**
 
-Checks **TypeScript, JavaScript, Python and Go**. Ships as a single static binary with no runtime
+Checks **TypeScript, JavaScript, Python, Go and Rust**. Ships as a single static binary with no runtime
 dependency.
 
 ---
@@ -83,40 +83,53 @@ lanekeep is not a linter in the ESLint sense. ESLint enforces language-level cor
 enforces *project-specific* conventions. The two do not overlap much, and lanekeep is not a
 replacement for either your linter or your formatter.
 
-Rules are TypeScript programs, written in the same language as the code they inspect:
+Rules are TypeScript programs. Here is one checking **Go**:
 
 ```ts
 import { defineRule } from 'lanekeep'
 
 export default defineRule({
-  id: 'local/no-numeric-sizes',
+  id: 'local/no-fmt-println',
+  language: 'go',
   severity: 'error',
 
   card: {
-    message: 'Literal numeric size inside makeStyles',
-    remediation: 'Use theme.spacing.*, theme.borderRadius.* or theme.borders.*',
-    examples: { bad: 'padding: 12', good: 'padding: theme.spacing.md' },
+    message: 'fmt.Println in library code',
+    remediation: 'use log/slog, so the output has a level and a destination',
+    examples: {
+      bad: 'fmt.Println("saved", count)',
+      good: 'slog.Info("saved", "count", count)',
+    },
   },
 
   // Matched in Rust, at native speed. Your code runs only on matches.
   query: `
-    (pair
-      key: (property_identifier) @prop
-      value: [(number) (unary_expression operand: (number))] @value) @match
+    (call_expression
+      function: (selector_expression
+        operand: (identifier) @pkg
+        field: (field_identifier) @fn)) @call
   `,
 
   check(ctx, m) {
-    if (!/^(padding|margin|gap|borderRadius)/.test(ctx.text(m.prop))) return
-    if (Number(ctx.text(m.value)) === 0) return
+    if (ctx.text(m.pkg) !== 'fmt') return
+    if (ctx.text(m.fn) !== 'Println') return
 
-    const call = ctx.closestAncestor(m.match, '(call_expression function: (identifier) @f)')
-    if (!call) return
-    if (!ctx.resolvesToImport(call.f, { module: '@rneui/themed', name: 'makeStyles' })) return
+    // The line that makes this a rule rather than a grep: a local variable
+    // named `fmt` is not the standard library package.
+    if (ctx.bindingKind(m.pkg) !== 'import') return
 
-    ctx.report(m.match)
+    ctx.report(m.call)
   },
 })
 ```
+
+**Rules are TypeScript whatever they check** — that is one embedded language, not a JavaScript
+bias. Rules need to be *programs*, because the conventions worth enforcing are too specific for
+any fixed vocabulary of predicates, and one language keeps the sandbox, the cache and the host
+API single-implementation.
+
+**Configuration is not TypeScript.** `lanekeep.json` is plain data, so a Go or Python team never
+writes a `.ts` file except when authoring an actual rule.
 
 `check` is ordinary TypeScript. Loop, accumulate state, build data structures, read other files,
 import shared helpers — there is no expressiveness ceiling and no DSL to learn beyond the query
@@ -132,22 +145,24 @@ they are what gets fed back to whoever has to act on the violation — increasin
 
 ## Supported languages
 
-| Language | id | Extensions |
+Each guide covers installing lanekeep in that ecosystem, what to put in the config, which
+built-in rules apply, a worked custom rule, and the resolution behavior specific to it.
+
+| Language | Guide | Extensions |
 | --- | --- | --- |
-| TypeScript | `typescript` | `.ts`, `.mts`, `.cts` |
-| TSX | `tsx` | `.tsx` |
-| JavaScript | `javascript` | `.js`, `.mjs`, `.cjs`, `.jsx` |
-| Python | `python` | `.py`, `.pyi` |
-| Go | `go` | `.go` |
+| Go | **[Go guide](https://github.com/fmsouza/lanekeep/wiki/Go)** | `.go` |
+| Python | **[Python guide](https://github.com/fmsouza/lanekeep/wiki/Python)** | `.py`, `.pyi` |
+| Rust | **[Rust guide](https://github.com/fmsouza/lanekeep/wiki/Rust)** | `.rs` |
+| TypeScript / JavaScript | **[TypeScript and JavaScript guide](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript)** | `.ts`, `.mts`, `.cts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx` |
 
-Each carries syntactic binding resolution, so a rule can ask where a name came from rather than
-matching text: `ctx.bindingKind`, `ctx.resolvesToImport` and `ctx.isShadowed` answer for all five.
-That is what stops a rule about an imported `makeStyles` from firing on a local variable of the
-same name.
+Every one carries syntactic binding resolution, so a rule can ask where a name came from rather
+than matching text — `ctx.bindingKind`, `ctx.resolvesToImport` and `ctx.isShadowed` answer for
+all of them.
 
-**The grammar is chosen by the file, not by the rule.** A rule declares which languages it applies
-to and does not run on files of any other language. A rule that omits `language` defaults to
-`['typescript', 'tsx']`.
+**The grammar is chosen by the file, not by the rule.** A rule declares which languages it
+applies to and does not run on files of any other, defaulting to `['typescript', 'tsx']` when it
+says nothing. That default is the one thing to get right on a non-TypeScript rule: omit
+`language` on a Go rule and it silently never fires.
 
 ## Configuration
 
@@ -183,7 +198,7 @@ Rule ids are namespaced. `lanekeep/` is reserved for built-ins and `local/` need
 declaration; any other prefix must be listed in `namespaces`, so a typo in an id is an error
 rather than a rule that silently never runs.
 
-Eight rules ship built in — four for TypeScript and JavaScript, two for Python, two for Go. See
+Ten rules ship built in — four for TypeScript and JavaScript, two each for Python, Go and Rust. See
 [`docs/built-in-rules.md`](docs/built-in-rules.md) for what each one checks and its options.
 
 <details>
@@ -250,35 +265,20 @@ parser works even when something fails.
 able to tell "your code has problems" from "the tool is broken". `--warn-only` reports violations
 but exits `0`, for a phased rollout.
 
-## In CI
-
-```yaml
-- name: lanekeep
-  run: npx lanekeep check --format sarif > lanekeep.sarif
-- uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: lanekeep.sarif
-```
-
-As a pre-commit hook, `--staged` is the one you want:
+## In CI, editors and agents
 
 ```bash
-lanekeep check --staged
+lanekeep check --staged                 # pre-commit
+lanekeep check --format sarif           # GitHub code scanning
+lanekeep server                         # LSP, for any editor
+lanekeep server --protocol mcp          # MCP, for an agent host
 ```
 
-## In your editor, and for agents
+MCP exposes three tools — `lanekeep_check`, `lanekeep_rules`, `lanekeep_explain` — so an agent
+can ask what it broke and what the rule wants without shelling out and parsing text.
 
-```bash
-lanekeep server
-```
-
-One binary speaking two protocols over stdio, both JSON-RPC 2.0:
-
-- **LSP** — diagnostics as you edit, for any editor with a language client.
-- **MCP** — three tools (`lanekeep_check`, `lanekeep_rules`, `lanekeep_explain`) for agent hosts,
-  so an agent can ask what it broke and what the rule wants without shelling out.
-
-Nothing is printed to stdout that is not a protocol message.
+Worked examples for each, including SARIF upload and adopting on an existing codebase, are in
+**[CI and Editors](https://github.com/fmsouza/lanekeep/wiki/CI-and-Editors)**.
 
 ## How it stays fast with programmable rules
 
@@ -324,6 +324,18 @@ fetches the real binary on first use, verifies it against the release's publishe
 caches it. Set `LANEKEEP_BINARY` to an already-installed lanekeep and it fetches nothing.
 
 ## Documentation
+
+**The [wiki](https://github.com/fmsouza/lanekeep/wiki) is the place to start** — it is task-shaped and organized by language.
+
+| Page | Purpose |
+| --- | --- |
+| [Getting Started](https://github.com/fmsouza/lanekeep/wiki/Getting-Started) | Install and catch something, in about a minute |
+| [Configuration](https://github.com/fmsouza/lanekeep/wiki/Configuration) | `lanekeep.json`, every field |
+| [Writing Rules](https://github.com/fmsouza/lanekeep/wiki/Writing-Rules) | Rule anatomy and the full host API |
+| [CI and Editors](https://github.com/fmsouza/lanekeep/wiki/CI-and-Editors) | Pre-commit, GitHub Actions, LSP, MCP |
+| [Go](https://github.com/fmsouza/lanekeep/wiki/Go) · [Python](https://github.com/fmsouza/lanekeep/wiki/Python) · [Rust](https://github.com/fmsouza/lanekeep/wiki/Rust) · [TypeScript and JavaScript](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript) | Per-language guides |
+
+In-repo, versioned with the code:
 
 | Document | Purpose |
 | --- | --- |

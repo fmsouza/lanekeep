@@ -93,6 +93,7 @@ lanekeep/
     lanekeep-lang-js/    # TS/TSX/JS/JSX grammars + binding resolution
     lanekeep-lang-python/ # Python grammar + binding resolution
     lanekeep-lang-go/    # Go grammar + binding resolution
+    lanekeep-lang-rust/  # Rust grammar + binding resolution
     lanekeep-languages/  # the set of supported languages, assembled in one place
     lanekeep-config/     # schema, config loading, canonicalization + hashing
     lanekeep-cache/      # content-addressed store with dependency tracking
@@ -698,7 +699,7 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 ## 16. Milestones
 
-**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python and Go; ships eight built-in rules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
+**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships ten built-in rules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
 Two things named here are still outstanding, both stated where they belong rather than only here: the §15 performance budgets are targets that are not met, and `packages/lanekeep` (§3) is not built, so rule authors have no editor types yet.
 
@@ -718,7 +719,7 @@ MCP exposes three tools, one per thing the CLI already does: `lanekeep_check`, `
 
 Diagnostics publish on open and on save, not per keystroke: a check reads from disk, and the buffer an editor holds mid-edit is not there yet. Publishing against stale bytes puts squiggles under the wrong characters, which is worse than a save-length delay on a warm cache.
 
-**M4 — a second language, then a third. Done.** Python was the cheapest proof that the `Language` trait abstraction actually holds, and it held: `lanekeep-core` is untouched. `lanekeep-lang-python` implements `Language` and `BindingResolver` and nothing above it needed to know.
+**M4 — a second language, then a third and a fourth. Done.** Python was the cheapest proof that the `Language` trait abstraction actually holds, and it held: `lanekeep-core` is untouched. `lanekeep-lang-python` implements `Language` and `BindingResolver` and nothing above it needed to know.
 
 Two things did change, and both are the abstraction working rather than leaking. `lanekeep-lang` gained binding kinds — `assignment`, `loop`, `context-manager`, `comprehension` — because Python binds names in ways JavaScript has no word for, and answering `ctx.bindingKind` with `var` for all three would have been untrue. And `lanekeep-languages` was added as the composition root: the CLI and the testkit both need to know which languages exist, and no crate below them can hold that answer without inverting the dependency the trait exists to create.
 
@@ -727,5 +728,7 @@ Go followed, and is the stronger evidence: the second language could have been a
 **Distribution followed each language.** A checker that reads Python should be installable by a Python project on its own terms, and the same for Go, rather than telling either team to install Node. PyPI takes one platform wheel per target and needs no launcher, because a wheel names its platform in its own filename. Go needed one, because Go's tooling installs and pins only things written in Go — and it needed no publish step at all, because a Go module version *is* a git tag. [`docs/releasing.md`](releasing.md) has both.
 
 Building the PyPI lane surfaced a bug none of the other channels would have: the Linux binaries had inherited a glibc 2.39 floor from the runner image, so they did not start on Ubuntu 22.04, Debian 12 or RHEL 9. A wheel is the first artifact that must *name* its floor, which is why it surfaced there. The floor is now pinned at 2.17 in the build and asserted against the binary before anything is tagged.
+
+Rust is the fourth, and the one whose *patterns* do the most work. The other three bind a name by writing it; Rust binds several at once through destructuring, and the shape doing it also names constructors that are matched rather than bound — `let Some(v) = opt` binds `v` and not `Some`. Getting that wrong is worse than resolving nothing, because every constructor in a file starts resolving to a local and rules that ask whether a name is an import begin answering no. Two more binding kinds were added, `module` and `trait`, on the same test as before: the nearest existing kind would have been untrue.
 
 What Python does *not* share with JavaScript is the interesting part. It has no block scope, so resolving a name means walking a scope's whole body rather than its direct children — the JavaScript resolver can look at direct children only because a block *is* a scope there. And a class body is opaque to functions nested inside it, so `def m(self): return LIMIT` does not see a class-level `LIMIT`. Neither rule could be expressed by reusing the JavaScript resolver, which is the evidence that mattered: the trait is the boundary, not a shared implementation.

@@ -65,6 +65,17 @@ pub enum BindingKind {
     Receiver,
     /// A generic type parameter — the `T` in `func F[T any]()` or `type S[T any] struct{}`.
     TypeParam,
+
+    // --- Rust ----------------------------------------------------------------------------
+    //
+    // Two more, for the same reason as every kind above: the nearest existing one would be a
+    // lie. A module is not a type — it names a namespace, not something a value can be. And
+    // a trait is not a struct; reusing `type` for both would stop a rule asking the one
+    // question it most wants to ask about a trait, which is whether it is one.
+    /// `mod parser;` or `mod parser { ... }`.
+    Module,
+    /// `trait Store { ... }`.
+    Trait,
 }
 
 impl BindingKind {
@@ -86,6 +97,8 @@ impl BindingKind {
             Self::Type => "type",
             Self::Receiver => "receiver",
             Self::TypeParam => "type-param",
+            Self::Module => "module",
+            Self::Trait => "trait",
         }
     }
 }

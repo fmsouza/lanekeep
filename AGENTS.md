@@ -108,6 +108,7 @@ crates/
   lanekeep-lang-js   TS/TSX/JS/JSX grammars, binding resolution
   lanekeep-lang-python  Python grammar, binding resolution
   lanekeep-lang-go      Go grammar, binding resolution
+  lanekeep-lang-rust    Rust grammar, binding resolution
   lanekeep-languages    the set of supported languages, assembled in one place
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
@@ -321,6 +322,21 @@ The mirror-image trap is worth holding at the same time: **a change that ships d
 without touching crate source proposes nothing at all.** The glibc fix lived entirely in build
 tooling, so release-plz saw no package change while every binary it shipped was different. That
 one needs a version bump by hand; `docs/releasing.md` has the steps.
+
+**`gates.fileContains` is an *and*, not an *or*.** Every listed substring has to be present,
+so a rule matching either of two tokens — `unwrap` or `expect` — cannot express its gate as
+`['unwrap', 'expect']`. That rejects any file containing only one of them, which is nearly all
+of them. Nothing fails: the rule loads, the query never runs, and the output reads exactly like
+a codebase with none of the thing in it. There is no *or* form, so a rule with no single
+covering substring omits the gate rather than writing one that is wrong.
+
+**A node handle is an integer and the root's is `0`, so `if (!node)` discards it.** Nodes cross
+into the sandbox as handles rather than objects — one of the one-way doors in §14 — and the
+root is handle zero. A rule written the ordinary JavaScript way, `const parent = ctx.parent(n);
+if (!parent) return`, therefore treats every top-level item as parentless. `no-unwrap` lost its
+whole `#[test]` exemption to this, silently, because the check it skipped only ever *removed*
+violations. Compare against `undefined` explicitly, or read `ctx.ancestors` positionally and
+avoid the question.
 
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,

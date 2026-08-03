@@ -77,6 +77,29 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
+      # Build against the pinned toolchain *without* letting cargo sync its components.
+      #
+      # `rust-toolchain.toml` asks for rustfmt, clippy and rust-src — useful to a contributor,
+      # useless to a release build, and the source of two failures. cargo honors that file by
+      # having rustup add whatever is missing, and rustup refuses with "detected conflict" when
+      # a component's files are on disk but it is not recorded as installed. That is the state
+      # both Linux images now arrive in: `rust-src` on arm64, `clippy-preview` on x86-64.
+      #
+      # `RUSTUP_TOOLCHAIN` makes rustup use the named toolchain directly and skip the file, so
+      # the component install never happens. That is deliberately stronger than making it
+      # succeed — an operation that is not performed cannot conflict, and v0.5.0 has now lost
+      # two release builds to attempts at the weaker version.
+      #
+      # The version is read from the pin, so this cannot drift from the toolchain the rest of
+      # the repository develops against. Setting it to something *other* than the pin is the
+      # trap AGENTS.md documents, and reading the file is what avoids it.
+      - name: Pin the toolchain for this build
+        shell: bash
+        run: |
+          pinned="$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "RUSTUP_TOOLCHAIN=${pinned}" >> "${GITHUB_ENV}"
+          echo "building against ${pinned}, without rust-toolchain.toml's dev components"
+
       # Deliberately uncached, for two reasons. A binary someone will download should be
       # built from a clean tree rather than from whatever a cache happened to hold — a
       # release is the one build where a stale artifact is worst. And `Swatinem/rust-cache`
@@ -131,7 +154,7 @@ jobs:
           "${binary}" --version
           "${binary}" --help > /dev/null
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
           path: |
@@ -151,7 +174,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
 
@@ -198,28 +221,28 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-homebrew-formula.sh "${VERSION}" dist-archives dist-homebrew/lanekeep.rb
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-archives
           path: dist-archives/
           if-no-files-found: error
           retention-days: 7
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: homebrew-formula
           path: dist-homebrew/
           if-no-files-found: error
           retention-days: 7
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-packages
           path: dist-npm/
           if-no-files-found: error
           retention-days: 7
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: python-wheels
           path: dist-wheels/
@@ -249,27 +272,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: npm-packages
           path: dist-npm
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-archives
           path: dist-archives
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: homebrew-formula
           path: dist-homebrew
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: python-wheels
           path: dist-wheels
 
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
