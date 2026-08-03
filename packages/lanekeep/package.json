@@ -1,0 +1,9 @@
+{
+  "name": "lanekeep",
+  "types": "index.d.ts",
+  "typesVersions": {
+    "*": {
+      "*": ["builtin.d.ts"]
+    }
+  }
+}

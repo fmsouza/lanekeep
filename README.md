@@ -138,10 +138,13 @@ that gates it.
 **The card is not documentation.** `message`, `remediation` and `examples` are mandatory, because
 they are what gets fed back to whoever has to act on the violation — increasingly an agent.
 
-> **Editor types are not shipped yet.** `defineRule` and `defineConfig` resolve inside lanekeep's
-> sandbox at run time, so rules execute correctly, but there is no published package supplying
-> TypeScript definitions for the host API — you will not get autocomplete on `ctx` today.
-> [`docs/architecture.md`](docs/architecture.md) §6 documents the full surface in the meantime.
+**Editor types ship with the npm package.** `npm install --save-dev lanekeep` gives you the
+binary *and* TypeScript definitions for the whole host API, so `ctx` autocompletes and a typo'd
+method is a compile error rather than a rule that throws in the sandbox. They are checked
+against the engine's own registration, so they cannot drift from what actually exists.
+
+A Go, Python or Rust project that wants them can add the npm package as a dev dependency
+purely for authoring — nothing about the checker needs Node.
 
 ## Supported languages
 
