@@ -659,19 +659,34 @@ Targets, gated in CI. Measured by `benches/corpus.rs` over a synthetic 2,000-fil
 
 | Scenario | Budget | Measured (dev machine) |
 |---|---|---|
-| Cold full run, ~2k files, ~20 rules | < 800 ms | ~1.5 s |
-| Warm run, no changes | < 25 ms | ~56 ms |
-| Warm run, 1 changed file, full discovery | — | ~56 ms |
-| Warm run, 1 changed file, `--staged` | < 10 ms | ~32 ms |
+| Cold full run, ~2k files, ~20 rules | < 800 ms | ~3.3 s |
+| Warm run, no changes | < 25 ms | ~65 ms |
+| Warm run, 1 changed file, full discovery | — | ~60 ms |
+| Warm run, 1 changed file, `--staged` | < 10 ms | ~30 ms |
+
+These are noisy to within about 10% between runs on the same machine, so read them as
+magnitudes rather than figures.
 
 **Nothing meets its budget yet, and the budgets stand.** They are targets to aim at, not release gates — a number chosen before anything existed does not get to decide whether the thing that exists is worth shipping. What they are for is direction: they say which way is better, and the gap between them and the measurements says how much room is left.
 
 Measuring them is not grounds for moving them. The levers below are the answer, in that order, and relaxing a budget remains the last resort — the point of a target you have not hit is that it keeps pointing.
 
-Two things the first measurement already bought:
+**The earlier numbers in this table were stale, and understated the gap by about half.** They
+were taken before Python, Go and Rust support existed; three more grammars means more rules
+compiling more queries, and cold went from ~1.5 s to ~3.3 s without anyone noticing. Worth
+holding on to generally: a "measured" column is a claim with a date on it, and this one had
+drifted for four releases while being read as current.
+
+Three things measurement has bought so far:
 
 - **A warm run built a sandbox per worker and evaluated every rule module into it**, then executed no JavaScript because every file was a cache hit. Making the sandbox lazy — built on the first match that actually needs one — took a warm run from ~263 ms to ~56 ms. §7.3's claim that a warm run runs no JavaScript was true; it was paying to be *able* to.
 - **A subset run discarded the cache entries for every file it did not look at.** `--staged` left the next full run cold, which is the opposite of what an incremental entry point is for. A run now prunes only when it saw the whole corpus.
+
+- **Compiling queries cost more than the entire warm run.** `Engine::prepare` was measured at ~88 ms against a ~55 ms warm run: a tree-sitter query takes a couple of milliseconds to compile, a rule compiles one per language it declares, and twenty rules over two languages is forty compilations before a single file is read. Compiling them in parallel took warm from ~102 ms to ~65 ms and `--staged` from ~75 ms to ~30 ms.
+
+  **None of the levers listed below named this**, which is the more useful lesson: the analysis reached for the parts of the design that were interesting — the sandbox, the cache format, the staleness check — and missed a plain constant cost sitting in front of them. The first profile of a warm run showed setup outweighing work, and that was not a hypothesis anyone had written down.
+
+  It is deliberately *not* lazy. Compiling on first use would take warm setup to nearly zero and would cost what the §16 comment describes: a broken query is reported at preparation, naming its rule, rather than staying silent until some file happens to need it. Parallelism buys most of the win without trading that away.
 
 **Why "1 changed file, full discovery" has no budget.** Finding which file changed means reading and hashing all of them, so that scenario is the row above plus one file's work and can never beat it. §15's 10 ms describes the pre-commit workflow, and the pre-commit workflow is `--staged` — which is where the budget now sits.
 
