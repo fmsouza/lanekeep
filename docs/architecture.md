@@ -114,7 +114,11 @@ lanekeep/
 
 `lanekeep-languages` is the composition root for languages. Both the CLI and the testkit need to know which languages exist, and no crate below them can hold that answer without inverting the dependency the `Language` trait exists to create.
 
-**`packages/lanekeep` is not built yet**, and it is the one piece of this design still outstanding. The intent is an npm package shipping the `defineRule`/`defineConfig` helpers and — more importantly — TypeScript definitions for the whole host API, so rules are autocompleted and type-checked in the author's editor. Today `defineRule` and `defineConfig` resolve inside the sandbox at run time, which means rules *execute* correctly with nothing installed but gives an author no types to write against. §6 documents the surface by hand in the meantime.
+`packages/lanekeep` holds the TypeScript definitions for the whole host API, plus the `defineRule`/`defineConfig` helpers, so rules are autocompleted and type-checked in the author's editor. They ship *inside* the `lanekeep` npm package rather than as one of their own, because `lanekeep` is the specifier a rule imports from — types under any other name would be types nobody's editor finds.
+
+Nothing there runs in Node: lanekeep evaluates rules in its own sandbox, where `lanekeep` resolves to a host module. The shipped `index.js` exists so a tool that *does* load a rule under Node finds something coherent, and its `defineRule` is the same identity function the sandbox provides.
+
+The definitions are asserted against this crate's own registration in `lanekeep-js/tests/host_types.rs`, in both directions. A definition that drifts from the engine is worse than none — it produces confident autocomplete for a method that throws at run time.
 
 ### The Language trait
 
@@ -246,7 +250,7 @@ M1 measured handler execution at roughly three times query matching on a synthet
 
 ### 5.2 TypeScript
 
-Rule modules are TypeScript. Types are stripped before evaluation — a syntactic transform, not a type check. Rules are *intended* to be type-checked in the author's editor against types shipped in `packages/lanekeep`, which is not built yet — see §3. lanekeep itself never type-checks, because doing so would mean shipping a TypeScript compiler and paying its cost on every run.
+Rule modules are TypeScript. Types are stripped before evaluation — a syntactic transform, not a type check. Rules are type-checked in the author's editor against the types shipped in `packages/lanekeep` — see §3. lanekeep itself never type-checks, because doing so would mean shipping a TypeScript compiler and paying its cost on every run.
 
 This is a deliberate division: the authoring experience is fully typed, the runtime is not.
 
@@ -701,7 +705,7 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 **Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships ten built-in rules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
-Two things named here are still outstanding, both stated where they belong rather than only here: the §15 performance budgets are targets that are not met, and `packages/lanekeep` (§3) is not built, so rule authors have no editor types yet.
+One thing named here is still outstanding, and it is stated where it belongs rather than only here: the §15 performance budgets are targets that are not met.
 
 **M0 — walking skeleton. Done.** Workspace, config loading, discovery, tree-sitter TS/TSX, query compilation, the embedded engine with the §6 host API, human + json reporters, `RuleTester`. Acceptance: the built-in rules and a representative set of project-authored rules run end-to-end against the fixture corpus, with snapshot-verified output — every reporter is snapshotted in `lanekeep-report/tests/snapshots.rs`, and the built-in rules are driven through the binary over real corpora in `lanekeep-cli/tests/`.
 

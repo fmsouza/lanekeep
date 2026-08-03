@@ -83,6 +83,42 @@ if [ "$(uname -s 2>/dev/null || echo unknown)" != "unknown" ] &&
     "$([ -x "${out}/@lanekeep/linux-x64/bin/lanekeep" ] && echo 0 || echo 1)"
 fi
 
+# --- the authoring types ship with the launcher -----------------------------------------------
+#
+# `lanekeep` is the name a rule imports from, so the types have to live under that name for an
+# editor to find them. Shipping them anywhere else would give autocomplete to nobody.
+#
+# Placed here rather than at the end of the file on purpose: the negative test below empties
+# `${out}` deliberately, and checks written after it inspect a directory that is gone. Which
+# they did, at first — every one of them "failed" against nothing.
+for file in index.js index.d.ts builtin.d.ts; do
+  check "the launcher ships ${file}" "1" \
+    "$([ -f "${out}/lanekeep/${file}" ] && echo 1 || echo 0)"
+done
+
+check "package.json points at the types" "index.d.ts" \
+  "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("types",""))' \
+    "${out}/lanekeep/package.json")"
+
+# npm publishes only what `files` lists. A definition present in the directory and absent from
+# that list never reaches anyone, and nothing else would say so — the package installs fine and
+# the editor simply stays quiet.
+#
+# Read from the parsed array rather than grepped: every one of these names also appears in
+# `types` or `typesVersions`, so a substring count answers two and proves nothing.
+check "the types are in the published file list" "" \
+  "$(python3 -c '
+import json, sys
+listed = set(json.load(open(sys.argv[1])).get("files", []))
+print(", ".join(sorted({"index.js", "index.d.ts", "builtin.d.ts"} - listed)))
+' "${out}/lanekeep/package.json")"
+
+# Every specifier resolves through builtin.d.ts, the bare one included, so it has to re-export
+# index — otherwise `import { defineRule } from 'lanekeep'` lands on a file without it. That is
+# exactly how it failed before a compile test caught it.
+check "the subpath types re-export the main ones" "1" \
+  "$(grep -c "export \* from './index'" "${out}/lanekeep/builtin.d.ts" | tr -d ' ')"
+
 # --- a missing binary fails loudly ------------------------------------------------------
 rm -rf "${out}"
 missing="${work}/partial"

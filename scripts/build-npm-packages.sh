@@ -119,5 +119,17 @@ if missing:
     raise SystemExit(1)
 PY
 
+# The authoring package's types travel with the launcher rather than as a package of their
+# own. `lanekeep` is the name a rule imports from — `import { defineRule } from 'lanekeep'` —
+# so the types have to live under that name for an editor to find them, and a second package
+# would be a second thing to install for no gain.
+#
+# Nothing here runs in Node: lanekeep evaluates rules in its own sandbox, where `lanekeep`
+# resolves to a host module. `index.js` exists so a tool that *does* load a rule under Node
+# finds something coherent, and `index.d.ts` is what gives an author autocomplete.
+for types in index.js index.d.ts builtin.d.ts; do
+  cp "${repo_root}/packages/lanekeep/${types}" "${out}/lanekeep/${types}"
+done
+
 cp "${repo_root}/README.md" "${out}/lanekeep/README.md"
 echo "packaged lanekeep (launcher) with ${built} platform package(s) at ${version}"
