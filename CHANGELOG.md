@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/fmsouza/lanekeep/compare/v0.4.0...v0.5.0) - 2026-08-03
+
+### Added
+
+- *(lang)* support Rust ([#78](https://github.com/fmsouza/lanekeep/pull/78))
+
+  Rust joins TypeScript, JavaScript, Python and Go. Two built-in rules ship with it:
+  `lanekeep/no-glob-import` and `lanekeep/no-unwrap`.
+
+- *(config)* configure in JSON, and scaffold for the language found ([#72](https://github.com/fmsouza/lanekeep/pull/72))
+
+  **`lanekeep.json` is the new config format.** Rules are still TypeScript — that is what
+  makes them programs — but saying *which* rules to run is data, and a Go, Python or Rust
+  team should not have to write a `.ts` file for it. The config carries a `$schema` key, so
+  editors offer completion and validation with nothing installed.
+
+  `lanekeep init` now detects the project from its manifest and scaffolds to match: the right
+  include glob, a starter rule in that language, and a built-in worth having on.
+
+  `lanekeep.config.ts` still works and is unchanged. Both formats compile to the same thing
+  before anything reads them, so they cannot differ in behavior.
+
+### Changed
+
+- **`BindingKind` gained two variants**: `module` and `trait`, which Rust needs and the
+  earlier languages had no word for. Adding a variant to a public enum breaks an exhaustive
+  `match` downstream, which is why this is 0.5.0 rather than 0.4.1.
+
+  No effect on rule authors: `ctx.bindingKind` returns strings, and the new ones are only ever
+  produced for Rust files. Only a Rust crate matching on `lanekeep_lang::BindingKind` needs a
+  new arm.
+
+### Documentation
+
+- Per-language guides now live in the [wiki](https://github.com/fmsouza/lanekeep/wiki), and
+  the README points at them rather than being written around TypeScript
+  ([#76](https://github.com/fmsouza/lanekeep/pull/76)).
+
 ## [0.4.0](https://github.com/fmsouza/lanekeep/compare/v0.3.2...v0.4.0) - 2026-08-03
 
 ### Added
