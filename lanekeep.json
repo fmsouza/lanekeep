@@ -30,6 +30,10 @@
           "crates/lanekeep-js/src/typescript.rs"
         ]
       }
+    },
+    {
+      "rule": "./lanekeep/rules/sandbox-containment.ts",
+      "options": { "allow": ["crates/lanekeep-js/"] }
     }
   ]
 }
