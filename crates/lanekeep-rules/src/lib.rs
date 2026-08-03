@@ -50,6 +50,7 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
         "no-default-export",
         include_str!("../rules/no-default-export.ts"),
     ),
+    ("no-glob-import", include_str!("../rules/no-glob-import.ts")),
     (
         "no-mutable-default-argument",
         include_str!("../rules/no-mutable-default-argument.ts"),
@@ -66,6 +67,7 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
         "no-unused-exports",
         include_str!("../rules/no-unused-exports.ts"),
     ),
+    ("no-unwrap", include_str!("../rules/no-unwrap.ts")),
 ];
 
 /// Shared modules the built-in rules import, and project rules may too.

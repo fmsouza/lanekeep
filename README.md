@@ -12,7 +12,7 @@ lanekeep enforces the conventions that live in your team's heads and your review
 the ones a language model cannot infer from the code it is shown. Every rule is a codified answer
 to **"the agent keeps doing this wrong."**
 
-Checks **TypeScript, JavaScript, Python and Go**. Ships as a single static binary with no runtime
+Checks **TypeScript, JavaScript, Python, Go and Rust**. Ships as a single static binary with no runtime
 dependency.
 
 ---
@@ -152,6 +152,7 @@ built-in rules apply, a worked custom rule, and the resolution behavior specific
 | --- | --- | --- |
 | Go | **[Go guide](https://github.com/fmsouza/lanekeep/wiki/Go)** | `.go` |
 | Python | **[Python guide](https://github.com/fmsouza/lanekeep/wiki/Python)** | `.py`, `.pyi` |
+| Rust | **[Rust guide](https://github.com/fmsouza/lanekeep/wiki/Rust)** | `.rs` |
 | TypeScript / JavaScript | **[TypeScript and JavaScript guide](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript)** | `.ts`, `.mts`, `.cts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx` |
 
 Every one carries syntactic binding resolution, so a rule can ask where a name came from rather
@@ -197,7 +198,7 @@ Rule ids are namespaced. `lanekeep/` is reserved for built-ins and `local/` need
 declaration; any other prefix must be listed in `namespaces`, so a typo in an id is an error
 rather than a rule that silently never runs.
 
-Eight rules ship built in — four for TypeScript and JavaScript, two for Python, two for Go. See
+Ten rules ship built in — four for TypeScript and JavaScript, two each for Python, Go and Rust. See
 [`docs/built-in-rules.md`](docs/built-in-rules.md) for what each one checks and its options.
 
 <details>
@@ -332,7 +333,7 @@ caches it. Set `LANEKEEP_BINARY` to an already-installed lanekeep and it fetches
 | [Configuration](https://github.com/fmsouza/lanekeep/wiki/Configuration) | `lanekeep.json`, every field |
 | [Writing Rules](https://github.com/fmsouza/lanekeep/wiki/Writing-Rules) | Rule anatomy and the full host API |
 | [CI and Editors](https://github.com/fmsouza/lanekeep/wiki/CI-and-Editors) | Pre-commit, GitHub Actions, LSP, MCP |
-| [Go](https://github.com/fmsouza/lanekeep/wiki/Go) · [Python](https://github.com/fmsouza/lanekeep/wiki/Python) · [TypeScript and JavaScript](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript) | Per-language guides |
+| [Go](https://github.com/fmsouza/lanekeep/wiki/Go) · [Python](https://github.com/fmsouza/lanekeep/wiki/Python) · [Rust](https://github.com/fmsouza/lanekeep/wiki/Rust) · [TypeScript and JavaScript](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript) | Per-language guides |
 
 In-repo, versioned with the code:
 

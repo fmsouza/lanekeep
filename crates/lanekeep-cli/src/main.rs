@@ -573,6 +573,39 @@ export default defineRule({
 })
 ";
 
+const RUST_RULE: &str = r"import { defineRule } from 'lanekeep'
+
+export default defineRule({
+  id: 'local/no-dbg',
+  language: 'rust',
+  severity: 'error',
+
+  // The card is not documentation. It is fed back to whoever has to act on the
+  // violation — increasingly an agent — so `remediation` is the field worth the effort.
+  card: {
+    message: 'dbg! left in the source',
+    remediation: 'remove it, or use tracing if the output is meant to stay',
+    examples: {
+      bad: 'let total = dbg!(sum(&items));',
+      good: 'let total = sum(&items);',
+    },
+  },
+
+  // Cheap and exact: a file whose bytes never contain `dbg!` is never parsed.
+  gates: {
+    fileContains: ['dbg!'],
+  },
+
+  // The query is the gate that matters. Rust matches it; only matches reach `check`.
+  query: '(macro_invocation macro: (identifier) @name) @call',
+
+  check(ctx, m) {
+    if (ctx.text(m.name) !== 'dbg') return
+    ctx.report(m.call)
+  },
+})
+";
+
 const TYPESCRIPT: Scaffold = Scaffold {
     language: "TypeScript",
     include: "src/**/*.{ts,tsx}",
@@ -600,6 +633,17 @@ const GO: Scaffold = Scaffold {
     rule: GO_RULE,
 };
 
+const RUST: Scaffold = Scaffold {
+    language: "Rust",
+    include: "src/**/*.rs",
+    // A Rust project keeps its unit tests beside the code they cover, so there is no test
+    // path to exclude — `#[cfg(test)]` is the convention, not a directory.
+    exclude: None,
+    builtins: &["lanekeep/no-unwrap"],
+    rule_file: "no-dbg.ts",
+    rule: RUST_RULE,
+};
+
 /// What this project looks like, from the manifest a language cannot really do without.
 ///
 /// Checked in a fixed order so a polyglot repository scaffolds predictably rather than
@@ -608,6 +652,7 @@ const GO: Scaffold = Scaffold {
 /// one a user is least surprised to have to change.
 fn detect(project_root: &Path) -> &'static Scaffold {
     for (marker, scaffold) in [
+        ("Cargo.toml", &RUST),
         ("go.mod", &GO),
         ("pyproject.toml", &PYTHON),
         ("setup.py", &PYTHON),

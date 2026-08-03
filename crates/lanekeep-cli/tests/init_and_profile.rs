@@ -145,6 +145,12 @@ fn every_scaffold_catches_something_on_the_first_run() {
             "app.py",
             "def f():\n    print(\"x\")\n",
         ),
+        (
+            "Cargo.toml",
+            "[package]\nname = \"a\"\n",
+            "src/lib.rs",
+            "pub fn f() {\n    let _ = dbg!(1);\n}\n",
+        ),
     ] {
         let project = Project::new(
             &format!("catches-{marker}"),
