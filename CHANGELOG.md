@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/fmsouza/lanekeep/compare/v0.6.0...v0.6.1) - 2026-08-03
+
+### Other
+
+- *(engine)* compile rule queries in parallel ([#85](https://github.com/fmsouza/lanekeep/pull/85))
+- *(engine)* parse each file once, not once per rule ([#86](https://github.com/fmsouza/lanekeep/pull/86))
+
 ## [0.6.0](https://github.com/fmsouza/lanekeep/compare/v0.5.0...v0.6.0) - 2026-08-03
 
 ### Added
