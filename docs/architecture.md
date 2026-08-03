@@ -688,9 +688,13 @@ Four things measurement has bought so far:
 
 - **A file was parsed once per rule, not once.** §2 and §7 both say the queries run across a single shared parse; `run_rule` built its own `tree_sitter::Parser` instead, so a file admitted by twenty rules was parsed twenty times. Cold went from ~3.3 s to ~2.1 s when the parse moved up to the file.
 
-  It hid well. The per-rule profile attributed the re-parse to *query* time, so the reading was "twelve rules spend 400 ms each matching nothing" — which sounds like a query problem and sent the first look towards gates. `Tree::clone` is `ts_tree_copy`, a refcounted copy, so every rule still gets an owned tree for its arena at almost no cost.
+  It hid because `--profile` never saw it. The per-rule clock starts *after* the parse, so the re-parse was not attributed to query time or handler time — it was not in the table at all. The per-rule numbers summed to well under the run's wall clock and nothing pointed at the difference, which is the failure mode worth naming: **the profile accounts for what rules do, not for what a run does**, and a cost outside every rule is invisible to it rather than misfiled.
 
-  The general lesson is about the instrument rather than the bug: a profile attributes time to the phase that *called* the work, and a cost pushed into the wrong phase reads as evidence for the wrong fix. A test now asserts the engine constructs exactly one parser outside its tests, because parsing per rule produces identical output and simply runs N times slower — there is nothing to notice.
+  What found it was arithmetic on a number the profile *did* report: 0.23 ms to run a one-pattern query over a 1.5 KB file is an order of magnitude too slow, and chasing that gap led to the parse.
+
+  `Tree::clone` is `ts_tree_copy`, a refcounted copy, so every rule still gets an owned tree for its arena at almost no cost. A test asserts the engine constructs exactly one parser outside its tests, because parsing per rule produces identical output and simply runs N times slower — there is nothing to notice.
+
+  **An earlier version of this passage claimed the profile had attributed the re-parse to query time.** It never did; the timer starts after the parse in both the old code and the new. The correction matters because the false version made the instrument sound more trustworthy than it is — it says nothing about time spent between rules, and a reader planning the next optimization needs to know that.
 
   It is deliberately *not* lazy. Compiling on first use would take warm setup to nearly zero and would cost what the §16 comment describes: a broken query is reported at preparation, naming its rule, rather than staying silent until some file happens to need it. Parallelism buys most of the win without trading that away.
 
