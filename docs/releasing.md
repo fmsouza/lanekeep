@@ -132,11 +132,29 @@ the packaged `Cargo.lock` differs, and proposes a further release. After v0.3.2 
 for 0.3.3 whose entire changelog was "update Cargo.lock dependencies" — a version identical to
 the one still waiting to go out, and no index lets a number be reused.
 
-`release_commits` in `release-plz.toml` closes it: only `feat`, `fix`, `perf` and `revert`
-propose a release, and the commit sitting in that window is always a `chore: release`. The
-filtered commits still appear in the changelog — this decides whether to *release*, not what to
-record. `scripts/test-release-config.sh` asserts which commit types the pattern admits, by
-matching real subjects rather than comparing the regex to a literal.
+**The fix is a gate on the window itself**, in `release-plz.yml`: before proposing anything,
+the run reads the workspace version from `Cargo.toml` and asks crates.io whether it is
+published. If it is not, the release-pull-request step is skipped — what is in the repository
+has not shipped yet, and proposing something on top of it is always wrong. Tagging is
+deliberately *not* gated, or a merged release pull request would never tag and nothing would
+ever publish again. `scripts/test-workflows.sh` asserts both halves.
+
+Comparing the *manifest* version rather than the newest tag is what makes it cover both cases.
+After a release pull request merges the tag does not exist yet — the `release` step is what
+creates it — so a tag-based check would still be reading the previous, published tag and would
+let the first failure straight through.
+
+**A first attempt got this wrong**, and it is worth recording why. `release_commits` in
+`release-plz.toml` filters by commit *type*: only `feat`, `fix`, `perf` and `revert` propose a
+release. That closes the case where the only commit in the window is a `chore: release`, which
+was the shape of the first failure — so it looked like a fix. It is not: a *real* `feat` sitting
+in the window matches the filter and proposes a duplicate anyway, which is what happened next.
+Filtering commits was a proxy for the condition; the crates.io check is the condition.
+
+`release_commits` stays, because it is independently true — this project already says chores and
+CI changes are not worth a changelog entry, and it keeps release proposals to changes users care
+about. It is just not what closes this window. `scripts/test-release-config.sh` asserts which
+commit types it admits, by matching real subjects rather than comparing the regex to a literal.
 
 `git_only = true` fixes the same lag by reading versions from tags instead of the registry, and
 is the wrong fix here: only `lanekeep-cli` is tagged, deliberately, so the other fourteen crates

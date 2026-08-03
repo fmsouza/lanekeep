@@ -305,6 +305,56 @@ print("\n".join(found))
 PY
 report "the Go launcher offers exactly the built platforms" "$(cat "${findings}")"
 
+# --- proposing a release is gated on nothing being in flight ------------------------------------
+#
+# release-plz computes the next version by diffing against crates.io, and publishing waits on a
+# human approving the `release` environment. For the length of that approval the registry is
+# behind `main`, and every run in the window proposes a release for work already on its way out.
+# That is #64 and #69, the second of which slipped past a first fix that filtered commit types
+# rather than checking the condition.
+#
+# Two halves, and the check needs both: `release-pr` must be gated, and `release` must *not* be —
+# gating the tagging step would mean a merged release pull request never tags, and nothing would
+# ever publish again.
+python3 - "${workflows}" >"${findings}" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+document = yaml.safe_load(
+    (pathlib.Path(sys.argv[1]) / "release-plz.yml").read_text(encoding="utf-8")
+) or {}
+
+steps = ((document.get("jobs") or {}).get("release-plz") or {}).get("steps") or []
+by_command = {}
+for step in steps:
+    uses = str(step.get("uses", ""))
+    if "release-plz/action" in uses:
+        by_command[str((step.get("with") or {}).get("command", ""))] = step
+
+found = []
+for command, must_be_gated in (("release-pr", True), ("release", False)):
+    step = by_command.get(command)
+    if step is None:
+        found.append(f"release-plz.yml has no `command: {command}` step")
+        continue
+    gated = bool(step.get("if"))
+    if must_be_gated and not gated:
+        found.append(
+            "the `release-pr` step has no `if:` — every push during a publish approval "
+            "will propose a release for the version already going out"
+        )
+    if not must_be_gated and gated:
+        found.append(
+            "the `release` step is gated, so a merged release pull request may never tag "
+            "and nothing would publish"
+        )
+
+print("\n".join(found))
+PY
+report "proposing a release is gated, tagging is not" "$(cat "${findings}")"
+
 echo
 echo "${passed} passed, ${failed} failed"
 [ "${failed}" -eq 0 ]
