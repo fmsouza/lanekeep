@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-cache"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-config"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "globset",
  "ignore",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-engine"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-cache",
  "lanekeep-config",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-js"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "thiserror",
  "tree-sitter",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-go"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-lang",
  "tree-sitter",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-js"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-lang",
  "tree-sitter",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-python"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-lang",
  "tree-sitter",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-languages"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-lang",
  "lanekeep-lang-go",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-query"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-core",
  "lanekeep-lang",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-report"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "insta",
  "lanekeep-core",
@@ -569,14 +569,14 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-rules"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-testkit",
 ]
 
 [[package]]
 name = "lanekeep-server"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-core",
  "serde",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-testkit"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "lanekeep-config",
  "lanekeep-core",
