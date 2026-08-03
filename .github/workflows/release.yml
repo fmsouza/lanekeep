@@ -72,33 +72,33 @@ jobs:
         with:
           persist-credentials: false
 
-      # The runner image can arrive with a partially installed toolchain at the pinned
-      # version, and that is enough to fail the build.
-      #
-      # `rust-toolchain.toml` asks for `rust-src`. No workflow installs it, so cargo has
-      # rustup add it at build time — and rustup refuses with "detected conflict:
-      # lib/rustlib/src/rust/library/Cargo.lock" when the files are already on disk but the
-      # component is not recorded as installed. v0.5.0's first release build died there,
-      # reproducibly, on `ubuntu-24.04-arm` alone. v0.4.0 built fine on the same workflow, so
-      # the image changed under us rather than anything here.
-      #
-      # Removing the toolchain first makes the install below a clean one. It is a no-op
-      # wherever the image did not preinstall it, which is why this is unconditional rather
-      # than guarded on the target — the next image to do this will be a different one.
-      #
-      # The version is read from the pin rather than written out again, so this cannot drift
-      # from the toolchain the build actually uses.
-      - name: Clear any partially installed toolchain
-        shell: bash
-        run: |
-          pinned="$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/.*"(.*)".*/\1/')"
-          echo "clearing any existing ${pinned} before a clean install"
-          rustup toolchain uninstall "${pinned}" || true
-
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
+
+      # Build against the pinned toolchain *without* letting cargo sync its components.
+      #
+      # `rust-toolchain.toml` asks for rustfmt, clippy and rust-src — useful to a contributor,
+      # useless to a release build, and the source of two failures. cargo honors that file by
+      # having rustup add whatever is missing, and rustup refuses with "detected conflict" when
+      # a component's files are on disk but it is not recorded as installed. That is the state
+      # both Linux images now arrive in: `rust-src` on arm64, `clippy-preview` on x86-64.
+      #
+      # `RUSTUP_TOOLCHAIN` makes rustup use the named toolchain directly and skip the file, so
+      # the component install never happens. That is deliberately stronger than making it
+      # succeed — an operation that is not performed cannot conflict, and v0.5.0 has now lost
+      # two release builds to attempts at the weaker version.
+      #
+      # The version is read from the pin, so this cannot drift from the toolchain the rest of
+      # the repository develops against. Setting it to something *other* than the pin is the
+      # trap AGENTS.md documents, and reading the file is what avoids it.
+      - name: Pin the toolchain for this build
+        shell: bash
+        run: |
+          pinned="$(grep -m1 '^channel' rust-toolchain.toml | sed -E 's/.*"(.*)".*/\1/')"
+          echo "RUSTUP_TOOLCHAIN=${pinned}" >> "${GITHUB_ENV}"
+          echo "building against ${pinned}, without rust-toolchain.toml's dev components"
 
       # Deliberately uncached, for two reasons. A binary someone will download should be
       # built from a clean tree rather than from whatever a cache happened to hold — a
