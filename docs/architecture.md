@@ -659,10 +659,10 @@ Targets, gated in CI. Measured by `benches/corpus.rs` over a synthetic 2,000-fil
 
 | Scenario | Budget | Measured (dev machine) |
 |---|---|---|
-| Cold full run, ~2k files, ~20 rules | < 800 ms | ~3.3 s |
-| Warm run, no changes | < 25 ms | ~65 ms |
-| Warm run, 1 changed file, full discovery | — | ~60 ms |
-| Warm run, 1 changed file, `--staged` | < 10 ms | ~30 ms |
+| Cold full run, ~2k files, ~20 rules | < 800 ms | ~2.1 s |
+| Warm run, no changes | < 25 ms | ~48 ms |
+| Warm run, 1 changed file, full discovery | — | ~46 ms |
+| Warm run, 1 changed file, `--staged` | < 10 ms | ~25 ms |
 
 These are noisy to within about 10% between runs on the same machine, so read them as
 magnitudes rather than figures.
@@ -677,7 +677,7 @@ compiling more queries, and cold went from ~1.5 s to ~3.3 s without anyone notic
 holding on to generally: a "measured" column is a claim with a date on it, and this one had
 drifted for four releases while being read as current.
 
-Three things measurement has bought so far:
+Four things measurement has bought so far:
 
 - **A warm run built a sandbox per worker and evaluated every rule module into it**, then executed no JavaScript because every file was a cache hit. Making the sandbox lazy — built on the first match that actually needs one — took a warm run from ~263 ms to ~56 ms. §7.3's claim that a warm run runs no JavaScript was true; it was paying to be *able* to.
 - **A subset run discarded the cache entries for every file it did not look at.** `--staged` left the next full run cold, which is the opposite of what an incremental entry point is for. A run now prunes only when it saw the whole corpus.
@@ -685,6 +685,12 @@ Three things measurement has bought so far:
 - **Compiling queries cost more than the entire warm run.** `Engine::prepare` was measured at ~88 ms against a ~55 ms warm run: a tree-sitter query takes a couple of milliseconds to compile, a rule compiles one per language it declares, and twenty rules over two languages is forty compilations before a single file is read. Compiling them in parallel took warm from ~102 ms to ~65 ms and `--staged` from ~75 ms to ~30 ms.
 
   **None of the levers listed below named this**, which is the more useful lesson: the analysis reached for the parts of the design that were interesting — the sandbox, the cache format, the staleness check — and missed a plain constant cost sitting in front of them. The first profile of a warm run showed setup outweighing work, and that was not a hypothesis anyone had written down.
+
+- **A file was parsed once per rule, not once.** §2 and §7 both say the queries run across a single shared parse; `run_rule` built its own `tree_sitter::Parser` instead, so a file admitted by twenty rules was parsed twenty times. Cold went from ~3.3 s to ~2.1 s when the parse moved up to the file.
+
+  It hid well. The per-rule profile attributed the re-parse to *query* time, so the reading was "twelve rules spend 400 ms each matching nothing" — which sounds like a query problem and sent the first look towards gates. `Tree::clone` is `ts_tree_copy`, a refcounted copy, so every rule still gets an owned tree for its arena at almost no cost.
+
+  The general lesson is about the instrument rather than the bug: a profile attributes time to the phase that *called* the work, and a cost pushed into the wrong phase reads as evidence for the wrong fix. A test now asserts the engine constructs exactly one parser outside its tests, because parsing per rule produces identical output and simply runs N times slower — there is nothing to notice.
 
   It is deliberately *not* lazy. Compiling on first use would take warm setup to nearly zero and would cost what the §16 comment describes: a broken query is reported at preparation, naming its rule, rather than staying silent until some file happens to need it. Parallelism buys most of the win without trading that away.
 
