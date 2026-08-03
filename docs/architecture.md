@@ -31,8 +31,8 @@ So rules are TypeScript programs. Everything below follows from holding that alo
 
 - No type-aware analysis. Light binding resolution only, exposed as host helpers (§6.4).
 - No npm imports from rule code. Rules run in an embedded sandbox, not in Node (§5).
-- No autofix in M0 (arrives M2, §14).
-- No LSP/MCP server in M0 (arrives M3).
+- No autofix in M0 — delivered in M2, §14.
+- No LSP/MCP server in M0 — delivered in M3, and `lanekeep server` now speaks both.
 
 ### Distribution
 
@@ -90,16 +90,18 @@ lanekeep/
     lanekeep-js/         # embedded engine, sandbox, host API, module loader
     lanekeep-query/      # query parsing + compilation
     lanekeep-lang/       # Language trait + registry
-    lanekeep-lang-js/    # tree-sitter grammars + JS binding resolution
+    lanekeep-lang-js/    # TS/TSX/JS/JSX grammars + binding resolution
+    lanekeep-lang-python/ # Python grammar + binding resolution
+    lanekeep-lang-go/    # Go grammar + binding resolution
+    lanekeep-languages/  # the set of supported languages, assembled in one place
     lanekeep-config/     # schema, config loading, canonicalization + hashing
     lanekeep-cache/      # content-addressed store with dependency tracking
     lanekeep-rules/      # built-in rules (authored in TypeScript, embedded at build time)
     lanekeep-report/     # human, json, sarif, agent reporters
     lanekeep-cli/        # binary
-    lanekeep-server/     # LSP + MCP           (M3 — not created in v1 scope)
+    lanekeep-server/     # LSP + MCP over stdio
     lanekeep-testkit/    # RuleTester: fixture-based snapshot harness
-  packages/
-    lanekeep/            # the TypeScript authoring package: defineRule, defineConfig, types
+  cmd/lanekeep/          # the Go launcher, so `go tool lanekeep` works
   npm/                   # platform packages + wrapper
   benches/
   docs/
@@ -109,7 +111,9 @@ lanekeep/
 
 `lanekeep-testkit` is not optional. Without a `RuleTester` equivalent, community rule contributions are unreviewable.
 
-`packages/lanekeep` is the npm package rule authors import from. It ships the `defineRule`/`defineConfig` helpers and — more importantly — the TypeScript type definitions for the entire host API, so rule authoring is autocompleted and type-checked in the author's own editor.
+`lanekeep-languages` is the composition root for languages. Both the CLI and the testkit need to know which languages exist, and no crate below them can hold that answer without inverting the dependency the `Language` trait exists to create.
+
+**`packages/lanekeep` is not built yet**, and it is the one piece of this design still outstanding. The intent is an npm package shipping the `defineRule`/`defineConfig` helpers and — more importantly — TypeScript definitions for the whole host API, so rules are autocompleted and type-checked in the author's editor. Today `defineRule` and `defineConfig` resolve inside the sandbox at run time, which means rules *execute* correctly with nothing installed but gives an author no types to write against. §6 documents the surface by hand in the meantime.
 
 ### The Language trait
 
@@ -241,7 +245,7 @@ M1 measured handler execution at roughly three times query matching on a synthet
 
 ### 5.2 TypeScript
 
-Rule modules are TypeScript. Types are stripped before evaluation — a syntactic transform, not a type check. Rules are *type-checked in the author's editor* against the types shipped in `packages/lanekeep`; lanekeep itself never type-checks, because doing so would mean shipping a TypeScript compiler and paying its cost on every run.
+Rule modules are TypeScript. Types are stripped before evaluation — a syntactic transform, not a type check. Rules are *intended* to be type-checked in the author's editor against types shipped in `packages/lanekeep`, which is not built yet — see §3. lanekeep itself never type-checks, because doing so would mean shipping a TypeScript compiler and paying its cost on every run.
 
 This is a deliberate division: the authoring experience is fully typed, the runtime is not.
 
@@ -694,11 +698,15 @@ Off by default, because measuring costs a clock read per handler invocation and 
 
 ## 16. Milestones
 
-**M0 — walking skeleton.** Workspace, config loading, discovery, tree-sitter TS/TSX, query compilation, the embedded engine with the §6 host API, human + json reporters, `RuleTester`. Acceptance: the built-in rules and a representative set of project-authored rules run end-to-end against the fixture corpus, with snapshot-verified output — every reporter is snapshotted in `lanekeep-report/tests/snapshots.rs`, and the built-in rules are driven through the binary over real corpora in `lanekeep-cli/tests/`.
+**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python and Go; ships eight built-in rules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
-**M1 — speed.** Cache with dependency tracking, `--since` / `--staged`, rayon parallelism, `benches/` in CI with regression gates. Acceptance: the suite exists, runs in CI, and gates on regression — all of which it does. The §15 budgets are targets rather than an acceptance criterion; none is met yet, and §15 says by how much and what the levers are.
+Two things named here are still outstanding, both stated where they belong rather than only here: the §15 performance budgets are targets that are not met, and `packages/lanekeep` (§3) is not built, so rule authors have no editor types yet.
 
-**M2 — completeness.** Full host API surface, SARIF + agent reporters, `explain`, fixes (template-based replacement of a capture, marked machine-applicable vs suggestion), unused-suppression reporting.
+**M0 — walking skeleton. Done.** Workspace, config loading, discovery, tree-sitter TS/TSX, query compilation, the embedded engine with the §6 host API, human + json reporters, `RuleTester`. Acceptance: the built-in rules and a representative set of project-authored rules run end-to-end against the fixture corpus, with snapshot-verified output — every reporter is snapshotted in `lanekeep-report/tests/snapshots.rs`, and the built-in rules are driven through the binary over real corpora in `lanekeep-cli/tests/`.
+
+**M1 — speed. Done, with the budgets outstanding.** Cache with dependency tracking, `--since` / `--staged`, rayon parallelism, `benches/` in CI with regression gates. Acceptance: the suite exists, runs in CI, and gates on regression — all of which it does. The §15 budgets are targets rather than an acceptance criterion; none is met yet, and §15 says by how much and what the levers are.
+
+**M2 — completeness. Done.** Full host API surface, SARIF + agent reporters, `explain`, fixes (template-based replacement of a capture, marked machine-applicable vs suggestion), unused-suppression reporting.
 
 **M3 — loops. Done.** `--watch`, and `server` speaking both LSP and MCP.
 
@@ -710,10 +718,14 @@ MCP exposes three tools, one per thing the CLI already does: `lanekeep_check`, `
 
 Diagnostics publish on open and on save, not per keystroke: a check reads from disk, and the buffer an editor holds mid-edit is not there yet. Publishing against stale bytes puts squiggles under the wrong characters, which is worse than a save-length delay on a warm cache.
 
-**M4 — second language. Done.** Python was the cheapest proof that the `Language` trait abstraction actually holds, and it held: `lanekeep-core` is untouched. `lanekeep-lang-python` implements `Language` and `BindingResolver` and nothing above it needed to know.
+**M4 — a second language, then a third. Done.** Python was the cheapest proof that the `Language` trait abstraction actually holds, and it held: `lanekeep-core` is untouched. `lanekeep-lang-python` implements `Language` and `BindingResolver` and nothing above it needed to know.
 
 Two things did change, and both are the abstraction working rather than leaking. `lanekeep-lang` gained binding kinds — `assignment`, `loop`, `context-manager`, `comprehension` — because Python binds names in ways JavaScript has no word for, and answering `ctx.bindingKind` with `var` for all three would have been untrue. And `lanekeep-languages` was added as the composition root: the CLI and the testkit both need to know which languages exist, and no crate below them can hold that answer without inverting the dependency the trait exists to create.
 
 Go followed, and is the stronger evidence: the second language could have been accommodated by a trait shaped around the first two, whereas the third arrived after the shape was fixed. `lanekeep-core` was untouched again. `lanekeep-lang` gained three more binding kinds — `type`, `receiver`, `type-param` — for the same reason Python's were added: a struct is not a `class` and a method receiver is not quite a `param`, and answering `ctx.bindingKind` with the nearest existing kind would be untrue. Go's scoping needed genuinely new modeling rather than a variation on Python's, since its package block is order-independent and several of its statements are scopes without being blocks.
+
+**Distribution followed each language.** A checker that reads Python should be installable by a Python project on its own terms, and the same for Go, rather than telling either team to install Node. PyPI takes one platform wheel per target and needs no launcher, because a wheel names its platform in its own filename. Go needed one, because Go's tooling installs and pins only things written in Go — and it needed no publish step at all, because a Go module version *is* a git tag. [`docs/releasing.md`](releasing.md) has both.
+
+Building the PyPI lane surfaced a bug none of the other channels would have: the Linux binaries had inherited a glibc 2.39 floor from the runner image, so they did not start on Ubuntu 22.04, Debian 12 or RHEL 9. A wheel is the first artifact that must *name* its floor, which is why it surfaced there. The floor is now pinned at 2.17 in the build and asserted against the binary before anything is tagged.
 
 What Python does *not* share with JavaScript is the interesting part. It has no block scope, so resolving a name means walking a scope's whole body rather than its direct children — the JavaScript resolver can look at direct children only because a block *is* a scope there. And a class body is opaque to functions nested inside it, so `def m(self): return LIMIT` does not see a class-level `LIMIT`. Neither rule could be expressed by reusing the JavaScript resolver, which is the evidence that mattered: the trait is the boundary, not a shared implementation.
