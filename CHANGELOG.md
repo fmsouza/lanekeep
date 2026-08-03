@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/fmsouza/lanekeep/compare/v0.4.0...v0.4.1) - 2026-08-03
+
+### Added
+
+- *(config)* configure in JSON, and scaffold for the language found ([#72](https://github.com/fmsouza/lanekeep/pull/72))
+
 ## [0.4.0](https://github.com/fmsouza/lanekeep/compare/v0.3.2...v0.4.0) - 2026-08-03
 
 ### Added
