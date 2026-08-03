@@ -65,6 +65,25 @@ print(f"releasing={','.join(sorted(releasing))}")
 
 print(f"release_commits={workspace.get('release_commits', '')}")
 
+parsers = config.get("changelog", {}).get("commit_parsers", [])
+print(f"parser_count={len(parsers)}")
+print(f"has_catch_all={any(p.get('message') == '.*' for p in parsers)}")
+
+# Every type that can propose a release must have a heading of its own. One that falls to the
+# catch-all lands under "Other" with nothing but its title, which is what made v0.6.1 — a
+# release entirely about performance — read as two bare lines.
+import re as _re
+releasing = _re.findall(r"[a-z]+", workspace.get("release_commits", ""))
+releasing = [t for t in releasing if t not in {"revert"}]
+grouped = {}
+for parser in parsers:
+    message = parser.get("message", "")
+    if message.startswith("^"):
+        grouped[message[1:]] = parser.get("group", "")
+missing = sorted(t for t in releasing if t not in grouped)
+print(f"release_types_without_a_group={','.join(missing)}")
+print(f"perf_group={grouped.get('perf', '')}")
+
 # Which commit types the regex actually admits, checked by matching rather than by reading
 # the pattern. A regex is easy to write and easy to get subtly wrong, and the two failure
 # directions are opposite: too narrow silently stops releasing, too broad brings back the
@@ -190,6 +209,21 @@ check "release.yml triggers on the tag release-plz creates" "0" \
 #
 # Asserted by matching real subjects rather than by comparing the pattern to a literal, because
 # the point is which commits it admits, not how the regex is spelled.
+# --- every releasing commit type has a heading -------------------------------------------------
+#
+# Declaring `commit_parsers` replaces release-plz's defaults rather than adding to them, so a
+# type left out does not error — its commits quietly land under the catch-all, or vanish if
+# there is none. That is how v0.6.1 shipped: `perf` fell through to "Other" and a release whose
+# whole point was a 36% faster cold run read as two bare lines.
+check "every type that can trigger a release has its own heading" "" \
+  "$(value release_types_without_a_group)"
+
+check "perf has a heading of its own" "Performance" "$(value perf_group)"
+
+# Without a catch-all, a `refactor` that changed behavior would not appear at all — worse than
+# appearing under a heading nobody reads.
+check "nothing falls off the changelog entirely" "True" "$(value has_catch_all)"
+
 check "a release is proposed for meaningful changes only" \
   "feat,feat-breaking,fix,perf,revert" "$(value release_commits_matches)"
 

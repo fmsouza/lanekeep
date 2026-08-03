@@ -80,6 +80,28 @@ changelog_update = false
 [changelog]
 sort_commits = "oldest"
 
+# Which commit types get which heading.
+#
+# Declaring `commit_parsers` **replaces** the defaults rather than adding to them, so every
+# type that should appear has to be listed here — including the ones that were already working.
+# Leaving one out does not raise an error; its commits quietly stop appearing.
+#
+# `perf` is why this exists. It fell through to "Other" with nothing but its title, so v0.6.1 —
+# a release whose entire point was that cold runs got 36% faster — read as two bare lines under
+# a heading that says nothing. A reader had no way to tell whether it was worth taking.
+#
+# The headings match what the changelog already used, so earlier entries and later ones agree.
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Performance" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^revert", group = "Changed" },
+  # Everything else still appears, under the heading it had before. Dropping these would hide
+  # a `refactor` that changed behavior, which is worse than a heading nobody reads.
+  { message = ".*", group = "Other" },
+]
+
 # The binary is what users install, so its release is the one the whole workspace rides on.
 # Every other crate ships as part of it rather than announcing its own.
 #
