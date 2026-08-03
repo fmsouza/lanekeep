@@ -54,16 +54,21 @@ export function inTestCode(ctx: any, node: any): boolean {
 }
 
 /**
- * Whether this node sits inside a `use` declaration.
+ * Whether this node sits inside a larger path expression.
  *
  * A query alternating over `(use_declaration argument: (_))` and `(scoped_identifier path:
- * (_))` matches both for a single `use std::process::Command;` — the outer declaration and
- * the path nested inside it — and reports the same line twice. Skipping the nested match
- * keeps one violation per site.
+ * (_))` matches a single site more than once. `use std::process::Command;` matches the
+ * declaration and the path nested in it. `std::process::Command::new()` matches once per
+ * `::`, because a qualified path nests one `scoped_identifier` per segment — so a rule that
+ * reports every match reports the same line three times.
+ *
+ * Reporting only the outermost match keeps one violation per site, which is what a reader
+ * expects and what the tests assert.
  */
-export function underUse(ctx: any, node: any): boolean {
+export function isNestedInPath(ctx: any, node: any): boolean {
   for (const ancestor of ctx.ancestors(node)) {
-    if (ctx.kind(ancestor) === 'use_declaration') return true
+    const kind = ctx.kind(ancestor)
+    if (kind === 'use_declaration' || kind === 'scoped_identifier') return true
   }
   return false
 }

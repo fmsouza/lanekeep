@@ -34,6 +34,10 @@
     {
       "rule": "./lanekeep/rules/sandbox-containment.ts",
       "options": { "allow": ["crates/lanekeep-js/"] }
+    },
+    {
+      "rule": "./lanekeep/rules/no-ambient-authority.ts",
+      "options": { "allow": ["crates/lanekeep-core/src/changed.rs"] }
     }
   ]
 }

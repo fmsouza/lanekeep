@@ -124,3 +124,42 @@ fn an_unrelated_import_passes() {
         .accepts("use std::collections::BTreeMap;\n")
         .expect("only the engine is contained");
 }
+
+const AUTHORITY: &str = include_str!("../../../lanekeep/rules/no-ambient-authority.ts");
+
+fn authority() -> RuleTester {
+    configured("authority", AUTHORITY, "{ allow: [] }")
+}
+
+#[test]
+fn a_subprocess_import_is_reported() {
+    authority()
+        .reports_at("use std::process::Command;\n", &[(1, 1)])
+        .expect("nothing but changed.rs spawns a process");
+}
+
+#[test]
+fn a_socket_is_reported() {
+    authority()
+        .reports_at("use std::net::TcpStream;\n", &[(1, 1)])
+        .expect("§13's no network, ever, is enforced rather than aspirational");
+}
+
+#[test]
+fn the_git_caller_passes() {
+    RuleTester::configured(
+        "authority-allow",
+        AUTHORITY,
+        "{ allow: ['subject/input.rs'] }",
+    )
+    .expect("the rule builds")
+    .accepts("use std::process::Command;\n")
+    .expect("--since shells out to git, and that is the one place");
+}
+
+#[test]
+fn ordinary_std_passes() {
+    authority()
+        .accepts("use std::collections::BTreeMap;\nuse std::fs;\n")
+        .expect("only network and subprocess are the boundary");
+}

@@ -1,5 +1,5 @@
 import { defineRule } from 'lanekeep'
-import { underUse } from '../modules/rust'
+import { isNestedInPath } from '../modules/rust'
 
 /**
  * `rquickjs` named outside `lanekeep-js`.
@@ -41,16 +41,7 @@ export default function sandboxContainment(options) {
     check(ctx, m) {
       if (allow.some((prefix: string) => ctx.filePath.startsWith(prefix))) return
 
-      if (ctx.kind(m.site) !== 'use_declaration') {
-        // A multi-segment path nests one `scoped_identifier` inside another, one level
-        // per `::` — `rquickjs::Ctx` is the `path` field of `rquickjs::Ctx::new`, and both
-        // independently satisfy this same query. Left unchecked, one qualified reference
-        // reports once per segment. Skip a site that is itself the `path` of an enclosing
-        // match — a `use_declaration` via `underUse`, or another `scoped_identifier` here —
-        // so only the outermost site in the chain reports.
-        if (underUse(ctx, m.site)) return
-        if (ctx.ancestors(m.site).some((a: any) => ctx.kind(a) === 'scoped_identifier')) return
-      }
+      if (isNestedInPath(ctx, m.site)) return
 
       const text = ctx.text(m.path)
       if (!/(^|::)rquickjs($|::)/.test(text)) return
