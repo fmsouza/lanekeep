@@ -681,7 +681,7 @@ compiling more queries, and cold went from ~1.5 s to ~3.3 s without anyone notic
 holding on to generally: a "measured" column is a claim with a date on it, and this one had
 drifted for four releases while being read as current.
 
-Four things measurement has bought so far:
+What measurement has bought so far:
 
 - **A warm run built a sandbox per worker and evaluated every rule module into it**, then executed no JavaScript because every file was a cache hit. Making the sandbox lazy — built on the first match that actually needs one — took a warm run from ~263 ms to ~56 ms. §7.3's claim that a warm run runs no JavaScript was true; it was paying to be *able* to.
 - **A subset run discarded the cache entries for every file it did not look at.** `--staged` left the next full run cold, which is the opposite of what an incremental entry point is for. A run now prunes only when it saw the whole corpus.
@@ -736,6 +736,29 @@ Four things measurement has bought so far:
 The cold budget is looser than a pure-Rust engine would allow, and that difference is the honest price of programmable rules: handler invocation and QuickJS interpretation cost real time on every match. The query gate (§7.2) is what keeps that cost bounded to matches rather than nodes.
 
 If the cold budget proves unreachable, the levers in order are: better gate usage in built-in rules, bytecode caching across runs, then a faster engine behind the §5.1 trait.
+
+And one thing it has ruled out, which is worth as much:
+
+- **Sharing the file's source across rules bought nothing.** `HostContext::new` copies the
+  file's text into every rule's arena, so twenty rules meant twenty copies — about 72 MB of
+  copying across the corpus. Replacing the `String` with an `Arc<str>` so every rule shares
+  one allocation produced byte-identical output and **no measurable improvement in a
+  parallel run**: 1320 ms before, 1353 ms after, which is noise. Single-threaded it was worth
+  about 4%, and that is the whole of it.
+
+  The hypothesis had a real signal behind it, which is why it was worth testing: padding the
+  corpus with comments — more bytes, same nodes, same matches — did make the per-rule cost
+  grow. But it grew *sub*-linearly, 2.1× for 9.3× the bytes, and a two-point model built on
+  that predicted the third point 43% low. A cost that will not fit a line in the variable you
+  think drives it is a cost driven by something else.
+
+  Not shipped, because it changes `HostContext::new` and `NodeArena::new` in the public API
+  for a gain no user would ever observe. Worth writing down so the next person reads the
+  measurement instead of repeating it — and worth noting that this was the fourth of five
+  hypotheses about where cold time goes to be wrong. In this area the profile and the
+  intuition have both been poor guides, and only arithmetic on measured numbers has found
+  anything: the cache I/O that turned out to be 0.37 ms, the "expensive queries" that turned
+  out to be a re-parse, the misattribution that never happened, and now this.
 
 The remaining warm cost is reading and hashing every file to discover what changed, plus loading and rewriting a whole-corpus cache file. Beating it needs either a cheaper staleness check than content hashing, or a cache format that can be written in part.
 
