@@ -19,7 +19,8 @@ use lanekeep_lang::{LanguageRegistry, RegistryError};
 pub fn register_all(registry: &mut LanguageRegistry) -> Result<(), RegistryError> {
     lanekeep_lang_js::register_all(registry)?;
     lanekeep_lang_python::register_all(registry)?;
-    lanekeep_lang_go::register_all(registry)
+    lanekeep_lang_go::register_all(registry)?;
+    lanekeep_lang_rust::register_all(registry)
 }
 
 /// A registry holding every supported language.
@@ -50,7 +51,10 @@ mod tests {
         let registry = registry();
         let mut ids: Vec<&str> = registry.languages().map(|l| l.id().as_str()).collect();
         ids.sort_unstable();
-        assert_eq!(ids, ["go", "javascript", "python", "tsx", "typescript"]);
+        assert_eq!(
+            ids,
+            ["go", "javascript", "python", "rust", "tsx", "typescript"]
+        );
     }
 
     #[test]

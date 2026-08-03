@@ -378,6 +378,61 @@ objects to.
 
 ---
 
+# Rust
+
+Both Rust rules are about *legibility of dependencies and failure*: where a name came from, and
+what happens when something goes wrong.
+
+## `lanekeep/no-glob-import`
+
+```rust
+// bad
+use crate::models::*;
+
+// good
+use crate::models::{User, Session};
+```
+
+A glob makes it impossible to answer, by reading the file, where a name came from. Every
+unqualified identifier becomes a candidate for every glob in scope, and the answer moves when an
+upstream crate adds a public item — a name that resolved to yours last week resolves to theirs
+today, with no change on your side.
+
+It is also the case that defeats tooling. lanekeep's own resolver reports nothing for a glob
+import, because the names it brings in cannot be known without reading the other crate, so a
+rule asking "is this the imported `Result`?" quietly stops being answerable in any file with
+one.
+
+Preludes are the shape a glob is the intended spelling of, and `*prelude*` is allowed by
+default. `allow` takes patterns to widen that.
+
+## `lanekeep/no-unwrap`
+
+```rust
+// bad
+let config = load().unwrap();
+
+// good
+let config = load()?;
+```
+
+A library that panics on a malformed input has failed at its job: the caller wanted an error it
+could handle and got a process abort. In a binary it is a crash whose stack trace points at the
+unwrap rather than at what was actually wrong.
+
+**Test code is exempt.** `#[test]` functions, `#[cfg(test)]` modules and files under `tests/`
+are not reported — panicking *is* the failure mechanism there, and reporting it would mean
+either a rule nobody turns on or a suppression on every assertion. `allow` takes path patterns
+for anything else, `src/main.rs` being the usual one.
+
+### What it cannot tell apart
+
+A method genuinely named `expect` on your own type — a mock builder, say — is reported like
+`Result::expect`. Telling them apart needs type information, which lanekeep deliberately does
+not have (§1 non-goals). A test pins the behavior so it is a known limit rather than a surprise.
+
+---
+
 ## Composing them
 
 The two cross-file rules share their module resolution, which is exported as
