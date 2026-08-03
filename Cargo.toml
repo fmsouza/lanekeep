@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -18,23 +18,23 @@ categories = ["development-tools", "development-tools::testing"]
 # an unused dependency is a cargo-machete failure, and the intended graph is
 # documented in docs/architecture.md §3.
 [workspace.dependencies]
-lanekeep-cache = { version = "0.5.0", path = "crates/lanekeep-cache" }
-lanekeep-cli = { version = "0.5.0", path = "crates/lanekeep-cli" }
-lanekeep-config = { version = "0.5.0", path = "crates/lanekeep-config" }
-lanekeep-core = { version = "0.5.0", path = "crates/lanekeep-core" }
-lanekeep-engine = { version = "0.5.0", path = "crates/lanekeep-engine" }
-lanekeep-js = { version = "0.5.0", path = "crates/lanekeep-js" }
-lanekeep-lang = { version = "0.5.0", path = "crates/lanekeep-lang" }
-lanekeep-languages = { version = "0.5.0", path = "crates/lanekeep-languages" }
-lanekeep-lang-js = { version = "0.5.0", path = "crates/lanekeep-lang-js" }
-lanekeep-lang-go = { version = "0.5.0", path = "crates/lanekeep-lang-go" }
-lanekeep-lang-python = { version = "0.5.0", path = "crates/lanekeep-lang-python" }
-lanekeep-lang-rust = { version = "0.5.0", path = "crates/lanekeep-lang-rust" }
-lanekeep-query = { version = "0.5.0", path = "crates/lanekeep-query" }
-lanekeep-report = { version = "0.5.0", path = "crates/lanekeep-report" }
-lanekeep-server = { version = "0.5.0", path = "crates/lanekeep-server" }
-lanekeep-rules = { version = "0.5.0", path = "crates/lanekeep-rules" }
-lanekeep-testkit = { version = "0.5.0", path = "crates/lanekeep-testkit" }
+lanekeep-cache = { version = "0.6.0", path = "crates/lanekeep-cache" }
+lanekeep-cli = { version = "0.6.0", path = "crates/lanekeep-cli" }
+lanekeep-config = { version = "0.6.0", path = "crates/lanekeep-config" }
+lanekeep-core = { version = "0.6.0", path = "crates/lanekeep-core" }
+lanekeep-engine = { version = "0.6.0", path = "crates/lanekeep-engine" }
+lanekeep-js = { version = "0.6.0", path = "crates/lanekeep-js" }
+lanekeep-lang = { version = "0.6.0", path = "crates/lanekeep-lang" }
+lanekeep-languages = { version = "0.6.0", path = "crates/lanekeep-languages" }
+lanekeep-lang-js = { version = "0.6.0", path = "crates/lanekeep-lang-js" }
+lanekeep-lang-go = { version = "0.6.0", path = "crates/lanekeep-lang-go" }
+lanekeep-lang-python = { version = "0.6.0", path = "crates/lanekeep-lang-python" }
+lanekeep-lang-rust = { version = "0.6.0", path = "crates/lanekeep-lang-rust" }
+lanekeep-query = { version = "0.6.0", path = "crates/lanekeep-query" }
+lanekeep-report = { version = "0.6.0", path = "crates/lanekeep-report" }
+lanekeep-server = { version = "0.6.0", path = "crates/lanekeep-server" }
+lanekeep-rules = { version = "0.6.0", path = "crates/lanekeep-rules" }
+lanekeep-testkit = { version = "0.6.0", path = "crates/lanekeep-testkit" }
 
 # External dependencies are versioned once here so two crates cannot disagree, which
 # would otherwise show up as a duplicate in the dependency graph rather than as an error.

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/fmsouza/lanekeep/compare/v0.5.0...v0.6.0) - 2026-08-03
+
+### Added
+
+- *(types)* ship TypeScript definitions for the host API ([#82](https://github.com/fmsouza/lanekeep/pull/82))
+
+  `npm install --save-dev lanekeep` now gives you the binary **and** types, so `ctx`
+  autocompletes and a typo'd method is a compile error rather than a rule that throws inside
+  the sandbox. They live in the `lanekeep` package because that is the specifier a rule
+  imports from — types under any other name are types no editor finds.
+
+  A Go, Python or Rust project can add the npm package as a dev dependency purely for
+  authoring; nothing about the checker needs Node.
+
+  The definitions are asserted against the engine's own registration in both directions, so
+  they cannot drift into describing a method that does not exist.
+
+**Nothing in this release changes a public Rust API.** It is `0.6.0` rather than `0.5.1` as a
+deliberate signal that editor types have arrived, not because anything broke — but cargo reads
+a `0.x` minor bump as breaking, so a dependent pinning `lanekeep-core = "0.5"` will need to
+widen that requirement.
+
 ## [0.5.0](https://github.com/fmsouza/lanekeep/compare/v0.4.0...v0.5.0) - 2026-08-03
 
 ### Added
