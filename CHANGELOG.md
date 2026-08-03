@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/fmsouza/lanekeep/compare/v0.6.1...v0.6.2) - 2026-08-03
+
+### Fixed
+
+- *(cli)* honor --timeout ([#91](https://github.com/fmsouza/lanekeep/pull/91))
+
+### Performance
+
+- *(engine)* match every rule in one traversal ([#93](https://github.com/fmsouza/lanekeep/pull/93))
+
 ## [0.6.1](https://github.com/fmsouza/lanekeep/compare/v0.6.0...v0.6.1) - 2026-08-03
 
 ### Performance
