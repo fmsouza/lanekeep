@@ -9,10 +9,22 @@ import { isNestedInPath } from '../modules/rust'
  * dependency at all.
  *
  * Subprocess is a narrower claim and was never absolute: `--since` and `--staged` shell out to
- * git from `crates/lanekeep-core/src/changed.rs`. That is the whole of it, and `allow` states
- * it so a second one fails the gate rather than passing review as easily as the first did.
+ * git from `crates/lanekeep-core/src/changed.rs`. That is the whole of it for the engine, and
+ * `allow` states it so a second one fails the gate rather than passing review as easily as the
+ * first did.
+ *
+ * Integration tests under `tests/` are a different case, not a second exemption for the same
+ * thing: they spawn the compiled binary, or shell out to git to build fixtures, which is the
+ * scaffolding that proves the engine works rather than the engine reaching outside itself
+ * during a run. Excluded the same way `no-unwrap` excludes them, so the two rules agree on
+ * what "a test" means.
+ *
+ * `std::process` alone is not in this list. It would also match `std::process::ExitCode`,
+ * which is how a process reports its own exit status and reaches nothing outside it —
+ * `process::Command` is the capability this rule is actually about, and it matches both
+ * `std::process::Command` and an already-imported bare `process::Command`.
  */
-const FORBIDDEN = ['std::net', 'std::process', 'process::Command', 'TcpStream', 'UdpSocket']
+const FORBIDDEN = ['std::net', 'process::Command', 'TcpStream', 'UdpSocket']
 
 export default function noAmbientAuthority(options) {
   const allow = options?.allow ?? []
@@ -39,7 +51,15 @@ export default function noAmbientAuthority(options) {
     `,
 
     check(ctx, m) {
-      if (allow.includes(ctx.filePath)) return
+      const path = ctx.filePath
+      if (allow.includes(path)) return
+
+      // Integration tests spawn the compiled binary, and the CLI corpus helper shells out to
+      // git to build fixtures. §13's claim is about what the engine does in a run, not about
+      // the scaffolding that proves it works — the same trade `no-unwrap` makes, and the same
+      // spelling, so the two rules agree on what "a test" means.
+      if (path.includes('/tests/') || path.startsWith('tests/')) return
+
       if (isNestedInPath(ctx, m.site)) return
 
       const text = ctx.text(m.path)

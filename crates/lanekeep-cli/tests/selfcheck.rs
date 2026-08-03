@@ -163,3 +163,18 @@ fn ordinary_std_passes() {
         .accepts("use std::collections::BTreeMap;\nuse std::fs;\n")
         .expect("only network and subprocess are the boundary");
 }
+
+#[test]
+fn exit_code_is_not_reported_but_command_still_is() {
+    // `std::process` alone would also match `std::process::ExitCode`, which is how `main()`
+    // reports its own exit status and reaches nothing outside the process. `process::Command`
+    // is the capability the rule is actually about, and it still catches the qualified path.
+    // Both imports in one subject so a `FORBIDDEN` list containing bare `std::process` — which
+    // would report both lines — is what this test would catch.
+    authority()
+        .reports_at(
+            "use std::process::Command;\nuse std::process::ExitCode;\n",
+            &[(1, 1)],
+        )
+        .expect("ExitCode is not subprocess capability; Command still is");
+}
