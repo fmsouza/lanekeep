@@ -9,10 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.1](https://github.com/fmsouza/lanekeep/compare/v0.6.0...v0.6.1) - 2026-08-03
 
-### Other
+### Performance
+
+**Every scenario got faster, and nothing about behavior changed.** Measured on a development
+machine over the §15 corpus — 2,000 files, 20 rules — and noisy to within about 10%, so read
+them as magnitudes:
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| Cold full run | ~3.3 s | **~2.1 s** |
+| Warm, no changes | ~102 ms | **~48 ms** |
+| Warm, 1 changed file, `--staged` | ~75 ms | **~25 ms** |
+
+- *(engine)* parse each file once, not once per rule ([#86](https://github.com/fmsouza/lanekeep/pull/86))
+
+  A file admitted by twenty rules was parsed twenty times. The architecture said the queries
+  run across a single shared parse; the engine built a parser per rule instead. This is most
+  of the cold gain.
 
 - *(engine)* compile rule queries in parallel ([#85](https://github.com/fmsouza/lanekeep/pull/85))
-- *(engine)* parse each file once, not once per rule ([#86](https://github.com/fmsouza/lanekeep/pull/86))
+
+  A tree-sitter query costs a couple of milliseconds to compile and a rule compiles one per
+  language it declares, so twenty rules over two languages was ~88 ms before a single file was
+  read — more than an entire warm run. This is most of the `--staged` gain.
+
+Nothing here changes a public API, a rule's behavior, or what a run reports. The budgets in
+[§15](https://github.com/fmsouza/lanekeep/blob/main/docs/architecture.md) are still not met —
+cold is ~2.6× over — and that section now says where the remaining time goes.
 
 ## [0.6.0](https://github.com/fmsouza/lanekeep/compare/v0.5.0...v0.6.0) - 2026-08-03
 
