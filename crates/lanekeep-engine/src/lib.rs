@@ -272,47 +272,71 @@ impl Engine {
             }
         }
 
-        let mut rules = Vec::with_capacity(config.rules.len());
-        for spec in &config.rules {
-            if !spec.severity.is_enabled() {
-                continue;
-            }
-
-            let mut compiled = Vec::with_capacity(spec.languages.len());
-            for id in &spec.languages {
-                let language =
-                    registry
-                        .by_id(id)
-                        .cloned()
-                        .ok_or_else(|| RunError::UnknownLanguage {
-                            rule: spec.id.to_string(),
-                            language: id.clone(),
-                            known: known.clone(),
+        // Compiled in parallel, because this is the single most expensive thing a run does
+        // before it has looked at a file: a tree-sitter query costs a couple of milliseconds
+        // to compile, and a rule compiles one per language it declares. Twenty rules over two
+        // languages is forty compilations and most of a warm run's wall clock — measured at
+        // ~88 ms against a ~55 ms warm run, so construction cost more than the work.
+        //
+        // Every compilation is independent, so this is parallelism with no shared state and
+        // no ordering to preserve *during* it. What must stay ordered is the result: `rules`
+        // is indexed by the config's rule order, and a run's violations are sorted by rule id,
+        // so a shuffled `rules` would be a different program. `collect` into a `Vec<Result<_>>`
+        // preserves input order regardless of completion order, which is what makes this safe.
+        //
+        // Deliberately *not* made lazy. Compiling on first use would take a warm run's cost to
+        // nearly zero, and would cost the guarantee the comment below describes: a broken query
+        // is reported here, naming its rule, rather than staying silent until some file happens
+        // to need it.
+        let prepared: Vec<Result<Prepared, RunError>> =
+            config
+                .rules
+                .par_iter()
+                .filter(|spec| spec.severity.is_enabled())
+                .map(|spec| {
+                    let mut compiled = Vec::with_capacity(spec.languages.len());
+                    for id in &spec.languages {
+                        let language = registry.by_id(id).cloned().ok_or_else(|| {
+                            RunError::UnknownLanguage {
+                                rule: spec.id.to_string(),
+                                language: id.clone(),
+                                known: known.clone(),
+                            }
                         })?;
 
-                // Compiled against this grammar specifically. A query that is valid for one
-                // dialect and not another is a rule bug, and this is where it surfaces —
-                // at config load, naming the rule, rather than as silence at run time.
-                let query = CompiledQuery::compile(language.as_ref(), &spec.query).map_err(
-                    |e: CompileError| RunError::Query {
-                        rule: spec.id.to_string(),
-                        detail: e.to_string(),
-                    },
-                )?;
+                        // Compiled against this grammar specifically. A query that is valid for
+                        // one dialect and not another is a rule bug, and this is where it
+                        // surfaces — at config load, naming the rule, rather than as silence at
+                        // run time.
+                        let query = CompiledQuery::compile(language.as_ref(), &spec.query)
+                            .map_err(|e: CompileError| RunError::Query {
+                                rule: spec.id.to_string(),
+                                detail: e.to_string(),
+                            })?;
 
-                compiled.push((language, query));
-            }
+                        compiled.push((language, query));
+                    }
 
-            let gates = CompiledGates::compile(&spec.gates).map_err(|e| RunError::Gates {
-                rule: spec.id.to_string(),
-                detail: e.to_string(),
-            })?;
+                    let gates =
+                        CompiledGates::compile(&spec.gates).map_err(|e| RunError::Gates {
+                            rule: spec.id.to_string(),
+                            detail: e.to_string(),
+                        })?;
 
-            rules.push(Prepared {
-                spec: spec.clone(),
-                gates,
-                compiled,
-            });
+                    Ok(Prepared {
+                        spec: spec.clone(),
+                        gates,
+                        compiled,
+                    })
+                })
+                .collect();
+
+        // The first failure by *config order*, not by whichever thread finished first. Two
+        // broken rules must always name the same one, or the same project reports a different
+        // error between runs.
+        let mut rules = Vec::with_capacity(prepared.len());
+        for result in prepared {
+            rules.push(result?);
         }
 
         // Every registered grammar, so a tree-sitter bump invalidates rather than silently
@@ -1747,6 +1771,50 @@ mod tests {
         let err = project.run().expect_err("must fail at preparation");
         assert!(matches!(err, RunError::Query { .. }), "{err:?}");
         assert!(err.to_string().contains("no_such_node"), "{err}");
+    }
+
+    #[test]
+    fn two_broken_queries_always_name_the_same_rule() {
+        // Queries compile in parallel, so which thread finishes first is not fixed. The
+        // reported error must be the first by *config order* regardless — a project whose
+        // rules are both broken must not be told about a different one each run, because
+        // "fix that rule" followed by an error about another one reads as the tool being
+        // wrong rather than as two problems.
+        let broken = |name: &str| {
+            format!(
+                "import {{ defineRule }} from 'lanekeep';\n\
+                 export default defineRule({{\n\
+                   id: 'local/{name}',\n\
+                   query: '(no_such_node_{name}) @x',\n\
+                   card: {{ message: 'm', remediation: 'r', examples: {{ bad: 'a', good: 'b' }} }},\n\
+                   check() {{}},\n\
+                 }});\n"
+            )
+        };
+
+        let config = "import { defineConfig } from 'lanekeep';\n\
+             import first from './first';\n\
+             import second from './second';\n\
+             export default defineConfig({ include: ['src/**/*.ts'], rules: [first, second] });\n";
+
+        // Repeated, because a race reported once is a race that passes sometimes.
+        for attempt in 0..12 {
+            let project = Project::new(
+                &format!("two-broken-{attempt}"),
+                &[
+                    ("first.ts", &broken("first")),
+                    ("second.ts", &broken("second")),
+                    ("lanekeep.config.ts", config),
+                    ("src/a.ts", "debugger;\n"),
+                ],
+            );
+
+            let err = project.run().expect_err("must fail at preparation");
+            assert!(
+                err.to_string().contains("no_such_node_first"),
+                "attempt {attempt} named the wrong rule: {err}"
+            );
+        }
     }
 
     #[test]
