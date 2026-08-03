@@ -259,6 +259,7 @@ fn fix_and_recheck(
     project_root: &Path,
     config: Option<&Path>,
     caching: bool,
+    global_timeout: Option<u64>,
     outcome: Outcome,
 ) -> anyhow::Result<Outcome> {
     let written = apply_fixes(project_root, &outcome)?;
@@ -282,7 +283,7 @@ fn fix_and_recheck(
         )?;
     }
 
-    let (engine, _) = prepare(project_root, config, caching)?;
+    let (engine, _) = prepare(project_root, config, caching, global_timeout)?;
     engine.run().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -839,6 +840,7 @@ fn prepare(
     project_root: &Path,
     config: Option<&Path>,
     caching: bool,
+    global_timeout: Option<u64>,
 ) -> anyhow::Result<(Engine, usize)> {
     let root = RuleRoot::new(project_root)
         .map_err(|e| anyhow::anyhow!("cannot use `{}`: {e}", project_root.display()))?
@@ -847,9 +849,20 @@ fn prepare(
 
     let sandbox = lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let loaded =
+    let mut loaded =
         lanekeep_config::load(&sandbox, &root, &config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let declared = loaded.rules.len();
+
+    // `--timeout` overrides whatever the config settled on, because a flag a user typed on
+    // this run is a more specific statement than a file that applies to every run.
+    //
+    // It was validated in `check` and then dropped on the floor: the flag parsed, `--timeout 0`
+    // was rejected with a message, and the budget never moved. A run given two minutes still
+    // died at fifteen seconds — and the message it died with says "raise it with `--timeout`",
+    // which was advice that could not work.
+    if let Some(ms) = global_timeout {
+        loaded.limits.global_timeout = std::time::Duration::from_millis(ms);
+    }
 
     let engine = Engine::prepare(
         &loaded,
@@ -928,7 +941,8 @@ fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow:
             lanekeep_server::serve_lsp(&mut input, &mut output, &root, || {
                 // Every failure becomes a string the server logs and carries on from. An
                 // editor session should survive a config typo, not end on one.
-                let (engine, _) = prepare(project_root, config, true).map_err(|e| e.to_string())?;
+                let (engine, _) =
+                    prepare(project_root, config, true, None).map_err(|e| e.to_string())?;
                 engine
                     .run()
                     .map(|outcome| outcome.violations)
@@ -957,7 +971,7 @@ struct Project<'a> {
 impl lanekeep_server::mcp::Tools for Project<'_> {
     fn check(&mut self) -> Result<String, String> {
         let (engine, _) =
-            prepare(self.project_root, self.config, true).map_err(|e| e.to_string())?;
+            prepare(self.project_root, self.config, true, None).map_err(|e| e.to_string())?;
         let outcome = engine.run().map_err(|e| e.to_string())?;
 
         let cards: lanekeep_report::Cards = engine
@@ -985,7 +999,7 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
         use std::fmt::Write as _;
 
         let (engine, _) =
-            prepare(self.project_root, self.config, false).map_err(|e| e.to_string())?;
+            prepare(self.project_root, self.config, false, None).map_err(|e| e.to_string())?;
 
         let mut out = String::new();
         for spec in engine.rules() {
@@ -1005,7 +1019,7 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
         use std::fmt::Write as _;
 
         let (engine, _) =
-            prepare(self.project_root, self.config, false).map_err(|e| e.to_string())?;
+            prepare(self.project_root, self.config, false, None).map_err(|e| e.to_string())?;
 
         let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
             // The list, not only the miss. A rule id is easy to mistype and the answer is
@@ -1060,7 +1074,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         "--timeout must be greater than zero"
     );
 
-    let (engine, _) = prepare(project_root, config, !no_cache)?;
+    let (engine, _) = prepare(project_root, config, !no_cache, timeout)?;
 
     let selected = selection.resolve(project_root)?;
     let cross_file: Vec<String> = engine
@@ -1111,7 +1125,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let outcome = if fix {
-        fix_and_recheck(project_root, config, !no_cache, outcome)?
+        fix_and_recheck(project_root, config, !no_cache, timeout, outcome)?
     } else {
         outcome
     };
@@ -1156,7 +1170,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
 }
 
 fn rules(project_root: &Path, config: Option<&Path>, as_json: bool) -> anyhow::Result<ExitCode> {
-    let (engine, declared) = prepare(project_root, config, false)?;
+    let (engine, declared) = prepare(project_root, config, false, None)?;
     let mut stdout = std::io::stdout();
 
     if as_json {
@@ -1221,7 +1235,7 @@ fn explain(
     config: Option<&Path>,
     as_json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let (engine, _) = prepare(project_root, config, false)?;
+    let (engine, _) = prepare(project_root, config, false, None)?;
 
     let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
         // Naming what is configured, rather than only what is missing. A rule id is easy to
