@@ -6,9 +6,9 @@ how the tool works, start with [`docs/architecture.md`](docs/architecture.md).
 If you are a coding agent, or directing one, read [`AGENTS.md`](AGENTS.md) — it has the
 same process plus the invariants and the traps.
 
-> **lanekeep is in early development.** The architecture is settled but the
-> implementation is arriving milestone by milestone. Opening an issue before a large
-> change saves you from building something the design already answers differently.
+> **lanekeep is released and in use.** Every milestone in the architecture is delivered,
+> and it ships on five distribution channels. The design is settled, so opening an issue
+> before a large change saves you from building something it already answers differently.
 
 ## Setup
 
@@ -35,7 +35,9 @@ Every check is defined once, in the `justfile`. CI runs the same recipes, so a g
 | `just` | List every recipe |
 | `just check-fast` | Format, clippy, tests — runs on every commit |
 | `just check` | The full gate — runs on push and in CI |
-| `just test` | Tests only |
+| `just test` | Rust tests only |
+| `just test-scripts` | The repository's own shell tooling |
+| `just test-go` | The Go launcher, skipped where Go is absent |
 | `just fmt` | Apply formatting |
 | `just snapshot` | Review pending snapshot changes |
 
@@ -71,8 +73,9 @@ feat(js)!: replace the node handle representation
 Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`,
 `chore`, `revert`. A `!` or a `BREAKING CHANGE:` footer marks a breaking change.
 
-`feat` and `fix` move the version. Everything else does not, so if your change affects
-users, do not file it as a `chore`.
+`feat`, `fix`, `perf` and `revert` propose a release; everything else does not. So if your
+change affects users, do not file it as a `chore` — see the `release_commits` note in
+[`docs/releasing.md`](docs/releasing.md).
 
 The `commit-msg` hook validates branch commits and CI validates the title. Both run the
 same script, so they cannot disagree.
@@ -101,9 +104,18 @@ same script, so they cannot disagree.
 
 ## Adding a rule
 
-The rule authoring guide ships with the rule engine, which is still being built. Until
-then, §4 of [`docs/architecture.md`](docs/architecture.md) defines the rule format and §6
-the host API available to rule code.
+Start from a working example: `lanekeep init` scaffolds a runnable rule, and
+[`docs/built-in-rules.md`](docs/built-in-rules.md) walks through the eight that ship, including
+what each one deliberately does *not* catch. [`docs/cross-file-rules.md`](docs/cross-file-rules.md)
+covers rules needing a whole-corpus view.
+
+The reference is §4 of [`docs/architecture.md`](docs/architecture.md) for the rule format and §6
+for the host API. §6 is where to look for `ctx` today, since the package that will carry the
+TypeScript definitions is not built yet.
+
+A new built-in rule needs a `RuleTester` suite driven through the real engine — see
+`crates/lanekeep-rules/tests/` — and an entry in `docs/built-in-rules.md` in the same pull
+request.
 
 ## Reporting a bug
 
