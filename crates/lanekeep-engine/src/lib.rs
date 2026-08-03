@@ -116,6 +116,12 @@ pub enum RunError {
 /// against a grammar and the grammars differ. Which one a given file uses is decided by the
 /// file, not by the rule — see [`Prepared::for_language`].
 struct Prepared {
+    /// This rule's position in [`Engine::rules`].
+    ///
+    /// Carried on the rule rather than paired with it in the admitted list, because that
+    /// list is rebuilt for every file — on a warm run too, before the cache is consulted —
+    /// and widening its elements to a tuple measured about 5 ms over the §15 corpus.
+    index: usize,
     spec: RuleSpec,
     gates: CompiledGates,
     /// Compiled query per language, in the order the rule declared them.
@@ -135,6 +141,127 @@ impl Prepared {
     }
 }
 
+/// The file a rule is about to run against, and the tree every rule on it shares.
+struct FileUnderCheck<'a> {
+    path: &'a FilePath,
+    source: &'a str,
+    tree: &'a tree_sitter::Tree,
+}
+
+/// One match's captures: the capture name, and a structural path to the node it bound.
+///
+/// A path rather than a node because a node borrows its tree, and these outlive the borrow
+/// — see `NodeArena::path_of`. It being structural is also what lets one traversal serve
+/// every rule: the path interns correctly into any arena over the same tree.
+type MatchCaptures = Vec<(String, Vec<u32>)>;
+
+/// Every match one rule found in one file.
+type RuleMatches = Vec<MatchCaptures>;
+
+/// Matches from one traversal, indexed by position in [`Engine::rules`].
+type MatchesByRule = Vec<RuleMatches>;
+
+/// One language's patterns, accumulated across rules before anything is compiled.
+struct Concatenation {
+    language: Arc<dyn Language>,
+    source: String,
+    owners: Vec<usize>,
+}
+
+/// Every rule's query for one language, compiled as a single multi-pattern query.
+///
+/// Twenty rules used to mean twenty `QueryCursor` walks of the same tree. tree-sitter is
+/// built to evaluate many patterns in one traversal — that is what a `highlights.scm` is —
+/// and doing it that way measured 20× faster over the §15 corpus at identical capture
+/// counts. It is the single biggest cost left in a cold run.
+///
+/// Correctness rests on two facts. `pattern_index` says which pattern produced a match, so
+/// matches can be handed back to the rule that asked for them. And a capture path is a walk
+/// of child indices from the root — see `NodeArena::path_of` — so it is a property of the
+/// tree's *shape*, not of any one arena, and a path collected here interns correctly into
+/// every rule's own arena afterwards.
+struct CombinedQuery {
+    language: Arc<dyn Language>,
+    source: String,
+    /// `owners[pattern_index]` is the index into [`Engine::rules`] that contributed it.
+    ///
+    /// A rule's query source may hold several patterns, so this is not one entry per rule.
+    owners: Vec<usize>,
+    /// Compiled on first use, and never on a run that has no use for it.
+    ///
+    /// Compiling eagerly cost a warm run 26 ms — every file was a cache hit, no query ran,
+    /// and the whole compilation was thrown away. Warm is the scenario in the inner loop
+    /// and the one with the tightest budget, so paying for cold there is the wrong trade.
+    compiled: std::sync::OnceLock<Option<CompiledQuery>>,
+}
+
+impl CombinedQuery {
+    /// The compiled query, or `None` if the concatenation will not serve.
+    ///
+    /// `None` sends the file down the per-rule path: slower, never wrong. Every part was
+    /// already compiled individually at preparation, which is where a broken query is
+    /// reported against the rule that owns it, so this only catches a concatenation
+    /// rejected for a reason no single pattern was.
+    fn query(&self) -> Option<&CompiledQuery> {
+        self.compiled
+            .get_or_init(|| {
+                CompiledQuery::compile(self.language.as_ref(), &self.source)
+                    .ok()
+                    // Only sound if tree-sitter numbered the patterns the way the
+                    // concatenation did. It always has; checking turns a silent
+                    // misattribution — one rule's matches handed to another — into a
+                    // fallback.
+                    .filter(|query| query.pattern_count() == self.owners.len())
+            })
+            .as_ref()
+    }
+}
+
+/// Build one multi-pattern query per language, over every rule that declares it.
+///
+/// Rules are visited in `rules` order and their patterns appended in that order, so
+/// `owners` is built alongside the source it describes and the two cannot drift.
+///
+/// Nothing is compiled here — see [`CombinedQuery::query`], which does it on first use so a
+/// warm run never pays for a query it will not run.
+fn combine_queries(rules: &[Prepared]) -> BTreeMap<String, CombinedQuery> {
+    let mut sources: BTreeMap<String, Concatenation> = BTreeMap::new();
+
+    for (index, rule) in rules.iter().enumerate() {
+        for (language, query) in &rule.compiled {
+            let entry = sources
+                .entry(language.id().as_str().to_owned())
+                .or_insert_with(|| Concatenation {
+                    language: Arc::clone(language),
+                    source: String::new(),
+                    owners: Vec::new(),
+                });
+            entry.source.push_str(&rule.spec.query);
+            // A query source need not end in a newline, and two patterns run together on
+            // one line is a different query from the two of them.
+            entry.source.push('\n');
+            entry
+                .owners
+                .extend(std::iter::repeat_n(index, query.pattern_count()));
+        }
+    }
+
+    sources
+        .into_iter()
+        .map(|(id, parts)| {
+            (
+                id,
+                CombinedQuery {
+                    language: parts.language,
+                    source: parts.source,
+                    owners: parts.owners,
+                    compiled: std::sync::OnceLock::new(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Everything a run needs, built once and shared across workers.
 #[expect(
     clippy::struct_excessive_bools,
@@ -146,6 +273,13 @@ impl Prepared {
 )]
 pub struct Engine {
     rules: Vec<Prepared>,
+    /// One multi-pattern query per language, over every rule that declares it.
+    ///
+    /// Empty for a language no rule targets, and not built at all until a file needs it.
+    /// Assembling the sources measured ~4 ms over the §15 ruleset, which a warm run — every
+    /// file a cache hit, no query run — would have paid for nothing. Warm has the tightest
+    /// budget of the three scenarios, so it does not subsidize cold.
+    combined: std::sync::OnceLock<BTreeMap<String, CombinedQuery>>,
     discovery: Discovery,
     /// The project root, canonicalized once. Every tracked read is checked against it, and
     /// canonicalizing per file would put a syscall on the hot path for a constant.
@@ -324,6 +458,8 @@ impl Engine {
                         })?;
 
                     Ok(Prepared {
+                        // Filled in below, once config order is known.
+                        index: 0,
                         spec: spec.clone(),
                         gates,
                         compiled,
@@ -337,6 +473,9 @@ impl Engine {
         let mut rules = Vec::with_capacity(prepared.len());
         for result in prepared {
             rules.push(result?);
+        }
+        for (index, rule) in rules.iter_mut().enumerate() {
+            rule.index = index;
         }
 
         // Every registered grammar, so a tree-sitter bump invalidates rather than silently
@@ -363,6 +502,7 @@ impl Engine {
 
         Ok(Self {
             rules,
+            combined: std::sync::OnceLock::new(),
             run_key,
             caching: true,
             reducing: true,
@@ -747,6 +887,7 @@ impl Engine {
         let files = Rc::new(FileAccess::rooted(self.root.clone()));
 
         // Path gates first: rejecting here costs no read at all.
+        //
         let admitted: Vec<&Prepared> = self
             .rules
             .iter()
@@ -839,9 +980,27 @@ impl Engine {
             return Ok(outcome);
         };
 
+        // One traversal for every rule, where the ruleset allows it. `collected[i]` holds
+        // the matches for `self.rules[i]`; `None` means no combined pass ran and each rule
+        // walks the tree itself.
+        let file = FileUnderCheck {
+            path,
+            source: &source,
+            tree: &tree,
+        };
+        let mut collected = self.collect_matches(&file, &admitted);
+
         for rule in admitted {
+            // Taken, not cloned: each bucket is read exactly once, and copying capture
+            // paths per rule would give back a share of what the single traversal saved.
+            let matches = collected.as_mut().map(|by_rule| {
+                by_rule
+                    .get_mut(rule.index)
+                    .map(std::mem::take)
+                    .unwrap_or_default()
+            });
             let (violations, facts, read_the_date, timing) =
-                self.run_rule(worker, &files, rule, path, &source, &tree)?;
+                self.run_rule(worker, &files, rule, &file, matches)?;
             outcome.violations.extend(violations);
             outcome.facts.extend(facts);
             outcome.read_the_date |= read_the_date;
@@ -850,28 +1009,7 @@ impl Engine {
             }
         }
 
-        // Applied after every rule has run, so a directive covers whatever any of them
-        // reported at that line. Which directive fired is recorded rather than discarded:
-        // it is the only moment the information exists, since a warm run sees the survivors
-        // and not what was hidden.
-        let mut used = Vec::new();
-        outcome.violations.retain(|violation| {
-            match directives.covering(&violation.rule_id, violation.location.position.line) {
-                Some(index) => {
-                    let index = u32::try_from(index).unwrap_or(u32::MAX);
-                    if !used.contains(&index) {
-                        used.push(index);
-                    }
-                    false
-                }
-                None => true,
-            }
-        });
-        used.sort_unstable();
-        outcome.used_suppressions = used;
-        outcome
-            .violations
-            .extend(self.directive_violations(&directives, path));
+        self.apply_directives(&mut outcome, &directives, path);
 
         outcome.suppressions = directives.valid;
         outcome.reads = files.dependencies();
@@ -966,6 +1104,99 @@ impl Engine {
     /// `None` when the language is unknown or the grammar cannot parse the file. That is not
     /// an error — it is what the per-rule early returns did before, and callers depend on a
     /// file like that simply producing no violations.
+    /// Run every admitted rule's patterns in one traversal, bucketed by rule.
+    ///
+    /// `None` means the caller should fall back to a query per rule: either no combined
+    /// query exists for this language, or `--profile` is on. Profiling deliberately takes
+    /// the slow path, because the per-rule split it reports — query time against handler
+    /// time — is a measurement of one rule in isolation, and a shared traversal has no
+    /// honest way to divide itself between the rules that share it. See §15.
+    ///
+    /// Patterns belonging to rules a gate excluded still run; their matches are dropped
+    /// here rather than never produced. That costs a little evaluation and saves the
+    /// traversal, and it cannot change a result: a gate that rejects a file means the rule
+    /// does not run on it, and a bucket that is thrown away is a rule that did not run.
+    fn collect_matches(
+        &self,
+        file: &FileUnderCheck<'_>,
+        admitted: &[&Prepared],
+    ) -> Option<MatchesByRule> {
+        if self.profiling {
+            return None;
+        }
+        let FileUnderCheck { path, source, tree } = *file;
+        let combined = self
+            .combined
+            .get_or_init(|| combine_queries(&self.rules))
+            .get(self.language_of(path)?)?;
+
+        // One arena for the whole file, only to turn nodes into paths. Each rule still gets
+        // its own arena and its own handles; a path is structural, so it crosses freely.
+        let arena = lanekeep_js::NodeArena::new(tree.clone(), source.to_owned());
+
+        let mut by_rule: MatchesByRule = vec![Vec::new(); self.rules.len()];
+        let wanted: Vec<bool> = {
+            let mut wanted = vec![false; self.rules.len()];
+            for rule in admitted {
+                wanted[rule.index] = true;
+            }
+            wanted
+        };
+
+        combined
+            .query()?
+            .for_each_match(arena.tree(), source.as_bytes(), |m| {
+                let Some(&owner) = combined.owners.get(m.pattern_index) else {
+                    return;
+                };
+                if !wanted[owner] {
+                    return;
+                }
+                let captures = m
+                    .captures
+                    .iter()
+                    .filter_map(|(name, node)| {
+                        arena.path_of(*node).map(|path| ((*name).to_owned(), path))
+                    })
+                    .collect();
+                by_rule[owner].push(captures);
+            });
+
+        Some(by_rule)
+    }
+
+    /// Drop the violations this file's directives silence, and record which fired.
+    ///
+    /// Applied after every rule has run, so a directive covers whatever any of them
+    /// reported at that line. Which directive fired is recorded rather than discarded: it
+    /// is the only moment the information exists, since a warm run sees the survivors and
+    /// not what was hidden.
+    fn apply_directives(
+        &self,
+        outcome: &mut FileOutcome,
+        directives: &Suppressions,
+        path: &FilePath,
+    ) {
+        let mut used = Vec::new();
+        outcome.violations.retain(|violation| {
+            match directives.covering(&violation.rule_id, violation.location.position.line) {
+                Some(index) => {
+                    let index = u32::try_from(index).unwrap_or(u32::MAX);
+                    if !used.contains(&index) {
+                        used.push(index);
+                    }
+                    false
+                }
+                None => true,
+            }
+        });
+        used.sort_unstable();
+        outcome.used_suppressions = used;
+        outcome
+            .violations
+            .extend(self.directive_violations(directives, path));
+    }
+
     fn parse_once(
         &self,
         path: &FilePath,
@@ -987,10 +1218,10 @@ impl Engine {
         worker: &mut Worker<'_>,
         files: &Rc<FileAccess>,
         rule: &Prepared,
-        path: &FilePath,
-        source: &str,
-        tree: &tree_sitter::Tree,
+        file: &FileUnderCheck<'_>,
+        precollected: Option<RuleMatches>,
     ) -> Result<(Vec<Violation>, Vec<Fact>, bool, RuleTiming), RunError> {
+        let FileUnderCheck { path, source, tree } = *file;
         // The grammar is chosen by the file, not by the rule. A rule that does not target
         // this file's language does not run on it at all — previously it ran anyway, against
         // a grammar that could not parse the file, and matched nothing without saying so.
@@ -1018,7 +1249,8 @@ impl Engine {
 
         // Collect capture paths while the tree is borrowed, then intern once the borrow
         // has ended — the two-phase shape the arena's ownership of the tree forces.
-        let mut matches: Vec<Vec<(String, Vec<u32>)>> = Vec::new();
+        let mut matches: RuleMatches = Vec::new();
+
         let host = HostContext::new(tree, source.to_owned(), path.as_str())
             .with_resolver_from(language.as_ref())
             .with_language(Arc::clone(language))
@@ -1026,7 +1258,12 @@ impl Engine {
             .with_file_access(Rc::clone(files));
 
         let query_started = clock(self.profiling);
-        {
+        if let Some(found) = precollected {
+            // Already matched, in one traversal shared with every other rule on this file.
+            matches = found;
+        } else {
+            // No combined query for this language, or profiling asked for the per-rule
+            // split. Walk the tree for this rule alone.
             let arena = host.arena().borrow();
             compiled_query.for_each_match(arena.tree(), source.as_bytes(), |m| {
                 let captures = m
@@ -1829,6 +2066,166 @@ mod tests {
             parsers, 1,
             "the engine constructs {parsers} tree-sitter parsers outside tests; there must be \
              exactly one, in `check_file`, shared by every rule that runs on the file"
+        );
+    }
+
+    #[test]
+    fn the_combined_and_per_rule_paths_report_the_same_thing() {
+        // There are two ways to match a file — one traversal for every rule, or one per
+        // rule — and `--profile` is what chooses between them. Two paths through the hot
+        // path is a place for divergence, and divergence here is silent: a rule whose
+        // matches were handed to the wrong owner, or dropped, reports fewer violations and
+        // nothing says so.
+        //
+        // Rules deliberately share capture names and node kinds. A combined query numbers
+        // captures across the whole query rather than per pattern, so `@stmt` meaning one
+        // thing in the third rule and another in the fifth is exactly the confusion an
+        // owner map has to survive.
+        let rule = |id: &str, query: &str| {
+            format!(
+                "import {{ defineRule }} from 'lanekeep';\n\
+                 export default defineRule({{\n\
+                 \x20 id: 'local/{id}',\n\
+                 \x20 severity: 'error',\n\
+                 \x20 card: {{ message: '{id}', remediation: 'n/a', \
+                 examples: {{ bad: 'a', good: 'b' }} }},\n\
+                 \x20 query: '{query}',\n\
+                 \x20 check(ctx, m) {{ if (m.stmt) ctx.report(m.stmt); }},\n\
+                 }});\n"
+            )
+        };
+
+        let project = Project::new(
+            "both-paths",
+            &[
+                // Two patterns, and first, so pattern indices stop coinciding with rule
+                // indices. With one pattern per rule the identity map is accidentally
+                // correct, and a test built that way passes against an engine that ignores
+                // the owner map entirely — which is how the first version of this test was
+                // written, and it did.
+                (
+                    "rules/a.ts",
+                    &rule(
+                        "a",
+                        "(debugger_statement) @stmt (lexical_declaration) @stmt",
+                    ),
+                ),
+                ("rules/b.ts", &rule("b", "(class_declaration) @stmt")),
+                ("rules/c.ts", &rule("c", "(debugger_statement) @stmt")),
+                (
+                    "rules/d.ts",
+                    &rule("d", "(call_expression function: (identifier) @fn) @stmt"),
+                ),
+                (
+                    "lanekeep.config.ts",
+                    "import { defineConfig } from 'lanekeep';\n\
+                     import a from './rules/a';\n\
+                     import b from './rules/b';\n\
+                     import c from './rules/c';\n\
+                     import d from './rules/d';\n\
+                     export default defineConfig({\n\
+                     \x20 include: ['src/**/*.ts'],\n\
+                     \x20 rules: [a, b, c, d],\n\
+                     });\n",
+                ),
+                (
+                    "src/one.ts",
+                    "export class A {\n  go() {\n    debugger;\n    helper();\n  }\n}\n",
+                ),
+                (
+                    "src/two.ts",
+                    "export class B {}\nexport function f() {\n  other();\n  debugger;\n}\n",
+                ),
+                ("src/three.ts", "export const n = 1;\n"),
+            ],
+        );
+
+        let combined = project
+            .build()
+            .map(Engine::without_cache)
+            .expect("engine")
+            .run()
+            .expect("combined run");
+        let per_rule = project
+            .build()
+            .map(Engine::without_cache)
+            .expect("engine")
+            .profiling()
+            .run()
+            .expect("per-rule run");
+
+        assert_eq!(
+            rendered(&combined),
+            rendered(&per_rule),
+            "the shared traversal and the per-rule queries disagree"
+        );
+        // Not vacuous: a pair of empty runs would compare equal and assert nothing.
+        assert!(
+            combined.violations.len() >= 6,
+            "the fixture should produce violations from several rules, got {}",
+            combined.violations.len()
+        );
+    }
+
+    #[test]
+    fn every_pattern_in_a_combined_query_is_owned_by_the_rule_that_wrote_it() {
+        // The map from pattern to rule is positional, so it is only correct if tree-sitter
+        // numbers patterns in the order they were concatenated. Asserted directly, because
+        // an off-by-one here does not fail — it hands one rule's matches to its neighbor,
+        // and both rules keep reporting.
+        let project = Project::new(
+            "owner-map",
+            &[
+                // Two patterns in one rule, so the mapping cannot be one entry per rule.
+                (
+                    "rules/two.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     export default defineRule({\n\
+                     \x20 id: 'local/two',\n\
+                     \x20 severity: 'error',\n\
+                     \x20 card: { message: 'two', remediation: 'n/a', \
+                     examples: { bad: 'a', good: 'b' } },\n\
+                     \x20 query: '(debugger_statement) @stmt (class_declaration) @stmt',\n\
+                     \x20 check(ctx, m) { if (m.stmt) ctx.report(m.stmt); },\n\
+                     });\n",
+                ),
+                (
+                    "rules/one.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     export default defineRule({\n\
+                     \x20 id: 'local/one',\n\
+                     \x20 severity: 'error',\n\
+                     \x20 card: { message: 'one', remediation: 'n/a', \
+                     examples: { bad: 'a', good: 'b' } },\n\
+                     \x20 query: '(function_declaration) @stmt',\n\
+                     \x20 check(ctx, m) { if (m.stmt) ctx.report(m.stmt); },\n\
+                     });\n",
+                ),
+                (
+                    "lanekeep.config.ts",
+                    "import { defineConfig } from 'lanekeep';\n\
+                     import two from './rules/two';\n\
+                     import one from './rules/one';\n\
+                     export default defineConfig({\n\
+                     \x20 include: ['src/**/*.ts'],\n\
+                     \x20 rules: [two, one],\n\
+                     });\n",
+                ),
+                ("src/a.ts", "export class C {}\n"),
+            ],
+        );
+
+        let engine = project.build().expect("engine");
+        let combined = combine_queries(&engine.rules);
+        let combined = combined
+            .get("typescript")
+            .expect("typescript has a combined query");
+
+        // Three patterns: two from the first rule, one from the second, in that order.
+        assert_eq!(combined.owners, vec![0, 0, 1], "{:?}", combined.owners);
+        assert_eq!(
+            combined.query().expect("compiles").pattern_count(),
+            combined.owners.len()
         );
     }
 
