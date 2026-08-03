@@ -16,6 +16,17 @@ import { isNestedInPath } from '../modules/rust'
  */
 export default function trackedReadsOnly(options) {
   const scope = options?.scope ?? []
+
+  // A rule scoped to nothing checks nothing and reports a clean run, which is the failure
+  // this whole rule set exists to prevent. `allow` defaults to empty and that is safe — it
+  // makes the rule check *more*. `scope` is the opposite polarity, so an empty one has to be
+  // refused rather than defaulted. Loud at config load beats silent forever.
+  if (scope.length === 0) {
+    throw new Error(
+      'local/tracked-reads-only needs a non-empty `scope`; with none it silently checks nothing',
+    )
+  }
+
   const allow = options?.allow ?? []
 
   return defineRule({

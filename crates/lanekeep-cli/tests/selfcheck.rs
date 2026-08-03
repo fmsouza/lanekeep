@@ -218,3 +218,35 @@ fn a_file_outside_the_scope_passes() {
     .accepts("fn go() {\n    let t = std::fs::read_to_string(\"x\");\n}\n")
     .expect("the rule is about the sandbox crate, not the whole workspace");
 }
+
+#[test]
+fn an_empty_scope_is_refused() {
+    // `RuleTester::configured` only writes the fixture to disk; the factory is not called
+    // until `run` loads the config, which is what `accepts` triggers below. The error surfaces
+    // there, as a `TestError::Load`, not from `configured` itself.
+    let error = RuleTester::configured("tracked-noscope", TRACKED, "{ scope: [], allow: [] }")
+        .expect("the rule builds")
+        .accepts("fn go() {}\n")
+        .expect_err("a rule scoped to nothing must refuse to load rather than check nothing");
+    assert!(format!("{error}").contains("scope"), "{error}");
+}
+
+#[test]
+fn a_use_declaration_reports_once() {
+    // The site captured from `use_declaration argument: (_)` nests a `scoped_identifier` for
+    // every `::` inside it. Nothing in the other cases exercises `isNestedInPath` filtering a
+    // match down from a `use_declaration` ancestor specifically, rather than from another
+    // `scoped_identifier` ancestor — this does.
+    tracked()
+        .reports_at("use std::fs::File;\n", &[(1, 1)])
+        .expect("one violation for the declaration, not one per path segment");
+}
+
+#[test]
+fn a_near_miss_identifier_is_not_reported() {
+    // `vfs::` contains the substring `fs::`, which is enough to pass the `fileContains` gate,
+    // but it is not the `fs` module — the regex requires `fs` as a whole path segment.
+    tracked()
+        .accepts("fn go() {\n    let t = vfs::something(\"x\");\n}\n")
+        .expect("`vfs` is not `fs`; the gate's substring match is coarser than the check's");
+}
