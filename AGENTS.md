@@ -338,6 +338,25 @@ whole `#[test]` exemption to this, silently, because the check it skipped only e
 violations. Compare against `undefined` explicitly, or read `ctx.ancestors` positionally and
 avoid the question.
 
+**Validating a flag is not applying it, and validation is what makes an ignored flag look
+implemented.** `check` destructured `--timeout`, rejected zero with a considered message — whose
+comment warned that accepting a value and ignoring it "would surface much later as an
+unexplained breach of a budget they thought they had changed" — and then called `prepare`, which
+had no parameter for it. The value was dropped one line below the comment explaining why that
+must not happen. It survived because the failure has no symptom of its own: lowering a budget
+looks like it worked, since the run completes either way, and raising one looks like the run is
+simply slow. The breach message even ends with "raise it with `--timeout`", advice printed by
+the code that made it impossible. A test that only *lowers* a limit passes against this bug —
+assert the raise.
+
+**The global run budget is polled by QuickJS's interrupt handler, so it only bounds a run while
+JavaScript is executing.** A rule whose handler returns after a handful of operations can
+overrun the budget without ever being asked to stop: 400 files against a one-line rule ran to
+completion under a 1 ms budget, config-set or flag-set alike. It is not that the limit is unwired
+— a rule doing real work trips it precisely — but the poll only happens inside the sandbox, and
+§15's cold cost is dominated by Rust-side parsing. Any fixture testing this needs a rule that
+burns real bytecode, or it is testing nothing.
+
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,
 so the build machine silently decides the oldest distribution the release supports. When
