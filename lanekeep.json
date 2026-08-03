@@ -21,6 +21,15 @@
     "lanekeep/no-mutable-default-argument",
     "lanekeep/no-package-init",
     "lanekeep/no-context-in-struct",
-    { "rule": "lanekeep/no-circular-imports", "options": {} }
+    { "rule": "lanekeep/no-circular-imports", "options": {} },
+    {
+      "rule": "./lanekeep/rules/one-parser-per-file.ts",
+      "options": {
+        "allow": [
+          "crates/lanekeep-engine/src/lib.rs",
+          "crates/lanekeep-js/src/typescript.rs"
+        ]
+      }
+    }
   ]
 }
