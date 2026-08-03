@@ -38,6 +38,13 @@
     {
       "rule": "./lanekeep/rules/no-ambient-authority.ts",
       "options": { "allow": ["crates/lanekeep-core/src/changed.rs"] }
+    },
+    {
+      "rule": "./lanekeep/rules/tracked-reads-only.ts",
+      "options": {
+        "scope": ["crates/lanekeep-js/"],
+        "allow": ["crates/lanekeep-js/src/files.rs", "crates/lanekeep-js/src/loader.rs"]
+      }
     }
   ]
 }

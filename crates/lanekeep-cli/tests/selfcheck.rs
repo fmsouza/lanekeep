@@ -178,3 +178,43 @@ fn exit_code_is_not_reported_but_command_still_is() {
         )
         .expect("ExitCode is not subprocess capability; Command still is");
 }
+
+const TRACKED: &str = include_str!("../../../lanekeep/rules/tracked-reads-only.ts");
+
+fn tracked() -> RuleTester {
+    configured("tracked", TRACKED, "{ scope: ['subject/'], allow: [] }")
+}
+
+#[test]
+fn an_untracked_read_is_reported() {
+    tracked()
+        .reports_at(
+            "fn go() {\n    let t = std::fs::read_to_string(\"x\");\n}\n",
+            &[(2, 13)],
+        )
+        .expect("a read that records no dependency makes the cache entry unsound");
+}
+
+#[test]
+fn the_tracking_module_passes() {
+    RuleTester::configured(
+        "tracked-allow",
+        TRACKED,
+        "{ scope: ['subject/'], allow: ['subject/input.rs'] }",
+    )
+    .expect("the rule builds")
+    .accepts("fn go() {\n    let t = std::fs::read_to_string(\"x\");\n}\n")
+    .expect("files.rs is the tracked-read implementation");
+}
+
+#[test]
+fn a_file_outside_the_scope_passes() {
+    RuleTester::configured(
+        "tracked-scope",
+        TRACKED,
+        "{ scope: ['crates/lanekeep-js/'], allow: [] }",
+    )
+    .expect("the rule builds")
+    .accepts("fn go() {\n    let t = std::fs::read_to_string(\"x\");\n}\n")
+    .expect("the rule is about the sandbox crate, not the whole workspace");
+}
