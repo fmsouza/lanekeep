@@ -94,7 +94,60 @@ jobs:
 
       # Opens or updates the release pull request: the version bump and the changelog, for
       # review. Nothing here is irreversible — closing the pull request undoes all of it.
+      # Whether a release is already on its way out, which is the one condition under which
+      # proposing another is always wrong.
+      #
+      # release-plz works out the next version by diffing a package against the newest
+      # version *on crates.io*. Publishing is gated on a human approving the `release`
+      # environment, so between a version landing on `main` and reaching the registry — which
+      # can be hours — the registry is behind, and every run in that window proposes a
+      # release for work that is already tagged and about to ship. That produced #64 and,
+      # after the first attempt at a fix, #69.
+      #
+      # `release_commits` in release-plz.toml was that first attempt. It filters by commit
+      # *type*, which closes only the case where the sole commit in the window is a
+      # `chore: release` — #69 got through because #66's title is `feat(lang):`, which
+      # legitimately matches. Filtering commits was a proxy for the condition; this is the
+      # condition.
+      #
+      # Comparing the *manifest* version rather than the newest tag matters: after a release
+      # pull request merges, the tag does not exist yet — the `release` step below is what
+      # creates it — so a tag-based check would still be looking at the previous, published
+      # one and would let #64 through again.
+      - name: Is a release already in flight?
+        id: inflight
+        run: |
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml |
+            grep -m1 '^version = ' | sed -E 's/.*"(.*)".*/\1/')"
+          if [ -z "${version}" ]; then
+            echo "::error::could not read the workspace version from Cargo.toml"
+            exit 1
+          fi
+
+          # crates.io answers 404 for a version it does not have, which is the answer this
+          # wants rather than an error. It rejects requests with no User-Agent, and a request
+          # that fails for any other reason is treated as "not published" — the safe
+          # direction, since the cost is a release proposed one run later than it could have
+          # been, against a duplicate release that cannot be taken back.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -A 'lanekeep release-plz gate (github.com/fmsouza/lanekeep)' \
+            "https://crates.io/api/v1/crates/lanekeep-cli/${version}")"
+
+          if [ "${code}" = "200" ]; then
+            echo "inflight=no" >> "${GITHUB_OUTPUT}"
+            echo "the manifest is at ${version}, which crates.io already has"
+            echo "nothing is in flight, so a release pull request may be proposed"
+          else
+            echo "inflight=yes" >> "${GITHUB_OUTPUT}"
+            echo "the manifest is at ${version}, which crates.io does not have (HTTP ${code})"
+            echo "that release is still on its way out, so no release pull request this run"
+            echo "::notice::${version} is tagged or merged but not yet published, so no \
+            release pull request is proposed. This run will still tag and release if there \
+            is anything to."
+          fi
+
       - name: Open the release pull request
+        if: steps.inflight.outputs.inflight == 'no'
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release-pr

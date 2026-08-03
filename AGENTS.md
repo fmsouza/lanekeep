@@ -300,9 +300,22 @@ one version behind the manifest. Any push to `main` in that window finds the pac
 whole changelog was "update Cargo.lock dependencies". Merging it would have published a version
 identical to the one still waiting to go out, and no index lets a number be reused.
 
-`release_commits` is the fix — only `feat`, `fix`, `perf` and `revert` propose a release, and
-the commit in that window is always a `chore: release`. Not `git_only`, which reads versions
-from tags and would strand the fourteen crates this repository deliberately leaves untagged.
+The fix is to gate the window itself: `release-plz.yml` reads the workspace version from
+`Cargo.toml`, asks crates.io whether it is published, and skips the release-pull-request step
+when it is not. Tagging stays ungated, or a merged release pull request would never tag.
+Comparing the manifest rather than the newest tag is load-bearing — right after a release pull
+request merges the tag does not exist yet, so a tag-based check reads the previous, published
+one and lets the failure through.
+
+**The first attempt was `release_commits`, and it was a proxy rather than the condition.**
+Filtering to `feat`, `fix`, `perf` and `revert` closes the case where the only commit in the
+window is a `chore: release` — which was the first failure's shape, so it looked right. Then a
+real `feat` landed in the window, matched the filter, and proposed a duplicate of a version
+already publishing. Worth remembering generally: when a fix works by excluding the example you
+have rather than by describing the fault, expect the next instance to walk straight past it.
+
+Not `git_only` either, which reads versions from tags and would strand the fourteen crates this
+repository deliberately leaves untagged.
 
 The mirror-image trap is worth holding at the same time: **a change that ships different bytes
 without touching crate source proposes nothing at all.** The glibc fix lived entirely in build
