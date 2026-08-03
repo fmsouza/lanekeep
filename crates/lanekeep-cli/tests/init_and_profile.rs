@@ -81,8 +81,85 @@ fn init_writes_a_config_and_a_rule() {
     let output = project.run(&["init"]);
 
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert!(project.exists("lanekeep.config.ts"));
+    // JSON, not TypeScript: configuration is data, and a Go or Python team should not have
+    // to write a `.ts` file to say which rules they want.
+    assert!(project.exists("lanekeep.json"));
     assert!(project.exists("lanekeep/rules/no-debugger.ts"));
+}
+
+#[test]
+fn init_scaffolds_for_the_language_it_finds() {
+    // A Go team running `init` and receiving a TypeScript config with a rule about
+    // `debugger` statements learns that this tool is not really for them.
+    for (marker, contents, expected_rule, expected_glob) in [
+        (
+            "go.mod",
+            "module example.com/a\n",
+            "no-fmt-println.ts",
+            "**/*.go",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"a\"\n",
+            "no-print.ts",
+            "**/*.py",
+        ),
+        (
+            "package.json",
+            "{}\n",
+            "no-debugger.ts",
+            "src/**/*.{ts,tsx}",
+        ),
+    ] {
+        let project = Project::new(marker, &[(marker, contents)]);
+        let output = project.run(&["init"]);
+
+        assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+        assert!(
+            project.exists(&format!("lanekeep/rules/{expected_rule}")),
+            "{marker} should scaffold {expected_rule}: {}",
+            describe(&output)
+        );
+        assert!(
+            project.read("lanekeep.json").contains(expected_glob),
+            "{marker} should include {expected_glob}"
+        );
+    }
+}
+
+#[test]
+fn every_scaffold_catches_something_on_the_first_run() {
+    // The only assertion that matters, for each language rather than only for TypeScript. A
+    // starter config that reports nothing is a worse starting point than an empty directory,
+    // because it looks like it works.
+    for (marker, manifest, source_path, source) in [
+        (
+            "go.mod",
+            "module example.com/a\n",
+            "internal/a.go",
+            "package a\n\nimport \"fmt\"\n\nfunc F() { fmt.Println(\"x\") }\n",
+        ),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"a\"\n",
+            "app.py",
+            "def f():\n    print(\"x\")\n",
+        ),
+    ] {
+        let project = Project::new(
+            &format!("catches-{marker}"),
+            &[(marker, manifest), (source_path, source)],
+        );
+        project.run(&["init"]);
+        let output = project.run(&["check"]);
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{marker} scaffold should report a violation: {}",
+            describe(&output)
+        );
+    }
 }
 
 #[test]
@@ -131,15 +208,11 @@ fn init_refuses_to_overwrite() {
     project.run(&["init"]);
 
     let mine = "// mine\n";
-    std::fs::write(project.dir.join("lanekeep.config.ts"), mine).expect("writes");
+    std::fs::write(project.dir.join("lanekeep.json"), mine).expect("writes");
     let output = project.run(&["init"]);
 
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
-    assert_eq!(
-        project.read("lanekeep.config.ts"),
-        mine,
-        "it was overwritten"
-    );
+    assert_eq!(project.read("lanekeep.json"), mine, "it was overwritten");
     assert!(
         describe(&output).contains("--force"),
         "the error should say how to proceed: {}",
@@ -151,11 +224,11 @@ fn init_refuses_to_overwrite() {
 fn force_overwrites() {
     let project = Project::new("force", &[]);
     project.run(&["init"]);
-    std::fs::write(project.dir.join("lanekeep.config.ts"), "// mine\n").expect("writes");
+    std::fs::write(project.dir.join("lanekeep.json"), "// mine\n").expect("writes");
 
     let output = project.run(&["init", "--force"]);
     assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
-    assert!(project.read("lanekeep.config.ts").contains("defineConfig"));
+    assert!(project.read("lanekeep.json").contains("\"rules\""));
 }
 
 #[test]
