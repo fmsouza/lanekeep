@@ -659,13 +659,17 @@ Targets, gated in CI. Measured by `benches/corpus.rs` over a synthetic 2,000-fil
 
 | Scenario | Budget | Measured (dev machine) |
 |---|---|---|
-| Cold full run, ~2k files, ~20 rules | < 800 ms | ~2.1 s |
-| Warm run, no changes | < 25 ms | ~48 ms |
-| Warm run, 1 changed file, full discovery | — | ~46 ms |
-| Warm run, 1 changed file, `--staged` | < 10 ms | ~25 ms |
+| Cold full run, ~2k files, ~20 rules | < 800 ms | ~1.1 s |
+| Warm run, no changes | < 25 ms | ~64 ms |
+| Warm run, 1 changed file, `--staged` | < 10 ms | ~51 ms |
 
 These are noisy to within about 10% between runs on the same machine, so read them as
-magnitudes rather than figures.
+magnitudes rather than figures. The warm and `--staged` figures are higher than the ones
+this table carried before the combined query landed, and the difference is the machine and
+the session, not a regression — every number above was taken in one interleaved run against
+the previous commit as a baseline, which measured cold ~1.76 s, warm ~67 ms and `--staged`
+~61 ms on the same corpus minutes apart. Comparing a measurement to one taken on another
+day is the mistake this table has already made once.
 
 **Nothing meets its budget yet, and the budgets stand.** They are targets to aim at, not release gates — a number chosen before anything existed does not get to decide whether the thing that exists is worth shipping. What they are for is direction: they say which way is better, and the gap between them and the measurements says how much room is left.
 
@@ -685,6 +689,35 @@ Four things measurement has bought so far:
 - **Compiling queries cost more than the entire warm run.** `Engine::prepare` was measured at ~88 ms against a ~55 ms warm run: a tree-sitter query takes a couple of milliseconds to compile, a rule compiles one per language it declares, and twenty rules over two languages is forty compilations before a single file is read. Compiling them in parallel took warm from ~102 ms to ~65 ms and `--staged` from ~75 ms to ~30 ms.
 
   **None of the levers listed below named this**, which is the more useful lesson: the analysis reached for the parts of the design that were interesting — the sandbox, the cache format, the staleness check — and missed a plain constant cost sitting in front of them. The first profile of a warm run showed setup outweighing work, and that was not a hypothesis anyone had written down.
+
+- **Every rule walked the tree itself.** The parse was shared; the traversal was not, so
+  twenty rules meant twenty `QueryCursor` passes over one tree — 40,000 walks across the
+  corpus. tree-sitter evaluates many patterns in a single traversal, which is what a
+  `highlights.scm` is, and doing it that way took cold from ~1.76 s to ~1.06 s.
+
+  Found by arithmetic on the profile rather than by reading it. Cold time was linear in the
+  rule count at ~380 ms per rule, and four rules that matched *nothing* still cost 250 ms
+  each — a cost proportional to rules rather than to matches is a cost per traversal. A
+  micro-benchmark then put 20 separate cursors at 13.5× one combined query at identical
+  capture counts, and reusing a single cursor across the separate queries recovered only
+  1.7× of that, which said the traversal was the cost rather than the allocation.
+
+  The marginal cost per rule is now ~133 ms and *falls* as rules are added (239 → 143 → 85
+  over 5, 10 and 20 rules), which is the shape a shared traversal predicts: the first rule
+  pays for the walk and the rest add only their own patterns.
+
+  `--profile` deliberately keeps the old path. The split it reports — query time against
+  handler time — measures one rule in isolation, and a shared traversal has no honest way
+  to divide itself among the rules sharing it. So the profile now reports more query time
+  than the run pays, which is a sharper version of the caveat below: **the profile accounts
+  for what rules do, not for what a run does.** Two paths through the hot path is somewhere
+  divergence could hide, so a test asserts both report the same violations.
+
+  Both halves of it had to be made lazy before it was a win everywhere. Compiling the
+  combined query eagerly cost a warm run 26 ms, and merely *assembling* its source cost
+  another 4 ms — both paid in full by a run where every file is a cache hit and no query
+  ever runs. Warm has the tightest budget of the three scenarios; it does not subsidize
+  cold.
 
 - **A file was parsed once per rule, not once.** §2 and §7 both say the queries run across a single shared parse; `run_rule` built its own `tree_sitter::Parser` instead, so a file admitted by twenty rules was parsed twenty times. Cold went from ~3.3 s to ~2.1 s when the parse moved up to the file.
 
