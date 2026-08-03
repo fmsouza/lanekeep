@@ -12,220 +12,67 @@ lanekeep enforces the conventions that live in your team's heads and your review
 the ones a language model cannot infer from the code it is shown. Every rule is a codified answer
 to **"the agent keeps doing this wrong."**
 
-Checks **TypeScript, JavaScript, Python, Go and Rust**. Ships as a single static binary with no runtime
-dependency.
+It ships as a single static binary with no runtime dependency.
 
 ---
 
-## Quick start
+## Languages
 
-Sixty seconds, from nothing to a rule catching something.
+Each guide covers installing lanekeep in that ecosystem, configuring it, the built-in rules that
+apply, a worked custom rule, and the name-resolution behavior specific to that language.
 
-**1. Install** — whichever fits the project you are adding it to:
+| Language | Extensions | Install | Guide |
+| --- | --- | --- | --- |
+| Go | `.go` | `go get -tool github.com/fmsouza/lanekeep/cmd/lanekeep` | **[Go](https://github.com/fmsouza/lanekeep/wiki/Go)** |
+| Python | `.py`, `.pyi` | `pip install lanekeep` | **[Python](https://github.com/fmsouza/lanekeep/wiki/Python)** |
+| Rust | `.rs` | `cargo install lanekeep-cli` | **[Rust](https://github.com/fmsouza/lanekeep/wiki/Rust)** |
+| TypeScript / JavaScript | `.ts`, `.mts`, `.cts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx` | `npm install --save-dev lanekeep` | **[TypeScript and JavaScript](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript)** |
 
-```bash
-npm install --save-dev lanekeep
-```
+`brew install fmsouza/tap/lanekeep` works anywhere, as does a binary from the
+[releases page](https://github.com/fmsouza/lanekeep/releases). Every channel delivers the same
+build, so the bytes are identical whichever you pick.
 
-<details>
-<summary>Python, Go, Homebrew, cargo, or a raw binary</summary>
-
-```bash
-pip install lanekeep                                      # Python
-go get -tool github.com/fmsouza/lanekeep/cmd/lanekeep     # Go
-brew install fmsouza/tap/lanekeep                         # macOS / Linux, system-wide
-cargo install lanekeep-cli                                # from source
-```
-
-Or download from the [releases page](https://github.com/fmsouza/lanekeep/releases).
-
-</details>
-
-**2. Scaffold a config and a first rule:**
+Whatever the project, the first two commands are the same:
 
 ```bash
-npx lanekeep init
+lanekeep init     # detects the project and writes a config plus a starter rule
+lanekeep check
 ```
 
-That writes two files, both runnable:
-
-```
-lanekeep.json                 # what to check, and with which rules
-lanekeep/rules/<starter>.ts   # a worked example you can edit
-```
-
-It detects whether the project is Go, Python or TypeScript and scaffolds accordingly — the
-right glob, a starter rule in that language, and a built-in worth having on.
-
-**3. Check:**
-
-```bash
-npx lanekeep check
-```
-
-```
-src/payment.ts:12:3 error [local/no-debugger] debugger statement
-  → remove it before committing
-
-✖ 1 error(s) across 1 file(s) checked
-```
-
-> **If it says `0 file(s) checked`**, nothing matched the config's `include`. The scaffold starts
-> with `src/**/*.{ts,tsx}` — widen it to wherever your code actually lives.
-
-That is the whole loop. Everything below is detail.
-
----
+New here? **[Getting Started](https://github.com/fmsouza/lanekeep/wiki/Getting-Started)** is about
+a minute, end to end.
 
 ## What it is
 
 lanekeep is not a linter in the ESLint sense. ESLint enforces language-level correctness; lanekeep
-enforces *project-specific* conventions. The two do not overlap much, and lanekeep is not a
-replacement for either your linter or your formatter.
+enforces *project-specific* conventions. The two barely overlap, and lanekeep replaces neither your
+linter nor your formatter.
 
-Rules are TypeScript programs. Here is one checking **Go**:
+A rule is a **program**, not a configuration entry. It declares a
+[tree-sitter query](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/1-syntax.html)
+that Rust matches at native speed, and a handler that runs only on matches — where it can loop,
+accumulate state, read other files and ask where a name came from.
 
-```ts
-import { defineRule } from 'lanekeep'
+That matters because the conventions worth enforcing are the ones specific enough that nobody
+else would ever write them, which is exactly the population a fixed vocabulary of predicates
+fails. See **[Writing Rules](https://github.com/fmsouza/lanekeep/wiki/Writing-Rules)** for the
+anatomy and the full host API, and each language guide for a worked example in that language.
 
-export default defineRule({
-  id: 'local/no-fmt-println',
-  language: 'go',
-  severity: 'error',
+Three things follow from who reads the output:
 
-  card: {
-    message: 'fmt.Println in library code',
-    remediation: 'use log/slog, so the output has a level and a destination',
-    examples: {
-      bad: 'fmt.Println("saved", count)',
-      good: 'slog.Info("saved", "count", count)',
-    },
-  },
+- **Every rule carries its own fix.** `message`, `remediation` and `examples` are mandatory
+  fields, not documentation — they are the card fed back to whoever has to act on the violation,
+  increasingly an agent.
+- **Output is deterministic.** Violations are always sorted by `(ruleId, file, line, column)`, and
+  the sandbox withholds the clock and randomness, so two runs over identical input produce
+  byte-identical output. An agent reading it twice must not see reordering as change.
+- **It runs in the inner loop.** Agents and developers invoke it after every edit, so a warm run
+  is measured in tens of milliseconds.
 
-  // Matched in Rust, at native speed. Your code runs only on matches.
-  query: `
-    (call_expression
-      function: (selector_expression
-        operand: (identifier) @pkg
-        field: (field_identifier) @fn)) @call
-  `,
-
-  check(ctx, m) {
-    if (ctx.text(m.pkg) !== 'fmt') return
-    if (ctx.text(m.fn) !== 'Println') return
-
-    // The line that makes this a rule rather than a grep: a local variable
-    // named `fmt` is not the standard library package.
-    if (ctx.bindingKind(m.pkg) !== 'import') return
-
-    ctx.report(m.call)
-  },
-})
-```
-
-**Rules are TypeScript whatever they check** — that is one embedded language, not a JavaScript
-bias. Rules need to be *programs*, because the conventions worth enforcing are too specific for
-any fixed vocabulary of predicates, and one language keeps the sandbox, the cache and the host
-API single-implementation.
-
-**Configuration is not TypeScript.** `lanekeep.json` is plain data, so a Go or Python team never
-writes a `.ts` file except when authoring an actual rule.
-
-`check` is ordinary TypeScript. Loop, accumulate state, build data structures, read other files,
-import shared helpers — there is no expressiveness ceiling and no DSL to learn beyond the query
-that gates it.
-
-**The card is not documentation.** `message`, `remediation` and `examples` are mandatory, because
-they are what gets fed back to whoever has to act on the violation — increasingly an agent.
-
-**Editor types ship with the npm package.** `npm install --save-dev lanekeep` gives you the
-binary *and* TypeScript definitions for the whole host API, so `ctx` autocompletes and a typo'd
-method is a compile error rather than a rule that throws in the sandbox. They are checked
-against the engine's own registration, so they cannot drift from what actually exists.
-
-A Go, Python or Rust project that wants them can add the npm package as a dev dependency
-purely for authoring — nothing about the checker needs Node.
-
-## Supported languages
-
-Each guide covers installing lanekeep in that ecosystem, what to put in the config, which
-built-in rules apply, a worked custom rule, and the resolution behavior specific to it.
-
-| Language | Guide | Extensions |
-| --- | --- | --- |
-| Go | **[Go guide](https://github.com/fmsouza/lanekeep/wiki/Go)** | `.go` |
-| Python | **[Python guide](https://github.com/fmsouza/lanekeep/wiki/Python)** | `.py`, `.pyi` |
-| Rust | **[Rust guide](https://github.com/fmsouza/lanekeep/wiki/Rust)** | `.rs` |
-| TypeScript / JavaScript | **[TypeScript and JavaScript guide](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript)** | `.ts`, `.mts`, `.cts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx` |
-
-Every one carries syntactic binding resolution, so a rule can ask where a name came from rather
-than matching text — `ctx.bindingKind`, `ctx.resolvesToImport` and `ctx.isShadowed` answer for
-all of them.
-
-**The grammar is chosen by the file, not by the rule.** A rule declares which languages it
-applies to and does not run on files of any other, defaulting to `['typescript', 'tsx']` when it
-says nothing. That default is the one thing to get right on a non-TypeScript rule: omit
-`language` on a Go rule and it silently never fires.
-
-## Configuration
-
-`lanekeep.json`, at the project root. `lanekeep init` writes one for you, matched to the
-project it finds.
-
-```json
-{
-  "$schema": "https://raw.githubusercontent.com/fmsouza/lanekeep/main/schema/lanekeep.schema.json",
-
-  "include": ["**/*.go"],
-  "exclude": ["**/*_test.go"],
-
-  "rules": [
-    "lanekeep/no-package-init",
-    { "rule": "lanekeep/no-restricted-imports", "options": { "restrictions": [
-      { "module": "database/sql", "from": ["!internal/store/**"], "reason": "go through the store package" }
-    ] } },
-    "./lanekeep/rules/no-fmt-println.ts"
-  ]
-}
-```
-
-A string uses a rule as it comes; the object form calls it with options. `$schema` is what
-gives you **completion and validation in your editor with nothing installed** — VS Code and
-most others read it directly.
-
-**Rules are TypeScript, configuration is not.** A rule is a program, and that is the point of
-the tool; saying which rules to run is data. A Go or Python team should not have to write a
-`.ts` file to do the second, which is why the config is JSON and only the rules are not.
-
-Rule ids are namespaced. `lanekeep/` is reserved for built-ins and `local/` needs no
-declaration; any other prefix must be listed in `namespaces`, so a typo in an id is an error
-rather than a rule that silently never runs.
-
-Ten rules ship built in — four for TypeScript and JavaScript, two each for Python, Go and Rust. See
-[`docs/built-in-rules.md`](docs/built-in-rules.md) for what each one checks and its options.
-
-<details>
-<summary>Configuring in TypeScript instead</summary>
-
-`lanekeep.config.ts` still works, and is the better choice when the config computes something
-or shares a preset across repositories — composition is then ordinary `import`, with no
-bespoke `extends` mechanism to learn.
-
-```ts
-import { defineConfig } from 'lanekeep'
-import noDefaultExport from 'lanekeep/no-default-export'
-import noDebugger from './lanekeep/rules/no-debugger'
-
-export default defineConfig({
-  include: ['src/**/*.{ts,tsx}'],
-  rules: [noDefaultExport, noDebugger],
-})
-```
-
-Both formats compile to the same thing before anything reads them, so they cannot differ in
-behavior. `lanekeep.json` wins if a project somehow has both.
-
-</details>
+**Rules are authored in TypeScript whatever language they check.** One embedded language keeps the
+sandbox, the cache and the host API single-implementation, and it is the one most teams already
+have someone who writes. **Configuration is not** — `lanekeep.json` is plain data, so a Go, Python
+or Rust team never writes a `.ts` file except when authoring an actual rule.
 
 ## Using it
 
@@ -238,97 +85,98 @@ lanekeep check --fix            # apply the safe fixes, report what is left
 lanekeep check --profile        # where the run spent its time, per rule
 lanekeep rules                  # what this project has configured
 lanekeep explain <rule-id>      # one rule's card, without opening its source
+lanekeep server                 # LSP for an editor, or --protocol mcp for an agent host
 ```
-
-`--staged` and `--since` are intersected with the config's `include`/`exclude`, and both **skip
-cross-file rules** — a whole-corpus rule over a subset gives a wrong answer rather than a smaller
-one, so they are skipped and named on stderr instead of quietly producing one.
-
-**Fixes.** Only a fix its rule marked as behavior-preserving is applied. Anything else is a
-suggestion — shown, never written — because the cautious mistake costs a manual edit and the other
-one rewrites your code silently.
-
-**Suppressions** carry a mandatory reason and an optional expiry. A directive that does not work
-says so, rather than silently doing nothing:
-
-```ts
-// lanekeep-ignore-next-line lanekeep/no-default-export reason: legacy entry point
-export default parse
-```
-
-Run `lanekeep check --report-unused-suppressions` to find the ones that no longer silence
-anything.
-
-**Output.** `--format` takes `human` (default), `json` (versioned, stable schema), `sarif` (GitHub
-code scanning) and `agent` — token-minimal, grouped by rule rather than by file, with each card
-stated once instead of once per violation. Diagnostics always go to stderr, so piping into a
-parser works even when something fails.
 
 **Exit codes:** `0` clean, `1` violations found, `2` the checker could not run. A caller has to be
 able to tell "your code has problems" from "the tool is broken". `--warn-only` reports violations
 but exits `0`, for a phased rollout.
 
-## In CI, editors and agents
+**Output formats** via `--format`: `human` (default), `json` (versioned, stable schema), `sarif`
+(GitHub code scanning), and `agent` — token-minimal, grouped by rule rather than by file. Diagnostics
+always go to stderr, so piping into a parser works even when something fails.
 
-```bash
-lanekeep check --staged                 # pre-commit
-lanekeep check --format sarif           # GitHub code scanning
-lanekeep server                         # LSP, for any editor
-lanekeep server --protocol mcp          # MCP, for an agent host
-```
+**Fixes** are applied only when the rule marked them behavior-preserving; anything else is shown
+and never written. **Suppressions** carry a mandatory reason and an optional expiry, and a directive
+that does not work says so rather than silently doing nothing.
 
-MCP exposes three tools — `lanekeep_check`, `lanekeep_rules`, `lanekeep_explain` — so an agent
-can ask what it broke and what the rule wants without shelling out and parsing text.
-
-Worked examples for each, including SARIF upload and adopting on an existing codebase, are in
-**[CI and Editors](https://github.com/fmsouza/lanekeep/wiki/CI-and-Editors)**.
+Configuration reference, CI recipes, editor setup and the MCP tool list are in the
+[wiki](https://github.com/fmsouza/lanekeep/wiki).
 
 ## How it stays fast with programmable rules
 
 The usual problem with a native tool that runs JavaScript plugins is the boundary between them:
 dispatching into JS once per AST node means tens of thousands of crossings per file.
 
-lanekeep dispatches once per **query match** instead. The tree-sitter query runs in Rust across a
-single shared parse; only matches reach your handler. That is typically two to three orders of
-magnitude fewer crossings, and it is the reason a Rust engine still earns its place once rules are
-TypeScript.
+lanekeep dispatches once per **query match** instead. The query runs in Rust across a single shared
+parse; only matches reach your handler. That is typically two to three orders of magnitude fewer
+crossings, and it is the reason a Rust engine still earns its place once rules are programs.
 
 ```
 discover paths (globs, gitignore-aware)
   └─> for each file, in parallel:
         cache key ──hit──> validate tracked deps ──> cached violations + facts
                   └─miss─> path and raw-text gates reject before any parse
-                           └─> parse ─> match queries in Rust
-                               └─> invoke the TypeScript handler, per match only
+                           └─> parse once ─> match queries in Rust
+                               └─> invoke the handler, per match only
   └─> reduce phase: cross-file rules consume facts only, never parse trees
   └─> filter suppressions ─> sort ─> report
 ```
 
 A warm run with no changes executes no JavaScript at all — every file is a cache hit.
 
-Violations are always sorted by `(ruleId, file, line, column)`, and the sandbox withholds the clock
-and randomness, so two runs over identical input produce byte-identical output. An agent reading
-the output twice must not see reordering as change.
-
-## Installing without a package manager
+## Platforms
 
 Prebuilt for macOS on Apple silicon, Linux on x86-64 and arm64, and Windows on x86-64. The Linux
 binaries are built against **glibc 2.17**, so they run on anything from RHEL 7 onwards.
 
+**No runtime is required to run lanekeep.** Node, Python or Go is needed only to install it from
+that ecosystem, where it picks which binary to fetch. Nothing is pulled in as a dependency any of
+those ways.
+
 Intel macOS is not prebuilt — `cargo install lanekeep-cli` builds it from source, and both the npm
 launcher and the Homebrew formula say so rather than failing obscurely.
 
-**No runtime is required to run lanekeep**, even though rules are written in TypeScript. Node,
-Python or Go is needed only to install it from that ecosystem, where it picks which binary to
-fetch. Nothing is pulled in as a dependency any of those ways.
+## Security
 
-The Go package is a small launcher, because Go can only install and pin things written in Go: it
-fetches the real binary on first use, verifies it against the release's published checksums, and
-caches it. Set `LANEKEEP_BINARY` to an already-installed lanekeep and it fetches nothing.
+lanekeep is meant to run as a pre-commit hook and inside CI, which makes it a supply-chain target.
+Rules are executable code, so the posture is about confinement rather than absence:
+
+- **No ambient authority.** Rules run in an embedded QuickJS sandbox and reach exactly the host
+  functions lanekeep exposes. `fs`, `process`, `child_process`, network and dynamic import are not
+  restricted — they do not exist in the context.
+- **No network access.** Ever, in any mode, with no configuration that enables it.
+- **Filesystem confinement.** Reads go through a tracked host call, confined to the project root.
+  Writes happen only under `--fix`, only to matched files, only within reported ranges.
+- **Bounded execution.** A per-invocation timeout, a global run budget and a per-runtime memory
+  ceiling, none disableable — a rule that hangs a pre-commit hook is indistinguishable from a
+  broken tool. Breaching any of them cancels the run and exits `2`, rather than reporting a partial
+  result as a clean one.
+- **Deterministic by construction.** The sandbox withholds the clock and randomness, so a rule
+  cannot introduce nondeterminism even by accident.
+
+This bounds blast radius and makes third-party rule sets reviewable. It is not a boundary against
+someone who can already commit to the repository being checked. To report a vulnerability, see
+[`SECURITY.md`](SECURITY.md).
+
+## Project status
+
+**Released and usable**, on every channel in the table above — one build feeding all of them.
+
+It is **0.x**, and this repository treats that as semver does: a minor bump may break a public Rust
+API. Rule authors are insulated from that — host API methods and the config shape are additive —
+but pin a version if you embed the crates.
+
+Known gaps, stated rather than implied:
+
+- **The performance budgets in [`docs/architecture.md`](docs/architecture.md) §15 are not met.**
+  They are targets, and that section says by how much and where the remaining time goes.
+- **No type-aware analysis**, by design. Name resolution is syntactic — see §1 non-goals.
 
 ## Documentation
 
-**The [wiki](https://github.com/fmsouza/lanekeep/wiki) is the place to start** — it is task-shaped and organized by language.
+**The [wiki](https://github.com/fmsouza/lanekeep/wiki) is the place to start** — it is task-shaped
+and organized by language.
 
 | Page | Purpose |
 | --- | --- |
@@ -336,7 +184,6 @@ caches it. Set `LANEKEEP_BINARY` to an already-installed lanekeep and it fetches
 | [Configuration](https://github.com/fmsouza/lanekeep/wiki/Configuration) | `lanekeep.json`, every field |
 | [Writing Rules](https://github.com/fmsouza/lanekeep/wiki/Writing-Rules) | Rule anatomy and the full host API |
 | [CI and Editors](https://github.com/fmsouza/lanekeep/wiki/CI-and-Editors) | Pre-commit, GitHub Actions, LSP, MCP |
-| [Go](https://github.com/fmsouza/lanekeep/wiki/Go) · [Python](https://github.com/fmsouza/lanekeep/wiki/Python) · [Rust](https://github.com/fmsouza/lanekeep/wiki/Rust) · [TypeScript and JavaScript](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript) | Per-language guides |
 
 In-repo, versioned with the code:
 
@@ -351,46 +198,6 @@ In-repo, versioned with the code:
 | [`SECURITY.md`](SECURITY.md) | Threat model and how to report a vulnerability |
 | [`docs/releasing.md`](docs/releasing.md) | How a release is built, gated and published |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed, per release |
-
-## Security
-
-lanekeep is meant to run as a pre-commit hook and inside CI, which makes it a supply-chain target.
-Rules are executable code, so the posture is about confinement rather than absence:
-
-- **No ambient authority.** Rules run in an embedded QuickJS sandbox and reach exactly the host
-  functions lanekeep exposes. `fs`, `process`, `child_process`, network and dynamic import are not
-  restricted — they do not exist in the context.
-- **No network access.** Ever, in any mode, with no configuration that enables it.
-- **Filesystem confinement.** Reads go through a tracked `ctx.readFile`, confined to the project
-  root. Writes happen only under `--fix`, only to matched files, only within reported ranges.
-- **Bounded execution.** A per-invocation timeout, a global run budget and a per-runtime memory
-  ceiling, none disableable — a rule that hangs a pre-commit hook is indistinguishable from a
-  broken tool. Breaching any of them cancels the run and exits `2`, rather than reporting a partial
-  result as a clean one.
-- **Deterministic by construction.** The sandbox withholds the clock and randomness, so a rule
-  cannot introduce nondeterminism even by accident.
-
-This bounds blast radius and makes third-party rule sets reviewable. It is not a boundary against
-someone who can already commit to the repository being checked. To report a vulnerability, see
-[`SECURITY.md`](SECURITY.md).
-
-## Project status
-
-**Released and usable.** The current version is on [crates.io](https://crates.io/crates/lanekeep-cli),
-[npm](https://www.npmjs.com/package/lanekeep), [PyPI](https://pypi.org/project/lanekeep/), Homebrew,
-and as a Go module — one build feeding every channel, so the bytes are identical whichever you use.
-
-It is **0.x**, and this repository treats that as semver does: a minor bump may break a public Rust
-API. Rule authors are insulated from that — `ctx` methods and the config shape are additive — but
-pin a version if you embed the crates.
-
-Known gaps, stated rather than implied:
-
-- **No editor types for rule authors yet** (above).
-- **The performance budgets in [`docs/architecture.md`](docs/architecture.md) §15 are not met.**
-  They are targets, and that document says by how much and what the levers are. The tool is fast;
-  the numbers are simply ambitious.
-- **No type-aware analysis**, by design. Binding resolution is syntactic — see §1 non-goals.
 
 ## Contributing
 
