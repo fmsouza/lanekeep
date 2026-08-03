@@ -437,25 +437,31 @@ fn write_profile(
 /// exists for conventions a model cannot infer, and every one of those is project-authored.
 /// A starter that only configured built-ins would teach the wrong lesson about what the tool
 /// is for.
-const STARTER_CONFIG: &str = r"import { defineConfig } from 'lanekeep'
-import noDefaultExport from 'lanekeep/no-default-export'
-
-import noDebugger from './lanekeep/rules/no-debugger'
-
-export default defineConfig({
-  include: ['src/**/*.{ts,tsx}'],
-  exclude: ['**/*.{test,spec}.{ts,tsx}'],
-
-  rules: [noDefaultExport, noDebugger],
-})
-";
-
-/// The rule a fresh project starts with.
+/// What `init` writes, chosen by what the project looks like.
 ///
-/// Deliberately trivial, and deliberately complete: a card with both examples, a gate, a
-/// query and a handler. Someone editing this to write their first real rule should be
-/// changing parts, not discovering which parts exist.
-const STARTER_RULE: &str = r"import { defineRule } from 'lanekeep'
+/// A Go team running `lanekeep init` and receiving a TypeScript config with a rule about
+/// `debugger` statements learns that this tool is not really for them. The config format is
+/// only half of that; the other half is scaffolding a rule and an include glob that match
+/// the code actually in the repository.
+///
+/// Rules stay TypeScript in every case — that is ADR-0007 and it does not bend. What varies
+/// is which rule, which glob, and which built-ins are worth turning on.
+struct Scaffold {
+    /// What was detected, for the message printed at the end.
+    language: &'static str,
+    /// The `include` glob.
+    include: &'static str,
+    /// The `exclude` glob, or none when the language has no obvious test convention.
+    exclude: Option<&'static str>,
+    /// Built-in rules to enable, by specifier.
+    builtins: &'static [&'static str],
+    /// Filename of the starter rule, under `lanekeep/rules/`.
+    rule_file: &'static str,
+    /// Its source.
+    rule: &'static str,
+}
+
+const TYPESCRIPT_RULE: &str = r"import { defineRule } from 'lanekeep'
 
 export default defineRule({
   id: 'local/no-debugger',
@@ -487,14 +493,179 @@ export default defineRule({
 })
 ";
 
+const PYTHON_RULE: &str = r"import { defineRule } from 'lanekeep'
+
+export default defineRule({
+  id: 'local/no-print',
+  language: 'python',
+  severity: 'error',
+
+  // The card is not documentation. It is fed back to whoever has to act on the
+  // violation — increasingly an agent — so `remediation` is the field worth the effort.
+  card: {
+    message: 'print() in library code',
+    remediation: 'use the logging module, so the output has a level and a destination',
+    examples: {
+      bad: 'print(f\'saved {count}\')',
+      good: 'logger.info(\'saved %s\', count)',
+    },
+  },
+
+  // Cheap and exact: a file whose bytes never contain `print` is never parsed.
+  gates: {
+    fileContains: ['print'],
+  },
+
+  // The query is the gate that matters. Rust matches it; only matches reach `check`.
+  query: '(call function: (identifier) @name) @call',
+
+  check(ctx, m) {
+    if (ctx.text(m.name) !== 'print') return
+
+    // A project that defined its own `print` is not calling the builtin.
+    if (ctx.bindingKind(m.name)) return
+
+    ctx.report(m.call)
+  },
+})
+";
+
+const GO_RULE: &str = r"import { defineRule } from 'lanekeep'
+
+export default defineRule({
+  id: 'local/no-fmt-println',
+  language: 'go',
+  severity: 'error',
+
+  // The card is not documentation. It is fed back to whoever has to act on the
+  // violation — increasingly an agent — so `remediation` is the field worth the effort.
+  card: {
+    message: 'fmt.Println in library code',
+    remediation: 'use log/slog, so the output has a level and a destination',
+    examples: {
+      bad: 'fmt.Println(\'saved\', count)',
+      good: 'slog.Info(\'saved\', \'count\', count)',
+    },
+  },
+
+  // Cheap and exact: a file whose bytes never contain `fmt` is never parsed.
+  gates: {
+    fileContains: ['fmt'],
+  },
+
+  // The query is the gate that matters. Rust matches it; only matches reach `check`.
+  query: `
+    (call_expression
+      function: (selector_expression
+        operand: (identifier) @pkg
+        field: (field_identifier) @fn)) @call
+  `,
+
+  check(ctx, m) {
+    if (ctx.text(m.pkg) !== 'fmt') return
+    if (ctx.text(m.fn) !== 'Println' && ctx.text(m.fn) !== 'Printf') return
+
+    // A local variable named `fmt` is not the standard library package.
+    if (ctx.bindingKind(m.pkg) !== 'import') return
+
+    ctx.report(m.call)
+  },
+})
+";
+
+const TYPESCRIPT: Scaffold = Scaffold {
+    language: "TypeScript",
+    include: "src/**/*.{ts,tsx}",
+    exclude: Some("**/*.{test,spec}.{ts,tsx}"),
+    builtins: &["lanekeep/no-default-export"],
+    rule_file: "no-debugger.ts",
+    rule: TYPESCRIPT_RULE,
+};
+
+const PYTHON: Scaffold = Scaffold {
+    language: "Python",
+    include: "**/*.py",
+    exclude: Some("**/test_*.py"),
+    builtins: &["lanekeep/no-broad-except"],
+    rule_file: "no-print.ts",
+    rule: PYTHON_RULE,
+};
+
+const GO: Scaffold = Scaffold {
+    language: "Go",
+    include: "**/*.go",
+    exclude: Some("**/*_test.go"),
+    builtins: &["lanekeep/no-package-init"],
+    rule_file: "no-fmt-println.ts",
+    rule: GO_RULE,
+};
+
+/// What this project looks like, from the manifest a language cannot really do without.
+///
+/// Checked in a fixed order so a polyglot repository scaffolds predictably rather than
+/// according to directory iteration. TypeScript is last because a Go or Python service with
+/// a small web frontend is more usefully scaffolded for its backend, and because that is the
+/// one a user is least surprised to have to change.
+fn detect(project_root: &Path) -> &'static Scaffold {
+    for (marker, scaffold) in [
+        ("go.mod", &GO),
+        ("pyproject.toml", &PYTHON),
+        ("setup.py", &PYTHON),
+        ("requirements.txt", &PYTHON),
+        ("tsconfig.json", &TYPESCRIPT),
+        ("package.json", &TYPESCRIPT),
+    ] {
+        if project_root.join(marker).exists() {
+            return scaffold;
+        }
+    }
+    &TYPESCRIPT
+}
+
+/// The `lanekeep.json` for a scaffold.
+///
+/// JSON rather than TypeScript because configuration is not a rule. Requiring a Go or Python
+/// team to write a `.ts` file to say which rules they want was a coupling with nothing behind
+/// it — `lanekeep.config.ts` still works, and is the better choice for a config that computes
+/// something or shares a preset.
+fn starter_config(scaffold: &Scaffold) -> String {
+    let mut rules: Vec<String> = scaffold
+        .builtins
+        .iter()
+        .map(|specifier| format!("    \"{specifier}\""))
+        .collect();
+    rules.push(format!("    \"./lanekeep/rules/{}\"", scaffold.rule_file));
+
+    let exclude = scaffold.exclude.map_or_else(
+        || "  \"exclude\": [],\n".to_owned(),
+        |glob| format!("  \"exclude\": [\"{glob}\"],\n"),
+    );
+
+    format!(
+        "{{\n  \"$schema\": \"{SCHEMA_URL}\",\n\n  \"include\": [\"{}\"],\n{exclude}\n  \"rules\": [\n{}\n  ]\n}}\n",
+        scaffold.include,
+        rules.join(",\n"),
+    )
+}
+
+/// Where editors fetch the config schema from.
+///
+/// Pinned to `main` rather than to a tag: a schema describing fields a user's version does
+/// not have yet is a worse failure than one describing all of them, since the first shows up
+/// as an editor warning on correct config.
+const SCHEMA_URL: &str =
+    "https://raw.githubusercontent.com/fmsouza/lanekeep/main/schema/lanekeep.schema.json";
+
 /// Write a starter config and rule.
 ///
 /// Refuses to overwrite without `--force`. A config is a file someone has edited by the time
 /// they run this again, and silently replacing it would destroy work that nothing else has a
 /// copy of.
 fn init(project_root: &Path, force: bool) -> anyhow::Result<ExitCode> {
-    let config = project_root.join("lanekeep.config.ts");
-    let rule = project_root.join("lanekeep/rules/no-debugger.ts");
+    let scaffold = detect(project_root);
+
+    let config = project_root.join("lanekeep.json");
+    let rule = project_root.join(format!("lanekeep/rules/{}", scaffold.rule_file));
 
     let existing: Vec<&Path> = [config.as_path(), rule.as_path()]
         .into_iter()
@@ -517,7 +688,8 @@ fn init(project_root: &Path, force: bool) -> anyhow::Result<ExitCode> {
         );
     }
 
-    for (path, contents) in [(&config, STARTER_CONFIG), (&rule, STARTER_RULE)] {
+    let config_source = starter_config(scaffold);
+    for (path, contents) in [(&config, config_source.as_str()), (&rule, scaffold.rule)] {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow::anyhow!("cannot create `{}`: {e}", parent.display()))?;
@@ -529,14 +701,18 @@ fn init(project_root: &Path, force: bool) -> anyhow::Result<ExitCode> {
     let ignored = ignore_the_cache(project_root)?;
 
     let mut stdout = std::io::stdout();
+    writeln!(stdout, "detected a {} project", scaffold.language)?;
     writeln!(stdout, "created {}", config.display())?;
     writeln!(stdout, "created {}", rule.display())?;
     if ignored {
         writeln!(stdout, "added .lanekeep/ to .gitignore")?;
     }
+    // The rule id is derived from the filename rather than written down twice, so the
+    // command printed here cannot drift from the rule that was actually written.
+    let starter_id = scaffold.rule_file.trim_end_matches(".ts");
     writeln!(
         stdout,
-        "\nrun `lanekeep check` to try it, and `lanekeep explain local/no-debugger` to see \
+        "\nrun `lanekeep check` to try it, and `lanekeep explain local/{starter_id}` to see \
          what a rule card looks like"
     )?;
     stdout.flush()?;

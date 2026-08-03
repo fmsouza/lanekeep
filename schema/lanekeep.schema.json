@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/fmsouza/lanekeep/main/schema/lanekeep.schema.json",
+  "title": "lanekeep configuration",
+  "description": "Configuration for lanekeep, an architectural conformance checker. Rules are TypeScript programs; this file says which of them to run and over what.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "URL of this schema. Editors read it to offer completion and validation."
+    },
+    "include": {
+      "type": "array",
+      "description": "Globs selecting the files to check. Relative to the project root.",
+      "items": { "type": "string" },
+      "examples": [["src/**/*.{ts,tsx}"], ["**/*.go"], ["**/*.py"]]
+    },
+    "exclude": {
+      "type": "array",
+      "description": "Globs removing files from the selection. Applied after include.",
+      "items": { "type": "string" },
+      "examples": [["**/*_test.go"], ["**/*.{test,spec}.{ts,tsx}"]]
+    },
+    "namespaces": {
+      "type": "array",
+      "description": "Rule-id namespaces this project uses beyond `local`. A rule whose namespace is not declared is rejected, so a typo in an id is an error rather than a rule that silently never runs. `lanekeep` is reserved for built-ins.",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]*$"
+      },
+      "examples": [["acme"]]
+    },
+    "severity": {
+      "type": "object",
+      "description": "Override the severity a rule declares for itself, by rule id.",
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["error", "warn", "off"]
+      },
+      "examples": [{ "lanekeep/no-default-export": "warn" }]
+    },
+    "timeouts": {
+      "type": "object",
+      "description": "Execution budgets, in milliseconds. Breaching one cancels the run and exits 2 rather than reporting a partial result as a clean one.",
+      "additionalProperties": false,
+      "properties": {
+        "rule": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-invocation budget for a single rule handler."
+        },
+        "global": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Wall-clock budget for the whole run."
+        }
+      }
+    },
+    "rules": {
+      "type": "array",
+      "description": "The rules to run, in order. A string uses a rule as it comes; the object form calls it with options, which is what a rule that takes configuration expects.",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "A built-in, as `lanekeep/<name>`, or a path to a local rule module such as `./lanekeep/rules/mine.ts`.",
+            "minLength": 1,
+            "examples": [
+              "lanekeep/no-default-export",
+              "lanekeep/no-package-init",
+              "./lanekeep/rules/mine.ts"
+            ]
+          },
+          {
+            "type": "object",
+            "description": "A rule called with options.",
+            "additionalProperties": false,
+            "required": ["rule"],
+            "properties": {
+              "rule": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The rule's specifier, as in the string form."
+              },
+              "options": {
+                "description": "Passed to the rule. Its shape is the rule's own — see docs/built-in-rules.md for the built-ins."
+              }
+            },
+            "examples": [
+              {
+                "rule": "lanekeep/no-restricted-imports",
+                "options": {
+                  "restrictions": [
+                    { "module": "stripe", "reason": "route it through the payments package" }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
