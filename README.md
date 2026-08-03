@@ -50,9 +50,12 @@ npx lanekeep init
 That writes two files, both runnable:
 
 ```
-lanekeep.config.ts            # what to check, and with which rules
-lanekeep/rules/no-debugger.ts # a worked example you can edit
+lanekeep.json                 # what to check, and with which rules
+lanekeep/rules/<starter>.ts   # a worked example you can edit
 ```
+
+It detects whether the project is Go, Python or TypeScript and scaffolds accordingly — the
+right glob, a starter rule in that language, and a built-in worth having on.
 
 **3. Check:**
 
@@ -148,37 +151,63 @@ to and does not run on files of any other language. A rule that omits `language`
 
 ## Configuration
 
-`lanekeep.config.ts`, at the project root. It is a TypeScript module like any rule, so composition
-is ordinary `import` — there is no bespoke `extends` mechanism to learn.
+`lanekeep.json`, at the project root. `lanekeep init` writes one for you, matched to the
+project it finds.
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/fmsouza/lanekeep/main/schema/lanekeep.schema.json",
+
+  "include": ["**/*.go"],
+  "exclude": ["**/*_test.go"],
+
+  "rules": [
+    "lanekeep/no-package-init",
+    { "rule": "lanekeep/no-restricted-imports", "options": { "restrictions": [
+      { "module": "database/sql", "from": ["!internal/store/**"], "reason": "go through the store package" }
+    ] } },
+    "./lanekeep/rules/no-fmt-println.ts"
+  ]
+}
+```
+
+A string uses a rule as it comes; the object form calls it with options. `$schema` is what
+gives you **completion and validation in your editor with nothing installed** — VS Code and
+most others read it directly.
+
+**Rules are TypeScript, configuration is not.** A rule is a program, and that is the point of
+the tool; saying which rules to run is data. A Go or Python team should not have to write a
+`.ts` file to do the second, which is why the config is JSON and only the rules are not.
+
+Rule ids are namespaced. `lanekeep/` is reserved for built-ins and `local/` needs no
+declaration; any other prefix must be listed in `namespaces`, so a typo in an id is an error
+rather than a rule that silently never runs.
+
+Eight rules ship built in — four for TypeScript and JavaScript, two for Python, two for Go. See
+[`docs/built-in-rules.md`](docs/built-in-rules.md) for what each one checks and its options.
+
+<details>
+<summary>Configuring in TypeScript instead</summary>
+
+`lanekeep.config.ts` still works, and is the better choice when the config computes something
+or shares a preset across repositories — composition is then ordinary `import`, with no
+bespoke `extends` mechanism to learn.
 
 ```ts
 import { defineConfig } from 'lanekeep'
 import noDefaultExport from 'lanekeep/no-default-export'
-import noRestrictedImports from 'lanekeep/no-restricted-imports'
-
 import noDebugger from './lanekeep/rules/no-debugger'
 
 export default defineConfig({
   include: ['src/**/*.{ts,tsx}'],
-  exclude: ['**/*.{test,spec}.{ts,tsx}'],
-
-  rules: [
-    noDefaultExport,
-    noDebugger,
-    noRestrictedImports({
-      restrictions: [
-        { module: 'stripe', from: ['!packages/payments/**'], reason: 'route it through the payments package' },
-      ],
-    }),
-  ],
+  rules: [noDefaultExport, noDebugger],
 })
 ```
 
-Rule ids are namespaced. `lanekeep/` is reserved for built-ins; your own rules use any other
-prefix, and a config must declare the namespaces it uses beyond `local`.
+Both formats compile to the same thing before anything reads them, so they cannot differ in
+behavior. `lanekeep.json` wins if a project somehow has both.
 
-Eight rules ship built in — four for TypeScript and JavaScript, two for Python, two for Go. See
-[`docs/built-in-rules.md`](docs/built-in-rules.md) for what each one checks and its options.
+</details>
 
 ## Using it
 
