@@ -835,9 +835,13 @@ impl Engine {
         let directives = suppression::parse(&source);
 
         let mut outcome = FileOutcome::parsed(path.clone());
+        let Some(tree) = self.parse_once(path, &source, &admitted) else {
+            return Ok(outcome);
+        };
+
         for rule in admitted {
             let (violations, facts, read_the_date, timing) =
-                self.run_rule(worker, &files, rule, path, &source)?;
+                self.run_rule(worker, &files, rule, path, &source, &tree)?;
             outcome.violations.extend(violations);
             outcome.facts.extend(facts);
             outcome.read_the_date |= read_the_date;
@@ -949,6 +953,35 @@ impl Engine {
         violations
     }
 
+    /// Parse a file once, for every rule that will run on it.
+    ///
+    /// §2's "run compiled queries (one pass)" and §7's "single shared parse". `run_rule` built
+    /// its own parser instead, so a file admitted by twenty rules was parsed twenty times —
+    /// most of a cold run, and invisible, because parsing per rule produces identical output.
+    ///
+    /// The grammar comes from the rules rather than from a registry the engine would have to
+    /// hold: every admitted rule that targets this file targets the same grammar for it, so
+    /// the first one that does is as good as any.
+    ///
+    /// `None` when the language is unknown or the grammar cannot parse the file. That is not
+    /// an error — it is what the per-rule early returns did before, and callers depend on a
+    /// file like that simply producing no violations.
+    fn parse_once(
+        &self,
+        path: &FilePath,
+        source: &str,
+        admitted: &[&Prepared],
+    ) -> Option<tree_sitter::Tree> {
+        let language_id = self.language_of(path)?;
+        let (language, _) = admitted
+            .iter()
+            .find_map(|rule| rule.for_language(language_id))?;
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language.grammar()).ok()?;
+        parser.parse(source, None)
+    }
+
     fn run_rule(
         &self,
         worker: &mut Worker<'_>,
@@ -956,6 +989,7 @@ impl Engine {
         rule: &Prepared,
         path: &FilePath,
         source: &str,
+        tree: &tree_sitter::Tree,
     ) -> Result<(Vec<Violation>, Vec<Fact>, bool, RuleTiming), RunError> {
         // The grammar is chosen by the file, not by the rule. A rule that does not target
         // this file's language does not run on it at all — previously it ran anyway, against
@@ -967,13 +1001,15 @@ impl Engine {
             return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
         };
 
-        let mut parser = tree_sitter::Parser::new();
-        if parser.set_language(&language.grammar()).is_err() {
-            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
-        }
-        let Some(tree) = parser.parse(source, None) else {
-            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
-        };
+        // The tree is parsed once for the file and handed to every rule — §2's "run compiled
+        // queries (one pass)" and §7's "single shared parse".
+        //
+        // It was parsed here instead, per rule, so a file admitted by twenty rules was parsed
+        // twenty times. That is most of a cold run: the profile attributed it to query time,
+        // which made twelve rules matching *nothing* look like they cost 400 ms of matching
+        // each. `Tree::clone` is `ts_tree_copy`, a refcounted copy rather than a re-parse, so
+        // each rule still gets an owned tree for its arena at almost no cost.
+        let tree = tree.clone();
 
         // Only when asked. A clock read per invocation is cheap and not free, and this is
         // the hot path.
@@ -1771,6 +1807,29 @@ mod tests {
         let err = project.run().expect_err("must fail at preparation");
         assert!(matches!(err, RunError::Query { .. }), "{err:?}");
         assert!(err.to_string().contains("no_such_node"), "{err}");
+    }
+
+    #[test]
+    fn a_file_is_parsed_once_however_many_rules_run_on_it() {
+        // §2's "run compiled queries (one pass)" and §7's "single shared parse", asserted
+        // structurally because the cost of breaking it is invisible: parsing per rule
+        // produces identical output and simply runs N times slower. It did exactly that
+        // until measured — a file admitted by twenty rules was parsed twenty times, which
+        // was most of a cold run and showed up in the profile as *query* time, making rules
+        // that matched nothing look expensive to match.
+        //
+        // Counting parses at run time would need a hook through the hot path for a test.
+        // Reading this file is cheaper and catches the same regression: the only way back is
+        // to construct a parser inside the per-rule path again.
+        let source = include_str!("lib.rs");
+        let body = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let parsers = body.matches("tree_sitter::Parser::new()").count();
+
+        assert_eq!(
+            parsers, 1,
+            "the engine constructs {parsers} tree-sitter parsers outside tests; there must be \
+             exactly one, in `check_file`, shared by every rule that runs on the file"
+        );
     }
 
     #[test]
