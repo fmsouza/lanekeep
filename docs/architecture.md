@@ -234,6 +234,8 @@ Positions travel as plain numbers rather than as an opaque location object, beca
 
 A rule sees only its own facts. Reading another rule's would turn a private payload shape into a contract between rules, and would make results depend on the order rules were declared in.
 
+Two consequences are worth stating together, because dogfooding lanekeep against its own source ran into both at once. A rule's query is compiled once per language it declares, so no single query matches node types from two different grammars; and a rule sees only its own facts. Together, those rule out a cross-file rule that reconciles two files written in different languages — the natural shape for checking that a Rust registration still agrees with the TypeScript declaration it is meant to mirror. The way to write it today is a per-file rule, scoped to one language, that reads the other file through `ctx.readFile`: the dependency stays tracked, but the second language is parsed by hand rather than by a query. `local/host-api-matches-types` and `local/binding-kinds-are-typed` are both written this way. Lifting the restriction would mean either per-language queries within one rule or a declared way for one rule to consume another's facts; both are §14-shaped decisions.
+
 ---
 
 ## 5. The JavaScript host
@@ -789,6 +791,8 @@ Off by default, because measuring costs a clock read per handler invocation and 
 **Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships ten built-in rules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
 One thing named here is still outstanding, and it is stated where it belongs rather than only here: the §15 performance budgets are targets that are not met.
+
+It also checks itself: the invariants in this document that are expressible as rules are enforced by `just lanekeep` rather than by review. See [AGENTS.md](../AGENTS.md) for what that covers and what it does not.
 
 **M0 — walking skeleton. Done.** Workspace, config loading, discovery, tree-sitter TS/TSX, query compilation, the embedded engine with the §6 host API, human + json reporters, `RuleTester`. Acceptance: the built-in rules and a representative set of project-authored rules run end-to-end against the fixture corpus, with snapshot-verified output — every reporter is snapshotted in `lanekeep-report/tests/snapshots.rs`, and the built-in rules are driven through the binary over real corpora in `lanekeep-cli/tests/`.
 
