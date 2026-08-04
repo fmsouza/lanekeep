@@ -1137,3 +1137,53 @@ fn a_matching_pair_passes() {
         .accepts("fn r() {\n    object.set(\"text\", 1)?;\n}\n")
         .expect("registered and declared is the state this rule protects");
 }
+
+#[test]
+fn a_registered_name_starting_with_r_is_recognized() {
+    // The historical bug this guards, empirically: an early version stripped Rust string
+    // prefixes with `/^["r#]+/`, greedy across `"` and `r` together, which ate the leading `r`
+    // of names like `root`, `report` and `readFile` and invented four mismatches against the
+    // real repository. None of this file's other fixtures register a name starting with `r`,
+    // so none of them would have caught it — this one registers and declares `root` and
+    // requires the pair to reconcile cleanly rather than becoming `root` vs. `oot`.
+    let tester = RuleTester::configured(
+        "host-api-r-initial",
+        HOST_API,
+        "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture(
+            "types.d.ts",
+            "export interface RuleContext {\n  root(node: Node): string\n}\n",
+        )
+        .expect("the types fixture is written");
+
+    tester
+        .accepts("fn r() {\n    object.set(\"root\", 1)?;\n}\n")
+        .expect("`root` registered and declared should reconcile, not become `oot`");
+}
+
+#[test]
+fn a_registration_inside_test_code_is_ignored() {
+    // `host.rs`'s own `#[cfg(test)] mod tests { ... }` never calls `object.set("literal",
+    // ...)` today, so nothing in the real repository exercises this exclusion — this fixture
+    // stands in for what a future test-only registration inside `host.rs` would look like.
+    let tester = RuleTester::configured(
+        "host-api-test-code",
+        HOST_API,
+        "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture("types.d.ts", "export interface RuleContext {\n}\n")
+        .expect("the types fixture is written");
+
+    tester
+        .accepts(
+            "#[cfg(test)]\nmod tests {\n    fn t() {\n        object.set(\"fakeThing\", 1)?;\n    }\n}\n",
+        )
+        .expect("a registration inside test code is not real API and must not be reported");
+}

@@ -27,11 +27,15 @@ import { inTestCode } from '../modules/rust'
 /**
  * Registered names that are not context members.
  *
- * `report` builds a location object with the same `object.set` call, so these are the
- * violation's fields rather than anything an author reaches. Named individually rather than
- * filtered by heuristic, so a genuinely new host function cannot hide among them.
+ * `loc` builds a `{ file, line, column }` object with its own nested `object.set` calls, so
+ * `file` is one of that object's fields rather than anything an author reaches directly.
+ * `loc` itself is a real, declared context member and does not belong here — it was wrongly
+ * listed until a review caught it, which is exactly the gap this exemption list exists to
+ * avoid hiding: an exemption is only for a name that genuinely is not a context member, never
+ * for one this rule found and nobody declared. Named individually rather than filtered by
+ * heuristic, so a genuinely new host function cannot hide among them.
  */
-const NOT_CONTEXT_MEMBERS = ['file', 'loc']
+const NOT_CONTEXT_MEMBERS = ['file']
 
 const INTERFACES = ['export interface RuleContext {', 'export interface ReduceContext {']
 

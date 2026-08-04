@@ -134,6 +134,22 @@ export interface EmittedFact extends Fact {
   file: string
 }
 
+/**
+ * A node's location: the file, line and column `ctx.loc` returns.
+ *
+ * `line` and `column` are required here, unlike on `ReduceLocation`: `ctx.loc` either
+ * resolves the node and returns all three together, or the node does not resolve and the
+ * call returns `undefined` entirely — there is no partial state to leave room for.
+ */
+export interface NodeLocation {
+  /** Path relative to the project root. */
+  file: string
+  /** One-based. */
+  line: number
+  /** One-based. */
+  column: number
+}
+
 /** What a rule's `check` handler reaches. */
 export interface RuleContext {
   /** Path of the file being checked, relative to the project root. */
@@ -200,6 +216,8 @@ export interface RuleContext {
   /** Facts emitted so far, optionally filtered by `kind`. */
   facts(kind?: string): EmittedFact[]
 
+  /** The node's location, in the shape a fact carries and a reduce phase reports at. */
+  loc(node: Node): NodeLocation | undefined
   /** Report a violation at a node. */
   report(at: Node, message?: string | ReportOptions): void
 }
