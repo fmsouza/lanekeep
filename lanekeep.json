@@ -45,6 +45,19 @@
         "scope": ["crates/lanekeep-js/"],
         "allow": ["crates/lanekeep-js/src/files.rs", "crates/lanekeep-js/src/loader.rs"]
       }
+    },
+    {
+      "rule": "./lanekeep/rules/no-ambient-observation.ts",
+      "options": {
+        "scope": [
+          "crates/lanekeep-cache/",
+          "crates/lanekeep-config/",
+          "crates/lanekeep-core/",
+          "crates/lanekeep-query/",
+          "crates/lanekeep-js/"
+        ],
+        "allow": ["crates/lanekeep-core/src/suppression.rs"]
+      }
     }
   ]
 }

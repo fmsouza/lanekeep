@@ -228,7 +228,14 @@ fn an_empty_scope_is_refused() {
         .expect("the rule builds")
         .accepts("fn go() {}\n")
         .expect_err("a rule scoped to nothing must refuse to load rather than check nothing");
-    assert!(format!("{error}").contains("scope"), "{error}");
+    // Assert on wording unique to the thrown message, not on a short word. `RuleTester`'s
+    // temp directory embeds the tester's name and every `ConfigError`'s `Display` interpolates
+    // that path, so `contains("scope")` would be satisfied by the path alone for any load
+    // error at all — including one that has nothing to do with this guard.
+    assert!(
+        format!("{error}").contains("silently checks nothing"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -249,4 +256,76 @@ fn a_near_miss_identifier_is_not_reported() {
     tracked()
         .accepts("fn go() {\n    let t = vfs::something(\"x\");\n}\n")
         .expect("`vfs` is not `fs`; the gate's substring match is coarser than the check's");
+}
+
+const OBSERVATION: &str = include_str!("../../../lanekeep/rules/no-ambient-observation.ts");
+
+fn observation() -> RuleTester {
+    configured(
+        "observation",
+        OBSERVATION,
+        "{ scope: ['subject/'], allow: [] }",
+    )
+}
+
+#[test]
+fn a_clock_read_is_reported() {
+    observation()
+        .reports_at(
+            "fn go() {\n    let n = std::time::SystemTime::now();\n}\n",
+            &[(2, 13)],
+        )
+        .expect("a cached result computed from the clock is not reproducible");
+}
+
+#[test]
+fn an_environment_read_is_reported() {
+    observation()
+        .reports_at(
+            "fn go() {\n    let v = std::env::var(\"HOME\");\n}\n",
+            &[(2, 13)],
+        )
+        .expect("the environment is not in the cache key");
+}
+
+#[test]
+fn the_one_clock_site_passes() {
+    RuleTester::configured(
+        "observation-allow",
+        OBSERVATION,
+        "{ scope: ['subject/'], allow: ['subject/input.rs'] }",
+    )
+    .expect("the rule builds")
+    .accepts("fn go() {\n    let n = std::time::SystemTime::now();\n}\n")
+    .expect("suppression::today is the one place lanekeep looks at the clock");
+}
+
+#[test]
+fn an_empty_observation_scope_is_refused() {
+    // Named distinctly from `tracked-reads-only`'s `an_empty_scope_is_refused` above: this
+    // file is one module, and two `#[test]` functions sharing a name is `E0428`, not a
+    // rule-behavior question — confirmed by compiling this file with the brief's literal
+    // name before this rename.
+    //
+    // `RuleTester::configured` only writes the fixture to disk; the factory is not called
+    // until `run` loads the config, which is what `accepts` triggers below. The error surfaces
+    // there, as a `TestError::Load`, not from `configured` itself. Task 5 established this
+    // shape the hard way — a test asserting on `configured`'s own Result passes whether the
+    // guard exists or not.
+    let error = RuleTester::configured(
+        "observation-noscope",
+        OBSERVATION,
+        "{ scope: [], allow: [] }",
+    )
+    .expect("the rule builds")
+    .accepts("fn go() {}\n")
+    .expect_err("a rule scoped to nothing must refuse to load rather than check nothing");
+    // Assert on wording unique to the thrown message, not on a short word. `RuleTester`'s
+    // temp directory embeds the tester's name and every `ConfigError`'s `Display` interpolates
+    // that path, so `contains("scope")` would be satisfied by the path alone for any load
+    // error at all — including one that has nothing to do with this guard.
+    assert!(
+        format!("{error}").contains("silently checks nothing"),
+        "{error}"
+    );
 }
