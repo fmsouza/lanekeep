@@ -488,3 +488,41 @@ fn a_same_shaped_call_under_a_different_name_passes() {
         .accepts("foo({ a: 1 }) // defineRule\n")
         .expect("the query matches any identifier call with an object argument; only defineRule is this rule's concern");
 }
+
+const REDUCE: &str = include_str!("../../../lanekeep/rules/reduce-touches-no-tree.ts");
+
+fn reduce() -> RuleTester {
+    plain("reduce", REDUCE, "ts")
+}
+
+#[test]
+fn a_tree_call_in_reduce_is_reported() {
+    reduce()
+        .reports_at(
+            "const r = {\n  reduce(ctx) {\n    const t = ctx.text(n)\n  },\n}\n",
+            &[(3, 15)],
+        )
+        .expect("reduce receives facts and the file list, never trees");
+}
+
+#[test]
+fn a_fact_call_in_reduce_passes() {
+    reduce()
+        .accepts("const r = {\n  reduce(ctx) {\n    for (const f of ctx.facts('e')) {}\n  },\n}\n")
+        .expect("facts are what reduce is given");
+}
+
+#[test]
+fn a_tree_call_in_check_passes() {
+    // The trailing comment is load-bearing: the rule's own gate is `fileContains: ['reduce']`,
+    // and a fixture that never contains that substring is rejected before the query runs at
+    // all. Without it, this would pass whether or not `check` filters by method name — which
+    // is the one thing this case exists to prove. Confirmed by mutation: deleting the
+    // `ctx.text(m.name) !== 'reduce'` guard left this test passing until the comment was
+    // added, because the gate alone was already keeping the file out.
+    reduce()
+        .accepts(
+            "const r = {\n  check(ctx, m) {\n    const t = ctx.text(m.d)\n  },\n}\n// reduce\n",
+        )
+        .expect("check has a tree; that is the difference");
+}

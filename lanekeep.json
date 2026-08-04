@@ -67,6 +67,7 @@
       "options": { "scope": ["crates/lanekeep-report/", "crates/lanekeep-cache/"] }
     },
     "./lanekeep/rules/gates-are-and.ts",
-    "./lanekeep/rules/rule-declares-language.ts"
+    "./lanekeep/rules/rule-declares-language.ts",
+    "./lanekeep/rules/reduce-touches-no-tree.ts"
   ]
 }
