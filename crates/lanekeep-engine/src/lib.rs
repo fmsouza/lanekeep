@@ -1208,6 +1208,7 @@ impl Engine {
             .iter()
             .find_map(|rule| rule.for_language(language_id))?;
 
+        // lanekeep-ignore-next-line local/one-parser-per-file reason: the one shared per-file parse every rule's query runs against
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language.grammar()).ok()?;
         parser.parse(source, None)

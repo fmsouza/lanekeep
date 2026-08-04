@@ -1188,6 +1188,64 @@ fn a_registration_inside_test_code_is_ignored() {
         .expect("a registration inside test code is not real API and must not be reported");
 }
 
+#[test]
+fn the_real_host_and_types_reconcile() {
+    // The deleted host_types.rs used include_str! against the real host.rs — a moved or
+    // renamed file failed to COMPILE. This rule's `hostPath` is a runtime string instead, and
+    // `check` returns early on `ctx.filePath !== hostPath`, so without an anchor like this one a
+    // rename would make the rule silently check nothing on every file while `just lanekeep`
+    // stayed green. Mirrors what `the_rule_still_matches_the_real_binding_source` already does
+    // for binding-kinds-are-typed — and, on its own, would not be enough: see the floor test
+    // below for why a second assertion is needed alongside this one.
+    const REAL_HOST: &str = include_str!("../../lanekeep-js/src/host.rs");
+    const REAL_TYPES: &str = include_str!("../../../packages/lanekeep/index.d.ts");
+
+    let tester = RuleTester::configured(
+        "host-api-real",
+        HOST_API,
+        "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture("types.d.ts", REAL_TYPES)
+        .expect("the types fixture is written");
+
+    tester
+        .accepts(REAL_HOST)
+        .expect("the real host API and its real published types should agree");
+}
+
+#[test]
+fn the_rule_still_matches_the_real_host_source() {
+    // Reconciling cleanly, above, is not enough on its own — a rule that returned early for
+    // every file would also reconcile cleanly, vacuously. An empty `RuleContext` here proves
+    // `check` actually read and matched the real host.rs's `object.set(` calls rather than
+    // silently no-op-ing. There are roughly 31 `object.set(` call sites in host.rs; this floor
+    // leaves generous headroom below the real, deduplicated count so one or two future
+    // registrations do not make the test flaky. Same shape as
+    // `the_rule_still_matches_the_real_binding_source` below.
+    const REAL_HOST: &str = include_str!("../../lanekeep-js/src/host.rs");
+
+    let tester = RuleTester::configured(
+        "host-api-floor",
+        HOST_API,
+        "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture("types.d.ts", "export interface RuleContext {\n}\n")
+        .expect("the types fixture is written");
+
+    let violations = tester.run(REAL_HOST).expect("the rule runs");
+    assert!(
+        violations.len() >= 15,
+        "expected the real host source to yield at least 15 registrations, got {}",
+        violations.len()
+    );
+}
+
 const KINDS: &str = include_str!("../../../lanekeep/rules/binding-kinds-are-typed.ts");
 
 #[test]

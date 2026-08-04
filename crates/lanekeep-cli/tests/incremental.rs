@@ -207,6 +207,7 @@ fn a_selected_file_the_config_excludes_is_not_checked() {
     repo.git(&["add", "-A"]);
 
     let output = repo.check(&["--staged"]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(violation_count(&output), 0, "{}", describe(&output));
 }
 
@@ -383,6 +384,7 @@ fn changing_a_rule_option_in_a_json_config_invalidates_the_cache() {
 
     // Cold: nothing is restricted, so nothing is reported — and that is cached.
     let clean = repo.check(&[]);
+    assert_eq!(clean.status.code(), Some(0), "{}", describe(&clean));
     assert_eq!(violation_count(&clean), 0, "{}", describe(&clean));
 
     // The only edit is the options. Warm, and it has to be seen.
@@ -398,6 +400,7 @@ fn changing_a_rule_option_in_a_json_config_invalidates_the_cache() {
     // And back: taking the restriction away has to be seen just as much.
     repo.write("lanekeep.json", &json_config(""));
     let relaxed = repo.check(&[]);
+    assert_eq!(relaxed.status.code(), Some(0), "{}", describe(&relaxed));
     assert_eq!(
         violation_count(&relaxed),
         0,
@@ -420,6 +423,7 @@ fn changing_a_rule_option_in_a_module_config_invalidates_the_cache() {
     );
 
     let clean = repo.check(&[]);
+    assert_eq!(clean.status.code(), Some(0), "{}", describe(&clean));
     assert_eq!(violation_count(&clean), 0, "{}", describe(&clean));
 
     repo.write("lanekeep.config.ts", &module_config(STRIPE));

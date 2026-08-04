@@ -24,12 +24,7 @@
     { "rule": "lanekeep/no-circular-imports", "options": {} },
     {
       "rule": "./lanekeep/rules/one-parser-per-file.ts",
-      "options": {
-        "allow": [
-          "crates/lanekeep-engine/src/lib.rs",
-          "crates/lanekeep-js/src/typescript.rs"
-        ]
-      }
+      "options": { "allow": [] }
     },
     {
       "rule": "./lanekeep/rules/sandbox-containment.ts",
@@ -54,11 +49,13 @@
           "crates/lanekeep-config/",
           "crates/lanekeep-core/",
           "crates/lanekeep-query/",
-          "crates/lanekeep-js/"
+          "crates/lanekeep-js/",
+          "crates/lanekeep-engine/"
         ],
         "allow": [
           "crates/lanekeep-core/src/suppression.rs",
-          "crates/lanekeep-js/src/limits.rs"
+          "crates/lanekeep-js/src/limits.rs",
+          "crates/lanekeep-engine/benches/corpus.rs"
         ]
       }
     },

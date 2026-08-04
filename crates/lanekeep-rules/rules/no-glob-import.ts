@@ -21,14 +21,14 @@ import { defineRule } from 'lanekeep'
  * import noGlobImport from 'lanekeep/no-glob-import'
  *
  * export default defineConfig({
- *   rules: [noGlobImport({ allow: ['**\/prelude', 'std::prelude::*'] })],
+ *   rules: [noGlobImport({ allow: ['*prelude*', 'super::*'] })],
  * })
  * ```
  *
  * and, for a `lanekeep.json`:
  *
  * ```json
- * { "rule": "lanekeep/no-glob-import", "options": { "allow": ["**\/prelude", "std::prelude::*"] } }
+ * { "rule": "lanekeep/no-glob-import", "options": { "allow": ["*prelude*", "super::*"] } }
  * ```
  */
 export default function noGlobImport(options) {
