@@ -56,7 +56,10 @@
           "crates/lanekeep-query/",
           "crates/lanekeep-js/"
         ],
-        "allow": ["crates/lanekeep-core/src/suppression.rs"]
+        "allow": [
+          "crates/lanekeep-core/src/suppression.rs",
+          "crates/lanekeep-js/src/limits.rs"
+        ]
       }
     }
   ]
