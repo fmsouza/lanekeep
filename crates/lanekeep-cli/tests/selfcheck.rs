@@ -620,3 +620,95 @@ fn an_unrelated_report_call_passes() {
         )
         .expect("only emitFact has to survive the cache");
 }
+
+const HANDLE: &str = include_str!("../../../lanekeep/rules/node-handle-truthiness.ts");
+
+fn handle() -> RuleTester {
+    plain("handle", HANDLE, "ts")
+}
+
+#[test]
+fn negating_a_node_handle_is_reported() {
+    handle()
+        .reports_at(
+            "function f(ctx, m) {\n  const p = ctx.parent(m.n)\n  if (!p) return\n}\n",
+            &[(3, 7)],
+        )
+        .expect("the root's handle is 0, so !p discards every top-level item");
+}
+
+#[test]
+fn comparing_against_undefined_passes() {
+    handle()
+        .accepts(
+            "function f(ctx, m) {\n  const p = ctx.parent(m.n)\n  if (p === undefined) return\n}\n",
+        )
+        .expect("undefined is the absent value; zero is a node");
+}
+
+#[test]
+fn negating_something_else_passes() {
+    // The trailing comment is load-bearing: the rule's own gate is `fileContains:
+    // ['ctx.parent']`, and a fixture that never contains that substring is rejected before the
+    // query runs at all — without it this would pass whether or not `check`'s
+    // `NODE_RETURNING.includes(...)` guard filters by method name at all.
+    handle()
+        .accepts(
+            "function f(ctx, m) {\n  const t = ctx.text(m.n)\n  if (!t) return\n}\n// ctx.parent\n",
+        )
+        .expect("text is a string and falsy means empty");
+}
+
+#[test]
+fn negating_an_unrelated_variable_in_the_same_scope_passes() {
+    // Closes a coverage gap the name-equality filter's absence would leave open (found while
+    // mutation-testing this rule, not asked for directly) — the same reason
+    // `facts-must-serialize.ts`'s `a_call_rooted_at_the_match_still_passes` exists. Every other
+    // fixture's one unary expression already negates the node-returning variable itself, or
+    // there is no unary expression at all, so neither would catch a `check` that reported on
+    // any `!`-prefixed identifier found in scope, regardless of which variable it names.
+    // Confirmed by mutation: deleting `ctx.text(hit.id) !== name` makes this fixture reported,
+    // which is precisely the over-report this test exists to catch if it comes back.
+    handle()
+        .accepts(
+            "function f(ctx, m) {\n  const p = ctx.parent(m.n)\n  const q = 0\n  if (!q) return\n}\n",
+        )
+        .expect("`q` never held a node handle; `p`, the ctx.parent result, is untouched");
+}
+
+#[test]
+fn a_different_unary_operator_on_the_node_handle_passes() {
+    // Closes a second coverage gap alongside the one above (found the same way, while
+    // mutation-testing this rule): every other fixture's one unary expression on the
+    // node-returning variable already starts with `!`, so none of them would catch a `check`
+    // that reported on any unary operator at all — `typeof`, `-`, `void`, `~` — rather than
+    // specifically negation. Confirmed by mutation: deleting
+    // `!ctx.text(hit.neg).startsWith('!')` makes this fixture reported, which is precisely the
+    // over-report this test exists to catch if it comes back.
+    handle()
+        .accepts(
+            "function f(ctx, m) {\n  const p = ctx.parent(m.n)\n  if (typeof p === 'number') return\n}\n",
+        )
+        .expect("`typeof p` asks about the handle's JS type, not its truthiness");
+}
+
+#[test]
+fn a_shadowed_variable_in_a_nested_function_is_still_reported() {
+    // The rule's known limitation, asserted rather than left to be discovered — the same
+    // reason `facts-must-serialize.ts`'s `a_serializable_member_expression_passes` and
+    // `reduce-touches-no-tree.ts`'s `a_non_ctx_receiver_named_like_a_tree_method_passes` exist.
+    // `closestAncestor`'s scope is the nearest enclosing `statement_block`, which for a
+    // top-level declaration is the whole function body — including any function nested inside
+    // it. The name check is textual (`ctx.text(hit.id) !== name`), not binding-based, so it
+    // cannot tell this inner `p`, an ordinary number, from the outer one, a node handle: they
+    // share a name and nothing else. This is a genuine over-report on legitimate code, not
+    // merely a hypothetical — confirmed by running exactly this fixture and reading back
+    // where it reported, per the same requirement that derived every other position in this
+    // file from test output rather than from arithmetic.
+    handle()
+        .reports_at(
+            "function f(ctx, m) {\n  const p = ctx.parent(m.n)\n  function g() {\n    const p = 0\n    if (!p) return\n  }\n}\n",
+            &[(5, 9)],
+        )
+        .expect("g's own `p` is a plain number, but the rule cannot distinguish it from f's node handle by name alone");
+}
