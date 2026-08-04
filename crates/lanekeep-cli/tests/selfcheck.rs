@@ -566,6 +566,40 @@ fn a_serializable_fact_passes() {
 }
 
 #[test]
+fn a_serializable_member_expression_passes() {
+    // The rule's known limitation, asserted rather than left to be discovered — the same
+    // reason `reduce-touches-no-tree.ts`'s `a_non_ctx_receiver_named_like_a_tree_method_passes`
+    // exists. `options.kind` is a member expression exactly like `m.decl` is, and it serializes
+    // just as well; `startsWith('m.')` is the (convention-based, not binding-based) guard that
+    // keeps this rule from flagging it. Confirmed by mutation: deleting
+    // `ctx.text(value).startsWith('m.')` makes this fixture reported, which is precisely the
+    // over-report this test exists to catch if it comes back.
+    facts()
+        .accepts(
+            "const r = { check(ctx, m) { ctx.emitFact({ kind: 'e', tier: options.kind }) } }\n",
+        )
+        .expect("options.kind is a member expression too, but it is not a handle");
+}
+
+#[test]
+fn a_call_rooted_at_the_match_still_passes() {
+    // Closes a coverage gap the `startsWith('m.')` guard introduced (found while
+    // mutation-testing the review's fix, not asked for directly): every other `accepts`
+    // fixture's non-handle value starts with `ctx.` or `options.`, so the `m.`-prefix guard
+    // alone would filter it out even if the `member_expression`-kind check just above it were
+    // deleted entirely. Confirmed by mutation: deleting that kind check left
+    // `a_serializable_fact_passes` and `a_serializable_member_expression_passes` both passing
+    // regardless, because neither fixture's value has text starting with `m.`. `m.toString()`
+    // does — it is a call on the match object itself, so it is only accepted because it is a
+    // call, not because the guard below it never got a chance to fire.
+    facts()
+        .accepts(
+            "const r = { check(ctx, m) { ctx.emitFact({ kind: 'e', label: m.toString() }) } }\n",
+        )
+        .expect("a call rooted at m is still a call, not a bare handle");
+}
+
+#[test]
 fn an_unrelated_report_call_passes() {
     // Named distinctly from `rule-declares-language.ts`'s `an_unrelated_call_passes` above:
     // this file is one module, and two `#[test]` functions sharing a name is `E0428`, not a

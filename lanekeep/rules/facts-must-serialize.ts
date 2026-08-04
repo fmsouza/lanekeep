@@ -12,7 +12,18 @@ import { defineRule } from 'lanekeep'
  * at `{ file, line, column }`, because the position has to be captured during the per-file
  * pass while the tree is still there.
  *
- * A bare `m.something` as a fact value is the shape of that mistake.
+ * A bare `m.something` as a fact value is the shape of that mistake, and the check is keyed on
+ * that literal prefix — the conventional name of `check`'s second parameter, not binding
+ * analysis. `options.kind` and `config.name` are member expressions too, and serialize
+ * perfectly; they are left alone because their receiver isn't `m`. Same trade
+ * `reduce-touches-no-tree.ts` makes for `ctx.`: an author who renames or destructures the
+ * second parameter — `check(ctx, match)`, `check(ctx, { decl })` — defeats this rule silently.
+ *
+ * A second, narrower gap: `ctx.emitFact({ kind: 'e', decl })` stores `decl` by object-literal
+ * shorthand. At that call site `decl` is a bare identifier, not a member expression, so this
+ * rule has nothing to report even if `decl` was assigned from `m.decl` a line earlier — seeing
+ * that would mean resolving the identifier back to its initializer, a binding-resolution pass
+ * this rule does not attempt anywhere else.
  */
 export default defineRule({
   id: 'local/facts-must-serialize',
@@ -45,6 +56,13 @@ export default defineRule({
       const parts = ctx.namedChildren(pair)
       const value = parts[parts.length - 1]
       if (ctx.kind(value) !== 'member_expression') continue
+
+      // Rooted at the match, not at anything else. `options.kind` and `config.name` are
+      // member expressions too and serialize perfectly; only the match's captures are handles.
+      // Keyed on the conventional parameter name the way `reduce-touches-no-tree` keys on
+      // `ctx.` — an author who renames or destructures the second parameter defeats it, which
+      // is the same accepted limitation for the same reason.
+      if (!ctx.text(value).startsWith('m.')) continue
 
       ctx.report(pair, {
         message: `\`${ctx.text(value)}\` is a node handle; a fact has to survive JSON.stringify and be meaningful after the tree is gone`,
