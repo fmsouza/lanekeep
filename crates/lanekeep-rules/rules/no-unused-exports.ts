@@ -27,6 +27,7 @@ export default function noUnusedExports(options) {
 
   return defineRule({
     id: 'lanekeep/no-unused-exports',
+    language: ['typescript', 'tsx'],
     severity: 'error',
 
     card: {

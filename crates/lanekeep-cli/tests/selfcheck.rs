@@ -438,3 +438,53 @@ fn an_unrelated_array_passes() {
         .accepts("const r = { pathMatches: ['a', 'b'] } // Contains\n")
         .expect("only the content gates are conjunctions");
 }
+
+const DECLARES: &str = include_str!("../../../lanekeep/rules/rule-declares-language.ts");
+
+fn declares() -> RuleTester {
+    plain("declares", DECLARES, "ts")
+}
+
+#[test]
+fn a_rule_without_a_language_is_reported() {
+    declares()
+        .reports_at(
+            "const r = defineRule({ id: 'local/x', query: '(x) @y' })\n",
+            &[(1, 11)],
+        )
+        .expect("the default is typescript and tsx, so a Rust rule would run on nothing");
+}
+
+#[test]
+fn a_rule_with_a_language_passes() {
+    declares()
+        .accepts("const r = defineRule({ id: 'local/x', language: 'rust', query: '(x) @y' })\n")
+        .expect("naming the language is the whole requirement");
+}
+
+#[test]
+fn a_rule_with_several_languages_passes() {
+    declares()
+        .accepts("const r = defineRule({ id: 'local/x', language: ['typescript', 'tsx'] })\n")
+        .expect("the default written out is still written out");
+}
+
+#[test]
+fn an_unrelated_call_passes() {
+    declares()
+        .accepts("const c = defineConfig({ rules: [] })\n")
+        .expect("only defineRule declares a language");
+}
+
+#[test]
+fn a_same_shaped_call_under_a_different_name_passes() {
+    // `an_unrelated_call_passes` above is excluded by the gate before the query ever runs —
+    // `defineConfig` does not contain the substring `defineRule` — so it cannot tell whether
+    // `check` itself filters by callee name. This fixture satisfies the gate on a comment
+    // alone, leaving a call with the identical shape the query matches: an identifier callee
+    // with a single object argument. Only the identifier check inside `check` keeps this
+    // unreported.
+    declares()
+        .accepts("foo({ a: 1 }) // defineRule\n")
+        .expect("the query matches any identifier call with an object argument; only defineRule is this rule's concern");
+}

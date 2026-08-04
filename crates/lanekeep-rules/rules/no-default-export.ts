@@ -10,6 +10,7 @@ import { defineRule } from 'lanekeep'
  */
 export default defineRule({
   id: 'lanekeep/no-default-export',
+  language: ['typescript', 'tsx'],
   severity: 'error',
 
   card: {
