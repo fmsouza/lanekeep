@@ -1062,3 +1062,78 @@ fn a_print_call_passes() {
         .accepts("print(\"hi\")\n# sys.stdout\n")
         .expect("print shares the encoding problem but this rule's query does not reach it");
 }
+
+const HOST_API: &str = include_str!("../../../lanekeep/rules/host-api-matches-types.ts");
+
+#[test]
+fn a_registration_missing_from_the_types_is_reported() {
+    // The rule reads the types through `ctx.readFile`, which is confined to the project root
+    // — so the tester's own directory is the root, and the types file is written beside the
+    // subject. `reports_messages` rather than `reports_at`: every finding is reported at the
+    // file root, so the position says nothing and the message is the assertion.
+    let tester = RuleTester::configured(
+        "host-api",
+        HOST_API,
+        "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture(
+            "types.d.ts",
+            "export interface RuleContext {\n  text(node: Node): string\n}\n",
+        )
+        .expect("the types fixture is written");
+
+    tester
+        .reports_messages(
+            "fn r() {\n    object.set(\"text\", 1)?;\n    object.set(\"newThing\", 2)?;\n}\n",
+            &["host.rs registers `newThing`, which packages/lanekeep/index.d.ts does not declare — it works but nobody can find it"],
+        )
+        .expect("a host function nobody can find is as good as absent");
+}
+
+#[test]
+fn a_type_with_no_registration_is_reported() {
+    let tester = RuleTester::configured(
+        "host-api-invented",
+        HOST_API,
+        "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture(
+            "types.d.ts",
+            "export interface RuleContext {\n  text(node: Node): string\n  invented(node: Node): string\n}\n",
+        )
+        .expect("the types fixture is written");
+
+    tester
+        .reports_messages(
+            "fn r() {\n    object.set(\"text\", 1)?;\n}\n",
+            &["index.d.ts declares `invented`, which host.rs does not register — autocomplete for a method that throws"],
+        )
+        .expect("a declared method that throws at run time is worse than no types");
+}
+
+#[test]
+fn a_matching_pair_passes() {
+    let tester = RuleTester::configured(
+        "host-api-clean",
+        HOST_API,
+        "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture(
+            "types.d.ts",
+            "export interface RuleContext {\n  text(node: Node): string\n}\n",
+        )
+        .expect("the types fixture is written");
+
+    tester
+        .accepts("fn r() {\n    object.set(\"text\", 1)?;\n}\n")
+        .expect("registered and declared is the state this rule protects");
+}

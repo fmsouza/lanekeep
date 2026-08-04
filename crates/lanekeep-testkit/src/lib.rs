@@ -234,6 +234,20 @@ impl RuleTester {
         std::fs::write(full, contents).map_err(|e| TestError::Setup(e.to_string()))
     }
 
+    /// Write an extra file into the tester's project, for a rule that reads one.
+    ///
+    /// `ctx.readFile` is confined to the project root and records what it read as a cache
+    /// dependency. A rule that reconciles two files cannot be tested without a second file to
+    /// reconcile against, and writing it here keeps it inside the root the rule is confined
+    /// to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Setup`] if the file cannot be written.
+    pub fn write_fixture(&self, path: &str, contents: &str) -> Result<(), TestError> {
+        self.write(path, contents)
+    }
+
     /// Run the rule over a single source file and return what it reported.
     ///
     /// # Errors

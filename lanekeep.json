@@ -73,6 +73,13 @@
     "./lanekeep/rules/node-handle-truthiness.ts",
     "./lanekeep/rules/no-eval-in-rules.ts",
     "./lanekeep/rules/py-explicit-encoding.ts",
-    "./lanekeep/rules/py-stdout-buffer.ts"
+    "./lanekeep/rules/py-stdout-buffer.ts",
+    {
+      "rule": "./lanekeep/rules/host-api-matches-types.ts",
+      "options": {
+        "hostPath": "crates/lanekeep-js/src/host.rs",
+        "typesPath": "packages/lanekeep/index.d.ts"
+      }
+    }
   ]
 }
