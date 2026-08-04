@@ -648,14 +648,13 @@ fn comparing_against_undefined_passes() {
 
 #[test]
 fn negating_something_else_passes() {
-    // The trailing comment is load-bearing: the rule's own gate is `fileContains:
-    // ['ctx.parent']`, and a fixture that never contains that substring is rejected before the
-    // query runs at all — without it this would pass whether or not `check`'s
-    // `NODE_RETURNING.includes(...)` guard filters by method name at all.
+    // No trailing gate-clearing comment needed: `ctx.text` already contains `ctx.`, the gate's
+    // substring since fix round 2 broadened it from `['ctx.parent']`. This fixture used to
+    // carry a `// ctx.parent` comment for the narrower gate; removed rather than left pointless
+    // once it stopped being necessary, per this repository's own rule about stale comments
+    // claiming a reason that no longer holds.
     handle()
-        .accepts(
-            "function f(ctx, m) {\n  const t = ctx.text(m.n)\n  if (!t) return\n}\n// ctx.parent\n",
-        )
+        .accepts("function f(ctx, m) {\n  const t = ctx.text(m.n)\n  if (!t) return\n}\n")
         .expect("text is a string and falsy means empty");
 }
 
@@ -719,12 +718,13 @@ fn negating_ctx_root_is_reported() {
     // `0`, so `!r` here isn't a bug that might happen depending on which node was passed in —
     // it is one that happens every time. `ctx.root` is a property, not a call
     // (`readonly root: Node`), so it needs the query's second alternative rather than the
-    // `call_expression` one `ctx.parent` matches. The trailing comment is load-bearing: the
-    // rule's own gate is `fileContains: ['ctx.parent']`, and this fixture otherwise never
-    // contains that substring.
+    // `call_expression` one `ctx.parent` matches. No trailing gate-clearing comment needed:
+    // `ctx.root` itself contains `ctx.`, the gate's substring since fix round 2 — the
+    // `// ctx.parent` this fixture used to carry, for the narrower gate that round closed, is
+    // removed rather than left pointless.
     handle()
         .reports_at(
-            "function f(ctx, m) {\n  const r = ctx.root\n  if (!r) return\n}\n// ctx.parent\n",
+            "function f(ctx, m) {\n  const r = ctx.root\n  if (!r) return\n}\n",
             &[(3, 7)],
         )
         .expect("ctx.root is handle 0 unconditionally, not merely a call result that might be");
@@ -739,11 +739,40 @@ fn negating_an_unrelated_root_property_passes() {
     // `facts-must-serialize.ts` and `reduce-touches-no-tree.ts` both had to add a receiver
     // guard to avoid. Confirmed by mutation: relaxing `ctx.text(m.property) !== 'ctx.root'` to
     // a suffix check (`!endsWith('.root')`) makes this fixture reported, which is precisely the
-    // over-report this test exists to catch if it comes back. The trailing comment clears the
-    // same gate as the test above.
+    // over-report this test exists to catch if it comes back. Unlike the two tests above, the
+    // trailing comment here is still load-bearing — `config.root` contains no `ctx.` anywhere,
+    // and neither does the rest of the fixture (`ctx` appears only as a bare parameter name,
+    // never followed by `.`) — simplified from `// ctx.parent` to `// ctx.` since fix round 2
+    // broadened the gate to that substring.
     handle()
-        .accepts(
-            "function f(ctx, m) {\n  const r = config.root\n  if (!r) return\n}\n// ctx.parent\n",
-        )
+        .accepts("function f(ctx, m) {\n  const r = config.root\n  if (!r) return\n}\n// ctx.\n")
         .expect("config.root is an ordinary property; only ctx.root is always handle 0");
+}
+
+#[test]
+fn a_file_containing_only_ctx_root_is_reported() {
+    // Direct evidence the broadened gate closes the hole the narrow one left open: this
+    // fixture contains no substring `ctx.parent` anywhere, including in comments — exactly the
+    // case `gates: { fileContains: ['ctx.parent'] }` used to reject before the query ever ran,
+    // even though `ctx.root` is unconditionally handle `0` and this is the guaranteed-bug shape
+    // the rule's own docstring opens by describing. Deliberately the same shape as
+    // `negating_ctx_root_is_reported` above, now that that test's own stale gate-clearing
+    // comment is gone — the two are redundant against every mutation tried so far (confirmed:
+    // reverting the gate fails both, not just this one), and that redundancy is intentional
+    // rather than an oversight. This test exists as freestanding, explicitly-named evidence
+    // that the gate itself is what changed, so a reader does not have to notice that the other
+    // test happens to double as that proof only because its comment was removed in this same
+    // round. Confirmed by mutation: reverting the gate to `['ctx.parent']` makes this fixture
+    // (and `negating_ctx_root_is_reported`) produce no violations at all, not because the
+    // detection logic is wrong but because the file is rejected before it is ever parsed — the
+    // gate trap from the other direction, a gate narrow enough to hide the exact case a rule
+    // exists to catch.
+    handle()
+        .reports_at(
+            "function f(ctx, m) {\n  const root = ctx.root\n  if (!root) return\n}\n",
+            &[(3, 7)],
+        )
+        .expect(
+            "no ctx.parent substring anywhere; only the broadened `ctx.` gate lets this run at all",
+        );
 }
