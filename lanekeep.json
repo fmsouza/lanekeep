@@ -61,6 +61,10 @@
           "crates/lanekeep-js/src/limits.rs"
         ]
       }
+    },
+    {
+      "rule": "./lanekeep/rules/deterministic-iteration.ts",
+      "options": { "scope": ["crates/lanekeep-report/", "crates/lanekeep-cache/"] }
     }
   ]
 }
