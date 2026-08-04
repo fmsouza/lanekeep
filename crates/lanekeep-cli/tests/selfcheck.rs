@@ -541,3 +541,48 @@ fn a_non_ctx_receiver_named_like_a_tree_method_passes() {
         .accepts("const r = {\n  reduce(ctx) {\n    const e = { line: 1 }\n    const x = e.line\n  },\n}\n")
         .expect("a property named like a tree method, on something that is not ctx, is not a tree call");
 }
+
+const FACTS: &str = include_str!("../../../lanekeep/rules/facts-must-serialize.ts");
+
+fn facts() -> RuleTester {
+    plain("facts", FACTS, "ts")
+}
+
+#[test]
+fn a_node_handle_in_a_fact_is_reported() {
+    facts()
+        .reports_at(
+            "const r = { check(ctx, m) { ctx.emitFact({ kind: 'e', node: m.decl }) } }\n",
+            &[(1, 55)],
+        )
+        .expect("a handle is an index into a tree that will not exist when reduce runs");
+}
+
+#[test]
+fn a_serializable_fact_passes() {
+    facts()
+        .accepts("const r = { check(ctx, m) { ctx.emitFact({ kind: 'e', name: ctx.text(m.decl), line: ctx.line(m.decl) }) } }\n")
+        .expect("text, line and column survive JSON");
+}
+
+#[test]
+fn an_unrelated_report_call_passes() {
+    // Named distinctly from `rule-declares-language.ts`'s `an_unrelated_call_passes` above:
+    // this file is one module, and two `#[test]` functions sharing a name is `E0428`, not a
+    // rule-behavior question — the same collision several rules above already ran into under
+    // different names.
+    //
+    // Two things load-bearing here, both confirmed by mutation. The trailing comment: the
+    // rule's own gate is `fileContains: ['emitFact']`, and a fixture that never contains that
+    // substring is rejected before the query runs at all — without it, this passes whether or
+    // not `check` filters by method name. And the object argument itself: it holds a bare
+    // member expression (`m.decl`), the same shape the rule reports on inside `emitFact`, rather
+    // than a string. Deleting `ctx.text(m.method) !== 'emitFact'` left the brief's original
+    // fixture (`{ message: 'x' }`) passing regardless — partly the gate, and partly that a
+    // string value gives the deleted guard nothing to expose either way.
+    facts()
+        .accepts(
+            "const r = { check(ctx, m) { ctx.report(m.decl, { node: m.decl }) } }\n// emitFact\n",
+        )
+        .expect("only emitFact has to survive the cache");
+}

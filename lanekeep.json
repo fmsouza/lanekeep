@@ -68,6 +68,7 @@
     },
     "./lanekeep/rules/gates-are-and.ts",
     "./lanekeep/rules/rule-declares-language.ts",
-    "./lanekeep/rules/reduce-touches-no-tree.ts"
+    "./lanekeep/rules/reduce-touches-no-tree.ts",
+    "./lanekeep/rules/facts-must-serialize.ts"
   ]
 }
