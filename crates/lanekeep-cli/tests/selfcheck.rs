@@ -776,3 +776,57 @@ fn a_file_containing_only_ctx_root_is_reported() {
             "no ctx.parent substring anywhere; only the broadened `ctx.` gate lets this run at all",
         );
 }
+
+const NO_EVAL: &str = include_str!("../../../lanekeep/rules/no-eval-in-rules.ts");
+
+fn no_eval() -> RuleTester {
+    plain("no-eval", NO_EVAL, "ts")
+}
+
+#[test]
+fn eval_is_reported() {
+    no_eval()
+        .reports_at("function f(src) {\n  return eval(src)\n}\n", &[(2, 10)])
+        .expect("the sandbox cannot remove eval, so a rule using it is unreviewable by reading");
+}
+
+#[test]
+fn the_function_constructor_is_reported() {
+    no_eval()
+        .reports_at(
+            "function f(src) {\n  return new Function(src)\n}\n",
+            &[(2, 10)],
+        )
+        .expect("the Function constructor is eval under another name");
+}
+
+#[test]
+fn an_ordinary_function_passes() {
+    no_eval()
+        .accepts("function f() {\n  return 1\n}\n")
+        .expect("writing the logic out is the remediation");
+}
+
+#[test]
+fn a_call_to_an_unrelated_function_passes() {
+    // Closes a coverage gap the brief's own fixture leaves open (found while mutation-testing
+    // this rule, not asked for directly): `an_ordinary_function_passes` above contains no call
+    // or `new` expression at all, so the query never matches it — it cannot tell a `check` that
+    // reports on every match, regardless of name, from the real one. Confirmed by mutation:
+    // deleting the whole guard (`if (name !== 'eval' && name !== 'Function') return`) leaves
+    // every other case in this file passing regardless, this one included only once it exists.
+    no_eval()
+        .accepts("function f(src) {\n  return foo(src)\n}\n")
+        .expect("an ordinary call is not a reviewability hazard; only eval is");
+}
+
+#[test]
+fn constructing_an_unrelated_class_passes() {
+    // The `new_expression` counterpart to the test above, closing the same gap for the query's
+    // second alternative. Confirmed by mutation the same way: deleting the guard entirely makes
+    // this fixture reported too, which is precisely the over-report these two tests exist to
+    // catch if it comes back.
+    no_eval()
+        .accepts("function f(src) {\n  return new Array(src)\n}\n")
+        .expect("an ordinary constructor is not a reviewability hazard; only Function is");
+}
