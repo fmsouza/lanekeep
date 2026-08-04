@@ -18,9 +18,17 @@ import { defineRule } from 'lanekeep'
  *
  * @example
  * ```ts
+ * import noUnwrap from 'lanekeep/no-unwrap'
+ *
  * export default defineConfig({
- *   rules: [{ rule: 'lanekeep/no-unwrap', options: { allow: ['src/main.rs'] } }],
+ *   rules: [noUnwrap({ allow: ['src/main.rs'] })],
  * })
+ * ```
+ *
+ * and, for a `lanekeep.json`:
+ *
+ * ```json
+ * { "rule": "lanekeep/no-unwrap", "options": { "allow": ["src/main.rs"] } }
  * ```
  */
 export default function noUnwrap(options) {
