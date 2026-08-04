@@ -7,13 +7,25 @@ import { defineRule } from 'lanekeep'
  * the union is complete. A language crate adding a kind without adding it here narrows an
  * author's `switch` to something wrong — silently, since the missing arm just never matches.
  *
- * The kinds are read from `as_str`'s match arms rather than from a list, for the same reason
- * §3 reads the host surface from `host.rs`: the compiler already forces that match to be
- * exhaustive, so it is the one place that cannot fall behind the enum. Four languages have
- * each added kinds to it — `assignment` and `comprehension` for Python, `receiver` and
- * `type-param` for Go, `module` and `trait` for Rust — on the test that the nearest existing
- * kind would have been untrue.
+ * The kinds are read from `as_str` and `kind_str`'s match arms rather than from a list, for the
+ * same reason §3 reads the host surface from `host.rs`: the compiler already forces each match
+ * to be exhaustive, so together they are the one place that cannot fall behind the enum. Three
+ * languages have each added kinds beyond the original JavaScript/TypeScript set — `assignment`,
+ * `loop`, `context-manager` and `comprehension` for Python, `type`, `receiver` and `type-param`
+ * for Go, `module` and `trait` for Rust — on the test that the nearest existing kind would have
+ * been untrue.
  */
+
+/**
+ * The two functions that render a binding kind as the string `ctx.bindingKind` returns.
+ *
+ * `as_str` covers every `BindingKind` variant. `kind_str` adds `import`, which is not a
+ * `BindingKind` at all — `Binding::Import` is a separate arm of the enum above it — so scoping
+ * to `as_str` alone would silently drop a real kind, and scoping to the whole file would pick
+ * up any unrelated match with string arms.
+ */
+const KIND_FUNCTIONS = ['as_str', 'kind_str']
+
 export default function bindingKindsAreTyped(options) {
   const bindingPath = options?.bindingPath ?? 'crates/lanekeep-lang/src/binding.rs'
   const typesPath = options?.typesPath ?? 'packages/lanekeep/index.d.ts'
@@ -47,12 +59,18 @@ export default function bindingKindsAreTyped(options) {
 
       const union = unionMembers(types)
 
-      // The string on the right of a match arm inside `as_str`. Reading the arm rather than
-      // the enum variant, because `as_str` is what a resolver's answer travels through.
+      // The string on the right of a match arm inside `as_str` or `kind_str`. Reading the arm
+      // rather than the enum variant, because those are what a resolver's answer travels through.
       for (const hit of ctx.querySubtree(
         m.root,
         '(match_arm value: (string_literal) @kind) @arm',
       )) {
+        // Scoped, not whole-file. An unrelated `match` with string arms — a `Display` impl, an
+        // error-message match — would otherwise be reported as a missing binding kind.
+        const owner = ctx.closestAncestor(hit.arm, '(function_item name: (identifier) @name) @fn')
+        if (owner === undefined) continue
+        if (!KIND_FUNCTIONS.includes(ctx.text(owner.name))) continue
+
         const kind = ctx.text(hit.kind).replace(/^r?#*"/, '').replace(/"#*$/, '')
         if (kind === '') continue
         if (union.has(kind)) continue

@@ -1235,3 +1235,91 @@ fn a_complete_union_passes() {
         )
         .expect("every kind typed is the state this protects");
 }
+
+#[test]
+fn a_match_outside_as_str_and_kind_str_is_not_reported() {
+    // Fix round 1: the query scans the whole file, so a `Display` impl or an error-message
+    // match elsewhere in `binding.rs` must not be mistaken for a source of binding kinds.
+    // Scoping is enforced by checking which function encloses each match arm.
+    let tester = RuleTester::configured(
+        "kinds-scoped",
+        KINDS,
+        "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture(
+            "types.d.ts",
+            "export type BindingKind =\n  | 'const'\n  | 'trait'\n",
+        )
+        .expect("the types fixture is written");
+
+    tester
+        .accepts(
+            "impl BindingKind {\n    fn as_str(&self) -> &str {\n        match self {\n            \
+             Self::Const => \"const\",\n            Self::Trait => \"trait\",\n        }\n    }\n}\n\
+             fn describe(kind: &BindingKind) -> &'static str {\n    match kind {\n        \
+             BindingKind::Const => \"a compile-time constant\",\n        \
+             BindingKind::Trait => \"a trait definition\",\n    }\n}\n",
+        )
+        .expect("a match in a function that is not as_str or kind_str is not scanned for kinds");
+}
+
+#[test]
+fn a_kind_str_only_arm_is_reported_too() {
+    // The exact wrong scoping the review warned against: narrowing `KIND_FUNCTIONS` to `as_str`
+    // alone would silently drop `import`, which only `kind_str` produces — `Binding::Import` is
+    // a separate arm of the enum from `BindingKind`, so `as_str` never sees it. Mutation-verified:
+    // dropping `'kind_str'` from `KIND_FUNCTIONS` leaves this fixture accepted (reporting
+    // nothing), which is exactly the silent failure this test exists to catch — none of the
+    // other fixtures in this file contain a `kind_str`-shaped match, so none of them would.
+    let tester = RuleTester::configured(
+        "kinds-kind-str",
+        KINDS,
+        "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture("types.d.ts", "export type BindingKind =\n  | 'const'\n")
+        .expect("the types fixture is written");
+
+    tester
+        .reports_messages(
+            "impl BindingKind {\n    fn as_str(&self) -> &str {\n        match self {\n            \
+             Self::Const => \"const\",\n        }\n    }\n}\nimpl Binding {\n    \
+             fn kind_str(&self) -> &str {\n        match self {\n            \
+             Self::Import { .. } => \"import\",\n            Self::Local(kind) => kind.as_str(),\n        \
+             }\n    }\n}\n",
+            &["`import` is a binding kind the resolvers can return, and BindingKind does not include it — an author's switch silently never matches it"],
+        )
+        .expect("kind_str's arm is in scope too, not only as_str's");
+}
+
+#[test]
+fn the_rule_still_matches_the_real_binding_source() {
+    // The deleted host_types.rs carried a `found >= 10` floor for exactly this reason: a query
+    // that silently stopped matching would make every assertion vacuous and the check would go
+    // green forever. The synthetic fixtures above cannot catch that — they would keep matching
+    // a two-arm toy file while the real one drifted out of reach.
+    const BINDING: &str = include_str!("../../lanekeep-lang/src/binding.rs");
+
+    let tester = RuleTester::configured(
+        "kinds-floor",
+        KINDS,
+        "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture("types.d.ts", "export type BindingKind =\n  | 'nothing'\n")
+        .expect("the types fixture is written");
+
+    let violations = tester.run(BINDING).expect("the rule runs");
+    assert!(
+        violations.len() >= 10,
+        "expected the real binding source to yield at least 10 kinds, got {}",
+        violations.len()
+    );
+}
