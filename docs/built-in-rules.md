@@ -404,7 +404,16 @@ rule asking "is this the imported `Result`?" quietly stops being answerable in a
 one.
 
 Preludes are the shape a glob is the intended spelling of, and `*prelude*` is allowed by
-default. `allow` takes patterns to widen that.
+default. `allow` takes patterns to widen that, matched against the wildcard's *full* text —
+`super::*`, not `super`, for `use super::*;`.
+
+```json
+{ "rule": "lanekeep/no-glob-import", "options": { "allow": ["*prelude*", "super::*"] } }
+```
+
+**The object form is required.** This rule is a factory — that is what makes `allow`
+reachable at all — so a bare `"lanekeep/no-glob-import"` fails config load with
+`missing 'id'` rather than running with the default `allow`.
 
 ## `lanekeep/no-unwrap`
 
@@ -424,6 +433,14 @@ unwrap rather than at what was actually wrong.
 are not reported — panicking *is* the failure mechanism there, and reporting it would mean
 either a rule nobody turns on or a suppression on every assertion. `allow` takes path patterns
 for anything else, `src/main.rs` being the usual one.
+
+```json
+{ "rule": "lanekeep/no-unwrap", "options": { "allow": ["src/main.rs"] } }
+```
+
+**The object form is required.** This rule is a factory — that is what makes `allow`
+reachable at all — so a bare `"lanekeep/no-unwrap"` fails config load with `missing 'id'`
+rather than running with no exemptions.
 
 ### What it cannot tell apart
 

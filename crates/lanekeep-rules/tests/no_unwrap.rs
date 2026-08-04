@@ -11,7 +11,7 @@ use lanekeep_testkit::RuleTester;
 
 fn tester() -> RuleTester {
     let source = lanekeep_rules::source("no-unwrap").expect("the rule ships");
-    RuleTester::with_extension("no-unwrap", source, "rs").expect("builds")
+    RuleTester::configured("no-unwrap", source, "{}").expect("builds")
 }
 
 #[test]
@@ -88,4 +88,13 @@ fn a_file_containing_only_one_of_the_two_words_is_still_checked() {
             &[(2, 13)],
         )
         .expect("and the other way round");
+}
+
+#[test]
+fn an_allowed_path_passes() {
+    let source = lanekeep_rules::source("no-unwrap").expect("the rule ships");
+    RuleTester::configured("no-unwrap-allow", source, "{ allow: ['subject/input.rs'] }")
+        .expect("builds")
+        .accepts("fn go() {\n    let c = load().unwrap();\n}\n")
+        .expect("`allow` is documented and has to work");
 }

@@ -87,6 +87,22 @@
         "bindingPath": "crates/lanekeep-lang/src/binding.rs",
         "typesPath": "packages/lanekeep/index.d.ts"
       }
+    },
+    {
+      "rule": "lanekeep/no-glob-import",
+      "options": { "allow": ["*prelude*", "super::*"] }
+    },
+    {
+      "rule": "lanekeep/no-unwrap",
+      "options": {
+        "allow": [
+          "crates/lanekeep-engine/benches/corpus.rs",
+          "crates/lanekeep-lang-go/src/lib.rs",
+          "crates/lanekeep-lang-python/src/lib.rs",
+          "crates/lanekeep-lang-rust/src/lib.rs",
+          "crates/lanekeep-languages/src/lib.rs"
+        ]
+      }
     }
   ]
 }
