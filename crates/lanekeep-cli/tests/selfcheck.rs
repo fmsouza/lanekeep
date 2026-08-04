@@ -394,3 +394,47 @@ fn an_empty_iteration_scope_is_refused() {
         "{error}"
     );
 }
+
+const GATES: &str = include_str!("../../../lanekeep/rules/gates-are-and.ts");
+
+fn gates() -> RuleTester {
+    plain("gates", GATES, "ts")
+}
+
+#[test]
+fn a_two_substring_gate_is_reported() {
+    gates()
+        .reports_at(
+            "const r = { gates: { fileContains: ['unwrap', 'expect'] } }\n",
+            &[(1, 22)],
+        )
+        .expect("both substrings must be present, which rejects nearly every file");
+}
+
+#[test]
+fn a_one_substring_gate_passes() {
+    gates()
+        .accepts("const r = { gates: { fileContains: ['makeStyles'] } }\n")
+        .expect("one substring is the shape the gate is for");
+}
+
+#[test]
+fn the_negative_form_is_checked_too() {
+    gates()
+        .reports_at(
+            "const r = { gates: { fileNotContains: ['a', 'b'] } }\n",
+            &[(1, 22)],
+        )
+        .expect("fileNotContains has the same conjunction");
+}
+
+#[test]
+fn an_unrelated_array_passes() {
+    // The trailing comment is load-bearing: the rule's own gate is `Contains`, and a fixture
+    // that never contains that substring is rejected before the query runs at all. Without
+    // it, this would pass whether or not `check` filters by key — which is the one thing
+    // this case exists to prove.
+    gates()
+        .accepts("const r = { pathMatches: ['a', 'b'] } // Contains\n")
+        .expect("only the content gates are conjunctions");
+}
