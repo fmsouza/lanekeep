@@ -24,59 +24,69 @@ import { defineRule } from 'lanekeep'
  *   rules: [noUnwrap({ allow: ['src/main.rs'] })],
  * })
  * ```
+ *
+ * and, for a `lanekeep.json`:
+ *
+ * ```json
+ * { "rule": "lanekeep/no-unwrap", "options": { "allow": ["src/main.rs"] } }
+ * ```
  */
-export default defineRule({
-  id: 'lanekeep/no-unwrap',
-  language: 'rust',
-  severity: 'error',
+export default function noUnwrap(options) {
+  const allow = options?.allow ?? []
 
-  card: {
-    message: 'unwrap or expect outside a test',
-    remediation:
-      'propagate with `?` and a typed error, so the caller decides what a failure means',
-    examples: {
-      bad: 'let config = load().unwrap();',
-      good: 'let config = load()?;',
+  return defineRule({
+    id: 'lanekeep/no-unwrap',
+    language: 'rust',
+    severity: 'error',
+
+    card: {
+      message: 'unwrap or expect outside a test',
+      remediation:
+        'propagate with `?` and a typed error, so the caller decides what a failure means',
+      examples: {
+        bad: 'let config = load().unwrap();',
+        good: 'let config = load()?;',
+      },
     },
-  },
 
-  // No `fileContains` gate, deliberately.
-  //
-  // It would be the obvious optimization and it is not expressible: `fileContains` is an
-  // *and* — every listed substring must be present — so `['unwrap', 'expect']` rejects any
-  // file containing only one of them, which is nearly all of them. The failure is silent:
-  // the rule loads, runs on nothing, and reads as a codebase with no unwraps in it.
-  //
-  // There is no single substring covering both, so the gate is omitted rather than written
-  // wrong. The query is still the real gate; this only costs a parse on files that would
-  // have been rejected.
+    // No `fileContains` gate, deliberately.
+    //
+    // It would be the obvious optimization and it is not expressible: `fileContains` is an
+    // *and* — every listed substring must be present — so `['unwrap', 'expect']` rejects any
+    // file containing only one of them, which is nearly all of them. The failure is silent:
+    // the rule loads, runs on nothing, and reads as a codebase with no unwraps in it.
+    //
+    // There is no single substring covering both, so the gate is omitted rather than written
+    // wrong. The query is still the real gate; this only costs a parse on files that would
+    // have been rejected.
 
-  query: `
-    (call_expression
-      function: (field_expression
-        field: (field_identifier) @method)) @call
-  `,
+    query: `
+      (call_expression
+        function: (field_expression
+          field: (field_identifier) @method)) @call
+    `,
 
-  check(ctx, m, options) {
-    const method = ctx.text(m.method)
-    if (method !== 'unwrap' && method !== 'expect') return
+    check(ctx, m) {
+      const method = ctx.text(m.method)
+      if (method !== 'unwrap' && method !== 'expect') return
 
-    const path = ctx.filePath
+      const path = ctx.filePath
 
-    // An integration test directory, and the conventional unit-test module name. Panicking
-    // is the failure mechanism there, which is the whole point of a test.
-    if (path.includes('/tests/') || path.startsWith('tests/')) return
-    if (inTestCode(ctx, m.call)) return
+      // An integration test directory, and the conventional unit-test module name. Panicking
+      // is the failure mechanism there, which is the whole point of a test.
+      if (path.includes('/tests/') || path.startsWith('tests/')) return
+      if (inTestCode(ctx, m.call)) return
 
-    for (const pattern of options?.allow ?? []) {
-      if (matches(pattern, path)) return
-    }
+      for (const pattern of allow) {
+        if (matches(pattern, path)) return
+      }
 
-    ctx.report(m.call, {
-      message: `\`${method}()\` aborts the process where the caller wanted an error it could handle`,
-    })
-  },
-})
+      ctx.report(m.call, {
+        message: `\`${method}()\` aborts the process where the caller wanted an error it could handle`,
+      })
+    },
+  })
+}
 
 /**
  * Whether this node sits inside `#[test]` or `#[cfg(test)]`.

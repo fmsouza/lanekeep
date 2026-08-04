@@ -118,7 +118,7 @@ lanekeep/
 
 Nothing there runs in Node: lanekeep evaluates rules in its own sandbox, where `lanekeep` resolves to a host module. The shipped `index.js` exists so a tool that *does* load a rule under Node finds something coherent, and its `defineRule` is the same identity function the sandbox provides.
 
-The definitions are asserted against this crate's own registration in `lanekeep-js/tests/host_types.rs`, in both directions. A definition that drifts from the engine is worse than none — it produces confident autocomplete for a method that throws at run time.
+The definitions are asserted against this crate's own registration by `local/host-api-matches-types`, one of this repository's own self-check rules (`lanekeep/rules/host-api-matches-types.ts`), in both directions. A definition that drifts from the engine is worse than none — it produces confident autocomplete for a method that throws at run time. `BindingKind` specifically is checked the same way, by `local/binding-kinds-are-typed`.
 
 ### The Language trait
 
@@ -233,6 +233,8 @@ Positions travel as plain numbers rather than as an opaque location object, beca
 `file` is attached by the host, not by the rule, and it is attached last — so a rule that puts its own `file` in a fact cannot make a violation appear to come from somewhere it did not.
 
 A rule sees only its own facts. Reading another rule's would turn a private payload shape into a contract between rules, and would make results depend on the order rules were declared in.
+
+Two consequences are worth stating together, because dogfooding lanekeep against its own source ran into both at once. A rule's query is compiled once per language it declares, so no single query matches node types from two different grammars; and a rule sees only its own facts. Together, those rule out a cross-file rule that reconciles two files written in different languages — the natural shape for checking that a Rust registration still agrees with the TypeScript declaration it is meant to mirror. The way to write it today is a per-file rule, scoped to one language, that reads the other file through `ctx.readFile`: the dependency stays tracked, but the second language is parsed by hand rather than by a query. `local/host-api-matches-types` and `local/binding-kinds-are-typed` are both written this way. Lifting the restriction would mean either per-language queries within one rule or a declared way for one rule to consume another's facts; both are §14-shaped decisions.
 
 ---
 
@@ -449,6 +451,8 @@ Three things people get wrong here, all of which are silent-staleness bugs:
   It hashes module **source bytes**, not a canonicalized form. An earlier draft required canonicalization so that reformatting would not invalidate while editing a regex would — which was achievable when rules were declarative data and canonicalizing meant normalizing a parsed value. Canonicalizing arbitrary TypeScript would mean shipping a formatter and committing to its output forever. So reformatting a rule *does* invalidate its cached results. That is over-invalidation, costing a recompute; the opposite error — serving results computed by code that no longer exists — is the one this section exists to prevent, and the two are not symmetric.
 
 - **`config_hash` is canonicalized properly**, because configuration values genuinely are structured data. The severity map is ordered, so writing the same entries in a different order hashes the same, and `include`/`exclude` are sorted, since reordering globs changes nothing about which files are selected.
+
+  **A rule's `options` are part of it**, and they have to be, because for a JSON config they reach nothing else. `ruleset_hash` covers the modules the loader *read*; a JSON config's rules live in an entry module lanekeep generates, which is never one of them. A module config was covered all along — there the options are ordinary source in a module the loader does read — so the gap was in one format only, which is why a fixture written against `lanekeep.config.ts` passes against the bug. What goes into the hash is the options text as compiled into the entry module, not the parsed value: the key then covers exactly what the sandbox was given, down to the key order a rule reading its own options could observe. Since `serde_json` parses an object into an ordered map, writing the same options with the keys in a different order produces the same text and the same hash.
 - **Relative path belongs in the key.** Path gates make results path-sensitive; a moved file with identical bytes is not a cache hit.
 - **Grammar ABI belongs in the key.** A tree-sitter grammar bump changes node shapes and therefore query results.
 
@@ -787,6 +791,8 @@ Off by default, because measuring costs a clock read per handler invocation and 
 **Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships ten built-in rules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
 One thing named here is still outstanding, and it is stated where it belongs rather than only here: the §15 performance budgets are targets that are not met.
+
+It also checks itself: the invariants in this document that are expressible as rules are enforced by `just lanekeep` rather than by review. See [AGENTS.md](../AGENTS.md) for what that covers and what it does not.
 
 **M0 — walking skeleton. Done.** Workspace, config loading, discovery, tree-sitter TS/TSX, query compilation, the embedded engine with the §6 host API, human + json reporters, `RuleTester`. Acceptance: the built-in rules and a representative set of project-authored rules run end-to-end against the fixture corpus, with snapshot-verified output — every reporter is snapshotted in `lanekeep-report/tests/snapshots.rs`, and the built-in rules are driven through the binary over real corpora in `lanekeep-cli/tests/`.
 

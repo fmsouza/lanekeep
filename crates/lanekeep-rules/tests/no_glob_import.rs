@@ -11,7 +11,7 @@ use lanekeep_testkit::RuleTester;
 
 fn tester() -> RuleTester {
     let source = lanekeep_rules::source("no-glob-import").expect("the rule ships");
-    RuleTester::with_extension("no-glob-import", source, "rs").expect("builds")
+    RuleTester::configured("no-glob-import", source, "{}").expect("builds")
 }
 
 #[test]
@@ -49,4 +49,15 @@ fn every_glob_in_a_file_is_reported() {
     tester()
         .reports_at("use a::*;\nuse b::*;\n", &[(1, 1), (2, 1)])
         .expect("two globs are two problems");
+}
+
+#[test]
+fn an_allowed_pattern_passes() {
+    // The pattern has to match `ctx.text(m.wildcard)`'s actual span, which is the whole
+    // `prefix::*` — not only the prefix. `'super'` alone never matches `"super::*"`.
+    let source = lanekeep_rules::source("no-glob-import").expect("the rule ships");
+    RuleTester::configured("no-glob-import-allow", source, "{ allow: ['super::*'] }")
+        .expect("builds")
+        .accepts("use super::*;\n")
+        .expect("`allow` is documented and has to work");
 }

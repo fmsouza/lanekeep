@@ -5,10 +5,14 @@
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
  *
- * Every member below is asserted against the host's own registration in
- * `crates/lanekeep-js/tests/host_types.rs`. A method that exists here and not there — or the
- * reverse — fails that test, because a definition that drifts from the engine is worse than
+ * Every member below is asserted against the host's own registration by
+ * `local/host-api-matches-types`, one of this repository's own self-check rules
+ * (`lanekeep/rules/host-api-matches-types.ts`). A method that exists here and not there — or
+ * the reverse — is reported, because a definition that drifts from the engine is worse than
  * none: it produces confident autocomplete for something that does not exist.
+ *
+ * `BindingKind` specifically is checked the same way, by `local/binding-kinds-are-typed`
+ * (`lanekeep/rules/binding-kinds-are-typed.ts`).
  */
 
 /**
@@ -134,6 +138,22 @@ export interface EmittedFact extends Fact {
   file: string
 }
 
+/**
+ * A node's location: the file, line and column `ctx.loc` returns.
+ *
+ * `line` and `column` are required here, unlike on `ReduceLocation`: `ctx.loc` either
+ * resolves the node and returns all three together, or the node does not resolve and the
+ * call returns `undefined` entirely — there is no partial state to leave room for.
+ */
+export interface NodeLocation {
+  /** Path relative to the project root. */
+  file: string
+  /** One-based. */
+  line: number
+  /** One-based. */
+  column: number
+}
+
 /** What a rule's `check` handler reaches. */
 export interface RuleContext {
   /** Path of the file being checked, relative to the project root. */
@@ -200,6 +220,8 @@ export interface RuleContext {
   /** Facts emitted so far, optionally filtered by `kind`. */
   facts(kind?: string): EmittedFact[]
 
+  /** The node's location, in the shape a fact carries and a reduce phase reports at. */
+  loc(node: Node): NodeLocation | undefined
   /** Report a violation at a node. */
   report(at: Node, message?: string | ReportOptions): void
 }

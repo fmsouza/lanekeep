@@ -32,6 +32,7 @@ export default function noRestrictedImports(options) {
 
   return defineRule({
     id: 'lanekeep/no-restricted-imports',
+    language: ['typescript', 'tsx'],
     severity: 'error',
 
     card: {

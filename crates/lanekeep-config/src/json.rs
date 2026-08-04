@@ -46,7 +46,24 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::ConfigError;
+use crate::{ConfigError, Entry};
+
+/// A rule as a JSON config declares it: the module named, and the options passed to it.
+///
+/// Carried back out of compilation because nothing else can see it. The options are spliced
+/// into a generated module, and a generated module is not one the loader read — so
+/// `hash_ruleset`, which hashes the sources the loader recorded, never covers them. Handing
+/// the declaration to `hash_config` is what puts them in the cache key.
+#[derive(Debug)]
+pub(crate) struct DeclaredRule {
+    /// The module specifier, as written.
+    pub(crate) specifier: String,
+    /// The options literal spliced into the entry module, or `None` for the bare form.
+    ///
+    /// The text itself rather than the parsed value, so what is hashed is exactly what was
+    /// compiled — including the key order the rule will observe.
+    pub(crate) options: Option<String>,
+}
 
 /// Whether this path is a JSON config rather than a module.
 pub(crate) fn is_json(path: &Path) -> bool {
@@ -109,7 +126,7 @@ impl JsonRule {
 ///
 /// Returns [`ConfigError`] when the file cannot be read, is not valid JSON, or names a rule
 /// in a way that cannot be turned into an import.
-pub(crate) fn entry_source(config_path: &Path) -> Result<String, ConfigError> {
+pub(crate) fn entry_source(config_path: &Path) -> Result<Entry, ConfigError> {
     let display = config_path.display().to_string();
 
     let text = std::fs::read_to_string(config_path).map_err(|e| ConfigError::Unreadable {
@@ -124,6 +141,7 @@ pub(crate) fn entry_source(config_path: &Path) -> Result<String, ConfigError> {
 
     let mut imports = String::new();
     let mut references = Vec::with_capacity(config.rules.len());
+    let mut declared = Vec::with_capacity(config.rules.len());
 
     for (index, rule) in config.rules.iter().enumerate() {
         let specifier = rule.specifier();
@@ -132,25 +150,37 @@ pub(crate) fn entry_source(config_path: &Path) -> Result<String, ConfigError> {
         let binding = format!("__lanekeepRule{index}");
         let _ = writeln!(imports, "import {binding} from {};", js_string(specifier));
 
-        references.push(match rule {
-            JsonRule::Plain(_) => binding,
-            JsonRule::Configured { options, .. } => {
-                format!("{binding}({})", literal(options))
+        let options = match rule {
+            JsonRule::Plain(_) => {
+                references.push(binding);
+                None
             }
+            JsonRule::Configured { options, .. } => {
+                let options = literal(options);
+                references.push(format!("{binding}({options})"));
+                Some(options)
+            }
+        };
+        declared.push(DeclaredRule {
+            specifier: specifier.to_owned(),
+            options,
         });
     }
 
-    Ok(format!(
-        "{imports}globalThis.__lanekeepConfig = {{\n  \
-         include: {},\n  exclude: {},\n  namespaces: {},\n  \
-         severity: {},\n  timeouts: {},\n  rules: [{}],\n}};\n",
-        literal(&config.include),
-        literal(&config.exclude),
-        literal(&config.namespaces),
-        object_or_empty(&config.severity),
-        object_or_empty(&config.timeouts),
-        references.join(", "),
-    ))
+    Ok(Entry {
+        source: format!(
+            "{imports}globalThis.__lanekeepConfig = {{\n  \
+             include: {},\n  exclude: {},\n  namespaces: {},\n  \
+             severity: {},\n  timeouts: {},\n  rules: [{}],\n}};\n",
+            literal(&config.include),
+            literal(&config.exclude),
+            literal(&config.namespaces),
+            object_or_empty(&config.severity),
+            object_or_empty(&config.timeouts),
+            references.join(", "),
+        ),
+        rules: declared,
+    })
 }
 
 /// Reject a specifier that cannot mean what it says.
@@ -210,6 +240,10 @@ mod tests {
     use super::*;
 
     fn compile(json: &str) -> Result<String, ConfigError> {
+        compile_entry(json).map(|entry| entry.source)
+    }
+
+    fn compile_entry(json: &str) -> Result<Entry, ConfigError> {
         let dir = std::env::temp_dir().join(format!("lanekeep-json-{:x}", json.len()));
         std::fs::create_dir_all(&dir).expect("creates dir");
         let path = dir.join("lanekeep.json");
@@ -233,6 +267,33 @@ mod tests {
         )
         .expect("compiles");
         assert!(source.contains("__lanekeepRule0({\"restrictions\":[{\"module\":\"stripe\"}]})"));
+    }
+
+    /// What the compilation hands back for the cache key.
+    ///
+    /// The generated module is never one the loader read, so `hash_ruleset` cannot see these
+    /// options. This is the only route they have into the key, and the bare form has to stay
+    /// distinguishable from one configured with nothing.
+    #[test]
+    fn the_declared_rules_carry_their_options() {
+        let entry = compile_entry(
+            r#"{"rules": ["lanekeep/no-default-export",
+                {"rule": "./mine.ts", "options": {"limit": 3}}]}"#,
+        )
+        .expect("compiles");
+
+        let declared: Vec<(&str, Option<&str>)> = entry
+            .rules
+            .iter()
+            .map(|rule| (rule.specifier.as_str(), rule.options.as_deref()))
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                ("lanekeep/no-default-export", None),
+                ("./mine.ts", Some(r#"{"limit":3}"#)),
+            ]
+        );
     }
 
     #[test]

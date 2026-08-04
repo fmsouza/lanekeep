@@ -20,6 +20,11 @@ struct Repo {
 
 impl Repo {
     fn new(name: &str, config: &str, files: &[(&str, &str)]) -> Self {
+        Self::with_config(name, "lanekeep.config.ts", config, files)
+    }
+
+    /// The same, under a chosen config file name, so a test can drive `lanekeep.json`.
+    fn with_config(name: &str, config_file: &str, config: &str, files: &[(&str, &str)]) -> Self {
         let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("lanekeep-incr-{name}-{}-{seq}", std::process::id()));
@@ -32,7 +37,7 @@ impl Repo {
         repo.git(&["config", "user.name", "Test"]);
         repo.git(&["config", "commit.gpgsign", "false"]);
 
-        repo.write("lanekeep.config.ts", config);
+        repo.write(config_file, config);
         for (path, contents) in files {
             repo.write(path, contents);
         }
@@ -202,6 +207,7 @@ fn a_selected_file_the_config_excludes_is_not_checked() {
     repo.git(&["add", "-A"]);
 
     let output = repo.check(&["--staged"]);
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
     assert_eq!(violation_count(&output), 0, "{}", describe(&output));
 }
 
@@ -328,4 +334,104 @@ fn since_and_staged_cannot_be_combined() {
     let repo = Repo::new("both", PER_FILE_CONFIG, &[("src/a.ts", "const a = 1;\n")]);
     let output = repo.check(&["--since", "HEAD", "--staged"]);
     assert_ne!(output.status.code(), Some(0), "{}", describe(&output));
+}
+
+// --- a rule's options are part of the cache key ---------------------------------------
+
+/// A `lanekeep.json` whose one rule restricts the given modules.
+fn json_config(restrictions: &str) -> String {
+    format!(
+        r#"{{
+  "include": ["src/**"],
+  "rules": [
+    {{ "rule": "lanekeep/no-restricted-imports",
+       "options": {{ "restrictions": [{restrictions}] }} }}
+  ]
+}}
+"#
+    )
+}
+
+/// The same configuration written as a module.
+fn module_config(restrictions: &str) -> String {
+    format!(
+        "import {{ defineConfig }} from 'lanekeep';\n\
+         import noRestrictedImports from 'lanekeep/no-restricted-imports';\n\
+         export default defineConfig({{\n\
+           include: ['src/**'],\n\
+           rules: [noRestrictedImports({{ restrictions: [{restrictions}] }})],\n\
+         }});\n"
+    )
+}
+
+const STRIPE: &str = r#"{"module": "stripe"}"#;
+
+/// Editing a rule's options invalidates the cache.
+///
+/// The options are the whole content of a configurable rule, and for a JSON config they
+/// reach neither the module sources `ruleset_hash` covers nor — before this test — the
+/// values `config_hash` covers. A warm run therefore kept answering the previous
+/// configuration for as long as the cache survived, which is silent in both directions: a
+/// restriction added still reports clean, and a restriction removed still reports.
+#[test]
+fn changing_a_rule_option_in_a_json_config_invalidates_the_cache() {
+    let repo = Repo::with_config(
+        "json-options",
+        "lanekeep.json",
+        &json_config(""),
+        &[("src/a.ts", "import Stripe from 'stripe'\nStripe\n")],
+    );
+
+    // Cold: nothing is restricted, so nothing is reported — and that is cached.
+    let clean = repo.check(&[]);
+    assert_eq!(clean.status.code(), Some(0), "{}", describe(&clean));
+    assert_eq!(violation_count(&clean), 0, "{}", describe(&clean));
+
+    // The only edit is the options. Warm, and it has to be seen.
+    repo.write("lanekeep.json", &json_config(STRIPE));
+    let restricted = repo.check(&[]);
+    assert_eq!(
+        violation_count(&restricted),
+        1,
+        "a warm run answered the configuration from before the edit: {}",
+        describe(&restricted)
+    );
+
+    // And back: taking the restriction away has to be seen just as much.
+    repo.write("lanekeep.json", &json_config(""));
+    let relaxed = repo.check(&[]);
+    assert_eq!(relaxed.status.code(), Some(0), "{}", describe(&relaxed));
+    assert_eq!(
+        violation_count(&relaxed),
+        0,
+        "a warm run kept reporting a restriction the config no longer has: {}",
+        describe(&relaxed)
+    );
+}
+
+/// The same edit in a module config, which is covered by a different hash.
+///
+/// Options written inline are ordinary module source, so the loader records them and
+/// `ruleset_hash` covers them. This pins that, because it is the reason the fix belongs in
+/// `config_hash` and needs no second mechanism in the loader.
+#[test]
+fn changing_a_rule_option_in_a_module_config_invalidates_the_cache() {
+    let repo = Repo::new(
+        "module-options",
+        &module_config(""),
+        &[("src/a.ts", "import Stripe from 'stripe'\nStripe\n")],
+    );
+
+    let clean = repo.check(&[]);
+    assert_eq!(clean.status.code(), Some(0), "{}", describe(&clean));
+    assert_eq!(violation_count(&clean), 0, "{}", describe(&clean));
+
+    repo.write("lanekeep.config.ts", &module_config(STRIPE));
+    let restricted = repo.check(&[]);
+    assert_eq!(
+        violation_count(&restricted),
+        1,
+        "a warm run answered the configuration from before the edit: {}",
+        describe(&restricted)
+    );
 }

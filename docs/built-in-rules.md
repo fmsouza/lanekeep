@@ -404,7 +404,30 @@ rule asking "is this the imported `Result`?" quietly stops being answerable in a
 one.
 
 Preludes are the shape a glob is the intended spelling of, and `*prelude*` is allowed by
-default. `allow` takes patterns to widen that.
+default. `allow` takes patterns to widen that, matched against the wildcard's *full* text —
+`super::*`, not `super`, for `use super::*;`. `*` is a wildcard here, not a literal character —
+`super::*` also matches `use super::inner::*;`, and there is no escape for a literal `*`, so an
+exact "only this one path" match is not expressible.
+
+This rule is a **factory** — a function you call with options, which returns a rule. Calling it
+with no options keeps the default `allow`.
+
+```ts
+import noGlobImport from 'lanekeep/no-glob-import'
+
+export default defineConfig({
+  rules: [noGlobImport({ allow: ['*prelude*', 'super::*'] })],
+})
+```
+
+```json
+{ "rule": "lanekeep/no-glob-import", "options": { "allow": ["*prelude*", "super::*"] } }
+```
+
+**Two spellings fail to load.** A bare `"lanekeep/no-glob-import"` in a JSON config, and an
+uncalled `noGlobImport` reference in a TypeScript config (`rules: [noGlobImport]` rather than
+`rules: [noGlobImport({...})]`), both fail with `missing 'id'` — a factory function has no `id`
+of its own; only the rule it returns does.
 
 ## `lanekeep/no-unwrap`
 
@@ -424,6 +447,26 @@ unwrap rather than at what was actually wrong.
 are not reported — panicking *is* the failure mechanism there, and reporting it would mean
 either a rule nobody turns on or a suppression on every assertion. `allow` takes path patterns
 for anything else, `src/main.rs` being the usual one.
+
+This rule is a **factory** — a function you call with options, which returns a rule. Calling it
+with no options keeps the default, empty `allow`.
+
+```ts
+import noUnwrap from 'lanekeep/no-unwrap'
+
+export default defineConfig({
+  rules: [noUnwrap({ allow: ['src/main.rs'] })],
+})
+```
+
+```json
+{ "rule": "lanekeep/no-unwrap", "options": { "allow": ["src/main.rs"] } }
+```
+
+**Two spellings fail to load.** A bare `"lanekeep/no-unwrap"` in a JSON config, and an uncalled
+`noUnwrap` reference in a TypeScript config (`rules: [noUnwrap]` rather than
+`rules: [noUnwrap({...})]`), both fail with `missing 'id'` — a factory function has no `id` of
+its own; only the rule it returns does.
 
 ### What it cannot tell apart
 

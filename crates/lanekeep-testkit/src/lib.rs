@@ -28,7 +28,7 @@
 //! ```
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -70,7 +70,10 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug)]
 pub struct RuleTester {
     dir: PathBuf,
-    extension: String,
+    /// `Some` when the caller chose the subject's extension explicitly (`new`,
+    /// `with_extension`). `None` for `configured`, which has no parameter for one — `run`
+    /// then derives it from the rule's own declared `language` instead.
+    extension: Option<String>,
 }
 
 impl RuleTester {
@@ -102,7 +105,7 @@ impl RuleTester {
         rule_source: &str,
         extension: &str,
     ) -> Result<Self, TestError> {
-        Self::build(name, rule_source, extension, "rule")
+        Self::build(name, rule_source, Some(extension), "rule")
     }
 
     /// Build a tester for a *factory* rule — one whose default export returns a rule when
@@ -112,6 +115,12 @@ impl RuleTester {
     /// Passing the options as source rather than as a serialized value is deliberate: a
     /// factory takes whatever its author designed, and a harness that only accepted JSON
     /// could not test one taking a function or a regular expression.
+    ///
+    /// No extension parameter, unlike [`RuleTester::with_extension`] — `run` derives the
+    /// subject's extension from the rule's own declared `language` instead, once the config
+    /// is loaded. A factory rule is exactly the case most likely to target a non-default
+    /// language, and threading a fourth parameter through would change the shape of every
+    /// existing call for the sake of the ones that need it.
     ///
     /// ```no_run
     /// # use lanekeep_testkit::RuleTester;
@@ -128,17 +137,18 @@ impl RuleTester {
     ///
     /// As [`RuleTester::new`].
     pub fn configured(name: &str, rule_source: &str, options: &str) -> Result<Self, TestError> {
-        Self::build(name, rule_source, "ts", &format!("rule({options})"))
+        Self::build(name, rule_source, None, &format!("rule({options})"))
     }
 
     /// Write the throwaway project.
     ///
     /// `rule_expr` is what goes in the config's `rules` array — the imported module for a
-    /// plain rule, a call for a factory.
+    /// plain rule, a call for a factory. `extension` is `None` only from `configured`; see
+    /// its documentation for why `run` — not `build` — is where that gets resolved.
     fn build(
         name: &str,
         rule_source: &str,
-        extension: &str,
+        extension: Option<&str>,
         rule_expr: &str,
     ) -> Result<Self, TestError> {
         // Unique per tester: the counter separates testers in one process, the process id
@@ -152,18 +162,68 @@ impl RuleTester {
 
         let tester = Self {
             dir,
-            extension: extension.to_owned(),
+            extension: extension.map(str::to_owned),
         };
-        tester.write("rule.ts", rule_source)?;
+        // Nested one level rather than sitting at the fixture's own top, so a rule that
+        // imports a sibling module the way this repository's local rules do — `../modules/x`
+        // from `lanekeep/rules/some-rule.ts` — resolves inside the fixture instead of
+        // escaping it. `mirror_modules` is what makes `../modules/x` resolve to something
+        // real rather than merely legal.
+        tester.write("rules/rule.ts", rule_source)?;
+        tester.mirror_modules()?;
         tester.write(
             "lanekeep.config.ts",
             &format!(
                 "import {{ defineConfig }} from 'lanekeep';\n\
-                 import rule from './rule';\n\
+                 import rule from './rules/rule';\n\
                  export default defineConfig({{ include: ['subject/**'], rules: [{rule_expr}] }});\n"
             ),
         )?;
         Ok(tester)
+    }
+
+    /// Copy this repository's own `lanekeep/modules/` into the fixture, as `modules/` — a
+    /// sibling of `rules/rule.ts`, one level up from it, exactly as `lanekeep/modules/` sits
+    /// relative to `lanekeep/rules/` in the real repository.
+    ///
+    /// A rule tested here is given as a source string, not a path, so there is no file on
+    /// disk this crate could otherwise learn the rule's real location from — and no way to
+    /// thread one through without changing the shape every existing caller of `new`,
+    /// `with_extension` and `configured` already depends on. Locating the source directory
+    /// from this crate's own manifest directory keeps that shape unchanged.
+    ///
+    /// A no-op when the source directory does not exist, which is true for everything other
+    /// than this workspace's own tests: a rule with no relative import never reads the copy,
+    /// and a project outside this repository that depends on this crate to test its own
+    /// rules has no such directory to find.
+    fn mirror_modules(&self) -> Result<(), TestError> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanekeep/modules");
+        let Ok(read_dir) = std::fs::read_dir(&source) else {
+            return Ok(());
+        };
+
+        // Read-dir order is not guaranteed; fixed order keeps a failure in here reproducible.
+        let mut paths = read_dir
+            .map(|entry| {
+                entry
+                    .map(|e| e.path())
+                    .map_err(|e| TestError::Setup(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let contents =
+                std::fs::read_to_string(&path).map_err(|e| TestError::Setup(e.to_string()))?;
+            self.write(&format!("modules/{name}"), &contents)?;
+        }
+        Ok(())
     }
 
     fn write(&self, path: &str, contents: &str) -> Result<(), TestError> {
@@ -172,6 +232,20 @@ impl RuleTester {
             std::fs::create_dir_all(parent).map_err(|e| TestError::Setup(e.to_string()))?;
         }
         std::fs::write(full, contents).map_err(|e| TestError::Setup(e.to_string()))
+    }
+
+    /// Write an extra file into the tester's project, for a rule that reads one.
+    ///
+    /// `ctx.readFile` is confined to the project root and records what it read as a cache
+    /// dependency. A rule that reconciles two files cannot be tested without a second file to
+    /// reconcile against, and writing it here keeps it inside the root the rule is confined
+    /// to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Setup`] if the file cannot be written.
+    pub fn write_fixture(&self, path: &str, contents: &str) -> Result<(), TestError> {
+        self.write(path, contents)
     }
 
     /// Run the rule over a single source file and return what it reported.
@@ -183,7 +257,6 @@ impl RuleTester {
     pub fn run(&self, source: &str) -> Result<Vec<Violation>, TestError> {
         // A fresh subject each time, so one case cannot see another's file.
         let _ = std::fs::remove_dir_all(self.dir.join("subject"));
-        self.write(&format!("subject/input.{}", self.extension), source)?;
 
         let root = RuleRoot::new(&self.dir).map_err(|e| TestError::Setup(e.to_string()))?;
         let config_path = self.dir.join("lanekeep.config.ts");
@@ -193,6 +266,16 @@ impl RuleTester {
                 .map_err(|e| TestError::Load(e.to_string()))?;
         let config = lanekeep_config::load(&sandbox, &root, &config_path)
             .map_err(|e| TestError::Load(e.to_string()))?;
+
+        // Loaded before the subject is written: `include` is a glob string the config holds,
+        // not something checked against the filesystem yet, so `load` has no dependency on
+        // `subject/` already existing — which is what leaves room to pick the subject's own
+        // extension from what the loaded rule declares.
+        let extension = match &self.extension {
+            Some(extension) => extension.clone(),
+            None => extension_for(&config),
+        };
+        self.write(&format!("subject/input.{extension}"), source)?;
 
         let engine = Engine::prepare(
             &config,
@@ -293,6 +376,25 @@ impl Drop for RuleTester {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The extension matching the first language the config's one rule declared, for
+/// [`RuleTester::configured`], which has no parameter of its own to say.
+///
+/// Reads `languages` off the already-loaded [`lanekeep_config::Config`] rather than the raw
+/// rule source, so this agrees with whatever the engine itself will run the rule against —
+/// including the default the `Rule` interface documents when a rule declares no `language`
+/// at all. Falls back to `"ts"` if the registry does not recognize the id, which `load`
+/// tolerates (only `Engine::prepare` validates a rule's language against the registry) and
+/// which is the same extension `configured` used unconditionally before this existed.
+fn extension_for(config: &lanekeep_config::Config) -> String {
+    config
+        .rules
+        .first()
+        .and_then(|rule| rule.languages.first())
+        .and_then(|id| lanekeep_languages::registry().by_id(id).cloned())
+        .and_then(|language| language.extensions().first().copied())
+        .map_or_else(|| "ts".to_owned(), str::to_owned)
 }
 
 /// Indent source for inclusion in a failure message, so it is visibly quoted rather than
@@ -465,6 +567,32 @@ mod tests {
             .expect("builds")
             .reports_at("const a = <div>hi</div>;\n", &[(1, 11)])
             .expect("should report the element");
+    }
+
+    #[test]
+    fn a_configured_rule_is_tested_against_the_language_it_declares() {
+        // `configured` has no extension parameter of its own — unlike `with_extension` above,
+        // there is no argument through which a caller could ask for anything but the
+        // default. The subject's extension has to come from somewhere, and the only thing
+        // left to read is the rule's own declared `language`.
+        let rule = "import { defineRule } from 'lanekeep';\n\
+            export default function factory(options) {\n\
+              return defineRule({\n\
+                id: 'local/rust-only',\n\
+                language: 'rust',\n\
+                query: '(function_item name: (identifier) @name) @fn',\n\
+                card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+                check(ctx, m) { ctx.report(m.fn); },\n\
+              });\n\
+            }\n";
+
+        RuleTester::configured("rust-language", rule, "{}")
+            .expect("builds")
+            .reports_at("fn go() {}\n", &[(1, 1)])
+            .expect(
+                "a rust-only factory rule should be tested against a rust subject, not the \
+                 typescript one every configured rule used before this",
+            );
     }
 
     #[test]

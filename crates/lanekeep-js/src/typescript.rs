@@ -181,6 +181,7 @@ pub fn strip_types(
 }
 
 fn parse(language: &dyn Language, source: &str) -> Result<Tree, StripError> {
+    // lanekeep-ignore-next-line local/one-parser-per-file reason: the TS-stripping parse, distinct from the per-rule shared parse
     let mut parser = Parser::new();
     // A grammar that will not load is a broken build, and the caller has no better
     // response than the one the verification path already gives.

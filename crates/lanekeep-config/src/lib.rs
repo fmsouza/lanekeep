@@ -247,6 +247,19 @@ const EXTRACT: &str = r"
     })()
 ";
 
+/// The entry module the loader evaluates, and the rule list it was built from.
+struct Entry {
+    /// The module source.
+    source: String,
+    /// What the config's `rules` array named, for a JSON config.
+    ///
+    /// Empty for a module config, and deliberately so: there the rule list and its options
+    /// are ordinary source in a module the loader reads, which `hash_ruleset` already
+    /// covers. A JSON config has no such module, so this is the only route its options have
+    /// into the cache key.
+    rules: Vec<json::DeclaredRule>,
+}
+
 /// The entry module the loader evaluates, whichever format the config is written in.
 ///
 /// Both formats converge here, and that is the point: a JSON config is compiled into the
@@ -254,7 +267,7 @@ const EXTRACT: &str = r"
 /// cache key never learn which format they came from. Two loaders would be two behaviors
 /// eventually, and the divergence would show up as a rule that runs under one form and not
 /// the other.
-fn entry_source(root: &RuleRoot, config_path: &Path, display: &str) -> Result<String, ConfigError> {
+fn entry_source(root: &RuleRoot, config_path: &Path, display: &str) -> Result<Entry, ConfigError> {
     if json::is_json(config_path) {
         return json::entry_source(config_path);
     }
@@ -264,9 +277,12 @@ fn entry_source(root: &RuleRoot, config_path: &Path, display: &str) -> Result<St
             path: display.to_owned(),
             detail: "the config file must sit inside the rules root".to_owned(),
         })?;
-    Ok(format!(
-        "import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n"
-    ))
+    Ok(Entry {
+        source: format!(
+            "import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n"
+        ),
+        rules: Vec::new(),
+    })
 }
 
 /// Evaluate the config module into a sandbox, leaving the rule objects reachable.
@@ -285,11 +301,11 @@ pub fn evaluate_into(
     config_path: &Path,
 ) -> Result<(), ConfigError> {
     let display = config_path.display().to_string();
-    let entry = root.path().join(ENTRY);
-    let source = entry_source(root, config_path, &display)?;
+    let name = root.path().join(ENTRY);
+    let entry = entry_source(root, config_path, &display)?;
 
     sandbox
-        .eval_module(&entry.display().to_string(), &source)
+        .eval_module(&name.display().to_string(), &entry.source)
         .map_err(|e| ConfigError::Evaluation {
             path: display,
             detail: e.to_string(),
@@ -305,10 +321,10 @@ pub fn evaluate_into(
 pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Config, ConfigError> {
     let display = config_path.display().to_string();
 
-    let entry = root.path().join(ENTRY);
-    let source = entry_source(root, config_path, &display)?;
+    let name = root.path().join(ENTRY);
+    let entry = entry_source(root, config_path, &display)?;
     sandbox
-        .eval_module(&entry.display().to_string(), &source)
+        .eval_module(&name.display().to_string(), &entry.source)
         .map_err(|e| ConfigError::Evaluation {
             path: display.clone(),
             detail: e.to_string(),
@@ -328,10 +344,15 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
         detail: "the default export is not an object — did you forget `export default`?".to_owned(),
     })?;
 
-    build(sandbox, raw, &display)
+    build(sandbox, raw, &entry.rules, &display)
 }
 
-fn build(sandbox: &Sandbox, raw: RawConfig, display: &str) -> Result<Config, ConfigError> {
+fn build(
+    sandbox: &Sandbox,
+    raw: RawConfig,
+    declared_rules: &[json::DeclaredRule],
+    display: &str,
+) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
     // Namespaces this project claims, beyond the two lanekeep defines. Validated for shape
@@ -368,7 +389,13 @@ fn build(sandbox: &Sandbox, raw: RawConfig, display: &str) -> Result<Config, Con
     }
 
     let ruleset_hash = hash_ruleset(sandbox);
-    let config_hash = hash_config(&raw.include, &raw.exclude, &overrides, &limits);
+    let config_hash = hash_config(
+        &raw.include,
+        &raw.exclude,
+        &overrides,
+        &limits,
+        declared_rules,
+    );
 
     Ok(Config {
         include: raw.include,
@@ -536,11 +563,18 @@ fn hash_ruleset(sandbox: &Sandbox) -> Hash {
 /// Canonicalized properly, because these *are* structured data: the severity map is ordered
 /// so writing the same entries in a different order hashes the same, and the budgets are
 /// hashed as numbers rather than as whatever the user typed.
+///
+/// `rules` is what a JSON config declared — the module each entry names and the options it
+/// passes. Those options are the whole content of a configurable rule and they reach no
+/// other hash, because the module carrying them is generated rather than read. Leaving them
+/// out meant editing a rule's options invalidated nothing, and a warm run kept answering
+/// the previous configuration for as long as the cache survived.
 fn hash_config(
     include: &[String],
     exclude: &[String],
     severity: &BTreeMap<RuleId, Severity>,
     limits: &Limits,
+    rules: &[json::DeclaredRule],
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-config-v1");
@@ -575,6 +609,22 @@ fn hash_config(
         limits.memory_bytes as u128,
     ] {
         hasher.update(&value.to_le_bytes());
+    }
+
+    // In the order written, which the rules array has and the severity map does not. The
+    // options are the literal text spliced into the entry module rather than the parsed
+    // value, so the hash covers precisely what the sandbox was given — down to the key
+    // order a rule reading its own options could observe.
+    hasher.update(b"rules");
+    for rule in rules {
+        hasher.update(rule.specifier.as_bytes());
+        hasher.update(&[0]);
+        // Absent for the bare form, which calls nothing. Contributing no bytes is
+        // unambiguous, because an options literal is JSON and JSON is never empty.
+        if let Some(options) = &rule.options {
+            hasher.update(options.as_bytes());
+        }
+        hasher.update(&[0]);
     }
 
     *hasher.finalize().as_bytes()
@@ -665,10 +715,15 @@ mod tests {
         }
 
         fn load_config(&self) -> Result<Config, ConfigError> {
+            self.load_named("lanekeep.config.ts")
+        }
+
+        /// The same, for a config file that is not the TypeScript one.
+        fn load_named(&self, name: &str) -> Result<Config, ConfigError> {
             let root = RuleRoot::new(&self.dir).expect("canonicalizes");
             let sandbox =
                 sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
-            load(&sandbox, &root, &self.dir.join("lanekeep.config.ts"))
+            load(&sandbox, &root, &self.dir.join(name))
         }
     }
 
@@ -1112,6 +1167,78 @@ mod tests {
         assert_ne!(
             hex(&make("", "d")),
             hex(&make(", timeouts: { rule: 5000 }", "t"))
+        );
+    }
+
+    /// A rule factory, which is what an `options` object in a config is passed to.
+    fn factory(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default function make(options) {{\n\
+               return defineRule({{\n\
+                 id: '{id}',\n\
+                 query: '(identifier) @id',\n\
+                 card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
+                 check(ctx, m) {{ if (options.on) ctx.report(m.id); }},\n\
+               }});\n\
+             }}\n"
+        )
+    }
+
+    /// A rule's options decide what it reports, so they belong in the key.
+    ///
+    /// For a JSON config they reach no other hash: the module carrying them is generated,
+    /// and `hash_ruleset` covers the modules the loader *read*. Without this, editing an
+    /// option invalidated nothing and a warm run answered the previous configuration.
+    #[test]
+    fn the_config_hash_changes_with_a_rule_option() {
+        let make = |options: &str, tag: &str| {
+            Fixture::new(
+                &format!("option-hash-{tag}"),
+                &[
+                    ("rule.ts", &factory("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": [{{"rule": "./rule.ts", "options": {options}}}]}}"#),
+                    ),
+                ],
+            )
+            .load_named("lanekeep.json")
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make(r#"{"on": false}"#, "off")),
+            hex(&make(r#"{"on": true}"#, "on")),
+            "changing a rule's options must invalidate the config hash"
+        );
+    }
+
+    /// And the other half, which is what canonicalizing means: writing the same options
+    /// with the keys in a different order is not a change, and must not cost a recompute.
+    #[test]
+    fn the_config_hash_ignores_option_key_order() {
+        let make = |options: &str, tag: &str| {
+            Fixture::new(
+                &format!("option-order-{tag}"),
+                &[
+                    ("rule.ts", &factory("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": [{{"rule": "./rule.ts", "options": {options}}}]}}"#),
+                    ),
+                ],
+            )
+            .load_named("lanekeep.json")
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_eq!(
+            hex(&make(r#"{"on": true, "off": false}"#, "a")),
+            hex(&make(r#"{"off": false, "on": true}"#, "b")),
+            "reordering the keys of an options object must not change the config hash"
         );
     }
 
