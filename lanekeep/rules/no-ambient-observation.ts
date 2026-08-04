@@ -10,9 +10,17 @@ import { defineRule } from 'lanekeep'
  * cache. There is no 'it's only used for logging' exception; a cached result is a cached
  * result."
  *
- * One site legitimately reads the clock — `suppression::today`, which a suppression's
- * `expires:` has to be compared against. Its own doc comment already says it is the only one.
- * `allow` is what makes that enforceable rather than aspirational.
+ * Two sites legitimately read the clock, and `allow` names both so the distinction is
+ * reviewable rather than assumed:
+ *
+ * - `suppression::today`, which a suppression's `expires:` has to be compared against. Fixed
+ *   once per run, in UTC, so two files checked a millisecond apart cannot disagree.
+ * - `RunClock::start` in `lanekeep-js`, which fixes the origin the global run budget is
+ *   measured from. A timeout clock cannot change *what* gets cached: §6.8 cancels the whole
+ *   run on a breach — exit `2`, no report, no entry for any file still in flight — so it can
+ *   stop a result being produced but cannot produce a different one.
+ *
+ * Anything else reading the clock is an input the cache key does not have.
  */
 const FORBIDDEN = [
   'SystemTime::now',
@@ -20,8 +28,14 @@ const FORBIDDEN = [
   'env::var',
   'env::vars',
   'env::current_dir',
-  'thread_rng',
-  'random',
+  // Qualified, like every other entry, because the match is `callee.endsWith(forbidden)` and
+  // a bare `'random'` also matches `getrandom::getrandom`. Note the limit: the query matches
+  // `(call_expression function: (scoped_identifier))`, so an imported `use rand::thread_rng;`
+  // called as plain `thread_rng()` is an `identifier` and never reaches `check`. That is
+  // acceptable here because randomness needs a dependency this workspace does not have, and
+  // adding one is itself a visible, reviewable act — this rule is the second line, not the only one.
+  'rand::thread_rng',
+  'rand::random',
 ]
 
 export default function noAmbientObservation(options) {

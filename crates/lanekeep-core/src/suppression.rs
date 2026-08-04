@@ -347,11 +347,16 @@ const fn token_for(scope: Scope) -> &'static str {
 
 /// Today, from the host clock.
 ///
-/// The one place lanekeep looks at the clock, and it is deliberately here rather than in the
-/// sandbox: a rule must not be able to observe the date, but a suppression's expiry has to
-/// be compared against something. Callers fix it once per run so two files checked a
-/// millisecond apart cannot disagree about what day it is — and any file whose result
-/// depends on it says so in its cache key.
+/// The one place the checker consults the clock for a result it reports, and it is
+/// deliberately here rather than in the sandbox: a rule must not be able to observe the
+/// date, but a suppression's expiry has to be compared against something. Callers fix it
+/// once per run so two files checked a millisecond apart cannot disagree about what day it
+/// is — and any file whose result depends on it says so in its cache key.
+///
+/// `local/no-ambient-observation` names the full list of places this repository's own
+/// source legitimately reads the clock — this one, and the run budget's origin in
+/// `lanekeep-js`, which is a different case: that clock can stop a result from being
+/// produced at all, never change what one contains.
 ///
 /// UTC, not local time. A deadline that moved with the reader's time zone would expire
 /// twice in some places and not at all in others.
