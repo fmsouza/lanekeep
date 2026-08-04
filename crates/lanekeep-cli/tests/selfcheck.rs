@@ -997,3 +997,68 @@ fn an_errors_keyword_with_a_string_value_is_not_mistaken_for_mode() {
             "errors is not mode, and its value being a string that contains `b` must not matter",
         );
 }
+
+const STDOUT: &str = include_str!("../../../lanekeep/rules/py-stdout-buffer.ts");
+
+fn stdout() -> RuleTester {
+    plain("stdout", STDOUT, "py")
+}
+
+#[test]
+fn a_text_write_to_stdout_is_reported() {
+    stdout()
+        .reports_at("import sys\nsys.stdout.write(\"hi\")\n", &[(2, 1)])
+        .expect("stdout re-encodes to cp1252 on Windows and truncates");
+}
+
+#[test]
+fn a_buffer_write_passes() {
+    stdout()
+        .accepts("import sys\nsys.stdout.buffer.write(b\"hi\")\n")
+        .expect("bytes are neither re-encoded nor newline-translated");
+}
+
+#[test]
+fn an_unrelated_write_passes() {
+    // The brief's own fixture, `"def go(f):\n    f.write(\"hi\")\n"`, contains no substring
+    // `sys.stdout` anywhere — the rule's own gate (`fileContains: ['sys.stdout']`) would
+    // exclude it before the query ever runs, the same vacuous shape flagged repeatedly
+    // elsewhere in this file. The trailing comment clears the gate without changing what is
+    // called, so this actually exercises `ctx.text(m.obj) !== 'sys.stdout'`. Confirmed by
+    // mutation: without the comment, deleting that guard still leaves this fixture passing —
+    // for the wrong reason, since the file never reaches `check` either way.
+    stdout()
+        .accepts("def go(f):\n    f.write(\"hi\")\n# sys.stdout\n")
+        .expect("only sys.stdout has the encoding problem");
+}
+
+#[test]
+fn a_flush_call_on_stdout_passes() {
+    // Every fixture above calls `.write`, so none of them can tell whether `check` filters by
+    // method name at all, or whether the object-text guard is silently doing all the work on
+    // its own — one guard masking another going untested, the same shape several rules earlier
+    // in this file already had to close. `sys.stdout.flush()` clears the gate and still matches
+    // the query (`.flush` is an attribute-form call exactly like `.write` is); only
+    // `ctx.text(m.method) !== 'write'` keeps it unreported. Confirmed by mutation: deleting that
+    // guard makes this fixture reported, which nothing else here would catch.
+    stdout()
+        .accepts("import sys\nsys.stdout.flush()\n")
+        .expect("only write carries the encoding and newline problem; flush takes no text");
+}
+
+#[test]
+fn a_print_call_passes() {
+    // A real gap, documented rather than left to be discovered: `print` writes through
+    // `sys.stdout` under the hood and fails the identical way on Windows, but this rule's query
+    // only matches an attribute-form call (`(call function: (attribute ...))`), and `print(...)`
+    // is a bare identifier call — there is no match for `check` to run against at all. That is a
+    // narrower, different limitation than the object-text guard above: it is not that `check`
+    // declines to report, it is that this fixture produces no match to decide on, so this test
+    // does not exercise `check` and cannot be read as guard coverage. Recorded here because both
+    // of this repository's own scripts write exclusively through `print`, which is why running
+    // this rule over them finds nothing despite the shared underlying risk. The trailing comment
+    // clears the gate; `print("hi")` alone contains no substring `sys.stdout`.
+    stdout()
+        .accepts("print(\"hi\")\n# sys.stdout\n")
+        .expect("print shares the encoding problem but this rule's query does not reach it");
+}
