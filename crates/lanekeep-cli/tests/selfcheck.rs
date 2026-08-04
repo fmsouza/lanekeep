@@ -712,3 +712,38 @@ fn a_shadowed_variable_in_a_nested_function_is_still_reported() {
         )
         .expect("g's own `p` is a plain number, but the rule cannot distinguish it from f's node handle by name alone");
 }
+
+#[test]
+fn negating_ctx_root_is_reported() {
+    // The purest instance of the bug this rule exists to catch: `ctx.root` is *always* handle
+    // `0`, so `!r` here isn't a bug that might happen depending on which node was passed in —
+    // it is one that happens every time. `ctx.root` is a property, not a call
+    // (`readonly root: Node`), so it needs the query's second alternative rather than the
+    // `call_expression` one `ctx.parent` matches. The trailing comment is load-bearing: the
+    // rule's own gate is `fileContains: ['ctx.parent']`, and this fixture otherwise never
+    // contains that substring.
+    handle()
+        .reports_at(
+            "function f(ctx, m) {\n  const r = ctx.root\n  if (!r) return\n}\n// ctx.parent\n",
+            &[(3, 7)],
+        )
+        .expect("ctx.root is handle 0 unconditionally, not merely a call result that might be");
+}
+
+#[test]
+fn negating_an_unrelated_root_property_passes() {
+    // What stops the query's second alternative from becoming an over-report: `config.root` is
+    // a `member_expression` shaped exactly like `ctx.root`, and a check keyed on the property
+    // name alone (`.root`) rather than the full receiver-qualified text would flag a config
+    // root, a directory root, or a tree root — precisely the over-reporting
+    // `facts-must-serialize.ts` and `reduce-touches-no-tree.ts` both had to add a receiver
+    // guard to avoid. Confirmed by mutation: relaxing `ctx.text(m.property) !== 'ctx.root'` to
+    // a suffix check (`!endsWith('.root')`) makes this fixture reported, which is precisely the
+    // over-report this test exists to catch if it comes back. The trailing comment clears the
+    // same gate as the test above.
+    handle()
+        .accepts(
+            "function f(ctx, m) {\n  const r = config.root\n  if (!r) return\n}\n// ctx.parent\n",
+        )
+        .expect("config.root is an ordinary property; only ctx.root is always handle 0");
+}

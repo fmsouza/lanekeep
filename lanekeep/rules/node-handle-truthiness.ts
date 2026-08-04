@@ -16,7 +16,10 @@ import { defineRule } from 'lanekeep'
  * `closestAncestor` is deliberately not in the list: §6.2 says it returns `undefined` rather
  * than an empty object precisely so that `!` works on it.
  */
-const NODE_RETURNING = ['parent', 'root']
+// `root` isn't here: `ctx.root` is a property (`readonly root: Node`), never a call, so it can
+// never satisfy the query's call_expression alternative. It's matched by exact text instead, in
+// the query's second alternative and the check below.
+const NODE_RETURNING = ['parent']
 
 export default defineRule({
   id: 'local/node-handle-truthiness',
@@ -34,16 +37,33 @@ export default defineRule({
 
   gates: { fileContains: ['ctx.parent'] },
 
+  // Two shapes, because the host API has two. `ctx.parent(n)` is a call; `ctx.root` is a
+  // property (`readonly root: Node`). The second matters more than it looks: `ctx.root` is
+  // *always* handle `0`, so `const r = ctx.root; if (!r) return` is not a bug that might
+  // happen — it is one that always does, and it is the exact shape this rule opens by
+  // describing.
   query: `
-    (variable_declarator
-      name: (identifier) @name
-      value: (call_expression
-        function: (member_expression
-          property: (property_identifier) @method))) @decl
+    [
+      (variable_declarator
+        name: (identifier) @name
+        value: (call_expression
+          function: (member_expression
+            property: (property_identifier) @method))) @decl
+      (variable_declarator
+        name: (identifier) @name
+        value: (member_expression) @property) @decl
+    ]
   `,
 
   check(ctx, m) {
-    if (!NODE_RETURNING.includes(ctx.text(m.method))) return
+    // Exact text, not a property name. Matching any `.root` would flag a directory root, a
+    // config root or a tree root — the over-reporting `facts-must-serialize` and
+    // `reduce-touches-no-tree` both had to add a receiver guard to avoid.
+    if (m.property !== undefined) {
+      if (ctx.text(m.property) !== 'ctx.root') return
+    } else if (!NODE_RETURNING.includes(ctx.text(m.method))) {
+      return
+    }
     const name = ctx.text(m.name)
 
     const scope = ctx.closestAncestor(m.decl, '(statement_block) @block')
