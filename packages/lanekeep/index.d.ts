@@ -5,10 +5,14 @@
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
  *
- * Every member below is asserted against the host's own registration in
- * `crates/lanekeep-js/tests/host_types.rs`. A method that exists here and not there — or the
- * reverse — fails that test, because a definition that drifts from the engine is worse than
+ * Every member below is asserted against the host's own registration by
+ * `local/host-api-matches-types`, one of this repository's own self-check rules
+ * (`lanekeep/rules/host-api-matches-types.ts`). A method that exists here and not there — or
+ * the reverse — is reported, because a definition that drifts from the engine is worse than
  * none: it produces confident autocomplete for something that does not exist.
+ *
+ * `BindingKind` specifically is checked the same way, by `local/binding-kinds-are-typed`
+ * (`lanekeep/rules/binding-kinds-are-typed.ts`).
  */
 
 /**

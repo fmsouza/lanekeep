@@ -80,6 +80,13 @@
         "hostPath": "crates/lanekeep-js/src/host.rs",
         "typesPath": "packages/lanekeep/index.d.ts"
       }
+    },
+    {
+      "rule": "./lanekeep/rules/binding-kinds-are-typed.ts",
+      "options": {
+        "bindingPath": "crates/lanekeep-lang/src/binding.rs",
+        "typesPath": "packages/lanekeep/index.d.ts"
+      }
     }
   ]
 }

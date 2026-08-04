@@ -118,7 +118,7 @@ lanekeep/
 
 Nothing there runs in Node: lanekeep evaluates rules in its own sandbox, where `lanekeep` resolves to a host module. The shipped `index.js` exists so a tool that *does* load a rule under Node finds something coherent, and its `defineRule` is the same identity function the sandbox provides.
 
-The definitions are asserted against this crate's own registration in `lanekeep-js/tests/host_types.rs`, in both directions. A definition that drifts from the engine is worse than none — it produces confident autocomplete for a method that throws at run time.
+The definitions are asserted against this crate's own registration by `local/host-api-matches-types`, one of this repository's own self-check rules (`lanekeep/rules/host-api-matches-types.ts`), in both directions. A definition that drifts from the engine is worse than none — it produces confident autocomplete for a method that throws at run time. `BindingKind` specifically is checked the same way, by `local/binding-kinds-are-typed`.
 
 ### The Language trait
 

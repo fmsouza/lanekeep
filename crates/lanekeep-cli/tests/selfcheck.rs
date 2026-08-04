@@ -1187,3 +1187,51 @@ fn a_registration_inside_test_code_is_ignored() {
         )
         .expect("a registration inside test code is not real API and must not be reported");
 }
+
+const KINDS: &str = include_str!("../../../lanekeep/rules/binding-kinds-are-typed.ts");
+
+#[test]
+fn a_binding_kind_missing_from_the_union_is_reported() {
+    let tester = RuleTester::configured(
+        "kinds",
+        KINDS,
+        "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture("types.d.ts", "export type BindingKind =\n  | 'const'\n")
+        .expect("the types fixture is written");
+
+    tester
+        .reports_messages(
+            "impl BindingKind {\n    fn as_str(&self) -> &str {\n        match self {\n            \
+             Self::Const => \"const\",\n            Self::Trait => \"trait\",\n        }\n    }\n}\n",
+            &["`trait` is a binding kind the resolvers can return, and BindingKind does not include it — an author's switch silently never matches it"],
+        )
+        .expect("a narrowed union is wrong in a way that never errors");
+}
+
+#[test]
+fn a_complete_union_passes() {
+    let tester = RuleTester::configured(
+        "kinds-clean",
+        KINDS,
+        "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
+    )
+    .expect("the rule builds");
+
+    tester
+        .write_fixture(
+            "types.d.ts",
+            "export type BindingKind =\n  | 'const'\n  | 'trait'\n",
+        )
+        .expect("the types fixture is written");
+
+    tester
+        .accepts(
+            "impl BindingKind {\n    fn as_str(&self) -> &str {\n        match self {\n            \
+             Self::Const => \"const\",\n            Self::Trait => \"trait\",\n        }\n    }\n}\n",
+        )
+        .expect("every kind typed is the state this protects");
+}
