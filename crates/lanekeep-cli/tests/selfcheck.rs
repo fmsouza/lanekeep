@@ -526,3 +526,18 @@ fn a_tree_call_in_check_passes() {
         )
         .expect("check has a tree; that is the difference");
 }
+
+#[test]
+fn a_non_ctx_receiver_named_like_a_tree_method_passes() {
+    // The rule's known limitation, asserted rather than left to be discovered — the same
+    // reason `no-unwrap`'s `a_method_named_expect_on_a_mock_is_still_reported` exists. The
+    // `startsWith('ctx.')` guard is what keeps this rule from flagging `e.line` and
+    // `cycle.column` inside `no-circular-imports.ts`'s own `reduce`, where `e` and `cycle` are
+    // plain fact objects, not the sandbox context. Its only coverage before this test was
+    // incidental: it worked because those two production files happen to name their loop
+    // variables that way. Renaming them would have silently removed the only regression check
+    // this guard had.
+    reduce()
+        .accepts("const r = {\n  reduce(ctx) {\n    const e = { line: 1 }\n    const x = e.line\n  },\n}\n")
+        .expect("a property named like a tree method, on something that is not ctx, is not a tree call");
+}

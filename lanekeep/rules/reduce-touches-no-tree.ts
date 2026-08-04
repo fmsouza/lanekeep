@@ -29,6 +29,13 @@ const TREE_API = [
   'fileText',
   'filePath',
   'emitFact',
+  // These four take a `Node` too, and are absent from `ReduceContext` the same way the
+  // navigation methods above are. They read like queries rather than like tree walking,
+  // which is exactly why they are easy to forget here.
+  'resolvesToImport',
+  'isImportedFrom',
+  'bindingKind',
+  'isShadowed',
 ]
 
 export default defineRule({
