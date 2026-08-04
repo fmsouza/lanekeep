@@ -69,9 +69,15 @@ function isBinaryMode(ctx: any, args: any): boolean {
     const kind = ctx.kind(arg)
 
     if (kind === 'keyword_argument') {
-      const text = ctx.text(arg)
-      if (text.startsWith('mode')) return text.includes('b')
-      continue
+      if (!ctx.text(arg).startsWith('mode')) continue
+
+      // The literal, not the whole `mode=...` text. `mode=readable_mode` contains a `b` in
+      // the identifier's spelling, and treating that as binary would silently exempt a call
+      // that genuinely needs an encoding — the exact silencing this guard must not do. Same
+      // discipline as the positional branch below: prove it is a string before reading it.
+      const parts = ctx.namedChildren(arg)
+      const value = parts[parts.length - 1]
+      return ctx.kind(value) === 'string' && ctx.text(value).includes('b')
     }
 
     positional += 1

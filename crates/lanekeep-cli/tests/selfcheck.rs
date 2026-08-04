@@ -926,3 +926,74 @@ fn a_path_containing_b_is_still_reported() {
         .reports_at("def go():\n    return open(\"b.txt\")\n", &[(2, 12)])
         .expect("a path containing `b` is not a mode; only the second positional argument is");
 }
+
+#[test]
+fn an_open_with_a_non_literal_mode_keyword_is_reported() {
+    // The silencer this review round exists to catch. `mode=readable_mode`'s *whole* keyword
+    // text contains a `b`, from partway through the identifier `readable_mode` itself and not
+    // from any mode string — and a check that reads that whole text without first confirming
+    // the value is a string literal treats this as binary and silently exempts a call that may
+    // well be `mode="r"` at runtime and genuinely needs an encoding. The positional branch
+    // already requires `kind === 'string'` before reading content; the keyword branch must hold
+    // itself to the same discipline.
+    encoding()
+        .reports_at(
+            "def go(p, readable_mode):\n    return open(p, mode=readable_mode)\n",
+            &[(2, 12)],
+        )
+        .expect("a mode that is not a string literal cannot be proven binary, so it must still be reported");
+}
+
+#[test]
+fn a_literal_mode_keyword_still_passes_after_the_string_check() {
+    // Deliberately the same fixture as `an_open_with_mode_as_a_keyword_passes` above: this is
+    // the regression the review round asked to be re-proven at the site of the fix, once the
+    // keyword branch gained a `kind === 'string'` guard — the same intentional-redundancy
+    // precedent already used elsewhere in this file (`node-handle-truthiness.ts`'s
+    // `a_file_containing_only_ctx_root_is_reported`, kept "redundant against every mutation
+    // tried so far... and that redundancy is intentional rather than an oversight"). Without
+    // it, only `an_open_with_mode_as_a_keyword_passes` — written before the string check
+    // existed — stands as evidence the new code path still accepts the literal case.
+    encoding()
+        .accepts("def go(p):\n    return open(p, mode=\"rb\")\n")
+        .expect(
+            "a string-literal mode keyword is exactly what the new check is supposed to accept",
+        );
+}
+
+#[test]
+fn a_buffering_keyword_is_not_mistaken_for_mode() {
+    // The `Minor` finding as originally suggested: `buffering=1` is a real Python `open`
+    // keyword whose *whole text* contains a `b` — its own first letter. Kept as direct evidence
+    // this specific idiom is handled — but mutation-tested below (dropping the name filter)
+    // and found NOT to isolate the name filter on its own: `1` is an `integer`, so the value's
+    // own `kind === 'string'` check already saves this fixture regardless of whether the name
+    // filter is present. `an_errors_keyword_with_a_string_value_is_not_mistaken_for_mode` below
+    // is what actually closes the gap the `Minor` finding described, by using a keyword whose
+    // *value* is a string containing `b` — the one case where only the name filter, not the
+    // type check, can save it.
+    encoding()
+        .reports_at("def go(p):\n    return open(p, buffering=1)\n", &[(2, 12)])
+        .expect("buffering is not mode; only a keyword named mode can indicate binary");
+}
+
+#[test]
+fn an_errors_keyword_with_a_string_value_is_not_mistaken_for_mode() {
+    // The fixture that actually isolates the name filter (`ctx.text(arg).startsWith('mode')`)
+    // from the value-type check (`ctx.kind(value) === 'string'`) added earlier in this same
+    // review round. `errors` is a real Python `open` keyword, and `"backslashreplace"` is a
+    // real, valid value for it — a string, so it clears the type check — and it starts with
+    // `b`. If the name filter were ever dropped or widened, this keyword's value alone would
+    // be enough to make `isBinaryMode` return `true` and silently exempt a call that carries no
+    // encoding at all. Confirmed by mutation: dropping the name filter entirely leaves
+    // `a_buffering_keyword_is_not_mistaken_for_mode` green (see above) but reports nothing for
+    // this fixture — this is the one that fails.
+    encoding()
+        .reports_at(
+            "def go(p):\n    return open(p, errors=\"backslashreplace\")\n",
+            &[(2, 12)],
+        )
+        .expect(
+            "errors is not mode, and its value being a string that contains `b` must not matter",
+        );
+}
