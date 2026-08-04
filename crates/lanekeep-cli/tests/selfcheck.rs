@@ -830,3 +830,99 @@ fn constructing_an_unrelated_class_passes() {
         .accepts("function f(src) {\n  return new Array(src)\n}\n")
         .expect("an ordinary constructor is not a reviewability hazard; only Function is");
 }
+
+const ENCODING: &str = include_str!("../../../lanekeep/rules/py-explicit-encoding.ts");
+
+fn encoding() -> RuleTester {
+    plain("encoding", ENCODING, "py")
+}
+
+#[test]
+fn an_open_without_encoding_is_reported() {
+    encoding()
+        .reports_at("def go(p):\n    return open(p)\n", &[(2, 12)])
+        .expect("Windows defaults to cp1252 and the failure is a truncated read");
+}
+
+#[test]
+fn a_read_text_without_encoding_is_reported() {
+    encoding()
+        .reports_at("def go(p):\n    return Path(p).read_text()\n", &[(2, 12)])
+        .expect("read_text takes the same default");
+}
+
+#[test]
+fn a_write_text_without_encoding_is_reported() {
+    // `NEEDS_ENCODING` lists three names, and the brief's own fixtures exercise only two of
+    // them — `open` through the query's bare-identifier alternative, `read_text` through its
+    // attribute alternative. A list entry no fixture ever reaches is indistinguishable from a
+    // typo in that entry, so this closes the gap: `write_text` takes the same attribute-callee
+    // shape as `read_text`, and this is the fixture that proves the pairing is real rather than
+    // assumed.
+    encoding()
+        .reports_at(
+            "def go(p, data):\n    return Path(p).write_text(data)\n",
+            &[(2, 12)],
+        )
+        .expect("write_text takes the same default as read_text, and needs the same encoding");
+}
+
+#[test]
+fn an_explicit_encoding_passes() {
+    encoding()
+        .accepts("def go(p):\n    a = open(p, encoding=\"utf-8\")\n    b = Path(p).read_text(encoding=\"utf-8\")\n")
+        .expect("naming the encoding is the whole fix");
+}
+
+#[test]
+fn a_call_to_len_passes() {
+    // Named distinctly from `rule-declares-language.ts`'s `an_unrelated_call_passes` above:
+    // this file is one module, and two `#[test]` functions sharing a name is `E0428`, not a
+    // rule-behavior question — the same collision several rules above already ran into under
+    // different names.
+    encoding()
+        .accepts("def go(p):\n    return len(p)\n")
+        .expect("only the text-reading calls take an encoding");
+}
+
+#[test]
+fn an_open_in_binary_mode_passes() {
+    // `scripts/check_glibc_floor.py:67` — `open(path, "rb").read()` — reads raw ELF bytes.
+    // `encoding=` is not merely unnecessary there, it is invalid: CPython raises `ValueError:
+    // binary mode doesn't take an encoding argument` if it is passed alongside a binary mode.
+    // Reporting this call would send an author to a change that breaks their script, which is
+    // worse than not reporting it at all.
+    encoding()
+        .accepts("def go(p):\n    return open(p, \"rb\")\n")
+        .expect("a binary open takes no encoding at all; there is nothing to add");
+}
+
+#[test]
+fn an_open_with_mode_as_a_keyword_passes() {
+    // The same binary-mode exemption, spelled with `mode=` rather than as the second
+    // positional argument — proves `isBinaryMode` checks the keyword form and not only position.
+    encoding()
+        .accepts("def go(p):\n    return open(p, mode=\"rb\")\n")
+        .expect("mode is still binary whether it is positional or a keyword");
+}
+
+#[test]
+fn an_open_in_text_mode_is_still_reported() {
+    // The test that matters most: without it, a mutation that made `isBinaryMode` always
+    // return `true` would silence this rule for every `open` call, and every other test in
+    // this file — none of which exercises plain text mode — would still pass.
+    encoding()
+        .reports_at("def go(p):\n    return open(p, \"r\")\n", &[(2, 12)])
+        .expect("text mode still needs an explicit encoding; only binary is exempt");
+}
+
+#[test]
+fn a_path_containing_b_is_still_reported() {
+    // `isBinaryMode` counts positional arguments and only inspects the second one — the mode
+    // — so a single-argument `open` whose *path* happens to contain the letter `b` must not be
+    // mistaken for a binary mode string. This fixture has exactly one positional argument, the
+    // path itself, and no mode at all: default text mode, still needs an encoding.
+    encoding()
+        .reports_at("def go():\n    return open(\"b.txt\")\n", &[(2, 12)])
+        .expect("a path containing `b` is not a mode; only the second positional argument is");
+}
