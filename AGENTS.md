@@ -357,6 +357,19 @@ completion under a 1 ms budget, config-set or flag-set alike. It is not that the
 §15's cold cost is dominated by Rust-side parsing. Any fixture testing this needs a rule that
 burns real bytecode, or it is testing nothing.
 
+**A generated module reaches neither hash, and a rule's `options` used to live in one.** For a
+`lanekeep.json` the rules are compiled into an entry module lanekeep writes itself, and
+`hash_ruleset` covers the sources the loader *read* — never that one. `hash_config`
+canonicalized severity, include/exclude and timeouts and stopped there. So editing an option
+invalidated nothing: a warm run kept answering the previous configuration for as long as the
+cache survived, in both directions, and the dangerous one is silent — a restriction added still
+reports clean, and only `--no-cache` disagrees, which reads as "the rule is broken" rather than
+"the answer is old". Found by pointing lanekeep at this repository: an `allow` entry was removed
+and the run stayed green. `lanekeep init` generates JSON, so this was the default path. Two
+things worth carrying forward: a fixture written against a `.ts` config passes against this bug,
+because there the options are ordinary source in a module the loader does read; and anything new
+a config can say has to reach one of the two hashes on purpose — nothing checks that for you.
+
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,
 so the build machine silently decides the oldest distribution the release supports. When
