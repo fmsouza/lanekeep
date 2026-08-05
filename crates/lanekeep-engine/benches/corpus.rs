@@ -87,7 +87,7 @@ const SELECTED_FRACTION_OF_WARM: f64 = 1.5;
 /// Not a budget — §15's budget is 800 ms and this is 75 times that. It exists so an
 /// accidental infinite loop or a quadratic blowup fails the job instead of running until
 /// the runner's own timeout, with no indication of what went wrong.
-const COLD_CEILING: Duration = Duration::from_secs(60);
+const COLD_CEILING: Duration = Duration::from_mins(1);
 
 /// One scenario's budget, from architecture §15.
 struct Budget {

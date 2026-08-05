@@ -188,11 +188,20 @@ scaffolding to thread `Result` through every helper. List only the lints that ac
 covered.
 
 **An MSRV moves when a dependency forces it, never for syntax.** It is a promise to users.
-The floor went 1.85 → 1.87 for rquickjs and 1.87 → 1.88 for `ignore`, both because those
-crates would not build otherwise. It did *not* move when let-chains would have been
-convenient — that code was rewritten instead. `just check` runs `just msrv`, so a violation
-fails locally rather than costing a CI round trip; without it, every other recipe runs on a
-toolchain far newer than the floor and happily accepts syntax that does not exist there.
+The floor went 1.85 → 1.87 for rquickjs, 1.87 → 1.88 for `ignore` and 1.88 → 1.94 for
+`wasmtime`, all three because those crates would not build otherwise. It did *not* move when
+let-chains would have been convenient — that code was rewritten instead. `just check` runs
+`just msrv`, so a violation fails locally rather than costing a CI round trip; without it,
+every other recipe runs on a toolchain far newer than the floor and happily accepts syntax
+that does not exist there.
+
+The `wasmtime` move is the largest of the three and worth understanding before it is repeated.
+`wasmtime` releases monthly and raises its own floor with roughly every release, so its
+declared `rust-version` tracks about one release behind current stable — 47.0.3 declares
+1.94.0 while the pinned toolchain is 1.95.0. The newest `wasmtime` that builds on 1.88 is
+38.0.4; 39.0.0 already needs 1.89. So there is no version of this dependency that both holds
+an old floor and is the version anything was measured against, and every subsequent `wasmtime`
+bump will drag the floor with it. Budget for that rather than discovering it per release.
 
 **`rayon`'s `map_init` runs its initializer per chunk, not per thread.** State built there
 is not reliably shared across the items one worker handles — with a small input, rayon splits

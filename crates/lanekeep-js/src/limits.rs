@@ -235,8 +235,8 @@ mod tests {
 
     #[test]
     fn a_rule_cannot_raise_the_global_budget() {
-        let limits = Limits::default().with_rule_timeout(Duration::from_secs(60));
-        assert_eq!(limits.rule_timeout, Duration::from_secs(60));
+        let limits = Limits::default().with_rule_timeout(Duration::from_mins(1));
+        assert_eq!(limits.rule_timeout, Duration::from_mins(1));
         assert_eq!(
             limits.global_timeout, DEFAULT_GLOBAL_TIMEOUT,
             "raising a rule's own budget must not extend the run"
@@ -245,14 +245,14 @@ mod tests {
 
     #[test]
     fn an_unarmed_budget_never_interrupts() {
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         assert!(!budget.should_interrupt());
         assert_eq!(budget.take_trip(), None);
     }
 
     #[test]
     fn an_expired_invocation_budget_interrupts_and_records_why() {
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::ZERO);
         assert!(budget.should_interrupt());
         assert_eq!(budget.take_trip(), Some(Trip::Rule));
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn an_expired_run_budget_interrupts_and_records_why() {
         let budget = Budget::new(RunClock::start(Duration::ZERO));
-        budget.arm(Duration::from_secs(3600));
+        budget.arm(Duration::from_hours(1));
         assert!(budget.should_interrupt());
         assert_eq!(budget.take_trip(), Some(Trip::Run));
     }
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn disarming_stops_invocation_enforcement() {
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::ZERO);
         budget.disarm();
         assert!(!budget.should_interrupt(), "no invocation is in flight");
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn taking_the_trip_clears_it() {
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::ZERO);
         assert!(budget.should_interrupt());
         assert_eq!(budget.take_trip(), Some(Trip::Rule));
@@ -301,11 +301,11 @@ mod tests {
     fn arming_clears_a_previous_trip() {
         // Otherwise the next invocation would inherit the last one's verdict and be
         // reported as timing out without ever running.
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::ZERO);
         assert!(budget.should_interrupt());
 
-        budget.arm(Duration::from_secs(3600));
+        budget.arm(Duration::from_hours(1));
         assert!(!budget.should_interrupt());
         assert_eq!(budget.take_trip(), None);
     }
@@ -314,7 +314,7 @@ mod tests {
     fn an_overflowing_budget_does_not_wrap_into_disarmed() {
         // A deadline of zero means "no invocation in flight". An enormous budget must
         // saturate rather than wrap around to zero and switch the limit off entirely.
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::MAX);
         assert_ne!(
             budget.invocation_deadline_nanos.load(Ordering::Relaxed),
@@ -325,12 +325,12 @@ mod tests {
 
     #[test]
     fn the_clock_measures_from_one_origin() {
-        let clock = RunClock::start(Duration::from_secs(3600));
+        let clock = RunClock::start(Duration::from_hours(1));
         let a = Arc::clone(&clock);
         let b = Arc::clone(&clock);
         assert!(!a.is_expired());
         assert!(!b.is_expired());
-        assert_eq!(a.global_timeout(), Duration::from_secs(3600));
+        assert_eq!(a.global_timeout(), Duration::from_hours(1));
     }
 
     #[test]

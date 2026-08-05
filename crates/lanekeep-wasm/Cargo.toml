@@ -1,0 +1,23 @@
+[package]
+name = "lanekeep-wasm"
+description = "WebAssembly component runtime for lanekeep rules."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# The spike fixture under tests/fixtures/ is a crate of its own, built for
+# wasm32-unknown-unknown by a separate toolchain. It is test scaffolding and has no
+# business in the published .crate, where it would only confuse `cargo package`'s
+# resolution with a nested manifest it cannot build.
+exclude = ["tests/fixtures/**"]
+
+[dependencies]
+wasmtime = { workspace = true }
+
+[lints]
+workspace = true
