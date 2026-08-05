@@ -264,8 +264,12 @@ impl std::fmt::Debug for CheckContext {
             .field("interned_nodes", &self.arena.len())
             .field("reports", &self.reports.len())
             .field("has_resolver", &self.resolver.is_some())
+            // Whether reads are possible, and not how many were made. `dependencies()` builds a
+            // `Vec`, clones a `FilePath` per entry and sorts it, which is a lot of work to print
+            // one number — and it takes a `RefCell` borrow inside a `Debug` impl, which is the
+            // kind of thing that is safe until the day something formats while holding one.
+            // `lanekeep-js`'s `HostContext` prints exactly this field and no count either.
             .field("has_file_access", &self.files.is_some())
-            .field("dependencies", &self.dependencies().len())
             // Both, because they answer different questions: how many distinct sources this
             // file has seen, and how many of those actually reached the query compiler. Equal
             // is the healthy state; a `queries_compiled` that outruns `queries_cached` is the
@@ -332,10 +336,18 @@ impl CheckContext {
     /// same refusal `lanekeep-js` expresses by not installing the functions at all. The module
     /// header carries why that is the answer here and what the alternatives cost.
     ///
-    /// Takes the access by value, and the reads it records are this context's. Whether that is
-    /// one set per file or one per rule is the engine's to decide when it is wired: nothing
-    /// here presumes either, and merging two dependency lists is a `Vec` concatenation and a
-    /// [`lanekeep_core::tracked::sort`].
+    /// Takes the access by value, and the reads it records are this context's. Whether the
+    /// engine builds one context per file or one per rule is its decision when it is wired, and
+    /// nothing here presumes either — but the two are not equally cheap, and the difference is
+    /// worth knowing before it is chosen.
+    ///
+    /// **One per file shares the memo; one per rule does not, and the lists do not merge
+    /// safely.** [`lanekeep_core::tracked::sort`] orders by path and *does not dedupe*, so two
+    /// per-rule lists that disagree about one path's hash concatenate into two contradictory
+    /// entries for it — and disagreeing is exactly what they do if the file was rewritten
+    /// between the two rules, which is the case a shared memo exists to prevent. Merging is
+    /// sound only when the lists already agree. One context per file avoids the question
+    /// entirely, and shares the arena and the query cache while it is there.
     #[must_use]
     pub fn with_file_access(mut self, files: FileAccess) -> Self {
         self.files = Some(files);
@@ -354,6 +366,16 @@ impl CheckContext {
     /// Empty for a context with no file access, which is the truth about what was read rather
     /// than a stand-in for the missing authority. The rule-facing answer to that state is not
     /// an empty value — it is a failed call.
+    ///
+    /// **The "a refusal is not a dependency" claim has one known hole, and it is `FileAccess`'s
+    /// rather than this crate's.** Two of the three refusals are properties of the path string,
+    /// so nothing a later run does can change them. The third is not: `EscapesRoot` also fires
+    /// *after* canonicalizing, when an in-root path resolves outside the root through a symlink
+    /// — filesystem state, which a later run can change by replacing the link with an ordinary
+    /// file. Nothing is recorded, so nothing invalidates the entry. Filed against
+    /// `lanekeep-core`, where it affects both engines and is fixed once; it is more *reachable*
+    /// here only because a refusal crosses this boundary as a value a rule can act on, where
+    /// under QuickJS it throws and ends the invocation.
     #[must_use]
     pub fn dependencies(&self) -> Vec<TrackedRead> {
         self.files
@@ -916,8 +938,6 @@ impl HostCheckContext for HostState {
         Ok(Ok(Some(intern(&mut context.arena, captures))))
     }
 
-    // --- declared, not yet implemented ----------------------------------------------------
-
     // --- tracked reads ---------------------------------------------------------------------
     //
     // Both delegate straight into `FileAccess`, which owns confinement and tracking for every
@@ -962,6 +982,8 @@ impl HostCheckContext for HostState {
         // something untrue about the filesystem.
         Ok(files.exists(&path).map_err(wit_read_error))
     }
+
+    // --- declared, not yet implemented ----------------------------------------------------
 
     fn emit_fact(
         &mut self,
