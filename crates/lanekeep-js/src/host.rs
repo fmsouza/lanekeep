@@ -31,7 +31,7 @@ use rquickjs::function::Opt;
 use rquickjs::object::Accessor;
 use rquickjs::{Ctx, Function, Object, Value};
 
-use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
+use lanekeep_lang::binding::BindingResolver;
 
 use lanekeep_core::files::FileAccess;
 use lanekeep_core::fix::Fix;
@@ -381,6 +381,11 @@ impl HostContext {
         // text alone is wrong twice: it misses `import { makeStyles as ms }`, and it fires
         // on a local `const makeStyles` that has nothing to do with the import.
 
+        // What each question *means* — which module and export count as a match, and how a
+        // `*` in a pattern behaves — lives on `Binding` in `lanekeep-lang`, because
+        // `lanekeep-wasm` answers `check-context.resolves-to-import` and
+        // `check-context.is-imported-from` with the identical predicate. A copy in each
+        // engine would let one file resolve differently depending on which one ran the rule.
         let arena = Rc::clone(&self.arena);
         let resolver = self.resolver.clone();
         object.set(
@@ -391,20 +396,10 @@ impl HostContext {
                     let Some(resolver) = resolver.as_deref() else {
                         return false;
                     };
-                    match arena.borrow().resolve_binding(handle, resolver) {
-                        Some(Binding::Import {
-                            module: from,
-                            name: imported,
-                        }) => {
-                            from == module
-                                && name.0.is_none_or(|wanted| match &imported {
-                                    ImportedName::Named(actual) => *actual == wanted,
-                                    ImportedName::Default => wanted == "default",
-                                    ImportedName::Namespace => wanted == "*",
-                                })
-                        }
-                        _ => false,
-                    }
+                    arena
+                        .borrow()
+                        .resolve_binding(handle, resolver)
+                        .is_some_and(|binding| binding.is_import_of(&module, name.0.as_deref()))
                 },
             )?,
         )?;
@@ -417,10 +412,10 @@ impl HostContext {
                 let Some(resolver) = resolver.as_deref() else {
                     return false;
                 };
-                match arena.borrow().resolve_binding(handle, resolver) {
-                    Some(Binding::Import { module, .. }) => glob_matches(&pattern, &module),
-                    _ => false,
-                }
+                arena
+                    .borrow()
+                    .resolve_binding(handle, resolver)
+                    .is_some_and(|binding| binding.is_imported_from(&pattern))
             })?,
         )?;
 
@@ -1026,47 +1021,6 @@ fn escape_json_string(text: &str, out: &mut String) {
     out.push('"');
 }
 
-/// Match a module specifier against a pattern where `*` stands for any run of characters.
-///
-/// Written out rather than pulled in, because the whole need is `@scope/*` and `*/themed`.
-/// A glob crate would bring a dependency and a dialect — character classes, `**`, escapes —
-/// for a surface this small.
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return true;
-    };
-    if !text.starts_with(first) {
-        return false;
-    }
-
-    let mut rest = &text[first.len()..];
-    let segments: Vec<&str> = parts.collect();
-
-    // No `*` at all: the pattern has to account for the whole specifier.
-    if segments.is_empty() {
-        return rest.is_empty();
-    }
-
-    for (index, segment) in segments.iter().enumerate() {
-        if segment.is_empty() {
-            continue;
-        }
-        // The final segment has to sit at the end, or `@scope/*` would match
-        // `@scope/pkg/nested` on a pattern the author meant to be exact after the star.
-        if index == segments.len() - 1 {
-            return rest.ends_with(segment);
-        }
-        match rest.find(segment) {
-            Some(at) => rest = &rest[at + segment.len()..],
-            None => return false,
-        }
-    }
-
-    // The pattern ended with `*`, so whatever is left is matched.
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use lanekeep_lang::Language;
@@ -1453,20 +1407,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn glob_matching_handles_the_shapes_that_appear_in_rules() {
-        assert!(glob_matches("m", "m"));
-        assert!(!glob_matches("m", "mm"));
-        assert!(glob_matches("*", "anything"));
-        assert!(glob_matches("@scope/*", "@scope/pkg"));
-        assert!(!glob_matches("@scope/*", "@other/pkg"));
-        assert!(glob_matches("*/themed", "@rneui/themed"));
-        assert!(!glob_matches("*/themed", "@rneui/other"));
-        assert!(glob_matches("@a/*/c", "@a/b/c"));
-        assert!(!glob_matches("@a/*/c", "@a/b/d"));
-        assert!(glob_matches("", ""));
-        assert!(!glob_matches("", "x"));
-    }
+    // The pattern dialect itself is tested where it now lives, in `lanekeep-lang`'s
+    // `glob_matching_handles_the_shapes_that_appear_in_rules`. What stays here is
+    // `matches_a_module_by_glob` above, which is about `ctx.isImportedFrom` reaching it
+    // through a resolved binding.
 
     #[test]
     fn navigation_stays_lazy() {
