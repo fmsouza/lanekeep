@@ -140,4 +140,5 @@ changelog_include = [
   "lanekeep-server",
   "lanekeep-rules",
   "lanekeep-testkit",
+  "lanekeep-wasm",
 ]
