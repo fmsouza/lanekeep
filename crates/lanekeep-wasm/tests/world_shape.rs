@@ -280,7 +280,11 @@ fn context() -> CheckContext {
         .set_language(&TypeScript.grammar())
         .expect("grammar loads");
     let tree = parser.parse(source, None).expect("parses");
-    CheckContext::new(NodeArena::new(tree, source.to_owned()), FILE)
+    CheckContext::new(
+        NodeArena::new(tree, source.to_owned()),
+        FILE,
+        std::sync::Arc::new(TypeScript),
+    )
 }
 
 #[test]

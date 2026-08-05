@@ -29,6 +29,8 @@
     reason = "helpers in a tests/ crate are outside clippy.toml's allow-expect-in-tests"
 )]
 
+use std::sync::Arc;
+
 use lanekeep_lang::Language;
 use lanekeep_lang_js::TypeScript;
 use lanekeep_nodes::NodeArena;
@@ -80,6 +82,7 @@ fn run(
         .push_check_context(CheckContext::new(
             NodeArena::new(tree, source.to_owned()),
             FILE,
+            Arc::new(TypeScript),
         ))
         .expect("the resource table accepts a context");
 

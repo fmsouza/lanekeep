@@ -36,6 +36,12 @@ wasmtime = { workspace = true }
 # engine to any particular grammar.
 lanekeep-lang = { workspace = true }
 
+# `lanekeep-query` for `CompiledQuery`, which is what `check-context`'s two scoped-query
+# methods run and cache. The edge is earned here rather than declared ahead of it: an unused
+# dependency fails `cargo machete`, and nothing in this crate compiled a query until the
+# query methods did.
+lanekeep-query = { workspace = true }
+
 # Parsing, so the tests can build a real tree for a real context to be lent over. The engine
 # itself never picks a grammar — the file does, through `lanekeep-languages` — so these are
 # the tests' dependencies and not the crate's.

@@ -106,7 +106,11 @@ fn probe(source: &str, name: &str, target: Option<&str>, resolution: Resolution)
         .expect("grammar loads");
     let tree = parser.parse(source, None).expect("parses");
 
-    let mut context = CheckContext::new(NodeArena::new(tree, source.to_owned()), FILE);
+    let mut context = CheckContext::new(
+        NodeArena::new(tree, source.to_owned()),
+        FILE,
+        Arc::new(TypeScript),
+    );
     if let Resolution::Resolved = resolution {
         context = context.with_resolver(Arc::new(JsBindingResolver));
     }

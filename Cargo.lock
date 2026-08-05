@@ -1009,6 +1009,7 @@ dependencies = [
  "lanekeep-lang",
  "lanekeep-lang-js",
  "lanekeep-nodes",
+ "lanekeep-query",
  "tree-sitter",
  "wasmtime",
 ]

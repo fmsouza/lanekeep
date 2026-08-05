@@ -10,15 +10,15 @@
 //!
 //! # What is implemented so far
 //!
-//! `check-context`'s navigation, reporting and binding resolution. Everything else the world
-//! declares — scoped queries, tracked reads, facts, `today`, and the whole of
-//! `reduce-context` — returns an error naming itself, which traps the call.
+//! `check-context`'s navigation, reporting, binding resolution and scoped queries. Everything
+//! else the world declares — tracked reads, facts, `today`, and the whole of `reduce-context`
+//! — returns an error naming itself, which traps the call.
 //!
 //! **Trapping rather than answering, deliberately.** Every plausible placeholder is a
-//! plausible *answer*: an empty list from `query-subtree` reads as "nothing matched", `none`
-//! from `read-file` reads as "the file is not there". A rule built against either would look
-//! like it was working, and the run would be wrong quietly. An error is the one response no
-//! caller can mistake for a result.
+//! plausible *answer*: `none` from `read-file` reads as "the file is not there", an empty list
+//! from `facts` reads as "nothing was emitted". A rule built against either would look like it
+//! was working, and the run would be wrong quietly. An error is the one response no caller can
+//! mistake for a result.
 //!
 //! **Binding resolution is not one of those, and the difference is not a relaxation.** `false`
 //! and `none` are what "nothing resolves" *is*: a name nothing declares, a handle no arena
@@ -54,8 +54,56 @@
 //! answering `false`/`undefined` without a resolver — see `HostContext::with_resolver`. The
 //! surfaces that *are* absent there rather than answering are the ones attached per run and
 //! per language for other reasons: `querySubtree` and `closestAncestor` without a grammar,
-//! `readFile` and `fileExists` without file access, `today` without a date. Those are the
-//! places where a later change here has a real decision to make, and it is theirs to make.
+//! `readFile` and `fileExists` without file access, `today` without a date. Each of those is a
+//! decision this crate has to make rather than inherit. The first of the three is made below;
+//! the other two belong to the changes that implement them.
+//!
+//! # What a query answers with no grammar: the question is removed
+//!
+//! `lanekeep-js` installs `querySubtree` and `closestAncestor` only when a language was
+//! attached, so a rule that calls one without a grammar reaches a function that is genuinely
+//! *absent* and gets a `TypeError` naming it. WIT has no absent export — every method the
+//! world declares exists on every component — so that absence cannot cross the boundary, and
+//! something has to be answered.
+//!
+//! It is answered by removing the state rather than by choosing a value for it.
+//! [`CheckContext::new`] takes the grammar, so a context that cannot compile a query cannot be
+//! built. This costs nothing and is not a coincidence: the file was parsed by *some* grammar
+//! before any of this runs — "the grammar that parses a file is chosen by the file, not by the
+//! rule" — and whoever parsed it is holding the [`Language`] that chose it. A caller who
+//! forgets now gets a compile error instead of a run that is quietly wrong.
+//!
+//! Three alternatives were on the table. Each is worse, and in a different direction.
+//!
+//! - **An empty list, or `none`.** The cheapest, and the one this project has already been
+//!   bitten by: an empty result set is a *plausible answer to a real question*, and a rule
+//!   cannot tell it from "this file's language has no grammar for that query". A defect that
+//!   only ever *removes* findings announces itself to nobody — `no-unwrap` lost its whole
+//!   `#[test]` exemption to one, silently, and the rule went on passing its tests.
+//! - **A trap.** Loud, which is the right instinct and the wrong tool here. It crashes a rule
+//!   on a file it could have skipped, and it is not the rule's to catch: a wasm trap unwinds
+//!   the instance, where the `result` the world already declares is a value the guest handles.
+//! - **The world's own error case, carrying "this host has no grammar".** The closest of the
+//!   three, and it fails on what the world *says*: `query-subtree`'s error is "the query
+//!   compiler's message". A host misconfiguration rendered on that channel reaches a rule
+//!   author as a query-authoring mistake in a query that is fine. Making it honest means
+//!   editing `wit/world.wit`, whose bytes are a cache-key input — a real cost, paid to
+//!   describe a state that did not have to exist.
+//!
+//! So the error case carries exactly what the world says it carries, and nothing else. That is
+//! what `tests/queries.rs` asserts rather than merely asserting the error is non-empty.
+//!
+//! **What this does not do is make the two engines disagree.** `lanekeep-js` keeps its
+//! `Option`, and its `None` branch is unreachable in production — `lanekeep-engine` builds
+//! every `HostContext` with `.with_language(...)` — so there is no file a run can produce where
+//! one engine has a grammar and the other does not.
+//!
+//! **The pattern, and its limit.** Read the world first, because it has often already decided.
+//! `today` is declared `option<string>` *with* the meaning of `none` written into it — "none
+//! when the rule is not permitted to observe it" — so absence there is a declared answer and
+//! nothing needs removing. `read-error`'s three cases are all about the path and none of them
+//! says "this host has no file access", so tracked reads face the decision this one faced, with
+//! the same two ways out: remove the state, or change the world and pay for it.
 //!
 //! # No interior mutability, and why that is not an oversight
 //!
@@ -66,11 +114,14 @@
 //! interning methods want. The plain `NodeArena` below is the same type used the simpler way,
 //! not a second design.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use lanekeep_core::fix::Fix;
+use lanekeep_lang::Language;
 use lanekeep_lang::binding::{Binding, BindingKind as LangBindingKind, BindingResolver};
 use lanekeep_nodes::{Handle, NodeArena};
+use lanekeep_query::CompiledQuery;
 use wasmtime::component::{Resource, ResourceTable};
 
 use crate::bindings::types::{
@@ -117,34 +168,78 @@ pub struct CheckContext {
     file_path: String,
     reports: Vec<Report>,
     resolver: Option<Arc<dyn BindingResolver>>,
+    /// The grammar the two query methods compile against.
+    ///
+    /// Not an `Option`, and that is this module's answer to the question `lanekeep-js` answers
+    /// by not installing the functions at all. See the module header.
+    language: Arc<dyn Language>,
+    /// Queries compiled so far this file, by source.
+    ///
+    /// A rule that calls `query-subtree` inside a handler calls it once per match, with the
+    /// same query string every time. Compiling per call would make the second-cheapest
+    /// operation in the host the most expensive one. Failures are cached too, so a bad query
+    /// is reported once rather than recompiled on every match.
+    ///
+    /// `BTreeMap` rather than `HashMap` for the reason `lanekeep-js` uses one: nothing here
+    /// iterates it today, and a map whose order is a function of a hash seed is the kind of
+    /// thing that starts being iterated later.
+    queries: BTreeMap<String, Result<Arc<CompiledQuery>, String>>,
+    /// How many compilations that cache has actually performed.
+    compiled: usize,
 }
 
 impl std::fmt::Debug for CheckContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CheckContext")
             .field("file_path", &self.file_path)
+            .field("language", &self.language.id())
             .field("interned_nodes", &self.arena.len())
             .field("reports", &self.reports.len())
             .field("has_resolver", &self.resolver.is_some())
+            // Both, because they answer different questions: how many distinct sources this
+            // file has seen, and how many of those actually reached the query compiler. Equal
+            // is the healthy state; a `queries_compiled` that outruns `queries_cached` is the
+            // cache not being read.
+            .field("queries_cached", &self.queries.len())
+            .field("queries_compiled", &self.compiled)
             .finish()
     }
 }
 
 impl CheckContext {
-    /// Build a context over a parsed file.
+    /// Build a context over a parsed file, against the grammar that parsed it.
     ///
-    /// Takes an arena rather than a `tree_sitter::Tree` and a source, which is the one place
-    /// this differs from `lanekeep_js::HostContext::new`. Both build the identical
+    /// Takes an arena rather than a `tree_sitter::Tree` and a source, which is one of two
+    /// places this differs from `lanekeep_js::HostContext::new`. Both build the identical
     /// [`NodeArena`]; taking it already built keeps `tree-sitter` out of this crate's public
     /// API, and the caller that parses the file is holding one anyway.
+    ///
+    /// The other difference is `language`, which is required here and optional there. That is
+    /// the module header's decision and not an inconvenience of the signature: WIT cannot make
+    /// `query-subtree` absent for a context that has no grammar, so this crate does not let one
+    /// exist. The caller that parsed the file is holding this too.
     #[must_use]
-    pub fn new(arena: NodeArena, file_path: &str) -> Self {
+    pub fn new(arena: NodeArena, file_path: &str, language: Arc<dyn Language>) -> Self {
         Self {
             arena,
             file_path: file_path.to_owned(),
             reports: Vec::new(),
             resolver: None,
+            language,
+            queries: BTreeMap::new(),
+            compiled: 0,
         }
+    }
+
+    /// How many distinct query sources this context has compiled.
+    ///
+    /// Here so the compile-once-per-source property is *checkable* rather than assumed. The
+    /// size of the cache would not do it: an implementation that recompiled on every call and
+    /// overwrote the entry ends up with the same map and a different amount of work, and the
+    /// difference between those two is the whole property.
+    #[must_use]
+    pub const fn queries_compiled(&self) -> usize {
+        self.compiled
     }
 
     /// Attach a binding resolver, so the four binding-resolution methods have something to
@@ -168,6 +263,30 @@ impl CheckContext {
     /// world's `bool` and `option<binding-kind>` returns can carry.
     fn binding(&self, n: Handle) -> Option<Binding> {
         self.arena.resolve_binding(n, self.resolver.as_deref()?)
+    }
+
+    /// Compile a query, or hand back the outcome this file already saw for it.
+    ///
+    /// The cache is checked first, **including a cached failure**, which is the shape
+    /// `lanekeep-js`'s `compile` has and the reason it has it: a rule calling `query-subtree`
+    /// from inside its handler calls it once per match with the same source every time, and a
+    /// query that does not compile does not compile any harder the fourth time.
+    ///
+    /// `Arc` rather than `Rc`, which is the one difference from the JavaScript engine's copy.
+    /// QuickJS is single-threaded and its host functions are `'static` closures; nothing here
+    /// is either, and rules run across rayon's pool, so an `Rc` in the store's data would take
+    /// `Send` away from a type that has it.
+    fn compile(&mut self, source: &str) -> Result<Arc<CompiledQuery>, String> {
+        if let Some(found) = self.queries.get(source) {
+            return found.clone();
+        }
+
+        self.compiled += 1;
+        let compiled = CompiledQuery::compile(self.language.as_ref(), source)
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        self.queries.insert(source.to_owned(), compiled.clone());
+        compiled
     }
 
     /// The tree this context is reading.
@@ -279,6 +398,27 @@ const fn wit_kind(binding: &Binding) -> BindingKind {
             LangBindingKind::Trait => BindingKind::Trait,
         },
     }
+}
+
+/// Turn one match's capture paths into handles, once the tree borrow has ended.
+///
+/// A `list<match-entry>` and not a record, because a query's capture names are the rule's own
+/// and are not known to the world in advance. Order is tree-sitter's reporting order, which is
+/// deterministic for a given tree and query; nothing may depend on it beyond that, and a guest
+/// reads a capture by name.
+///
+/// A capture whose path no longer resolves is dropped rather than handed over as a sentinel:
+/// there is no `node` value meaning "not a node" — handle zero is the root — so the entry
+/// simply is not there, which is what the world's own note on `match` describes.
+fn intern(arena: &mut NodeArena, captures: Vec<(String, Vec<u32>)>) -> types::Match {
+    captures
+        .into_iter()
+        .filter_map(|(name, path)| {
+            arena
+                .intern_path(path)
+                .map(|node| types::MatchEntry { name, node })
+        })
+        .collect()
 }
 
 /// The error a method the world declares but nothing has implemented yet returns.
@@ -543,28 +683,64 @@ impl HostCheckContext for HostState {
             .is_some_and(|resolver| context.arena.is_shadowed(n, resolver)))
     }
 
-    // --- declared, not yet implemented ----------------------------------------------------
+    // --- scoped queries --------------------------------------------------------------------
+    //
+    // Neither of these traps, on any input. A query that does not compile answers through the
+    // world's own error case; a handle that resolves to nothing answers empty, as every
+    // navigation method above does; an upward walk that finds nothing answers `none`. There is
+    // no fourth case, because there is no context without a grammar to produce one.
+    //
+    // Both compile through one cache, keyed by source. `closest-ancestor` compiles before it
+    // walks, even from a node with no ancestors at all, so a rule that wrote a bad query is
+    // told so whatever node it asked from — an error that depended on the node's depth would
+    // be a query bug that only some files reported.
 
     fn query_subtree(
         &mut self,
-        _: Resource<CheckContext>,
-        _: Handle,
-        _: String,
+        this: Resource<CheckContext>,
+        n: Handle,
+        query: String,
     ) -> wasmtime::Result<Result<Vec<types::Match>, String>> {
-        Err(not_yet("check-context.query-subtree", "the scoped queries"))
+        let context = self.check_context_mut(&this)?;
+        let compiled = match context.compile(&query) {
+            Ok(compiled) => compiled,
+            Err(problem) => return Ok(Err(problem)),
+        };
+
+        // Two phases, which the arena's ownership of the tree forces: capture paths are
+        // collected while the tree is borrowed, then interned once that borrow has ended. A
+        // handle cannot be minted while a `Node` derived from the same tree is still alive.
+        let matches = context.arena.query_subtree(n, &compiled);
+        Ok(Ok(matches
+            .into_iter()
+            .map(|captures| intern(&mut context.arena, captures))
+            .collect()))
     }
 
     fn closest_ancestor(
         &mut self,
-        _: Resource<CheckContext>,
-        _: Handle,
-        _: String,
+        this: Resource<CheckContext>,
+        n: Handle,
+        query: String,
     ) -> wasmtime::Result<Result<Option<types::Match>, String>> {
-        Err(not_yet(
-            "check-context.closest-ancestor",
-            "the scoped queries",
-        ))
+        let context = self.check_context_mut(&this)?;
+        let compiled = match context.compile(&query) {
+            Ok(compiled) => compiled,
+            Err(problem) => return Ok(Err(problem)),
+        };
+
+        let Some(captures) = context.arena.closest_ancestor_paths(n, &compiled) else {
+            // `none`, never an empty `match`. A match that bound no captures is a real match,
+            // so the two must not be spelled the same — which is what the world's
+            // `option<match>` is for, and why a rule reading an empty capture list as "nothing
+            // matched" would be right only until a query bound nothing.
+            return Ok(Ok(None));
+        };
+
+        Ok(Ok(Some(intern(&mut context.arena, captures))))
     }
+
+    // --- declared, not yet implemented ----------------------------------------------------
 
     fn read_file(
         &mut self,
