@@ -335,7 +335,7 @@ that line from `crates/lanekeep-wasm/wit/world.wit` gives ``name `check-context`
 under `wasm-tools` 1.255.0, pointing at the export's parameter — it names whichever type the first
 offending signature mentions, and it reads as though the type is missing rather than out of scope.
 A sketch carrying the bug is in `docs/superpowers/specs/2026-08-04-rust-rule-authoring-design.md`
-§2.7, whose `world rule` names `rule-context` and `reduce-context` with no `use`. The sub-project's
+§2.4, whose `world rule` names `rule-context` and `reduce-context` with no `use`. The sub-project's
 own sketch, in `2026-08-04-wit-host-api-design.md` §3, does *not* have it: it carries the `use` and
 documents the trap in a doc comment, and extracted verbatim it parses.
 
