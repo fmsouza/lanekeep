@@ -54,9 +54,12 @@ impl JsBindingResolver {
     fn declaration_in(scope: Node<'_>, source: &str, name: &str) -> Option<Binding> {
         let mut cursor = scope.walk();
 
-        // Written with `is_some_and` rather than a let-chain: those need Rust 1.88 and the
-        // declared MSRV is 1.87. An MSRV is a promise to users and should move when a
-        // dependency forces it, not for syntax.
+        // Written with `is_some_and` rather than a let-chain. That was originally because
+        // let-chains needed Rust 1.88 and the declared MSRV was 1.87; the floor has since
+        // moved to 1.94 for `wasmtime`, so the syntax is available now. It stays as it is
+        // because rewriting working code to use newly-available syntax is not a reason to
+        // touch it — an MSRV moves when a dependency forces it, never for syntax, and the
+        // same logic applies in reverse.
         //
         // Parameters belong to the function, not to its body block.
         if scope

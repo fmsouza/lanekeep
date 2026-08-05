@@ -112,6 +112,7 @@ crates/
   lanekeep-languages    the set of supported languages, assembled in one place
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
+  lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring
   lanekeep-rules     built-in rules, authored in TypeScript
   lanekeep-report    human, json, sarif, agent reporters
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
@@ -151,6 +152,25 @@ saves the round trip.
 ## Traps already found here
 
 Real ones, each of which cost time. If you hit something surprising, add it.
+
+**The test suite can set `core.bare = true` on the real repository, and every later git command
+then fails with "this operation must be run in a work tree."** `changed.rs` and
+`tests/incremental.rs` build throwaway repositories with `git -C <tmpdir> init`. That is safe from
+a plain shell and unsafe from anything that exports `GIT_DIR` — a git hook does, which is why it
+shows up when the gate runs under `pre-push` rather than when you run `just check` by hand. `-C`
+changes the working directory; it does not override `GIT_DIR`, so `init` initializes the *real*
+repository, finds no worktree relationship, and records it as bare. Worktrees are hit hardest,
+since they resolve through the common config.
+
+The repair is one command, run from the main checkout:
+
+```bash
+git config --file .git/config core.bare false
+```
+
+Nothing is lost — no objects or refs are touched, only that one line. The durable fix is for those
+helpers to clear the variables they must not inherit (`.env_remove("GIT_DIR")`,
+`.env_remove("GIT_WORK_TREE")`), which makes them hermetic no matter who invokes them.
 
 **`rust-toolchain.toml` overrides the installed default.** A CI job that installs 1.85
 and runs plain `cargo check` tests 1.95 and passes regardless — a green check asserting
