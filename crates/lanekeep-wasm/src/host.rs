@@ -10,9 +10,9 @@
 //!
 //! # What is implemented so far
 //!
-//! `check-context`'s navigation, reporting, binding resolution and scoped queries. Everything
-//! else the world declares — tracked reads, facts, `today`, and the whole of `reduce-context`
-//! — returns an error naming itself, which traps the call.
+//! `check-context`'s navigation, reporting, binding resolution, scoped queries and tracked
+//! reads. Everything else the world declares — facts, `today`, and the whole of
+//! `reduce-context` — returns an error naming itself, which traps the call.
 //!
 //! **Trapping rather than answering, deliberately.** Every plausible placeholder is a
 //! plausible *answer*: `none` from `read-file` reads as "the file is not there", an empty list
@@ -55,8 +55,9 @@
 //! surfaces that *are* absent there rather than answering are the ones attached per run and
 //! per language for other reasons: `querySubtree` and `closestAncestor` without a grammar,
 //! `readFile` and `fileExists` without file access, `today` without a date. Each of those is a
-//! decision this crate has to make rather than inherit. The first of the three is made below;
-//! the other two belong to the changes that implement them.
+//! decision this crate has to make rather than inherit. The first two are made below, and they
+//! came out **differently** — which is the point of making them one at a time; the third belongs
+//! to the change that implements it.
 //!
 //! # What a query answers with no grammar: the question is removed
 //!
@@ -102,8 +103,60 @@
 //! `today` is declared `option<string>` *with* the meaning of `none` written into it — "none
 //! when the rule is not permitted to observe it" — so absence there is a declared answer and
 //! nothing needs removing. `read-error`'s three cases are all about the path and none of them
-//! says "this host has no file access", so tracked reads face the decision this one faced, with
-//! the same two ways out: remove the state, or change the world and pay for it.
+//! says "this host has no file access", so tracked reads faced the decision this one faced.
+//! They did not reach the same answer, and an earlier draft of this paragraph said they had
+//! only the same two ways out — remove the state, or change the world. There was a third, and
+//! it is the one the next section takes.
+//!
+//! # What a read answers with no file access: the call fails
+//!
+//! The same shape of question, decided on its own evidence rather than inherited from the
+//! section above.
+//!
+//! `lanekeep-js` installs `readFile` and `fileExists` only when a [`FileAccess`] was attached,
+//! so a rule calling one without it reaches a function that is genuinely absent, gets a
+//! `TypeError`, and `lanekeep-engine` turns that into `RunError::Rule` — the invocation ends and
+//! the run fails. This host reproduces that refusal by the only means the boundary has: the two
+//! methods return `Err`, which traps the call. Both engines refuse the same call, and both
+//! refusals end the invocation. That parity is the requirement, because confinement is a
+//! security property: two engines disagreeing about what is reachable is worse than either
+//! answer alone.
+//!
+//! **Why not remove the state, as the grammar above does?** Because a grammar is *information*
+//! about a file that has already been parsed, and file access is *authority*. "No grammar"
+//! cannot exist — something parsed the file and is holding the [`Language`] that did. "No file
+//! access" can, and under `docs/architecture.md` §13 it is a state the design may deliberately
+//! want. Requiring a `FileAccess` would force every caller without one to fabricate one, and
+//! there is no `FileAccess` that refuses everything: the nearest thing is one rooted at an empty
+//! directory, which answers "that file is not there" to every question ever asked of it. That is
+//! choosing a value to represent absence with an extra step, and the value it chooses is the
+//! worst of the four. Nor is the caller hypothetical — `tests/world_shape.rs`,
+//! `tests/bindings.rs`, `tests/navigation.rs` and `tests/queries.rs` each build a context with
+//! no project root anywhere in sight, where every one of them was already holding the `Language`
+//! the section above made mandatory.
+//!
+//! **Why not `none` and `false`?** They are the answers "the file is not there" and "it does not
+//! exist". A rule cannot tell either from the truth, and one concluding "no tsconfig, so nothing
+//! to check" would be silently right about a project it never looked at — the failure mode that
+//! only ever *removes* findings, which announces itself to nobody.
+//!
+//! **Why not a fourth `read-error` case?** It is genuinely cheap — `read-error` is a `variant`,
+//! so unlike the previous section's documented `string` channel a case can be added without
+//! overloading anything — and it is still wrong, for a reason that is not about cost. It would
+//! make host configuration **handleable**: a rule could catch `no-file-access` and report
+//! something. The run's output would then depend on whether the host granted file access, which
+//! is not one of `(bytes, path, ruleset, config, tracked reads)` and so is not in the cache key
+//! — two hosts, two answers, one cache entry, and nothing that would ever invalidate it. A
+//! failed call cannot be handled, so no output can depend on it. The world edit would also cost
+//! what world edits cost: `wit/world.wit`'s bytes are a cache-key input, and four authoring
+//! sub-projects bind against its shape.
+//!
+//! The residue is real and is named rather than hidden. A rule that reads a file on a host with
+//! no file access takes the run down, where a rule told "you may not look" could have skipped
+//! the file and carried on. That is exactly what happens today under QuickJS, and it is not the
+//! state any wired engine produces: `lanekeep-engine` builds a `FileAccess` per file
+//! unconditionally, so the branch is unreachable in production for the same reason
+//! `with_language`'s is.
 //!
 //! # No interior mutability, and why that is not an oversight
 //!
@@ -117,7 +170,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use lanekeep_core::files::{FileAccess, ReadError as FileReadError};
 use lanekeep_core::fix::Fix;
+use lanekeep_core::tracked::TrackedRead;
 use lanekeep_lang::Language;
 use lanekeep_lang::binding::{Binding, BindingKind as LangBindingKind, BindingResolver};
 use lanekeep_nodes::{Handle, NodeArena};
@@ -168,6 +223,19 @@ pub struct CheckContext {
     file_path: String,
     reports: Vec<Report>,
     resolver: Option<Arc<dyn BindingResolver>>,
+    /// Tracked, confined access to the rest of the project, when the host granted any.
+    ///
+    /// An `Option`, where [`CheckContext::language`] above is not, and that asymmetry is this
+    /// module's second decision rather than an oversight. See the module header.
+    ///
+    /// Owned rather than shared. `lanekeep-js` holds an `Rc<FileAccess>` because the engine
+    /// builds one per *file* and hands it to every rule checking that file; an `Rc` here would
+    /// take `Send` away from a type the `const` block below requires to have it, and an
+    /// `Arc<FileAccess>` is not `Send` either, since `FileAccess`'s memo is a `RefCell`. Owning
+    /// it keeps the reads structurally attached to the context that made them — which is what
+    /// `files.rs` asks for — and leaves the engine free to decide, when it is wired, whether a
+    /// context is built per file or per rule.
+    files: Option<FileAccess>,
     /// The grammar the two query methods compile against.
     ///
     /// Not an `Option`, and that is this module's answer to the question `lanekeep-js` answers
@@ -196,6 +264,8 @@ impl std::fmt::Debug for CheckContext {
             .field("interned_nodes", &self.arena.len())
             .field("reports", &self.reports.len())
             .field("has_resolver", &self.resolver.is_some())
+            .field("has_file_access", &self.files.is_some())
+            .field("dependencies", &self.dependencies().len())
             // Both, because they answer different questions: how many distinct sources this
             // file has seen, and how many of those actually reached the query compiler. Equal
             // is the healthy state; a `queries_compiled` that outruns `queries_cached` is the
@@ -225,6 +295,7 @@ impl CheckContext {
             file_path: file_path.to_owned(),
             reports: Vec::new(),
             resolver: None,
+            files: None,
             language,
             queries: BTreeMap::new(),
             compiled: 0,
@@ -253,6 +324,42 @@ impl CheckContext {
     pub fn with_resolver(mut self, resolver: Arc<dyn BindingResolver>) -> Self {
         self.resolver = Some(resolver);
         self
+    }
+
+    /// Allow tracked, confined reads of the rest of the project.
+    ///
+    /// Without one, `read-file` and `file-exists` fail the call rather than answering — the
+    /// same refusal `lanekeep-js` expresses by not installing the functions at all. The module
+    /// header carries why that is the answer here and what the alternatives cost.
+    ///
+    /// Takes the access by value, and the reads it records are this context's. Whether that is
+    /// one set per file or one per rule is the engine's to decide when it is wired: nothing
+    /// here presumes either, and merging two dependency lists is a `Vec` concatenation and a
+    /// [`lanekeep_core::tracked::sort`].
+    #[must_use]
+    pub fn with_file_access(mut self, files: FileAccess) -> Self {
+        self.files = Some(files);
+        self
+    }
+
+    /// Every file this context reached for, in path order.
+    ///
+    /// What a cache entry for this file depends on besides the file itself. Three things it
+    /// records that are easy to leave out, all of them inherited from [`FileAccess`] rather
+    /// than decided here: a read that found nothing is recorded with no hash, because a rule
+    /// told "not there" has depended on that answer and must be re-run when the file appears; a
+    /// file read twice under two spellings is one entry; and a *refused* read is not an entry
+    /// at all, having produced no answer to depend on.
+    ///
+    /// Empty for a context with no file access, which is the truth about what was read rather
+    /// than a stand-in for the missing authority. The rule-facing answer to that state is not
+    /// an empty value — it is a failed call.
+    #[must_use]
+    pub fn dependencies(&self) -> Vec<TrackedRead> {
+        self.files
+            .as_ref()
+            .map(FileAccess::dependencies)
+            .unwrap_or_default()
     }
 
     /// What the identifier at a handle refers to, or `None` when nothing does.
@@ -444,6 +551,39 @@ fn intern(arena: &mut NodeArena, captures: Vec<(String, Vec<u32>)>) -> types::Ma
                 .map(|node| types::MatchEntry { name, node })
         })
         .collect()
+}
+
+/// How a refusal is spelled at the boundary.
+///
+/// The world's `read-error` is a `variant` where [`lanekeep_core::files::ReadError`] is an
+/// `enum` with named fields, so this is a change of shape and not of meaning: the same three
+/// cases, each still carrying the path as the rule wrote it, which is what makes the message a
+/// rule renders match the one QuickJS produces.
+///
+/// The match is exhaustive, so a fourth case added to `FileAccess` stops this crate from
+/// building rather than quietly becoming one of the three — which matters more here than
+/// almost anywhere else in this file, because a refusal silently re-labeled as a different
+/// refusal is a confinement failure that still looks like a refusal.
+fn wit_read_error(error: FileReadError) -> ReadError {
+    match error {
+        FileReadError::EscapesRoot { path } => ReadError::EscapesRoot(path),
+        FileReadError::Absolute { path } => ReadError::Absolute(path),
+        FileReadError::NotText { path } => ReadError::NotText(path),
+    }
+}
+
+/// The error a read method returns when the host granted no file access at all.
+///
+/// Fails the call rather than answering, for the reason the module header sets out: every value
+/// this could return instead is a plausible answer to the question that was asked.
+fn no_file_access(method: &str) -> wasmtime::Error {
+    wasmtime::Error::msg(format!(
+        "`{method}` was called on a check-context built without file access, so this host \
+         cannot answer it. Not `none` and not `false`: both are ordinary answers meaning the \
+         file is not there, and a rule cannot tell either from the truth. `lanekeep-js` refuses \
+         the same call the same way — without file access the function is absent, and calling \
+         it is a TypeError that ends the invocation."
+    ))
 }
 
 /// The error a method the world declares but nothing has implemented yet returns.
@@ -778,20 +918,49 @@ impl HostCheckContext for HostState {
 
     // --- declared, not yet implemented ----------------------------------------------------
 
+    // --- tracked reads ---------------------------------------------------------------------
+    //
+    // Both delegate straight into `FileAccess`, which owns confinement and tracking for every
+    // engine rather than for one of them. Nothing about the rules is restated here: a path is
+    // refused, read, or found absent by the same code `lanekeep-js` calls, so the question "can
+    // a component rule reach a file a TypeScript rule cannot" has no place to be answered
+    // differently.
+    //
+    // The two ways out are not interchangeable. A *refusal* is a value the world declares and
+    // the rule handles; the *absence of file access* fails the call, because it is not about
+    // the path and there is no answer to give.
+
     fn read_file(
         &mut self,
-        _: Resource<CheckContext>,
-        _: String,
+        this: Resource<CheckContext>,
+        path: String,
     ) -> wasmtime::Result<Result<Option<String>, ReadError>> {
-        Err(not_yet("check-context.read-file", "the tracked reads"))
+        let context = self.check_context_mut(&this)?;
+        let Some(files) = context.files.as_ref() else {
+            return Err(no_file_access("check-context.read-file"));
+        };
+
+        // `Ok(None)` is a read that found nothing, and it stays distinguishable from a refusal
+        // — a rule asking whether a config is present should not have to handle an error to
+        // find out. That is why the world's return is `result<option<string>, ...>` rather than
+        // an error case carrying "not found".
+        Ok(files.read(&path).map_err(wit_read_error))
     }
 
     fn file_exists(
         &mut self,
-        _: Resource<CheckContext>,
-        _: String,
+        this: Resource<CheckContext>,
+        path: String,
     ) -> wasmtime::Result<Result<bool, ReadError>> {
-        Err(not_yet("check-context.file-exists", "the tracked reads"))
+        let context = self.check_context_mut(&this)?;
+        let Some(files) = context.files.as_ref() else {
+            return Err(no_file_access("check-context.file-exists"));
+        };
+
+        // Not `read(...).is_some()`. A file that exists and is not text still exists, and
+        // `FileAccess::exists` answers the question that was asked — where `false` would claim
+        // something untrue about the filesystem.
+        Ok(files.exists(&path).map_err(wit_read_error))
     }
 
     fn emit_fact(
