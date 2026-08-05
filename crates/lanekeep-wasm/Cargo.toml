@@ -10,12 +10,16 @@ homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# The spike guest is a crate of its own, built for wasm32-unknown-unknown by
-# `cargo component`. Its nested manifest has no business in the published .crate, where it
-# would only give `cargo package` a second package to resolve and fail to build. The built
-# artifact beside it — tests/fixtures/spike.wasm — is deliberately not excluded: it is what
-# tests/spike.rs embeds.
-exclude = ["tests/fixtures/spike/**"]
+# The whole test tree, not just the nested guest crate, and the difference matters.
+#
+# tests/fixtures/spike/ is a crate of its own, built for wasm32-unknown-unknown by
+# `cargo component`; a nested manifest in the .crate only gives `cargo package` a second
+# package to resolve and fail to build. Excluding only that directory packages cleanly —
+# `cargo package`'s verification step builds the lib, not the tests, so it never notices —
+# while shipping a tests/spike.rs whose `bindgen!` reads a WIT file that is no longer
+# there. Anyone vendoring the crate and running `cargo test` would hit that, and the error
+# would name a missing path rather than the decision that removed it.
+exclude = ["tests/**"]
 
 [dependencies]
 wasmtime = { workspace = true }
