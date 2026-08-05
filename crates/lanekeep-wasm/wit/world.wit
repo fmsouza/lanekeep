@@ -74,12 +74,23 @@ interface types {
     column: option<u32>,
   }
 
-  /// A suggested edit replacing a node's text. `safe` is the rule's own claim that applying
-  /// it preserves behavior; the engine does not verify it.
+  /// A suggested edit replacing a node's text.
   record fix {
     node: node,
     text: string,
-    safe: bool,
+    /// The rule's own claim that applying this preserves behavior, which the engine does not
+    /// verify. `--fix` applies the safe ones and offers the rest as suggestions.
+    ///
+    /// Optional, and **the host decides what unspecified means: not safe.** The two mistakes
+    /// are not symmetric — a suggestion that should have been safe costs a manual edit, and a
+    /// fix that should have been a suggestion rewrites someone's code. A plain `bool` cannot
+    /// represent "did not say", so every authoring crate would have to choose a value to send
+    /// when its author omitted one, and one of them mapping that to `true` would silently
+    /// make fixes auto-applicable with nothing here to catch it. `option<bool>` keeps the
+    /// cautious answer an invariant of the boundary rather than a convention each language
+    /// re-decides. This is what `lanekeep-js`'s `read_fix` already does with an absent
+    /// property.
+    safe: option<bool>,
   }
 
   /// One capture of a query match: the name the query gave it, and the node it bound.

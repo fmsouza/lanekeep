@@ -195,7 +195,14 @@ impl HostCheckContext for HostState {
         Ok(self.check_context_mut(&this)?.arena.source().to_owned())
     }
 
-    fn root(&mut self, _: Resource<CheckContext>) -> wasmtime::Result<Handle> {
+    fn root(&mut self, this: Resource<CheckContext>) -> wasmtime::Result<Handle> {
+        // Resolved even though the answer does not depend on it, so this method cannot answer
+        // for a context that is not there. Unreachable through the component model, which does
+        // not deliver a method call on a dead borrow — but it is the one method where a
+        // constant returned without a lookup would have been invisible, and every sibling
+        // resolves first.
+        self.check_context_mut(&this)?;
+
         // Zero, always, and `NodeArena` interns it first so that stays true. It is also the
         // reason `parent` returns `option<node>` rather than a sentinel.
         Ok(NodeArena::ROOT)
@@ -321,10 +328,9 @@ impl HostCheckContext for HostState {
     /// Two independently optional parameters rather than the TypeScript API's union second
     /// argument, which existed only because JavaScript has no optional named parameters.
     ///
-    /// One thing the record shape does change: `fix.safe` is a plain `bool` here and an
-    /// optional property in JavaScript, where omitting it means "a suggestion". A component
-    /// must always say. The cautious default is not lost, but it moves out of the host and
-    /// into whatever each language's authoring crate uses to construct a `fix`.
+    /// `fix.safe` is `option<bool>` and unspecified means "a suggestion", read here rather
+    /// than defaulted by whoever built the record — the same answer `read_fix` gives an
+    /// absent `safe` property in JavaScript.
     fn report(
         &mut self,
         this: Resource<CheckContext>,
@@ -350,7 +356,11 @@ impl HostCheckContext for HostState {
                 start,
                 end,
                 replacement: fix.text,
-                safe: fix.safe,
+                // Absent means suggestion, decided here rather than by whatever authoring
+                // crate built the record. The cautious mistake costs a manual edit; the other
+                // one rewrites code silently. Identical to `lanekeep-js`'s `read_fix`, which
+                // reads an absent `safe` property the same way.
+                safe: fix.safe.unwrap_or(false),
             })
         });
 

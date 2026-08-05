@@ -53,6 +53,7 @@ impl Guest for Component {
             "unresolvable" => unresolvable(ctx),
             "loc" => loc(ctx),
             "fix" => fix(ctx),
+            "unsaid-fix" => unsaid_fix(ctx),
             "bare" => bare(ctx),
             "unimplemented" => unimplemented(ctx),
             other => say(ctx, &format!("unknown probe `{other}`")),
@@ -246,7 +247,7 @@ fn fix(ctx: &CheckContext) {
         Some(&Fix {
             node: *second,
             text: "const y = 3;".to_owned(),
-            safe: true,
+            safe: Some(true),
         }),
     );
 
@@ -256,7 +257,7 @@ fn fix(ctx: &CheckContext) {
         Some(&Fix {
             node: *first,
             text: "const x = 2;".to_owned(),
-            safe: false,
+            safe: Some(false),
         }),
     );
 
@@ -268,7 +269,29 @@ fn fix(ctx: &CheckContext) {
         Some(&Fix {
             node: UNRESOLVABLE,
             text: "nope".to_owned(),
-            safe: true,
+            safe: Some(true),
+        }),
+    );
+}
+
+/// A fix that does not say whether it is safe.
+///
+/// `safe` is `option<bool>` precisely so this is expressible: a rule that did not decide has
+/// said something different from a rule that decided "yes", and the host is what turns the
+/// first into a suggestion. A `bool` would have made this guest pick a value, which is the
+/// choice that must not be the guest's.
+fn unsaid_fix(ctx: &CheckContext) {
+    let Some(&first) = ctx.named_children(ctx.root()).first() else {
+        return say(ctx, "shape: the root has no named children");
+    };
+
+    ctx.report(
+        first,
+        Some("did not say"),
+        Some(&Fix {
+            node: first,
+            text: "const x = 3;".to_owned(),
+            safe: None,
         }),
     );
 }

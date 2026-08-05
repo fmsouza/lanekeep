@@ -253,6 +253,31 @@ fn a_fix_is_a_byte_range_taken_from_the_node_it_names() {
 }
 
 #[test]
+fn a_fix_that_does_not_say_whether_it_is_safe_is_a_suggestion() {
+    // The reason `fix.safe` is `option<bool>` rather than `bool`. `--fix` applies the safe
+    // ones, so the two mistakes are not symmetric: a suggestion that should have been safe
+    // costs a manual edit, and a fix that should have been a suggestion rewrites someone's
+    // code. A `bool` cannot carry "did not say", so every authoring crate would have to pick a
+    // value on its author's behalf, and one picking `true` would make fixes auto-applicable
+    // with nothing here able to notice. This asserts the host owns that answer.
+    let reports = probe("const x = 1;", "unsaid-fix");
+    let fix = reports
+        .first()
+        .and_then(|report| report.fix.as_ref())
+        .expect("the fix survives, since the node it names resolves");
+
+    assert!(
+        !fix.safe,
+        "a fix that did not say must not be auto-applicable"
+    );
+    assert_eq!(
+        (fix.start, fix.end, fix.replacement.as_str()),
+        (0, 12, "const x = 3;"),
+        "and the rest of the fix is unaffected by the field being absent"
+    );
+}
+
+#[test]
 fn the_no_message_form_records_a_report_with_no_message() {
     // `report`'s two `option` parameters are independent, which is the shape the TypeScript
     // API could only express as a union second argument.
