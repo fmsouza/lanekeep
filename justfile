@@ -91,7 +91,10 @@ wasm-fixtures:
         name="$(basename "${dir}")"
         echo "building ${name}"
         (cd "${dir}" && cargo component build --release --target wasm32-unknown-unknown)
-        cp "${dir}target/wasm32-unknown-unknown/release/${name}.wasm" \
+        # cargo names the artifact after the crate with hyphens turned into underscores,
+        # and the directory keeps the hyphens. `spike` has neither, so this only starts
+        # mattering with the second fixture — a `cp` of a path that never existed.
+        cp "${dir}target/wasm32-unknown-unknown/release/${name//-/_}.wasm" \
            "${root}/crates/lanekeep-wasm/tests/fixtures/${name}.wasm"
     done
 

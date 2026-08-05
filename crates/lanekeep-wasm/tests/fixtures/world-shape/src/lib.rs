@@ -1,0 +1,68 @@
+//! A guest that implements every export of `lanekeep:host@0.1.0`'s `rule` world.
+//!
+//! Not a rule, and not a template for one. What it exists to prove is that the world as
+//! written can be targeted at all — that a component can be built against it, that the two
+//! host-implemented contexts arrive as borrowed handles, and that values cross in both
+//! directions through the canonical ABI.
+//!
+//! **It allocates on purpose.** A guest that only returns integers imports nothing on
+//! either build target, so an import-list assertion over one proves nothing about the
+//! target being right; a guest one `String` different imports ten interfaces on
+//! `wasm32-wasip1` and none on `wasm32-unknown-unknown`. Formatting a message and reading
+//! a `list<string>` is what makes the difference visible here.
+
+#[allow(warnings)]
+mod bindings;
+
+// `CheckContext`, `ReduceContext` and `Match` are at the top level of the generated
+// bindings because the *world* `use`s them; `ReduceLocation` is not, because it does not
+// appear in an export signature and the world does not name it. That is the whole rule for
+// what a guest gets flat and what it reaches through the interface path, and it is worth
+// knowing before sub-project 3 writes an authoring crate around it.
+use bindings::lanekeep::host::types::ReduceLocation;
+use bindings::{CheckContext, Guest, Match, ReduceContext};
+
+struct Component;
+
+impl Guest for Component {
+    fn has_check() -> bool {
+        true
+    }
+
+    fn has_reduce() -> bool {
+        true
+    }
+
+    fn check(ctx: &CheckContext, m: Match) {
+        // Reads through the borrowed handle, so the host observes that the borrow is live
+        // for the length of the call, and allocates, so the artifact's import list is a
+        // real measurement rather than an artifact of the guest being too small.
+        let path = ctx.file_path();
+        let names: Vec<&str> = m.iter().map(|entry| entry.name.as_str()).collect();
+        let node = m.first().map_or_else(|| ctx.root(), |entry| entry.node);
+        ctx.report(
+            node,
+            Some(&format!("{path}: {}", names.join(","))),
+            // No fix: `report`'s two optional parameters are independent, and passing one
+            // without the other is the shape that could not be expressed as a union.
+            None,
+        );
+    }
+
+    fn reduce(ctx: &ReduceContext) {
+        let files = ctx.files();
+        let kinds: Vec<String> = ctx.facts(None).into_iter().map(|fact| fact.kind).collect();
+        ctx.report(
+            &ReduceLocation {
+                file: files.first().cloned().unwrap_or_default(),
+                // A reduce-phase report may know only the file: the reduce phase never
+                // touches parse trees, so it has no node to take a position from.
+                line: None,
+                column: None,
+            },
+            Some(&format!("{} files, {} facts", files.len(), kinds.len())),
+        );
+    }
+}
+
+bindings::export!(Component with_types_in bindings);

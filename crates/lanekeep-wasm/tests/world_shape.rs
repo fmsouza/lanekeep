@@ -1,0 +1,395 @@
+//! The world in `wit/world.wit` is satisfiable from both sides.
+//!
+//! `tests/fixtures/world-shape/` is a component that exports all four of the `rule` world's
+//! functions; this file implements the host half of the same world and links the two
+//! together. Neither half proves much alone — a world nobody can target is a document, and a
+//! world no host can implement is the same document from the other end.
+//!
+//! **This is not a rule and the host here is not the host.** Every value the stub returns is
+//! a constant, and the two context types are still empty. What is under test is the *shape*:
+//! that the generated traits can be implemented, that a host-owned context can be lent to a
+//! guest export as a `borrow<>`, and that records, options and lists of records survive the
+//! canonical ABI in both directions. The real implementations arrive with `src/host.rs`.
+
+use lanekeep_wasm::bindings::types::{
+    BindingKind, CheckContext, EmittedFact, FactError, Fix, Host, HostCheckContext,
+    HostReduceContext, NodeLocation, ReadError, ReduceContext, ReduceLocation,
+};
+use lanekeep_wasm::bindings::{Rule, types};
+use lanekeep_wasm::engine;
+use wasmtime::Store;
+use wasmtime::component::types::ComponentItem;
+use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
+
+/// The component under test, as built by `just wasm-fixtures`.
+///
+/// `include_bytes!` is the wrong load path for a rule — a byte slice cannot be mapped, which
+/// forfeits wasmtime's copy-on-write memory images — and is fine for a fixture that is never
+/// precompiled and never shipped.
+const WORLD_SHAPE: &[u8] = include_bytes!("fixtures/world-shape.wasm");
+
+/// The path the stub reports as the file under check.
+const FILE: &str = "src/lib.ts";
+
+/// The store's data: the table the contexts live in, and what the guest reported through
+/// them.
+#[derive(Default)]
+struct StubHost {
+    table: ResourceTable,
+    /// Every `report` the guest made, per-file and cross-file alike, in call order.
+    reported: Vec<String>,
+}
+
+impl HostCheckContext for StubHost {
+    fn file_path(&mut self, _: Resource<CheckContext>) -> wasmtime::Result<String> {
+        Ok(FILE.to_owned())
+    }
+
+    fn file_text(&mut self, _: Resource<CheckContext>) -> wasmtime::Result<String> {
+        Ok("const x = 1;\n".to_owned())
+    }
+
+    fn root(&mut self, _: Resource<CheckContext>) -> wasmtime::Result<u32> {
+        // Zero, and that is the whole reason `closest-ancestor` returns an option: anything
+        // testing this handle for truthiness discards the root of every file.
+        Ok(0)
+    }
+
+    fn kind(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Option<String>> {
+        Ok(Some("program".to_owned()))
+    }
+
+    fn text(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn is_named(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<bool> {
+        Ok(true)
+    }
+
+    fn line(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Option<u32>> {
+        Ok(Some(0))
+    }
+
+    fn column(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Option<u32>> {
+        Ok(Some(0))
+    }
+
+    fn parent(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Option<u32>> {
+        Ok(None)
+    }
+
+    fn children(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+
+    fn named_children(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+
+    fn ancestors(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+
+    fn resolves_to_import(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: u32,
+        _: String,
+        _: Option<String>,
+    ) -> wasmtime::Result<bool> {
+        Ok(false)
+    }
+
+    fn is_imported_from(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: u32,
+        _: String,
+    ) -> wasmtime::Result<bool> {
+        Ok(false)
+    }
+
+    fn binding_kind(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: u32,
+    ) -> wasmtime::Result<Option<BindingKind>> {
+        Ok(Some(BindingKind::Const))
+    }
+
+    fn is_shadowed(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<bool> {
+        Ok(false)
+    }
+
+    fn query_subtree(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: u32,
+        _: String,
+    ) -> wasmtime::Result<Result<Vec<types::Match>, String>> {
+        Ok(Ok(Vec::new()))
+    }
+
+    fn closest_ancestor(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: u32,
+        _: String,
+    ) -> wasmtime::Result<Result<Option<types::Match>, String>> {
+        Ok(Ok(None))
+    }
+
+    fn read_file(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: String,
+    ) -> wasmtime::Result<Result<Option<String>, ReadError>> {
+        Ok(Ok(None))
+    }
+
+    fn file_exists(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: String,
+    ) -> wasmtime::Result<Result<bool, ReadError>> {
+        Ok(Ok(false))
+    }
+
+    fn emit_fact(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: String,
+        _: String,
+    ) -> wasmtime::Result<Result<(), FactError>> {
+        Ok(Ok(()))
+    }
+
+    fn loc(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Option<NodeLocation>> {
+        Ok(Some(NodeLocation {
+            file: FILE.to_owned(),
+            line: 0,
+            column: 0,
+        }))
+    }
+
+    fn report(
+        &mut self,
+        _: Resource<CheckContext>,
+        node: u32,
+        message: Option<String>,
+        fix: Option<Fix>,
+    ) -> wasmtime::Result<()> {
+        self.reported.push(format!(
+            "check node={node} message={} fix={}",
+            message.unwrap_or_default(),
+            fix.map_or_else(|| "none".to_owned(), |f| f.text)
+        ));
+        Ok(())
+    }
+
+    fn today(&mut self, _: Resource<CheckContext>) -> wasmtime::Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn drop(&mut self, this: Resource<CheckContext>) -> wasmtime::Result<()> {
+        self.table.delete(this)?;
+        Ok(())
+    }
+}
+
+impl HostReduceContext for StubHost {
+    fn files(&mut self, _: Resource<ReduceContext>) -> wasmtime::Result<Vec<String>> {
+        Ok(vec!["a.ts".to_owned(), "b.ts".to_owned()])
+    }
+
+    fn facts(
+        &mut self,
+        _: Resource<ReduceContext>,
+        _: Option<String>,
+    ) -> wasmtime::Result<Vec<EmittedFact>> {
+        Ok(vec![EmittedFact {
+            kind: "stub".to_owned(),
+            file: "a.ts".to_owned(),
+            data: "{}".to_owned(),
+        }])
+    }
+
+    fn report(
+        &mut self,
+        _: Resource<ReduceContext>,
+        at: ReduceLocation,
+        message: Option<String>,
+    ) -> wasmtime::Result<()> {
+        self.reported.push(format!(
+            "reduce file={} line={:?} message={}",
+            at.file,
+            at.line,
+            message.unwrap_or_default()
+        ));
+        Ok(())
+    }
+
+    fn drop(&mut self, this: Resource<ReduceContext>) -> wasmtime::Result<()> {
+        self.table.delete(this)?;
+        Ok(())
+    }
+}
+
+impl Host for StubHost {}
+
+/// Builds everything a call needs: an engine, the fixture, a linker carrying the stub host,
+/// and a store.
+///
+/// A crate-level `expect` is what licenses the `expect` calls here. `clippy.toml`'s
+/// `allow-expect-in-tests` reaches `#[test]` functions and `#[cfg(test)]` modules; a helper
+/// in an integration-test crate is neither, so the identical line that passes inside a test
+/// body fails the gate out here.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper in a tests/ crate is outside clippy.toml's allow-expect-in-tests"
+)]
+fn linked() -> (wasmtime::Engine, Component, Linker<StubHost>) {
+    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+    let component = Component::new(&engine, WORLD_SHAPE).expect("the fixture is a valid component");
+    let mut linker = Linker::new(&engine);
+    Rule::add_to_linker::<_, HasSelf<_>>(&mut linker, |host| host)
+        .expect("the generated host traits satisfy every import the world declares");
+    (engine, component, linker)
+}
+
+#[test]
+fn a_component_targeting_the_world_instantiates_and_answers_both_probes() {
+    let (engine, component, linker) = linked();
+    let mut store = Store::new(&engine, StubHost::default());
+    let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
+
+    assert!(
+        rule.call_has_check(&mut store).expect("has-check returns"),
+        "the fixture declares a per-file pass"
+    );
+    assert!(
+        rule.call_has_reduce(&mut store)
+            .expect("has-reduce returns"),
+        "the fixture declares a cross-file pass"
+    );
+}
+
+/// The per-file phase, end to end: the host owns the context, lends it, and sees the report.
+///
+/// This is the two-resource shape exercised on the real world rather than on the
+/// two-method prototype the decision record measured. What crosses in this one call: a
+/// `borrow<check-context>`, a `list<match-entry>` of records carrying strings and handles, a
+/// `string` back out through `file-path`, and a `report` with one `option` present and the
+/// other absent — the call the TypeScript API could only express as a union second argument.
+#[test]
+fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
+    let (engine, component, linker) = linked();
+    let mut store = Store::new(&engine, StubHost::default());
+    let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
+
+    let ctx = store
+        .data_mut()
+        .table
+        .push(CheckContext)
+        .expect("the resource table accepts a context");
+
+    let captures = vec![
+        types::MatchEntry {
+            name: "callee".to_owned(),
+            node: 7,
+        },
+        types::MatchEntry {
+            name: "arg".to_owned(),
+            node: 9,
+        },
+    ];
+
+    rule.call_check(&mut store, Resource::new_borrow(ctx.rep()), &captures)
+        .expect("check returns");
+
+    assert_eq!(
+        store.data().reported,
+        vec![format!("check node=7 message={FILE}: callee,arg fix=none")],
+        "the guest read the borrowed context, saw both captures in order, and reported at \
+         the first one with a message and no fix"
+    );
+}
+
+/// The cross-file phase, end to end, over the types only it can reach.
+///
+/// `reduce-location` carries `option<u32>` positions because the reduce phase never touches
+/// parse trees and so has no node to take a position from. That the guest sends `none` for
+/// both and the host receives `None` is the assertion.
+#[test]
+fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
+    let (engine, component, linker) = linked();
+    let mut store = Store::new(&engine, StubHost::default());
+    let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
+
+    let ctx = store
+        .data_mut()
+        .table
+        .push(ReduceContext)
+        .expect("the resource table accepts a context");
+
+    rule.call_reduce(&mut store, Resource::new_borrow(ctx.rep()))
+        .expect("reduce returns");
+
+    assert_eq!(
+        store.data().reported,
+        vec!["reduce file=a.ts line=None message=2 files, 1 facts".to_owned()],
+        "the guest read the file list and the fact list and reported at a file with no line"
+    );
+}
+
+/// The load-time import check, and the two ways of counting that disagree.
+///
+/// `wasm-tools component wit` shows one import on this artifact,
+/// `lanekeep:host/types@0.1.0` — the number the decision record's "an import count of
+/// exactly one, the declared world" refers to. wasmtime's own view of the same bytes lists
+/// **three**: that instance, plus bare `check-context` and `reduce-context` *resource type*
+/// imports, which the component model requires because those types appear in the signature
+/// of an export. A load check written as `imports.len() == 1` against this API therefore
+/// rejects every component that takes a context — which is every rule. The instance imports
+/// are the ones that describe reachable capability, and they are what has to be checked.
+///
+/// One instance rather than three is also the measurement that settled one interface against
+/// three: a three-interface split leaves both context types nameable from both phases and
+/// changes nothing except this number.
+///
+/// **What the artifact declares is a subset of what the world offers, and any check written
+/// against it has to expect that too.** This guest calls three of `check-context`'s
+/// twenty-four methods, and the WIT embedded in its component-type section lists those three
+/// and no others; `node-location`, `binding-kind`, `read-error` and `fact-error` do not
+/// appear at all. A check comparing the artifact's WIT against the engine's would reject
+/// every real rule for a second, independent reason.
+#[test]
+fn the_component_imports_exactly_the_one_declared_interface() {
+    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+    let component = Component::new(&engine, WORLD_SHAPE).expect("the fixture is a valid component");
+
+    let ty = component.component_type();
+
+    let all: Vec<&str> = ty.imports(&engine).map(|(name, _)| name).collect();
+    assert_eq!(
+        all,
+        vec![
+            "lanekeep:host/types@0.1.0",
+            "check-context",
+            "reduce-context"
+        ],
+        "the raw list carries the two resource types the exports name"
+    );
+
+    let instances: Vec<&str> = ty
+        .imports(&engine)
+        .filter(|(_, item)| matches!(item.ty, ComponentItem::ComponentInstance(_)))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        instances,
+        vec!["lanekeep:host/types@0.1.0"],
+        "and exactly one of them is an instance the guest can call into"
+    );
+}
