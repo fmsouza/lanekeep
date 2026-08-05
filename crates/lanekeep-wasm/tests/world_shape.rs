@@ -358,12 +358,62 @@ fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
 /// three: a three-interface split leaves both context types nameable from both phases and
 /// changes nothing except this number.
 ///
+/// The subset claim asserted, not just described: what the instance carries is far less than
+/// what the world offers.
+///
+/// This is the second of the two ways a load-time import check can be written wrong, and it
+/// is independent of the first. The instance the guest imports declares only the functions it
+/// actually calls — three of `check-context`'s twenty-four and three of `reduce-context`'s
+/// three — so a check that compares an artifact against `wit/world.wit` for equality rejects
+/// every real rule. The test is discriminating rather than decorative: it names the three
+/// `check-context` methods the fixture calls and asserts that a method it does not call is
+/// absent, which fails the moment either half of the claim stops holding.
+#[test]
+fn the_imported_instance_declares_only_what_the_guest_calls() {
+    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+    let component = Component::new(&engine, WORLD_SHAPE).expect("the fixture is a valid component");
+    let ty = component.component_type();
+
+    let (_, types) = ty
+        .imports(&engine)
+        .find(|(name, _)| *name == "lanekeep:host/types@0.1.0")
+        .expect("the world's one instance import is there");
+    let ComponentItem::ComponentInstance(instance) = types.ty else {
+        panic!("the world's import is an instance");
+    };
+
+    let mut methods: Vec<&str> = instance
+        .exports(&engine)
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("[method]"))
+        .collect();
+    methods.sort_unstable();
+
+    assert_eq!(
+        methods,
+        vec![
+            "[method]check-context.file-path",
+            "[method]check-context.report",
+            "[method]check-context.root",
+            "[method]reduce-context.facts",
+            "[method]reduce-context.files",
+            "[method]reduce-context.report",
+        ],
+        "exactly the six the fixture calls, out of the twenty-seven the world declares"
+    );
+    assert!(
+        !methods.iter().any(|name| name.contains("query-subtree")),
+        "a method the fixture never calls is absent from the artifact entirely"
+    );
+}
+
 /// **What the artifact declares is a subset of what the world offers, and any check written
 /// against it has to expect that too.** This guest calls three of `check-context`'s
 /// twenty-four methods, and the WIT embedded in its component-type section lists those three
 /// and no others; `node-location`, `binding-kind`, `read-error` and `fact-error` do not
 /// appear at all. A check comparing the artifact's WIT against the engine's would reject
-/// every real rule for a second, independent reason.
+/// every real rule for a second, independent reason — asserted by
+/// [`the_imported_instance_declares_only_what_the_guest_calls`].
 #[test]
 fn the_component_imports_exactly_the_one_declared_interface() {
     let engine = engine().expect("the shipped wasmtime configuration builds an engine");

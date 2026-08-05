@@ -330,10 +330,14 @@ job. Stage first and compare `git diff --cached`. This was latent in the Homebre
 only run that would have hit it is the first one, against a tap with no formula in it yet.
 
 **A WIT type declared inside an interface is not in scope in a world that imports it.** The
-world needs `use types.{check-context};` for every type it names in an export signature, and the
-error without it is "name `node` is not defined" — which reads as though the type does not exist
-rather than as a scoping rule. The design spec's own sketch of `wit/world.wit` had this bug and
-did not parse.
+world needs `use types.{check-context};` for every type it names in an export signature. Deleting
+that line from `crates/lanekeep-wasm/wit/world.wit` gives ``name `check-context` does not exist``
+under `wasm-tools` 1.255.0, pointing at the export's parameter — it names whichever type the first
+offending signature mentions, and it reads as though the type is missing rather than out of scope.
+A sketch carrying the bug is in `docs/superpowers/specs/2026-08-04-rust-rule-authoring-design.md`
+§2.7, whose `world rule` names `rule-context` and `reduce-context` with no `use`. The sub-project's
+own sketch, in `2026-08-04-wit-host-api-design.md` §3, does *not* have it: it carries the `use` and
+documents the trap in a doc comment, and extracted verbatim it parses.
 
 **Every WIT comment is a doc comment, including `//`.** `wit-parser` attaches a plain `//` block
 to the item that follows exactly as it attaches `///`, so `wasm-tools component wit` prints the
