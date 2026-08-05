@@ -34,6 +34,7 @@ lanekeep-lang-js = { version = "0.6.0", path = "crates/lanekeep-lang-js" }
 lanekeep-lang-go = { version = "0.6.0", path = "crates/lanekeep-lang-go" }
 lanekeep-lang-python = { version = "0.6.0", path = "crates/lanekeep-lang-python" }
 lanekeep-lang-rust = { version = "0.6.0", path = "crates/lanekeep-lang-rust" }
+lanekeep-nodes = { version = "0.6.1", path = "crates/lanekeep-nodes" }
 lanekeep-query = { version = "0.6.0", path = "crates/lanekeep-query" }
 lanekeep-report = { version = "0.6.0", path = "crates/lanekeep-report" }
 lanekeep-server = { version = "0.6.0", path = "crates/lanekeep-server" }

@@ -1,6 +1,6 @@
 [package]
-name = "lanekeep-js"
-description = "Embedded JavaScript sandbox and host API for lanekeep rules."
+name = "lanekeep-nodes"
+description = "The node arena: parsed-tree handles shared across lanekeep's rule-execution engines."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,12 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-lanekeep-core = { workspace = true }
 lanekeep-lang = { workspace = true }
-lanekeep-nodes = { workspace = true }
 lanekeep-query = { workspace = true }
-rquickjs = { workspace = true }
-thiserror = { workspace = true }
 tree-sitter = { workspace = true }
 
 [dev-dependencies]

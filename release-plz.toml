@@ -135,6 +135,7 @@ changelog_include = [
   "lanekeep-lang-python",
   "lanekeep-lang-rust",
   "lanekeep-languages",
+  "lanekeep-nodes",
   "lanekeep-query",
   "lanekeep-report",
   "lanekeep-server",

@@ -104,6 +104,7 @@ crates/
   lanekeep-core      engine: walker, query evaluation, facts, violations, Rule trait
   lanekeep-js        the sandbox: QuickJS, host API, TS stripping, module loader
   lanekeep-query     tree-sitter query parsing and compilation
+  lanekeep-nodes     the node arena: parsed-tree handles shared by every rule-execution engine
   lanekeep-lang      Language trait and registry
   lanekeep-lang-js   TS/TSX/JS/JSX grammars, binding resolution
   lanekeep-lang-python  Python grammar, binding resolution

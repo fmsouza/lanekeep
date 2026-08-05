@@ -1,29 +1,32 @@
-//! Node handles: how AST nodes cross into the sandbox.
+//! Node handles: how a parsed file's nodes cross into a rule.
 //!
 //! Architecture §14 requires nodes to cross the boundary as opaque handles rather than as
-//! materialized JavaScript objects. Materializing an AST is the cost that makes native
-//! tooling with JavaScript plugins slow, and it is a decision that cannot be walked back
-//! once rules depend on the object shape.
+//! materialized objects. Materializing an AST is the cost that makes native tooling with
+//! JavaScript plugins slow, and it is a decision that cannot be walked back once rules
+//! depend on the object shape. Nothing about that argument is specific to one engine, which
+//! is why this type lives in its own crate rather than inside the engine that first needed
+//! it — see the crate-level docs for which engines that is.
 //!
 //! # Why paths rather than stored nodes
 //!
-//! The obvious arena holds `Node<'tree>` and hands out indices. It does not compile: the
-//! engine's `Function::new` requires `'static` closures, so nothing captured by a host
-//! function may borrow from a tree living on the caller's stack.
+//! The obvious arena holds `Node<'tree>` and hands out indices. It does not compile against
+//! `lanekeep-js`'s engine: rquickjs's `Function::new` requires `'static` closures, so
+//! nothing captured by a host function may borrow from a tree living on the caller's stack.
 //!
 //! So the arena **owns** the tree and stores, for each handle, the path of child indices
 //! from the root. Resolving a handle walks that path — `O(depth)`, where depth is typically
 //! ten to thirty — and every method does its work internally rather than returning a
 //! borrowed `Node`, which is what keeps the borrow checker satisfied without `unsafe`.
 //!
-//! Two properties this buys, both of which matter more than the lookup cost:
+//! Two properties this buys, both of which matter more than the lookup cost, and neither of
+//! which is specific to the engine that first needed them:
 //!
 //! **Laziness.** Only nodes actually handed to a rule are interned. A file whose query
 //! matches nothing costs nothing here, which is the whole point of the query gate.
 //!
 //! **Stable identity.** Handles are interned by node id, so the same node reached twice —
-//! `ctx.parent(a)` and `ctx.parent(b)` for siblings — yields the same number. Rules compare
-//! handles with `===`, and that has to mean what it appears to mean.
+//! a parent lookup from two siblings, say — yields the same number. A rule comparing two
+//! handles for equality relies on that, and it has to mean what it appears to mean.
 
 use lanekeep_query::CompiledQuery;
 use std::collections::HashMap;

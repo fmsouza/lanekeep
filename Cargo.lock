@@ -844,6 +844,7 @@ dependencies = [
 name = "lanekeep-core"
 version = "0.6.1"
 dependencies = [
+ "blake3",
  "globset",
  "ignore",
  "memchr",
@@ -873,10 +874,10 @@ dependencies = [
 name = "lanekeep-js"
 version = "0.6.1"
 dependencies = [
- "blake3",
  "lanekeep-core",
  "lanekeep-lang",
  "lanekeep-lang-js",
+ "lanekeep-nodes",
  "lanekeep-query",
  "rquickjs",
  "thiserror",
@@ -937,6 +938,16 @@ dependencies = [
  "lanekeep-lang-js",
  "lanekeep-lang-python",
  "lanekeep-lang-rust",
+]
+
+[[package]]
+name = "lanekeep-nodes"
+version = "0.6.1"
+dependencies = [
+ "lanekeep-lang",
+ "lanekeep-lang-js",
+ "lanekeep-query",
+ "tree-sitter",
 ]
 
 [[package]]

@@ -10,6 +10,12 @@
 //! Every addition to the host API widens the trust boundary and bumps the API version that
 //! feeds the cache key.
 //!
+//! `FileAccess`/`ReadError` and `NodeArena`/`Handle` are re-exported rather than owned here:
+//! the first lives in `lanekeep-core`, the second in `lanekeep-nodes`. Both moved out once a
+//! second engine (`lanekeep-wasm`) needed the identical definitions — a copy per engine
+//! would let one run enforce two different notions of "the same file" or "the same node",
+//! each correct alone and disagreeing with the other.
+//!
 //! # How absence is achieved
 //!
 //! Two mechanisms, and the first is much stronger than the second.
@@ -33,26 +39,24 @@
 //! arrive in later milestones.
 
 pub mod error;
-pub mod files;
 pub mod host;
 pub mod limits;
 pub mod loader;
-pub mod nodes;
 pub mod sandbox;
 pub mod typescript;
 
 pub use error::SandboxError;
-pub use files::{FileAccess, ReadError};
 pub use host::{
     EmittedFact, HOST_API_VERSION, HostContext, ReduceContext, ReduceFact, ReduceReport, Report,
     merge_file,
 };
+pub use lanekeep_core::files::{FileAccess, ReadError};
 /// Re-exported so consumers can supply languages without depending on `lanekeep-lang` directly.
 pub use lanekeep_lang::Language;
+pub use lanekeep_nodes::{Handle, NodeArena};
 pub use limits::{
     DEFAULT_GLOBAL_TIMEOUT, DEFAULT_MEMORY_BYTES, DEFAULT_RULE_TIMEOUT, Limits, RunClock,
 };
 pub use loader::{BuiltinSource, HOST_MODULE, ResolveError, RuleLoader, RuleResolver, RuleRoot};
-pub use nodes::{Handle, NodeArena};
 pub use sandbox::Sandbox;
 pub use typescript::{StripError, Unsupported, strip_types};

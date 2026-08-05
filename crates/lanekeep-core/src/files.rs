@@ -11,7 +11,7 @@
 //!
 //! **Tracking.** Every read is recorded as `(path, content_hash)`, including reads that
 //! found nothing. That record is what a cache entry needs to know when it has gone stale;
-//! see [`lanekeep_core::tracked`].
+//! see [`crate::tracked`].
 //!
 //! # Reads are memoized within a run
 //!
@@ -19,13 +19,21 @@
 //! between. A rule that saw a file change under it could report differently on two runs over
 //! identical input, which is the determinism invariant — and the cache would record one of
 //! the two hashes with no way to say which was used.
+//!
+//! # Why this lives in `lanekeep-core` rather than in an engine crate
+//!
+//! Every engine that runs a rule needs the same confinement and the same tracking — a read
+//! `lanekeep-wasm`'s component runtime allows that `lanekeep-js`'s sandbox forbids, or
+//! records differently, would make a cache entry mean something different depending on
+//! which engine happened to produce it. Defining `FileAccess` once, below every engine
+//! rather than inside one of them, is what keeps that question from being askable.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use lanekeep_core::tracked::{ContentHash, TrackedRead};
-use lanekeep_core::{FilePath, tracked};
+use crate::tracked::{ContentHash, TrackedRead};
+use crate::{FilePath, tracked};
 use thiserror::Error;
 
 /// Why a read was refused.
@@ -258,7 +266,13 @@ fn normalize_key(path: &str) -> String {
 /// first `..` would collapse to `etc/passwd`, which looks contained, and the read would
 /// then resolve to `<root>/etc/passwd`: not an escape, but silently the wrong file. Depth
 /// counts only real segments, so a marker can never be consumed.
-pub(crate) fn normalize(path: &Path) -> PathBuf {
+///
+/// `pub` rather than `pub(crate)`: `lanekeep-js`'s module loader resolves rule specifiers
+/// against the same lexical rule (a different root, a different reason to reject `..`, the
+/// identical algorithm), and sharing this one function is what keeps that algorithm defined
+/// once rather than copied at its second call site.
+#[must_use]
+pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     let mut depth = 0usize;
 

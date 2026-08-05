@@ -16,11 +16,17 @@
 //! in cache entries, and in suppression comments users type by hand. Getting them wrong is
 //! expensive in a way that getting the walker wrong is not, because only these are visible
 //! from outside.
+//!
+//! Tracked, confined file reads (`FileAccess`) live here too, alongside `tracked` rather
+//! than inside whichever engine happened to need them first — every engine that runs a rule
+//! needs the identical confinement and tracking rules, and a copy per engine is exactly the
+//! kind of drift lanekeep's own self-check rules exist to catch elsewhere.
 
 pub mod card;
 pub mod changed;
 pub mod discovery;
 pub mod fact;
+pub mod files;
 pub mod fix;
 pub mod gates;
 pub mod location;
@@ -34,6 +40,7 @@ pub use card::{CardProblem, Examples, RuleCard};
 pub use changed::ChangeError;
 pub use discovery::{Discovery, DiscoveryError};
 pub use fact::Fact;
+pub use files::{FileAccess, ReadError};
 pub use fix::Fix;
 pub use gates::{CompiledGates, GateError, Gates};
 pub use location::{FilePath, Location, Position};

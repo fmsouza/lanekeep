@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
 memchr = { workspace = true }

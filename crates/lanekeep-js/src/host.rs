@@ -33,11 +33,10 @@ use rquickjs::{Ctx, Function, Object, Value};
 
 use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 
+use lanekeep_core::files::FileAccess;
 use lanekeep_core::fix::Fix;
+use lanekeep_nodes::{Handle, NodeArena};
 use lanekeep_query::CompiledQuery;
-
-use crate::files::FileAccess;
-use crate::nodes::{Handle, NodeArena};
 
 /// The version of the `ctx` surface this build exposes.
 ///
