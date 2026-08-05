@@ -21,6 +21,13 @@
 //! than inside whichever engine happened to need them first — every engine that runs a rule
 //! needs the identical confinement and tracking rules, and a copy per engine is exactly the
 //! kind of drift lanekeep's own self-check rules exist to catch elsewhere.
+//!
+//! So do the execution budgets (`Limits`, `RunClock`) and their enforcement (`Budget`,
+//! `Trip`), for a related but sharper reason: there is exactly one global run budget, not
+//! one per engine, so two independent `RunClock`s would each be correct in isolation while
+//! the run as a whole overran both. See [`limits`] for why that failure needs no maintenance
+//! drift to happen — unlike the per-engine-instance types above, it is wrong the moment a
+//! second copy exists at all.
 
 pub mod card;
 pub mod changed;
@@ -29,6 +36,7 @@ pub mod fact;
 pub mod files;
 pub mod fix;
 pub mod gates;
+pub mod limits;
 pub mod location;
 pub mod rule_id;
 pub mod severity;
@@ -43,6 +51,9 @@ pub use fact::Fact;
 pub use files::{FileAccess, ReadError};
 pub use fix::Fix;
 pub use gates::{CompiledGates, GateError, Gates};
+pub use limits::{
+    DEFAULT_GLOBAL_TIMEOUT, DEFAULT_MEMORY_BYTES, DEFAULT_RULE_TIMEOUT, Limits, RunClock,
+};
 pub use location::{FilePath, Location, Position};
 pub use rule_id::{Namespace, ParseRuleIdError, RuleId};
 pub use severity::{ParseSeverityError, Severity};

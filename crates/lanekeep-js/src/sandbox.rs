@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use lanekeep_core::limits::{Budget, Limits, RunClock, Trip};
 use lanekeep_lang::Language;
 use rquickjs::context::intrinsic;
 use rquickjs::promise::PromiseState;
@@ -10,7 +11,6 @@ use rquickjs::{CatchResultExt, Context, Ctx, FromJs, Module, Runtime};
 
 use crate::error::SandboxError;
 use crate::host::{HostContext, ReduceContext};
-use crate::limits::{Budget, Limits, RunClock, Trip};
 use crate::loader::{LoadedModules, RuleLoader, RuleResolver, RuleRoot};
 
 /// The intrinsics rule code gets.
