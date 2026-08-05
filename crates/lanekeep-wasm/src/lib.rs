@@ -41,22 +41,28 @@
 //! # What linking it costs
 //!
 //! Measured in this workspace on 2026-08-05, Apple M3 Max, `aarch64-apple-darwin`,
-//! `rustc`/`cargo` 1.95.0, under `[profile.release]` (`lto = "thin"`,
-//! `codegen-units = 1`, `strip = "symbols"`), with an `Engine` constructed and immediately
-//! dropped through `std::hint::black_box` — no component loaded, nothing executed:
+//! `rustc`/`cargo` 1.95.0, with an `Engine` constructed and immediately dropped through
+//! `std::hint::black_box` from a reachable call in `lanekeep-cli`'s `main` — no component
+//! loaded, nothing executed. Both profiles strip symbols.
 //!
-//! | Build | Stripped size |
-//! |---|---|
-//! | `lanekeep-cli` without `wasmtime` | `MEASURE_BASELINE` |
-//! | `lanekeep-cli` with `wasmtime` + `cranelift` | `MEASURE_WITH` |
-//! | Delta | **`MEASURE_DELTA`** |
+//! | Profile | Without `wasmtime` | With `wasmtime` + `cranelift` | Delta |
+//! |---|---|---|---|
+//! | `release` (`lto = "thin"`) | 9,763,536 | 15,677,392 | **+5,913,856** |
+//! | `dist` (`lto = "fat"`, what ships) | 9,425,712 | 15,235,440 | **+5,809,728** |
 //!
-//! `MEASURE_COMPARISON`
+//! The `release` delta lands 112 bytes — 0.002% — under the +5,913,968 the design spike
+//! measured against its own throwaway baseline, so this workspace's dependency graph does
+//! not change the answer. It refutes two written estimates that were never measured: the
+//! design spec's "+15–25 MB" and the decision record's "40 MB+" headline, the latter by
+//! about a factor of seven.
 //!
-//! The number bounds *what merely linking the dependency costs*. It is not what a runtime
-//! that actually loads and instantiates components costs, which is larger and which
-//! nobody has measured. The profile that ships is `[profile.dist]` (fat LTO); whether it
-//! shaves a similar fraction off this delta is an expectation, not a measurement.
+//! The `dist` row settles something both of those documents left open as an expectation.
+//! Fat LTO does *not* shave a similar fraction off the `wasmtime` delta as off the
+//! baseline: the baseline shrinks 3.46% and the delta only 1.76%, so `cranelift`'s
+//! contribution is roughly half as compressible as the code it is added to.
+//!
+//! What the numbers do not bound: what a runtime that actually loads and instantiates
+//! components costs, which is larger and which nobody has measured.
 
 use wasmtime::{Config, Engine, Result};
 
