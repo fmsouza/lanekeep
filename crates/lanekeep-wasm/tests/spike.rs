@@ -54,15 +54,23 @@ fn a_component_loads_instantiates_and_answers() {
 
 /// The sandbox invariant, asserted as behavior rather than as a claim.
 ///
-/// The `Linker` above has nothing added to it, and this one says so on purpose: an empty
-/// linker can only satisfy a component that imports nothing. Had the guest been built for
-/// the default target, the same assertion would fail — and it would fail naming the import
-/// it could not resolve, which is the diagnostic worth having.
+/// Nothing is added to this `Linker`, deliberately: an empty linker can only satisfy a
+/// component that imports nothing, so instantiating through one *is* the import check, and
+/// a widened import list fails here naming the import that could not be resolved.
 ///
-/// This is a weaker check than the loader will eventually do, because it happens after the
-/// component is compiled rather than before it is trusted. It is here so that a future
-/// change to the fixture's build cannot quietly widen its import list without a test
-/// noticing.
+/// **What this does not prove is that the target is the reason.** Measured 2026-08-05 with
+/// `cargo component` 0.21.1: this guest built for the default `wasm32-wasip1` target also
+/// imports nothing, because `add` allocates nothing and touches no part of `std` that
+/// reaches the WASI adapter. The same scaffold returning a `String` imports ten interfaces
+/// on that target — among them `wasi:clocks/wall-clock`, `wasi:filesystem/types` and
+/// `wasi:filesystem/preopens` — and zero on `wasm32-unknown-unknown`. So the default
+/// target's danger is latent rather than visible: it looks clean on a guest this small and
+/// grows a clock and a filesystem the moment a real rule formats a message. A per-fixture
+/// assertion cannot catch that; only building on `wasm32-unknown-unknown` and checking
+/// every artifact's import list at load can.
+///
+/// This is also weaker than the loader will eventually be, because it happens after the
+/// component is compiled rather than before it is trusted.
 #[test]
 fn the_component_imports_nothing_at_all() {
     let engine = engine().expect("the shipped wasmtime configuration builds an engine");

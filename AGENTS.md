@@ -274,6 +274,20 @@ that "parsed". On a React Native codebase that hid most of the code and produced
 positives in one rule. `language` now takes one or several and defaults to
 `['typescript', 'tsx']`, and a rule does not run on a file whose language it does not name.
 
+**A WebAssembly component's import list depends on what the guest touches, not only on the
+target it was built for — so a small fixture cannot tell you the target is right.** Rule
+components must be built for `wasm32-unknown-unknown`; `cargo component`'s default is
+`wasm32-wasip1`, whose components import a wall clock and two filesystem interfaces, which are
+exactly the capabilities the sandbox exists to withhold. The trap is that this is invisible at
+small scale. Measured 2026-08-05 on `cargo component` 0.21.1: a guest exporting
+`add: func(u32, u32) -> u32` has **zero** imports on *both* targets, because it allocates
+nothing and reaches no part of `std` that touches the WASI adapter. The scaffold's
+`hello-world: func() -> string`, one `String` away, has **ten** on `wasm32-wasip1` — including
+`wasi:clocks/wall-clock`, `wasi:filesystem/types` and `wasi:filesystem/preopens` — and zero on
+`wasm32-unknown-unknown`. So a fixture built on the wrong target passes an import assertion
+right up until a real rule formats a violation message. Pin the target at the build *and*
+check every artifact's import list at load; neither substitutes for the other.
+
 **`cargo publish` needs a crate's dev-dependencies on the registry too.** It resolves them when
 it packages, so a crate whose dev-dependency is unpublished cannot go up even though nothing it
 ships uses it. `lanekeep-rules` dev-depends on `lanekeep-testkit` for `RuleTester`, which puts

@@ -13,6 +13,15 @@
 //! property is readable off the artifact with `wasm-tools component wit` before a byte
 //! executes.
 //!
+//! That property is a consequence of the build target, and it is not self-announcing.
+//! Rule components are built for `wasm32-unknown-unknown`, whose import list is exactly
+//! the declared world; `cargo component`'s default target is `wasm32-wasip1`, whose
+//! components import a wall clock and two filesystem interfaces as soon as the guest
+//! touches the parts of `std` that reach the WASI adapter. A guest small enough to touch
+//! none of them looks identical on both targets, which is why the target is pinned at the
+//! build and the import list is checked at load, rather than either one standing in for
+//! the other.
+//!
 //! # The runtime configuration, recorded rather than inferred
 //!
 //! `wasmtime` **47.0.3**, with `default-features = false` and
