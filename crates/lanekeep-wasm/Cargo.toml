@@ -42,6 +42,11 @@ lanekeep-lang = { workspace = true }
 # query methods did.
 lanekeep-query = { workspace = true }
 
+# `serde_json` for the one thing QuickJS did structurally and a component cannot: deciding
+# whether the payload a guest calls JSON is JSON, and is an object. `JSON.stringify`
+# guaranteed both under `lanekeep-js`; here they are checked, in `src/facts.rs`.
+serde_json = { workspace = true }
+
 # Parsing, so the tests can build a real tree for a real context to be lent over. The engine
 # itself never picks a grammar — the file does, through `lanekeep-languages` — so these are
 # the tests' dependencies and not the crate's.

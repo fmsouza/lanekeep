@@ -92,6 +92,12 @@
 pub mod bindings;
 pub mod host;
 
+// Private, and the visibility is the claim: nothing outside this crate validates a fact,
+// because nothing outside it receives one from a guest. The module exists so the three
+// answers can be pinned down without a store, a component and a parsed file, not so callers
+// can reach them.
+mod facts;
+
 use wasmtime::{Config, Engine, Result};
 
 /// Builds the [`Engine`] rule components execute on.

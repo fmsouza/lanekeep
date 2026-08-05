@@ -10,9 +10,9 @@
 //!
 //! # What is implemented so far
 //!
-//! `check-context`'s navigation, reporting, binding resolution, scoped queries and tracked
-//! reads. Everything else the world declares — facts, `today`, and the whole of
-//! `reduce-context` — returns an error naming itself, which traps the call.
+//! `check-context`'s navigation, reporting, binding resolution, scoped queries, tracked reads
+//! and facts. Everything else the world declares — `today`, and the whole of `reduce-context` —
+//! returns an error naming itself, which traps the call.
 //!
 //! **Trapping rather than answering, deliberately.** Every plausible placeholder is a
 //! plausible *answer*: `none` from `read-file` reads as "the file is not there", an empty list
@@ -209,6 +209,27 @@ pub struct Report {
     pub fix: Option<Fix>,
 }
 
+/// A fact a rule emitted, before the engine attaches the file and rule it came from.
+///
+/// The fact analog of [`Report`] above, and deliberately not a [`lanekeep_core::Fact`] for the
+/// same reason: a rule supplies a `kind` and a payload, and the identity around them — which
+/// rule, which file, which position in that file's emission order — comes from the engine.
+/// `lanekeep-engine` builds the full `Fact` from these three when it wires this crate, exactly
+/// as it already does from `lanekeep_js::EmittedFact`.
+///
+/// Not the world's `emitted-fact` either, which is a different record for a different phase:
+/// that one carries `file`, because it is what the *reduce* phase reads and the file is by then
+/// known. Nothing merges a file into `data` here — see [`crate::host::HostState::emit_fact`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fact {
+    /// The `kind` the reduce phase selects on. Never empty; a fact with an empty kind is
+    /// refused rather than recorded.
+    pub kind: String,
+    /// The payload, exactly as the guest serialized it. Always a JSON object, checked rather
+    /// than assumed, and never re-serialized.
+    pub data: String,
+}
+
 /// Host state for one file: the tree a rule is reading and what it reported about it.
 ///
 /// This is the representation `wit/world.wit`'s `check-context` resource is stored as — the
@@ -222,6 +243,13 @@ pub struct CheckContext {
     arena: NodeArena,
     file_path: String,
     reports: Vec<Report>,
+    /// What the rule emitted for the reduce phase, in the order it emitted it.
+    ///
+    /// A `Vec` and never a set or a map: within a file the order a rule emitted in is the only
+    /// order it can have meant, and [`lanekeep_core::fact::sort`] preserves it by assigning a
+    /// sequence from this position. Deduplicating would be the engine inventing a claim the
+    /// rule did not make.
+    facts: Vec<Fact>,
     resolver: Option<Arc<dyn BindingResolver>>,
     /// Tracked, confined access to the rest of the project, when the host granted any.
     ///
@@ -263,6 +291,7 @@ impl std::fmt::Debug for CheckContext {
             .field("language", &self.language.id())
             .field("interned_nodes", &self.arena.len())
             .field("reports", &self.reports.len())
+            .field("facts", &self.facts.len())
             .field("has_resolver", &self.resolver.is_some())
             // Whether reads are possible, and not how many were made. `dependencies()` builds a
             // `Vec`, clones a `FilePath` per entry and sorts it, which is a lot of work to print
@@ -298,6 +327,7 @@ impl CheckContext {
             arena,
             file_path: file_path.to_owned(),
             reports: Vec::new(),
+            facts: Vec::new(),
             resolver: None,
             files: None,
             language,
@@ -447,6 +477,21 @@ impl CheckContext {
     #[must_use]
     pub fn take_reports(&mut self) -> Vec<Report> {
         std::mem::take(&mut self.reports)
+    }
+
+    /// Take every fact emitted so far, in emission order, leaving the context empty.
+    ///
+    /// Emptying for the reason [`CheckContext::take_reports`] empties: a context read twice
+    /// must not emit a fact twice. It matters more here than there, because a duplicated fact
+    /// does not merely appear twice in output — it changes what a counting or first-seen-wins
+    /// `reduce` concludes about the corpus.
+    ///
+    /// Emission order, and the engine turns that position into
+    /// [`lanekeep_core::Fact::sequence`]. Assigned from the outside rather than carried here so
+    /// that a rule cannot reorder its own facts relative to another file's.
+    #[must_use]
+    pub fn take_facts(&mut self) -> Vec<Fact> {
+        std::mem::take(&mut self.facts)
     }
 }
 
@@ -983,16 +1028,53 @@ impl HostCheckContext for HostState {
         Ok(files.exists(&path).map_err(wit_read_error))
     }
 
-    // --- declared, not yet implemented ----------------------------------------------------
+    // --- facts -----------------------------------------------------------------------------
+    //
+    // The one method on this surface whose *contract* differs from its QuickJS counterpart
+    // rather than only its calling convention. `JSON.stringify` made "the payload is a JSON
+    // object" true by construction; a guest hands over a `string` and the host has to find out.
+    // `crate::facts` owns that question and carries the reasoning.
 
+    /// Record a fact for the reduce phase, or refuse it through the world's own error case.
+    ///
+    /// Nothing is recorded when the fact is refused, which is the half a permissive
+    /// implementation gets wrong quietly: a malformed payload written into a cache entry
+    /// surfaces on a later run, in the reduce phase, as far from the rule that emitted it as
+    /// this design allows.
+    ///
+    /// **The file is not merged in here, and that is a departure from `lanekeep-js` worth
+    /// stating.** Its `merge_file` splices a `"file"` key into a fact's serialized payload so a
+    /// rule cannot misattribute a cross-file violation by shadowing it — but it is called by
+    /// `lanekeep-engine` at *reduce* time, not at emit time, and the world removes the need for
+    /// it: `emitted-fact` carries `file` as its own field, filled by the host from the context,
+    /// where a rule's own `"file"` key is inert data inside `data`. Doing it here would put a
+    /// `"file"` in the stored payload that the engine's reduce-time merge would then duplicate,
+    /// and would make this engine's cached `data` differ from the other's for the same fact.
     fn emit_fact(
         &mut self,
-        _: Resource<CheckContext>,
-        _: String,
-        _: String,
+        this: Resource<CheckContext>,
+        kind: String,
+        data: String,
     ) -> wasmtime::Result<Result<(), FactError>> {
-        Err(not_yet("check-context.emit-fact", "the facts"))
+        let context = self.check_context_mut(&this)?;
+
+        // A value, not a trap. The world declares three cases and every one of them is a
+        // property of what the *rule* sent — deterministic in `(bytes, path, ruleset, config,
+        // tracked reads)` — so a rule handling one cannot make the run's output depend on
+        // anything the cache key does not already cover. That is the whole difference from the
+        // read methods above, where the missing thing was the host's own authority.
+        if let Err(problem) = crate::facts::validate(&kind, &data) {
+            return Ok(Err(problem));
+        }
+
+        // The guest's bytes, moved rather than re-rendered. A round trip through
+        // `serde_json::Value` would substitute this workspace's map ordering for the guest's
+        // own — see `crate::facts`.
+        context.facts.push(Fact { kind, data });
+        Ok(Ok(()))
     }
+
+    // --- declared, not yet implemented ----------------------------------------------------
 
     fn today(&mut self, _: Resource<CheckContext>) -> wasmtime::Result<Option<String>> {
         Err(not_yet(
