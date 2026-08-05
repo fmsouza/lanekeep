@@ -22,7 +22,21 @@ categories.workspace = true
 exclude = ["tests/**"]
 
 [dependencies]
+# `lanekeep-core` for `Fix`, which is what `report`'s `fix` parameter becomes once the node
+# it names has been resolved to a byte range, and `lanekeep-nodes` for the arena both engines
+# read. Neither edge existed before `src/host.rs`, because `cargo machete` fails an unused
+# dependency and the two context types were empty until it arrived.
+lanekeep-core = { workspace = true }
+lanekeep-nodes = { workspace = true }
 wasmtime = { workspace = true }
+
+# Parsing, so the tests can build a real tree for a real context to be lent over. The engine
+# itself never picks a grammar — the file does, through `lanekeep-languages` — so these are
+# the tests' dependencies and not the crate's.
+[dev-dependencies]
+lanekeep-lang = { workspace = true }
+lanekeep-lang-js = { workspace = true }
+tree-sitter = { workspace = true }
 
 [lints]
 workspace = true

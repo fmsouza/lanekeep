@@ -164,9 +164,17 @@ interface types {
     text: func(n: node) -> option<string>;
     /// Whether the node is named in the grammar, as opposed to an anonymous token.
     is-named: func(n: node) -> bool;
-    /// The node's zero-based start line.
+    /// The node's one-based start line.
+    ///
+    /// One-based, matching every other position lanekeep reports: `node-location` below,
+    /// the violations the engine sorts by `(ruleId, file, line, column)`, and the column
+    /// `lanekeep-query` builds by adding one to tree-sitter's own zero-based figure. Both
+    /// engines read the same `NodeArena::position`, so there is one answer rather than a
+    /// convention per boundary — a zero-based reading here would put every component rule's
+    /// violations one line and one column off what the identical TypeScript rule reports,
+    /// which looks like a rule bug and is not one.
     line: func(n: node) -> option<u32>;
-    /// The node's zero-based start column.
+    /// The node's one-based start column, on the same footing as `line`.
     column: func(n: node) -> option<u32>;
     /// The node's parent, or none at the root.
     parent: func(n: node) -> option<node>;

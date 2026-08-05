@@ -6,11 +6,20 @@
 //! world no host can implement is the same document from the other end.
 //!
 //! **This is not a rule and the host here is not the host.** Every value the stub returns is
-//! a constant, and the two context types are still empty. What is under test is the *shape*:
+//! a constant and nothing reads the context it was handed. What is under test is the *shape*:
 //! that the generated traits can be implemented, that a host-owned context can be lent to a
 //! guest export as a `borrow<>`, and that records, options and lists of records survive the
-//! canonical ABI in both directions. The real implementations arrive with `src/host.rs`.
+//! canonical ABI in both directions. `tests/navigation.rs` is where the real host is
+//! exercised.
+//!
+//! The one thing that has to be real here is the value pushed into the table.
+//! `check-context`'s representation is [`lanekeep_wasm::host::CheckContext`], which owns a
+//! parsed file — so [`context`] parses one. A representation that could be conjured without a
+//! tree would be a context that could claim to be reading a file it does not have.
 
+use lanekeep_lang::Language;
+use lanekeep_lang_js::TypeScript;
+use lanekeep_nodes::NodeArena;
 use lanekeep_wasm::bindings::types::{
     BindingKind, CheckContext, EmittedFact, FactError, Fix, Host, HostCheckContext,
     HostReduceContext, NodeLocation, ReadError, ReduceContext, ReduceLocation,
@@ -258,6 +267,22 @@ fn linked() -> (wasmtime::Engine, Component, Linker<StubHost>) {
     (engine, component, linker)
 }
 
+/// A context to lend. Nothing in this file reads it — the stub answers every method with a
+/// constant — but the representation owns a parsed file, so one has to be parsed.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper in a tests/ crate is outside clippy.toml's allow-expect-in-tests"
+)]
+fn context() -> CheckContext {
+    let source = "const x = 1;\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&TypeScript.grammar())
+        .expect("grammar loads");
+    let tree = parser.parse(source, None).expect("parses");
+    CheckContext::new(NodeArena::new(tree, source.to_owned()), FILE)
+}
+
 #[test]
 fn a_component_targeting_the_world_instantiates_and_answers_both_probes() {
     let (engine, component, linker) = linked();
@@ -291,7 +316,7 @@ fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
     let ctx = store
         .data_mut()
         .table
-        .push(CheckContext)
+        .push(context())
         .expect("the resource table accepts a context");
 
     let captures = vec![

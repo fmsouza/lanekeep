@@ -90,6 +90,7 @@
 //! components costs, which is larger and which nobody has measured.
 
 pub mod bindings;
+pub mod host;
 
 use wasmtime::{Config, Engine, Result};
 

@@ -367,6 +367,13 @@ when something tries to run. The `with` key is `package/interface@version.resour
 before the resource name; a slash there fails with "interfaces were specified in the `with` config
 option but are not referenced in the target world", which reads like the interface name is wrong.
 
+**A wasm trap's rendered error already contains the method name, so asserting on it proves
+nothing.** wasmtime prefixes a host function's error with a backtrace whose top frame is spelled
+`wit-component:shim!indirect-lanekeep:host/types@0.1.0-[method]check-context.today`. A test doing
+`format!("{err:?}").contains("check-context.today")` therefore passes whatever the host said — it
+survived a mutation that made the host name a different method entirely, which is how it was
+found. Assert on `err.root_cause().to_string()`, which is the host's own message and nothing else.
+
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
 and re-checks forever — pinning a core while the output looks exactly like a tool that is

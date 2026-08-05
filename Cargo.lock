@@ -1005,6 +1005,11 @@ dependencies = [
 name = "lanekeep-wasm"
 version = "0.6.1"
 dependencies = [
+ "lanekeep-core",
+ "lanekeep-lang",
+ "lanekeep-lang-js",
+ "lanekeep-nodes",
+ "tree-sitter",
  "wasmtime",
 ]
 

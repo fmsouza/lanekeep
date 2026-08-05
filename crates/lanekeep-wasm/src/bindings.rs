@@ -17,8 +17,11 @@
 //! an **uninhabited** type — measured here, `match x {}` on it compiles. That is a
 //! deliberate stop rather than a default: no value of an uninhabited type exists, so nothing
 //! can be pushed into a [`wasmtime::component::ResourceTable`], and no export taking
-//! `borrow<check-context>` can be called at all. [`CheckContext`] and [`ReduceContext`]
-//! below are those representations.
+//! `borrow<check-context>` can be called at all.
+//!
+//! `check-context`'s representation is [`crate::host::CheckContext`], which holds the state
+//! and lives beside the methods that read it. [`ReduceContext`] below is still the empty
+//! placeholder both were, for the same reason it was needed in the first place.
 //!
 //! # Why the module wrapper, and why the suppression is on it rather than on the crate
 //!
@@ -32,22 +35,15 @@
 //! crate-level `#![expect(missing_docs)]` would cover every hand-written item added to this
 //! crate afterwards, silently, which is the drift the `warn` exists to catch.
 
-/// The engine's per-file context, as the resource table stores it.
-///
-/// Empty, and that is the current state rather than the design. What it will hold — the node
-/// arena, the tracked-read log, the date-read flag, the violation sink — is `src/host.rs`'s
-/// to define, and this crate does not yet depend on the types those are built from. What it
-/// already does is make the world runnable: a resource with no named representation is
-/// uninhabited, and an uninhabited context cannot be lent to anything.
-#[derive(Debug, Default)]
-pub struct CheckContext;
-
 /// The engine's cross-file context, as the resource table stores it.
 ///
-/// Empty for the same reason [`CheckContext`] is. Its eventual contents are the file list
-/// and the collected facts, and nothing that could reach a parse tree: the reduce phase
-/// consumes facts and the file list and nothing else, which is what keeps cross-file rules
-/// parallel and cacheable.
+/// Empty, and that is the current state rather than the design — the same placeholder
+/// [`crate::host::CheckContext`] was until it acquired an arena. Its eventual contents are
+/// the file list and the collected facts, and nothing that could reach a parse tree: the
+/// reduce phase consumes facts and the file list and nothing else, which is what keeps
+/// cross-file rules parallel and cacheable. What it already does is make the world runnable:
+/// a resource with no named representation is uninhabited, and an uninhabited context cannot
+/// be lent to anything.
 #[derive(Debug, Default)]
 pub struct ReduceContext;
 
@@ -65,7 +61,7 @@ mod generated {
         // `check-context` from an uninhabited placeholder into something the engine can
         // create, put in a resource table and lend to a guest export.
         with: {
-            "lanekeep:host/types@0.1.0.check-context": super::CheckContext,
+            "lanekeep:host/types@0.1.0.check-context": crate::host::CheckContext,
             "lanekeep:host/types@0.1.0.reduce-context": super::ReduceContext,
         },
 
