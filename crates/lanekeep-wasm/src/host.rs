@@ -10,16 +10,21 @@
 //!
 //! # What is implemented so far
 //!
-//! `check-context`'s navigation and reporting. Everything else the world declares — binding
-//! resolution, scoped queries, tracked reads, facts, `today`, and the whole of
+//! `check-context`'s navigation, reporting and binding resolution. Everything else the world
+//! declares — scoped queries, tracked reads, facts, `today`, and the whole of
 //! `reduce-context` — returns an error naming itself, which traps the call.
 //!
 //! **Trapping rather than answering, deliberately.** Every plausible placeholder is a
-//! plausible *answer*: `false` from `is-shadowed` reads as "it does not shadow", an empty
-//! list from `query-subtree` reads as "nothing matched", `none` from `read-file` reads as
-//! "the file is not there". A rule built against any of those would look like it was working,
-//! and the run would be wrong quietly. An error is the one response no caller can mistake for
-//! a result.
+//! plausible *answer*: an empty list from `query-subtree` reads as "nothing matched", `none`
+//! from `read-file` reads as "the file is not there". A rule built against either would look
+//! like it was working, and the run would be wrong quietly. An error is the one response no
+//! caller can mistake for a result.
+//!
+//! **Binding resolution is not one of those, and the difference is not a relaxation.** `false`
+//! and `none` are what "nothing resolves" *is*: a name nothing declares, a handle no arena
+//! issued, and a language whose [`lanekeep_lang::Language::resolver`] returns `None` are three
+//! ways of having no binding, and a rule acts on all three identically. The unimplemented
+//! methods trap because they have no answer to give; these have one.
 //!
 //! # Two engines, one arena, one answer
 //!
@@ -28,6 +33,29 @@
 //! about a node's parent or identity for one file would let a single run disagree with
 //! itself, and the shared type is what stops the question from being askable. Where the WIT
 //! shape forces a difference from the JavaScript surface, it is named at the method.
+//!
+//! Binding resolution needed one layer more. The arena resolves an identifier to a
+//! [`Binding`], but *which module and export count as a match* — and what a `*` in a pattern
+//! does — was written out in `lanekeep-js` and would have been written out a second time here.
+//! It now lives on [`Binding`] itself, in `lanekeep-lang`, and both engines call it. A copy in
+//! each would let one file resolve differently depending on which engine ran the rule, and
+//! nothing would fail: both would answer, plausibly, and disagree.
+//!
+//! # A rule always has all four, whatever its language
+//!
+//! A component imports what its world declares, so `resolves-to-import`, `is-imported-from`,
+//! `binding-kind` and `is-shadowed` are present for every rule. A resource's method set is
+//! fixed by the world, so making a method absent for one file and present for another is not
+//! something the component model can express at all: it would take a distinct resource type
+//! per combination of capabilities a host might attach, and a world naming all of them.
+//!
+//! This is not a departure from QuickJS, which is worth stating because it looks like one:
+//! `lanekeep-js` installs these four unconditionally too, closing over an `Option` and
+//! answering `false`/`undefined` without a resolver — see `HostContext::with_resolver`. The
+//! surfaces that *are* absent there rather than answering are the ones attached per run and
+//! per language for other reasons: `querySubtree` and `closestAncestor` without a grammar,
+//! `readFile` and `fileExists` without file access, `today` without a date. Those are the
+//! places where a later change here has a real decision to make, and it is theirs to make.
 //!
 //! # No interior mutability, and why that is not an oversight
 //!
@@ -38,7 +66,10 @@
 //! interning methods want. The plain `NodeArena` below is the same type used the simpler way,
 //! not a second design.
 
+use std::sync::Arc;
+
 use lanekeep_core::fix::Fix;
+use lanekeep_lang::binding::{Binding, BindingKind as LangBindingKind, BindingResolver};
 use lanekeep_nodes::{Handle, NodeArena};
 use wasmtime::component::{Resource, ResourceTable};
 
@@ -78,11 +109,25 @@ pub struct Report {
 /// type named in [`crate::bindings`]'s `with` mapping. The engine owns one of these, pushes
 /// it into the store's [`ResourceTable`], and lends the guest a `borrow` of it for the length
 /// of one `check` call.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written for the reason `lanekeep_js::HostContext`'s is: requiring it on
+/// [`BindingResolver`] would burden every language implementation for the sake of one derive.
 pub struct CheckContext {
     arena: NodeArena,
     file_path: String,
     reports: Vec<Report>,
+    resolver: Option<Arc<dyn BindingResolver>>,
+}
+
+impl std::fmt::Debug for CheckContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckContext")
+            .field("file_path", &self.file_path)
+            .field("interned_nodes", &self.arena.len())
+            .field("reports", &self.reports.len())
+            .field("has_resolver", &self.resolver.is_some())
+            .finish()
+    }
 }
 
 impl CheckContext {
@@ -98,7 +143,31 @@ impl CheckContext {
             arena,
             file_path: file_path.to_owned(),
             reports: Vec::new(),
+            resolver: None,
         }
+    }
+
+    /// Attach a binding resolver, so the four binding-resolution methods have something to
+    /// ask.
+    ///
+    /// Without one they answer `false` and `none` rather than trapping — see this module's
+    /// header for why that is an answer here and not a placeholder. The same posture
+    /// `lanekeep_js::HostContext::with_resolver` documents, and for the same reason: a rule
+    /// written against a language with no resolver should behave as though nothing resolves.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn BindingResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// What the identifier at a handle refers to, or `None` when nothing does.
+    ///
+    /// The one place the two questions "is there a resolver" and "does this name resolve"
+    /// are collapsed, because every caller below treats them identically. A language with no
+    /// resolver and a name nothing declares are both "no binding", which is the answer the
+    /// world's `bool` and `option<binding-kind>` returns can carry.
+    fn binding(&self, n: Handle) -> Option<Binding> {
+        self.arena.resolve_binding(n, self.resolver.as_deref()?)
     }
 
     /// The tree this context is reading.
@@ -171,6 +240,44 @@ impl HostState {
         handle: &Resource<CheckContext>,
     ) -> wasmtime::Result<&mut CheckContext> {
         Ok(self.table.get_mut(handle)?)
+    }
+}
+
+/// How a binding is spelled at the boundary.
+///
+/// The world's `binding-kind` is an enum where `lanekeep-js` hands JavaScript a string, so
+/// this is the one place the two engines' *representations* differ rather than their answers.
+/// Two things keep them from drifting apart. The match is exhaustive over
+/// [`lanekeep_lang::binding::BindingKind`], so a kind added there stops this crate from
+/// building rather than quietly becoming something else. And the case names correspond
+/// one-for-one with what [`Binding::kind_str`] returns and with the `BindingKind` union in
+/// `packages/lanekeep/index.d.ts`, which is what a rule author reads — `catch-param` here is
+/// `'catch-param'` there, and both are the same binding.
+///
+/// An enum rather than a string is the boundary's own improvement on that surface: a rule that
+/// compares a kind against a misspelled string literal under QuickJS gets `false` and no error,
+/// and the same mistake in a component does not compile.
+const fn wit_kind(binding: &Binding) -> BindingKind {
+    match binding {
+        Binding::Import { .. } => BindingKind::Import,
+        Binding::Local(kind) => match *kind {
+            LangBindingKind::Const => BindingKind::Const,
+            LangBindingKind::Let => BindingKind::Let,
+            LangBindingKind::Var => BindingKind::Var,
+            LangBindingKind::Param => BindingKind::Param,
+            LangBindingKind::Function => BindingKind::Function,
+            LangBindingKind::Class => BindingKind::Class,
+            LangBindingKind::CatchParam => BindingKind::CatchParam,
+            LangBindingKind::Assignment => BindingKind::Assignment,
+            LangBindingKind::Loop => BindingKind::Loop,
+            LangBindingKind::ContextManager => BindingKind::ContextManager,
+            LangBindingKind::Comprehension => BindingKind::Comprehension,
+            LangBindingKind::Type => BindingKind::Type,
+            LangBindingKind::Receiver => BindingKind::Receiver,
+            LangBindingKind::TypeParam => BindingKind::TypeParam,
+            LangBindingKind::Module => BindingKind::Module,
+            LangBindingKind::Trait => BindingKind::Trait,
+        },
     }
 }
 
@@ -374,44 +481,69 @@ impl HostCheckContext for HostState {
         Ok(())
     }
 
-    // --- declared, not yet implemented ----------------------------------------------------
+    // --- binding resolution ----------------------------------------------------------------
+    //
+    // The light semantic layer of `docs/architecture.md` §6.4. A rule matching
+    // `makeStyles(...)` on identifier text alone is wrong twice: it misses
+    // `import { makeStyles as ms }`, and it fires on a local `const makeStyles` that has
+    // nothing to do with the import.
+    //
+    // Nothing here traps, which is the difference from the group below. "That handle is not
+    // live", "nothing declares that name" and "this language has no resolver" are all
+    // *answers* a rule can act on, and the world's `bool` and `option<binding-kind>` carry
+    // them. A trap is for a question the host cannot answer at all, and this is not one.
 
     fn resolves_to_import(
         &mut self,
-        _: Resource<CheckContext>,
-        _: Handle,
-        _: String,
-        _: Option<String>,
+        this: Resource<CheckContext>,
+        n: Handle,
+        module: String,
+        name: Option<String>,
     ) -> wasmtime::Result<bool> {
-        Err(not_yet(
-            "check-context.resolves-to-import",
-            "binding resolution",
-        ))
+        Ok(self
+            .check_context_mut(&this)?
+            .binding(n)
+            .is_some_and(|binding| binding.is_import_of(&module, name.as_deref())))
     }
 
     fn is_imported_from(
         &mut self,
-        _: Resource<CheckContext>,
-        _: Handle,
-        _: String,
+        this: Resource<CheckContext>,
+        n: Handle,
+        pattern: String,
     ) -> wasmtime::Result<bool> {
-        Err(not_yet(
-            "check-context.is-imported-from",
-            "binding resolution",
-        ))
+        Ok(self
+            .check_context_mut(&this)?
+            .binding(n)
+            .is_some_and(|binding| binding.is_imported_from(&pattern)))
     }
 
     fn binding_kind(
         &mut self,
-        _: Resource<CheckContext>,
-        _: Handle,
+        this: Resource<CheckContext>,
+        n: Handle,
     ) -> wasmtime::Result<Option<BindingKind>> {
-        Err(not_yet("check-context.binding-kind", "binding resolution"))
+        Ok(self
+            .check_context_mut(&this)?
+            .binding(n)
+            .as_ref()
+            .map(wit_kind))
     }
 
-    fn is_shadowed(&mut self, _: Resource<CheckContext>, _: Handle) -> wasmtime::Result<bool> {
-        Err(not_yet("check-context.is-shadowed", "binding resolution"))
+    fn is_shadowed(&mut self, this: Resource<CheckContext>, n: Handle) -> wasmtime::Result<bool> {
+        let context = self.check_context_mut(&this)?;
+
+        // Asked of the arena directly rather than through `binding`, because it is a different
+        // question. `resolve_binding` answers "what does this name refer to"; this answers "is
+        // there more than one and did you get the inner one" — which a name bound exactly once
+        // answers `false` to while resolving perfectly well.
+        Ok(context
+            .resolver
+            .as_deref()
+            .is_some_and(|resolver| context.arena.is_shadowed(n, resolver)))
     }
+
+    // --- declared, not yet implemented ----------------------------------------------------
 
     fn query_subtree(
         &mut self,

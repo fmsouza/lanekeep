@@ -30,11 +30,16 @@ lanekeep-core = { workspace = true }
 lanekeep-nodes = { workspace = true }
 wasmtime = { workspace = true }
 
+# `lanekeep-lang` for `BindingResolver` and the `Binding` a resolved identifier becomes, which
+# is what the four binding-resolution methods answer from. It moved here from dev-dependencies
+# when they arrived; it is a language-agnostic vocabulary crate, so this edge does not tie the
+# engine to any particular grammar.
+lanekeep-lang = { workspace = true }
+
 # Parsing, so the tests can build a real tree for a real context to be lent over. The engine
 # itself never picks a grammar — the file does, through `lanekeep-languages` — so these are
 # the tests' dependencies and not the crate's.
 [dev-dependencies]
-lanekeep-lang = { workspace = true }
 lanekeep-lang-js = { workspace = true }
 tree-sitter = { workspace = true }
 
