@@ -329,6 +329,39 @@ workflow that writes a file into a checkout and asks `git diff --quiet` whether 
 job. Stage first and compare `git diff --cached`. This was latent in the Homebrew tap step: the
 only run that would have hit it is the first one, against a tap with no formula in it yet.
 
+**A WIT type declared inside an interface is not in scope in a world that imports it.** The
+world needs `use types.{check-context};` for every type it names in an export signature, and the
+error without it is "name `node` is not defined" — which reads as though the type does not exist
+rather than as a scoping rule. The design spec's own sketch of `wit/world.wit` had this bug and
+did not parse.
+
+**Every WIT comment is a doc comment, including `//`.** `wit-parser` attaches a plain `//` block
+to the item that follows exactly as it attaches `///`, so `wasm-tools component wit` prints the
+whole file back with `///` on everything. There is no way to write a note that stays out of the
+resolved package. What saves it from mattering is that the docs do not reach the artifact:
+`wit-bindgen` 0.41.0 drops them, and a built component's embedded WIT carries none.
+
+**A component's embedded WIT is a *subset* of the world it was built against.** The world-shape
+fixture calls three of `check-context`'s twenty-four methods and its component-type section lists
+those three; `node-location`, `binding-kind`, `read-error` and `fact-error` are absent entirely.
+A load-time check comparing an artifact's WIT against `crates/lanekeep-wasm/wit/world.wit` would
+therefore reject every real rule. The comparable thing is the set of imported instance names.
+
+**wasmtime's import list counts resource types, so `imports().len() == 1` rejects every rule.**
+`wasm-tools component wit` shows one import on a component built against `lanekeep:host@0.1.0`,
+and `Component::component_type().imports()` shows three for the same bytes: that instance, plus
+bare `check-context` and `reduce-context` type imports the component model requires because those
+types appear in an export signature. Filter on `ComponentItem::ComponentInstance` — the instances
+are what describe reachable capability, and the type imports are bookkeeping.
+
+**An imported resource with no `with` mapping compiles to an uninhabited type.** `bindgen!` emits
+one for every host-implemented resource the embedder has not named a Rust type for — `match x {}`
+on it compiles — so nothing can be pushed into a `ResourceTable` and no export taking
+`borrow<check-context>` can be called. Everything still builds and the failure is only visible
+when something tries to run. The `with` key is `package/interface@version.resource`, with a *dot*
+before the resource name; a slash there fails with "interfaces were specified in the `with` config
+option but are not referenced in the target world", which reads like the interface name is wrong.
+
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
 and re-checks forever — pinning a core while the output looks exactly like a tool that is
