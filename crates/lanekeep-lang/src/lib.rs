@@ -2,6 +2,12 @@
 //!
 //! The `Language` trait and the registry mapping file extensions onto grammars.
 //!
+//! It also owns `binding`: the shape of a resolved binding, and the convention deciding
+//! which import a rule's `resolvesToImport`/`isImportedFrom` counts as a match. That
+//! convention lives here rather than in either rule-execution engine because both call
+//! it, and two copies would drift into answering plausibly and differently for the same
+//! file — which no test on either side would catch.
+//!
 //! This abstraction exists before it has a second implementor on purpose. Retrofitting it
 //! after a second language arrives is the expensive version of the same work.
 

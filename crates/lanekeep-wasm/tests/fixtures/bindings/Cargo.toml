@@ -33,3 +33,10 @@ opt-level = "s"
 strip = true
 
 [workspace]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build`
+# generates and `.gitignore` deliberately excludes. cargo-machete reads source, so on a
+# fresh checkout it sees a dependency nothing references and fails the gate — while a
+# machine that has built the fixture once sees it used and passes.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]
