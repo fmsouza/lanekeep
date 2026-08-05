@@ -10,11 +10,12 @@ homepage.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# The spike fixture under tests/fixtures/ is a crate of its own, built for
-# wasm32-unknown-unknown by a separate toolchain. It is test scaffolding and has no
-# business in the published .crate, where it would only confuse `cargo package`'s
-# resolution with a nested manifest it cannot build.
-exclude = ["tests/fixtures/**"]
+# The spike guest is a crate of its own, built for wasm32-unknown-unknown by
+# `cargo component`. Its nested manifest has no business in the published .crate, where it
+# would only give `cargo package` a second package to resolve and fail to build. The built
+# artifact beside it — tests/fixtures/spike.wasm — is deliberately not excluded: it is what
+# tests/spike.rs embeds.
+exclude = ["tests/fixtures/spike/**"]
 
 [dependencies]
 wasmtime = { workspace = true }

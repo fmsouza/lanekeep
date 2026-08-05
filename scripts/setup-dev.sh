@@ -30,6 +30,15 @@ info "installing the pinned toolchain from rust-toolchain.toml"
 rustup show active-toolchain >/dev/null
 ok "$(rustc --version)"
 
+# Rule components are built for wasm32-unknown-unknown, whose import list is exactly the
+# declared world. `cargo component`'s default target, wasm32-wasip1, imports a wall clock
+# and a filesystem the moment a guest touches std, so the target is a requirement rather
+# than a preference and installing it here is what makes the requirement satisfiable.
+# Not needed to run any gate — the built fixtures are committed.
+info "installing the wasm32-unknown-unknown target"
+rustup target add wasm32-unknown-unknown
+ok "wasm32-unknown-unknown"
+
 # ---------------------------------------------------------------------------
 bold "tools"
 # ---------------------------------------------------------------------------
@@ -43,6 +52,9 @@ TOOLS=(
     "cargo-insta:cargo-insta"
     "cargo-audit:cargo-audit"
     "typos:typos-cli"
+    # Builds the WebAssembly rule components. Not needed by any gate — the built
+    # fixtures are committed — but needed by `just wasm-fixtures` to rebuild one.
+    "cargo-component:cargo-component"
 )
 
 missing=()

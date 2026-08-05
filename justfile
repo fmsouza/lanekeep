@@ -70,6 +70,31 @@ test *ARGS:
 test-doc:
     cargo test --workspace --doc
 
+# Rebuild the committed WebAssembly test fixtures from their sources.
+#
+# Deliberately not part of any gate. The built components are committed, so the gate does
+# not need `cargo component` and CI does not install it; this is what you run after
+# changing a fixture's WIT or source, and the resulting `.wasm` is reviewed like any other
+# change.
+#
+# `--target wasm32-unknown-unknown` is a requirement, not a preference. `cargo component`
+# defaults to `wasm32-wasip1`, whose components import a wall clock and a filesystem as
+# soon as the guest touches anything in `std` — the two capabilities the sandbox exists to
+# withhold. On this target the import list is exactly the declared world.
+wasm-fixtures:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _require cargo-component
+    root="$(pwd)"
+    for dir in crates/lanekeep-wasm/tests/fixtures/*/; do
+        [ -f "${dir}Cargo.toml" ] || continue
+        name="$(basename "${dir}")"
+        echo "building ${name}"
+        (cd "${dir}" && cargo component build --release --target wasm32-unknown-unknown)
+        cp "${dir}target/wasm32-unknown-unknown/release/${name}.wasm" \
+           "${root}/crates/lanekeep-wasm/tests/fixtures/${name}.wasm"
+    done
+
 # Tests for the repository's own shell tooling.
 #
 # lint-commit-msg.sh gates every commit and every pull request title, and the title is
