@@ -275,7 +275,10 @@ impl CheckContext {
     /// `Arc` rather than `Rc`, which is the one difference from the JavaScript engine's copy.
     /// QuickJS is single-threaded and its host functions are `'static` closures; nothing here
     /// is either, and rules run across rayon's pool, so an `Rc` in the store's data would take
-    /// `Send` away from a type that has it.
+    /// `Send` away from a type that has it. Enforced rather than asserted: the `const` block
+    /// above [`HostState`] holds that claim, without which an `Rc` here compiles clean and
+    /// stays clean until the engine is wired to rayon, at which point the reason is
+    /// rediscovered as a confusing error somewhere else.
     fn compile(&mut self, source: &str) -> Result<Arc<CompiledQuery>, String> {
         if let Some(found) = self.queries.get(source) {
             return found.clone();
@@ -317,6 +320,28 @@ impl CheckContext {
         std::mem::take(&mut self.reports)
     }
 }
+
+/// The store's data stays `Send`, checked at compile time rather than believed.
+///
+/// A [`wasmtime::Store`] is `Send` when its data is, and the engine will run rules across
+/// rayon's pool — so a `Store<HostState>` that has to move to a worker needs this. Nothing in
+/// the type system asks for it *yet*, which is exactly the problem: the crate builds today
+/// whether or not it holds, so dropping an `Rc` into [`CheckContext`] — the query cache is the
+/// obvious candidate, since `lanekeep-js`'s equivalent is an `Rc` — compiles clean and stays
+/// clean right up until the engine is wired, where it surfaces as an unsatisfied bound on a
+/// rayon call far from the field that caused it.
+///
+/// A `const` block rather than a test: a test that does not compile is not a test that fails,
+/// it is a build that stops, and either way this is a property of the types rather than of any
+/// behavior. It costs nothing at runtime and names the invariant at the place it protects.
+///
+/// Anonymous — `const _` rather than a name — because a named constant nothing reads is dead
+/// code, and silencing that lint would be a second claim to maintain.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<HostState>();
+    assert_send::<CheckContext>();
+};
 
 /// The store's data: the table the lent contexts live in.
 ///
@@ -710,6 +735,12 @@ impl HostCheckContext for HostState {
         // Two phases, which the arena's ownership of the tree forces: capture paths are
         // collected while the tree is borrowed, then interned once that borrow has ended. A
         // handle cannot be minted while a `Node` derived from the same tree is still alive.
+        //
+        // An empty `match` in this list is a real value and not a way of saying "no match":
+        // every capture of a pattern can fail to intern, and a rule reading an empty capture
+        // list as "nothing matched" would be reading the wrong thing. The list's *length* is
+        // what says how many matched. This is the distinction `closest-ancestor` cannot express
+        // in a list at all, which is why its return is an `option`.
         let matches = context.arena.query_subtree(n, &compiled);
         Ok(Ok(matches
             .into_iter()
@@ -730,10 +761,15 @@ impl HostCheckContext for HostState {
         };
 
         let Some(captures) = context.arena.closest_ancestor_paths(n, &compiled) else {
-            // `none`, never an empty `match`. A match that bound no captures is a real match,
-            // so the two must not be spelled the same — which is what the world's
-            // `option<match>` is for, and why a rule reading an empty capture list as "nothing
-            // matched" would be right only until a query bound nothing.
+            // `none`, on the world's own stated reason: an empty object is truthy in
+            // JavaScript, so a "nothing matched" value shaped like a match takes the wrong
+            // branch under `if (!...)`. Every authoring language reads the same `option`.
+            //
+            // Not because an empty `match` could arrive here and be confused with this —
+            // `closest_ancestor_paths` only ever returns a match that captured the ancestor,
+            // so `Some(vec![])` is unreachable through this method. The defensive shape is
+            // still right; the argument for it belongs to `query-subtree` above, where an
+            // empty capture list genuinely does occur.
             return Ok(Ok(None));
         };
 

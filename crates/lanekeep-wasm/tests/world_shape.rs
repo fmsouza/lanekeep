@@ -472,3 +472,104 @@ fn the_component_imports_exactly_the_one_declared_interface() {
         "and exactly one of them is an instance the guest can call into"
     );
 }
+
+/// **No fixture artifact imports ambient authority — every one of them, not just this file's.**
+///
+/// `AGENTS.md` states the rule the hard way round: pin the target at the build *and* check
+/// every artifact's import list at load, because neither substitutes for the other. A guest
+/// built for `wasm32-wasip1` rather than `wasm32-unknown-unknown` imports `wasi:clocks/
+/// wall-clock`, `wasi:filesystem/types` and `wasi:filesystem/preopens` — precisely the
+/// capabilities `docs/architecture.md` §13 exists to withhold — and the trap is that this is
+/// invisible at small scale: a guest that allocates nothing has zero imports on *both* targets,
+/// so a fixture on the wrong target passes every shape assertion right up until a real rule
+/// formats a string.
+///
+/// The two tests above check one artifact out of five. Each new fixture widened that gap
+/// silently, which is why this one is written the way it is.
+///
+/// # Globbed, and that is the whole point
+///
+/// A named list is the mistake this branch has already shipped: two commits before this one, a
+/// fix patched three fixture crates by name when there were four, and the fourth was found by
+/// a second red CI run rather than by anything here. A directory listing cannot be out of
+/// date, so a fixture added by a later task is covered by this the moment it is built — with
+/// no step anyone has to remember.
+///
+/// # A property, not a snapshot
+///
+/// What is asserted is that every *instance* import is the one host interface. Not a
+/// transcript of what the five artifacts import today: that would be a list again, and it
+/// would have to be edited by whoever adds a fixture, which is the failure mode being fixed.
+/// Importing nothing at all passes — `spike.wasm` targets its own `wit/spike.wit` and reaches
+/// no part of `std` that touches the adapter — because importing nothing is strictly less
+/// authority, never more.
+#[test]
+fn no_fixture_artifact_imports_ambient_authority() {
+    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut artifacts: Vec<std::path::PathBuf> = std::fs::read_dir(&directory)
+        .expect("the fixtures directory is there")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wasm"))
+        .collect();
+    artifacts.sort();
+
+    // A glob that matched nothing would make every assertion below vacuous, which is the one
+    // way this test could pass while checking not a single artifact.
+    assert!(
+        !artifacts.is_empty(),
+        "no artifacts under {}: either none are built, or the directory moved and this test \
+         has been asserting nothing",
+        directory.display()
+    );
+
+    let mut observed: Vec<String> = Vec::new();
+    let mut offenders: Vec<String> = Vec::new();
+
+    for path in &artifacts {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        let bytes = std::fs::read(path).expect("the artifact is readable");
+        let component =
+            Component::new(&engine, &bytes).expect("every committed fixture is a valid component");
+
+        // Instances only. wasmtime's raw import list also carries the bare `check-context` and
+        // `reduce-context` *resource type* imports the component model requires because those
+        // types appear in an export signature — bookkeeping, not reachable capability, and a
+        // check written as `imports.len() == 1` would reject every rule over it.
+        let ty = component.component_type();
+        let mut instances: Vec<&str> = ty
+            .imports(&engine)
+            .filter(|(_, item)| matches!(item.ty, ComponentItem::ComponentInstance(_)))
+            .map(|(import, _)| import)
+            .collect();
+        instances.sort_unstable();
+
+        observed.push(format!(
+            "{name}: {}",
+            if instances.is_empty() {
+                "<no instance imports>".to_owned()
+            } else {
+                instances.join(", ")
+            }
+        ));
+        offenders.extend(
+            instances
+                .iter()
+                .filter(|import| **import != "lanekeep:host/types@0.1.0")
+                .map(|import| format!("{name} imports `{import}`")),
+        );
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "a fixture reaches something the world does not declare, which on this evidence means \
+         it was built for the wrong target:\n  {}\n\nevery artifact:\n  {}",
+        offenders.join("\n  "),
+        observed.join("\n  ")
+    );
+}
