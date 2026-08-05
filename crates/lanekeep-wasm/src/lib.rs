@@ -1,9 +1,25 @@
 //! WebAssembly component runtime for lanekeep rules.
 //!
 //! This crate owns the execution of rule components: the [`wasmtime::Engine`] they run on,
-//! and — as later milestones land — the WIT host API they are linked against and the
+//! the WIT host API they are linked against, and — as later milestones land — the
 //! precompiled artifacts they are loaded from. It sits beside `lanekeep-js` rather than
 //! replacing it; QuickJS leaves the tree only once the last rule has migrated.
+//!
+//! # The boundary lives in `wit/world.wit`
+//!
+//! One file, `lanekeep:host@0.1.0`, holding one interface and one world. Rust, TypeScript
+//! and Go rule authoring all generate their bindings from it, and [`bindings`] is this
+//! crate's own generated view of the same source. It is the most expensive thing here to
+//! get wrong: four sub-projects bind against its shape, and its bytes become a cache-key
+//! input, so an edit invalidates every cached result in every checkout.
+//!
+//! Two things about it that a reader will otherwise assume the other way round. Both
+//! phases' contexts live in **one** interface, so a per-file rule can *name* the cross-file
+//! context even though it can never obtain one — the file itself carries the measurement
+//! that settled that against a per-phase split, and the residual weakness in full. And what
+//! a built component declares is a **subset** of what the world offers: the WIT embedded in
+//! an artifact lists only the methods that guest actually calls, so nothing downstream may
+//! compare an artifact's WIT against this crate's and expect equality.
 //!
 //! The invariant it exists to protect is the sandbox's absence of ambient authority
 //! (`docs/architecture.md` §13). Under QuickJS that absence is curated — intrinsics are
@@ -72,6 +88,8 @@
 //!
 //! What the numbers do not bound: what a runtime that actually loads and instantiates
 //! components costs, which is larger and which nobody has measured.
+
+pub mod bindings;
 
 use wasmtime::{Config, Engine, Result};
 
