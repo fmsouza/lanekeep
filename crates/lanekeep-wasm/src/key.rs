@@ -273,10 +273,17 @@ mod tests {
     fn a_carriage_return_does_not_change_the_host_api_hash() {
         // A Windows checkout is not a host API change. This is the one difference in the WIT
         // bytes that must *not* move the key.
-        let crlf = WORLD_WIT.replace('\n', "\r\n");
-        assert_ne!(crlf, WORLD_WIT, "the fixture has to actually differ");
+        //
+        // Both forms are built from a normalized base rather than from `WORLD_WIT` directly,
+        // because `WORLD_WIT` is whatever git checked out: on a host with `core.autocrlf` on it
+        // already carries `\r\n`, and `replace('\n', "\r\n")` would then produce `\r\r\n` and
+        // compare a half-normalized string against a normalized one. That is the shape
+        // `AGENTS.md` records as passing on macOS and failing on Windows.
+        let lf = WORLD_WIT.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(lf, crlf, "the two fixtures have to actually differ");
         assert_eq!(
-            hash_host_api(WORLD_WIT, EXTERNAL_BINDINGS),
+            hash_host_api(&lf, EXTERNAL_BINDINGS),
             hash_host_api(&crlf, EXTERNAL_BINDINGS)
         );
     }
