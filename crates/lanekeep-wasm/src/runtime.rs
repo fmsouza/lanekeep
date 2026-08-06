@@ -63,16 +63,40 @@
 //! this comment used to give, and an implementer would have gone looking for a feature that does
 //! not exist.
 //!
-//! # Instantiation happens once per (worker, rule), and this module is what makes that true
+//! # Instantiation happens once per (worker, rule), and a worker is not a thread
 //!
-//! [`MEMORY_RESERVATION`]'s whole argument rests on that bound: roughly three hundred and
-//! fifty instantiations for a run, against a 1.6× on guest compute that grows with the corpus.
-//! It used to be a paragraph asking callers to behave. It is now the shape of the API:
-//! [`RuleSet`] resolves each component's imports once for the whole run (`RulePre`, from
-//! `Linker::instantiate_pre`), and each worker's [`WasmRuntime`] holds **one `Option` per
-//! rule** — [`WasmRuntime::instantiations`] counts what it built — filled the first time that
-//! rule is actually asked to run. At ten thousand files times ten rules the penalty of getting
-//! this wrong is about three and a half seconds, and 4 GiB stops being defensible.
+//! This module bounds instantiation to one per (worker, rule): [`RuleSet`] resolves each
+//! component's imports once for the whole run (`RulePre`, from `Linker::instantiate_pre`), and
+//! each worker's [`WasmRuntime`] holds **one `Option` per rule** —
+//! [`WasmRuntime::instantiations`] counts what it built — filled the first time that rule is
+//! actually asked to run. It used to be a paragraph asking callers to behave; it is now the
+//! shape of the API, and `tests/instantiation.rs` fails the two eager designs it is written
+//! against.
+//!
+//! **What that bound is worth depended on a number that was wrong, and it is corrected here.**
+//! An earlier version of this paragraph said "roughly three hundred and fifty instantiations
+//! for a run", from workers × rules at fourteen workers. A worker is a `rayon` `map_init`
+//! initializer, and `map_init` runs **per chunk rather than per thread** — an `AGENTS.md` trap
+//! this module already cites two sections down for a different reason. So the count is set by
+//! rayon's adaptive splitting, not by the thread count, and it **does** grow with the corpus.
+//! Measured through `lanekeep-engine` on 2026-08-06, release, 14 threads, one instance per
+//! (worker, rule) throughout:
+//!
+//! | files | rules | stores | instantiations |
+//! |---|---|---|---|
+//! | 2,000 | 1 | 813 | 813 |
+//! | 2,000 | 10 | 579 | 5,790 |
+//! | 10,000 | 10 | 1,038 | 10,380 |
+//!
+//! Thirty times the old figure at the smallest of those and thirty again at the largest. The
+//! counts are not even stable between runs of one corpus — rayon splits on how the work is
+//! going — so this is a distribution rather than a bound.
+//!
+//! **The design is not falsified; the arithmetic behind [`MEMORY_RESERVATION`] is.** The
+//! per-worker cache still works, and it is what keeps the count at workers × rules instead of
+//! at files × rules, which would be forty thousand for the last row. What is gone is "the
+//! penalty does not grow with the corpus", and with it the claim that instantiation is a
+//! constant a large run can ignore. [`MEMORY_RESERVATION`] carries the re-derivation.
 //!
 //! **An `Option` per rule and not one flag per worker.** One lazy flag covering the whole
 //! ruleset recovers only the all-cache-hits case and pays in full the moment a single file
@@ -242,19 +266,74 @@ use crate::load::Loaded;
 ///
 /// Together, dropping the reservation to 16 MiB costs **1.61× on `strided` and 1.64× on `work`**.
 ///
-/// # What it costs, and the assumption that bound depends on
+/// # What it costs — re-derived, because the first derivation rested on a number that was wrong
 ///
-/// About **10–13 ms** of instantiation per run at fourteen workers, for three hundred and fifty
-/// instantiations. Measured here at 11.7 ms against 1.9 ms for a 16 MiB reservation; an
-/// independent reader measured the delta at 12.6 ms.
+/// This section used to say the instantiation penalty is "about 10–13 ms per run at fourteen
+/// workers, for three hundred and fifty instantiations", and that it "is bounded by workers ×
+/// rules and **does not grow with the corpus**". The second half is false. A worker is a rayon
+/// `map_init` initializer and `map_init` runs per *chunk*, so the store count is set by adaptive
+/// splitting rather than by the thread count — 1,038 stores and 10,380 instantiations at ten
+/// thousand files times ten rules, against the 140 that figure assumed. The module header has
+/// the table.
 ///
-/// The reason that is affordable is not its size but its **shape**: the instantiation penalty is
-/// bounded by workers × rules and does not grow with the corpus, while the 1.6× applies to guest
-/// compute, which grows with corpus × matches. On a run small enough for instantiation to
-/// dominate, twelve milliseconds is imperceptible; on a run large enough to care about,
-/// execution dominates.
+/// **Both terms were therefore re-measured end to end through `lanekeep-engine`**, 2026-08-06,
+/// Apple M3 Max, release, 14 threads, cache off, best of three.
 ///
-/// **That argument depends on an instance per (worker, rule) rather than per file, and on every
+/// **Term A — instantiation**, with a rule whose handler is a few host calls and essentially no
+/// guest compute, so the whole difference is the reservation's cost:
+///
+/// | corpus | 4 GiB | 16 MiB | delta |
+/// |---|---|---|---|
+/// | 2,000 files × 1 rule | 45.1 ms | 28.9 ms | 16.2 ms |
+/// | 2,000 files × 10 rules | 384.5 ms | 135.3 ms | **249.2 ms** |
+/// | 10,000 files × 10 rules | 764.6 ms | 502.8 ms | **261.8 ms** |
+///
+/// Roughly 20–40 µs per instantiation, stated as a range because the two arms do not instantiate
+/// the same number of times — rayon splits differently on each — so dividing one wall clock by
+/// the other's count is approximate by construction.
+///
+/// **Term B — guest compute**, `tests/fixtures/limits.wasm`'s two memory-bound probes driven
+/// through the engine on one file, where instantiation is one call and negligible:
+///
+/// | probe | 4 GiB | 16 MiB | ratio |
+/// |---|---|---|---|
+/// | `work 300` | 490.2 ms | 737.0 ms | **1.50×** |
+/// | `strided 100` | 266.2 ms | 430.3 ms | **1.62×** |
+///
+/// So term B reproduces: the 1.5–1.6× on memory-bound guest code is real and survives being
+/// measured through the whole engine rather than against a bare store.
+///
+/// # The trade is a crossover, not a bound, and it depends on the ruleset
+///
+/// 4 GiB is worth having exactly when the guest compute it speeds up outweighs the instantiation
+/// it slows down:
+///
+/// ```text
+/// 0.6 × (guest compute at 4 GiB)  >  (instantiations) × (20–40 µs)
+/// ```
+///
+/// At 2,000 files × 10 rules that is 249 ms of instantiation to recover, so the run needs about
+/// **415 ms of memory-bound guest compute across 20,000 invocations — roughly 21 µs each**. For
+/// scale, `strided`'s hundred million strided loads cost about 89 ms, so 21 µs is on the order of
+/// twenty-four thousand memory-bound operations per match. A rule that walks a subtree and
+/// compares a few strings is well under it; a rule doing real in-guest analysis is over it.
+///
+/// **So the honest statement is that the answer depends on corpus shape and rule weight, and
+/// this constant cannot be justified for all of them.** It is left at 4 GiB rather than reversed,
+/// for three reasons and none of them is that the old argument still holds. Changing it
+/// invalidates every precompiled artifact and every cached result in every checkout, so it is
+/// not a knob to flip on one machine's numbers. The rules that will actually run here do not
+/// exist yet — every rule in this tree is TypeScript — so the guest-compute term has no
+/// realistic measurement behind it, only a synthetic one. And the lever that would remove the
+/// question is not this constant: **`with_min_len` on `lanekeep-engine`'s `par_iter` would bound
+/// the store count directly**, and it is a bigger change than it looks, because the same
+/// initializer builds the QuickJS sandbox and the change would move the JavaScript path's
+/// measured behavior too.
+///
+/// Revisit when a real component ruleset exists. Whoever does should re-measure both terms rather
+/// than either half.
+///
+/// **The argument depends on an instance per (worker, rule) rather than per file, and on every
 /// path a run takes that is now enforced rather than assumed.** [`RuleSet`] resolves each
 /// component once for the run and each worker's [`WasmRuntime`] holds one `Option` per rule,
 /// filled by [`WasmRuntime::rule`] and by nothing else — so a cache sized to the ruleset is the

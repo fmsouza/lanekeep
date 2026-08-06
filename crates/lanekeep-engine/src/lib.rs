@@ -389,6 +389,28 @@ pub struct Engine {
     /// component rule must not build one at all.
     components: Option<Components>,
     /// Whether results may be read from and written to the cache.
+    ///
+    /// **Off for any run that loaded a component, and that is a correctness guard rather than a
+    /// policy.** A component's bytes reach no cache-key input: `RuleSpec::component` is set on a
+    /// `Config` *after* `lanekeep_config::load` computed `ruleset_hash`, and `load_components`
+    /// reads the file with an untracked `std::fs::read`. So without this, swapping a rule's
+    /// component for a different one between two runs serves the first one's answer forever —
+    /// demonstrated by `swapping_a_component_between_runs_changes_the_answer`, which fails
+    /// without it.
+    ///
+    /// **Refusing the cache rather than folding the bytes here**, for three reasons. The correct
+    /// fold already exists in `lanekeep-config`'s `hash_ruleset` — sorted, deduplicated,
+    /// length-prefixed, with a present/absent marker — and a second implementation of a
+    /// cache-key encoding in a second crate is exactly the drift that produced this
+    /// sub-project's one real cache bug, where reusing a text separator for arbitrary binary let
+    /// two rulesets share a key. The fold belongs beside the existing one, on the day
+    /// `lanekeep-config` can produce a component-backed rule at all — which it cannot, because
+    /// the world has no `metadata` export, so this costs nothing today. And a guard that turns
+    /// the cache *off* has no encoding to get wrong: the failure mode of getting it wrong is a
+    /// cold run, where the failure mode of a wrong fold is a wrong answer.
+    ///
+    /// It is per run rather than per rule because a cache entry is per *file* and holds every
+    /// rule's findings for it, so there is no finer granularity that is sound.
     caching: bool,
     /// Whether reduce phases run.
     reducing: bool,
@@ -413,18 +435,64 @@ pub struct Engine {
     languages_by_extension: BTreeMap<String, String>,
 }
 
-/// The component half of a run, built once and shared by every worker.
+/// The component half of a run, walled off so its one constructor cannot be gone around.
 ///
-/// Two `Arc`s and nothing else, which is the arrangement `lanekeep-wasm` requires rather than
-/// a convenience: one [`WasmEngine`] because it is the unit compiled code is cached in and the
-/// owner of the one epoch ticker, and one [`RuleSet`] because `instantiate_pre` resolves and
-/// type-checks a component's imports independently of how many stores will instantiate it.
-/// Nothing here is instantiated — an instance belongs to a store, and a store belongs to a
-/// worker.
-struct Components {
-    engine: Arc<WasmEngine>,
-    rules: Arc<RuleSet>,
+/// **A module for two fields, and the module is the point.** `EXTERNAL_BINDINGS` enforcement
+/// used to be a statement in `load_components`; deleting it left every test passing, because
+/// nothing asserted the comparison was *invoked*. Moving it into a constructor fixed that and
+/// left a second way to be wrong — a struct literal beside the constructor, which a mutation
+/// confirmed still compiled and still passed. Private fields behind a module seam remove that
+/// too, on exactly the reasoning `lanekeep_wasm::load::Loaded` uses for the import check: the
+/// door that skips the check is the one that does not exist.
+mod components {
+    use std::sync::Arc;
+
+    use lanekeep_wasm::{RuleSet, WasmEngine};
+
+    use super::{RunError, declared_bindings_match};
+
+    /// The component engine and the run's linked rule set.
+    ///
+    /// Two `Arc`s and nothing else, which is the arrangement `lanekeep-wasm` requires rather
+    /// than a convenience: one [`WasmEngine`] because it is the unit compiled code is cached in
+    /// and the owner of the one epoch ticker, and one [`RuleSet`] because `instantiate_pre`
+    /// resolves and type-checks a component's imports independently of how many stores will
+    /// instantiate it. Nothing here is instantiated — an instance belongs to a store, and a
+    /// store belongs to a worker.
+    pub(super) struct Components {
+        engine: Arc<WasmEngine>,
+        rules: Arc<RuleSet>,
+    }
+
+    impl Components {
+        /// The only way to make one, and it is the only way because of what it checks.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`RunError::Worker`] when the set bound an interface beside the declared
+        /// world that `lanekeep_wasm::EXTERNAL_BINDINGS` — the list the cache key was computed
+        /// from — does not name.
+        pub(super) fn linked(engine: Arc<WasmEngine>, rules: RuleSet) -> Result<Self, RunError> {
+            declared_bindings_match(rules.external_bindings())?;
+            Ok(Self {
+                engine,
+                rules: Arc::new(rules),
+            })
+        }
+
+        /// The shared engine, for building a worker's store.
+        pub(super) const fn engine(&self) -> &Arc<WasmEngine> {
+            &self.engine
+        }
+
+        /// The run's linked rule set.
+        pub(super) const fn rules(&self) -> &Arc<RuleSet> {
+            &self.rules
+        }
+    }
 }
+
+use components::Components;
 
 impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -618,8 +686,11 @@ impl Engine {
             rules,
             combined: std::sync::OnceLock::new(),
             run_key,
+            // Off whenever a component was loaded — see the field. Written from `components`
+            // rather than from the rule list so the two cannot disagree about whether this run
+            // has a component in it.
+            caching: components.is_none(),
             components,
-            caching: true,
             reducing: true,
             reporting_unused: false,
             profiling: false,
@@ -1011,8 +1082,8 @@ impl Engine {
                 .to_owned(),
         })?;
         let mut runtime = WasmRuntime::for_rules(
-            Arc::clone(&components.engine),
-            Arc::clone(&components.rules),
+            Arc::clone(components.engine()),
+            Arc::clone(components.rules()),
             self.limits,
             Arc::clone(clock),
         );
@@ -1918,13 +1989,25 @@ struct Worker<'a> {
     failed: Option<RunError>,
     /// This worker's component store, built on first use exactly as the sandbox is.
     ///
-    /// **One store per worker holding one instance per rule, and nothing here defeats that.**
-    /// `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing — it allocates one `None`
-    /// per rule — which is what makes it safe to build from rayon's initializer, since
-    /// `map_init` runs that per *chunk* rather than per thread. Instantiation happens in
-    /// `WasmRuntime::rule`, at most once per slot per store, and that bound is what the 4 GiB
-    /// memory reservation is chosen on: at ten thousand files times ten rules, getting it wrong
-    /// costs about three and a half seconds.
+    /// **One store per worker holding one instance per rule — and rayon decides how many workers
+    /// there are.** `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it allocates
+    /// one `None` per rule), which is what makes it safe to build from rayon's initializer,
+    /// since `map_init` runs that per *chunk* rather than per thread. Instantiation then happens
+    /// in `WasmRuntime::rule`, at most once per slot per store.
+    ///
+    /// That is a bound per `Worker`, not per thread, and the difference is not small: measured
+    /// through this engine at ten thousand files times ten rules, **1,038 stores and 10,380
+    /// instantiations at fourteen threads**, varying between runs because rayon splits on how the
+    /// work is going. `lanekeep_wasm::runtime::MEMORY_RESERVATION` used to be justified on
+    /// "roughly three hundred and fifty instantiations, and it does not grow with the corpus";
+    /// that half is false and its documentation now carries the re-derivation, the crossover, and
+    /// why the constant is left where it is anyway.
+    ///
+    /// **The lever, if this ever needs bounding, is here rather than there.** `with_min_len` on
+    /// `run_files`'s `par_iter` would cap the store count directly — and it is a bigger change
+    /// than it looks, because this same initializer builds the QuickJS sandbox and one sandbox
+    /// per chunk is the more expensive of the two. It would move the JavaScript path's measured
+    /// behavior, so it needs a benchmark rather than an argument.
     wasm: Option<WasmRuntime>,
     /// The first component failure this worker saw, if it saw one.
     ///
@@ -1994,8 +2077,8 @@ impl<'a> Worker<'a> {
                         .to_owned(),
                 })?;
             self.wasm = Some(WasmRuntime::for_rules(
-                Arc::clone(&components.engine),
-                Arc::clone(&components.rules),
+                Arc::clone(components.engine()),
+                Arc::clone(components.rules()),
                 self.engine.limits,
                 Arc::clone(&self.clock),
             ));
@@ -2245,12 +2328,7 @@ fn load_components(
         rule.slot = Some(slot);
     }
 
-    declared_bindings_match(set.external_bindings())?;
-
-    Ok(Some(Components {
-        engine,
-        rules: Arc::new(set),
-    }))
+    Components::linked(engine, set).map(Some)
 }
 
 /// Refuse a run that bound an interface the cache key was not computed against.
@@ -4874,12 +4952,6 @@ export default defineRule({
             fn run_with(&self, extra: Vec<RuleSpec>) -> Result<Outcome, RunError> {
                 self.prepared(extra)?.without_cache().run()
             }
-
-            /// The same, with the cache on, for the warm-run assertion.
-            fn cached_run(&self) -> Result<Outcome, RunError> {
-                self.prepared(vec![component_rule("local/middle", 1, false)])?
-                    .run()
-            }
         }
 
         /// A config declaring the `local` namespace and importing whichever rule modules it is
@@ -5163,11 +5235,69 @@ export default defineRule({
         }
 
         #[test]
-        fn a_component_rule_result_is_cached_and_restored_like_any_other() {
-            // The cache sits above both engines, so a warm run must serve a component rule's
-            // violations without instantiating anything.
+        fn swapping_a_component_between_runs_changes_the_answer() {
+            // **This is a real staleness bug the shipped guard prevents, demonstrated rather
+            // than argued.** `RuleSpec::component` is set on a `Config` *after*
+            // `lanekeep_config::load` computed `ruleset_hash`, and `load_components` reads the
+            // bytes with an untracked `std::fs::read` — so a component's bytes reach no
+            // cache-key input at all. With the cache on and no guard, swapping the component
+            // for a different one between two runs serves the first one's answer forever.
+            //
+            // Written against the copy the run actually loads, so the swap is the only
+            // difference: same rule id, same path, same query, different bytes.
             let project = Project::new(
-                "component-cache",
+                "component-swap",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+            let installed = project.dir.join("rule.wasm");
+            fs::copy(fixture(), &installed).expect("installs the rule-shaped component");
+
+            let mut rule = component_rule("local/middle", 1, false);
+            rule.component = Some(installed.clone());
+
+            let outcome = project
+                .prepared(vec![rule.clone()])
+                .expect("prepares")
+                .run()
+                .expect("runs");
+            let first = messages(&outcome);
+            assert!(first.contains(&"component saw `alpha`"), "{first:?}");
+
+            // A different component at the same path. `limits.wasm` answers an unrecognized
+            // probe by saying so, which is a message the first one cannot produce.
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/limits.wasm"),
+                &installed,
+            )
+            .expect("swaps the component");
+
+            let outcome = project
+                .prepared(vec![rule])
+                .expect("prepares")
+                .run()
+                .expect("runs");
+            let second = messages(&outcome);
+            assert!(
+                second.iter().any(|m| m.contains("unknown probe")),
+                "a swapped component must not be answered from the first one's cache: {second:?}"
+            );
+        }
+
+        #[test]
+        fn a_run_with_a_component_rule_does_not_touch_the_cache() {
+            // The guard behind the test above, asserted directly rather than only through its
+            // effect. Refusing the cache — rather than folding the component's bytes into the
+            // key here — is deliberate: the correct fold already exists in `lanekeep-config`,
+            // sorted, deduplicated and length-prefixed, and a second implementation of a
+            // cache-key encoding in a second crate is precisely the drift that produced this
+            // sub-project's one real cache bug. See `Engine::caching`.
+            let project = Project::new(
+                "component-no-cache",
                 &[
                     ("rule-a.ts", &debugger_rule("local/alpha")),
                     ("lanekeep.config.ts", &config_with(&["./rule-a"])),
@@ -5175,44 +5305,25 @@ export default defineRule({
                 ],
             );
 
-            let cold = rendered(&project.cached_run().expect("runs"));
+            let with_component = project
+                .prepared(vec![component_rule("local/middle", 1, false)])
+                .expect("prepares");
             assert!(
-                cold.iter().any(|v| v.starts_with("local/middle|")),
-                "{cold:?}"
+                !with_component.caching,
+                "a run that loaded a component must not read or write the cache"
             );
-
-            // The warm half, driven through one `Worker` so the claim is not merely that the
-            // answers match — two cold runs would also match. What a cache hit has to mean for
-            // the component path is that **nothing was built**: no store, no instance, no
-            // context. `Worker::wasm` staying `None` is that, and it is the same guarantee
-            // `Worker::sandbox` already gives QuickJS.
-            let engine = project.engine(vec![component_rule("local/middle", 1, false)]);
-            let clock = RunClock::start(engine.limits.global_timeout);
-            let cache = Store::load(&engine.root);
-            let mut worker = Worker::new(&engine, &clock);
-
-            let mut warm = Vec::new();
-            for path in engine.discover() {
-                let outcome = engine
-                    .check_file(&mut worker, &cache, &path)
-                    .expect("checks");
-                warm.extend(outcome.violations);
-            }
-            let warm: Vec<String> = warm
-                .iter()
-                .filter(|v| v.rule_id.to_string() == "local/middle")
-                .map(|v| v.message.clone())
-                .collect();
-
-            assert_eq!(
-                warm,
-                vec!["component saw `alpha`".to_owned()],
-                "a warm run must restore the component rule's violations"
-            );
+            with_component.run().expect("runs");
             assert!(
-                worker.wasm.is_none(),
-                "a worker whose files all hit the cache must build no component store"
+                !Store::path_for(&project.dir).exists(),
+                "and must leave no cache behind"
             );
+
+            // The same project with no component rule caches exactly as it always did, so the
+            // guard is scoped to the thing that is unsound rather than turning the cache off.
+            let typescript_only = project.prepared(Vec::new()).expect("prepares");
+            assert!(typescript_only.caching);
+            typescript_only.run().expect("runs");
+            assert!(Store::path_for(&project.dir).exists());
         }
 
         /// The same rule, with a query that also asks the fixture to burn real time first.
@@ -5751,6 +5862,35 @@ export default defineRule({
                 .expect("a component rule's tracked read must reach the dependency list");
             assert_eq!(reads.len(), 1, "{reads:?}");
             assert_eq!(reads[0].path.as_str(), "shared.json");
+        }
+
+        #[test]
+        fn a_run_that_binds_an_undeclared_interface_cannot_be_assembled() {
+            // **The wiring, not the comparison.** The check used to be a statement in
+            // `load_components`, and deleting that statement left all one hundred engine tests
+            // passing with no dead-code warning, because the test below calls the comparison
+            // directly. So this drives a real `RuleSet` through the real recording path —
+            // `linker_mut` takes the declaration and pushes it — and then through the only
+            // constructor a run's component set has.
+            let engine = WasmEngine::new().expect("the runtime builds");
+            let mut set = RuleSet::new(&engine).expect("the world links");
+            // The linker itself is not wanted — what is under test is that reaching for it
+            // records the declaration, which is what `linker_mut` does on the way.
+            let _ = set.linker_mut(&ExternalBinding::declare(
+                "wasi:random/random",
+                "a fixed 64-byte cycle, all zeroes",
+            ));
+
+            let error = Components::linked(Arc::clone(&engine), set)
+                .err()
+                .expect("a set that bound something undeclared must not become a run")
+                .to_string();
+            assert!(error.contains("wasi:random/random"), "{error}");
+
+            // And a set that bound nothing assembles, so the refusal is about the binding rather
+            // than about component runs in general.
+            let clean = RuleSet::new(&engine).expect("the world links");
+            assert!(Components::linked(engine, clean).is_ok());
         }
 
         #[test]

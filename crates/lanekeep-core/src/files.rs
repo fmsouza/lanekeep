@@ -233,6 +233,19 @@ impl FileAccess {
     }
 
     /// Resolve, read and record a path, or return what was already recorded.
+    ///
+    /// **The lock is dropped between the miss and the insert, so check-then-insert is not
+    /// atomic.** That is deliberate — holding it across [`Self::load`] would hold a lock across
+    /// a filesystem read, which is the shape that turns an uncontended mutex into a contended
+    /// one — and it is sound only under the construction described on the `seen` field: one
+    /// access per file, one worker per file. Two threads racing the same access would both read
+    /// and the second would overwrite the first, so the memo would still hold *an* answer and
+    /// still return one consistently, but the guarantee "a file rewritten mid-run is seen one
+    /// way" would rest on which write landed last rather than on the memo.
+    ///
+    /// So the invariant now rests on the caller's construction rather than on the type. If an
+    /// embedder ever shares one access across threads, this wants an entry API — `load` inside
+    /// the guard, or a per-key lock — rather than a comment.
     fn resolve(&self, path: &str) -> Result<Outcome, ReadError> {
         let key = normalize_key(path);
         if let Some(outcome) = self.memo().get(&key) {
