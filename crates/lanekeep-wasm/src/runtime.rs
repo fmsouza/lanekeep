@@ -1137,8 +1137,9 @@ impl WasmRuntime {
     /// during an instantiation is a race: instantiating this crate's fixtures takes tens of
     /// microseconds and the epoch advances every millisecond, so the check that would catch it
     /// usually is not reached. That is the same gap the module header describes, seen at the
-    /// shortest call there is, and it is Task 17's to close rather than something to paper over
-    /// with a second clock read here.
+    /// shortest call there is, and it is closed outside this crate — `lanekeep_engine` asks the
+    /// clock at each file boundary, so a spent run never reaches an instantiation to race with.
+    /// A second clock read here would paper over it in one place and leave the rest.
     ///
     /// # How often this may be called is a load-bearing assumption, and this is the raw form
     ///
