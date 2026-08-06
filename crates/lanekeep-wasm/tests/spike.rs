@@ -45,9 +45,9 @@ fn a_component_loads_instantiates_and_answers() {
     // `lanekeep_wasm::engine` enables epoch interruption, and wasmtime starts every store at
     // deadline zero — which has always elapsed. Without this line every call into a guest
     // traps with `wasm trap: interrupt` before running a single instruction. Nothing advances
-    // the epoch in this file, so an unreachable deadline is what "no limit" means here;
+    // the epoch in this file, so an out-of-reach deadline is what "no limit" means here;
     // `lanekeep_wasm::WasmRuntime` is what arms a real one per invocation, against a ticker.
-    store.set_epoch_deadline(u64::MAX);
+    store.set_epoch_deadline(u64::MAX / 2);
 
     let spike = Spike::instantiate(&mut store, &component, &linker).expect("instantiates");
 
@@ -88,9 +88,9 @@ fn the_component_imports_nothing_at_all() {
     // `lanekeep_wasm::engine` enables epoch interruption, and wasmtime starts every store at
     // deadline zero — which has always elapsed. Without this line every call into a guest
     // traps with `wasm trap: interrupt` before running a single instruction. Nothing advances
-    // the epoch in this file, so an unreachable deadline is what "no limit" means here;
+    // the epoch in this file, so an out-of-reach deadline is what "no limit" means here;
     // `lanekeep_wasm::WasmRuntime` is what arms a real one per invocation, against a ticker.
-    store.set_epoch_deadline(u64::MAX);
+    store.set_epoch_deadline(u64::MAX / 2);
 
     assert!(
         empty.instantiate(&mut store, &component).is_ok(),

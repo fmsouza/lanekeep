@@ -44,7 +44,9 @@ use lanekeep_lang_js::TypeScript;
 use lanekeep_nodes::NodeArena;
 use lanekeep_wasm::bindings::{Rule, types};
 use lanekeep_wasm::host::{CheckContext, ReduceContext, ReduceReport, Report};
-use lanekeep_wasm::runtime::WasmEngine;
+use lanekeep_wasm::runtime::{
+    EPOCH_INTERRUPTION, MEMORY_GUARD_SIZE, MEMORY_RESERVATION, WasmEngine,
+};
 use lanekeep_wasm::{WasmError, WasmRuntime};
 use wasmtime::component::Resource;
 
@@ -280,7 +282,12 @@ fn sandbox_the_run_budget_stops_execution_even_with_a_generous_rule_budget() {
 
 /// **The one case where the two engines genuinely differ, and the difference is wasmtime's.**
 ///
-/// `lanekeep-js`'s test of this name evaluates `1 + 1` after a breach and expects `2`: a
+/// The counterpart is `lanekeep_js::sandbox`'s `sandbox_survives_a_breach_and_keeps_working`,
+/// and this one is deliberately *not* named after it: half of what it asserts is the opposite
+/// of what that name claims, and a divergence that load-bearing should be in the name rather
+/// than only in prose.
+///
+/// That test evaluates `1 + 1` after a breach and expects `2`: a
 /// QuickJS context is reusable once an interrupt has unwound it. A wasmtime `Store` is not.
 /// Any trap out of wasm sets a **store-wide** flag — `store.0.set_trapped()` in
 /// `wasmtime-47.0.3/src/runtime/func.rs:1478`, on every error path out of
@@ -297,7 +304,7 @@ fn sandbox_the_run_budget_stops_execution_even_with_a_generous_rule_budget() {
 /// the diagnostic. Both halves are asserted below, so the day wasmtime makes a trapped store
 /// reusable, this fails and says which claim moved.
 #[test]
-fn sandbox_survives_a_breach_and_keeps_working() {
+fn a_breach_leaves_the_diagnostic_intact_and_the_store_dead() {
     let mut run = Run::new(Limits::default().with_rule_timeout(Duration::from_millis(80)));
 
     run.check(&["tick"]).expect("an ordinary call first");
@@ -313,7 +320,8 @@ fn sandbox_survives_a_breach_and_keeps_working() {
         "a breach must not cost the reports that preceded it"
     );
 
-    // The half that does not, stated as an assertion rather than as a comment.
+    // The half that does not, stated as an assertion rather than as a comment — and the half
+    // the name of the `lanekeep-js` counterpart would have hidden.
     let err = run
         .check(&["tick"])
         .expect_err("a trapped store cannot be re-entered");
@@ -333,7 +341,8 @@ fn sandbox_a_breach_is_not_reported_twice() {
     // If the trip record survived, the next invocation would be reported as timing out
     // without having run at all. Here that is exactly what distinguishes the two: the call
     // after a breach fails for its own reason — wasmtime refuses to re-enter a trapped store,
-    // per the case above — and it must be classified as that rather than as a second timeout.
+    // per `a_breach_leaves_the_diagnostic_intact_and_the_store_dead` — and it must be classified
+    // as that rather than as a second timeout.
     let mut run = Run::new(Limits::default().with_rule_timeout(Duration::from_millis(80)));
 
     assert!(matches!(
@@ -521,12 +530,18 @@ fn a_trap_that_is_not_a_limit_breach_is_not_reported_as_one() {
 /// test, which makes the structural claim exactly: with no tick inside any call, the budget is
 /// never consulted at all, and the run overruns without limit.
 ///
+/// **The name is what this actually shows, which is narrower than the gap.** At a one-hour
+/// tick the epoch never advances, so a *within*-invocation breach would not fire either — this
+/// demonstrates that the budget is consulted from nowhere but the epoch callback, and the
+/// between-invocations consequence follows from that rather than being measured here. Naming it
+/// for the consequence would have claimed more than the arrangement supports.
+///
 /// That pinning is also what makes the claim falsifiable rather than vacuous, because
 /// [`the_run_budget_does_stop_a_guest_that_keeps_executing`] runs the same fixture and the same
 /// expired clock against a ticker that does tick — so a green result here cannot be explained
 /// by the limit being unwired.
 #[test]
-fn the_run_budget_is_not_checked_between_invocations() {
+fn nothing_outside_the_epoch_mechanism_consults_the_run_budget() {
     let (mut run, clock) = Run::expiring_in_with_tick(
         Limits::default().with_rule_timeout(Duration::from_hours(1)),
         NEARLY_SPENT,
@@ -578,4 +593,132 @@ fn the_run_budget_does_stop_a_guest_that_keeps_executing() {
         "expected a run timeout, got {err:?}"
     );
     assert!(run.messages().is_empty(), "and it did not reach its report");
+}
+
+// --- the tunables are applied, not merely declared -----------------------------------------
+
+/// **The tunables the shipped engine actually applies, read back out of the engine itself.**
+///
+/// This exists because deleting `.memory_guard_size(MEMORY_GUARD_SIZE)` from `config` left all
+/// 125 tests in this crate passing. That is `AGENTS.md`'s recorded shape — *validating a flag is
+/// not applying it, and validation is what makes an ignored flag look implemented* — landing on
+/// the values in this task with the highest undo cost, since they bake into every artifact
+/// lanekeep will ever write.
+///
+/// The trick is that wasmtime's own refusal names the host's value: `check_int` in
+/// `wasmtime-47.0.3/src/engine/serialization.rs:255-263` reports "Module was compiled with a
+/// {feature} of '{found}' but '{expected}' is expected for the host", where `expected` is what
+/// the *loading* engine is configured with. So compiling under a deliberately wrong engine and
+/// reading the refusal is a way to ask the shipped engine what it is actually running with,
+/// rather than asking the constant what it says.
+///
+/// # What this cannot catch, and why that is not fixable
+///
+/// **Deleting the line while the constant equals the platform default is unobservable**, and
+/// after taking the guard back to wasmtime's 32 MiB default both constants are the 64-bit
+/// defaults — so the exact mutation that motivated this test now produces a byte-identical
+/// engine. That is an identity, not a gap in the test: no assertion can distinguish two
+/// configurations that are the same configuration.
+///
+/// It is still worth pinning both, and this is the reason. wasmtime's defaults are
+/// **platform-dependent** — 10 MiB and 64 KiB on a 32-bit host against 4 GiB and 32 MiB here —
+/// so an unset tunable is a cache-key input that varies by build machine, which is exactly what
+/// a cache key must not be. On such a host the deletion *is* observable, and this test catches
+/// it there.
+///
+/// What it catches everywhere is drift: a constant changed without the call site, or a call site
+/// setting something other than what the constant says. Those are the realistic regressions,
+/// because they are the ones a person makes.
+#[test]
+fn the_engine_applies_the_tunables_the_constants_declare() {
+    /// What the host said it expected, out of wasmtime's own refusal.
+    fn expected_by_the_host(message: &str) -> u64 {
+        let after = message
+            .split("but '")
+            .nth(1)
+            .unwrap_or_else(|| panic!("wasmtime's refusal changed shape: {message}"));
+        let value = after
+            .split('\'')
+            .next()
+            .unwrap_or_else(|| panic!("wasmtime's refusal changed shape: {message}"));
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("expected a number, got `{value}` in: {message}"))
+    }
+
+    /// Precompile under a deliberately mistuned engine, then read the shipped engine's refusal.
+    fn refusal(reservation: u64, guard: u64) -> String {
+        let mut wrong = wasmtime::Config::new();
+        wrong
+            .epoch_interruption(EPOCH_INTERRUPTION)
+            .memory_reservation(reservation)
+            .memory_guard_size(guard);
+        let wrong = wasmtime::Engine::new(&wrong).expect("the mistuned configuration is valid");
+        let artifact = wrong
+            .precompile_component(LIMITS)
+            .expect("the mistuned engine still compiles the fixture");
+
+        let shipped = WasmEngine::new().expect("the shipped configuration builds an engine");
+
+        // SAFETY: the bytes were produced by `precompile_component` a few lines above, in this
+        // process, so they are a well-formed artifact from a trusted source — which is the
+        // precondition `deserialize` carries. What is under test is not whether malformed input
+        // is handled, but whether a well-formed artifact is refused for the tunables it records.
+        #[expect(
+            unsafe_code,
+            reason = "deserializing bytes this test produced itself, to read the tunables check"
+        )]
+        let loaded =
+            unsafe { wasmtime::component::Component::deserialize(shipped.engine(), &artifact) };
+
+        let Err(err) = loaded else {
+            panic!(
+                "an artifact compiled with a {reservation} byte reservation and a {guard} byte                  guard loaded into the shipped engine, which means at least one of those                  settings is not reaching the compiler and the cache key would be hashing a                  value nothing applies"
+            );
+        };
+        err.root_cause().to_string()
+    }
+
+    // Same reservation, wrong guard: the reservation check passes and the guard check is the
+    // one that fires, so the message names the guard the shipped engine is really running with.
+    let message = refusal(MEMORY_RESERVATION, MEMORY_GUARD_SIZE / 4);
+    assert!(
+        message.contains("memory guard size"),
+        "expected the guard to be the disagreement: {message}"
+    );
+    assert_eq!(
+        expected_by_the_host(&message),
+        MEMORY_GUARD_SIZE,
+        "the engine is running with a different guard than `MEMORY_GUARD_SIZE` declares"
+    );
+
+    // And the reservation, which `check_tunables` compares first.
+    let message = refusal(MEMORY_RESERVATION / 2, MEMORY_GUARD_SIZE);
+    assert!(
+        message.contains("memory reservation"),
+        "expected the reservation to be the disagreement: {message}"
+    );
+    assert_eq!(
+        expected_by_the_host(&message),
+        MEMORY_RESERVATION,
+        "the engine is running with a different reservation than `MEMORY_RESERVATION` declares"
+    );
+}
+
+/// The `strided` probe still runs, so the measurement `MEMORY_GUARD_SIZE` records stays
+/// reproducible.
+///
+/// It is not a limits case. It exists because that probe is the evidence the guard decision
+/// rests on, and a probe nothing calls is a probe that can rot into something the next person
+/// re-measures and does not recognize.
+#[test]
+fn the_probe_the_guard_decision_was_measured_on_still_works() {
+    let mut run = Run::new(Limits::default());
+    run.check(&["strided", "1"]).expect("a short strided run");
+    let messages = run.messages();
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0].starts_with("strided 1m,"),
+        "the probe read its argument and reported a sum: {messages:?}"
+    );
 }

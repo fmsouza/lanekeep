@@ -51,6 +51,7 @@ impl Guest for Component {
             "grow" => grow(),
             "tick" => say(ctx, "tick"),
             "work" => work(ctx, &args),
+            "strided" => strided(ctx, &args),
             other => say(ctx, &format!("unknown probe `{other}`")),
         }
     }
@@ -134,6 +135,47 @@ fn work(ctx: &CheckContext, args: &[&str]) {
         n = std::hint::black_box(n.wrapping_add(i));
     }
     say(ctx, &format!("worked {millions}m, sum {n}"));
+}
+
+/// Three loads at distinct static offsets off one dynamic index.
+///
+/// The access pattern `memory_guard_size` actually decides, and the one `work` does not
+/// exercise. `wasmtime-internal-cranelift-47.0.3/src/bounds_checks.rs:417-423` names it exactly:
+/// "a series of Wasm loads that use the same dynamic index operand but different static offset
+/// immediates -- which is a common code pattern when accessing multiple fields in the same
+/// struct that is in linear memory -- will all emit the same `index > bound` check, which we can
+/// GVN". That collapsing is available only when `offset_and_size <= memory_guard_size`, so a
+/// zero guard turns one check into three.
+///
+/// A struct of three fields read through an opaque index is that pattern written out. The
+/// `black_box` on the index is what keeps it dynamic; without it the whole access folds.
+fn strided(ctx: &CheckContext, args: &[&str]) {
+    #[repr(C)]
+    struct Row {
+        a: u64,
+        b: u64,
+        c: u64,
+    }
+
+    let millions: u64 = args.first().and_then(|arg| arg.parse().ok()).unwrap_or(1);
+    let rows: Vec<Row> = (0..1024_u64)
+        .map(|i| Row {
+            a: i,
+            b: i * 2,
+            c: i * 3,
+        })
+        .collect();
+
+    let mut acc: u64 = 0;
+    for i in 0..millions.saturating_mul(1_000_000) {
+        let index = std::hint::black_box((i as usize) & 1023);
+        let row = &rows[index];
+        acc = acc
+            .wrapping_add(row.a)
+            .wrapping_add(row.b)
+            .wrapping_add(row.c);
+    }
+    say(ctx, &format!("strided {millions}m, sum {acc}"));
 }
 
 bindings::export!(Component with_types_in bindings);
