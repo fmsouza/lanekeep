@@ -235,19 +235,21 @@ so any "bounded by threads × N" arithmetic about it is wrong.** The entry above
 inputs; the more expensive mistake is at large ones. Measured through `lanekeep-engine` on
 2026-08-06, release, 14 threads, one initializer per chunk:
 
-| files | initializers |
-|---|---|
-| 2,000 | 579–903 |
-| 10,000 | 1,038–1,540 |
+| files | rules | initializers |
+|---|---|---|
+| 2,000 | 1 | 813 |
+| 2,000 | 10 | 579 |
+| 10,000 | 10 | 1,038 |
 
-Not fourteen, and not stable between runs of one corpus — rayon splits on how the work is going,
-so this is a distribution rather than a bound. `lanekeep-wasm`'s `MEMORY_RESERVATION` was
-justified on "roughly three hundred and fifty instantiations for a run, and it does not grow with
-the corpus", from workers × rules at fourteen workers; the real figure at ten thousand files times
-ten rules is 10,380. The design was right — one instance per (worker, rule) is what keeps it off
-files × rules, which would be 40,000 — and the *number* it was defended with was thirty times too
-small. If a cost is per initializer, measure the initializers; `with_min_len` is the lever that
-makes the count something you chose.
+Not fourteen, and not stable between runs of one corpus — the two 2,000-file rows are the same
+corpus and disagree, because rayon splits on how the work is going, so this is a distribution
+rather than a bound. `lanekeep-wasm`'s `MEMORY_RESERVATION` was justified on "roughly three
+hundred and fifty instantiations for a run, and it does not grow with the corpus", from workers ×
+rules at fourteen workers; the real figure at ten thousand files times ten rules is 10,380. The
+design was right — one instance per (worker, rule) is what keeps it off files × rules, which would
+be 100,000 — and the *number* it was defended with was thirty times too small. If a cost is per
+initializer, measure the initializers; `with_min_len` is the lever that makes the count something
+you chose.
 
 **A tree-sitter query matches children in tree order.** `(import_statement source: (string)
 (import_clause ...))` can never match, because the grammar puts `import_clause` first — and
@@ -372,11 +374,11 @@ A load-time check comparing an artifact's WIT against `crates/lanekeep-wasm/wit/
 therefore reject every real rule. The comparable thing is the set of imported instance names.
 
 **A rustup toolchain's *name* reaches a component's bytes, so "same compiler" is not the same as
-"same artifact".** Component builds are otherwise reproducible here — measured 2026-08-06, all nine
-fixtures in `crates/lanekeep-wasm/tests/fixtures/` built twice from clean for
-`wasm32-unknown-unknown` with `cargo component` 0.21.1 produced nine pairs of byte-identical
-artifacts, each matching what is committed, and the checkout's absolute path does not appear in any
-of them. What does appear is a standard-library source path in a panic location, which carries the
+"same artifact".** Component builds are otherwise reproducible here — measured 2026-08-06, the nine
+`wasm32-unknown-unknown` fixtures in `crates/lanekeep-wasm/tests/fixtures/` that existed then
+(`engine-rule` arrived after, making ten) built twice from clean with `cargo component` 0.21.1
+produced nine pairs of byte-identical artifacts, each matching what is committed, and the
+checkout's absolute path does not appear in any of them. What does appear is a standard-library source path in a panic location, which carries the
 *toolchain directory*: `.../toolchains/stable-aarch64-apple-darwin/...` against
 `.../toolchains/1.95.0-aarch64-apple-darwin/...`. Building `world-shape` through `stable` rather
 than through the pin gave a different sha256 at the same size, differing in exactly six bytes —
@@ -433,13 +435,14 @@ rest of that worker's share.
 that produces identical bytes is not one of them.** So "the source commit is newer than the
 artifact commit" is not evidence that the artifact is stale — it is equally the signature of a
 rebuild that changed nothing, and the two are indistinguishable from history alone. Three of the
-ten WebAssembly fixtures read as stale that way and all ten turned out to be current, which only
-a rebuild could establish: `cargo component build --release` on the pinned toolchain is
-byte-reproducible, so `just wasm-fixtures` on a consistent tree leaves `git status` clean and on
-an inconsistent one does not. That is now the check rather than the investigation —
+eleven committed WebAssembly fixtures read as stale that way — `bindings`, `spike` and
+`world-shape` — and all eleven turned out to be current, which only a rebuild could establish:
+`cargo component build --release` on the pinned toolchain is byte-reproducible, so
+`just wasm-fixtures` on a consistent tree leaves `git status` clean and on an inconsistent one
+does not. That is now the check rather than the investigation —
 `crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
 `tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
-there too, because nine of the ten name it as their component target and a world edit with no
+there too, because ten of the eleven name it as their component target and a world edit with no
 rebuild leaves every fixture satisfying an ABI that no longer exists.
 
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives

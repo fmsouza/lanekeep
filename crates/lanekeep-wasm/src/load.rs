@@ -352,8 +352,19 @@ impl ComponentLoader {
 
     /// A loader with nowhere to write, which therefore always takes the fallback.
     ///
-    /// What `--no-cache` and a read-only checkout get. Named rather than spelled
-    /// `new(None)` at every call site, so the decision is visible in a diff.
+    /// **No run builds one, and the two situations that sound like they would do not.**
+    /// `--no-cache` turns off the *result* cache and nothing else: it reaches
+    /// `lanekeep_engine::Engine::without_cache`, while that crate's `load_components` builds
+    /// [`ComponentLoader::for_project_root`] unconditionally — so a `--no-cache` run still
+    /// writes `.cwasm` artifacts. That is harmless rather than a bug, because an artifact is
+    /// named by a hash of the component's own bytes and there is no stale one to serve; it is
+    /// recorded because a doc claiming the wiring exists is how nobody looks for it. And a
+    /// read-only checkout does not arrive here either — it arrives at `for_project_root`,
+    /// whose write fails and whose step 3 is [`LoadSource::Embedded`].
+    ///
+    /// So the callers are this crate's tests, which want the fallback path and no directory to
+    /// clean up afterwards. Named rather than spelled `new(None)` at every call site, so the
+    /// decision is visible in a diff.
     #[must_use]
     pub fn without_cache() -> Self {
         Self::new(None)

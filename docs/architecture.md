@@ -386,6 +386,8 @@ Mechanically: the per-invocation limit uses QuickJS's interrupt handler for a Ty
 
 **Cache entries for files that fully completed are still committed.** Each entry is independently valid — it records the result of running every rule against that file to completion — and discarding them would mean a corpus that times out on a cold run times out identically on every retry, with no way to make progress. Files that were in flight when the run aborted are not written. An aborted run also **merges rather than prunes**: pruning is what ages a deleted file out and is sound only for a run that saw the whole corpus, so a run that stopped early would otherwise age out every file it never reached and leave the next run colder than the one that failed.
 
+Both halves became true in the same release and neither had been true before it, which is worth stating because this section has a history of describing behavior nothing implemented. The *commit* half this section always required and nothing did: `run_files` returned on the first error before it reached the save, so an aborted run wrote no entry at all, and a corpus that overran its budget would have been stranded cold forever the moment that budget started being enforced. The *no-prune* half is doctrine added alongside that fix, and it could not have been stated earlier — there was no save whose pruning behavior anyone had to decide. `lanekeep-engine`'s `an_aborted_run_still_commits_the_files_that_finished`, `an_aborted_run_does_not_prune_what_it_never_reached` and `a_full_run_still_prunes` are what hold the three claims above, and a claim added here without one is a claim in the position these were.
+
 ---
 
 ## 7. Making it fast

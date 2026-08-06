@@ -19,11 +19,14 @@
 //! # What is covered, and why it is more than the fixture directories
 //!
 //! `wit/world.wit` is in here too, and it is the sharpest case rather than an afterthought.
-//! Every fixture but `spike` sets `[package.metadata.component.target] path = "../../../wit"`,
-//! so the world is a build input to nine committed artifacts. Change it without rebuilding and
-//! the fixtures still load, still instantiate and still pass — as components built against an
-//! ABI that no longer exists. That is the one staleness a reader is least likely to suspect,
-//! because the file that changed is not in `tests/` at all.
+//! Every fixture but `spike` names that directory under `[package.metadata.component.target]`,
+//! so the world is a build input to ten of the eleven committed artifacts. Nine spell the path
+//! `../../../wit`; `rejected/wasip1` sits a directory deeper and spells it `../../../../wit`,
+//! which is worth knowing before grepping for the three-level form and concluding it is not a
+//! consumer. Change the world without rebuilding and the fixtures still load, still instantiate
+//! and still pass — as components built against an ABI that no longer exists. That is the one
+//! staleness a reader is least likely to suspect, because the file that changed is not in
+//! `tests/` at all.
 //!
 //! Recording the world as one entry over-invalidates slightly: `spike` targets its own
 //! `wit/spike.wit` and does not care. Over-invalidation costs a rebuild of a directory
@@ -143,7 +146,7 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
 
 /// Every file the committed artifacts are built from, and the artifacts themselves.
 ///
-/// Two roots: `wit/`, because nine of the ten fixtures name it as their component target, and
+/// Two roots: `wit/`, because ten of the eleven fixtures name it as their component target, and
 /// `tests/fixtures/`, which holds both the guest crates and their build output. The `.wasm`
 /// files need no separate pass — they sit in the second root as ordinary files.
 fn digests(crate_dir: &Path) -> BTreeMap<String, String> {

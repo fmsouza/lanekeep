@@ -94,7 +94,18 @@ pub struct RuleSpec {
     /// then refuses it. That refusal stays, because the fields above it have nowhere to come
     /// from: `crates/lanekeep-wasm/wit/world.wit` declares four exports and **none of them is
     /// `metadata`**, so a component cannot supply its own `id`, `query`, `card`, `gates`,
-    /// `languages`, `severity` or `timeout`. The only alternatives are to add that export —
+    /// `languages`, `severity` or `timeout`.
+    ///
+    /// [`RuleSpec::has_reduce`] is the exception and is worth naming rather than leaving out of
+    /// the list, because it is the one field a second source of truth already exists for. The
+    /// world *does* declare `has-check` and `has-reduce`, and a component answers both — but
+    /// nothing asks: the engine reads that field, which this crate fills in by inspecting the
+    /// TypeScript module or from JSON, and `lanekeep_wasm::WasmRuntime::has_reduce` has test
+    /// callers only. So a component-backed rule is taken at its config's word about a question
+    /// it can answer itself, and the two can disagree with nothing to notice. Closing that is
+    /// the same sub-project as `metadata`, and it should close both at once.
+    ///
+    /// The only alternatives are to add that export —
     /// which is the Rust-authoring sub-project's ABI to design, and bumps a cache-key input —
     /// or to invent config syntax carrying the metadata beside the reference, which that same
     /// sub-project would then have to un-invent. Both were declined, as they were when the
