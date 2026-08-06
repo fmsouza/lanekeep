@@ -529,13 +529,24 @@ simply slow. The breach message even ends with "raise it with `--timeout`", advi
 the code that made it impossible. A test that only *lowers* a limit passes against this bug —
 assert the raise.
 
-**The global run budget is polled by QuickJS's interrupt handler, so it only bounds a run while
-JavaScript is executing.** A rule whose handler returns after a handful of operations can
-overrun the budget without ever being asked to stop: 400 files against a one-line rule ran to
-completion under a 1 ms budget, config-set or flag-set alike. It is not that the limit is unwired
-— a rule doing real work trips it precisely — but the poll only happens inside the sandbox, and
-§15's cold cost is dominated by Rust-side parsing. Any fixture testing this needs a rule that
-burns real bytecode, or it is testing nothing.
+**Both engines poll the global run budget only from inside a handler, so for a while it bounded
+a run only while a handler was executing.** QuickJS polls it from its interrupt handler; wasmtime
+from the epoch checks Cranelift compiles into guest code. Neither runs while the engine is
+reading, hashing, parsing or matching, and §15's cold cost is dominated by exactly that. So a
+rule whose handler returned after a handful of operations could overrun the budget without ever
+being asked to stop: 400 files against a one-line rule ran to completion under a 1 ms budget,
+config-set or flag-set alike, and the component path had the same gap for the same reason. It was
+never that the limit is unwired — a rule doing real work trips it precisely.
+
+`Engine::check_file` now asks the run clock between one file and the next, which closes it for
+both engines at once because it sits above the dispatch that chooses between them. Two things
+follow. **A fixture for the *inner* limits still needs a rule that burns real bytecode**, or it
+passes because the work was fast; a fixture for the *outer* check needs the opposite — a handler
+so cheap that nothing but the outer check could have stopped the run, or it passes against the
+bug. And **an aborted run has to commit the entries for files that completed and must not prune**,
+which architecture §6.8 always required and nothing did: `run_files` returned on the first error
+before it reached the save, so a corpus that overran its budget would have been stranded cold
+forever the moment the budget started being enforced.
 
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,

@@ -138,6 +138,30 @@ pub enum RunError {
         detail: String,
     },
 
+    /// The run's wall-clock budget was spent, noticed between one file and the next.
+    ///
+    /// **The only limit breach that names no rule and no file, because it is about neither.**
+    /// Both engines already report a spent run budget from inside a handler — QuickJS from its
+    /// interrupt handler, wasmtime from an epoch check compiled into guest code — and those
+    /// arrive as [`RunError::Rule`], carrying whichever rule happened to be executing. That is
+    /// the right shape for a breach a rule was at least present for. It is the wrong shape for
+    /// this one: nothing was executing, so there is no culprit to name and naming one would
+    /// send a reader to a rule that is not the problem.
+    ///
+    /// The wording is deliberately the same as both engines', because the user-facing fact is
+    /// the same and which mechanism noticed is lanekeep's business rather than theirs.
+    #[error(
+        "the run exceeded its {budget:?} budget after {elapsed:?}\n  \
+         no single rule necessarily misbehaved — the total simply ran too long\n  \
+         raise it with `--timeout`, or narrow what is being checked"
+    )]
+    RunTimeout {
+        /// The global budget.
+        budget: Duration,
+        /// How long the run had actually been going.
+        elapsed: Duration,
+    },
+
     /// The sandbox failed, including on a breached budget.
     #[error("rule `{rule}` failed on `{file}`\n{detail}")]
     Rule {
@@ -856,8 +880,19 @@ impl Engine {
         let mut fresh = Store::empty();
         let mut directives: BTreeMap<FilePath, FileDirectives> = BTreeMap::new();
         let mut timings: BTreeMap<RuleId, RuleTiming> = BTreeMap::new();
+        // The first failure by *file order*, kept rather than returned, because the entries
+        // every other file produced are still owed to the cache — see the save below. Which
+        // failure is reported does not change: it is the same one `?` would have taken, since
+        // rayon's `collect` preserves input order.
+        let mut failure: Option<RunError> = None;
         for result in results {
-            let outcome = result?;
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
             violations.extend(outcome.violations);
             facts.extend(outcome.facts);
             files_parsed += usize::from(outcome.parsed);
@@ -884,16 +919,33 @@ impl Engine {
             }
         }
 
+        // Saved before the failure is propagated, and merged rather than pruned when there is
+        // one.
+        //
+        // §6.8: a limit breach cancels the run, and **cache entries for files that fully
+        // completed are still committed**. Each is independently valid — it records every rule
+        // running against those bytes to completion — and dropping them means a corpus that
+        // dies on a cold run dies identically on every retry, with no way to make progress.
+        // That was latent while nothing enforced the run budget outside a handler, because a
+        // corpus of cheap invocations simply finished; the check at the top of `check_file` is
+        // what turns it into the ordinary case.
+        //
+        // Pruning is the part that must not happen. A run that stopped early holds entries for
+        // a fraction of the corpus and never looked at the rest, so a fresh-only save would age
+        // out every file it never reached and leave the next run *colder* than the one that
+        // failed. That is the same reasoning `Coverage::Partial` already carries, arrived at
+        // from the other direction: pruning is sound only for a run that saw everything, and an
+        // aborted run did not.
         if self.caching {
             match coverage {
                 // The run saw everything, so what it did not produce an entry for no longer
                 // exists. Saving only fresh entries is what ages deleted files out.
-                Coverage::Whole => fresh.save(&self.root),
-                // The run saw a subset. Saving only what it produced would discard the
-                // entries for every file it never looked at — so `--staged` would leave the
-                // next full run cold, which is the opposite of what an incremental entry
-                // point is for.
-                Coverage::Partial => {
+                Coverage::Whole if failure.is_none() => fresh.save(&self.root),
+                // The run saw a subset — because it was given one, or because it stopped part
+                // way through. Saving only what it produced would discard the entries for
+                // every file it never looked at, so `--staged` would leave the next full run
+                // cold, which is the opposite of what an incremental entry point is for.
+                Coverage::Whole | Coverage::Partial => {
                     let mut merged = cache;
                     for key in fresh.keys().copied().collect::<Vec<_>>() {
                         if let Some(entry) = fresh.get(&key) {
@@ -903,6 +955,10 @@ impl Engine {
                     merged.save(&self.root);
                 }
             }
+        }
+
+        if let Some(error) = failure {
+            return Err(error);
         }
 
         // Into the one order every run will see, before any rule looks at them.
@@ -1182,6 +1238,33 @@ impl Engine {
         cache: &Store,
         path: &FilePath,
     ) -> Result<FileOutcome, RunError> {
+        // **The run's budget, asked where the run's time is actually spent.**
+        //
+        // Both engines poll it from inside a handler and nowhere else: QuickJS from its
+        // interrupt handler, wasmtime from the epoch checks Cranelift compiles into guest
+        // code. Neither runs while this engine is reading a file, hashing it, parsing it or
+        // evaluating a query — and §15 says that is most of a cold run. So a rule whose
+        // handler returns after a handful of operations could overrun the budget without ever
+        // being asked to stop: `AGENTS.md` recorded four hundred files against a one-line rule
+        // running to completion under a one-millisecond budget, and the component path had the
+        // same gap for the same reason.
+        //
+        // One check, here, closes it for both, because this sits above the dispatch that
+        // chooses between them. A file boundary is also the only place a run *can* be stopped
+        // without degrading it: everything before this line for this file has not happened
+        // yet, and everything after it happens in full or not at all.
+        //
+        // It costs one clock read per file, on a path that already reads the file from disk.
+        // That matters because `Worker`'s own count is per rayon *chunk* rather than per
+        // thread — but this is per file either way, and `RunClock::is_expired` allocates
+        // nothing and takes no lock.
+        if worker.clock.is_expired() {
+            return Err(RunError::RunTimeout {
+                budget: worker.clock.global_timeout(),
+                elapsed: worker.clock.elapsed(),
+            });
+        }
+
         // A fresh set of tracked reads for this file, sharing the root already canonicalized
         // at preparation.
         //
@@ -4868,6 +4951,174 @@ export default defineRule({
         assert_eq!(outcome.violations[0].location.position.line, 2);
     }
 
+    /// The run's own wall-clock budget, which is spent mostly outside any sandbox.
+    ///
+    /// `AGENTS.md` recorded the gap these cover: the budget was polled by QuickJS's interrupt
+    /// handler and by nothing else, so it only bounded a run *while JavaScript was executing*.
+    /// Four hundred files against a one-line rule ran to completion under a one-millisecond
+    /// budget, because §15's cold cost is dominated by Rust-side reading, parsing and query
+    /// matching and none of that is a place the handler runs.
+    ///
+    /// # Why these fixtures are cheap on purpose, when every other budget test is expensive
+    ///
+    /// The rest of this repository's limit tests need a rule that burns real bytecode, or they
+    /// pass because the work was fast rather than because a limit was enforced. Here the
+    /// requirement is the exact opposite and for the same reason: the handler has to be so
+    /// cheap that the *only* thing that can stop the run is the check outside it. A rule doing
+    /// real work would be stopped by the interrupt handler, and the test would pass against
+    /// the bug.
+    ///
+    /// Measured against the commit before this one, all three of these fixtures ran to
+    /// completion: 400 files and 400 `check` invocations in 84 ms under a 1 ms budget.
+    mod run_budget {
+        use super::*;
+
+        /// Enough files that a millisecond cannot cover them.
+        ///
+        /// The number from the `AGENTS.md` trap, and the margin is wide rather than tuned: the
+        /// corpus takes ~84 ms in a debug build, so the budget below is breached roughly eighty
+        /// times over.
+        const FILES: usize = 400;
+
+        /// A file the rule matches, so a handler really is invoked once per file.
+        const MATCHED: &str = "export function a() {\n  debugger;\n}\n";
+
+        /// `FILES` identical files under one global budget, with `no-debugger` over them.
+        fn corpus(name: &str, global_ms: u64) -> Project {
+            let config = config(&format!(", timeouts: {{ global: {global_ms} }}"));
+            let mut owned: Vec<(String, String)> = vec![
+                ("rule.ts".to_owned(), DEBUGGER_RULE.to_owned()),
+                ("lanekeep.config.ts".to_owned(), config),
+            ];
+            for i in 0..FILES {
+                owned.push((format!("src/f{i}.ts"), MATCHED.to_owned()));
+            }
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            Project::new(name, &borrowed)
+        }
+
+        #[test]
+        fn a_corpus_of_cheap_invocations_is_stopped_by_the_runs_budget() {
+            let project = corpus("run-budget-lowered", 1);
+
+            let error = project
+                .run_cold()
+                .expect_err("a run whose budget is spent must not finish the corpus");
+
+            // The variant, not the wording, and that is what makes this discriminating. A
+            // breach the interrupt handler noticed arrives as `RunError::Rule`, naming a rule
+            // and a file; this one is the walker's own, and it names neither because neither
+            // is at fault.
+            assert!(
+                matches!(error, RunError::RunTimeout { .. }),
+                "the run had to be stopped between files rather than inside a handler: {error}"
+            );
+        }
+
+        #[test]
+        fn the_same_corpus_completes_when_the_budget_is_raised() {
+            // `AGENTS.md`: a test that only *lowers* a limit passes against a limit that is
+            // read and then dropped, because the run completes either way. This is the half
+            // that discriminates — and it is also the control for the case above, since
+            // without it "the run was stopped" is equally consistent with a corpus that can
+            // no longer be checked at all.
+            let project = corpus("run-budget-raised", 60_000);
+
+            let outcome = project
+                .run_cold()
+                .expect("a minute is ample for four hundred one-line files");
+            assert_eq!(
+                outcome.violations.len(),
+                FILES,
+                "every file has to have been checked, or the case above stopped nothing"
+            );
+        }
+
+        /// A rule that throws on the one file whose text says `boom`, and nowhere else.
+        const SELECTIVE_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/selective',\n\
+              query: '(identifier) @id',\n\
+              card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { if (ctx.text(m.id) === 'boom') throw new Error('kaboom'); },\n\
+            });\n";
+
+        #[test]
+        fn an_aborted_run_still_commits_the_files_that_finished() {
+            // Architecture §6.8: cache entries for files that fully completed are still
+            // committed, because otherwise a corpus that dies on a cold run dies identically
+            // on every retry and there is no way to make progress. That mattered little while
+            // the run budget went unenforced — the run simply finished. It is load-bearing the
+            // moment the check above exists.
+            //
+            // The abort here is a thrown rule rather than a timeout, deliberately: which files
+            // finish is then a property of the corpus rather than of how fast the machine is.
+            const GOOD: usize = 40;
+            let mut owned: Vec<(String, String)> = vec![
+                ("rule.ts".to_owned(), SELECTIVE_RULE.to_owned()),
+                ("lanekeep.config.ts".to_owned(), config("")),
+            ];
+            for i in 0..GOOD {
+                owned.push((
+                    format!("src/f{i}.ts"),
+                    "export const fine = 1;\n".to_owned(),
+                ));
+            }
+            owned.push((
+                "src/zzz.ts".to_owned(),
+                "export const boom = 1;\n".to_owned(),
+            ));
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            let project = Project::new("run-budget-partial-cache", &borrowed);
+
+            project.run().expect_err("one file's rule throws");
+
+            assert_eq!(
+                Store::load(&project.dir).len(),
+                GOOD,
+                "every file that completed in full has to have an entry, and the one that did \
+                 not must have none"
+            );
+        }
+
+        #[test]
+        fn an_aborted_run_does_not_prune_what_it_never_reached() {
+            // The other half, and the one that would quietly destroy a cache rather than
+            // merely fail to fill it. A run that saw the whole corpus may prune, because what
+            // it produced no entry for no longer exists — that is what ages a deleted file
+            // out. A run the budget stopped produced entries for a fraction of the corpus and
+            // never looked at the rest, so saving only what it produced would age out every
+            // file it never reached, and the next run would be *colder* than the one that
+            // failed.
+            let project = corpus("run-budget-no-prune", 60_000);
+            project.run().expect("a minute is ample");
+            assert_eq!(
+                Store::load(&project.dir).len(),
+                FILES,
+                "the whole corpus is cached"
+            );
+
+            // The same corpus under a budget it cannot meet. Lowering it changes `config_hash`
+            // — `timeouts.global` is a cache-key input — so this run is cold as well as short,
+            // which is the worst case for the save: almost nothing of the corpus is fresh, and
+            // everything that is already stored belongs to a key this run will never write.
+            project.write("lanekeep.config.ts", &config(", timeouts: { global: 1 }"));
+            let error = project.run().expect_err("one millisecond is not enough");
+            assert!(matches!(error, RunError::RunTimeout { .. }), "{error}");
+
+            assert!(
+                Store::load(&project.dir).len() >= FILES,
+                "an aborted run pruned entries for files it never reached"
+            );
+        }
+    }
+
     /// The second dispatch path: rules whose handlers are a WebAssembly component.
     ///
     /// Every test above runs TypeScript rules through QuickJS and keeps doing so, which is what
@@ -5410,6 +5661,49 @@ export default defineRule({
             assert!(
                 error.contains("the run exceeded its"),
                 "the global budget must be what is blamed, not the rule's: {error}"
+            );
+        }
+
+        #[test]
+        fn a_spent_run_budget_stops_a_component_rule_before_the_guest_is_entered() {
+            // The same outer check as `run_budget`'s cases, on the other dispatch path — and it
+            // is one check rather than two, which is the point: it sits in `check_file`, above
+            // the `if let Some(slot)` that chooses an engine, so neither engine can be the one
+            // that has it.
+            //
+            // What makes this discriminating is the *variant*. Measured against the commit
+            // before this one, the same fixture failed with `RunError::Rule` — the epoch
+            // mechanism noticed, mid-instantiation, and blamed `local/middle` for `src/a.ts`.
+            // That is a rule and a file named for a breach that is about neither, and it is
+            // only luck that anything noticed at all: `AGENTS.md` records that epoch checks
+            // live inside guest code, so a tick that lands between two calls is invisible to
+            // them. `RunError::RunTimeout` can only come from the walker.
+            //
+            // A budget of zero is a run whose clock is spent before the first file, which is
+            // the one arrangement in which nothing but the outer check can fire — the guest is
+            // never entered, so there is no epoch deadline to trip. `lanekeep-wasm`'s own
+            // limit tests avoid a born-expired clock for the opposite reason, that
+            // instantiation is itself a budgeted guest call; here that is exactly what must
+            // not happen.
+            let config = "import { defineConfig } from 'lanekeep';\n\
+                 import r0 from './rule-a';\n\
+                 export default defineConfig({ include: ['src/**/*.ts'], \
+                 namespaces: ['local'], timeouts: { global: 0 }, rules: [r0] });\n";
+            let project = Project::new(
+                "component-spent-budget",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", config),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let error = project
+                .run_with(vec![component_rule("local/middle", 1, false)])
+                .expect_err("a spent run budget stops the run");
+            assert!(
+                matches!(error, RunError::RunTimeout { .. }),
+                "the walker had to stop this before any guest ran: {error}"
             );
         }
 

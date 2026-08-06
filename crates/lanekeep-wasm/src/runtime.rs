@@ -28,9 +28,11 @@
 //!   code, so it only runs while guest code runs. A rule that returns after a handful of
 //!   operations can overrun the global budget without ever being asked to stop. That is the
 //!   same gap `AGENTS.md` records against QuickJS's interrupt handler, for the same reason,
-//!   and switching engines does not touch it — see `tests/limits.rs`, which measures it. The
-//!   outer clock check that closes it is Task 17's, and it belongs outside both engines
-//!   because both need it.
+//!   and switching engines does not touch it — see `tests/limits.rs`, which measures it.
+//!   **This is still true of this module and is no longer true of a run**, because
+//!   `lanekeep_engine::Engine::check_file` asks the same [`RunClock`] between one file and the
+//!   next. That check is deliberately outside both engines: it is the one place a run can be
+//!   stopped while no handler is executing, which is where a run spends most of its time.
 //!
 //! # The two tunables that bake into every precompiled artifact
 //!

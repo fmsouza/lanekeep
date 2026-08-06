@@ -27,9 +27,12 @@
 //!
 //! # Two of these are not correctness tests
 //!
-//! [`nothing_outside_the_epoch_mechanism_consults_the_run_budget`] records a **known gap**,
-//! closed by the plan's Task 17 and not by this module. Its assertion is expected to change
-//! when that lands.
+//! [`nothing_outside_the_epoch_mechanism_consults_the_run_budget`] records what this crate's
+//! mechanism does **not** do, and its assertion is unchanged now that a run is bounded outside
+//! it: `lanekeep_engine::Engine::check_file` asks the same clock between files, and nothing in
+//! this crate is on that path. So the fact stated here — that the budget is consulted from the
+//! epoch callback and from nowhere else in `lanekeep-wasm` — stays exactly as true, and stays
+//! worth pinning, because it is the reason the outer check has to exist.
 //!
 //! [`the_probe_the_guard_decision_was_measured_on_still_works`] asserts nothing about a limit
 //! at all. It keeps the `strided` probe alive, because that probe is the evidence
@@ -520,16 +523,20 @@ fn a_trap_that_is_not_a_limit_breach_is_not_reported_as_one() {
 
 // --- the recorded gap, and its control ---------------------------------------------------
 
-/// **This records a known gap. It is not a correctness test, and its assertion is expected to
-/// change.**
+/// **This records what this crate's mechanism does not do. It is not a correctness test.**
 ///
-/// `AGENTS.md`: the global run budget is polled by QuickJS's interrupt handler, so it only
-/// bounds a run while JavaScript is executing — four hundred files against a one-line rule ran
-/// to completion under a one-millisecond budget. Switching engines does not touch that. The
-/// epoch check Cranelift emits lives at function entries and loop back-edges *inside guest
-/// code*, so wall-clock time passing between invocations is invisible to it for exactly the
-/// same reason. The plan's Task 17 adds the outer clock check that closes it, in the engine
-/// above both runtimes, because both need it.
+/// `AGENTS.md`: the global run budget was polled by QuickJS's interrupt handler and by nothing
+/// else, so it only bounded a run while JavaScript was executing — four hundred files against a
+/// one-line rule ran to completion under a one-millisecond budget. Switching engines does not
+/// touch that. The epoch check Cranelift emits lives at function entries and loop back-edges
+/// *inside guest code*, so wall-clock time passing between invocations is invisible to it for
+/// exactly the same reason.
+///
+/// **A run is now bounded anyway, and not from here.** `lanekeep_engine::Engine::check_file`
+/// asks the same [`RunClock`] between one file and the next, above the dispatch that chooses an
+/// engine, so neither runtime is the one that has the check — which is why this assertion is
+/// unchanged. Nothing in `lanekeep-wasm` is on that path, and the property pinned here is
+/// precisely the reason the outer check has to exist.
 ///
 /// # Why the tick interval is pinned rather than left at its default
 ///
@@ -565,7 +572,7 @@ fn nothing_outside_the_epoch_mechanism_consults_the_run_budget() {
 
     for call in 0..400 {
         run.check(&["tick"]).unwrap_or_else(|e| {
-            panic!("call {call} was stopped, which Task 17 has not landed yet: {e:?}")
+            panic!("call {call} was stopped, so something here consulted the clock: {e:?}")
         });
     }
 
