@@ -52,64 +52,113 @@ const FILE: &str = "src/example.ts";
 /// numbers asserted here are comparable to that test's by inspection.
 const TWO_STATEMENTS: &str = "const x = 1;\nconst y = 2;";
 
-/// Parse a source, lend a context over it to the fixture, and call one probe.
+/// One instantiated component, one store, and one context lent across every call.
 ///
-/// Returns the store, the context handle and the call's own outcome rather than the reports,
-/// so a test that needs to look at the context twice — or at a call that trapped — can.
-fn run(
-    source: &str,
-    name: &str,
-) -> (
-    Store<HostState>,
-    Resource<CheckContext>,
-    wasmtime::Result<()>,
-) {
-    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
-    let component = Component::new(&engine, NAVIGATION).expect("the fixture is a valid component");
-    let mut linker = Linker::new(&engine);
-    Rule::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-        .expect("the real host satisfies every import the world declares");
+/// The context outlives each call deliberately, on the terms `tests/reads.rs`'s harness sets
+/// out: whether the engine builds one context per file or one per rule is still open — see
+/// `CheckContext::with_file_access` — and under the per-file shape every rule on a file runs
+/// through a single one of these. A harness that rebuilt one per call could not observe
+/// anything that accumulates, and the date-read flag is exactly that.
+struct Run {
+    store: Store<HostState>,
+    rule: Rule,
+    context: Resource<CheckContext>,
+}
 
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&TypeScript.grammar())
-        .expect("grammar loads");
-    let tree = parser.parse(source, None).expect("parses");
+impl Run {
+    /// Parse a source and lend a context over it to the fixture.
+    ///
+    /// `today` is what the context answers through the world's `today`, and `None` means the
+    /// host supplied no date — the world's own declared answer rather than a missing one. It is
+    /// always a literal and never a clock read: a test that asked the machine what day it was
+    /// would pass today and fail at midnight, which is the failure this whole surface sits in
+    /// tension with.
+    fn new(source: &str, today: Option<&str>) -> Self {
+        let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+        let component =
+            Component::new(&engine, NAVIGATION).expect("the fixture is a valid component");
+        let mut linker = Linker::new(&engine);
+        Rule::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+            .expect("the real host satisfies every import the world declares");
 
-    let mut store = Store::new(&engine, HostState::new());
-    let context = store
-        .data_mut()
-        .push_check_context(CheckContext::new(
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&TypeScript.grammar())
+            .expect("grammar loads");
+        let tree = parser.parse(source, None).expect("parses");
+
+        let mut context = CheckContext::new(
             NodeArena::new(tree, source.to_owned()),
             FILE,
             Arc::new(TypeScript),
-        ))
-        .expect("the resource table accepts a context");
+        );
+        if let Some(today) = today {
+            context = context.with_today(today);
+        }
 
-    let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
-    let captures = vec![types::MatchEntry {
-        name: name.to_owned(),
-        node: NodeArena::ROOT,
-    }];
-    let outcome = rule.call_check(&mut store, Resource::new_borrow(context.rep()), &captures);
+        let mut store = Store::new(&engine, HostState::new());
+        let context = store
+            .data_mut()
+            .push_check_context(context)
+            .expect("the resource table accepts a context");
+        let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
 
-    (store, context, outcome)
+        Self {
+            store,
+            rule,
+            context,
+        }
+    }
+
+    /// Invoke one probe. An `Err` here is a trap.
+    ///
+    /// Separate from [`Run::probe`] because two tests need the error rather than the reports,
+    /// and a helper that unwrapped would make them unwritable.
+    fn call(&mut self, name: &str) -> wasmtime::Result<()> {
+        let captures = vec![types::MatchEntry {
+            name: name.to_owned(),
+            node: NodeArena::ROOT,
+        }];
+        self.rule.call_check(
+            &mut self.store,
+            Resource::new_borrow(self.context.rep()),
+            &captures,
+        )
+    }
+
+    /// Invoke one probe and collect what it reported.
+    fn probe(&mut self, name: &str) -> Vec<Report> {
+        self.call(name).expect("check returns without trapping");
+        self.take()
+    }
+
+    /// Everything the context has recorded since it was last asked.
+    fn take(&mut self) -> Vec<Report> {
+        self.context_mut().take_reports()
+    }
+
+    /// Whether anything has read the date through this context.
+    ///
+    /// The boolean `lanekeep-engine` turns into a dated cache key, asked of the same accessor
+    /// the engine asks of `lanekeep-js`.
+    fn date_was_read(&mut self) -> bool {
+        self.context_mut().date_was_read()
+    }
+
+    fn context_mut(&mut self) -> &mut CheckContext {
+        self.store
+            .data_mut()
+            .check_context_mut(&self.context)
+            .expect("the context outlives the call that borrowed it")
+    }
 }
 
-/// Everything the context has recorded since it was last asked.
-fn take(store: &mut Store<HostState>, context: &Resource<CheckContext>) -> Vec<Report> {
-    store
-        .data_mut()
-        .check_context_mut(context)
-        .expect("the context outlives the call that borrowed it")
-        .take_reports()
-}
-
-/// Run one probe and collect what it reported.
+/// Build a context with no date and run one probe, collecting what it reported.
+///
+/// The date is the one surface most of these probes never touch, so `None` is the default a
+/// test opts out of rather than a value every test has to state.
 fn probe(source: &str, name: &str) -> Vec<Report> {
-    let (mut store, context, outcome) = run(source, name);
-    outcome.expect("check returns without trapping");
-    take(&mut store, &context)
+    Run::new(source, None).probe(name)
 }
 
 /// Render reports as `line:column message`, so an assertion reads as what a reader would see
@@ -294,48 +343,144 @@ fn the_no_message_form_records_a_report_with_no_message() {
 #[test]
 fn taking_reports_empties_the_context() {
     // Mirrors `lanekeep-js`'s test of the same name. Taken twice would be reported twice.
-    let (mut store, context, outcome) = run("const x = 1;", "bare");
-    outcome.expect("check returns");
-    assert_eq!(take(&mut store, &context).len(), 1);
+    let mut run = Run::new("const x = 1;", None);
+    assert_eq!(run.probe("bare").len(), 1);
+    assert!(run.take().is_empty(), "reports must not be reported twice");
+}
+
+#[test]
+fn a_report_made_before_a_trap_survives_it() {
+    // This test used to drive `today`, which trapped while it was declared and unimplemented.
+    // Every `check-context` method is implemented now, so the trap it uses is `read-file` on a
+    // context built with no file access — see `tests/reads.rs` for that decision. The property
+    // asserted is unchanged and is about *reporting*: a handler may report several times and
+    // then hit something the host cannot answer, and what it already found is still true.
+    let mut run = Run::new("const x = 1;", None);
+    let trap = run.call("trap-after-report").expect_err("the call traps");
+
+    // The **root cause**, not the whole `{:?}` render, and the difference is not cosmetic.
+    // wasmtime prefixes a host error with a wasm backtrace whose top frame is spelled
+    // `wit-component:shim!indirect-lanekeep:host/types@0.1.0-[method]check-context.read-file`
+    // — so an assertion over the rendered error contains the method name whatever the host
+    // said, and holds even against a host that named a different method entirely. Measured on
+    // the earlier version of this test: it survived a mutation replacing the name with
+    // `something`.
+    let cause = trap.root_cause().to_string();
     assert!(
-        take(&mut store, &context).is_empty(),
-        "reports must not be reported twice"
+        cause.contains("check-context.read-file"),
+        "the trap names the method a reader has to go and look at: {cause}"
+    );
+    assert!(
+        cause.contains("built without file access"),
+        "and says why, rather than only that something failed: {cause}"
+    );
+
+    assert_eq!(
+        rendered(&run.take()),
+        ["1:1 recorded before the trap"],
+        "discarding it would make the failure harder to diagnose rather than easier — the same \
+         posture as `lanekeep-js`'s `a_rule_that_throws_still_leaves_earlier_reports`"
+    );
+}
+
+// --- the date ------------------------------------------------------------------------------
+//
+// Every assertion below mirrors one `crates/lanekeep-js/src/host.rs` already makes —
+// `today_is_what_the_host_supplied`, `today_is_absent_when_the_host_supplied_none`,
+// `reading_today_is_observed_and_not_reading_it_is_not` — restated against the component
+// boundary, plus the two cases that surface only here because WIT has no absent export.
+//
+// No test in this section reads a clock. The date is a literal the host hands the context, and
+// the point of the whole mechanism is that a rule sees the run's date rather than the machine's.
+
+#[test]
+fn today_is_what_the_host_supplied() {
+    // Verbatim, not re-rendered. `YYYY-MM-DD` comes from `lanekeep_core::suppression::Date`'s
+    // `Display` by way of whoever fixes the date for the run; a host that reformatted it here
+    // would make a component rule and the identical TypeScript rule compare against different
+    // strings.
+    assert_eq!(
+        rendered(&Run::new("const x = 1;", Some("2026-08-01")).probe("today")),
+        [r#"1:1 today=Some("2026-08-01")"#]
     );
 }
 
 #[test]
-fn a_declared_but_unimplemented_method_traps_rather_than_answering() {
-    // The decision this makes checkable: every value an unimplemented method could return
-    // instead — `none` for a date, `false` for a shadow, an empty list for a query — reads as
-    // a real answer, and a rule built against one would look like it was working while the
-    // run was quietly wrong. When a later change implements `today`, this test changes with
-    // it, which is the point.
-    let (mut store, context, outcome) = run("const x = 1;", "unimplemented");
-
-    let trap = outcome.expect_err("the call traps");
-
-    // The **root cause**, not the whole `{:?}` render, and the difference is not cosmetic.
-    // wasmtime prefixes a host error with a wasm backtrace whose top frame is spelled
-    // `wit-component:shim!indirect-lanekeep:host/types@0.1.0-[method]check-context.today` —
-    // so an assertion over the rendered error contains the method name whatever the host
-    // said, and holds even against a host that named a different method entirely. Measured:
-    // that version of this test survived a mutation replacing the name with `something`.
-    let cause = trap.root_cause().to_string();
-    assert!(
-        cause.contains("check-context.today"),
-        "the trap names the method a reader has to go and look at: {cause}"
-    );
-    assert!(
-        cause.contains("not implemented yet"),
-        "and says what is missing rather than only that something is: {cause}"
-    );
-
+fn today_is_absent_when_the_host_supplied_none() {
+    // `none`, not a trap and not an empty string. The world declares `option<string>` and
+    // writes the meaning of absence into it — "when the rule is not permitted to observe it" —
+    // so this is the boundary's own answer rather than a placeholder this host chose. It is
+    // also the one shape `lanekeep-js` cannot produce: there `ctx.today` is simply absent and
+    // reaching for it is a `TypeError`, because a JavaScript object can drop a property and a
+    // WIT resource cannot drop a method.
     assert_eq!(
-        rendered(&take(&mut store, &context)),
-        ["1:1 recorded before the trap"],
-        "a handler may report several times and then hit something it cannot do. What it \
-         already found is still true, and discarding it would make the failure harder to \
-         diagnose rather than easier — the same posture as `lanekeep-js`'s \
-         `a_rule_that_throws_still_leaves_earlier_reports`"
+        rendered(&Run::new("const x = 1;", None).probe("today")),
+        ["1:1 today=None"]
+    );
+}
+
+#[test]
+fn reading_today_is_observed_and_not_reading_it_is_not() {
+    // The whole reason the date is allowed through at all. Without the second half every file
+    // would look date-dependent and the corpus would re-check daily; without the first, a
+    // result computed on one day would be served on the next — a date comparison frozen at
+    // whenever the cache was written.
+    let mut unread = Run::new(TWO_STATEMENTS, Some("2026-08-01"));
+    assert_eq!(
+        unread.probe("navigate").len(),
+        5,
+        "the probe that does not read the date still did real work"
+    );
+    assert!(!unread.date_was_read(), "nothing read the date");
+
+    let mut read = Run::new(TWO_STATEMENTS, Some("2026-08-01"));
+    assert_eq!(read.probe("today").len(), 1);
+    assert!(read.date_was_read(), "the read was not observed");
+}
+
+#[test]
+fn asking_for_a_date_the_host_does_not_have_is_still_an_observation() {
+    // The case WIT creates and QuickJS cannot: the method exists whatever the host holds, so a
+    // rule can ask and be told `none`. The flag is set anyway.
+    //
+    // The two mistakes are not symmetric. Recording an observation that did not need recording
+    // dates one file's entry and costs a recompute whose answer is the same; not recording one
+    // that did serves a stale answer indefinitely, and nothing announces it. Conditioning a
+    // cache-soundness flag on host configuration is also the shape `src/host.rs`'s header warns
+    // about for file access — output that depends on what the host granted, which is not one of
+    // `(bytes, path, ruleset, config, tracked reads)` and so is in no key.
+    let mut run = Run::new("const x = 1;", None);
+    assert_eq!(
+        rendered(&run.probe("today")),
+        ["1:1 today=None"],
+        "the host had no date to give"
+    );
+    assert!(
+        run.date_was_read(),
+        "the rule reached for the date surface, and that is what is recorded"
+    );
+}
+
+#[test]
+fn nothing_un_observes_a_read() {
+    // Sticky for the life of the context, across taking reports and across a second `check`
+    // that never mentions the date. Both halves matter under the per-file context shape: one
+    // rule reading the date makes the *file* date-dependent, and a flag that a later rule or a
+    // `take_reports` could clear would silently un-date the entry.
+    let mut run = Run::new(TWO_STATEMENTS, Some("2026-08-01"));
+
+    assert_eq!(run.probe("today").len(), 1);
+    assert!(run.date_was_read(), "the read was observed to begin with");
+
+    assert!(run.take().is_empty(), "the reports were already taken");
+    assert!(
+        run.date_was_read(),
+        "taking reports empties the reports and not the observation"
+    );
+
+    assert_eq!(run.probe("navigate").len(), 5);
+    assert!(
+        run.date_was_read(),
+        "a later rule that ignored the date does not make the file dateless again"
     );
 }

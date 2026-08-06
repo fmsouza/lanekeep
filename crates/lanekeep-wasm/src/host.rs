@@ -10,15 +10,14 @@
 //!
 //! # What is implemented so far
 //!
-//! `check-context`'s navigation, reporting, binding resolution, scoped queries, tracked reads
-//! and facts. Everything else the world declares — `today`, and the whole of `reduce-context` —
+//! The whole of `check-context`. `reduce-context` — the cross-file phase, all three methods —
 //! returns an error naming itself, which traps the call.
 //!
 //! **Trapping rather than answering, deliberately.** Every plausible placeholder is a
-//! plausible *answer*: `none` from `read-file` reads as "the file is not there", an empty list
-//! from `facts` reads as "nothing was emitted". A rule built against either would look like it
-//! was working, and the run would be wrong quietly. An error is the one response no caller can
-//! mistake for a result.
+//! plausible *answer*: an empty list from `files` reads as "the run considered nothing", an
+//! empty list from `facts` reads as "nothing was emitted". A rule built against either would
+//! look like it was working, and the run would be wrong quietly. An error is the one response
+//! no caller can mistake for a result.
 //!
 //! **Binding resolution is not one of those, and the difference is not a relaxation.** `false`
 //! and `none` are what "nothing resolves" *is*: a name nothing declares, a handle no arena
@@ -55,9 +54,8 @@
 //! surfaces that *are* absent there rather than answering are the ones attached per run and
 //! per language for other reasons: `querySubtree` and `closestAncestor` without a grammar,
 //! `readFile` and `fileExists` without file access, `today` without a date. Each of those is a
-//! decision this crate has to make rather than inherit. The first two are made below, and they
-//! came out **differently** — which is the point of making them one at a time; the third belongs
-//! to the change that implements it.
+//! decision this crate has to make rather than inherit. All three are made below, and they came
+//! out **differently** — which is the point of making them one at a time.
 //!
 //! # What a query answers with no grammar: the question is removed
 //!
@@ -158,6 +156,47 @@
 //! unconditionally, so the branch is unreachable in production for the same reason
 //! `with_language`'s is.
 //!
+//! # What `today` answers with no date: `none`, because the world already said so
+//!
+//! The third of the three, and the only one this file did not have to decide. `today` is
+//! declared `option<string>` *with* the meaning of `none` written into it — "none when the rule
+//! is not permitted to observe it" — so absence is a **declared answer** here rather than an
+//! unrepresentable state. Neither move above applies: removing the state would contradict the
+//! boundary, and trapping would refuse a question the world says has an answer. Reading the
+//! world first is the pattern, and this is the case where reading it ends the argument.
+//!
+//! # The date is the one thing a rule may observe, so observing it is recorded
+//!
+//! What is left to decide is the half the cache depends on, and it is the sharper half.
+//! `docs/architecture.md`'s determinism invariant is why the sandbox withholds `Math.random`,
+//! `Date.now` and `new Date()` — a rule must not introduce nondeterminism even by accident —
+//! and `today` is the single sanctioned exception. It is sanctioned only because the date is
+//! *tracked*: [`CheckContext::date_was_read`] answers whether this file's result may be served
+//! on another day, and `lanekeep-engine` already owns the mechanism that consumes it — its
+//! `read_the_date` picks `RunKey::for_dated_file` over `RunKey::for_file`, which is what folds
+//! the run's date into the key. Nothing here is a second pathway: this crate supplies the same
+//! boolean, under the same name, that `lanekeep_js::HostContext::date_was_read` supplies.
+//!
+//! **Recorded whenever the method runs, including when the answer is `none`.** The two mistakes
+//! are not symmetric. Over-recording dates one file's entry whose answer would not have changed,
+//! costing a recompute; under-recording serves a stale answer indefinitely, which is the failure
+//! the whole mechanism exists to prevent and the one nothing announces. A flag set at the top of
+//! the only method that can set it is also auditable by reading it, where "set it unless the
+//! answer was `none`" is a claim about a case production never reaches — `lanekeep-engine`
+//! supplies a date for every file — and so a claim nothing would ever have falsified.
+//!
+//! There is no "it's only used for logging" exception, and there is no reading that does not
+//! count. What a rule does with the answer is not this host's business; that it asked is.
+//!
+//! **The date is the caller's string, stored and returned unchanged.** `YYYY-MM-DD` is what
+//! `wit/world.wit` documents and what `lanekeep_core::suppression::Date`'s `Display` renders,
+//! and the caller fixes it once per run so two files checked a millisecond apart cannot disagree
+//! about what day it is. This crate never reads a clock — there is none to read, since a
+//! component built for `wasm32-unknown-unknown` imports no wall clock and this host has nothing
+//! to offer one. Parsing or reformatting the string here and not in `lanekeep-js` would let one
+//! engine refuse a run the other accepted, which is a disagreement about the run rather than
+//! about the rule.
+//!
 //! # No interior mutability, and why that is not an oversight
 //!
 //! `lanekeep-js` holds its arena as `Rc<RefCell<NodeArena>>` because rquickjs requires
@@ -166,6 +205,14 @@
 //! up in the store's [`ResourceTable`], so it already holds the unique borrow the arena's
 //! interning methods want. The plain `NodeArena` below is the same type used the simpler way,
 //! not a second design.
+//!
+//! The date-read flag is the same story, and the one place copying the JavaScript spelling
+//! across would have been worse than redundant. `lanekeep_js::HostContext` carries it as
+//! `Rc<Cell<bool>>` for the reason above — an `Accessor` closure has to own a shared handle to
+//! set it. Here it is set from an ordinary function body through `&mut self`, and an `Rc` would
+//! not merely be unnecessary: `Rc` is not `Send`, so the `const` block above [`HostState`] would
+//! stop this crate building. A plain `bool` is the same flag, held the way this side holds
+//! everything else.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -282,6 +329,24 @@ pub struct CheckContext {
     queries: BTreeMap<String, Result<Arc<CompiledQuery>, String>>,
     /// How many compilations that cache has actually performed.
     compiled: usize,
+    /// The date a rule sees through `today`, when the host supplied one.
+    ///
+    /// `None` is the world's own declared answer — "none when the rule is not permitted to
+    /// observe it" — and not a stand-in for a missing one, which is why this is an `Option`
+    /// where [`CheckContext::language`] is not. Stored exactly as the caller spelled it; see the
+    /// module header on why nothing here parses it.
+    today: Option<String>,
+    /// Whether anything called `today` while checking this file.
+    ///
+    /// Tracked rather than assumed, because observing the date makes a file's result depend on
+    /// what day it is. Assuming every file might read it would date every cache entry and
+    /// invalidate the whole corpus daily; assuming none does would serve yesterday's answer.
+    /// The same sentence `lanekeep_js::HostContext`'s field carries, because it is the same flag
+    /// feeding the same key.
+    ///
+    /// A plain `bool` and not the JavaScript side's `Rc<Cell<bool>>` — see the module header's
+    /// last section, where an `Rc` here does not compile rather than merely being redundant.
+    date_read: bool,
 }
 
 impl std::fmt::Debug for CheckContext {
@@ -305,6 +370,12 @@ impl std::fmt::Debug for CheckContext {
             // cache not being read.
             .field("queries_cached", &self.queries.len())
             .field("queries_compiled", &self.compiled)
+            // Both, as `lanekeep_js::HostContext`'s `Debug` prints both, and they answer
+            // different questions: whether this context can answer `today` at all, and whether
+            // anything asked. The second is the cache-relevant one and is not derivable from
+            // the first.
+            .field("has_today", &self.today.is_some())
+            .field("date_read", &self.date_read)
             .finish()
     }
 }
@@ -333,6 +404,8 @@ impl CheckContext {
             language,
             queries: BTreeMap::new(),
             compiled: 0,
+            today: None,
+            date_read: false,
         }
     }
 
@@ -382,6 +455,42 @@ impl CheckContext {
     pub fn with_file_access(mut self, files: FileAccess) -> Self {
         self.files = Some(files);
         self
+    }
+
+    /// Supply the date rules see through `today`.
+    ///
+    /// Fixed for the run by the caller and never read here: two files checked a millisecond
+    /// apart must not disagree about what day it is, and this crate looks at no clock at all.
+    /// Without one, `today` answers `none` — the world's own declared meaning for absence, and
+    /// the reason this stays an `Option` where [`CheckContext::new`] makes the grammar
+    /// mandatory.
+    ///
+    /// Takes the date as the caller spells it and stores it unchanged. `YYYY-MM-DD` is what
+    /// `wit/world.wit` documents and what [`lanekeep_core::suppression::Date`] renders;
+    /// validating it here and not in `lanekeep-js` would let one engine refuse a run the other
+    /// accepted. The same posture — and the same signature —
+    /// `lanekeep_js::HostContext::with_today` has.
+    #[must_use]
+    pub fn with_today(mut self, today: &str) -> Self {
+        self.today = Some(today.to_owned());
+        self
+    }
+
+    /// Whether anything read the date while checking this file.
+    ///
+    /// What a caller needs in order to decide whether this file's result may be served on
+    /// another day: `lanekeep-engine` folds the run's date into the cache key for exactly the
+    /// files that answer `true`, through `RunKey::for_dated_file` rather than `RunKey::for_file`.
+    /// Named and shaped after `lanekeep_js::HostContext::date_was_read` because it is the same
+    /// input to the same mechanism, and a second spelling is how a second pathway starts.
+    ///
+    /// `true` whenever `today` ran, including when it answered `none` — see the module header.
+    /// Sticky for the life of the context: [`CheckContext::take_reports`] empties reports and
+    /// [`CheckContext::take_facts`] empties facts, but nothing un-observes a read, so a context
+    /// reused across several `check` calls carries the answer forward.
+    #[must_use]
+    pub const fn date_was_read(&self) -> bool {
+        self.date_read
     }
 
     /// Every file this context reached for, in path order.
@@ -1074,13 +1183,27 @@ impl HostCheckContext for HostState {
         Ok(Ok(()))
     }
 
-    // --- declared, not yet implemented ----------------------------------------------------
+    // --- the date --------------------------------------------------------------------------
+    //
+    // The one thing on this whole surface that lets a rule observe anything outside
+    // `(bytes, path, ruleset, config, tracked reads)`, and the only reason it is allowed is
+    // that the observation is *recorded*. Everything else the determinism invariant withholds
+    // stays withheld, structurally rather than by curation: a component built for
+    // `wasm32-unknown-unknown` imports no wall clock, and this world declares none to import.
 
-    fn today(&mut self, _: Resource<CheckContext>) -> wasmtime::Result<Option<String>> {
-        Err(not_yet(
-            "check-context.today",
-            "the date a rule may observe",
-        ))
+    /// The date the host supplied, and a note that this file's result now depends on it.
+    ///
+    /// The flag is set before the answer is read and whatever the answer turns out to be. A
+    /// `none` that left no trace would be a rule reaching for the date surface with nothing
+    /// recording that it did, which is the one failure this mechanism exists to prevent — see
+    /// the module header for why the branch that would save a recompute is not worth having.
+    fn today(&mut self, this: Resource<CheckContext>) -> wasmtime::Result<Option<String>> {
+        let context = self.check_context_mut(&this)?;
+        context.date_read = true;
+
+        // Verbatim. The caller's string is the run's answer, and re-rendering it here would put
+        // this crate's idea of a date between the engine and the rule.
+        Ok(context.today.clone())
     }
 
     fn drop(&mut self, this: Resource<CheckContext>) -> wasmtime::Result<()> {

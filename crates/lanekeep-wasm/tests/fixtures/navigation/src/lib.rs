@@ -55,7 +55,8 @@ impl Guest for Component {
             "fix" => fix(ctx),
             "unsaid-fix" => unsaid_fix(ctx),
             "bare" => bare(ctx),
-            "unimplemented" => unimplemented(ctx),
+            "today" => today(ctx),
+            "trap-after-report" => trap_after_report(ctx),
             other => say(ctx, &format!("unknown probe `{other}`")),
         }
     }
@@ -301,16 +302,37 @@ fn bare(ctx: &CheckContext) {
     ctx.report(ctx.root(), None, None);
 }
 
-/// A method the world declares that the host has not implemented, called after a report.
+/// The one thing about the environment a rule is permitted to observe.
 ///
-/// Two things at once, and both are about the *host*. That an unimplemented method traps
-/// rather than answering — every value it could return instead reads as a real answer, and a
-/// rule built against one would look like it was working. And that the report made before the
-/// trap survives it, because what the rule already found is still true.
-fn unimplemented(ctx: &CheckContext) {
+/// Rendered rather than branched on, so the host asserts on the whole answer and on nothing
+/// this guest decided. `None` is the world's declared meaning for "not permitted to observe it"
+/// and not an error the guest should be smoothing over, which is why there is no `unwrap_or`
+/// here — a probe that substituted a placeholder for `none` would make the two host
+/// configurations indistinguishable in the report the host asserts on.
+///
+/// Called exactly once. What the host checks alongside the answer is that asking was
+/// *recorded*, and a probe that asked twice could not tell a flag that latches from one that
+/// counts.
+fn today(ctx: &CheckContext) {
+    say(ctx, &format!("today={:?}", ctx.today()));
+}
+
+/// A report, and then a call this host has no answer to give.
+///
+/// The property is about *reporting*: a handler may report several times and then hit something
+/// it cannot do, and what it already found is still true. The host keeps those reports rather
+/// than discarding them with the instance.
+///
+/// The trap it uses is incidental and had to change. This probe used to call `today`, which
+/// trapped while it was declared and unimplemented; now that every `check-context` method is
+/// implemented, the only refusal left on this surface is `read-file` on a context built without
+/// file access — which `tests/navigation.rs` builds, and which `src/host.rs`'s module header
+/// explains. The host asserts on the trap's root cause, so a *different* trap arriving here
+/// fails the test rather than passing it.
+fn trap_after_report(ctx: &CheckContext) {
     say(ctx, "recorded before the trap");
-    let today = ctx.today();
-    say(ctx, &format!("unreachable, and yet: {today:?}"));
+    let refused = ctx.read_file("anything.json");
+    say(ctx, &format!("unreachable, and yet: {refused:?}"));
 }
 
 bindings::export!(Component with_types_in bindings);
