@@ -427,7 +427,12 @@ fn resource_body(source: &str, name: &str) -> String {
 
     source[start..end]
         .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
+        // Every WIT comment is a doc comment, so a method named inside one would otherwise read
+        // as a declaration. Cut at `//` rather than dropping whole comment lines: a *trailing*
+        // comment on a declaration line survives a line-prefix filter, and one mentioning a
+        // method would fail this test spuriously. Every comment in the world sits on its own
+        // line today, so that is latent rather than live — which is exactly when it is cheap.
+        .map(|line| line.split("//").next().unwrap_or(line))
         .collect::<Vec<_>>()
         .join("\n")
 }
