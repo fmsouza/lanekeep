@@ -1590,7 +1590,7 @@ impl Engine {
             let host = runtime
                 .host_mut()
                 .check_context_mut(resource)
-                .map_err(|e| self.component_failure(rule, path, &e.to_string()))?;
+                .map_err(|e| Self::component_failure(rule, path, &e.to_string()))?;
             walk_for(host, compiled_query, source)
         };
 
@@ -1608,7 +1608,7 @@ impl Engine {
                 let host = runtime
                     .host_mut()
                     .check_context_mut(resource)
-                    .map_err(|e| self.component_failure(rule, path, &e.to_string()))?;
+                    .map_err(|e| Self::component_failure(rule, path, &e.to_string()))?;
                 let arena = host.arena_mut();
                 captures
                     .into_iter()
@@ -1625,7 +1625,7 @@ impl Engine {
             if let Some(started) = handler_started {
                 timing.handler = timing.handler.saturating_add(started.elapsed());
             }
-            outcome.map_err(|e: WasmError| self.component_failure(rule, path, &e.to_string()))?;
+            outcome.map_err(|e: WasmError| Self::component_failure(rule, path, &e.to_string()))?;
         }
 
         // Taken per rule rather than per file, which is what attributes a report to the rule
@@ -1633,7 +1633,7 @@ impl Engine {
         let host = runtime
             .host_mut()
             .check_context_mut(resource)
-            .map_err(|e| self.component_failure(rule, path, &e.to_string()))?;
+            .map_err(|e| Self::component_failure(rule, path, &e.to_string()))?;
         let reports = host.take_reports();
         let emitted = host.take_facts();
 
@@ -1657,7 +1657,7 @@ impl Engine {
         // The date flag is sticky and belongs to the context, so it is read once when the file
         // is finished rather than claimed per rule — see `check_file`.
         Ok((
-            self.violations_from(rule, path, reports),
+            Self::violations_from(rule, path, reports),
             facts,
             false,
             timing,
@@ -1671,12 +1671,10 @@ impl Engine {
     /// severity, remediation and default message come from the engine. That is what stops a
     /// rule reporting under someone else's name, and it must not depend on which engine ran it.
     fn violations_from(
-        &self,
         rule: &Prepared,
         path: &FilePath,
         reports: Vec<lanekeep_wasm::host::Report>,
     ) -> Vec<Violation> {
-        let _ = self;
         reports
             .into_iter()
             .map(|report| Violation {
@@ -1732,8 +1730,7 @@ impl Engine {
     }
 
     /// One shape for every way a component rule can fail on a file.
-    fn component_failure(&self, rule: &Prepared, path: &FilePath, detail: &str) -> RunError {
-        let _ = self;
+    fn component_failure(rule: &Prepared, path: &FilePath, detail: &str) -> RunError {
         RunError::Rule {
             rule: rule.spec.id.to_string(),
             file: path.as_str().to_owned(),
