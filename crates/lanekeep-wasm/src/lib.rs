@@ -86,8 +86,11 @@
 //! baseline: the baseline shrinks 3.46% and the delta only 1.76%, so `cranelift`'s
 //! contribution is roughly half as compressible as the code it is added to.
 //!
-//! What the numbers do not bound: what a runtime that actually loads and instantiates
-//! components costs, which is larger and which nobody has measured.
+//! What the numbers do not bound is what a runtime that actually loads and instantiates
+//! components costs, which is larger. Part of that is now measured: [`runtime`]'s
+//! `MEMORY_RESERVATION` carries instantiation, execution and boundary-crossing figures for
+//! the two memory tunables, which turn out to trade against each other in opposite
+//! directions and to be baked into every precompiled artifact.
 
 pub mod bindings;
 pub mod error;
