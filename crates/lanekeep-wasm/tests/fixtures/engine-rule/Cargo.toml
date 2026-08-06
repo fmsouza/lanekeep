@@ -1,0 +1,52 @@
+# The one fixture here that is shaped like a *rule* rather than like a probe.
+#
+# Every other guest in this directory exercises one area of the host surface and encodes its
+# observations into report messages. This one does what a real rule does — report at the node a
+# query captured, emit a fact per match, and consume those facts in a cross-file pass — because
+# `lanekeep-engine`'s dispatch path is the thing under test and a probe cannot exercise it: the
+# engine's job is to carry a query match across the boundary and to turn what comes back into a
+# violation at the right position, and none of that is visible in a guest that reports at the
+# root.
+#
+# It lives here, beside the wasm crate's own fixtures rather than under `lanekeep-engine`, so it
+# inherits two guards it would otherwise need copies of: `just wasm-fixtures` globs this
+# directory, so it is built for `wasm32-unknown-unknown` like its siblings, and
+# `tests/world_shape.rs` globs `tests/fixtures/*.wasm` and asserts every artifact it finds
+# imports nothing but the host interface.
+#
+# Its own workspace, like every fixture here. An empty `[workspace]` table is what detaches it;
+# without one, cargo refuses to build it at all.
+[package]
+name = "engine-rule"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# The world is read from the engine's own wit/ directory rather than from a copy under this
+# crate: a copy would prove that a file which was once the world is targetable, and nothing
+# would catch the two drifting.
+[package.metadata.component.target]
+path = "../../../wit"
+world = "rule"
+
+[package.metadata.component.dependencies]
+
+# The artifact is committed, so it is worth not committing debug information nobody reads.
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build` generates
+# and `.gitignore` deliberately excludes. cargo-machete reads source, so on a fresh checkout it
+# sees a dependency nothing references and fails the gate — while a machine that has built the
+# fixture once sees it used and passes.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]
