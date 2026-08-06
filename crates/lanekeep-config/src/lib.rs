@@ -387,18 +387,26 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
     // A JSON config supplies its own data; exactly one field comes back from the sandbox,
     // and it is spelled out rather than merged, so a field added to `RawConfig` cannot
     // quietly start being read from the wrong side.
-    let raw = match parsed {
-        Some(parsed) => RawConfig {
-            rules: extracted.rules,
-            ..parsed.config
-        },
-        None => extracted,
+    let (raw, resolved) = match parsed {
+        Some(parsed) => (
+            RawConfig {
+                rules: extracted.rules,
+                ..parsed.config
+            },
+            parsed.rules,
+        ),
+        None => (extracted, Vec::new()),
     };
 
-    build(sandbox, raw, &display)
+    build(sandbox, raw, &display, &resolved)
 }
 
-fn build(sandbox: &Sandbox, raw: RawConfig, display: &str) -> Result<Config, ConfigError> {
+fn build(
+    sandbox: &Sandbox,
+    raw: RawConfig,
+    display: &str,
+    resolved: &[ResolvedRule],
+) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
     // Namespaces this project claims, beyond the two lanekeep defines. Validated for shape
@@ -435,7 +443,7 @@ fn build(sandbox: &Sandbox, raw: RawConfig, display: &str) -> Result<Config, Con
     }
 
     let ruleset_hash = hash_ruleset(sandbox);
-    let config_hash = hash_config(&raw.include, &raw.exclude, &overrides, &limits);
+    let config_hash = hash_config(&raw.include, &raw.exclude, &overrides, &limits, resolved);
 
     Ok(Config {
         include: raw.include,
@@ -598,16 +606,39 @@ fn hash_ruleset(sandbox: &Sandbox) -> Hash {
     *hasher.finalize().as_bytes()
 }
 
+/// Hash a variable-length field with its length in front.
+///
+/// `u64` rather than `usize`, because `usize::to_le_bytes` is four bytes on a 32-bit host
+/// and eight on a 64-bit one, and a hash that depends on the width of the machine that
+/// computed it is not deterministic. The saturating conversion is unreachable — it needs a
+/// field larger than 16 exabytes — and is written this way because a panic on user input is
+/// not something this crate does.
+fn length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+}
+
 /// Hash the configuration values.
 ///
 /// Canonicalized properly, because these *are* structured data: the severity map is ordered
 /// so writing the same entries in a different order hashes the same, and the budgets are
 /// hashed as numbers rather than as whatever the user typed.
+///
+/// `resolved` is a JSON config's rule references and their options, and is empty for a
+/// TypeScript one — where the same information lives inside the config module's own source
+/// and reaches the key through `ruleset_hash` instead. `docs/architecture.md` §8.1 lists
+/// options under this hash, and until the JSON path resolved its references in Rust there
+/// was nowhere they could be read from: they were interpolated into the synthetic entry
+/// module, which `Sandbox::eval_module` evaluates directly rather than through the loader,
+/// so it is not among the modules `hash_ruleset` walks. Editing an option in a
+/// `lanekeep.json` therefore invalidated nothing, and a warm run kept answering the previous
+/// configuration.
 fn hash_config(
     include: &[String],
     exclude: &[String],
     severity: &BTreeMap<RuleId, Severity>,
     limits: &Limits,
+    resolved: &[ResolvedRule],
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-config-v1");
@@ -642,6 +673,27 @@ fn hash_config(
         limits.memory_bytes as u128,
     ] {
         hasher.update(&value.to_le_bytes());
+    }
+
+    // In the order written, which over-invalidates on a reordering that changes nothing —
+    // rules are sorted by ID before they are reported, so their position is not an input to
+    // any result. That is the same asymmetry `hash_ruleset` documents: a recompute costs
+    // time, and serving a result computed under a different configuration costs correctness.
+    hasher.update(b"rules");
+    for rule in resolved {
+        length_prefixed(&mut hasher, rule.specifier.as_bytes());
+        // An explicit discriminant for which form the config wrote, because `"x"` and
+        // `{"rule": "x"}` are different configurations — one uses a rule as it comes, the
+        // other configures it with `null`, and a factory reading `options?.strict` behaves
+        // differently under the two. Omitting the tag would leave them distinguished only by
+        // the incidental fact that an absent field and a serialized `null` are different
+        // lengths, which is true and is not something to depend on.
+        if let Some(options) = &rule.options {
+            hasher.update(&[1]);
+            length_prefixed(&mut hasher, json::literal(options).as_bytes());
+        } else {
+            hasher.update(&[0]);
+        }
     }
 
     *hasher.finalize().as_bytes()
@@ -758,6 +810,21 @@ mod tests {
         format!(
             "import {{ defineRule }} from 'lanekeep';\n\
              export default defineRule({{\n\
+               id: '{id}',\n\
+               query: '(identifier) @id',\n\
+               card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.id); }},\n\
+             }});\n"
+        )
+    }
+
+    /// A rule factory: what `{ "rule": ..., "options": ... }` and `noRestrictedImports({...})`
+    /// both name. The options are captured and ignored; what matters here is that a value
+    /// reached the rule.
+    fn factory_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default (options) => defineRule({{\n\
                id: '{id}',\n\
                query: '(identifier) @id',\n\
                card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
@@ -1190,6 +1257,46 @@ mod tests {
         );
     }
 
+    /// A JSON rule's options are a cache-key input, and were reaching neither hash.
+    ///
+    /// The same config in the same directory, one option value edited: before this was
+    /// fixed both hashes came back byte-identical, so a warm run kept answering the
+    /// previous configuration. `docs/architecture.md` §8.1 lists options under
+    /// `config_hash`, and the JSON path is where they are known as data.
+    ///
+    /// The fixture is rewritten in place rather than built twice under different names.
+    /// Two directories would move `ruleset_hash` on their own — it hashes each module's
+    /// path alongside its source — which is a difference that looks like the assertion
+    /// passing and is not.
+    #[test]
+    fn the_config_hash_changes_with_a_json_rule_option() {
+        let config =
+            |options: &str| format!(r#"{{"rules": [{{"rule": "./rule", "options": {options}}}]}}"#);
+        let fixture = Fixture::new(
+            "json-option-hash",
+            &[
+                ("rule.ts", &factory_rule("local/example")),
+                ("lanekeep.json", &config(r#"{"limit": 1}"#)),
+            ],
+        );
+
+        let before = fixture.load_json().expect("loads");
+        fixture.write_all(&[("lanekeep.json", &config(r#"{"limit": 2}"#))]);
+        let after = fixture.load_json().expect("loads");
+
+        assert_ne!(
+            hex(&before.config_hash),
+            hex(&after.config_hash),
+            "editing a rule option must invalidate"
+        );
+        assert_eq!(
+            hex(&before.ruleset_hash),
+            hex(&after.ruleset_hash),
+            "no module changed, so the ruleset hash must not move — which is exactly why \
+             the config hash has to"
+        );
+    }
+
     // --- hashing, the JSON path -------------------------------------------------------
     //
     // Matched pairs of the six above. The two formats used to be one mechanism — a JSON
@@ -1270,6 +1377,37 @@ mod tests {
         );
     }
 
+    /// The same property one level down, for the values only this path can see.
+    ///
+    /// `serde_json::Map` is a `BTreeMap` in this build, so the options blob serializes in
+    /// key order whatever order it was written in. That is a property of a dependency's
+    /// feature set rather than of anything written here — `preserve_order` would reverse it
+    /// silently, and the only symptom would be a cache that stops hitting.
+    #[test]
+    fn the_config_hash_ignores_option_key_order() {
+        let make = |options: &str| {
+            Fixture::new(
+                &format!("json-option-order-{}", options.find('b').unwrap_or(0)),
+                &[
+                    ("rule.ts", &factory_rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": [{{"rule": "./rule", "options": {options}}}]}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_eq!(
+            hex(&make(r#"{"a": 1, "b": 2}"#)),
+            hex(&make(r#"{"b": 2, "a": 1}"#)),
+            "reordering option keys must not change the config hash"
+        );
+    }
+
     #[test]
     fn the_config_hash_changes_with_severity_for_json() {
         let make = |severity: &str, tag: &str| {
@@ -1314,6 +1452,79 @@ mod tests {
         };
 
         assert_ne!(hex(&make("{}", "d")), hex(&make(r#"{"rule": 5000}"#, "t")));
+    }
+
+    /// `"x"` and `{ "rule": "x" }` are different configurations and must not hash alike.
+    ///
+    /// One uses a rule as it comes; the other configures it, with `null`. A rule factory
+    /// reading `options?.strict` behaves differently under the two, so a key that could not
+    /// tell them apart would serve one's results for the other. The fixture's default export
+    /// is deliberately usable both ways, so the *only* difference between the two runs is
+    /// the form the config wrote.
+    #[test]
+    fn the_config_hash_tells_a_bare_rule_from_a_configured_one() {
+        let module = "import { defineRule } from 'lanekeep';\n\
+             const built = defineRule({\n\
+               id: 'local/example',\n\
+               query: '(identifier) @id',\n\
+               card: { message: 'no', remediation: 'do this', examples: { bad: 'a', good: 'b' } },\n\
+               check(ctx, m) { ctx.report(m.id); },\n\
+             });\n\
+             export default Object.assign((options) => built, built);\n";
+
+        let make = |rules: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-rule-form-{tag}"),
+                &[
+                    ("rule.ts", module),
+                    ("lanekeep.json", &format!(r#"{{"rules": [{rules}]}}"#)),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make(r#""./rule""#, "bare")),
+            hex(&make(r#"{"rule": "./rule"}"#, "configured")),
+            "a rule used as it comes and a rule configured with `null` are not the same run"
+        );
+    }
+
+    /// `config_hash` says *which* rule was configured, not merely that something was.
+    ///
+    /// Today `ruleset_hash` would notice this on its own, because two references load two
+    /// different modules. It is pinned here anyway, because Task 15 turns that hash into a
+    /// path-sorted fold over component bytes, and a property held only by the hash that is
+    /// about to be rewritten is a property about to be lost quietly. The two configs below
+    /// differ in nothing `config_hash` sees except the specifier.
+    #[test]
+    fn the_config_hash_tells_apart_two_rules_with_the_same_options() {
+        let make = |name: &str| {
+            Fixture::new(
+                &format!("json-which-rule-{name}"),
+                &[
+                    (
+                        &format!("{name}.ts"),
+                        &factory_rule(&format!("local/{name}")),
+                    ),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": [{{"rule": "./{name}", "options": {{"x": 1}}}}]}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make("a")),
+            hex(&make("b")),
+            "the same options on a different rule is a different configuration"
+        );
     }
 
     /// The two formats saying the same thing produce the same configuration.

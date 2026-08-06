@@ -418,6 +418,18 @@ of them. Nothing fails: the rule loads, the query never runs, and the output rea
 a codebase with none of the thing in it. There is no *or* form, so a rule with no single
 covering substring omits the gate rather than writing one that is wrong.
 
+**`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
+`ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a
+module something *imported*; the entry is handed straight to `Module::evaluate`. Everything the
+entry module carries and nothing else carries is therefore outside the cache key. That was exactly
+a `lanekeep.json` rule's `options`, which were interpolated into the entry as a factory-call
+argument and appeared in no hash at all: editing `{"rule": "x", "options": {"limit": 1}}` to
+`{"limit": 2}` produced two byte-identical `config_hash`es and a warm run kept answering the
+previous configuration. `docs/architecture.md` §8.1 has listed options under `config_hash` the
+whole time, so the code and the specification disagreed and neither said so. Options are read as
+data and hashed now, on the path that knows them — but the general fact stands: **a value that
+only ever exists in generated entry-module source is invisible to both hashes.**
+
 **A fixture directory named after the *length* of its content collides, and the collision reads as
 an unrelated test failing.** `json.rs`'s test helper wrote into
 `temp_dir()/lanekeep-json-{len:x}`; two configs of thirty-eight bytes shared one directory, tests
