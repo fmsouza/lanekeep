@@ -168,6 +168,7 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store, UpdateDeadline};
 use crate::bindings::{Rule, RulePre, types};
 use crate::error::{WasmError, classify};
 use crate::host::{CheckContext, HostState, ReduceContext};
+use crate::key::ExternalBinding;
 use crate::load::Loaded;
 
 /// Address space reserved ahead of time for each linear memory, in bytes.
@@ -354,7 +355,11 @@ pub const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(1);
 /// One configuration, not one per call site. Two engines configured differently would compile
 /// artifacts neither could load from the other, and the failure would surface as a cache miss
 /// nobody could explain.
-fn config() -> Config {
+///
+/// `pub(crate)` for [`crate::key`], which reads the three artifact-validity constants back off
+/// an [`Engine`] built from it rather than restating them — a second copy of a cache-key input
+/// is a drift source, and these three are already documented as things nobody flips.
+pub(crate) fn config() -> Config {
     let mut config = Config::new();
     config
         .epoch_interruption(EPOCH_INTERRUPTION)
@@ -586,6 +591,12 @@ struct Prepared {
 pub struct RuleSet {
     linker: Linker<RuntimeState>,
     rules: Vec<Prepared>,
+    /// What was bound beside the declared world, as declared at the call site.
+    ///
+    /// Evidence rather than enforcement, in the same sense [`WasmRuntime::instantiations`] is:
+    /// nothing in linking or execution reads it, and it exists so that "this run bound nothing
+    /// the cache key did not know about" is a claim something can be made about.
+    external: Vec<ExternalBinding>,
 }
 
 impl std::fmt::Debug for RuleSet {
@@ -615,6 +626,7 @@ impl RuleSet {
         Ok(Self {
             linker,
             rules: Vec::new(),
+            external: Vec::new(),
         })
     }
 
@@ -671,8 +683,36 @@ impl RuleSet {
     /// Whatever is bound here must be a *fixed* source rather than an ambient one — a random
     /// stream seeded from the run rather than the host's, sinks rather than the process's real
     /// stdout — or the determinism invariant is gone whatever the import list says.
-    pub const fn linker_mut(&mut self) -> &mut Linker<RuntimeState> {
+    ///
+    /// # It takes a declaration, and that is a cache-key requirement rather than paperwork
+    ///
+    /// Fixed is not enough on its own. A *different* fixed entropy source pins a *different*
+    /// map iteration order for a Go rule, so it reports a different violation while the world,
+    /// the component and the config are all unchanged — every cache-key input identical, a
+    /// warm run serving the old answer with no symptom. [`crate::key::host_api_hash`] folds
+    /// [`crate::key::EXTERNAL_BINDINGS`] in for exactly that reason, and this parameter is
+    /// what points a binder at it: reaching the linker means naming the interface and the
+    /// value that fixes its answers.
+    ///
+    /// **The declaration made here is recorded, not checked against
+    /// [`crate::key::EXTERNAL_BINDINGS`], and the residual gap is stated rather than implied.**
+    /// The cache key is computed when a configuration is loaded, before any [`RuleSet`]
+    /// exists, so this cannot consult what the key was built from. What it can do is make the
+    /// declaration exist and be readable — [`RuleSet::external_bindings`] — so a run that
+    /// binds something is in a position to compare, and so nothing gets bound by a caller who
+    /// never had to think about the value.
+    pub fn linker_mut(&mut self, declared: &ExternalBinding) -> &mut Linker<RuntimeState> {
+        self.external.push(*declared);
         &mut self.linker
+    }
+
+    /// Every interface bound through [`RuleSet::linker_mut`], in the order it was bound.
+    ///
+    /// Empty for a set that only ever linked the declared world, which is every set this
+    /// crate builds today.
+    #[must_use]
+    pub fn external_bindings(&self) -> &[ExternalBinding] {
+        &self.external
     }
 
     /// How many rules are in the set.

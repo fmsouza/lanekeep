@@ -49,6 +49,7 @@ use lanekeep_wasm::ComponentLoader;
 use lanekeep_wasm::WasmError;
 use lanekeep_wasm::bindings::types;
 use lanekeep_wasm::host::CheckContext;
+use lanekeep_wasm::key::ExternalBinding;
 use lanekeep_wasm::load::{PermittedImports, instance_imports};
 use lanekeep_wasm::runtime::{RuleSet, RuleSlot, WasmEngine, WasmRuntime};
 use wasmtime::component::Resource;
@@ -449,6 +450,12 @@ fn permitting_an_interface_does_not_bind_it() {
 /// What is asserted is the seam, not WASI: an extra instance is bound, and a rule that does not
 /// use it still resolves and runs. A binding that had clobbered `lanekeep:host/types@0.1.0`
 /// would fail here rather than somewhere less obvious.
+///
+/// It also asserts the second half of that seam, which is a cache-key one: reaching the linker
+/// takes a declaration, and the set records it. `lanekeep_wasm::EXTERNAL_BINDINGS` is the list a
+/// run's `host_api_hash` is built from, so a binding nobody declared is a host behavior outside
+/// the cache key — and for a Go rule, whose map order a bound entropy source decides, that is a
+/// changed answer with every key input unmoved.
 #[test]
 fn the_linker_accepts_bindings_beyond_the_declared_world() {
     let engine = WasmEngine::new().expect("the shipped configuration builds");
@@ -457,12 +464,25 @@ fn the_linker_accepts_bindings_beyond_the_declared_world() {
         .expect("the fixture loads");
 
     let mut rules = RuleSet::new(&engine).expect("the world links");
+    assert!(
+        rules.external_bindings().is_empty(),
+        "a freshly linked world has bound nothing beside itself"
+    );
+
+    let declared =
+        ExternalBinding::declare("acme:extra/thing@0.1.0", "a function that does nothing");
     rules
-        .linker_mut()
+        .linker_mut(&declared)
         .instance("acme:extra/thing@0.1.0")
         .expect("a fresh instance name is available")
         .func_wrap("noop", |_store, (): ()| Ok(()))
         .expect("the host can answer a function in it");
+    assert_eq!(
+        rules.external_bindings(),
+        [declared],
+        "what was bound beside the world is readable, so a run can compare it against the \
+         declaration its cache key was built from"
+    );
 
     let slot = rules
         .add("acme/rule", &loaded)

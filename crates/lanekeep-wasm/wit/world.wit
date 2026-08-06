@@ -2,8 +2,12 @@
 //
 // This file is the single source of truth for the boundary between the engine and a rule.
 // Rust, TypeScript and Go authoring all generate their bindings from it, and the engine
-// implements exactly what it declares. Its bytes are a cache-key input (`host_api_version`
-// becomes a hash over this source), so an edit here invalidates every cached result.
+// implements exactly what it declares. Its bytes are a cache-key input — `host_api_hash` is
+// blake3 over this source, taken by `src/key.rs` — so an edit here, including to a comment,
+// invalidates every cached result. That is the point: the `0.1.0` in the package declaration
+// below is for error messages and for the component model's conventions, and is deliberately
+// not what the cache keys on, because a hand-maintained version is a thing somebody has to
+// remember to bump.
 //
 // Adding a function widens the trust boundary described in `docs/architecture.md` §13: a
 // component reaches exactly what its world declares and nothing else, which is why the

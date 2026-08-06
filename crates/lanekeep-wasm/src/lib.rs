@@ -12,6 +12,13 @@
 //! component against the host world once for the run. [`runtime::WasmRuntime`] is one store
 //! per worker, holding one lazily built instance per rule.
 //!
+//! A fourth module answers to a different owner. [`key`] holds the two values a run folds into
+//! its cache key before any of that happens: what a rule may reach, and what a component was
+//! compiled against. Both are derived rather than declared — the first from `wit/world.wit`'s
+//! own bytes, the second from the [`wasmtime::Engine`] [`runtime`] builds — because a
+//! cache-key input somebody has to remember to update is the failure the whole cache design is
+//! arranged against.
+//!
 //! # The boundary lives in `wit/world.wit`
 //!
 //! One file, `lanekeep:host@0.1.0`, holding one interface and one world. Rust, TypeScript
@@ -102,6 +109,7 @@
 pub mod bindings;
 pub mod error;
 pub mod host;
+pub mod key;
 pub mod load;
 pub mod runtime;
 
@@ -112,5 +120,6 @@ pub mod runtime;
 mod facts;
 
 pub use error::WasmError;
+pub use key::{EXTERNAL_BINDINGS, ExternalBinding, compile_env_hash, host_api_hash};
 pub use load::{ComponentLoader, LoadSource, Loaded, PermittedImports};
 pub use runtime::{RuleSet, RuleSlot, WasmEngine, WasmRuntime, engine};

@@ -352,6 +352,20 @@ those three; `node-location`, `binding-kind`, `read-error` and `fact-error` are 
 A load-time check comparing an artifact's WIT against `crates/lanekeep-wasm/wit/world.wit` would
 therefore reject every real rule. The comparable thing is the set of imported instance names.
 
+**A rustup toolchain's *name* reaches a component's bytes, so "same compiler" is not the same as
+"same artifact".** Component builds are otherwise reproducible here — measured 2026-08-06, all nine
+fixtures in `crates/lanekeep-wasm/tests/fixtures/` built twice from clean for
+`wasm32-unknown-unknown` with `cargo component` 0.21.1 produced nine pairs of byte-identical
+artifacts, each matching what is committed, and the checkout's absolute path does not appear in any
+of them. What does appear is a standard-library source path in a panic location, which carries the
+*toolchain directory*: `.../toolchains/stable-aarch64-apple-darwin/...` against
+`.../toolchains/1.95.0-aarch64-apple-darwin/...`. Building `world-shape` through `stable` rather
+than through the pin gave a different sha256 at the same size, differing in exactly six bytes —
+`stable` and `1.95.0` are the same rustc, and `rustc --version` says so for both. It matters
+because a component's bytes are a `ruleset_hash` input: two people on one commit with one compiler
+get two cache keys if one of them reached it by a different name. `rust-toolchain.toml` makes this
+a non-issue inside the repository and does not reach a fixture copied out of it.
+
 **wasmtime's import list counts resource types, so `imports().len() == 1` rejects every rule.**
 `wasm-tools component wit` shows one import on a component built against `lanekeep:host@0.1.0`,
 and `Component::component_type().imports()` shows three for the same bytes: that instance, plus
