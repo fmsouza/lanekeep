@@ -535,10 +535,9 @@ fn a_slot_this_rule_set_never_issued_is_refused() {
 #[test]
 fn a_store_stops_accepting_instances_at_the_memory_ceiling_long_before_wasmtimes_cap() {
     let mut runtime = WasmRuntime::with_limits(Limits::default()).expect("the world links");
-    let component = runtime
-        .engine()
-        .compile(WORLD_SHAPE)
-        .expect("the fixture is a valid component");
+    let component = ComponentLoader::without_cache()
+        .load(runtime.engine(), "world-shape", WORLD_SHAPE)
+        .expect("the fixture loads and imports only the declared world");
 
     let mut instances = 0_usize;
     let error = loop {
@@ -586,10 +585,9 @@ fn a_store_never_reclaims_an_instance_and_wasmtime_stops_it_at_3333() {
         Limits::default().with_memory_bytes(64 * 1024 * 1024 * 1024),
     )
     .expect("the world links");
-    let component = runtime
-        .engine()
-        .compile(WORLD_SHAPE)
-        .expect("the fixture is a valid component");
+    let component = ComponentLoader::without_cache()
+        .load(runtime.engine(), "world-shape", WORLD_SHAPE)
+        .expect("the fixture loads and imports only the declared world");
 
     let mut instances = 0_usize;
     let error = loop {

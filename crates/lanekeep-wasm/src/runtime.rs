@@ -96,7 +96,7 @@
 //!
 //! **The design is not falsified; the arithmetic behind [`MEMORY_RESERVATION`] is.** The
 //! per-worker cache still works, and it is what keeps the count at workers × rules instead of
-//! at files × rules, which would be forty thousand for the last row. What is gone is "the
+//! at files × rules, which would be one hundred thousand for the last row. What is gone is "the
 //! penalty does not grow with the corpus", and with it the claim that instantiation is a
 //! constant a large run can ignore. [`MEMORY_RESERVATION`] carries the re-derivation.
 //!
@@ -1154,25 +1154,37 @@ impl WasmRuntime {
     /// [`MEMORY_RESERVATION`] is chosen on the basis that instantiation happens **per (worker,
     /// rule)**. What makes that true is [`RuleSet`] plus the per-rule `Option` behind
     /// [`WasmRuntime::rule`], which instantiates at most once per slot per store. This method
-    /// is underneath that: it takes a `Component` rather than a slot, so it resolves the
+    /// is underneath that: it takes a component rather than a slot, so it resolves the
     /// component's imports on every call and keeps no instance, and calling it per file is
     /// exactly the shape the bound rules out.
     ///
     /// It stays public for two callers, both of them tests and neither of them a run.
-    /// `tests/limits.rs` drives one component under four different budgets and wants the
-    /// primitive rather than a ruleset; and the two cap cases in `tests/instantiation.rs`
-    /// instantiate into one store until it refuses, which is the one thing a bounded API
-    /// cannot express. **It performs no import check**, because it takes a component rather
-    /// than a [`Loaded`] — which is another reason it is not the door a run comes through.
+    /// `tests/limits.rs` drives one component under several budgets and wants the primitive
+    /// rather than a ruleset; and the two cap cases in `tests/instantiation.rs` instantiate
+    /// into one store until it refuses, which is the one thing a bounded API cannot express.
+    ///
+    /// # It takes a [`Loaded`] for the same reason [`RuleSet::add`] does
+    ///
+    /// It took a bare `&Component` until a review found what that meant: a published method
+    /// that reaches a *running instance* without the import check decision-record condition 4
+    /// rests on, in a crate `release-plz.toml` ships. `Loaded` is only produced by
+    /// [`crate::load::ComponentLoader::load`], which runs [`crate::load::check_imports`] first,
+    /// so the bypass now fails to compile rather than being ruled out by everyone remembering
+    /// that this is not the door a run comes through. That is the same repair `add` had, and
+    /// its rationale is the one worth reading: a check being *reachable* was never the
+    /// requirement, the check being *unavoidable* is.
+    ///
+    /// What this does **not** bound is how often it may be called; the paragraph above still
+    /// governs that, and [`MEMORY_RESERVATION`] names this method as the one unbounded path.
     ///
     /// # Errors
     ///
     /// Returns [`WasmError`] on a breached limit, or [`WasmError::Engine`] when the component
     /// does not satisfy the world.
-    pub fn instantiate(&mut self, component: &Component) -> Result<Rule, WasmError> {
+    pub fn instantiate(&mut self, loaded: &Loaded) -> Result<Rule, WasmError> {
         let timeout = self.limits.rule_timeout;
         self.arm(timeout);
-        let outcome = Rule::instantiate(&mut self.store, component, &self.rules.linker);
+        let outcome = Rule::instantiate(&mut self.store, loaded.component(), &self.rules.linker);
         self.disarm();
         self.instantiations += 1;
         outcome.map_err(|error| self.classify(&error, timeout))

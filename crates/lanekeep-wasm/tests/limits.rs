@@ -57,10 +57,11 @@ use lanekeep_lang_js::TypeScript;
 use lanekeep_nodes::NodeArena;
 use lanekeep_wasm::bindings::{Rule, types};
 use lanekeep_wasm::host::{CheckContext, ReduceContext, ReduceReport, Report};
+use lanekeep_wasm::load::Loaded;
 use lanekeep_wasm::runtime::{
     EPOCH_INTERRUPTION, MEMORY_GUARD_SIZE, MEMORY_RESERVATION, WasmEngine,
 };
-use lanekeep_wasm::{WasmError, WasmRuntime};
+use lanekeep_wasm::{ComponentLoader, WasmError, WasmRuntime};
 use wasmtime::component::Resource;
 
 /// The component under test, as built by `just wasm-fixtures`.
@@ -68,6 +69,18 @@ const LIMITS: &[u8] = include_bytes!("fixtures/limits.wasm");
 
 /// The path the context reports as the file under check. Nothing here reads it.
 const FILE: &str = "src/example.ts";
+
+/// The fixture, through a loader, because `WasmRuntime::instantiate` takes a `Loaded`.
+///
+/// That signature is what makes the import check unavoidable — there is no way from bytes to a
+/// running instance that skips it — so the cost to a test that wants the raw instantiation
+/// primitive is this one line. `without_cache` so this file writes no `.cwasm`; artifact paths
+/// are `tests/load.rs`'s subject.
+fn loaded(engine: &WasmEngine) -> Loaded {
+    ComponentLoader::without_cache()
+        .load(engine, "limits", LIMITS)
+        .expect("the fixture loads and imports only the declared world")
+}
 
 /// A runtime with one instance of the limits fixture in it, and one context to lend.
 ///
@@ -116,9 +129,7 @@ impl Run {
     ) -> (Self, Arc<RunClock>) {
         let engine =
             WasmEngine::with_tick_interval(interval).expect("the shipped configuration builds");
-        let component = engine
-            .compile(LIMITS)
-            .expect("the fixture is a valid component");
+        let component = loaded(&engine);
 
         // Everything above is outside the budget on purpose; everything below is inside it.
         let clock = RunClock::start(budget.unwrap_or(limits.global_timeout));
@@ -470,7 +481,7 @@ fn the_ceiling_applies_at_instantiation_before_a_rule_has_run_a_line() {
 
     let mut runtime =
         WasmRuntime::with_limits(Limits::default().with_memory_bytes(ceiling)).expect("builds");
-    let component = runtime.engine().compile(LIMITS).expect("valid component");
+    let component = loaded(runtime.engine());
 
     // `let Err(..) else` rather than `expect_err`, because the generated `Rule` has no
     // `Debug` — `bindgen!` writes none — and `expect_err` needs one for the success type.
@@ -498,7 +509,7 @@ fn a_second_instance_is_charged_against_the_same_ceiling_as_the_first() {
     let mut runtime =
         WasmRuntime::with_limits(Limits::default().with_memory_bytes(PER_INSTANCE * 2 + 65_536))
             .expect("builds");
-    let component = runtime.engine().compile(LIMITS).expect("valid component");
+    let component = loaded(runtime.engine());
 
     runtime.instantiate(&component).expect("the first fits");
     runtime.instantiate(&component).expect("the second fits");
