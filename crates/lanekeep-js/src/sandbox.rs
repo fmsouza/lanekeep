@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use lanekeep_core::limits::{Budget, Limits, RunClock, Trip};
 use lanekeep_lang::Language;
 use rquickjs::context::intrinsic;
 use rquickjs::promise::PromiseState;
@@ -10,7 +11,6 @@ use rquickjs::{CatchResultExt, Context, Ctx, FromJs, Module, Runtime};
 
 use crate::error::SandboxError;
 use crate::host::{HostContext, ReduceContext};
-use crate::limits::{Budget, Limits, RunClock, Trip};
 use crate::loader::{LoadedModules, RuleLoader, RuleResolver, RuleRoot};
 
 /// The intrinsics rule code gets.
@@ -661,7 +661,7 @@ mod tests {
         // own budget, but the run is already over.
         let clock = RunClock::start(Duration::ZERO);
         let s = Sandbox::new(
-            Limits::default().with_rule_timeout(Duration::from_secs(3600)),
+            Limits::default().with_rule_timeout(Duration::from_hours(1)),
             clock,
         )
         .expect("sandbox builds");
@@ -708,9 +708,8 @@ mod tests {
 
     #[test]
     fn sandbox_a_per_rule_budget_overrides_the_default() {
-        let s =
-            Sandbox::with_limits(Limits::default().with_rule_timeout(Duration::from_secs(3600)))
-                .expect("sandbox builds");
+        let s = Sandbox::with_limits(Limits::default().with_rule_timeout(Duration::from_hours(1)))
+            .expect("sandbox builds");
 
         let err = s
             .eval_with_timeout::<()>("while (true) {}", Duration::from_millis(80))

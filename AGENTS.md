@@ -104,6 +104,7 @@ crates/
   lanekeep-core      engine: walker, query evaluation, facts, violations, Rule trait
   lanekeep-js        the sandbox: QuickJS, host API, TS stripping, module loader
   lanekeep-query     tree-sitter query parsing and compilation
+  lanekeep-nodes     the node arena: parsed-tree handles shared by every rule-execution engine
   lanekeep-lang      Language trait and registry
   lanekeep-lang-js   TS/TSX/JS/JSX grammars, binding resolution
   lanekeep-lang-python  Python grammar, binding resolution
@@ -112,6 +113,7 @@ crates/
   lanekeep-languages    the set of supported languages, assembled in one place
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
+  lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring
   lanekeep-rules     built-in rules, authored in TypeScript
   lanekeep-report    human, json, sarif, agent reporters
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
@@ -152,6 +154,25 @@ saves the round trip.
 
 Real ones, each of which cost time. If you hit something surprising, add it.
 
+**The test suite can set `core.bare = true` on the real repository, and every later git command
+then fails with "this operation must be run in a work tree."** `changed.rs` and
+`tests/incremental.rs` build throwaway repositories with `git -C <tmpdir> init`. That is safe from
+a plain shell and unsafe from anything that exports `GIT_DIR` — a git hook does, which is why it
+shows up when the gate runs under `pre-push` rather than when you run `just check` by hand. `-C`
+changes the working directory; it does not override `GIT_DIR`, so `init` initializes the *real*
+repository, finds no worktree relationship, and records it as bare. Worktrees are hit hardest,
+since they resolve through the common config.
+
+The repair is one command, run from the main checkout:
+
+```bash
+git config --file .git/config core.bare false
+```
+
+Nothing is lost — no objects or refs are touched, only that one line. The durable fix is for those
+helpers to clear the variables they must not inherit (`.env_remove("GIT_DIR")`,
+`.env_remove("GIT_WORK_TREE")`), which makes them hermetic no matter who invokes them.
+
 **`rust-toolchain.toml` overrides the installed default.** A CI job that installs 1.85
 and runs plain `cargo check` tests 1.95 and passes regardless — a green check asserting
 nothing. Only `cargo +<version>` overrides the pin. This is why `just msrv` exists.
@@ -188,17 +209,47 @@ scaffolding to thread `Result` through every helper. List only the lints that ac
 covered.
 
 **An MSRV moves when a dependency forces it, never for syntax.** It is a promise to users.
-The floor went 1.85 → 1.87 for rquickjs and 1.87 → 1.88 for `ignore`, both because those
-crates would not build otherwise. It did *not* move when let-chains would have been
-convenient — that code was rewritten instead. `just check` runs `just msrv`, so a violation
-fails locally rather than costing a CI round trip; without it, every other recipe runs on a
-toolchain far newer than the floor and happily accepts syntax that does not exist there.
+The floor went 1.85 → 1.87 for rquickjs, 1.87 → 1.88 for `ignore` and 1.88 → 1.94 for
+`wasmtime`, all three because those crates would not build otherwise. It did *not* move when
+let-chains would have been convenient — that code was rewritten instead. `just check` runs
+`just msrv`, so a violation fails locally rather than costing a CI round trip; without it,
+every other recipe runs on a toolchain far newer than the floor and happily accepts syntax
+that does not exist there.
+
+The `wasmtime` move is the largest of the three and worth understanding before it is repeated.
+`wasmtime` releases monthly and raises its own floor with roughly every release, so its
+declared `rust-version` tracks about one release behind current stable — 47.0.3 declares
+1.94.0 while the pinned toolchain is 1.95.0. The newest `wasmtime` that builds on 1.88 is
+38.0.4; 39.0.0 already needs 1.89. So there is no version of this dependency that both holds
+an old floor and is the version anything was measured against, and every subsequent `wasmtime`
+bump will drag the floor with it. Budget for that rather than discovering it per release.
 
 **`rayon`'s `map_init` runs its initializer per chunk, not per thread.** State built there
 is not reliably shared across the items one worker handles — with a small input, rayon splits
 down to single items and every item gets its own. A design that relies on per-worker state
 being shared is therefore untestable at small scale and only wrong at large scale. Either
 make the state per item, or accept that a test cannot distinguish the two.
+
+**And the corollary that reads the other way round: the initializer count grows with the input,
+so any "bounded by threads × N" arithmetic about it is wrong.** The entry above warns about small
+inputs; the more expensive mistake is at large ones. Measured through `lanekeep-engine` on
+2026-08-06, release, 14 threads, one initializer per chunk:
+
+| files | rules | initializers |
+|---|---|---|
+| 2,000 | 1 | 813 |
+| 2,000 | 10 | 579 |
+| 10,000 | 10 | 1,038 |
+
+Not fourteen, and not stable between runs of one corpus — the two 2,000-file rows are the same
+corpus and disagree, because rayon splits on how the work is going, so this is a distribution
+rather than a bound. `lanekeep-wasm`'s `MEMORY_RESERVATION` was justified on "roughly three
+hundred and fifty instantiations for a run, and it does not grow with the corpus", from workers ×
+rules at fourteen workers; the real figure at ten thousand files times ten rules is 10,380. The
+design was right — one instance per (worker, rule) is what keeps it off files × rules, which would
+be 100,000 — and the *number* it was defended with was thirty times too small. If a cost is per
+initializer, measure the initializers; `with_min_len` is the lever that makes the count something
+you chose.
 
 **A tree-sitter query matches children in tree order.** `(import_statement source: (string)
 (import_clause ...))` can never match, because the grammar puts `import_clause` first — and
@@ -265,6 +316,20 @@ that "parsed". On a React Native codebase that hid most of the code and produced
 positives in one rule. `language` now takes one or several and defaults to
 `['typescript', 'tsx']`, and a rule does not run on a file whose language it does not name.
 
+**A WebAssembly component's import list depends on what the guest touches, not only on the
+target it was built for — so a small fixture cannot tell you the target is right.** Rule
+components must be built for `wasm32-unknown-unknown`; `cargo component`'s default is
+`wasm32-wasip1`, whose components import a wall clock and two filesystem interfaces, which are
+exactly the capabilities the sandbox exists to withhold. The trap is that this is invisible at
+small scale. Measured 2026-08-05 on `cargo component` 0.21.1: a guest exporting
+`add: func(u32, u32) -> u32` has **zero** imports on *both* targets, because it allocates
+nothing and reaches no part of `std` that touches the WASI adapter. The scaffold's
+`hello-world: func() -> string`, one `String` away, has **ten** on `wasm32-wasip1` — including
+`wasi:clocks/wall-clock`, `wasi:filesystem/types` and `wasi:filesystem/preopens` — and zero on
+`wasm32-unknown-unknown`. So a fixture built on the wrong target passes an import assertion
+right up until a real rule formats a violation message. Pin the target at the build *and*
+check every artifact's import list at load; neither substitutes for the other.
+
 **`cargo publish` needs a crate's dev-dependencies on the registry too.** It resolves them when
 it packages, so a crate whose dev-dependency is unpublished cannot go up even though nothing it
 ships uses it. `lanekeep-rules` dev-depends on `lanekeep-testkit` for `RuleTester`, which puts
@@ -285,6 +350,100 @@ workflow that writes a file into a checkout and asks `git diff --quiet` whether 
 "nothing to do" whenever that file is new — announcing success while doing the opposite of its
 job. Stage first and compare `git diff --cached`. This was latent in the Homebrew tap step: the
 only run that would have hit it is the first one, against a tap with no formula in it yet.
+
+**A WIT type declared inside an interface is not in scope in a world that imports it.** The
+world needs `use types.{check-context};` for every type it names in an export signature. Deleting
+that line from `crates/lanekeep-wasm/wit/world.wit` gives ``name `check-context` does not exist``
+under `wasm-tools` 1.255.0, pointing at the export's parameter — it names whichever type the first
+offending signature mentions, and it reads as though the type is missing rather than out of scope.
+A sketch carrying the bug is in `docs/superpowers/specs/2026-08-04-rust-rule-authoring-design.md`
+§2.4, whose `world rule` names `rule-context` and `reduce-context` with no `use`. The sub-project's
+own sketch, in `2026-08-04-wit-host-api-design.md` §3, does *not* have it: it carries the `use` and
+documents the trap in a doc comment, and extracted verbatim it parses.
+
+**Every WIT comment is a doc comment, including `//`.** `wit-parser` attaches a plain `//` block
+to the item that follows exactly as it attaches `///`, so `wasm-tools component wit` prints the
+whole file back with `///` on everything. There is no way to write a note that stays out of the
+resolved package. What saves it from mattering is that the docs do not reach the artifact:
+`wit-bindgen` 0.41.0 drops them, and a built component's embedded WIT carries none.
+
+**A component's embedded WIT is a *subset* of the world it was built against.** The world-shape
+fixture calls three of `check-context`'s twenty-four methods and its component-type section lists
+those three; `node-location`, `binding-kind`, `read-error` and `fact-error` are absent entirely.
+A load-time check comparing an artifact's WIT against `crates/lanekeep-wasm/wit/world.wit` would
+therefore reject every real rule. The comparable thing is the set of imported instance names.
+
+**A rustup toolchain's *name* reaches a component's bytes, so "same compiler" is not the same as
+"same artifact".** Component builds are otherwise reproducible here — measured 2026-08-06, the nine
+`wasm32-unknown-unknown` fixtures in `crates/lanekeep-wasm/tests/fixtures/` that existed then
+(`engine-rule` arrived after, making ten) built twice from clean with `cargo component` 0.21.1
+produced nine pairs of byte-identical artifacts, each matching what is committed, and the
+checkout's absolute path does not appear in any of them. What does appear is a standard-library source path in a panic location, which carries the
+*toolchain directory*: `.../toolchains/stable-aarch64-apple-darwin/...` against
+`.../toolchains/1.95.0-aarch64-apple-darwin/...`. Building `world-shape` through `stable` rather
+than through the pin gave a different sha256 at the same size, differing in exactly six bytes —
+`stable` and `1.95.0` are the same rustc, and `rustc --version` says so for both. It matters
+because a component's bytes are a `ruleset_hash` input: two people on one commit with one compiler
+get two cache keys if one of them reached it by a different name. `rust-toolchain.toml` makes this
+a non-issue inside the repository and does not reach a fixture copied out of it.
+
+**wasmtime's import list counts resource types, so `imports().len() == 1` rejects every rule.**
+`wasm-tools component wit` shows one import on a component built against `lanekeep:host@0.1.0`,
+and `Component::component_type().imports()` shows three for the same bytes: that instance, plus
+bare `check-context` and `reduce-context` type imports the component model requires because those
+types appear in an export signature. Filter on `ComponentItem::ComponentInstance` — the instances
+are what describe reachable capability, and the type imports are bookkeeping.
+
+**An imported resource with no `with` mapping compiles to an uninhabited type.** `bindgen!` emits
+one for every host-implemented resource the embedder has not named a Rust type for — `match x {}`
+on it compiles — so nothing can be pushed into a `ResourceTable` and no export taking
+`borrow<check-context>` can be called. Everything still builds and the failure is only visible
+when something tries to run. The `with` key is `package/interface@version.resource`, with a *dot*
+before the resource name; a slash there fails with "interfaces were specified in the `with` config
+option but are not referenced in the target world", which reads like the interface name is wrong.
+
+**A wasm trap's rendered error already contains the method name, so asserting on it proves
+nothing.** wasmtime prefixes a host function's error with a backtrace whose top frame is spelled
+`wit-component:shim!indirect-lanekeep:host/types@0.1.0-[method]check-context.today`. A test doing
+`format!("{err:?}").contains("check-context.today")` therefore passes whatever the host said — it
+survived a mutation that made the host name a different method entirely, which is how it was
+found. Assert on `err.root_cause().to_string()`, which is the host's own message and nothing else.
+
+**`wasm32-unknown-unknown` has no atomics target feature, so an `AtomicU64` is a plain load and
+store and a busy loop written around one is deleted.** A fixture that has to spend real time —
+the only kind that can test a wall-clock budget, per the interrupt-handler trap above — cannot
+rely on either of the two obvious guards. Storing the accumulator into a `static AtomicU64` once
+at the end lets LLVM strength-reduce a linear congruential step to a closed form and drop the
+loop; storing into it on *every* iteration does not help either, because without the atomics
+feature `core::sync::atomic` lowers to ordinary memory operations and every store but the last is
+removed. Both were measured: a 20 ms budget failed to notice four hundred million rounds of each,
+and the test passed in under a second. `core::hint::black_box` inside the loop is what makes it
+real — `crates/lanekeep-wasm/tests/fixtures/limits/` already used it, and
+`.../fixtures/engine-rule/` says why in its `burn`.
+
+**A trap poisons a `wasmtime::Store` for good, and the store outlives the file.**
+`bindgen!`'s `imports: { default: trappable }` means any trap sets a store-wide flag with no
+public reset, so the next call on that store fails with `cannot enter component instance` — a
+message about the runtime's bookkeeping that names nothing that went wrong. rayon keeps handing
+a worker its remaining files after one fails, and which of several simultaneous failures the
+reduction surfaces is arbitrary, so a run can be reported against a file that was fine. Nothing
+is rescued by noticing, since every such failure cancels the run either way; the *diagnostic* is.
+`lanekeep-engine`'s `Worker::poison_on` remembers the first failure and hands it back for the
+rest of that worker's share.
+
+**`git log -- <a committed binary>` lists the commits where its bytes changed, and a rebuild
+that produces identical bytes is not one of them.** So "the source commit is newer than the
+artifact commit" is not evidence that the artifact is stale — it is equally the signature of a
+rebuild that changed nothing, and the two are indistinguishable from history alone. Three of the
+eleven committed WebAssembly fixtures read as stale that way — `bindings`, `spike` and
+`world-shape` — and all eleven turned out to be current, which only a rebuild could establish:
+`cargo component build --release` on the pinned toolchain is byte-reproducible, so
+`just wasm-fixtures` on a consistent tree leaves `git status` clean and on an inconsistent one
+does not. That is now the check rather than the investigation —
+`crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
+`tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
+there too, because ten of the eleven name it as their component target and a world edit with no
+rebuild leaves every fixture satisfying an ABI that no longer exists.
 
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
@@ -330,6 +489,43 @@ of them. Nothing fails: the rule loads, the query never runs, and the output rea
 a codebase with none of the thing in it. There is no *or* form, so a rule with no single
 covering substring omits the gate rather than writing one that is wrong.
 
+**`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
+`ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a
+module something *imported*; the entry is handed straight to `Module::evaluate`. Everything the
+entry module carries and nothing else carries is therefore outside the cache key. That was exactly
+a `lanekeep.json` rule's `options`, which were interpolated into the entry as a factory-call
+argument and appeared in no hash at all: editing `{"rule": "x", "options": {"limit": 1}}` to
+`{"limit": 2}` produced two byte-identical `config_hash`es and a warm run kept answering the
+previous configuration. `docs/architecture.md` §8.1 has listed options under `config_hash` the
+whole time, so the code and the specification disagreed and neither said so. Options are read as
+data and hashed now, on the path that knows them — but the general fact stands: **a value that
+only ever exists in generated entry-module source is invisible to both hashes.**
+
+**What hid it is worth more than the mechanism: a fixture written against a `lanekeep.config.ts`
+passes against this bug.** The two config formats reach the key by different routes — a TypeScript
+config's options live in the config module's own source, which the loader *did* read, so they were
+hashed all along — and every hashing test there was covered one format. Single-format coverage of a
+property both formats have to satisfy is not coverage of the property. When two paths can reach the
+same requirement, assert it on each of them, in matched pairs, and name the pairing so nobody drops
+half of it later.
+
+**A fixture path derived from its content races, and the *repair* for the obvious version of that
+bug races too.** `json.rs`'s test helper first keyed `temp_dir()/lanekeep-json-…` on the config's
+*length*: two thirty-eight-byte configs shared one file, tests run in parallel, and each read
+whichever had been written last. Keying on a `blake3` of the content looks like the fix and is not
+— two tests can legitimately write the *identical* config, and `std::fs::write` truncates before it
+writes, so the sibling thread reads an empty file and fails with `EOF while parsing a value at line
+1 column 0`. Measured five failures in eighty runs of `cargo test -p lanekeep-config`; **same bytes
+is not the same as no race, because truncate-then-write is not atomic.** Name the directory after
+the *test*, or write to a temporary and rename. Nothing derived is safe here, and the derivation
+that is nearly safe is the one that costs the most to disbelieve.
+
+Both versions surfaced during mutation testing, where a mutation of the hashing code was reported as
+breaking a specifier-parsing assertion — worse than an ordinary flake, because the whole point of
+that exercise is trusting the attribution. `just check` hid it: nextest runs a process per test,
+which widens the window enough that a hundred runs were clean, while the plain `cargo test` the
+brief prescribes was failing one run in sixteen.
+
 **A node handle is an integer and the root's is `0`, so `if (!node)` discards it.** Nodes cross
 into the sandbox as handles rather than objects — one of the one-way doors in §14 — and the
 root is handle zero. A rule written the ordinary JavaScript way, `const parent = ctx.parent(n);
@@ -349,13 +545,27 @@ simply slow. The breach message even ends with "raise it with `--timeout`", advi
 the code that made it impossible. A test that only *lowers* a limit passes against this bug —
 assert the raise.
 
-**The global run budget is polled by QuickJS's interrupt handler, so it only bounds a run while
-JavaScript is executing.** A rule whose handler returns after a handful of operations can
-overrun the budget without ever being asked to stop: 400 files against a one-line rule ran to
-completion under a 1 ms budget, config-set or flag-set alike. It is not that the limit is unwired
-— a rule doing real work trips it precisely — but the poll only happens inside the sandbox, and
-§15's cold cost is dominated by Rust-side parsing. Any fixture testing this needs a rule that
-burns real bytecode, or it is testing nothing.
+**Both engines poll the global run budget only from inside a handler, so for a while it bounded
+a run only while a handler was executing.** QuickJS polls it from its interrupt handler; wasmtime
+from the epoch checks Cranelift compiles into guest code. Neither runs while the engine is
+reading, hashing, parsing or matching, and §15's cold cost is dominated by exactly that. So a
+rule whose handler returned after a handful of operations could overrun the budget without ever
+being asked to stop: 400 files against a one-line rule ran to completion under a 1 ms budget,
+config-set or flag-set alike, and the component path had the same gap for the same reason. It was
+never that the limit is unwired — a rule doing real work trips it precisely.
+
+`Engine::check_file` now asks the run clock between one file and the next, which closes it for
+both engines at once because it sits above the dispatch that chooses between them. Two things
+follow. **A fixture for the *inner* limits still needs a rule that burns real bytecode**, or it
+passes because the work was fast; a fixture for the *outer* check needs the opposite — a handler
+so cheap that nothing but the outer check could have stopped the run, or it passes against the
+bug. And **an aborted run has to commit the entries for files that completed, and must not
+prune.** Those two halves have different histories and it is worth keeping them apart. The
+*commit* half architecture §6.8 always required and nothing did: `run_files` returned on the
+first error before it reached the save, so a corpus that overran its budget would have been
+stranded cold forever the moment the budget started being enforced. The *no-prune* half is
+doctrine this change added to §6.8, and it could not have been there before — an aborted run
+wrote nothing at all, so there was no save whose pruning behavior anyone had to decide.
 
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,

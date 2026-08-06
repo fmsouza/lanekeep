@@ -1,0 +1,51 @@
+# The one fixture built for the *wrong* target, on purpose.
+#
+# Everything under tests/fixtures/ is built for wasm32-unknown-unknown, where the import
+# list is exactly the declared world. This one is built for wasm32-wasip1 — `cargo
+# component`'s own default — whose components import a wall clock and two filesystem
+# interfaces as soon as the guest touches the parts of `std` that reach the WASI adapter.
+# It exists so `tests/load.rs` can prove the load-time import check rejects a real
+# wrongly-targeted artifact rather than a synthetic approximation of one.
+#
+# It lives one directory deeper than its siblings for two reasons that are both load-bearing.
+# `just wasm-fixtures` iterates `tests/fixtures/*/` and would otherwise build it for the
+# right target, which would defeat its whole purpose. And `tests/world_shape.rs`'s
+# `no_fixture_artifact_imports_ambient_authority` globs `tests/fixtures/*.wasm` and asserts
+# every artifact it finds imports nothing but the host interface — an assertion this artifact
+# is specifically built to violate.
+#
+# Its own workspace, exactly as its siblings are: `members = ["crates/*"]` does not reach it,
+# and an empty `[workspace]` table is what detaches it.
+[package]
+name = "wasip1"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# The world is read from the engine's own wit/ directory, one level further up than a
+# top-level fixture reaches. A copy would prove that a file which was once the world is
+# targetable, and nothing would catch the two drifting.
+[package.metadata.component.target]
+path = "../../../../wit"
+world = "rule"
+
+[package.metadata.component.dependencies]
+
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build`
+# generates and `.gitignore` deliberately excludes. cargo-machete reads source, so on a
+# fresh checkout it sees a dependency nothing references and fails the gate — while a
+# machine that has built the fixture once sees it used and passes.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]

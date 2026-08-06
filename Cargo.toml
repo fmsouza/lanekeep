@@ -5,7 +5,11 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.6.1"
 edition = "2024"
-rust-version = "1.88"
+# Moved 1.88 → 1.94 because wasmtime 47.0.3 declares `rust-version = "1.94.0"`, not for
+# syntax. 38.0.4 is the newest wasmtime that builds on 1.88 — nine major releases behind
+# the one every measurement behind `lanekeep-wasm` was taken against — so keeping the old
+# floor meant keeping a different runtime than the one that was evaluated.
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fmsouza/lanekeep"
 homepage = "https://github.com/fmsouza/lanekeep"
@@ -30,11 +34,13 @@ lanekeep-lang-js = { version = "0.6.0", path = "crates/lanekeep-lang-js" }
 lanekeep-lang-go = { version = "0.6.0", path = "crates/lanekeep-lang-go" }
 lanekeep-lang-python = { version = "0.6.0", path = "crates/lanekeep-lang-python" }
 lanekeep-lang-rust = { version = "0.6.0", path = "crates/lanekeep-lang-rust" }
+lanekeep-nodes = { version = "0.6.1", path = "crates/lanekeep-nodes" }
 lanekeep-query = { version = "0.6.0", path = "crates/lanekeep-query" }
 lanekeep-report = { version = "0.6.0", path = "crates/lanekeep-report" }
 lanekeep-server = { version = "0.6.0", path = "crates/lanekeep-server" }
 lanekeep-rules = { version = "0.6.1", path = "crates/lanekeep-rules" }
 lanekeep-testkit = { version = "0.6.1", path = "crates/lanekeep-testkit" }
+lanekeep-wasm = { version = "0.6.1", path = "crates/lanekeep-wasm" }
 
 # External dependencies are versioned once here so two crates cannot disagree, which
 # would otherwise show up as a duplicate in the dependency graph rather than as an error.
@@ -67,6 +73,29 @@ tree-sitter-go = { version = "0.25" }
 tree-sitter-rust = { version = "0.24" }
 streaming-iterator = { version = "0.1" }
 rquickjs = { version = "0.12", features = ["loader"] }
+# The WebAssembly component runtime rules execute on. `default-features = false` and an
+# explicit list, because wasmtime's default set is fourteen features wide and includes
+# `async`, `cache` and `gc`, none of which lanekeep uses — `async` in particular would
+# drag in a futures executor for a synchronous `Store`.
+#
+# `cranelift` is not optional and not a performance preference. lanekeep is the only thing
+# on a user's machine that can turn a rule component into a form a run can afford to load:
+# compiling twenty components at check time costs ~186 ms against ~0.74 ms to load twenty
+# precompiled ones. `cranelift` is what does that compiling.
+#
+# `std` is redundant beside `cranelift`, which already implies it — wasmtime 47.0.3 defines
+# `cranelift = ["dep:wasmtime-cranelift", "std", "wasmtime-unwinder/cranelift"]`. It is
+# written out anyway because dropping `cranelift` without also naming `std` selects
+# wasmtime's bare-metal `custom` platform backend, which expects the embedder to supply
+# `wasmtime_tls_get` and friends by hand and fails at the link step here. `cargo check`
+# never invokes the linker and cannot see that, so the redundant spelling is a guard
+# against a future edit that removes one feature and passes a check it should not.
+wasmtime = { version = "47.0.3", default-features = false, features = [
+    "runtime",
+    "component-model",
+    "cranelift",
+    "std",
+] }
 
 [workspace.lints.rust]
 # Denied rather than forbidden: lanekeep-cache needs `unsafe` for memory mapping and

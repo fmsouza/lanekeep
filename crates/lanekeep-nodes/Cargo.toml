@@ -1,0 +1,23 @@
+[package]
+name = "lanekeep-nodes"
+description = "The node arena: parsed-tree handles shared across lanekeep's rule-execution engines."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+lanekeep-lang = { workspace = true }
+lanekeep-query = { workspace = true }
+tree-sitter = { workspace = true }
+
+[dev-dependencies]
+lanekeep-lang-js = { workspace = true }
+
+[lints]
+workspace = true

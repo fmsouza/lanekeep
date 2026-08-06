@@ -28,10 +28,11 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A rule that burns bytecode rather than sleeping, because the sandbox has no clock.
 ///
-/// It also has to burn a *lot* of it: the global budget is polled by QuickJS's interrupt
-/// handler, which only runs while JavaScript does, so a handler that returns after a
-/// handful of operations can overrun the budget without ever being asked to stop. A rule
-/// doing real work is what makes this fixture deterministic instead of a race.
+/// It also has to burn a *lot* of it, for a reason that survives the walker having gained a
+/// clock check of its own: this corpus is one file, so there is no second file boundary for
+/// that check to fire at, and the only thing that can breach a 200 ms budget over one file is
+/// a handler that runs for longer than that. A rule doing real work is what makes this fixture
+/// deterministic instead of a race.
 ///
 /// The iteration count is chosen for margin on both sides: it runs about two seconds in a
 /// debug build, so the 200 ms budget below is breached by roughly ten times over, and the

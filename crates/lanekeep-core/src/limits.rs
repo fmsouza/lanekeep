@@ -4,8 +4,22 @@
 //! be disabled: a per-invocation timeout, a global wall-clock budget for the whole run, and
 //! a memory ceiling per runtime.
 //!
-//! Breaching any of them cancels the run. See [`crate::SandboxError`] for why continuing
-//! would be worse.
+//! Breaching any of them cancels the run — see `docs/architecture.md` §6.8 for why
+//! continuing would be worse. Turning a breach into an error is each engine's own concern;
+//! `lanekeep-js`'s `SandboxError` is one such type.
+//!
+//! # Why this lives in `lanekeep-core` rather than in one engine
+//!
+//! There is one global run budget, not one per engine: `docs/architecture.md`'s resource-limits
+//! invariant is that breaching it cancels the *run*, and a run can call into more than one
+//! engine (`lanekeep-js`'s QuickJS sandbox today, `lanekeep-wasm`'s component runtime once it
+//! dispatches rules). [`RunClock`] is the shared origin that makes "the run" a single wall-clock
+//! deadline rather than a per-engine one. Two independent clocks would each enforce their own
+//! share of the budget correctly in isolation while the run as a whole overran both — a
+//! quantitative failure, not a maintenance one, since it needs no drift to manifest: two honest
+//! clocks that were never told about each other already sum past the one promise the run makes.
+//! Defining `RunClock` once, here, is what keeps a second instance from being constructible at
+//! all for a single run.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,7 +135,7 @@ impl RunClock {
 
 /// Which budget was breached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Trip {
+pub enum Trip {
     /// A single invocation ran too long.
     Rule,
     /// The run as a whole ran too long.
@@ -132,15 +146,17 @@ const TRIP_NONE: u64 = 0;
 const TRIP_RULE: u64 = 1;
 const TRIP_RUN: u64 = 2;
 
-/// Shared between the sandbox and its interrupt handler.
+/// Shared between an engine's runtime and its interrupt handler.
 ///
 /// Records *why* execution was interrupted rather than leaving it to be inferred from the
-/// engine's exception text. The engine reports an interrupt as an ordinary `Error` whose
-/// message happens to be "interrupted"; keying behavior off that string would make the
-/// difference between "your rule looped forever" and "your rule threw" depend on wording
-/// this project does not control.
+/// engine's own exception or trap text. QuickJS, for instance, reports an interrupt as an
+/// ordinary `Error` whose message happens to be "interrupted"; keying behavior off that
+/// string would make the difference between "your rule looped forever" and "your rule
+/// threw" depend on wording this project does not control. A different engine's own
+/// interrupted-execution signal would be exactly as unreliable to string-match, for the
+/// same reason.
 #[derive(Debug)]
-pub(crate) struct Budget {
+pub struct Budget {
     clock: Arc<RunClock>,
     global_nanos: u64,
     /// Deadline for the current invocation, in nanoseconds since the run started.
@@ -150,7 +166,8 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
-    pub(crate) fn new(clock: Arc<RunClock>) -> Arc<Self> {
+    /// Build a budget enforcer sharing the run's clock.
+    pub fn new(clock: Arc<RunClock>) -> Arc<Self> {
         let global_nanos = u64::try_from(clock.global_timeout.as_nanos()).unwrap_or(u64::MAX);
         Arc::new(Self {
             clock,
@@ -161,7 +178,7 @@ impl Budget {
     }
 
     /// Start the clock on one invocation.
-    pub(crate) fn arm(&self, rule_timeout: Duration) {
+    pub fn arm(&self, rule_timeout: Duration) {
         let now = self.clock.elapsed_nanos();
         let budget = u64::try_from(rule_timeout.as_nanos()).unwrap_or(u64::MAX);
         // Saturating: a deadline of zero means disarmed, so an overflowing budget must not
@@ -172,13 +189,13 @@ impl Budget {
     }
 
     /// Stop enforcing an invocation budget.
-    pub(crate) fn disarm(&self) {
+    pub fn disarm(&self) {
         self.invocation_deadline_nanos.store(0, Ordering::Relaxed);
     }
 
     /// Whether execution should stop now, recording why. Called by the engine's interrupt
     /// handler, so it runs often and must stay cheap.
-    pub(crate) fn should_interrupt(&self) -> bool {
+    pub fn should_interrupt(&self) -> bool {
         let elapsed = self.clock.elapsed_nanos();
 
         if elapsed >= self.global_nanos {
@@ -196,7 +213,7 @@ impl Budget {
     }
 
     /// Which budget was breached, if any. Clears the record.
-    pub(crate) fn take_trip(&self) -> Option<Trip> {
+    pub fn take_trip(&self) -> Option<Trip> {
         match self.tripped.swap(TRIP_NONE, Ordering::Relaxed) {
             TRIP_RULE => Some(Trip::Rule),
             TRIP_RUN => Some(Trip::Run),
@@ -204,7 +221,8 @@ impl Budget {
         }
     }
 
-    pub(crate) fn clock(&self) -> &RunClock {
+    /// The run clock this budget was built from.
+    pub fn clock(&self) -> &RunClock {
         &self.clock
     }
 }
@@ -235,8 +253,8 @@ mod tests {
 
     #[test]
     fn a_rule_cannot_raise_the_global_budget() {
-        let limits = Limits::default().with_rule_timeout(Duration::from_secs(60));
-        assert_eq!(limits.rule_timeout, Duration::from_secs(60));
+        let limits = Limits::default().with_rule_timeout(Duration::from_mins(1));
+        assert_eq!(limits.rule_timeout, Duration::from_mins(1));
         assert_eq!(
             limits.global_timeout, DEFAULT_GLOBAL_TIMEOUT,
             "raising a rule's own budget must not extend the run"
@@ -245,14 +263,14 @@ mod tests {
 
     #[test]
     fn an_unarmed_budget_never_interrupts() {
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         assert!(!budget.should_interrupt());
         assert_eq!(budget.take_trip(), None);
     }
 
     #[test]
     fn an_expired_invocation_budget_interrupts_and_records_why() {
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::ZERO);
         assert!(budget.should_interrupt());
         assert_eq!(budget.take_trip(), Some(Trip::Rule));
@@ -261,7 +279,7 @@ mod tests {
     #[test]
     fn an_expired_run_budget_interrupts_and_records_why() {
         let budget = Budget::new(RunClock::start(Duration::ZERO));
-        budget.arm(Duration::from_secs(3600));
+        budget.arm(Duration::from_hours(1));
         assert!(budget.should_interrupt());
         assert_eq!(budget.take_trip(), Some(Trip::Run));
     }
@@ -278,7 +296,7 @@ mod tests {
 
     #[test]
     fn disarming_stops_invocation_enforcement() {
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::ZERO);
         budget.disarm();
         assert!(!budget.should_interrupt(), "no invocation is in flight");
@@ -286,7 +304,7 @@ mod tests {
 
     #[test]
     fn taking_the_trip_clears_it() {
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::ZERO);
         assert!(budget.should_interrupt());
         assert_eq!(budget.take_trip(), Some(Trip::Rule));
@@ -301,11 +319,11 @@ mod tests {
     fn arming_clears_a_previous_trip() {
         // Otherwise the next invocation would inherit the last one's verdict and be
         // reported as timing out without ever running.
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::ZERO);
         assert!(budget.should_interrupt());
 
-        budget.arm(Duration::from_secs(3600));
+        budget.arm(Duration::from_hours(1));
         assert!(!budget.should_interrupt());
         assert_eq!(budget.take_trip(), None);
     }
@@ -314,7 +332,7 @@ mod tests {
     fn an_overflowing_budget_does_not_wrap_into_disarmed() {
         // A deadline of zero means "no invocation in flight". An enormous budget must
         // saturate rather than wrap around to zero and switch the limit off entirely.
-        let budget = Budget::new(RunClock::start(Duration::from_secs(3600)));
+        let budget = Budget::new(RunClock::start(Duration::from_hours(1)));
         budget.arm(Duration::MAX);
         assert_ne!(
             budget.invocation_deadline_nanos.load(Ordering::Relaxed),
@@ -325,12 +343,12 @@ mod tests {
 
     #[test]
     fn the_clock_measures_from_one_origin() {
-        let clock = RunClock::start(Duration::from_secs(3600));
+        let clock = RunClock::start(Duration::from_hours(1));
         let a = Arc::clone(&clock);
         let b = Arc::clone(&clock);
         assert!(!a.is_expired());
         assert!(!b.is_expired());
-        assert_eq!(a.global_timeout(), Duration::from_secs(3600));
+        assert_eq!(a.global_timeout(), Duration::from_hours(1));
     }
 
     #[test]

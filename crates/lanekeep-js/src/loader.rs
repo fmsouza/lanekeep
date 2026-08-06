@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use lanekeep_core::files::normalize;
 use lanekeep_lang::Language;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::module::{Declared, Module};
 use rquickjs::{Ctx, Error as JsError};
 use thiserror::Error;
 
-use crate::files::normalize;
 use crate::typescript::strip_types;
 
 /// The specifier that resolves to lanekeep's own module.

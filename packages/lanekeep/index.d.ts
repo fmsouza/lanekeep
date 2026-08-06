@@ -171,6 +171,10 @@ export interface RuleContext {
    * local of the same name.
    *
    * @param name Which export. Omit to match the module regardless of which name was taken.
+   *   Two spellings are special and are the only way to name those imports:
+   *   `'default'` matches `import x from 'm'`, and `'*'` matches
+   *   `import * as x from 'm'`. Every other value is matched against the exported
+   *   name, so `import { a as b }` is named by `'a'` and not by `'b'`.
    */
   resolvesToImport(node: Node, module: string, name?: string): boolean
   /** Whether an identifier came from a module matching this glob. */

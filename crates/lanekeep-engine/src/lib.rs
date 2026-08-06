@@ -32,7 +32,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +48,12 @@ use lanekeep_js::{
 };
 use lanekeep_lang::{Language, LanguageRegistry};
 use lanekeep_query::{CompileError, CompiledQuery};
+use lanekeep_wasm::bindings::types;
+use lanekeep_wasm::host::{CheckContext, ReduceContext as ComponentReduceContext};
+use lanekeep_wasm::{
+    ComponentLoader, EXTERNAL_BINDINGS, ExternalBinding, Resource, RuleSet, RuleSlot, WasmEngine,
+    WasmError, WasmRuntime,
+};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -82,6 +87,33 @@ pub enum RunError {
         known: String,
     },
 
+    /// The WebAssembly runtime could not be described, so a run cannot be keyed against it.
+    ///
+    /// Not about any rule. A cached result is only valid for the compilation environment it
+    /// was produced under, and that environment is read off an engine built from
+    /// `lanekeep_wasm`'s one configuration — so a host where `wasmtime` cannot realize it is a
+    /// host where no result can be filed under a key that means anything. Guessing a value
+    /// instead would put entries under a key describing nothing, which is the one failure
+    /// `docs/architecture.md` §8.1 is arranged against.
+    ///
+    /// **What this costs, stated plainly: a host where `wasmtime` cannot build an engine can
+    /// now run no rules at all — including a ruleset that is entirely TypeScript and needs no
+    /// WebAssembly whatever.** That is a real reduction in reach for no benefit until a
+    /// component actually executes, and it is the price of keying every run against the
+    /// environment rather than only the runs that use it. The alternative is a sentinel for
+    /// "no wasm here", which is a second code path through the cache key whose correctness
+    /// nothing would exercise until the first component arrived. Worth revisiting if this ever
+    /// fires on a real host; nothing has seen it fire, because the configuration is three
+    /// tunables on a supported target.
+    #[error(
+        "the WebAssembly runtime could not be configured on this host\n  {detail}\n  \
+         this is a broken build rather than anything about a rule"
+    )]
+    WasmRuntime {
+        /// What `wasmtime` said.
+        detail: String,
+    },
+
     /// A rule's gates are malformed.
     #[error("rule `{rule}` has invalid gates: {detail}")]
     Gates {
@@ -89,6 +121,45 @@ pub enum RunError {
         rule: String,
         /// What is wrong.
         detail: String,
+    },
+
+    /// A rule's component could not be loaded, or could not be linked against the host world.
+    ///
+    /// Separate from [`RunError::Rule`], which is a rule that ran and failed. This one never
+    /// ran: its bytes are missing, its import list reaches for something the sandbox does not
+    /// grant, or its exports do not satisfy `lanekeep:host`'s `rule` world. All three are
+    /// properties of the artifact rather than of any file, which is why there is no `file`
+    /// field, and all three are found before a file is read.
+    #[error("rule `{rule}` could not load its component\n{detail}")]
+    Component {
+        /// Which rule.
+        rule: String,
+        /// What the component runtime said.
+        detail: String,
+    },
+
+    /// The run's wall-clock budget was spent, noticed between one file and the next.
+    ///
+    /// **The only limit breach that names no rule and no file, because it is about neither.**
+    /// Both engines already report a spent run budget from inside a handler — QuickJS from its
+    /// interrupt handler, wasmtime from an epoch check compiled into guest code — and those
+    /// arrive as [`RunError::Rule`], carrying whichever rule happened to be executing. That is
+    /// the right shape for a breach a rule was at least present for. It is the wrong shape for
+    /// this one: nothing was executing, so there is no culprit to name and naming one would
+    /// send a reader to a rule that is not the problem.
+    ///
+    /// The wording is deliberately the same as both engines', because the user-facing fact is
+    /// the same and which mechanism noticed is lanekeep's business rather than theirs.
+    #[error(
+        "the run exceeded its {budget:?} budget after {elapsed:?}\n  \
+         no single rule necessarily misbehaved — the total simply ran too long\n  \
+         raise it with `--timeout`, or narrow what is being checked"
+    )]
+    RunTimeout {
+        /// The global budget.
+        budget: Duration,
+        /// How long the run had actually been going.
+        elapsed: Duration,
     },
 
     /// The sandbox failed, including on a breached budget.
@@ -126,6 +197,16 @@ struct Prepared {
     gates: CompiledGates,
     /// Compiled query per language, in the order the rule declared them.
     compiled: Vec<(Arc<dyn Language>, CompiledQuery)>,
+    /// Where this rule's handlers live in the run's [`RuleSet`], or `None` for a TypeScript
+    /// rule executed through the QuickJS sandbox.
+    ///
+    /// **This is the whole of the dispatch decision**, and it is read off
+    /// [`RuleSpec::component`] rather than derived from anything else, so a rule that names a
+    /// component runs as a component and a rule that does not cannot accidentally become one.
+    /// Both kinds coexist in one run over one corpus, which is what the second path exists for:
+    /// every built-in and every self-check rule is TypeScript today, so replacing the first
+    /// path rather than adding beside it would leave nothing able to run.
+    slot: Option<RuleSlot>,
 }
 
 impl Prepared {
@@ -146,6 +227,44 @@ struct FileUnderCheck<'a> {
     path: &'a FilePath,
     source: &'a str,
     tree: &'a tree_sitter::Tree,
+    /// The grammar that parsed it — the file's, never a rule's.
+    ///
+    /// Carried on the file rather than looked up per rule because the component engine needs
+    /// it once per *file*: `lanekeep_wasm::host::CheckContext` is built per file and requires a
+    /// grammar at construction, which is how that crate makes "a context that cannot compile a
+    /// scoped query" an unrepresentable state rather than an answer.
+    language: &'a Arc<dyn Language>,
+}
+
+/// Walk the tree for one component rule alone, through the context's own arena.
+///
+/// The fallback path: no combined query for this language, or `--profile` asked for the
+/// per-rule split. Collected through the *context's* arena rather than a temporary one so a
+/// capture path is taken from the same tree that will later intern it into a handle.
+fn walk_for(host: &CheckContext, query: &CompiledQuery, source: &str) -> RuleMatches {
+    let arena = host.arena();
+    let mut found: RuleMatches = Vec::new();
+    query.for_each_match(arena.tree(), source.as_bytes(), |m| {
+        let captures = m
+            .captures
+            .iter()
+            .filter_map(|(name, node)| arena.path_of(*node).map(|path| ((*name).to_owned(), path)))
+            .collect();
+        found.push(captures);
+    });
+    found
+}
+
+/// What every component rule on one file shares.
+///
+/// The two things that are per *file* rather than per rule, carried together because they are
+/// the same decision: the read memo, and the context the arena and the query cache live in.
+/// Splitting them would let one be built per rule while the other was not, which is the
+/// disagreement the sharing exists to prevent.
+struct ComponentPass<'a> {
+    files: &'a Arc<FileAccess>,
+    /// Opened by the first component rule with a match, and taken back when the file is done.
+    context: &'a mut Option<Resource<CheckContext>>,
 }
 
 /// One match's captures: the capture name, and a structural path to the node it bound.
@@ -286,7 +405,36 @@ pub struct Engine {
     root: PathBuf,
     /// Everything constant about this run that a cache key depends on.
     run_key: RunKey,
+    /// The component engine and the run's linked rule set, or `None` when no rule is backed
+    /// by a component.
+    ///
+    /// `None` is the state every run in this tree is in today, and it is not merely an empty
+    /// set: building one starts an epoch ticker thread and compiles nothing, so a run with no
+    /// component rule must not build one at all.
+    components: Option<Components>,
     /// Whether results may be read from and written to the cache.
+    ///
+    /// **Off for any run that loaded a component, and that is a correctness guard rather than a
+    /// policy.** A component's bytes reach no cache-key input: `RuleSpec::component` is set on a
+    /// `Config` *after* `lanekeep_config::load` computed `ruleset_hash`, and `load_components`
+    /// reads the file with an untracked `std::fs::read`. So without this, swapping a rule's
+    /// component for a different one between two runs serves the first one's answer forever —
+    /// demonstrated by `swapping_a_component_between_runs_changes_the_answer`, which fails
+    /// without it.
+    ///
+    /// **Refusing the cache rather than folding the bytes here**, for three reasons. The correct
+    /// fold already exists in `lanekeep-config`'s `hash_ruleset` — sorted, deduplicated,
+    /// length-prefixed, with a present/absent marker — and a second implementation of a
+    /// cache-key encoding in a second crate is exactly the drift that produced this
+    /// sub-project's one real cache bug, where reusing a text separator for arbitrary binary let
+    /// two rulesets share a key. The fold belongs beside the existing one, on the day
+    /// `lanekeep-config` can produce a component-backed rule at all — which it cannot, because
+    /// the world has no `metadata` export, so this costs nothing today. And a guard that turns
+    /// the cache *off* has no encoding to get wrong: the failure mode of getting it wrong is a
+    /// cold run, where the failure mode of a wrong fold is a wrong answer.
+    ///
+    /// It is per run rather than per rule because a cache entry is per *file* and holds every
+    /// rule's findings for it, so there is no finer granularity that is sound.
     caching: bool,
     /// Whether reduce phases run.
     reducing: bool,
@@ -310,6 +458,65 @@ pub struct Engine {
     /// checked should not depend on how someone typed it.
     languages_by_extension: BTreeMap<String, String>,
 }
+
+/// The component half of a run, walled off so its one constructor cannot be gone around.
+///
+/// **A module for two fields, and the module is the point.** `EXTERNAL_BINDINGS` enforcement
+/// used to be a statement in `load_components`; deleting it left every test passing, because
+/// nothing asserted the comparison was *invoked*. Moving it into a constructor fixed that and
+/// left a second way to be wrong — a struct literal beside the constructor, which a mutation
+/// confirmed still compiled and still passed. Private fields behind a module seam remove that
+/// too, on exactly the reasoning `lanekeep_wasm::load::Loaded` uses for the import check: the
+/// door that skips the check is the one that does not exist.
+mod components {
+    use std::sync::Arc;
+
+    use lanekeep_wasm::{RuleSet, WasmEngine};
+
+    use super::{RunError, declared_bindings_match};
+
+    /// The component engine and the run's linked rule set.
+    ///
+    /// Two `Arc`s and nothing else, which is the arrangement `lanekeep-wasm` requires rather
+    /// than a convenience: one [`WasmEngine`] because it is the unit compiled code is cached in
+    /// and the owner of the one epoch ticker, and one [`RuleSet`] because `instantiate_pre`
+    /// resolves and type-checks a component's imports independently of how many stores will
+    /// instantiate it. Nothing here is instantiated — an instance belongs to a store, and a
+    /// store belongs to a worker.
+    pub(super) struct Components {
+        engine: Arc<WasmEngine>,
+        rules: Arc<RuleSet>,
+    }
+
+    impl Components {
+        /// The only way to make one, and it is the only way because of what it checks.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`RunError::Worker`] when the set bound an interface beside the declared
+        /// world that `lanekeep_wasm::EXTERNAL_BINDINGS` — the list the cache key was computed
+        /// from — does not name.
+        pub(super) fn linked(engine: Arc<WasmEngine>, rules: RuleSet) -> Result<Self, RunError> {
+            declared_bindings_match(rules.external_bindings())?;
+            Ok(Self {
+                engine,
+                rules: Arc::new(rules),
+            })
+        }
+
+        /// The shared engine, for building a worker's store.
+        pub(super) const fn engine(&self) -> &Arc<WasmEngine> {
+            &self.engine
+        }
+
+        /// The run's linked rule set.
+        pub(super) const fn rules(&self) -> &Arc<RuleSet> {
+            &self.rules
+        }
+    }
+}
+
+use components::Components;
 
 impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -463,6 +670,8 @@ impl Engine {
                         spec: spec.clone(),
                         gates,
                         compiled,
+                        // Filled in below too, by the one place components are loaded.
+                        slot: None,
                     })
                 })
                 .collect();
@@ -478,6 +687,12 @@ impl Engine {
             rule.index = index;
         }
 
+        // Every component this run will execute, compiled, import-checked and linked against
+        // the host world — once, here, before any worker exists. A rule whose bytes are
+        // missing or whose imports reach past the sandbox fails now, naming itself, rather
+        // than on whichever file happened to match it first.
+        let components = load_components(&mut rules, project_root)?;
+
         // Every registered grammar, so a tree-sitter bump invalidates rather than silently
         // reusing results computed against different node shapes.
         let mut grammars: Vec<GrammarKey> = registry
@@ -489,22 +704,17 @@ impl Engine {
             .collect();
         grammars.sort_by(|a, b| a.id.cmp(&b.id));
 
-        let run_key = RunKey::new(
-            // Major.minor only: a patch release changes nothing a rule can observe, and
-            // invalidating every cache on one would make patch upgrades expensive for
-            // nothing.
-            engine_version(),
-            HOST_API_VERSION,
-            &config.ruleset_hash,
-            &config.config_hash,
-            &grammars,
-        );
+        let run_key = run_key(&config.ruleset_hash, &config.config_hash, &grammars)?;
 
         Ok(Self {
             rules,
             combined: std::sync::OnceLock::new(),
             run_key,
-            caching: true,
+            // Off whenever a component was loaded — see the field. Written from `components`
+            // rather than from the rule list so the two cannot disagree about whether this run
+            // has a component in it.
+            caching: components.is_none(),
+            components,
             reducing: true,
             reporting_unused: false,
             profiling: false,
@@ -670,8 +880,19 @@ impl Engine {
         let mut fresh = Store::empty();
         let mut directives: BTreeMap<FilePath, FileDirectives> = BTreeMap::new();
         let mut timings: BTreeMap<RuleId, RuleTiming> = BTreeMap::new();
+        // The first failure by *file order*, kept rather than returned, because the entries
+        // every other file produced are still owed to the cache — see the save below. Which
+        // failure is reported does not change: it is the same one `?` would have taken, since
+        // rayon's `collect` preserves input order.
+        let mut failure: Option<RunError> = None;
         for result in results {
-            let outcome = result?;
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
             violations.extend(outcome.violations);
             facts.extend(outcome.facts);
             files_parsed += usize::from(outcome.parsed);
@@ -698,16 +919,33 @@ impl Engine {
             }
         }
 
+        // Saved before the failure is propagated, and merged rather than pruned when there is
+        // one.
+        //
+        // §6.8: a limit breach cancels the run, and **cache entries for files that fully
+        // completed are still committed**. Each is independently valid — it records every rule
+        // running against those bytes to completion — and dropping them means a corpus that
+        // dies on a cold run dies identically on every retry, with no way to make progress.
+        // That was latent while nothing enforced the run budget outside a handler, because a
+        // corpus of cheap invocations simply finished; the check at the top of `check_file` is
+        // what turns it into the ordinary case.
+        //
+        // Pruning is the part that must not happen. A run that stopped early holds entries for
+        // a fraction of the corpus and never looked at the rest, so a fresh-only save would age
+        // out every file it never reached and leave the next run *colder* than the one that
+        // failed. That is the same reasoning `Coverage::Partial` already carries, arrived at
+        // from the other direction: pruning is sound only for a run that saw everything, and an
+        // aborted run did not.
         if self.caching {
             match coverage {
                 // The run saw everything, so what it did not produce an entry for no longer
                 // exists. Saving only fresh entries is what ages deleted files out.
-                Coverage::Whole => fresh.save(&self.root),
-                // The run saw a subset. Saving only what it produced would discard the
-                // entries for every file it never looked at — so `--staged` would leave the
-                // next full run cold, which is the opposite of what an incremental entry
-                // point is for.
-                Coverage::Partial => {
+                Coverage::Whole if failure.is_none() => fresh.save(&self.root),
+                // The run saw a subset — because it was given one, or because it stopped part
+                // way through. Saving only what it produced would discard the entries for
+                // every file it never looked at, so `--staged` would leave the next full run
+                // cold, which is the opposite of what an incremental entry point is for.
+                Coverage::Whole | Coverage::Partial => {
                     let mut merged = cache;
                     for key in fresh.keys().copied().collect::<Vec<_>>() {
                         if let Some(entry) = fresh.get(&key) {
@@ -717,6 +955,10 @@ impl Engine {
                     merged.save(&self.root);
                 }
             }
+        }
+
+        if let Some(error) = failure {
+            return Err(error);
         }
 
         // Into the one order every run will see, before any rule looks at them.
@@ -789,11 +1031,26 @@ impl Engine {
             return Ok(Vec::new());
         }
 
-        let sandbox = self.build_sandbox(clock)?;
         let paths: Vec<String> = files.iter().map(|f| f.as_str().to_owned()).collect();
         let mut violations = Vec::new();
 
-        for rule in reducing {
+        // Each engine's cross-file pass, and each built only if something needs it. A ruleset
+        // whose only cross-file rule is a component must not start QuickJS and evaluate every
+        // module into it, and the reverse holds just as strongly: building a component runtime
+        // spawns the epoch ticker.
+        let (module_rules, component_rules): (Vec<&Prepared>, Vec<&Prepared>) =
+            reducing.into_iter().partition(|rule| rule.slot.is_none());
+
+        if !component_rules.is_empty() {
+            violations.extend(self.reduce_components(clock, &component_rules, &paths, facts)?);
+        }
+        if module_rules.is_empty() {
+            return Ok(violations);
+        }
+
+        let sandbox = self.build_sandbox(clock)?;
+
+        for rule in module_rules {
             // A rule sees only its own facts. Letting one read another's would make an
             // internal payload shape into a contract between rules, and would make the
             // result depend on the order rules happened to be declared in.
@@ -850,6 +1107,105 @@ impl Engine {
         Ok(violations)
     }
 
+    /// The cross-file pass for every component-backed rule that has one.
+    ///
+    /// One store for the whole phase, instantiating each reducing rule once. It is not a
+    /// worker's store: workers are gone by now, and a reduce pass is single-threaded.
+    ///
+    /// # A fact's file is a field, and this is where getting that wrong would have shown
+    ///
+    /// The JavaScript path splices `"file"` into the payload with `lanekeep_js::merge_file`,
+    /// because its `ReduceFact` carries only `kind` and `json` and a rule reads `fact.file` off
+    /// the parsed object. The world's `emitted-fact` has a `file` field of its own, so the
+    /// component path carries it there and **must not** merge. Doing both produces a payload
+    /// with a literal duplicate `"file"` key — valid enough for most parsers to accept and
+    /// silently pick one of, and invisible from the host side, because the host forwards `data`
+    /// exactly as the guest wrote it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::Rule`] for a trapping guest or a breached budget, and
+    /// [`RunError::Worker`] when the runtime cannot be built.
+    fn reduce_components(
+        &self,
+        clock: &Arc<RunClock>,
+        reducing: &[&Prepared],
+        paths: &[String],
+        facts: &[Fact],
+    ) -> Result<Vec<Violation>, RunError> {
+        let components = self.components.as_ref().ok_or_else(|| RunError::Worker {
+            detail: "a component rule has a reduce phase in a run that loaded no components"
+                .to_owned(),
+        })?;
+        let mut runtime = WasmRuntime::for_rules(
+            Arc::clone(components.engine()),
+            Arc::clone(components.rules()),
+            self.limits,
+            Arc::clone(clock),
+        );
+
+        let mut violations = Vec::new();
+        for rule in reducing {
+            let Some(slot) = rule.slot else { continue };
+            let fail = |detail: String| RunError::Rule {
+                rule: rule.spec.id.to_string(),
+                // No single file is at fault in a reduce phase, and naming one would be a lie
+                // the reader would then go and look at.
+                file: "<reduce>".to_owned(),
+                detail,
+            };
+
+            // A rule sees only its own facts, exactly as on the JavaScript path, and in the
+            // order `lanekeep_core::fact::sort` already put them in.
+            let own: Vec<types::EmittedFact> = facts
+                .iter()
+                .filter(|fact| fact.rule_id == rule.spec.id)
+                .map(|fact| types::EmittedFact {
+                    kind: fact.kind.clone(),
+                    file: fact.file.as_str().to_owned(),
+                    data: fact.data.clone(),
+                })
+                .collect();
+
+            let resource = runtime
+                .host_mut()
+                .push_reduce_context(ComponentReduceContext::new(paths.to_vec(), own))
+                .map_err(|e| fail(e.to_string()))?;
+
+            let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
+            let outcome = runtime.reduce_with_timeout(slot, &resource, timeout);
+
+            // Taken before the failure is propagated, so the context does not outlive the call
+            // that needed it even on the path that ends the run.
+            let mut taken = runtime
+                .host_mut()
+                .take_reduce_context(resource)
+                .map_err(|e| fail(e.to_string()))?;
+            outcome.map_err(|e: WasmError| fail(e.to_string()))?;
+
+            for report in taken.take_reports() {
+                // The path is the rule's, normalized but not checked against the corpus — the
+                // same posture the JavaScript path takes, for the same reason.
+                violations.push(Violation {
+                    rule_id: rule.spec.id.clone(),
+                    location: Location::new(
+                        FilePath::new(&report.file),
+                        Position::new(report.line, report.column),
+                    ),
+                    message: report
+                        .message
+                        .unwrap_or_else(|| rule.spec.card.message.clone()),
+                    remediation: rule.spec.card.remediation.clone(),
+                    severity: rule.spec.severity,
+                    // A reduce phase has no parse tree, so there is no node to replace.
+                    fix: None,
+                });
+            }
+        }
+
+        Ok(violations)
+    }
+
     /// Build the sandbox a worker uses, evaluating the ruleset into it.
     fn build_sandbox(&self, clock: &Arc<RunClock>) -> Result<Sandbox, RunError> {
         let sandbox = Sandbox::with_modules(
@@ -882,9 +1238,43 @@ impl Engine {
         cache: &Store,
         path: &FilePath,
     ) -> Result<FileOutcome, RunError> {
+        // **The run's budget, asked where the run's time is actually spent.**
+        //
+        // Both engines poll it from inside a handler and nowhere else: QuickJS from its
+        // interrupt handler, wasmtime from the epoch checks Cranelift compiles into guest
+        // code. Neither runs while this engine is reading a file, hashing it, parsing it or
+        // evaluating a query — and §15 says that is most of a cold run. So a rule whose
+        // handler returns after a handful of operations could overrun the budget without ever
+        // being asked to stop: `AGENTS.md` recorded four hundred files against a one-line rule
+        // running to completion under a one-millisecond budget, and the component path had the
+        // same gap for the same reason.
+        //
+        // One check, here, closes it for both, because this sits above the dispatch that
+        // chooses between them. A file boundary is also the only place a run *can* be stopped
+        // without degrading it: everything before this line for this file has not happened
+        // yet, and everything after it happens in full or not at all.
+        //
+        // It costs one clock read per file, on a path that already reads the file from disk.
+        // That matters because `Worker`'s own count is per rayon *chunk* rather than per
+        // thread — but this is per file either way, and `RunClock::is_expired` allocates
+        // nothing and takes no lock.
+        if worker.clock.is_expired() {
+            return Err(RunError::RunTimeout {
+                budget: worker.clock.global_timeout(),
+                elapsed: worker.clock.elapsed(),
+            });
+        }
+
         // A fresh set of tracked reads for this file, sharing the root already canonicalized
         // at preparation.
-        let files = Rc::new(FileAccess::rooted(self.root.clone()));
+        //
+        // **One per file, and now shared by both engines rather than one per engine.** An
+        // `Arc` rather than an `Rc` because `lanekeep_wasm::host::CheckContext` has to be
+        // `Send`; the sharing itself is the point, since two memos over one file would let two
+        // rules see a file rewritten between them differently, and the two dependency lists
+        // could not be merged afterwards — `tracked::sort` orders by path and does not dedupe,
+        // so a disagreement about one path becomes two contradictory entries for it.
+        let files = Arc::new(FileAccess::rooted(self.root.clone()));
 
         // Path gates first: rejecting here costs no read at all.
         //
@@ -976,7 +1366,7 @@ impl Engine {
         let directives = suppression::parse(&source);
 
         let mut outcome = FileOutcome::parsed(path.clone());
-        let Some(tree) = self.parse_once(path, &source, &admitted) else {
+        let Some((language, tree)) = self.parse_once(path, &source, &admitted) else {
             return Ok(outcome);
         };
 
@@ -987,28 +1377,9 @@ impl Engine {
             path,
             source: &source,
             tree: &tree,
+            language: &language,
         };
-        let mut collected = self.collect_matches(&file, &admitted);
-
-        for rule in admitted {
-            // Taken, not cloned: each bucket is read exactly once, and copying capture
-            // paths per rule would give back a share of what the single traversal saved.
-            let matches = collected.as_mut().map(|by_rule| {
-                by_rule
-                    .get_mut(rule.index)
-                    .map(std::mem::take)
-                    .unwrap_or_default()
-            });
-            let (violations, facts, read_the_date, timing) =
-                self.run_rule(worker, &files, rule, &file, matches)?;
-            outcome.violations.extend(violations);
-            outcome.facts.extend(facts);
-            outcome.read_the_date |= read_the_date;
-            if self.profiling {
-                outcome.timings.push((rule.spec.id.clone(), timing));
-            }
-        }
-
+        self.dispatch(worker, &files, &admitted, &file, &mut outcome)?;
         self.apply_directives(&mut outcome, &directives, path);
 
         outcome.suppressions = directives.valid;
@@ -1030,6 +1401,79 @@ impl Engine {
         });
 
         Ok(outcome)
+    }
+
+    /// Run every admitted rule over one parsed file, through whichever engine backs it.
+    ///
+    /// **The dispatch, and it is one `if let` on one field.** Both arms produce the same four
+    /// things, so nothing downstream — sorting, suppression, the cache entry — can tell which
+    /// engine an answer came from. That is the requirement rather than a nicety: two engines
+    /// feeding one output must not introduce a second ordering or a second shape of result.
+    fn dispatch(
+        &self,
+        worker: &mut Worker<'_>,
+        files: &Arc<FileAccess>,
+        admitted: &[&Prepared],
+        file: &FileUnderCheck<'_>,
+        outcome: &mut FileOutcome,
+    ) -> Result<(), RunError> {
+        let mut collected = self.collect_matches(file, admitted);
+
+        // One component context for the whole file, opened by the first component rule that has
+        // a match and shared by every one after it. Per file rather than per rule for the reason
+        // `files` is: it is what makes the arena, the query cache and — through `files` — the
+        // read memo one thing rather than one per rule.
+        let mut context: Option<Resource<CheckContext>> = None;
+
+        for rule in admitted {
+            // Taken, not cloned: each bucket is read exactly once, and copying capture
+            // paths per rule would give back a share of what the single traversal saved.
+            let matches = collected.as_mut().map(|by_rule| {
+                by_rule
+                    .get_mut(rule.index)
+                    .map(std::mem::take)
+                    .unwrap_or_default()
+            });
+
+            let (violations, facts, read_the_date, timing) = if let Some(slot) = rule.slot {
+                let mut pass = ComponentPass {
+                    files,
+                    context: &mut context,
+                };
+                let outcome = self.run_component_rule(worker, &mut pass, rule, slot, file, matches);
+                worker.poison_on(&outcome)?
+            } else {
+                self.run_rule(worker, files, rule, file, matches)?
+            };
+
+            outcome.violations.extend(violations);
+            outcome.facts.extend(facts);
+            outcome.read_the_date |= read_the_date;
+            if self.profiling {
+                outcome.timings.push((rule.spec.id.clone(), timing));
+            }
+        }
+
+        // Give the store its entry back. A context holds the parse tree and the file's whole
+        // source, so leaving one behind per file would grow a worker's store with the corpus —
+        // charged against the same per-store memory ceiling a rule is charged against, and
+        // silent until a large enough run.
+        if let Some(resource) = context.take() {
+            let taken = worker
+                .runtime()?
+                .host_mut()
+                .take_check_context(resource)
+                .map_err(|e| RunError::Rule {
+                    rule: "<components>".to_owned(),
+                    file: file.path.as_str().to_owned(),
+                    detail: e.to_string(),
+                })?;
+            // Read once for the file rather than per rule: the flag is sticky for the life of
+            // the context, so any component rule that asked dates this file's cache entry.
+            outcome.read_the_date |= taken.date_was_read();
+        }
+
+        Ok(())
     }
 
     /// Violations about the directives themselves.
@@ -1124,7 +1568,12 @@ impl Engine {
         if self.profiling {
             return None;
         }
-        let FileUnderCheck { path, source, tree } = *file;
+        let FileUnderCheck {
+            path,
+            source,
+            tree,
+            language: _,
+        } = *file;
         let combined = self
             .combined
             .get_or_init(|| combine_queries(&self.rules))
@@ -1197,12 +1646,17 @@ impl Engine {
             .extend(self.directive_violations(directives, path));
     }
 
+    /// Parse the file, and hand back the grammar that did it alongside the tree.
+    ///
+    /// The grammar comes back because the component engine needs it once per file rather than
+    /// once per rule — see [`FileUnderCheck::language`] — and because looking it up a second
+    /// time would be a second answer to a question that already has one.
     fn parse_once(
         &self,
         path: &FilePath,
         source: &str,
         admitted: &[&Prepared],
-    ) -> Option<tree_sitter::Tree> {
+    ) -> Option<(Arc<dyn Language>, tree_sitter::Tree)> {
         let language_id = self.language_of(path)?;
         let (language, _) = admitted
             .iter()
@@ -1210,18 +1664,248 @@ impl Engine {
 
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language.grammar()).ok()?;
-        parser.parse(source, None)
+        let tree = parser.parse(source, None)?;
+        Some((Arc::clone(language), tree))
+    }
+
+    /// Run one component-backed rule over one file.
+    ///
+    /// The counterpart of [`Engine::run_rule`], and deliberately the same signature and the
+    /// same four return values: a caller must not be able to tell which engine answered.
+    ///
+    /// # What is *not* here, and that is the simplification
+    ///
+    /// No source text is manufactured and nothing is parsed on the hot path. The JavaScript
+    /// path builds `globalThis.__lanekeepConfig.rules[i].check(ctx, {…})` per match and hands
+    /// it to a parser; here the captures become a WIT `match` — a list of name/handle pairs —
+    /// and the rule's typed `check` export is called with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError::Rule`] for a trapping guest or a breached budget, both of which
+    /// cancel the run. That is what keeps a poisoned store from being reused: any host refusal
+    /// traps, and `imports: { default: trappable }` marks the whole store unenterable with no
+    /// way to reset it — so a store that has trapped must never see another file, and every
+    /// error here is propagated rather than skipped.
+    fn run_component_rule(
+        &self,
+        worker: &mut Worker<'_>,
+        pass: &mut ComponentPass<'_>,
+        rule: &Prepared,
+        slot: RuleSlot,
+        file: &FileUnderCheck<'_>,
+        precollected: Option<RuleMatches>,
+    ) -> Result<(Vec<Violation>, Vec<Fact>, bool, RuleTiming), RunError> {
+        let FileUnderCheck {
+            path,
+            source,
+            tree: _,
+            language: _,
+        } = *file;
+
+        // The grammar is chosen by the file, not by the rule — the same gate the JavaScript
+        // path applies, applied identically, so the two engines cannot disagree about which
+        // files a rule runs on.
+        let Some(language_id) = self.language_of(path) else {
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
+        };
+        let Some((_, compiled_query)) = rule.for_language(language_id) else {
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
+        };
+
+        let mut timing = RuleTiming::default();
+        let clock = |on: bool| on.then(std::time::Instant::now);
+        let query_started = clock(self.profiling);
+
+        // Matches first, and the context only if there are any. A rule whose query matches
+        // nothing on this file must not open a context, instantiate anything, or copy the
+        // file's source into an arena.
+        let precollected_is_empty = precollected.as_ref().is_some_and(Vec::is_empty);
+        if precollected_is_empty {
+            if let Some(started) = query_started {
+                timing.query = started.elapsed();
+            }
+            return Ok((Vec::new(), Vec::new(), false, timing));
+        }
+
+        self.open_context(worker, pass, file)?;
+        let Some(resource) = pass.context.as_ref() else {
+            return Err(RunError::Worker {
+                detail: "the file's component context was not opened".to_owned(),
+            });
+        };
+        let runtime = worker.runtime()?;
+
+        // Already matched, in one traversal shared with every other rule on this file — or not,
+        // in which case this rule walks the tree alone.
+        let matches = if let Some(found) = precollected {
+            found
+        } else {
+            let host = runtime
+                .host_mut()
+                .check_context_mut(resource)
+                .map_err(|e| Self::component_failure(rule, path, &e.to_string()))?;
+            walk_for(host, compiled_query, source)
+        };
+
+        if let Some(started) = query_started {
+            timing.query = started.elapsed();
+            timing.matches = matches.len() as u64;
+        }
+        if matches.is_empty() {
+            return Ok((Vec::new(), Vec::new(), false, timing));
+        }
+
+        let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
+        for captures in matches {
+            let entries: Vec<types::MatchEntry> = {
+                let host = runtime
+                    .host_mut()
+                    .check_context_mut(resource)
+                    .map_err(|e| Self::component_failure(rule, path, &e.to_string()))?;
+                let arena = host.arena_mut();
+                captures
+                    .into_iter()
+                    .filter_map(|(name, path)| {
+                        arena
+                            .intern_path(path)
+                            .map(|node| types::MatchEntry { name, node })
+                    })
+                    .collect()
+            };
+
+            let handler_started = clock(self.profiling);
+            let outcome = runtime.check_with_timeout(slot, resource, &entries, timeout);
+            if let Some(started) = handler_started {
+                timing.handler = timing.handler.saturating_add(started.elapsed());
+            }
+            outcome.map_err(|e: WasmError| Self::component_failure(rule, path, &e.to_string()))?;
+        }
+
+        // Taken per rule rather than per file, which is what attributes a report to the rule
+        // that made it: the context is shared, and `take_reports` empties it.
+        let host = runtime
+            .host_mut()
+            .check_context_mut(resource)
+            .map_err(|e| Self::component_failure(rule, path, &e.to_string()))?;
+        let reports = host.take_reports();
+        let emitted = host.take_facts();
+
+        let facts = emitted
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, fact)| Fact {
+                rule_id: rule.spec.id.clone(),
+                file: path.clone(),
+                kind: fact.kind,
+                // The payload exactly as the guest serialized it. **Nothing merges a `file`
+                // key into it**, unlike the JavaScript path: `lanekeep-js`'s reduce phase
+                // splices one in because its `ReduceFact` carries only `kind` and `json`,
+                // where the world's `emitted-fact` has a `file` field of its own. Doing both
+                // would put a literal duplicate `"file"` key in the payload a component reads.
+                data: fact.data,
+                sequence: u32::try_from(sequence).unwrap_or(u32::MAX),
+            })
+            .collect();
+
+        // The date flag is sticky and belongs to the context, so it is read once when the file
+        // is finished rather than claimed per rule — see `check_file`.
+        Ok((
+            Self::violations_from(rule, path, reports),
+            facts,
+            false,
+            timing,
+        ))
+    }
+
+    /// Turn a component's reports into violations, under the rule's own identity.
+    ///
+    /// Identical in shape to what [`Engine::run_rule`] does with `lanekeep_js::Report`, and
+    /// deliberately so: a rule supplies a position and optionally a message, and the id,
+    /// severity, remediation and default message come from the engine. That is what stops a
+    /// rule reporting under someone else's name, and it must not depend on which engine ran it.
+    fn violations_from(
+        rule: &Prepared,
+        path: &FilePath,
+        reports: Vec<lanekeep_wasm::host::Report>,
+    ) -> Vec<Violation> {
+        reports
+            .into_iter()
+            .map(|report| Violation {
+                rule_id: rule.spec.id.clone(),
+                location: Location::new(path.clone(), Position::new(report.line, report.column)),
+                message: report
+                    .message
+                    .unwrap_or_else(|| rule.spec.card.message.clone()),
+                remediation: rule.spec.card.remediation.clone(),
+                severity: rule.spec.severity,
+                fix: report.fix,
+            })
+            .collect()
+    }
+
+    /// Open the file's component context, if this is the first rule that needs one.
+    ///
+    /// The resource stays in the caller's `Option` rather than being handed back by value:
+    /// a `Resource` is an owned table entry, so two of them naming one rep would be two claims
+    /// on the same context and a double delete when the file is finished.
+    fn open_context(
+        &self,
+        worker: &mut Worker<'_>,
+        pass: &mut ComponentPass<'_>,
+        file: &FileUnderCheck<'_>,
+    ) -> Result<(), RunError> {
+        if pass.context.is_some() {
+            return Ok(());
+        }
+
+        let mut built = CheckContext::new(
+            lanekeep_js::NodeArena::new(file.tree.clone(), file.source.to_owned()),
+            file.path.as_str(),
+            Arc::clone(file.language),
+        )
+        .with_file_access(Arc::clone(pass.files))
+        .with_today(&self.today.to_string());
+        if let Some(resolver) = file.language.resolver() {
+            built = built.with_resolver(resolver);
+        }
+
+        let resource = worker
+            .runtime()?
+            .host_mut()
+            .push_check_context(built)
+            .map_err(|e| RunError::Rule {
+                rule: "<components>".to_owned(),
+                file: file.path.as_str().to_owned(),
+                detail: e.to_string(),
+            })?;
+        *pass.context = Some(resource);
+        Ok(())
+    }
+
+    /// One shape for every way a component rule can fail on a file.
+    fn component_failure(rule: &Prepared, path: &FilePath, detail: &str) -> RunError {
+        RunError::Rule {
+            rule: rule.spec.id.to_string(),
+            file: path.as_str().to_owned(),
+            detail: detail.to_owned(),
+        }
     }
 
     fn run_rule(
         &self,
         worker: &mut Worker<'_>,
-        files: &Rc<FileAccess>,
+        files: &Arc<FileAccess>,
         rule: &Prepared,
         file: &FileUnderCheck<'_>,
         precollected: Option<RuleMatches>,
     ) -> Result<(Vec<Violation>, Vec<Fact>, bool, RuleTiming), RunError> {
-        let FileUnderCheck { path, source, tree } = *file;
+        let FileUnderCheck {
+            path,
+            source,
+            tree,
+            language: _,
+        } = *file;
         // The grammar is chosen by the file, not by the rule. A rule that does not target
         // this file's language does not run on it at all — previously it ran anyway, against
         // a grammar that could not parse the file, and matched nothing without saying so.
@@ -1255,7 +1939,7 @@ impl Engine {
             .with_resolver_from(language.as_ref())
             .with_language(Arc::clone(language))
             .with_today(&self.today.to_string())
-            .with_file_access(Rc::clone(files));
+            .with_file_access(Arc::clone(files));
 
         let query_started = clock(self.profiling);
         if let Some(found) = precollected {
@@ -1386,6 +2070,34 @@ struct Worker<'a> {
     /// A failure to build, remembered so it is reported once per worker rather than
     /// retried for every remaining file.
     failed: Option<RunError>,
+    /// This worker's component store, built on first use exactly as the sandbox is.
+    ///
+    /// **One store per worker holding one instance per rule — and rayon decides how many workers
+    /// there are.** `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it allocates
+    /// one `None` per rule), which is what makes it safe to build from rayon's initializer,
+    /// since `map_init` runs that per *chunk* rather than per thread. Instantiation then happens
+    /// in `WasmRuntime::rule`, at most once per slot per store.
+    ///
+    /// That is a bound per `Worker`, not per thread, and the difference is not small: measured
+    /// through this engine at ten thousand files times ten rules, **1,038 stores and 10,380
+    /// instantiations at fourteen threads**, varying between runs because rayon splits on how the
+    /// work is going. `lanekeep_wasm::runtime::MEMORY_RESERVATION` used to be justified on
+    /// "roughly three hundred and fifty instantiations, and it does not grow with the corpus";
+    /// that half is false and its documentation now carries the re-derivation, the crossover, and
+    /// why the constant is left where it is anyway.
+    ///
+    /// **The lever, if this ever needs bounding, is here rather than there.** `with_min_len` on
+    /// `run_files`'s `par_iter` would cap the store count directly — and it is a bigger change
+    /// than it looks, because this same initializer builds the QuickJS sandbox and one sandbox
+    /// per chunk is the more expensive of the two. It would move the JavaScript path's measured
+    /// behavior, so it needs a benchmark rather than an argument.
+    wasm: Option<WasmRuntime>,
+    /// The first component failure this worker saw, if it saw one.
+    ///
+    /// A trapped store cannot be entered again, so every file after the first failure would
+    /// otherwise be reported with wasmtime's own bookkeeping message rather than with what
+    /// actually went wrong. See [`Worker::poison_on`].
+    poisoned: Option<RunError>,
 }
 
 impl<'a> Worker<'a> {
@@ -1395,7 +2107,69 @@ impl<'a> Worker<'a> {
             clock: Arc::clone(clock),
             sandbox: None,
             failed: None,
+            wasm: None,
+            poisoned: None,
         }
+    }
+
+    /// Remember a component failure, and hand it straight back.
+    ///
+    /// **A trap poisons the whole store, and the store outlives the file.** `bindgen!` is
+    /// configured with `imports: { default: trappable }`, so any host refusal — and any guest
+    /// trap — sets a store-wide flag with no public reset: a later, unrelated call on the same
+    /// store fails with wasmtime's own `cannot enter component instance`, which names nothing
+    /// that went wrong. Every such failure already cancels the run, so nothing is *rescued* by
+    /// noticing; what is rescued is the diagnostic. rayon keeps handing this worker its
+    /// remaining files, and which of several failures surfaces from the reduction is arbitrary,
+    /// so without this the run can be reported against a file that was fine and a message that
+    /// describes the runtime's bookkeeping rather than the rule.
+    fn poison_on<T>(&mut self, outcome: &Result<T, RunError>) -> Result<T, RunError>
+    where
+        T: Clone,
+    {
+        match outcome {
+            Ok(value) => Ok(value.clone()),
+            Err(error) => {
+                if self.poisoned.is_none() {
+                    self.poisoned = Some(error.clone());
+                }
+                Err(error.clone())
+            }
+        }
+    }
+
+    /// This worker's component runtime, building it if this is the first component rule that
+    /// needs one.
+    ///
+    /// A cached failure, as [`Worker::sandbox`] has one — but for the opposite reason. There it
+    /// remembers a build that failed so the build is not retried per file; here it remembers a
+    /// *store* that trapped, because the store cannot be used again and its own account of that
+    /// is uninformative. See [`Worker::poison_on`].
+    fn runtime(&mut self) -> Result<&mut WasmRuntime, RunError> {
+        if let Some(error) = &self.poisoned {
+            return Err(error.clone());
+        }
+
+        if self.wasm.is_none() {
+            let components = self
+                .engine
+                .components
+                .as_ref()
+                .ok_or_else(|| RunError::Worker {
+                    detail: "a component rule was dispatched in a run that loaded no components"
+                        .to_owned(),
+                })?;
+            self.wasm = Some(WasmRuntime::for_rules(
+                Arc::clone(components.engine()),
+                Arc::clone(components.rules()),
+                self.engine.limits,
+                Arc::clone(&self.clock),
+            ));
+        }
+
+        self.wasm.as_mut().ok_or_else(|| RunError::Worker {
+            detail: "the component runtime was not built".to_owned(),
+        })
     }
 
     /// This worker's sandbox, building it if this is the first rule that needs one.
@@ -1577,6 +2351,176 @@ fn unused_violations(directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Vio
     violations
 }
 
+/// Load, check and link every component-backed rule, filling in its slot.
+///
+/// Returns `None` when no rule names a component, and that is the case worth stating: building
+/// a [`WasmEngine`] spawns the epoch ticker thread that enforces both wall-clock budgets, so a
+/// run with no component rule — which is every run this tree can express today — must not build
+/// one. Nothing is instantiated here either way; an instance belongs to a store and a store
+/// belongs to a worker.
+///
+/// The order is the ruleset's, so a broken component is reported against the first rule in
+/// config order that has one rather than against whichever load finished first.
+///
+/// # Errors
+///
+/// Returns [`RunError::Component`] when a component's bytes cannot be read, cannot be compiled,
+/// reach for an import the sandbox does not permit, or do not satisfy the `rule` world; and
+/// [`RunError::Worker`] when the runtime itself cannot be built or has bound something the
+/// cache key does not know about.
+fn load_components(
+    rules: &mut [Prepared],
+    project_root: &Path,
+) -> Result<Option<Components>, RunError> {
+    if rules.iter().all(|rule| rule.spec.component.is_none()) {
+        return Ok(None);
+    }
+
+    let engine = WasmEngine::new().map_err(|e: WasmError| RunError::Worker {
+        detail: e.to_string(),
+    })?;
+    let mut set = RuleSet::new(&engine).map_err(|e| RunError::Worker {
+        detail: e.to_string(),
+    })?;
+
+    // Writes precompiled artifacts under the project's own `.lanekeep/components`, and falls
+    // back to compiling in-process when that is not writable. Compiling twenty components costs
+    // about 186 ms against about 0.74 ms to map twenty precompiled ones, which is 23% of the
+    // whole cold budget spent before a file is read.
+    let loader = ComponentLoader::for_project_root(project_root);
+
+    for rule in rules.iter_mut() {
+        let Some(path) = rule.spec.component.clone() else {
+            continue;
+        };
+        let name = rule.spec.id.to_string();
+        let bytes = std::fs::read(&path).map_err(|e| RunError::Component {
+            rule: name.clone(),
+            detail: format!("cannot read `{}`: {e}", path.display()),
+        })?;
+        let admitted = loader
+            .load(&engine, &name, &bytes)
+            .map_err(|e: WasmError| RunError::Component {
+                rule: name.clone(),
+                detail: e.to_string(),
+            })?;
+        let slot = set.add(&name, &admitted).map_err(|e| RunError::Component {
+            rule: name,
+            detail: e.to_string(),
+        })?;
+        rule.slot = Some(slot);
+    }
+
+    Components::linked(engine, set).map(Some)
+}
+
+/// Refuse a run that bound an interface the cache key was not computed against.
+///
+/// **The half of `EXTERNAL_BINDINGS` that was a signature and is now a check.**
+/// `RuleSet::linker_mut` takes an [`ExternalBinding`], so nothing reaches the linker without
+/// naming what fixes its answers — but nothing compared that declaration against
+/// [`EXTERNAL_BINDINGS`], which is the list `lanekeep_wasm::host_api_hash` actually folds into
+/// the key. A binding made at the call site and left out of the constant is a run whose rules
+/// can reach something no cached result knows about, with every key identical.
+///
+/// It could not be closed in `lanekeep-wasm`: the key is computed when a configuration is
+/// loaded, before any `RuleSet` exists. It closes here because this is the first place that
+/// holds both — a linked set, and the constant the key was built from.
+///
+/// Both lists are empty today and the comparison is exact, including order: a declaration is a
+/// cache-key input, and two runs binding the same interfaces in different orders fold to
+/// different hashes, so accepting them as equal here would be accepting a key mismatch.
+fn declared_bindings_match(bound: &[ExternalBinding]) -> Result<(), RunError> {
+    if bound == EXTERNAL_BINDINGS {
+        return Ok(());
+    }
+
+    let render = |bindings: &[ExternalBinding]| {
+        if bindings.is_empty() {
+            return "nothing".to_owned();
+        }
+        bindings
+            .iter()
+            .map(|b| format!("`{}` ({})", b.interface(), b.behavior()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    Err(RunError::Worker {
+        detail: format!(
+            "this run bound {} beside the declared world, and the cache key was computed \
+             against {}\n  \
+             a bound interface is a cache-key input: add it to `lanekeep_wasm::EXTERNAL_BINDINGS` \
+             so a result computed without it is not served to a run that has it",
+            render(bound),
+            render(EXTERNAL_BINDINGS),
+        ),
+    })
+}
+
+/// Everything about a run that every file's key shares.
+///
+/// A named function rather than a call inside [`Engine::prepare`], because it is the one place
+/// the five run-wide inputs are actually assembled and a value dropped here is dropped from
+/// every key in the run. Inline it and "the compilation environment reaches a real run's key"
+/// becomes a claim about a private field of a struct that needs a project on disk to build.
+///
+/// # Errors
+///
+/// Returns [`RunError::WasmRuntime`] when `wasmtime` cannot describe its own compilation
+/// environment on this host.
+fn run_key(
+    ruleset_hash: &[u8],
+    config_hash: &[u8],
+    grammars: &[GrammarKey],
+) -> Result<RunKey, RunError> {
+    let compile_env = lanekeep_wasm::compile_env_hash().map_err(|e| RunError::WasmRuntime {
+        detail: e.to_string(),
+    })?;
+
+    Ok(RunKey::new(
+        // Major.minor only: a patch release changes nothing a rule can observe, and
+        // invalidating every cache on one would make patch upgrades expensive for nothing.
+        engine_version(),
+        &host_api_hash(),
+        &compile_env,
+        ruleset_hash,
+        config_hash,
+        grammars,
+    ))
+}
+
+/// Everything a rule may reach, from both engines, in one cache-key field.
+///
+/// This crate is where the two host surfaces meet, so it is where they are folded. QuickJS's
+/// `ctx` is still a hand-maintained `u32` — `lanekeep_js::HOST_API_VERSION`, whose own
+/// documentation says nothing detects a missed bump — and a component's surface is
+/// [`lanekeep_wasm::host_api_hash`], a content hash of the WIT file every binding is generated
+/// from plus whatever the host binds beside that world.
+///
+/// **Both, and not the newer one instead of the older.** Every rule in this tree is still
+/// TypeScript, so dropping the `ctx` version would take the only host surface a run actually
+/// uses out of the key: adding a `ctx` function would then serve results computed by a build
+/// where it did not exist, which is the failure the field exists to prevent. The `u32` leaves
+/// with the last JavaScript rule and not before.
+fn host_api_hash() -> [u8; 32] {
+    fold_host_api(HOST_API_VERSION, &lanekeep_wasm::host_api_hash())
+}
+
+/// The fold, separated from its inputs so a test can vary them.
+///
+/// `HOST_API_VERSION` is a `const` and the WIT hash is derived, so neither can be moved in a
+/// test against the real function — and "both halves are in the key" is exactly the claim that
+/// is worth nothing unasserted. This is the same reasoning `lanekeep_wasm::key` uses for its
+/// two folds.
+fn fold_host_api(ctx_version: u32, wasm_world: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lanekeep-host-api");
+    hasher.update(&ctx_version.to_le_bytes());
+    hasher.update(wasm_world);
+    *hasher.finalize().as_bytes()
+}
+
 /// The engine version a cache key uses: major.minor only.
 fn engine_version() -> &'static str {
     // Trimmed at the second dot. A patch release changes nothing a rule can observe, so
@@ -1623,6 +2567,123 @@ mod tests {
     use lanekeep_lang_js::{JavaScript, TypeScript};
 
     use super::*;
+
+    #[test]
+    fn both_host_surfaces_reach_the_cache_key() {
+        // Two engines, one field. A change to either has the same consequence — a rule could
+        // not have called something that did not exist — so a fold that dropped one would
+        // serve stale results for exactly the rules that engine runs.
+        let base = fold_host_api(1, b"world");
+        assert_ne!(
+            base,
+            fold_host_api(2, b"world"),
+            "a `ctx` function added to QuickJS must invalidate"
+        );
+        assert_ne!(
+            base,
+            fold_host_api(1, b"a-wider-world"),
+            "a function added to the WIT world must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_host_api_fold_reads_the_real_world_and_the_real_ctx_version() {
+        // The fold is only worth testing if the shipped call feeds it the shipped values.
+        assert_eq!(
+            host_api_hash(),
+            fold_host_api(HOST_API_VERSION, &lanekeep_wasm::host_api_hash())
+        );
+    }
+
+    #[test]
+    fn the_two_wasm_inputs_reach_a_real_runs_key() {
+        // Both of the new fields, asserted at the place they are assembled rather than at
+        // `RunKey`'s door. A hash that is derived correctly and then not passed is the same
+        // stale-answer bug as one that is never derived, and the tests either side of this one
+        // pass against exactly that.
+        let grammars = [GrammarKey {
+            id: "typescript".to_owned(),
+            abi: 15,
+        }];
+        let content = lanekeep_core::ContentHash::new([7; 32]);
+        let real = run_key(b"ruleset", b"config", &grammars).expect("the runtime describes itself");
+
+        for (label, host_api, compile_env) in [
+            (
+                "the WebAssembly compilation environment",
+                host_api_hash().to_vec(),
+                Vec::new(),
+            ),
+            (
+                "the host API surface",
+                Vec::new(),
+                lanekeep_wasm::compile_env_hash()
+                    .expect("the runtime describes itself")
+                    .to_vec(),
+            ),
+        ] {
+            let without = RunKey::new(
+                engine_version(),
+                &host_api,
+                &compile_env,
+                b"ruleset",
+                b"config",
+                &grammars,
+            );
+            assert_ne!(
+                real.for_file("src/a.ts", &content),
+                without.for_file("src/a.ts", &content),
+                "{label} must reach the key a run actually files results under"
+            );
+        }
+    }
+
+    #[test]
+    fn all_three_run_budget_breaches_are_worded_identically() {
+        // `RunError::RunTimeout`'s own documentation says the wording is "deliberately the same
+        // as both engines'", and until this test that was a claim rather than a fact: the
+        // string is written out in full in three crates and nothing compared any copy to any
+        // other. This is the only crate that could — `lanekeep-js` does not depend on
+        // `lanekeep-wasm`, and `lanekeep-core`, which both depend on, holds no copy to share.
+        //
+        // Drift is quiet because which copy a user sees is a race. QuickJS notices from its
+        // interrupt handler, wasmtime from an epoch check compiled into guest code, and
+        // `check_file` between one file and the next; on the same corpus under the same budget,
+        // two runs can be stopped by two different mechanisms. Reword one and lanekeep says two
+        // different things about one fact, with nothing to say which run gets which.
+        //
+        // It is also the text `crates/lanekeep-cli/tests/timeout.rs` matches on to tell a
+        // global breach from a per-rule one, since every limit exits 2. That test cannot tell
+        // which copy produced the output it read, so a reworded copy leaves it green against
+        // the other two.
+        let budget = Duration::from_millis(250);
+        let elapsed = Duration::from_millis(1_337);
+
+        // Unqualified because `unused_qualifications` is denied and all three are already in
+        // scope; the crate each comes from is `lanekeep-engine`, `lanekeep-js` and
+        // `lanekeep-wasm` in that order.
+        let walker = RunError::RunTimeout { budget, elapsed }.to_string();
+        let quickjs = SandboxError::RunTimeout { budget, elapsed }.to_string();
+        let wasm = WasmError::RunTimeout { budget, elapsed }.to_string();
+
+        assert_eq!(
+            walker, quickjs,
+            "the walker and QuickJS report one breach in two voices"
+        );
+        assert_eq!(
+            walker, wasm,
+            "the walker and wasmtime report one breach in two voices"
+        );
+
+        // And that what all three agree on is what the CLI's timeout test looks for, rather
+        // than three copies in perfect agreement about some other text. Both halves: the
+        // opening is what distinguishes this breach from a per-rule one, and the closing is the
+        // actionable half — `crates/lanekeep-cli/src/main.rs` records that it was once a lie,
+        // printed by the code that had dropped the flag it names.
+        for phrase in ["the run exceeded its", "raise it with `--timeout`"] {
+            assert!(walker.contains(phrase), "`{phrase}` is gone from: {walker}");
+        }
+    }
 
     struct Project {
         dir: PathBuf,
@@ -3935,5 +4996,1266 @@ export default defineRule({
         assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
         assert_eq!(outcome.violations[0].location.file.as_str(), "src/a.ts");
         assert_eq!(outcome.violations[0].location.position.line, 2);
+    }
+
+    /// The run's own wall-clock budget, which is spent mostly outside any sandbox.
+    ///
+    /// `AGENTS.md` recorded the gap these cover: the budget was polled by QuickJS's interrupt
+    /// handler and by nothing else, so it only bounded a run *while JavaScript was executing*.
+    /// Four hundred files against a one-line rule ran to completion under a one-millisecond
+    /// budget, because §15's cold cost is dominated by Rust-side reading, parsing and query
+    /// matching and none of that is a place the handler runs.
+    ///
+    /// # Why these fixtures are cheap on purpose, when every other budget test is expensive
+    ///
+    /// The rest of this repository's limit tests need a rule that burns real bytecode, or they
+    /// pass because the work was fast rather than because a limit was enforced. Here the
+    /// requirement is the exact opposite and for the same reason: the handler has to be so
+    /// cheap that the *only* thing that can stop the run is the check outside it. A rule doing
+    /// real work would be stopped by the interrupt handler, and the test would pass against
+    /// the bug.
+    ///
+    /// Measured against the commit before this one, this corpus ran to completion: 400 files
+    /// and 400 `check` invocations in 84 ms under a 1 ms budget, with nothing ever asked to
+    /// stop. That measurement is what says these cases are not passing for a reason unrelated
+    /// to the check they are about.
+    mod run_budget {
+        use super::*;
+
+        /// Enough files that a millisecond cannot cover them.
+        ///
+        /// The number from the `AGENTS.md` trap, and the margin is wide rather than tuned: the
+        /// corpus takes ~84 ms in a debug build, so the budget below is breached roughly eighty
+        /// times over.
+        const FILES: usize = 400;
+
+        /// A file the rule matches, so a handler really is invoked once per file.
+        const MATCHED: &str = "export function a() {\n  debugger;\n}\n";
+
+        /// `FILES` identical files under one global budget, with `no-debugger` over them.
+        fn corpus(name: &str, global_ms: u64) -> Project {
+            let config = config(&format!(", timeouts: {{ global: {global_ms} }}"));
+            let mut owned: Vec<(String, String)> = vec![
+                ("rule.ts".to_owned(), DEBUGGER_RULE.to_owned()),
+                ("lanekeep.config.ts".to_owned(), config),
+            ];
+            for i in 0..FILES {
+                owned.push((format!("src/f{i}.ts"), MATCHED.to_owned()));
+            }
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            Project::new(name, &borrowed)
+        }
+
+        #[test]
+        fn a_corpus_of_cheap_invocations_is_stopped_by_the_runs_budget() {
+            let project = corpus("run-budget-lowered", 1);
+
+            let error = project
+                .run_cold()
+                .expect_err("a run whose budget is spent must not finish the corpus");
+
+            // The variant, not the wording, and that is what makes this discriminating. A
+            // breach the interrupt handler noticed arrives as `RunError::Rule`, naming a rule
+            // and a file; this one is the walker's own, and it names neither because neither
+            // is at fault.
+            assert!(
+                matches!(error, RunError::RunTimeout { .. }),
+                "the run had to be stopped between files rather than inside a handler: {error}"
+            );
+        }
+
+        #[test]
+        fn the_same_corpus_completes_when_the_budget_is_raised() {
+            // `AGENTS.md`: a test that only *lowers* a limit passes against a limit that is
+            // read and then dropped, because the run completes either way. This is the half
+            // that discriminates — and it is also the control for the case above, since
+            // without it "the run was stopped" is equally consistent with a corpus that can
+            // no longer be checked at all.
+            let project = corpus("run-budget-raised", 60_000);
+
+            let outcome = project
+                .run_cold()
+                .expect("a minute is ample for four hundred one-line files");
+            assert_eq!(
+                outcome.violations.len(),
+                FILES,
+                "every file has to have been checked, or the case above stopped nothing"
+            );
+        }
+
+        /// A rule that throws on the one file whose text says `boom`, and nowhere else.
+        const SELECTIVE_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/selective',\n\
+              query: '(identifier) @id',\n\
+              card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { if (ctx.text(m.id) === 'boom') throw new Error('kaboom'); },\n\
+            });\n";
+
+        #[test]
+        fn an_aborted_run_still_commits_the_files_that_finished() {
+            // Architecture §6.8: cache entries for files that fully completed are still
+            // committed, because otherwise a corpus that dies on a cold run dies identically
+            // on every retry and there is no way to make progress. That mattered little while
+            // the run budget went unenforced — the run simply finished. It is load-bearing the
+            // moment the check above exists.
+            //
+            // The abort here is a thrown rule rather than a timeout, deliberately: which files
+            // finish is then a property of the corpus rather than of how fast the machine is.
+            const GOOD: usize = 40;
+            let mut owned: Vec<(String, String)> = vec![
+                ("rule.ts".to_owned(), SELECTIVE_RULE.to_owned()),
+                ("lanekeep.config.ts".to_owned(), config("")),
+            ];
+            for i in 0..GOOD {
+                owned.push((
+                    format!("src/f{i}.ts"),
+                    "export const fine = 1;\n".to_owned(),
+                ));
+            }
+            owned.push((
+                "src/zzz.ts".to_owned(),
+                "export const boom = 1;\n".to_owned(),
+            ));
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            let project = Project::new("run-budget-partial-cache", &borrowed);
+
+            project.run().expect_err("one file's rule throws");
+
+            assert_eq!(
+                Store::load(&project.dir).len(),
+                GOOD,
+                "every file that completed in full has to have an entry, and the one that did \
+                 not must have none"
+            );
+        }
+
+        #[test]
+        fn an_aborted_run_does_not_prune_what_it_never_reached() {
+            // The other half, and the one that would quietly destroy a cache rather than
+            // merely fail to fill it. A run that saw the whole corpus may prune, because what
+            // it produced no entry for no longer exists — that is what ages a deleted file
+            // out. A run the budget stopped produced entries for a fraction of the corpus and
+            // never looked at the rest, so saving only what it produced would age out every
+            // file it never reached, and the next run would be *colder* than the one that
+            // failed.
+            let project = corpus("run-budget-no-prune", 60_000);
+            project.run().expect("a minute is ample");
+            assert_eq!(
+                Store::load(&project.dir).len(),
+                FILES,
+                "the whole corpus is cached"
+            );
+
+            // The same corpus under a budget it cannot meet. Lowering it changes `config_hash`
+            // — `timeouts.global` is a cache-key input — so this run is cold as well as short,
+            // which is the worst case for the save: almost nothing of the corpus is fresh, and
+            // everything that is already stored belongs to a key this run will never write.
+            project.write("lanekeep.config.ts", &config(", timeouts: { global: 1 }"));
+            let error = project.run().expect_err("one millisecond is not enough");
+            assert!(matches!(error, RunError::RunTimeout { .. }), "{error}");
+
+            assert!(
+                Store::load(&project.dir).len() >= FILES,
+                "an aborted run pruned entries for files it never reached"
+            );
+        }
+    }
+
+    /// The second dispatch path: rules whose handlers are a WebAssembly component.
+    ///
+    /// Every test above runs TypeScript rules through QuickJS and keeps doing so, which is what
+    /// makes this module a check that a path was *added*. The two engines share one corpus, one
+    /// clock, one read memo per file, and one sorted output.
+    mod components {
+        use super::*;
+
+        /// The rule-shaped fixture, built by `just wasm-fixtures`.
+        ///
+        /// Referenced by path rather than `include_bytes!` because the engine's own loader is
+        /// what is under test — it reads the file, precompiles it into the project's
+        /// `.lanekeep/components`, and checks its import list before anything can instantiate.
+        fn fixture() -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../lanekeep-wasm/tests/fixtures/engine-rule.wasm")
+        }
+
+        /// The query the fixture is written against: it reports at `@target`.
+        const QUERY: &str = "(variable_declarator name: (identifier) @target)";
+
+        /// A `RuleSpec` backed by the fixture component.
+        ///
+        /// Built by hand, and that is not a shortcut around anything — `lanekeep-config` cannot
+        /// produce one, because `wit/world.wit` has no `metadata` export and a component has
+        /// therefore nowhere to put its own `id`, `query` or `card`. See [`RuleSpec::component`].
+        /// What the engine dispatches on is this field, so a hand-built spec exercises exactly
+        /// the production path.
+        fn component_rule(id: &str, index: usize, has_reduce: bool) -> RuleSpec {
+            RuleSpec {
+                index,
+                id: id.parse().expect("a well-formed rule id"),
+                languages: vec!["typescript".to_owned()],
+                severity: Severity::Error,
+                card: lanekeep_core::RuleCard {
+                    message: "a component rule fired".to_owned(),
+                    remediation: "n/a".to_owned(),
+                    examples: lanekeep_core::Examples {
+                        bad: "const x = 1;".to_owned(),
+                        good: "nothing".to_owned(),
+                    },
+                },
+                query: QUERY.to_owned(),
+                gates: lanekeep_core::Gates::default(),
+                timeout: None,
+                has_reduce,
+                component: Some(fixture()),
+            }
+        }
+
+        impl Project {
+            /// Prepare an engine over this project's config plus some component-backed rules.
+            ///
+            /// Fallible variant, for the tests about a component that cannot be loaded.
+            fn prepared(&self, extra: Vec<RuleSpec>) -> Result<Engine, RunError> {
+                let root = RuleRoot::new(&self.dir).expect("canonicalizes");
+                let config_path = self.dir.join("lanekeep.config.ts");
+                let sandbox =
+                    lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
+                        .expect("sandbox");
+                let mut config = lanekeep_config::load(&sandbox, &root, &config_path)
+                    .unwrap_or_else(|e| panic!("config failed to load: {e}"));
+                config.rules.extend(extra);
+
+                Engine::prepare(
+                    &config,
+                    &self.dir,
+                    root,
+                    &config_path,
+                    &lanekeep_lang_js::registry(),
+                    Arc::new(TypeScript),
+                    Arc::new(JavaScript),
+                )
+            }
+
+            /// The prepared engine, for a test reaching inside it.
+            fn engine(&self, extra: Vec<RuleSpec>) -> Engine {
+                self.prepared(extra).expect("prepares")
+            }
+
+            /// Load the project's config, add component-backed rules to it, and run cold.
+            fn run_with(&self, extra: Vec<RuleSpec>) -> Result<Outcome, RunError> {
+                self.prepared(extra)?.without_cache().run()
+            }
+        }
+
+        /// A config declaring the `local` namespace and importing whichever rule modules it is
+        /// given, in order.
+        fn config_with(modules: &[&str]) -> String {
+            let mut imports = String::new();
+            for (i, m) in modules.iter().enumerate() {
+                use std::fmt::Write as _;
+                let _ = writeln!(imports, "import r{i} from '{m}';");
+            }
+            let names: Vec<String> = (0..modules.len()).map(|i| format!("r{i}")).collect();
+            format!(
+                "import {{ defineConfig }} from 'lanekeep';\n\
+                 {imports}\
+                 export default defineConfig({{ include: ['src/**/*.ts'], \
+                 namespaces: ['local'], rules: [{}] }});\n",
+                names.join(", ")
+            )
+        }
+
+        /// A TypeScript rule reporting every `debugger` statement, under a chosen id.
+        fn debugger_rule(id: &str) -> String {
+            format!(
+                "import {{ defineRule }} from 'lanekeep';\n\
+                 export default defineRule({{\n\
+                   id: '{id}',\n\
+                   query: '(debugger_statement) @stmt',\n\
+                   card: {{ message: 'debugger statement', remediation: 'remove it',\n\
+                     examples: {{ bad: 'debugger;', good: 'x;' }} }},\n\
+                   check(ctx, m) {{ ctx.report(m.stmt); }},\n\
+                 }});\n"
+            )
+        }
+
+        /// Every violation as `rule|file|line:column|message`, which is what an ordering
+        /// assertion has to compare.
+        fn rendered(outcome: &Outcome) -> Vec<String> {
+            outcome
+                .violations
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{}|{}|{}:{}|{}",
+                        v.rule_id,
+                        v.location.file,
+                        v.location.position.line,
+                        v.location.position.column,
+                        v.message
+                    )
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_component_rule_reports_at_the_node_its_query_captured() {
+            // The whole dispatch path in one assertion: the query ran in Rust, the captures
+            // crossed as a WIT `match`, the guest read the node's text through the host, and the
+            // position on the violation is the one the query found rather than the root.
+            let rule_a = debugger_rule("local/alpha");
+            let project = Project::new(
+                "component-basic",
+                &[
+                    ("rule-a.ts", &rule_a),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\nconst beta = 2;\n"),
+                ],
+            );
+
+            let outcome = project
+                .run_with(vec![component_rule("local/middle", 1, false)])
+                .expect("runs");
+
+            assert_eq!(
+                rendered(&outcome),
+                vec![
+                    "local/middle|src/a.ts|1:7|component saw `alpha`".to_owned(),
+                    "local/middle|src/a.ts|2:7|component saw `beta`".to_owned(),
+                ],
+                "a component rule must report where its query matched"
+            );
+        }
+
+        #[test]
+        fn both_engines_run_in_one_corpus_and_feed_one_sorted_output() {
+            // The property this task creates. Two dispatch paths, three rules, and one order.
+            //
+            // The component rule's id sorts *between* the two TypeScript rules and it is
+            // declared *after* both, so an engine that ran one path and then the other and
+            // concatenated would put it last. Sorting by `(ruleId, file, line, column)` is what
+            // makes the two indistinguishable downstream.
+            let alpha = debugger_rule("local/alpha");
+            let zeta = debugger_rule("local/zeta");
+            let project = Project::new(
+                "component-mixed",
+                &[
+                    ("rule-a.ts", &alpha),
+                    ("rule-z.ts", &zeta),
+                    (
+                        "lanekeep.config.ts",
+                        &config_with(&["./rule-a", "./rule-z"]),
+                    ),
+                    ("src/a.ts", "const alpha = 1;\ndebugger;\n"),
+                    ("src/b.ts", "debugger;\nconst beta = 2;\n"),
+                ],
+            );
+
+            let outcome = project
+                .run_with(vec![component_rule("local/middle", 2, false)])
+                .expect("runs");
+
+            assert_eq!(
+                rendered(&outcome),
+                vec![
+                    "local/alpha|src/a.ts|2:1|debugger statement".to_owned(),
+                    "local/alpha|src/b.ts|1:1|debugger statement".to_owned(),
+                    "local/middle|src/a.ts|1:7|component saw `alpha`".to_owned(),
+                    "local/middle|src/b.ts|2:7|component saw `beta`".to_owned(),
+                    "local/zeta|src/a.ts|2:1|debugger statement".to_owned(),
+                    "local/zeta|src/b.ts|1:1|debugger statement".to_owned(),
+                ],
+                "the two engines' violations must interleave by id, not group by engine"
+            );
+        }
+
+        #[test]
+        fn a_mixed_run_is_byte_identical_to_itself() {
+            // Determinism across the two paths, which is the invariant a second engine is most
+            // likely to break: rayon assigns files to workers differently between runs, and the
+            // component path adds a second source of per-worker state.
+            let alpha = debugger_rule("local/alpha");
+            let project = Project::new(
+                "component-deterministic",
+                &[
+                    ("rule-a.ts", &alpha),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\ndebugger;\n"),
+                    ("src/b.ts", "const beta = 2;\n"),
+                    ("src/c.ts", "const gamma = 3;\ndebugger;\n"),
+                    ("src/d.ts", "const delta = 4;\n"),
+                ],
+            );
+
+            let first = rendered(
+                &project
+                    .run_with(vec![component_rule("local/middle", 1, true)])
+                    .expect("runs"),
+            );
+            assert!(!first.is_empty(), "the fixture corpus produces violations");
+
+            for round in 1..8 {
+                let again = rendered(
+                    &project
+                        .run_with(vec![component_rule("local/middle", 1, true)])
+                        .expect("runs"),
+                );
+                assert_eq!(again, first, "run {round} disagreed with the first");
+            }
+        }
+
+        #[test]
+        fn a_component_rules_facts_carry_their_file_in_the_field_and_not_in_the_payload() {
+            // The engine-side duplicate-key hazard, and the only place it is visible.
+            //
+            // `lanekeep-js`'s reduce phase splices `"file"` into a fact's payload, because its
+            // `ReduceFact` carries no file of its own. The world's `emitted-fact` has a `file`
+            // field, so the component path fills that instead — and an engine that did both
+            // would send a payload with two `"file"` keys. Nothing host-side would notice: the
+            // host forwards `data` exactly as the guest wrote it. The fixture reports every
+            // fact back as `kind|file|data`, which is what makes the payload assertable.
+            let alpha = debugger_rule("local/alpha");
+            let project = Project::new(
+                "component-facts",
+                &[
+                    ("rule-a.ts", &alpha),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                    ("src/b.ts", "const beta = 2;\n"),
+                ],
+            );
+
+            let outcome = project
+                .run_with(vec![component_rule("local/middle", 1, true)])
+                .expect("runs");
+
+            let reduce_reports: Vec<&str> = outcome
+                .violations
+                .iter()
+                .filter(|v| v.message.starts_with("seen|"))
+                .map(|v| v.message.as_str())
+                .collect();
+            assert_eq!(
+                reduce_reports,
+                vec![
+                    "seen|src/a.ts|{\"text\":\"alpha\"}",
+                    "seen|src/b.ts|{\"text\":\"beta\"}",
+                ],
+                "a fact's file belongs in the record field, and the payload is the guest's"
+            );
+
+            for report in reduce_reports {
+                let payload = report.rsplit('|').next().expect("a payload");
+                assert!(
+                    !payload.contains("\"file\""),
+                    "the engine merged a file key into a payload that already had a field: \
+                     {report}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_component_rules_cross_file_violations_are_reported_at_the_facts_file() {
+            let project = Project::new(
+                "component-reduce-site",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let outcome = project
+                .run_with(vec![component_rule("local/middle", 1, true)])
+                .expect("runs");
+
+            let sites: Vec<String> = outcome
+                .violations
+                .iter()
+                .filter(|v| v.message.starts_with("seen|"))
+                .map(|v| format!("{}:{}", v.location.file, v.location.position.line))
+                .collect();
+            assert_eq!(sites, vec!["src/a.ts:1".to_owned()]);
+        }
+
+        #[test]
+        fn a_gate_keeps_a_component_rule_off_a_file_exactly_as_it_does_a_module_rule() {
+            // The gates run in Rust before either engine is reached, so a component must not
+            // acquire a second answer to "does this rule run here".
+            let mut gated = component_rule("local/middle", 1, false);
+            gated.gates = lanekeep_core::Gates {
+                file_contains: vec!["beta".to_owned()],
+                ..lanekeep_core::Gates::default()
+            };
+
+            let project = Project::new(
+                "component-gated",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                    ("src/b.ts", "const beta = 2;\n"),
+                ],
+            );
+
+            let outcome = project.run_with(vec![gated]).expect("runs");
+            assert_eq!(
+                rendered(&outcome),
+                vec!["local/middle|src/b.ts|1:7|component saw `beta`".to_owned()],
+                "the content gate must exclude the file that does not hold the token"
+            );
+        }
+
+        #[test]
+        fn a_component_rule_does_not_run_on_a_language_it_does_not_declare() {
+            // The grammar is chosen by the file and the rule declares which files it wants;
+            // both engines apply the same gate, so a `.tsx` file is not checked by a rule that
+            // names only `typescript`.
+            let mut rule = component_rule("local/middle", 1, false);
+            rule.languages = vec!["tsx".to_owned()];
+
+            let project = Project::new(
+                "component-language",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let outcome = project.run_with(vec![rule]).expect("runs");
+            assert!(outcome.violations.is_empty(), "{:?}", rendered(&outcome));
+        }
+
+        #[test]
+        fn swapping_a_component_between_runs_changes_the_answer() {
+            // **This is a real staleness bug the shipped guard prevents, demonstrated rather
+            // than argued.** `RuleSpec::component` is set on a `Config` *after*
+            // `lanekeep_config::load` computed `ruleset_hash`, and `load_components` reads the
+            // bytes with an untracked `std::fs::read` — so a component's bytes reach no
+            // cache-key input at all. With the cache on and no guard, swapping the component
+            // for a different one between two runs serves the first one's answer forever.
+            //
+            // Written against the copy the run actually loads, so the swap is the only
+            // difference: same rule id, same path, same query, different bytes.
+            let project = Project::new(
+                "component-swap",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+            let installed = project.dir.join("rule.wasm");
+            fs::copy(fixture(), &installed).expect("installs the rule-shaped component");
+
+            let mut rule = component_rule("local/middle", 1, false);
+            rule.component = Some(installed.clone());
+
+            let outcome = project
+                .prepared(vec![rule.clone()])
+                .expect("prepares")
+                .run()
+                .expect("runs");
+            let first = messages(&outcome);
+            assert!(first.contains(&"component saw `alpha`"), "{first:?}");
+
+            // A different component at the same path. `limits.wasm` answers an unrecognized
+            // probe by saying so, which is a message the first one cannot produce.
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/limits.wasm"),
+                &installed,
+            )
+            .expect("swaps the component");
+
+            let outcome = project
+                .prepared(vec![rule])
+                .expect("prepares")
+                .run()
+                .expect("runs");
+            let second = messages(&outcome);
+            assert!(
+                second.iter().any(|m| m.contains("unknown probe")),
+                "a swapped component must not be answered from the first one's cache: {second:?}"
+            );
+        }
+
+        #[test]
+        fn a_run_with_a_component_rule_does_not_touch_the_cache() {
+            // The guard behind the test above, asserted directly rather than only through its
+            // effect. Refusing the cache — rather than folding the component's bytes into the
+            // key here — is deliberate: the correct fold already exists in `lanekeep-config`,
+            // sorted, deduplicated and length-prefixed, and a second implementation of a
+            // cache-key encoding in a second crate is precisely the drift that produced this
+            // sub-project's one real cache bug. See `Engine::caching`.
+            let project = Project::new(
+                "component-no-cache",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let with_component = project
+                .prepared(vec![component_rule("local/middle", 1, false)])
+                .expect("prepares");
+            assert!(
+                !with_component.caching,
+                "a run that loaded a component must not read or write the cache"
+            );
+            with_component.run().expect("runs");
+            assert!(
+                !Store::path_for(&project.dir).exists(),
+                "and must leave no cache behind"
+            );
+
+            // The same project with no component rule caches exactly as it always did, so the
+            // guard is scoped to the thing that is unsound rather than turning the cache off.
+            let typescript_only = project.prepared(Vec::new()).expect("prepares");
+            assert!(typescript_only.caching);
+            typescript_only.run().expect("runs");
+            assert!(Store::path_for(&project.dir).exists());
+        }
+
+        /// The same rule, with a query that also asks the fixture to burn real time first.
+        ///
+        /// A pattern-level capture beside the node-level one, so the guest receives both names
+        /// and the violation still lands at `@target`.
+        fn burning_rule(id: &str, timeout: Duration) -> RuleSpec {
+            let mut rule = component_rule(id, 1, false);
+            rule.query = format!("({QUERY}) @burn");
+            rule.timeout = Some(timeout);
+            rule
+        }
+
+        /// A project whose config sets the default per-invocation budget.
+        fn burning_project(name: &str, default_timeout_ms: u64) -> Project {
+            let config = format!(
+                "import {{ defineConfig }} from 'lanekeep';\n\
+                 import r0 from './rule-a';\n\
+                 export default defineConfig({{ include: ['src/**/*.ts'], \
+                 namespaces: ['local'], timeouts: {{ rule: {default_timeout_ms} }}, \
+                 rules: [r0] }});\n"
+            );
+            Project::new(
+                name,
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            )
+        }
+
+        #[test]
+        fn a_component_rules_own_timeout_is_applied_and_not_merely_read() {
+            // `AGENTS.md`'s "validating a flag is not applying it", asserted in both
+            // directions, because only one of them discriminates. A rule declaring a *smaller*
+            // budget than the config's aborts either way if the run is slow enough — so the
+            // load-bearing half is the **raise**: a rule declaring a budget far larger than a
+            // config default it would otherwise breach has to complete.
+            //
+            // The fixture burns real bytecode for this. A handler that returns immediately is
+            // never asked to stop, because the budget is polled from epoch checks compiled into
+            // guest code — so a fast fixture would pass against an engine that ignored the
+            // value entirely.
+            let raised = burning_project("component-timeout-raised", 20);
+            raised
+                .run_with(vec![burning_rule("local/middle", Duration::from_hours(1))])
+                .expect("a rule that raised its own budget must complete");
+
+            let lowered = burning_project("component-timeout-lowered", 3_600_000);
+            let error = lowered
+                .run_with(vec![burning_rule(
+                    "local/middle",
+                    Duration::from_millis(20),
+                )])
+                .expect_err("a rule that lowered its own budget must be stopped");
+            assert!(matches!(error, RunError::Rule { .. }), "{error}");
+            assert!(error.to_string().contains("local/middle"), "{error}");
+        }
+
+        #[test]
+        fn the_runs_global_budget_reaches_a_component_rule() {
+            // The clock is the run's, not the worker's and not the rule's. A component rule
+            // that overruns the whole run's wall-clock budget has to be stopped by *that*
+            // budget and say so, rather than being blamed for its own per-invocation one —
+            // which it has not breached here, since it is given an hour.
+            let config = "import { defineConfig } from 'lanekeep';\n\
+                 import r0 from './rule-a';\n\
+                 export default defineConfig({ include: ['src/**/*.ts'], \
+                 namespaces: ['local'], timeouts: { global: 50 }, rules: [r0] });\n";
+            let project = Project::new(
+                "component-global-budget",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", config),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let error = project
+                .run_with(vec![burning_rule("local/middle", Duration::from_hours(1))])
+                .expect_err("the run's own budget must stop it")
+                .to_string();
+            assert!(
+                error.contains("the run exceeded its"),
+                "the global budget must be what is blamed, not the rule's: {error}"
+            );
+        }
+
+        #[test]
+        fn a_spent_run_budget_stops_a_component_rule_before_the_guest_is_entered() {
+            // The same outer check as `run_budget`'s cases, on the other dispatch path — and it
+            // is one check rather than two, which is the point: it sits in `check_file`, above
+            // the `if let Some(slot)` that chooses an engine, so neither engine can be the one
+            // that has it.
+            //
+            // What makes this discriminating is the *variant*. Measured against the commit
+            // before this one, the same fixture failed with `RunError::Rule` — the epoch
+            // mechanism noticed, mid-instantiation, and blamed `local/middle` for `src/a.ts`.
+            // That is a rule and a file named for a breach that is about neither, and it is
+            // only luck that anything noticed at all: `AGENTS.md` records that epoch checks
+            // live inside guest code, so a tick that lands between two calls is invisible to
+            // them. `RunError::RunTimeout` can only come from the walker.
+            //
+            // A budget of zero is a run whose clock is spent before the first file, which is
+            // the one arrangement in which nothing but the outer check can fire — the guest is
+            // never entered, so there is no epoch deadline to trip. `lanekeep-wasm`'s own
+            // limit tests avoid a born-expired clock for the opposite reason, that
+            // instantiation is itself a budgeted guest call; here that is exactly what must
+            // not happen.
+            let config = "import { defineConfig } from 'lanekeep';\n\
+                 import r0 from './rule-a';\n\
+                 export default defineConfig({ include: ['src/**/*.ts'], \
+                 namespaces: ['local'], timeouts: { global: 0 }, rules: [r0] });\n";
+            let project = Project::new(
+                "component-spent-budget",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", config),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let error = project
+                .run_with(vec![component_rule("local/middle", 1, false)])
+                .expect_err("a spent run budget stops the run");
+            assert!(
+                matches!(error, RunError::RunTimeout { .. }),
+                "the walker had to stop this before any guest ran: {error}"
+            );
+        }
+
+        #[test]
+        fn each_reducing_component_rule_sees_only_its_own_facts() {
+            // A rule reading another's facts would make an internal payload shape into a
+            // contract between rules, and would make a result depend on the order rules were
+            // declared in. Two reducing rules is the smallest case that can tell the filter
+            // from its absence — with one, "its own facts" and "every fact" are the same list.
+            let project = Project::new(
+                "component-fact-isolation",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                    ("src/b.ts", "const beta = 2;\n"),
+                ],
+            );
+
+            let outcome = project
+                .run_with(vec![
+                    component_rule("local/first", 1, true),
+                    component_rule("local/second", 2, true),
+                ])
+                .expect("runs");
+
+            for id in ["local/first", "local/second"] {
+                let seen: Vec<&str> = outcome
+                    .violations
+                    .iter()
+                    .filter(|v| v.rule_id.to_string() == id && v.message.starts_with("seen|"))
+                    .map(|v| v.message.as_str())
+                    .collect();
+                assert_eq!(
+                    seen,
+                    vec![
+                        "seen|src/a.ts|{\"text\":\"alpha\"}",
+                        "seen|src/b.ts|{\"text\":\"beta\"}",
+                    ],
+                    "`{id}` must see its own two facts and not the other rule's as well"
+                );
+            }
+        }
+
+        #[test]
+        fn a_profiled_run_walks_the_tree_per_component_rule_and_agrees_with_the_shared_pass() {
+            // `--profile` turns the one-traversal-per-file pass off, because the per-rule split
+            // it reports cannot be divided honestly between rules that share a traversal. So
+            // there is a second, otherwise untested path into a component rule: the rule walks
+            // the tree alone, through the context's own arena.
+            //
+            // Two claims, and the second is what makes the first worth having: the answers are
+            // the same as the shared pass produces, and the language gate still applies — which
+            // on the shared pass is enforced by the combined query having no pattern for this
+            // rule at all, and here is enforced by nothing but the check itself.
+            let project = Project::new(
+                "component-profiled",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let outcome = project
+                .prepared(vec![component_rule("local/middle", 1, false)])
+                .expect("prepares")
+                .without_cache()
+                .profiling()
+                .run()
+                .expect("runs");
+            assert_eq!(
+                rendered(&outcome),
+                vec!["local/middle|src/a.ts|1:7|component saw `alpha`".to_owned()],
+                "the per-rule walk must agree with the shared traversal"
+            );
+            let timings = outcome.timings.expect("profiling collects timings");
+            let middle = timings
+                .get(&"local/middle".parse::<RuleId>().expect("a rule id"))
+                .expect("the component rule is timed like any other");
+            assert_eq!(middle.matches, 1, "the match count comes from the walk");
+
+            // A rule declaring *several* languages, with the file's second in the list. This is
+            // the case that distinguishes "the grammar the file chose" from "the first grammar
+            // the rule compiled": both are present, only one parses this tree, and a query
+            // compiled against the other matches nothing at all — silently, which is exactly
+            // the failure mode `AGENTS.md` records from the `.tsx` migration.
+            let mut both = component_rule("local/middle", 1, false);
+            both.languages = vec!["tsx".to_owned(), "typescript".to_owned()];
+            let outcome = project
+                .prepared(vec![both])
+                .expect("prepares")
+                .without_cache()
+                .profiling()
+                .run()
+                .expect("runs");
+            assert_eq!(
+                rendered(&outcome),
+                vec!["local/middle|src/a.ts|1:7|component saw `alpha`".to_owned()],
+                "the grammar is the file's, not the first one the rule happened to declare"
+            );
+
+            // The same rule, declaring a language this file is not. On the profiled path the
+            // combined query is not built, so the only thing keeping it off the file is the
+            // gate in the dispatch itself.
+            let mut elsewhere = component_rule("local/middle", 1, false);
+            elsewhere.languages = vec!["tsx".to_owned()];
+            let outcome = project
+                .prepared(vec![elsewhere])
+                .expect("prepares")
+                .without_cache()
+                .profiling()
+                .run()
+                .expect("runs");
+            assert!(
+                outcome.violations.is_empty(),
+                "a rule that does not name this file's language must not run on it: {:?}",
+                rendered(&outcome)
+            );
+        }
+
+        #[test]
+        fn a_worker_whose_store_has_trapped_keeps_reporting_what_went_wrong() {
+            // `bindgen!` is configured with `imports: { default: trappable }`, so a trap sets a
+            // store-wide flag with no public reset: the *next* call on that store fails with
+            // wasmtime's `cannot enter component instance`, which describes the runtime's
+            // bookkeeping rather than anything that went wrong. rayon keeps handing this worker
+            // its remaining files, and which of several failures surfaces from the reduction is
+            // arbitrary — so a run could be reported against a file that was fine, with a
+            // message naming nothing.
+            //
+            // Nothing is rescued by noticing: every failure here cancels the run either way.
+            // What is rescued is the diagnostic, and this is the assertion that it is.
+            let project = Project::new(
+                "component-poisoned",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                    ("src/b.ts", "const beta = 2;\n"),
+                ],
+            );
+
+            // The `limits` fixture spins forever when the first capture is named `spin`, which
+            // is the shortest route to a store that has trapped.
+            let mut spinner = component_rule("local/middle", 1, false);
+            spinner.component = Some(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/limits.wasm"),
+            );
+            spinner.query = "(variable_declarator) @spin".to_owned();
+            spinner.timeout = Some(Duration::from_millis(30));
+
+            let engine = project.engine(vec![spinner]).without_cache();
+            let clock = RunClock::start(engine.limits.global_timeout);
+            let cache = Store::empty();
+            let mut worker = Worker::new(&engine, &clock);
+
+            let files = engine.discover();
+            let Err(first) = engine.check_file(&mut worker, &cache, &files[0]) else {
+                panic!("a spinning rule must breach its budget")
+            };
+            let Err(second) = engine.check_file(&mut worker, &cache, &files[1]) else {
+                panic!("the store has trapped and cannot be entered again")
+            };
+
+            assert_eq!(
+                second.to_string(),
+                first.to_string(),
+                "the second file must be told what actually went wrong"
+            );
+            assert!(
+                !second
+                    .to_string()
+                    .contains("cannot enter component instance"),
+                "{second}"
+            );
+        }
+
+        #[test]
+        fn a_missing_component_is_reported_against_its_rule_before_any_file_is_read() {
+            let mut rule = component_rule("local/middle", 1, false);
+            rule.component = Some(PathBuf::from("/does/not/exist/rule.wasm"));
+
+            let project = Project::new(
+                "component-missing",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let error = project.run_with(vec![rule]).expect_err("must not run");
+            let rendered = error.to_string();
+            assert!(matches!(error, RunError::Component { .. }), "{rendered}");
+            assert!(rendered.contains("local/middle"), "{rendered}");
+        }
+
+        #[test]
+        fn a_component_that_is_not_a_component_is_refused() {
+            let project = Project::new(
+                "component-garbage",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                    ("not-a-rule.wasm", "this is not WebAssembly"),
+                ],
+            );
+
+            let mut rule = component_rule("local/middle", 1, false);
+            rule.component = Some(project.dir.join("not-a-rule.wasm"));
+
+            let error = project.run_with(vec![rule]).expect_err("must not run");
+            assert!(matches!(error, RunError::Component { .. }), "{error}");
+        }
+
+        #[test]
+        fn a_run_with_no_component_rule_builds_no_component_engine() {
+            // Building one spawns the epoch ticker thread that enforces both wall-clock
+            // budgets, and compiles nothing. Every run this tree can express today is this one,
+            // so "beside" has to mean "and costs nothing when unused".
+            let project = Project::new(
+                "component-absent",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "debugger;\n"),
+                ],
+            );
+
+            let engine = project.engine(Vec::new());
+            assert!(
+                engine.components.is_none(),
+                "a TypeScript-only ruleset must not build a component engine"
+            );
+        }
+
+        #[test]
+        fn a_worker_instantiates_a_component_rule_once_however_many_files_it_handles() {
+            // The bound `MEMORY_RESERVATION` is chosen on: one instance per (worker, rule).
+            // Driven through one `Worker` directly rather than through `run`, because rayon
+            // decides how many workers exist and the claim is about one of them.
+            let project = Project::new(
+                "component-instantiations",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                    ("src/b.ts", "const beta = 2;\n"),
+                    ("src/c.ts", "const gamma = 3;\n"),
+                ],
+            );
+
+            let engine = project
+                .engine(vec![component_rule("local/middle", 1, false)])
+                .without_cache();
+            let clock = RunClock::start(engine.limits.global_timeout);
+            let cache = Store::empty();
+            let mut worker = Worker::new(&engine, &clock);
+
+            for path in engine.discover() {
+                engine
+                    .check_file(&mut worker, &cache, &path)
+                    .expect("checks");
+            }
+
+            let runtime = worker.wasm.as_ref().expect("a component rule ran");
+            assert_eq!(
+                runtime.instantiations(),
+                1,
+                "three files sharing one worker must instantiate the rule once"
+            );
+            assert!(
+                runtime.host().holds_no_contexts(),
+                "each file's context must be given back, or a worker's store grows with the \
+                 corpus"
+            );
+        }
+
+        #[test]
+        fn a_worker_whose_component_rules_never_match_instantiates_nothing() {
+            // The case eager instantiation pays 82 to 96 times over for. A worker that never
+            // reaches a match must not build a store's worth of instances.
+            let project = Project::new(
+                "component-unmatched",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "debugger;\n"),
+                ],
+            );
+
+            let engine = project
+                .engine(vec![component_rule("local/middle", 1, false)])
+                .without_cache();
+            let clock = RunClock::start(engine.limits.global_timeout);
+            let cache = Store::empty();
+            let mut worker = Worker::new(&engine, &clock);
+
+            for path in engine.discover() {
+                engine
+                    .check_file(&mut worker, &cache, &path)
+                    .expect("checks");
+            }
+
+            assert!(
+                worker.wasm.is_none(),
+                "a worker with no component match must not build a store at all"
+            );
+        }
+
+        #[test]
+        fn one_read_memo_serves_both_engines_over_one_file() {
+            // The hazard a shared `FileAccess` closes. Two rules on one file, one in each
+            // engine, both reading the same path: with one memo per engine the second reader
+            // sees whatever is on disk *now*, and the two dependency lists disagree about the
+            // path's hash — which `tracked::sort` cannot repair, because it orders by path and
+            // does not dedupe.
+            //
+            // Asserted on the recorded dependency list rather than on what a rule saw, because
+            // that list is the cache-entry input and a duplicate in it is a cache entry that can
+            // never be validated.
+            const READER: &str = "import { defineRule } from 'lanekeep';\n\
+                export default defineRule({\n\
+                  id: 'local/alpha',\n\
+                  query: '(variable_declarator) @d',\n\
+                  card: { message: 'read', remediation: 'x',\n\
+                    examples: { bad: 'a', good: 'b' } },\n\
+                  check(ctx, m) { ctx.readFile('shared.json'); ctx.report(m.d); },\n\
+                });\n";
+
+            let project = Project::new(
+                "component-one-memo",
+                &[
+                    ("rule-a.ts", READER),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                    ("shared.json", "{\"v\":1}\n"),
+                ],
+            );
+
+            let outcome = project
+                .run_with(vec![component_rule("local/middle", 1, false)])
+                .expect("runs");
+
+            let reads = outcome
+                .dependencies
+                .get(&FilePath::new("src/a.ts"))
+                .expect("the file recorded a tracked read");
+            assert_eq!(
+                reads.len(),
+                1,
+                "one path read once must be one dependency, not one per engine: {reads:?}"
+            );
+            assert_eq!(reads[0].path.as_str(), "shared.json");
+            assert!(reads[0].hash.is_some(), "the file was there and was read");
+        }
+
+        #[test]
+        fn two_component_rules_on_one_file_share_one_context() {
+            // Found by mutation: every other test here has exactly one component rule, so
+            // "one context per file" and "one context per rule" are the same arrangement and
+            // nothing could tell them apart. Two rules on one file is the smallest case where
+            // they differ.
+            //
+            // What per-file buys is the arena, the query cache and a single entry in the
+            // store's table. The table is what an assertion can reach: a per-rule context
+            // would replace the file's entry without deleting it, so the first rule's arena —
+            // the parse tree and the file's whole source — would be stranded in a store that
+            // lives for the rest of the worker's share of the corpus.
+            let project = Project::new(
+                "component-two-rules",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+
+            let engine = project
+                .engine(vec![
+                    component_rule("local/first", 1, false),
+                    component_rule("local/second", 2, false),
+                ])
+                .without_cache();
+            let clock = RunClock::start(engine.limits.global_timeout);
+            let cache = Store::empty();
+            let mut worker = Worker::new(&engine, &clock);
+
+            let mut reported = Vec::new();
+            for path in engine.discover() {
+                reported.extend(
+                    engine
+                        .check_file(&mut worker, &cache, &path)
+                        .expect("checks")
+                        .violations,
+                );
+            }
+
+            // Both rules ran, and each got its own reports rather than one of them collecting
+            // the other's — the context is shared, so attribution comes from taking the reports
+            // between rules and not from the context.
+            let mut ids: Vec<String> = reported.iter().map(|v| v.rule_id.to_string()).collect();
+            ids.sort();
+            assert_eq!(
+                ids,
+                vec!["local/first".to_owned(), "local/second".to_owned()],
+                "both component rules must report, once each"
+            );
+
+            let runtime = worker.wasm.as_ref().expect("a component rule ran");
+            assert!(
+                runtime.host().holds_no_contexts(),
+                "two rules on one file must leave one context behind, and it must be given back"
+            );
+            assert_eq!(
+                runtime.instantiations(),
+                2,
+                "two rules is two instances, and two rules on one file is still two"
+            );
+        }
+
+        #[test]
+        fn a_component_rules_read_reaches_the_dependency_list_at_all() {
+            // The half of the shared-memo claim that a duplicate count cannot make. If the
+            // component engine held a `FileAccess` of its own, its reads would be recorded
+            // against a memo the engine never reads back — so they would not be duplicated,
+            // they would be *gone*, and the file's cache entry would not be invalidated when
+            // the file it depended on changed. Only a component rule reads here, so the entry
+            // exists if and only if the two engines share one access.
+            let project = Project::new(
+                "component-only-reader",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                    ("shared.json", "{\"v\":1}\n"),
+                ],
+            );
+
+            let outcome = project
+                .run_with(vec![component_rule("local/middle", 1, false)])
+                .expect("runs");
+
+            let reads = outcome
+                .dependencies
+                .get(&FilePath::new("src/a.ts"))
+                .expect("a component rule's tracked read must reach the dependency list");
+            assert_eq!(reads.len(), 1, "{reads:?}");
+            assert_eq!(reads[0].path.as_str(), "shared.json");
+        }
+
+        #[test]
+        fn a_run_that_binds_an_undeclared_interface_cannot_be_assembled() {
+            // **The wiring, not the comparison.** The check used to be a statement in
+            // `load_components`, and deleting that statement left all one hundred engine tests
+            // passing with no dead-code warning, because the test below calls the comparison
+            // directly. So this drives a real `RuleSet` through the real recording path —
+            // `linker_mut` takes the declaration and pushes it — and then through the only
+            // constructor a run's component set has.
+            let engine = WasmEngine::new().expect("the runtime builds");
+            let mut set = RuleSet::new(&engine).expect("the world links");
+            // The linker itself is not wanted — what is under test is that reaching for it
+            // records the declaration, which is what `linker_mut` does on the way.
+            let _ = set.linker_mut(&ExternalBinding::declare(
+                "wasi:random/random",
+                "a fixed 64-byte cycle, all zeroes",
+            ));
+
+            let error = Components::linked(Arc::clone(&engine), set)
+                .err()
+                .expect("a set that bound something undeclared must not become a run")
+                .to_string();
+            assert!(error.contains("wasi:random/random"), "{error}");
+
+            // And a set that bound nothing assembles, so the refusal is about the binding rather
+            // than about component runs in general.
+            let clean = RuleSet::new(&engine).expect("the world links");
+            assert!(Components::linked(engine, clean).is_ok());
+        }
+
+        #[test]
+        fn a_declaration_that_does_not_match_the_cache_keys_own_list_stops_the_run() {
+            // `EXTERNAL_BINDINGS` was a signature and nothing compared it against what a run
+            // actually bound. A binding declared at a call site and left out of the constant is
+            // a run whose rules reach something no cached result knows about, with every
+            // cache-key input identical.
+            assert!(
+                declared_bindings_match(EXTERNAL_BINDINGS).is_ok(),
+                "a run that binds exactly the declared list is accepted"
+            );
+
+            let undeclared = [ExternalBinding::declare(
+                "wasi:random/random",
+                "a fixed 64-byte cycle, all zeroes",
+            )];
+            let error = declared_bindings_match(&undeclared)
+                .expect_err("an undeclared binding must stop the run")
+                .to_string();
+            assert!(error.contains("wasi:random/random"), "{error}");
+            assert!(error.contains("EXTERNAL_BINDINGS"), "{error}");
+        }
     }
 }

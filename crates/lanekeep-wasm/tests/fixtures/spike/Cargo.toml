@@ -1,0 +1,44 @@
+# The spike guest component: the smallest thing that proves a component built here can be
+# loaded, instantiated and called by `lanekeep-wasm`.
+#
+# Its own workspace, deliberately. It is built for wasm32-unknown-unknown by
+# `cargo component`, not by the parent workspace's toolchain, and `members = ["crates/*"]`
+# does not reach it. An empty `[workspace]` table is what detaches it; without one, cargo
+# refuses to build it at all, reporting a package that believes it is in a workspace it is
+# not a member of.
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# No `@0.1.0` here even though wit/spike.wit declares one: this key takes a bare
+# `namespace:name` label and rejects the version with "invalid label: dash-separated words
+# may contain only lowercase alphanumeric ASCII characters", which does not read like a
+# version-not-allowed error. The version lives in the WIT file and reaches the component.
+[package.metadata.component]
+package = "lanekeep:spike"
+
+[package.metadata.component.dependencies]
+
+# Size is not the point of this fixture, but the artifact is committed, so it is worth not
+# committing debug information nobody reads.
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build`
+# generates and `.gitignore` deliberately excludes. cargo-machete reads source, so on a
+# fresh checkout it sees a dependency nothing references and fails the gate — while a
+# machine that has built the fixture once sees it used and passes. That split is the
+# whole bug: it passed locally and failed on CI's first Linux run.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]

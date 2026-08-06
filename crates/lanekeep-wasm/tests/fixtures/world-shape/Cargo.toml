@@ -1,0 +1,44 @@
+# The world-shape guest: proves `wit/world.wit` can actually be targeted by a component,
+# and that the host side of the same world can be implemented and linked against it.
+#
+# Its own workspace, deliberately, exactly as tests/fixtures/spike/ is. It is built for
+# wasm32-unknown-unknown by `cargo component`, not by the parent workspace's toolchain, and
+# `members = ["crates/*"]` does not reach it. An empty `[workspace]` table is what detaches
+# it; without one, cargo refuses to build it at all.
+[package]
+name = "world-shape"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# The world is read from the engine's own wit/ directory rather than from a copy under this
+# crate. A copy is the obvious thing and it is wrong: the fixture's whole job is to prove
+# that *the* world is targetable, and a copy proves that a file which was once that world
+# is. There is no check that would catch the two drifting apart.
+[package.metadata.component.target]
+path = "../../../wit"
+world = "rule"
+
+[package.metadata.component.dependencies]
+
+# Size is not the point of this fixture, but the artifact is committed, so it is worth not
+# committing debug information nobody reads.
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build`
+# generates and `.gitignore` deliberately excludes. cargo-machete reads source, so on a
+# fresh checkout it sees a dependency nothing references and fails the gate — while a
+# machine that has built the fixture once sees it used and passes. That split is the
+# whole bug: it passed locally and failed on CI's first Linux run.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]

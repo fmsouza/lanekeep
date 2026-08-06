@@ -75,6 +75,14 @@ jobs:
           allow-licenses: >-
             MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause,
             BSD-3-Clause, ISC, Unicode-3.0, Zlib, CC0-1.0
+          # rustc-demangle declares `license = "MIT/Apache-2.0"`, cargo's deprecated
+          # slash syntax rather than SPDX's `OR`. This action cannot parse it and
+          # reports `LicenseRef-bad-mitapache-2.0`, which is a parser artifact and not
+          # a license. cargo-deny reads the legacy form correctly and passes it, so the
+          # crate is checked — just not by this job. Exempting the one package is
+          # narrower than adding that pseudo-license to the list above, which would let
+          # any unparseable declaration through.
+          allow-dependencies-licenses: pkg:cargo/rustc-demangle
 
   # OpenSSF Scorecard: branch protection, pinned actions, signed releases, and the
   # rest of the supply-chain posture, scored by someone other than us.

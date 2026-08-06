@@ -1,0 +1,70 @@
+[package]
+name = "lanekeep-wasm"
+description = "WebAssembly component runtime for lanekeep rules."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# The whole test tree, not just the nested guest crate, and the difference matters.
+#
+# tests/fixtures/spike/ is a crate of its own, built for wasm32-unknown-unknown by
+# `cargo component`; a nested manifest in the .crate only gives `cargo package` a second
+# package to resolve and fail to build. Excluding only that directory packages cleanly —
+# `cargo package`'s verification step builds the lib, not the tests, so it never notices —
+# while shipping a tests/spike.rs whose `bindgen!` reads a WIT file that is no longer
+# there. Anyone vendoring the crate and running `cargo test` would hit that, and the error
+# would name a missing path rather than the decision that removed it.
+exclude = ["tests/**"]
+
+[dependencies]
+# `blake3` for the name a precompiled component is kept under. Content-addressing the
+# artifact is the whole of its invalidation strategy — a changed component is a different
+# file rather than a stale one — and it is the same hash `lanekeep-cache` and
+# `lanekeep-config` key on, so a reader meets one digest across the project rather than two.
+blake3 = { workspace = true }
+
+# `lanekeep-core` for `Fix`, which is what `report`'s `fix` parameter becomes once the node
+# it names has been resolved to a byte range, and `lanekeep-nodes` for the arena both engines
+# read. Neither edge existed before `src/host.rs`, because `cargo machete` fails an unused
+# dependency and the two context types were empty until it arrived.
+lanekeep-core = { workspace = true }
+lanekeep-nodes = { workspace = true }
+wasmtime = { workspace = true }
+
+# `lanekeep-lang` for `BindingResolver` and the `Binding` a resolved identifier becomes, which
+# is what the four binding-resolution methods answer from. It moved here from dev-dependencies
+# when they arrived; it is a language-agnostic vocabulary crate, so this edge does not tie the
+# engine to any particular grammar.
+lanekeep-lang = { workspace = true }
+
+# `lanekeep-query` for `CompiledQuery`, which is what `check-context`'s two scoped-query
+# methods run and cache. The edge is earned here rather than declared ahead of it: an unused
+# dependency fails `cargo machete`, and nothing in this crate compiled a query until the
+# query methods did.
+lanekeep-query = { workspace = true }
+
+# `serde_json` for the one thing QuickJS did structurally and a component cannot: deciding
+# whether the payload a guest calls JSON is JSON, and is an object. `JSON.stringify`
+# guaranteed both under `lanekeep-js`; here they are checked, in `src/facts.rs`.
+serde_json = { workspace = true }
+
+# `thiserror` for `WasmError`, which is the wasm counterpart of `lanekeep_js::SandboxError` and
+# is derived the same way. The two enums are deliberately the same shape: one set of limits is
+# enforced by both engines, so a caller telling a timeout from a rule bug should not have to
+# learn two vocabularies.
+thiserror = { workspace = true }
+
+# Parsing, so the tests can build a real tree for a real context to be lent over. The engine
+# itself never picks a grammar — the file does, through `lanekeep-languages` — so these are
+# the tests' dependencies and not the crate's.
+[dev-dependencies]
+lanekeep-lang-js = { workspace = true }
+tree-sitter = { workspace = true }
+
+[lints]
+workspace = true

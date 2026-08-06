@@ -11,7 +11,7 @@
 //!
 //! **Tracking.** Every read is recorded as `(path, content_hash)`, including reads that
 //! found nothing. That record is what a cache entry needs to know when it has gone stale;
-//! see [`lanekeep_core::tracked`].
+//! see [`crate::tracked`].
 //!
 //! # Reads are memoized within a run
 //!
@@ -19,13 +19,21 @@
 //! between. A rule that saw a file change under it could report differently on two runs over
 //! identical input, which is the determinism invariant — and the cache would record one of
 //! the two hashes with no way to say which was used.
+//!
+//! # Why this lives in `lanekeep-core` rather than in an engine crate
+//!
+//! Every engine that runs a rule needs the same confinement and the same tracking — a read
+//! `lanekeep-wasm`'s component runtime allows that `lanekeep-js`'s sandbox forbids, or
+//! records differently, would make a cache entry mean something different depending on
+//! which engine happened to produce it. Defining `FileAccess` once, below every engine
+//! rather than inside one of them, is what keeps that question from being askable.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
-use lanekeep_core::tracked::{ContentHash, TrackedRead};
-use lanekeep_core::{FilePath, tracked};
+use crate::tracked::{ContentHash, TrackedRead};
+use crate::{FilePath, tracked};
 use thiserror::Error;
 
 /// Why a read was refused.
@@ -84,8 +92,45 @@ pub struct FileAccess {
     ///
     /// A `BTreeMap` rather than a hash map: it is small, and iterating it in path order
     /// makes the recorded dependency list deterministic without a separate sort.
-    seen: RefCell<BTreeMap<String, Outcome>>,
+    ///
+    /// # A [`Mutex`] rather than a `RefCell`, so *one* memo can serve both engines
+    ///
+    /// It was a `RefCell` until two rule-execution engines had to share one of these. A
+    /// `RefCell` is `Send` and not `Sync`, so `Arc<FileAccess>` was not `Send` — and
+    /// `lanekeep_wasm::host::CheckContext` is required to be `Send`, because it lives in a
+    /// [`wasmtime::Store`] that rayon moves. That left the component engine no way to hold a
+    /// shared access, so it would have owned a second one per file, with a second memo.
+    ///
+    /// **Two memos over one file is not a tidiness problem, it is the determinism invariant.**
+    /// The memo exists so that a file rewritten mid-run cannot be seen two ways; a second one
+    /// beside it reintroduces exactly that, across engines rather than within one. And the
+    /// dependency lists cannot be merged afterwards to repair it: [`tracked::sort`] orders by
+    /// path and does **not** dedupe, so two lists disagreeing about one path's hash concatenate
+    /// into two contradictory entries for it, which is a cache entry that can never be
+    /// validated.
+    ///
+    /// The lock is uncontended by construction — an access belongs to one file, and a file
+    /// belongs to one worker — so it costs an atomic swap on a path that already touches the
+    /// filesystem. Poisoning is treated as "take the value anyway": nothing under this lock can
+    /// panic, and refusing to read a memo because an unrelated thread died would turn a rule's
+    /// read into a failure for a reason that has nothing to do with it.
+    seen: Mutex<BTreeMap<String, Outcome>>,
 }
+
+/// One access can be shared by both engines, checked at compile time rather than believed.
+///
+/// `Arc<FileAccess>: Send` needs `FileAccess: Send + Sync`, and that is the whole reason the
+/// memo is a [`Mutex`] — see the field. Without it the component engine cannot hold a shared
+/// access at all, because `lanekeep_wasm::host::CheckContext` is required to be `Send`, and it
+/// would silently fall back to a second memo per file.
+///
+/// A `const` block rather than a test, for the reason `lanekeep-wasm`'s equivalent is one: this
+/// is a property of the type, and a violation should stop the build at the field that caused it
+/// rather than surface as an unsatisfied bound in another crate.
+const _: () = {
+    const fn assert_shareable<T: Send + Sync>() {}
+    assert_shareable::<FileAccess>();
+};
 
 impl FileAccess {
     /// Anchor reads at a project root, canonicalizing it.
@@ -108,8 +153,18 @@ impl FileAccess {
     pub fn rooted(root: PathBuf) -> Self {
         Self {
             root,
-            seen: RefCell::new(BTreeMap::new()),
+            seen: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The memo, whether or not another thread died holding it.
+    ///
+    /// See the field's own documentation: nothing under this lock can panic, and a rule's read
+    /// must not fail because of something that happened elsewhere.
+    fn memo(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Outcome>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The project root reads are confined to.
@@ -151,8 +206,7 @@ impl FileAccess {
     #[must_use]
     pub fn dependencies(&self) -> Vec<TrackedRead> {
         let mut reads: Vec<TrackedRead> = self
-            .seen
-            .borrow()
+            .memo()
             .iter()
             .map(|(path, outcome)| {
                 let file = FilePath::new(path);
@@ -175,18 +229,31 @@ impl FileAccess {
     /// forget. Kept because reuse is a reasonable thing for an embedder to want, and a
     /// half-populated access is not.
     pub fn clear(&self) {
-        self.seen.borrow_mut().clear();
+        self.memo().clear();
     }
 
     /// Resolve, read and record a path, or return what was already recorded.
+    ///
+    /// **The lock is dropped between the miss and the insert, so check-then-insert is not
+    /// atomic.** That is deliberate — holding it across [`Self::load`] would hold a lock across
+    /// a filesystem read, which is the shape that turns an uncontended mutex into a contended
+    /// one — and it is sound only under the construction described on the `seen` field: one
+    /// access per file, one worker per file. Two threads racing the same access would both read
+    /// and the second would overwrite the first, so the memo would still hold *an* answer and
+    /// still return one consistently, but the guarantee "a file rewritten mid-run is seen one
+    /// way" would rest on which write landed last rather than on the memo.
+    ///
+    /// So the invariant now rests on the caller's construction rather than on the type. If an
+    /// embedder ever shares one access across threads, this wants an entry API — `load` inside
+    /// the guard, or a per-key lock — rather than a comment.
     fn resolve(&self, path: &str) -> Result<Outcome, ReadError> {
         let key = normalize_key(path);
-        if let Some(outcome) = self.seen.borrow().get(&key) {
+        if let Some(outcome) = self.memo().get(&key) {
             return Ok(outcome.clone());
         }
 
         let outcome = self.load(path)?;
-        self.seen.borrow_mut().insert(key, outcome.clone());
+        self.memo().insert(key, outcome.clone());
         Ok(outcome)
     }
 
@@ -258,7 +325,13 @@ fn normalize_key(path: &str) -> String {
 /// first `..` would collapse to `etc/passwd`, which looks contained, and the read would
 /// then resolve to `<root>/etc/passwd`: not an escape, but silently the wrong file. Depth
 /// counts only real segments, so a marker can never be consumed.
-pub(crate) fn normalize(path: &Path) -> PathBuf {
+///
+/// `pub` rather than `pub(crate)`: `lanekeep-js`'s module loader resolves rule specifiers
+/// against the same lexical rule (a different root, a different reason to reject `..`, the
+/// identical algorithm), and sharing this one function is what keeps that algorithm defined
+/// once rather than copied at its second call site.
+#[must_use]
+pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     let mut depth = 0usize;
 

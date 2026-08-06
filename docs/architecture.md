@@ -378,13 +378,15 @@ The two levels do different jobs. The per-invocation limit fires fast and **name
 
 ### 6.8 Breaching a limit cancels the run
 
-Any limit breach aborts the entire run: exit code `2`, a diagnostic naming the rule, file and phase, and no report.
+Any limit breach aborts the entire run: exit code `2`, a diagnostic, and no report. The diagnostic names the rule, file and phase whenever there is one to name — which is every breach except a global budget noticed between files, where nothing was executing and naming a rule would blame the wrong thing.
 
 The alternative — skip the offending rule and continue — is tempting and wrong. A timeout is timing-dependent by nature, so a rule that trips on a loaded machine and not on an idle one would make output vary between runs on identical input. That directly contradicts §11's guarantee that an agent reading the output twice must not see reordering as change, and it would let a partial, silently-incomplete result pass for a clean one. A checker that could not finish must not report that it found nothing.
 
-Mechanically: the per-invocation limit uses QuickJS's interrupt handler; the global limit is a deadline shared across workers, checked by the same handler and between files. Tripping either sets an abort flag that every rayon worker observes at its next file boundary.
+Mechanically: the per-invocation limit uses QuickJS's interrupt handler for a TypeScript rule and wasmtime's epoch interruption for a component one. The global limit is a deadline shared across workers, read by both of those *and* by the walker before it starts each file — one clock, three places that ask it. The third is not redundant: both of the others only run while a handler does, and a run spends most of its time reading, parsing and matching, so a corpus of cheap invocations would otherwise overrun the budget without anything ever being asked to stop. Whichever notices, the run ends; a breach the walker noticed names no rule, because none was executing.
 
-**Cache entries for files that fully completed are still committed.** Each entry is independently valid — it records the result of running every rule against that file to completion — and discarding them would mean a corpus that times out on a cold run times out identically on every retry, with no way to make progress. Files that were in flight when the run aborted are not written.
+**Cache entries for files that fully completed are still committed.** Each entry is independently valid — it records the result of running every rule against that file to completion — and discarding them would mean a corpus that times out on a cold run times out identically on every retry, with no way to make progress. Files that were in flight when the run aborted are not written. An aborted run also **merges rather than prunes**: pruning is what ages a deleted file out and is sound only for a run that saw the whole corpus, so a run that stopped early would otherwise age out every file it never reached and leave the next run colder than the one that failed.
+
+Both halves became true in the same release and neither had been true before it, which is worth stating because this section has a history of describing behavior nothing implemented. The *commit* half this section always required and nothing did: `run_files` returned on the first error before it reached the save, so an aborted run wrote no entry at all, and a corpus that overran its budget would have been stranded cold forever the moment that budget started being enforced. The *no-prune* half is doctrine added alongside that fix, and it could not have been stated earlier — there was no save whose pruning behavior anyone had to decide. `lanekeep-engine`'s `an_aborted_run_still_commits_the_files_that_finished`, `an_aborted_run_does_not_prune_what_it_never_reached` and `a_full_run_still_prunes` are what hold the three claims above, and a claim added here without one is a claim in the position these were.
 
 ---
 
@@ -423,9 +425,12 @@ A warm run with no changes executes **no JavaScript at all** — every file is a
 key = blake3(
     format_version,               // the on-disk encoding
     engine_version_major_minor,   // bump breaks cache intentionally
-    host_api_version,             // adding or changing a ctx function invalidates
+    host_api_hash,                // what a rule may reach: the ctx surface, the WIT world,
+                                  //   and anything bound beside that world
+    wasm_compile_env_hash,        // how a component is compiled: wasmtime's own
+                                  //   precompile-compatibility hash
     every (grammar_id, grammar_abi) in the registry, sorted
-    ruleset_hash,                 // hash of all rule module sources in the graph
+    ruleset_hash,                 // rule module sources in the graph, and component bytes
     config_hash,                  // severity, include/exclude, options
     file_relative_path,           // path gates exist — path is an input
     file_content_hash,            // blake3 of bytes
@@ -438,7 +443,11 @@ Every field is length-prefixed before hashing. Without that, `("ab", "c")` and `
 
 Grammars enter the key as the **whole registry**, not the one language a given file used. A file's rules can involve more than one grammar, and working out which is harder to get right than accepting that a tree-sitter bump invalidates everything. That over-invalidates by the files using the other languages, which costs a recompute.
 
-`host_api_version` is a constant in `lanekeep-js` and nothing bumps it automatically. A `ctx` function added without bumping it serves results computed by a build where the function did not exist — the rule could not have called it, so its verdict was reached without evidence it would have used.
+`host_api_hash` covers both engines' surfaces. QuickJS's half is still `HOST_API_VERSION`, a constant in `lanekeep-js` that nothing bumps automatically: a `ctx` function added without bumping it serves results computed by a build where the function did not exist — the rule could not have called it, so its verdict was reached without evidence it would have used. The component half is a content hash of `crates/lanekeep-wasm/wit/world.wit`, the file every binding is generated from, so that half needs nobody to remember. Folded in beside it is `lanekeep_wasm::EXTERNAL_BINDINGS`, which declares every interface the host binds *outside* that world — empty today, and not optional the day one is added: a Go rule's map iteration order is decided by whatever fixed entropy source `wasi:random/random` is bound to, so changing that source changes which violation it reports with the world, the component and the config all identical.
+
+`wasm_compile_env_hash` is `wasmtime`'s own `Engine::precompile_compatibility_hash`, read off an engine built from `lanekeep-wasm`'s one configuration. A precompiled `.cwasm` records the tunables it was compiled under and `wasmtime` refuses one that disagrees, so those tunables decide whether a component runs at all; the ones that survive that check still decide what the guest computes, because `MEMORY_RESERVATION` and `MEMORY_GUARD_SIZE` together decide whether Cranelift elides bounds checks. It is taken from `wasmtime` rather than listed here because `check_tunables` compares twenty-six fields, three of which are lanekeep's constants and twenty-three of which move with the `wasmtime` version, the target triple *and the resolved feature set* — Cargo's feature unification can move `concurrency_support`, `recording`, `memory_reservation` or `memory_init_cow` without the version moving.
+
+It is a compilation environment and **not** a runtime, which is why it is not named one. Settings that live entirely host-side are outside it on purpose: the memory ceiling is enforced by a resource limiter the compiled code knows nothing about, and the epoch tick interval only changes *when* a breach is noticed. Those are budgets, and §6.8 already says a budget cancels a run rather than changing its answer — so neither belongs in a key.
 
 Value: `{ violations, facts, suppressions, deps }`.
 
@@ -447,6 +456,8 @@ Three things people get wrong here, all of which are silent-staleness bugs:
 - **`ruleset_hash` covers every module in the rule import graph**, not just the entry files. A rule importing a shared helper must invalidate when that helper changes. The module loader records what it actually read, because nothing else in the system knows the helper was involved.
 
   It hashes module **source bytes**, not a canonicalized form. An earlier draft required canonicalization so that reformatting would not invalidate while editing a regex would — which was achievable when rules were declarative data and canonicalizing meant normalizing a parsed value. Canonicalizing arbitrary TypeScript would mean shipping a formatter and committing to its output forever. So reformatting a rule *does* invalidate its cached results. That is over-invalidation, costing a recompute; the opposite error — serving results computed by code that no longer exists — is the one this section exists to prevent, and the two are not symmetric.
+
+  It also covers **every rule component's bytes**, path-sorted, alongside the modules — a component is the code a rule is made of exactly as a module is. Its bytes and not its resolved path, which is absolute: hashing the path would throw a cache away for moving a checkout, and which component a rule *names* is `config_hash`'s through the specifier. A component that cannot be read folds in a marker rather than nothing, for the reason §8.2 gives about absent files.
 
 - **`config_hash` is canonicalized properly**, because configuration values genuinely are structured data. The severity map is ordered, so writing the same entries in a different order hashes the same, and `include`/`exclude` are sorted, since reordering globs changes nothing about which files are selected.
 - **Relative path belongs in the key.** Path gates make results path-sensitive; a moved file with identical bytes is not a cache hit.
@@ -525,9 +536,19 @@ export default defineConfig({
 })
 ```
 
-Config is a rule module like any other: same loader, same sandbox, same absence of npm resolution. Composition is ordinary TypeScript — a shared preset is a module that exports an array of rules, imported and spread. No bespoke `extends` mechanism is needed, because the language already has one.
+A `lanekeep.config.ts` is a rule module like any other: same loader, same sandbox, same absence of npm resolution. Composition is ordinary TypeScript — a shared preset is a module that exports an array of rules, imported and spread. No bespoke `extends` mechanism is needed, because the language already has one.
 
 `severity` is applied last and overrides whatever a rule declares.
+
+### 9.1 `lanekeep.json`, and why it no longer shares a mechanism
+
+A project that does not write TypeScript can say which rules it wants in `lanekeep.json`, listing rules as `"lanekeep/no-package-init"` or `{ "rule": "...", "options": { ... } }`. It is what `lanekeep init` scaffolds.
+
+It was originally *compiled* into the entry module the TypeScript path produces and handed to the same loader, so that nothing downstream knew which format a config came from and the two could not drift. That was deliberate and it is gone: the JSON path is now parsed, validated and resolved in Rust, and a rule reference becomes a value — a built-in name, a component path, or a rule module — rather than an `import` statement. The reason is §13's: with rules as components the sandbox eventually leaves, and a config format that is not a program should not have needed one to be read.
+
+**What replaces the mechanism is weaker, and is named rather than implied.** Two code paths can drift where one could not. Two things hold them together: both converge on the single function that constructs a `Config`, validates cards and severities and takes the hashes — so a divergence has to be introduced upstream of one place — and the §8.1 cache-key properties are asserted against both paths in matched pairs. A rule's `options` are among them, and are `config_hash` input on the JSON path because that is the path that knows them as data; on the TypeScript path they are written inside the config module and reach the key through `ruleset_hash`.
+
+What has no successor is `lanekeep.config.ts`'s programmability once there is no JavaScript sandbox. Three shapes are plausible — JSON-only, a config-shaped component, or a minimal evaluator kept for configuration alone — and picking one is an open decision, not something the JSON path being sandbox-free settles.
 
 ---
 
@@ -646,7 +667,7 @@ Cheap now, breaking changes later. Lock all five before writing much code.
 1. **Namespaced rule IDs from day one.** `lanekeep/<id>` for built-ins, `local/<id>` for project-authored, and any namespace a project declares in `namespaces:` for its own — `pera/<id>`. Bare IDs in v1 would break every config file, every suppression comment, and every consumer parsing JSON output when namespaces arrive. This is the expensive one.
 
     The set was originally closed to the two lanekeep defines, so that `lanekep/foo` was a typo rather than a valid ID matching nothing. Declaring keeps that property while letting a team group its own rules: an undeclared namespace fails at config load, naming the ones that exist. `lanekeep/` stays reserved, so a rule's origin is still readable from its ID alone.
-2. **The host API is versioned and in the cache key** (§8.1), so adding a `ctx` function invalidates correctly rather than silently serving results computed without it.
+2. **The host API is in the cache key** (§8.1), so adding a `ctx` function invalidates correctly rather than silently serving results computed without it. The component half is a *hash* of `wit/world.wit` rather than a version, because the version had to be bumped by hand and nothing detects a missed bump; QuickJS's half is still a hand-maintained number and leaves with the last JavaScript rule.
 3. **Tracked effects from the start.** Retrofitting dependency tracking onto a cache that assumed purity means every existing entry is unsound. `deps` ships with the first cache.
 4. **Nodes cross the boundary as handles, never as objects.** Materializing an AST for JavaScript is a decision that cannot be walked back once rules depend on the object shape.
 5. **A clean internal `Rule` boundary.** Built-in rules are authored in TypeScript against the same host API as user rules — the strongest available evidence that the API is sufficient. Should a built-in ever need to be reimplemented in Rust for speed, it does so behind the same ID and the same trait.

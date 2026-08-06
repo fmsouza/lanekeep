@@ -1,0 +1,4 @@
+package lanekeep:spike@0.1.0;
+world spike {
+  export add: func(a: u32, b: u32) -> u32;
+}

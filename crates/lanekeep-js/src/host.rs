@@ -31,13 +31,12 @@ use rquickjs::function::Opt;
 use rquickjs::object::Accessor;
 use rquickjs::{Ctx, Function, Object, Value};
 
-use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
+use lanekeep_lang::binding::BindingResolver;
 
+use lanekeep_core::files::FileAccess;
 use lanekeep_core::fix::Fix;
+use lanekeep_nodes::{Handle, NodeArena};
 use lanekeep_query::CompiledQuery;
-
-use crate::files::FileAccess;
-use crate::nodes::{Handle, NodeArena};
 
 /// The version of the `ctx` surface this build exposes.
 ///
@@ -48,6 +47,13 @@ use crate::nodes::{Handle, NodeArena};
 ///
 /// Nothing detects this automatically. A function added without bumping it serves stale
 /// results silently, which is the failure mode the whole cache design is arranged against.
+///
+/// **The component engine does not have this problem, and the difference is worth knowing
+/// about while this number is still here.** `lanekeep-wasm`'s half of the same cache-key field
+/// is a content hash of `wit/world.wit`, the file its bindings are generated from, so it moves
+/// when the surface moves and nobody has to remember. `lanekeep_engine` folds both into one
+/// field; this one leaves with the last JavaScript rule, and until then it is the half that
+/// can be got wrong.
 ///
 /// History:
 /// - `1` — reporting, navigation, binding resolution, `emitFact`, `readFile`, `fileExists`.
@@ -92,7 +98,15 @@ pub struct HostContext {
     facts: Rc<RefCell<Vec<EmittedFact>>>,
     file_path: Rc<str>,
     resolver: Option<Arc<dyn BindingResolver>>,
-    files: Option<Rc<FileAccess>>,
+    /// Tracked, confined access to the rest of the project, shared with every rule on this
+    /// file — and, since a run may execute both engines over one corpus, with the component
+    /// engine's context for the same file.
+    ///
+    /// An [`Arc`] rather than an [`Rc`], which is the one place this type's sharing is not
+    /// purely a QuickJS matter: `lanekeep_wasm::host::CheckContext` is required to be `Send`,
+    /// so the shared handle both engines hold has to be one. Nothing else about the arrangement
+    /// changes — an access still belongs to one file and is still touched by one worker.
+    files: Option<Arc<FileAccess>>,
     /// The grammar `querySubtree` and `closestAncestor` compile against.
     language: Option<Arc<dyn lanekeep_lang::Language>>,
     /// The date a rule sees as `ctx.today`, if the host supplied one.
@@ -212,8 +226,13 @@ impl HostContext {
     /// A rule reaching for them then gets a `TypeError` naming the function, which is the
     /// truthful answer — where a stub returning `undefined` would look like an empty project
     /// and produce a rule that silently checks nothing.
+    ///
+    /// Takes an [`Arc`] rather than an [`Rc`] so the *same* access can be handed to the
+    /// component engine's context for the same file. Two memos over one file would let two
+    /// rules see a file rewritten between them differently, which is the determinism invariant
+    /// and not a tidiness question — see [`FileAccess`]'s own `seen` field.
     #[must_use]
-    pub fn with_file_access(mut self, files: Rc<FileAccess>) -> Self {
+    pub fn with_file_access(mut self, files: Arc<FileAccess>) -> Self {
         self.files = Some(files);
         self
     }
@@ -382,6 +401,11 @@ impl HostContext {
         // text alone is wrong twice: it misses `import { makeStyles as ms }`, and it fires
         // on a local `const makeStyles` that has nothing to do with the import.
 
+        // What each question *means* — which module and export count as a match, and how a
+        // `*` in a pattern behaves — lives on `Binding` in `lanekeep-lang`, because
+        // `lanekeep-wasm` answers `check-context.resolves-to-import` and
+        // `check-context.is-imported-from` with the identical predicate. A copy in each
+        // engine would let one file resolve differently depending on which one ran the rule.
         let arena = Rc::clone(&self.arena);
         let resolver = self.resolver.clone();
         object.set(
@@ -392,20 +416,10 @@ impl HostContext {
                     let Some(resolver) = resolver.as_deref() else {
                         return false;
                     };
-                    match arena.borrow().resolve_binding(handle, resolver) {
-                        Some(Binding::Import {
-                            module: from,
-                            name: imported,
-                        }) => {
-                            from == module
-                                && name.0.is_none_or(|wanted| match &imported {
-                                    ImportedName::Named(actual) => *actual == wanted,
-                                    ImportedName::Default => wanted == "default",
-                                    ImportedName::Namespace => wanted == "*",
-                                })
-                        }
-                        _ => false,
-                    }
+                    arena
+                        .borrow()
+                        .resolve_binding(handle, resolver)
+                        .is_some_and(|binding| binding.is_import_of(&module, name.0.as_deref()))
                 },
             )?,
         )?;
@@ -418,10 +432,10 @@ impl HostContext {
                 let Some(resolver) = resolver.as_deref() else {
                     return false;
                 };
-                match arena.borrow().resolve_binding(handle, resolver) {
-                    Some(Binding::Import { module, .. }) => glob_matches(&pattern, &module),
-                    _ => false,
-                }
+                arena
+                    .borrow()
+                    .resolve_binding(handle, resolver)
+                    .is_some_and(|binding| binding.is_imported_from(&pattern))
             })?,
         )?;
 
@@ -662,7 +676,7 @@ impl HostContext {
             return Ok(());
         };
 
-        let reader = Rc::clone(&files);
+        let reader = Arc::clone(&files);
         object.set(
             "readFile",
             Function::new(
@@ -676,7 +690,7 @@ impl HostContext {
             )?,
         )?;
 
-        let reader = Rc::clone(&files);
+        let reader = Arc::clone(&files);
         object.set(
             "fileExists",
             Function::new(
@@ -1025,47 +1039,6 @@ fn escape_json_string(text: &str, out: &mut String) {
         }
     }
     out.push('"');
-}
-
-/// Match a module specifier against a pattern where `*` stands for any run of characters.
-///
-/// Written out rather than pulled in, because the whole need is `@scope/*` and `*/themed`.
-/// A glob crate would bring a dependency and a dialect — character classes, `**`, escapes —
-/// for a surface this small.
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return true;
-    };
-    if !text.starts_with(first) {
-        return false;
-    }
-
-    let mut rest = &text[first.len()..];
-    let segments: Vec<&str> = parts.collect();
-
-    // No `*` at all: the pattern has to account for the whole specifier.
-    if segments.is_empty() {
-        return rest.is_empty();
-    }
-
-    for (index, segment) in segments.iter().enumerate() {
-        if segment.is_empty() {
-            continue;
-        }
-        // The final segment has to sit at the end, or `@scope/*` would match
-        // `@scope/pkg/nested` on a pattern the author meant to be exact after the star.
-        if index == segments.len() - 1 {
-            return rest.ends_with(segment);
-        }
-        match rest.find(segment) {
-            Some(at) => rest = &rest[at + segment.len()..],
-            None => return false,
-        }
-    }
-
-    // The pattern ended with `*`, so whatever is left is matched.
-    true
 }
 
 #[cfg(test)]
@@ -1454,20 +1427,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn glob_matching_handles_the_shapes_that_appear_in_rules() {
-        assert!(glob_matches("m", "m"));
-        assert!(!glob_matches("m", "mm"));
-        assert!(glob_matches("*", "anything"));
-        assert!(glob_matches("@scope/*", "@scope/pkg"));
-        assert!(!glob_matches("@scope/*", "@other/pkg"));
-        assert!(glob_matches("*/themed", "@rneui/themed"));
-        assert!(!glob_matches("*/themed", "@rneui/other"));
-        assert!(glob_matches("@a/*/c", "@a/b/c"));
-        assert!(!glob_matches("@a/*/c", "@a/b/d"));
-        assert!(glob_matches("", ""));
-        assert!(!glob_matches("", "x"));
-    }
+    // The pattern dialect itself is tested where it now lives, in `lanekeep-lang`'s
+    // `glob_matching_handles_the_shapes_that_appear_in_rules`. What stays here is
+    // `matches_a_module_by_glob` above, which is about `ctx.isImportedFrom` reaching it
+    // through a resolved binding.
 
     #[test]
     fn navigation_stays_lazy() {

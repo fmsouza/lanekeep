@@ -1,0 +1,374 @@
+// lanekeep's host API, as the component model sees it.
+//
+// This file is the single source of truth for the boundary between the engine and a
+// *component* rule. `src/bindings.rs` generates the Rust bindings from it with
+// `wasmtime::component::bindgen!`, and the engine implements exactly what it declares.
+//
+// It is not yet the single source of truth for the other engine's boundary, and the difference
+// is worth stating here because the title above invites the opposite reading.
+// `packages/lanekeep/index.d.ts` — the definitions a TypeScript rule author installs — is
+// **hand-maintained**, and what holds it honest is `crates/lanekeep-js/tests/host_types.rs`,
+// which compares it against the QuickJS host in `crates/lanekeep-js/src/host.rs`. Nothing
+// generates it from this world: there is no generator, no build script and no recipe. Go
+// authoring does not exist at all yet — `src/key.rs`'s `EXTERNAL_BINDINGS` records what it
+// will need. Single-sourcing the published definitions from here is the unmet leg of the
+// decision record's condition 10, so nothing gated on that condition is unblocked by this
+// file's existence.
+//
+// Its bytes are a cache-key input — `host_api_hash` is blake3 over this source, taken by
+// `src/key.rs` — so an edit here, including to a comment, invalidates every cached result.
+// That is the point: the `0.1.0` in the package declaration below is for error messages and
+// for the component model's conventions, and is deliberately not what the cache keys on,
+// because a hand-maintained version is a thing somebody has to remember to bump.
+//
+// Adding a function widens the trust boundary described in `docs/architecture.md` §13: a
+// component reaches exactly what its world declares and nothing else, which is why the
+// absence of `fs`, `process`, network and the clock is structural here rather than curated.
+package lanekeep:host@0.1.0;
+
+/// The whole host surface: the data types that cross the boundary, and the two contexts
+/// that carry the functions.
+///
+/// One interface, not one per phase, and that was decided by building both.
+///
+/// The alternative on the table was three interfaces — `types`, `check-api`, `reduce-api` —
+/// on the theory that a per-file rule could then not so much as *name* the cross-file
+/// context. Both variants were written out in full and the same guest built against each on
+/// 2026-08-05, `wasm-tools` 1.255.0, `cargo-component` 0.21.1, `wit-bindgen` 0.41.0,
+/// `rustc` 1.95.0, `wasm32-unknown-unknown`:
+///
+/// | | artifact imports | bytes | guest bindings name both contexts |
+/// |---|---|---|---|
+/// | one interface | 1 | 26,644 | yes |
+/// | three interfaces | 3 | 26,979 | yes |
+///
+/// **The split does not deliver what it was proposed for.** The `rule` world exports both
+/// `check` and `reduce`, so it must import both phases' interfaces to give those two
+/// exports their argument types; `wit-parser` then adds `import types` on its own, and the
+/// split guest's bindings open with `pub type CheckContext = ...` and
+/// `pub type ReduceContext = ...` exactly as the single-interface guest's do. Literal
+/// unnameability needs two *worlds*, which doubles the build artifact for every rule that
+/// has a reduce phase — and that trade was already rejected. So the split costs three
+/// imports where one will do, and buys nothing.
+///
+/// The residual weakness is therefore real and is stated plainly rather than described as
+/// impossible: a per-file rule can name `reduce-context`, and the generated bindings hand
+/// it a `pub unsafe fn from_handle(handle: u32)` with which to forge one. What it cannot do
+/// is obtain a *valid* one. Two independent layers stop it. The method sets are disjoint,
+/// so a wrong-phase call does not compile. And a forged handle traps in the runtime with
+/// "unknown handle index", because the instance's table for the other phase's resource is
+/// empty during this call — the host is never reached, and it records that it was never
+/// reached. That second layer is the load-bearing one, since a compile error only guards a
+/// rule someone compiles from source and says nothing about a component that arrives
+/// prebuilt.
+///
+/// **Both layers are now measured against this world rather than against the prototype, and
+/// in both directions.** `tests/fixtures/reduce/` forges the other phase's handle from each
+/// phase, with the bindings' own `unsafe fn from_handle(0)` — zero being the handle the call
+/// already holds for its own phase, which is the most plausible forgery available. Measured
+/// 2026-08-06, `wasmtime` 47.0.3, `cargo-component` 0.21.1, `rustc` 1.95.0: the trap's root
+/// cause is exactly `unknown handle index 0`, the other phase's host state records nothing,
+/// and the guest's own announcement immediately before the forgery *is* recorded — so the
+/// call died at the forgery and not earlier. The compile-time layer was confirmed by hand in
+/// the same fixture: `ctx.files()` inside `check` fails with ``error[E0599]: no method named
+/// `files` found for reference `&types::CheckContext` in the current scope``. Both are
+/// described in `tests/reduce.rs`, which owns the runtime half; the declaration half — that
+/// the two blocks below share exactly one method name — is asserted against this file in
+/// `tests/facts.rs`.
+interface types {
+  /// An opaque reference into the arena of the check-context that produced it. Meaningless
+  /// outside the call that handed it out — the same discipline the published `Node` type
+  /// already enforces in TypeScript, restated in a form every target language shares.
+  ///
+  /// The root of a parsed file is handle 0. Compare against a sentinel explicitly, never
+  /// test truthiness: `if (!node)` discards the root, silently, and only ever by removing
+  /// results. This is why `closest-ancestor` returns `option<match>` rather than an empty
+  /// list.
+  type node = u32;
+
+  /// Where a per-file violation is reported. Every field is known, because a `node` always
+  /// has a position in the file it came from.
+  record node-location {
+    file: string,
+    line: u32,
+    column: u32,
+  }
+
+  /// Where a cross-file violation is reported. The reduce phase never touches parse trees
+  /// (`docs/architecture.md`'s reduce invariant), so it has no node to take a position from
+  /// and must carry one captured earlier — on a fact, during the per-file pass, while the
+  /// tree was still there.
+  ///
+  /// **`line` and `column` are optional in this record and required by the host.** The option
+  /// mirrors the published TypeScript `ReduceLocation`, where both have always been optional
+  /// in the type and required by the runtime; it is not permission to omit them. A `report`
+  /// naming no site fails the call, in both engines, because the only stand-in available
+  /// downstream is 1:1 — which points a reader at an unrelated line and cannot be told apart
+  /// from a rule that meant 1:1. A rule that means "the whole file" says `1, 1` itself.
+  ///
+  /// Declaring them `u32` would make that structural rather than enforced, and is the stronger
+  /// shape. It is not taken here because it would put this record out of step with the
+  /// published type it mirrors, and because it is an ABI change — cheap only while no
+  /// authoring crate binds against this world, which is true today and will not stay true.
+  record reduce-location {
+    file: string,
+    line: option<u32>,
+    column: option<u32>,
+  }
+
+  /// A suggested edit replacing a node's text.
+  record fix {
+    node: node,
+    text: string,
+    /// The rule's own claim that applying this preserves behavior, which the engine does not
+    /// verify. `--fix` applies the safe ones and offers the rest as suggestions.
+    ///
+    /// Optional, and **the host decides what unspecified means: not safe.** The two mistakes
+    /// are not symmetric — a suggestion that should have been safe costs a manual edit, and a
+    /// fix that should have been a suggestion rewrites someone's code. A plain `bool` cannot
+    /// represent "did not say", so every authoring crate would have to choose a value to send
+    /// when its author omitted one, and one of them mapping that to `true` would silently
+    /// make fixes auto-applicable with nothing here to catch it. `option<bool>` keeps the
+    /// cautious answer an invariant of the boundary rather than a convention each language
+    /// re-decides. This is what `lanekeep-js`'s `read_fix` already does with an absent
+    /// property.
+    safe: option<bool>,
+  }
+
+  /// One capture of a query match: the name the query gave it, and the node it bound.
+  record match-entry {
+    name: string,
+    node: node,
+  }
+
+  /// A query match's captures.
+  ///
+  /// A list rather than a record, because a query's capture names are declared by the rule
+  /// and are not known to this interface in advance, and WIT records have statically named
+  /// fields. A capture that did not participate is simply absent. There is no WIT analog of
+  /// a JavaScript object holding an explicit `undefined` under a key, so the ambiguity that
+  /// distinction could cause does not exist here.
+  type match = list<match-entry>;
+
+  /// A fact emitted during the per-file pass, for the reduce phase to consume.
+  record emitted-fact {
+    kind: string,
+    file: string,
+    /// The rest of the payload, as the rule's own language serialized it to JSON. Opaque to
+    /// the host beyond `kind` — a fact's shape is caller-defined. The host parses it and
+    /// rejects what is not a JSON object: under QuickJS `JSON.stringify` guaranteed the
+    /// shape, and a component can hand over any bytes it likes.
+    data: string,
+  }
+
+  /// How a name was introduced, as resolved by the language's binding resolution.
+  ///
+  /// Exactly two cases collide with a WIT keyword and are `%`-escaped for that reason
+  /// alone; the escape carries no meaning. The rest are written bare because they are not
+  /// keywords, which is measurable rather than assumed: `wasm-tools component wit` prints
+  /// this file back with `%` on `import` and `type` and on nothing else, and `const`, `let`,
+  /// `var`, `function`, `class`, `loop`, `module`, `trait` and `match` all parse unescaped.
+  /// Escaping a non-keyword is legal, so an over-escaped version of this enum would have
+  /// worked and would have said something false about WIT.
+  enum binding-kind {
+    %import, const, let, var, param, function, class, catch-param,
+    assignment, loop, context-manager, comprehension,
+    %type, receiver, type-param, module, trait,
+  }
+
+  /// Why a tracked read was refused. Each case carries the offending path.
+  variant read-error {
+    /// The path resolved outside the project root.
+    escapes-root(string),
+    /// The path was absolute, which a rule may not use — reads are root-relative so that a
+    /// result does not depend on where the project sits on disk.
+    absolute(string),
+    /// The file exists but is not valid UTF-8.
+    not-text(string),
+  }
+
+  /// Why a fact was refused.
+  variant fact-error {
+    /// `kind` was empty, so nothing could select the fact in the reduce phase.
+    empty-kind,
+    /// `data` parsed as JSON but was not an object.
+    not-an-object,
+    /// `data` did not parse as JSON. Carries the parser's message.
+    invalid-json(string),
+  }
+
+  /// The per-file phase's capabilities, and the parse tree it is reading.
+  ///
+  /// Held as a resource rather than passed as a record so that its method set *is* the
+  /// enforcement `docs/architecture.md` §6.5 asks for: a per-file rule is handed one of
+  /// these and nothing else, and there is no exported constructor, so it cannot make one of
+  /// the other kind.
+  resource check-context {
+    /// The path of the file being checked, relative to the project root.
+    file-path: func() -> string;
+    /// The full source text of the file being checked.
+    file-text: func() -> string;
+    /// The root node of the parsed file. Its handle is 0.
+    root: func() -> node;
+
+    /// The node's grammar kind, or none if the handle is not live in this context.
+    kind: func(n: node) -> option<string>;
+    /// The source text the node spans.
+    text: func(n: node) -> option<string>;
+    /// Whether the node is named in the grammar, as opposed to an anonymous token.
+    is-named: func(n: node) -> bool;
+    /// The node's one-based start line.
+    ///
+    /// One-based, matching every other position lanekeep reports: `node-location` below,
+    /// the violations the engine sorts by `(ruleId, file, line, column)`, and the column
+    /// `lanekeep-query` builds by adding one to tree-sitter's own zero-based figure. Both
+    /// engines read the same `NodeArena::position`, so there is one answer rather than a
+    /// convention per boundary — a zero-based reading here would put every component rule's
+    /// violations one line and one column off what the identical TypeScript rule reports,
+    /// which looks like a rule bug and is not one.
+    line: func(n: node) -> option<u32>;
+    /// The node's one-based start column, on the same footing as `line`.
+    column: func(n: node) -> option<u32>;
+    /// The node's parent, or none at the root.
+    parent: func(n: node) -> option<node>;
+    /// Every child, named and anonymous, in tree order.
+    children: func(n: node) -> list<node>;
+    /// The named children only, in tree order.
+    named-children: func(n: node) -> list<node>;
+    /// Every ancestor, nearest first, ending at the root.
+    ancestors: func(n: node) -> list<node>;
+
+    /// Whether the identifier at `n` resolves to a binding introduced by importing `name`
+    /// (or the module itself, when `name` is none) from `module`.
+    resolves-to-import: func(n: node, module: string, name: option<string>) -> bool;
+    /// Whether the identifier at `n` resolves to a binding imported from a module matching
+    /// the glob `pattern`.
+    is-imported-from: func(n: node, pattern: string) -> bool;
+    /// How the binding the identifier at `n` resolves to was introduced.
+    binding-kind: func(n: node) -> option<binding-kind>;
+    /// Whether the binding the identifier at `n` resolves to shadows an outer one.
+    is-shadowed: func(n: node) -> bool;
+
+    /// Run a query against the subtree rooted at `n`. The error is the query compiler's
+    /// message.
+    query-subtree: func(n: node, query: string) -> result<list<match>, string>;
+    /// The nearest ancestor of `n` matching the query, or none.
+    ///
+    /// `option<match>` rather than an empty list, deliberately: an empty object is truthy
+    /// in JavaScript, so a "nothing matched" value shaped like a match takes the wrong
+    /// branch under `if (!...)`. The error is the query compiler's message.
+    closest-ancestor: func(n: node, query: string) -> result<option<match>, string>;
+
+    /// Read another file in the project, root-relative. The read is tracked: it becomes a
+    /// dependency of this file's cached result. None means the file does not exist.
+    read-file: func(path: string) -> result<option<string>, read-error>;
+    /// Whether another file exists, root-relative. Tracked exactly as `read-file` is.
+    file-exists: func(path: string) -> result<bool, read-error>;
+
+    /// Emit a fact for the reduce phase. `data` must be a JSON object.
+    emit-fact: func(kind: string, data: string) -> result<_, fact-error>;
+
+    /// The node's position, for a rule that needs to reason about it rather than report at
+    /// it.
+    loc: func(n: node) -> option<node-location>;
+    /// Report a violation at `n`.
+    ///
+    /// Two independently optional named parameters rather than one union argument: the
+    /// union exists in the TypeScript API only because JavaScript has no optional named
+    /// parameters, and WIT does.
+    report: func(n: node, message: option<string>, fix: option<fix>);
+
+    /// Today's date, as `YYYY-MM-DD`, or none when the rule is not permitted to observe it.
+    ///
+    /// A function, not a property. Every capability here is already a host-executed call,
+    /// so "was the date read" is "did this implementation run" — the cache needs that
+    /// answer, and there is no plain-data-property alternative it has to be distinguished
+    /// from.
+    today: func() -> option<string>;
+  }
+
+  /// The cross-file phase's capabilities.
+  ///
+  /// No node, no tree, no file text: the reduce phase consumes facts and the file list and
+  /// nothing else, which is what keeps cross-file rules parallel and cacheable
+  /// (`docs/architecture.md`'s reduce invariant). The absence is the point, and here it is
+  /// structural — there is no method to decline.
+  resource reduce-context {
+    /// Every file the run considered, in the engine's deterministic order.
+    files: func() -> list<string>;
+    /// The facts emitted during the per-file pass, optionally narrowed to one kind.
+    facts: func(kind: option<string>) -> list<emitted-fact>;
+    /// Report a cross-file violation.
+    report: func(at: reduce-location, message: option<string>);
+  }
+}
+
+/// What a rule component is today: four exports over the host surface.
+///
+/// **This list is provisional, and the version number is where that shows.** Two more
+/// exports are already expected by a sub-project that binds against this world — a
+/// `metadata` export carrying what a TypeScript rule's default export carries today (id,
+/// language, severity, card, gates, query, timeout), and a `configure(options-json)` call
+/// made once after instantiation, since a component cannot close over a host-supplied value
+/// the way a factory rule does in JavaScript. Neither is written here, because inventing a
+/// shape that the sub-project needing it would then have to un-invent is worse than the
+/// omission.
+///
+/// Where the decision lands is not left open: the plan's Task 14 owns how a configured
+/// rule's `options` reach a component, and its acceptable outcome includes documenting the
+/// gap and deferring it rather than inventing one. What is worth knowing before that point
+/// is the cost. **Adding an export bumps `host_api_version`, which is a cache-key input**,
+/// so every cached result in every checkout is invalidated by it — which is the right
+/// behavior, since a result computed against a world without `configure` is not a valid
+/// result for a run that has it. The cost is real and one-time, and it is a reason to add
+/// exports deliberately rather than a reason to add them all now on speculation.
+world rule {
+  import types;
+
+  /// A type declared inside an interface is not in scope in the world that imports it. The
+  /// world needs an explicit `use` for every type it names in an export signature, or it
+  /// does not parse.
+  ///
+  /// Measured on this file, 2026-08-05, `wasm-tools` 1.255.0: with the `use` line deleted
+  /// the error is ``name `check-context` does not exist``, pointing at `export check`'s
+  /// parameter. It names whichever type the first offending export signature mentions, and
+  /// it reads as though the type is missing rather than out of scope — the type is right
+  /// there in `types`, twenty lines up.
+  ///
+  /// This list is what a guest gets at the top level of its bindings; everything else in
+  /// `types` is reached through the interface path. `check-context`, `reduce-context` and
+  /// `match` are here because the exports below name them. `node` is not named below and is
+  /// here anyway — for a Rust guest that buys nothing, measured: `wit-bindgen` 0.41.0
+  /// resolves `type node = u32` to `u32` and emits no alias, so the top of the generated
+  /// bindings is the same three names with or without it, and the whole cost is 23 bytes of
+  /// artifact metadata. It stays because languages that render an alias for a primitive
+  /// typedef would put `node` where rule authors expect it, and 23 bytes is not a reason to
+  /// find out the hard way which ones those are.
+  use types.{node, check-context, reduce-context, match};
+
+  /// Whether this rule has a per-file pass.
+  ///
+  /// **Declared and implemented, and not yet probed by anything.** The intent is one probe at
+  /// prepare time, mirroring how the presence of `check` is discovered today by inspecting the
+  /// evaluated module rather than by trusting hand-written config. What the engine does today
+  /// is read `rule.spec.has_reduce`, which `lanekeep-config` fills in from the TypeScript
+  /// module or from JSON — so `WasmRuntime::has_check` and `WasmRuntime::has_reduce` have test
+  /// callers only, and a component is still taken at its config's word. Closing that is the
+  /// same sub-project that gives a component a `metadata` export to describe itself with;
+  /// until then this is a surface that exists rather than a mechanism that runs.
+  export has-check: func() -> bool;
+  /// Whether this rule has a cross-file pass, on the same terms.
+  ///
+  /// Every component exports all four functions regardless of which passes it uses, because
+  /// a WIT world has no optional exports. A check-only rule's `reduce` is a no-op its own
+  /// language's scaffolding supplies.
+  export has-reduce: func() -> bool;
+
+  /// Run the per-file pass for one query match.
+  ///
+  /// `borrow<check-context>`: the host owns the context and lends it for the call, so the
+  /// handle is dead the moment `check` returns and cannot be stashed for a later one.
+  export check: func(ctx: borrow<check-context>, m: match);
+  /// Run the cross-file pass, once per run.
+  export reduce: func(ctx: borrow<reduce-context>);
+}

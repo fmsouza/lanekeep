@@ -1,0 +1,49 @@
+# The reduce guest: exercises `reduce-context`'s three methods, and tries — from each phase —
+# to reach the other phase's resource by forging a handle through the bindings' public
+# `unsafe fn from_handle`.
+#
+# The forgery is why this crate exports both passes rather than only `reduce`. The residual
+# weakness `wit/world.wit` names in full is that both contexts live in one interface, so a rule
+# can *name* the other phase's type; what it cannot do is obtain a valid handle to one. That
+# claim was measured on a two-method prototype rather than on this world, and the world says a
+# fixture proving it against this world is owed. This is it.
+#
+# Its own workspace, deliberately, exactly as tests/fixtures/world-shape/ is. It is built for
+# wasm32-unknown-unknown by `cargo component`, not by the parent workspace's toolchain, and
+# `members = ["crates/*"]` does not reach it. An empty `[workspace]` table is what detaches
+# it; without one, cargo refuses to build it at all.
+[package]
+name = "reduce"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# The world is read from the engine's own wit/ directory rather than from a copy under this
+# crate, for the reason tests/fixtures/world-shape/Cargo.toml gives: a copy would prove that
+# a file which was once the world is targetable, and nothing would catch the two drifting.
+[package.metadata.component.target]
+path = "../../../wit"
+world = "rule"
+
+[package.metadata.component.dependencies]
+
+# The artifact is committed, so it is worth not committing debug information nobody reads.
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build`
+# generates and `.gitignore` deliberately excludes. cargo-machete reads source, so on a
+# fresh checkout it sees a dependency nothing references and fails the gate — while a
+# machine that has built the fixture once sees it used and passes. That split is the
+# whole bug: it passed locally and failed on CI's first Linux run.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]

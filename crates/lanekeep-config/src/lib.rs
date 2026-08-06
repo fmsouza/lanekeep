@@ -1,13 +1,13 @@
 //! Configuration loading and canonicalized hashing for lanekeep.
 //!
-//! Loads `lanekeep.config.ts`, resolves the rule graph, and derives the hashes feeding the
-//! cache key.
+//! Loads `lanekeep.config.ts` or `lanekeep.json`, resolves the rule graph, and derives the
+//! hashes feeding the cache key.
 //!
 //! # How the config is read
 //!
-//! The config is a TypeScript module, so reading it means running it. A synthetic entry
-//! module imports the config's default export into a global, and a second evaluation hands
-//! back `JSON.stringify` of the parts that are data.
+//! A `lanekeep.config.ts` is a TypeScript module, so reading it means running it. A
+//! synthetic entry module imports the config's default export into a global, and a second
+//! evaluation hands back `JSON.stringify` of the parts that are data.
 //!
 //! Going through JSON rather than reaching into engine values is deliberate. It keeps
 //! every value crossing the boundary plainly serializable, it makes the whole extraction
@@ -17,6 +17,12 @@
 //! extraction separately records whether each rule has a callable `check` and `reduce`.
 //! Without that, a rule whose handler was misspelled would load cleanly and silently never
 //! fire — the worst failure this tool can have, because it looks exactly like passing.
+//!
+//! A `lanekeep.json` is not a program, and is read as what it is: `src/json.rs` parses,
+//! validates and resolves it in Rust, and only a rule reference naming a *TypeScript* rule
+//! reaches the sandbox — because that rule's own declaration is the only place its `id`,
+//! `query` and `card` exist. The note above `entry_source` in this file records what
+//! that cost.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +37,8 @@ use thiserror::Error;
 pub type Hash = [u8; 32];
 
 mod json;
+
+pub use json::{ResolvedRule, RuleReference};
 
 /// Render a hash the way it appears in diagnostics and cache paths.
 #[must_use]
@@ -73,6 +81,40 @@ pub struct RuleSpec {
     pub timeout: Option<Duration>,
     /// Whether the rule has a `reduce` phase.
     pub has_reduce: bool,
+    /// The compiled component this rule's handlers live in, or `None` for a TypeScript rule.
+    ///
+    /// **This is what sends a rule to one engine or the other.** `lanekeep-engine` runs a rule
+    /// with `None` through `lanekeep-js` and a rule with `Some` through `lanekeep-wasm`, in the
+    /// same run over the same corpus — the decision is a property of the rule and is made here,
+    /// where a rule is described, rather than by the engine guessing from anything else.
+    ///
+    /// # It is `None` for every rule a config can express today, and the reason is not this crate
+    ///
+    /// [`RuleReference::Component`] resolves a `.wasm` specifier to a path, and `rules_module`
+    /// then refuses it. That refusal stays, because the fields above it have nowhere to come
+    /// from: `crates/lanekeep-wasm/wit/world.wit` declares four exports and **none of them is
+    /// `metadata`**, so a component cannot supply its own `id`, `query`, `card`, `gates`,
+    /// `languages`, `severity` or `timeout`.
+    ///
+    /// [`RuleSpec::has_reduce`] is the exception and is worth naming rather than leaving out of
+    /// the list, because it is the one field a second source of truth already exists for. The
+    /// world *does* declare `has-check` and `has-reduce`, and a component answers both — but
+    /// nothing asks: the engine reads that field, which this crate fills in by inspecting the
+    /// TypeScript module or from JSON, and `lanekeep_wasm::WasmRuntime::has_reduce` has test
+    /// callers only. So a component-backed rule is taken at its config's word about a question
+    /// it can answer itself, and the two can disagree with nothing to notice. Closing that is
+    /// the same sub-project as `metadata`, and it should close both at once.
+    ///
+    /// The only alternatives are to add that export —
+    /// which is the Rust-authoring sub-project's ABI to design, and bumps a cache-key input —
+    /// or to invent config syntax carrying the metadata beside the reference, which that same
+    /// sub-project would then have to un-invent. Both were declined, as they were when the
+    /// options question reached the same wall.
+    ///
+    /// So the field is the seam and not yet the door: a caller holding a `Config` — a test, an
+    /// embedder, and the sub-project that adds `metadata` — can set it and get component
+    /// dispatch, and `lanekeep-config` sets it the day a component can describe itself.
+    pub component: Option<PathBuf>,
 }
 
 /// A loaded, validated configuration.
@@ -247,16 +289,71 @@ const EXTRACT: &str = r"
     })()
 ";
 
-/// The entry module the loader evaluates, whichever format the config is written in.
+/// The entry module the loader evaluates, and — for a JSON config — everything about it
+/// that never needed evaluating.
 ///
-/// Both formats converge here, and that is the point: a JSON config is compiled into the
-/// same module a TypeScript one is imported by, so extraction, validation, hashing and the
-/// cache key never learn which format they came from. Two loaders would be two behaviors
-/// eventually, and the divergence would show up as a rule that runs under one form and not
-/// the other.
-fn entry_source(root: &RuleRoot, config_path: &Path, display: &str) -> Result<String, ConfigError> {
+/// # The two formats no longer share a mechanism, and what holds them together now
+///
+/// They used to. A JSON config was compiled into the same module a TypeScript one is
+/// imported by, so extraction, validation, hashing and the cache key never learned which
+/// format they came from, and `json.rs`'s header said outright that this is why "the two
+/// cannot drift." That mechanism is gone from the JSON path: `lanekeep.json` is parsed,
+/// validated and resolved in Rust, and its `include`, `exclude`, `namespaces`, `severity`
+/// and `timeouts` never become JavaScript at all.
+///
+/// **That is what the un-coupling costs.** Two code paths can drift where one could not.
+/// Three things substitute for the mechanism, and they are named here rather than left
+/// implied, because two of them are conventions and only one is enforced.
+///
+/// *Enforced.* `json::parse` builds the **shared** `RawConfig` with an exhaustive struct
+/// literal, so a field added to it is a compile error on the JSON side rather than a setting
+/// that quietly stops being carried. This is the one guard that is stronger than what it
+/// replaced — the same omission from the old entry module's `format!` string compiled.
+///
+/// *Convention.* The two paths still converge at [`build`], the only place a `Config` is
+/// constructed, a severity override applied, a card validated or a hash taken, so a
+/// divergence has to be introduced upstream of a single function rather than anywhere.
+///
+/// *Convention.* The cache-key properties §8.1 depends on are asserted against **both** paths
+/// in this file's tests, deliberately in matched pairs. Nothing enforces that a new property
+/// gets both halves; the pairing is named in the tests so that dropping one is visible.
+///
+/// # Why `lanekeep-js` is still a dependency of this crate
+///
+/// Because `lanekeep.config.ts` is still evaluated, and will be until the last rule has
+/// migrated to a component — the accepted ADR's condition 8. Nothing here is a step toward
+/// deleting the sandbox on this crate's own schedule.
+///
+/// The JSON path also still reaches the sandbox, for one thing and not for configuration: a
+/// reference naming a TypeScript rule is imported so its `defineRule` object can be read.
+/// That is rule execution, which is the part condition 8 keeps. Nothing else crosses, which
+/// `json::tests::no_configuration_data_reaches_the_entry_module` holds the line on.
+///
+/// # What unblocks removing QuickJS, and what does not
+///
+/// Un-coupling this path is one of condition 8's two preconditions. **The other is open and
+/// this change does not answer it**: the ADR's §7.6 asks what a programmable
+/// `lanekeep.config.ts` means once there is no JavaScript sandbox — arbitrary composition
+/// logic, a shared preset imported as a module and spread into another config, per
+/// `docs/architecture.md` §9. At least three shapes are plausible and no measurement picks
+/// between them: configuration stops being programmable and becomes JSON-only; configuration
+/// becomes its own component with a config-shaped WIT world; or a minimal JavaScript
+/// evaluator is deliberately retained for configuration alone, decoupled from rule
+/// execution. It is a decision about what lanekeep's configuration language should be, and
+/// nobody has made it.
+///
+/// This function reading JSON without a sandbox is *not* that decision, and must not be read
+/// as evidence for the first shape. It says a config format that was never programmable does
+/// not need an evaluator, which was true before this change too.
+fn entry_source(
+    root: &RuleRoot,
+    config_path: &Path,
+    display: &str,
+) -> Result<(String, Option<json::Parsed>), ConfigError> {
     if json::is_json(config_path) {
-        return json::entry_source(config_path);
+        let parsed = json::parse(config_path, root.path())?;
+        let source = json::rules_module(&parsed.rules, display)?;
+        return Ok((source, Some(parsed)));
     }
 
     let specifier =
@@ -264,8 +361,9 @@ fn entry_source(root: &RuleRoot, config_path: &Path, display: &str) -> Result<St
             path: display.to_owned(),
             detail: "the config file must sit inside the rules root".to_owned(),
         })?;
-    Ok(format!(
-        "import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n"
+    Ok((
+        format!("import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n"),
+        None,
     ))
 }
 
@@ -286,7 +384,7 @@ pub fn evaluate_into(
 ) -> Result<(), ConfigError> {
     let display = config_path.display().to_string();
     let entry = root.path().join(ENTRY);
-    let source = entry_source(root, config_path, &display)?;
+    let (source, _) = entry_source(root, config_path, &display)?;
 
     sandbox
         .eval_module(&entry.display().to_string(), &source)
@@ -306,7 +404,7 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
     let display = config_path.display().to_string();
 
     let entry = root.path().join(ENTRY);
-    let source = entry_source(root, config_path, &display)?;
+    let (source, parsed) = entry_source(root, config_path, &display)?;
     sandbox
         .eval_module(&entry.display().to_string(), &source)
         .map_err(|e| ConfigError::Evaluation {
@@ -319,19 +417,39 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
         detail: e.to_string(),
     })?;
 
-    let raw: Option<RawConfig> = serde_json::from_str(&json).map_err(|e| ConfigError::Shape {
-        path: display.clone(),
-        detail: e.to_string(),
-    })?;
-    let raw = raw.ok_or_else(|| ConfigError::Shape {
+    let extracted: Option<RawConfig> =
+        serde_json::from_str(&json).map_err(|e| ConfigError::Shape {
+            path: display.clone(),
+            detail: e.to_string(),
+        })?;
+    let extracted = extracted.ok_or_else(|| ConfigError::Shape {
         path: display.clone(),
         detail: "the default export is not an object — did you forget `export default`?".to_owned(),
     })?;
 
-    build(sandbox, raw, &display)
+    // A JSON config supplies its own data; exactly one field comes back from the sandbox,
+    // and it is spelled out rather than merged, so a field added to `RawConfig` cannot
+    // quietly start being read from the wrong side.
+    let (raw, resolved) = match parsed {
+        Some(parsed) => (
+            RawConfig {
+                rules: extracted.rules,
+                ..parsed.config
+            },
+            parsed.rules,
+        ),
+        None => (extracted, Vec::new()),
+    };
+
+    build(sandbox, raw, &display, &resolved)
 }
 
-fn build(sandbox: &Sandbox, raw: RawConfig, display: &str) -> Result<Config, ConfigError> {
+fn build(
+    sandbox: &Sandbox,
+    raw: RawConfig,
+    display: &str,
+    resolved: &[ResolvedRule],
+) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
     // Namespaces this project claims, beyond the two lanekeep defines. Validated for shape
@@ -367,8 +485,8 @@ fn build(sandbox: &Sandbox, raw: RawConfig, display: &str) -> Result<Config, Con
         limits = limits.with_global_timeout(Duration::from_millis(ms));
     }
 
-    let ruleset_hash = hash_ruleset(sandbox);
-    let config_hash = hash_config(&raw.include, &raw.exclude, &overrides, &limits);
+    let ruleset_hash = hash_ruleset(sandbox, resolved);
+    let config_hash = hash_config(&raw.include, &raw.exclude, &overrides, &limits, resolved);
 
     Ok(Config {
         include: raw.include,
@@ -495,10 +613,14 @@ fn build_rule(
         gates: raw.gates,
         timeout: raw.timeout.map(Duration::from_millis),
         has_reduce: raw.has_reduce,
+        // Every rule that reaches here was read out of an evaluated TypeScript module, so its
+        // handlers are in that module. See [`RuleSpec::component`] for what has to exist before
+        // this can be anything else.
+        component: None,
     })
 }
 
-/// Hash every module the loader read.
+/// Hash the code every rule in this run is made of: modules the loader read, and components.
 ///
 /// # A correction to the architecture
 ///
@@ -513,9 +635,42 @@ fn build_rule(
 /// That is over-invalidation, which costs a recompute. The alternative error —
 /// under-invalidating and serving results computed by code that no longer exists — is the
 /// one §8 exists to prevent, and it is not symmetric with this one.
-fn hash_ruleset(sandbox: &Sandbox) -> Hash {
+///
+/// # Two kinds of rule code, and why both are folded here rather than one replacing the other
+///
+/// A component's bytes are the same input as a module's source: the code that decided the
+/// answer. The plan for this change described the component fold as replacing the module walk,
+/// which would be correct in a world where every rule is a component and is a silent
+/// under-invalidation in this one — every rule in this tree is TypeScript, and dropping the
+/// walk would take the whole ruleset out of the cache key. So both are folded, and the module
+/// walk leaves when the last module does.
+///
+/// A component is hashed by its **bytes and not its path**, sorted by path so the order is
+/// fixed. A resolved component path is absolute, and putting it in would make the key depend
+/// on where the checkout sits — a cache invalidated by moving a directory, for nothing. Which
+/// component a rule *names*, and with which options, is `hash_config`'s to carry; this hash is
+/// about the code. Duplicates collapse for the same reason: listing one component twice is a
+/// configuration difference, not a different program.
+///
+/// **A component that cannot be read folds in a marker rather than nothing.** Skipping it
+/// would make "the component is missing" and "the component is there" hash alike, which is the
+/// shape §8.2 already rules out for tracked reads: absence is an input, because a run that
+/// could not read a rule and one that could must not share a key. The marker is not a
+/// separator — a `.wasm` is arbitrary binary and can contain whichever byte it is — so the
+/// bytes are length-prefixed as well, and `two_components_cannot_run_together_into_one` is
+/// what says so.
+///
+/// # `resolved` is empty for a TypeScript config, so this half is JSON-only today
+///
+/// `load` passes `Vec::new()` on the TypeScript path, because only a `lanekeep.json` produces
+/// a [`RuleReference::Component`]. That is consistent rather than a hole *while that stays
+/// true*: a TypeScript config cannot name a component at all, so there are no component bytes
+/// to miss. **The day it can, this is the branch that silently stops covering them** — a
+/// component named from `lanekeep.config.ts` would reach no hash, and nothing here would fail.
+/// Whoever adds that path owes this function the reference list, not just the loader.
+fn hash_ruleset(sandbox: &Sandbox, resolved: &[ResolvedRule]) -> Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lanekeep-ruleset-v1");
+    hasher.update(b"lanekeep-ruleset-v2");
 
     if let Some(loaded) = sandbox.loaded_modules() {
         // The map is ordered, so the hash does not depend on load order — which varies with
@@ -528,7 +683,43 @@ fn hash_ruleset(sandbox: &Sandbox) -> Hash {
         }
     }
 
+    let mut components: Vec<&Path> = resolved
+        .iter()
+        .filter_map(|rule| match &rule.reference {
+            RuleReference::Component(path) => Some(path.as_path()),
+            RuleReference::Builtin(_) | RuleReference::Module(_) => None,
+        })
+        .collect();
+    components.sort_unstable();
+    components.dedup();
+
+    hasher.update(b"components");
+    length_prefixed(&mut hasher, &(components.len() as u64).to_le_bytes());
+    for path in components {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                hasher.update(&[1]);
+                length_prefixed(&mut hasher, &bytes);
+            }
+            Err(_) => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+
     *hasher.finalize().as_bytes()
+}
+
+/// Hash a variable-length field with its length in front.
+///
+/// `u64` rather than `usize`, because `usize::to_le_bytes` is four bytes on a 32-bit host
+/// and eight on a 64-bit one, and a hash that depends on the width of the machine that
+/// computed it is not deterministic. The saturating conversion is unreachable — it needs a
+/// field larger than 16 exabytes — and is written this way because a panic on user input is
+/// not something this crate does.
+fn length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
 }
 
 /// Hash the configuration values.
@@ -536,11 +727,22 @@ fn hash_ruleset(sandbox: &Sandbox) -> Hash {
 /// Canonicalized properly, because these *are* structured data: the severity map is ordered
 /// so writing the same entries in a different order hashes the same, and the budgets are
 /// hashed as numbers rather than as whatever the user typed.
+///
+/// `resolved` is a JSON config's rule references and their options, and is empty for a
+/// TypeScript one — where the same information lives inside the config module's own source
+/// and reaches the key through `ruleset_hash` instead. `docs/architecture.md` §8.1 lists
+/// options under this hash, and until the JSON path resolved its references in Rust there
+/// was nowhere they could be read from: they were interpolated into the synthetic entry
+/// module, which `Sandbox::eval_module` evaluates directly rather than through the loader,
+/// so it is not among the modules `hash_ruleset` walks. Editing an option in a
+/// `lanekeep.json` therefore invalidated nothing, and a warm run kept answering the previous
+/// configuration.
 fn hash_config(
     include: &[String],
     exclude: &[String],
     severity: &BTreeMap<RuleId, Severity>,
     limits: &Limits,
+    resolved: &[ResolvedRule],
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-config-v1");
@@ -575,6 +777,27 @@ fn hash_config(
         limits.memory_bytes as u128,
     ] {
         hasher.update(&value.to_le_bytes());
+    }
+
+    // In the order written, which over-invalidates on a reordering that changes nothing —
+    // rules are sorted by ID before they are reported, so their position is not an input to
+    // any result. That is the same asymmetry `hash_ruleset` documents: a recompute costs
+    // time, and serving a result computed under a different configuration costs correctness.
+    hasher.update(b"rules");
+    for rule in resolved {
+        length_prefixed(&mut hasher, rule.specifier.as_bytes());
+        // An explicit discriminant for which form the config wrote, because `"x"` and
+        // `{"rule": "x"}` are different configurations — one uses a rule as it comes, the
+        // other configures it with `null`, and a factory reading `options?.strict` behaves
+        // differently under the two. Omitting the tag would leave them distinguished only by
+        // the incidental fact that an absent field and a serialized `null` are different
+        // lengths, which is true and is not something to depend on.
+        if let Some(options) = &rule.options {
+            hasher.update(&[1]);
+            length_prefixed(&mut hasher, json::literal(options).as_bytes());
+        } else {
+            hasher.update(&[0]);
+        }
     }
 
     *hasher.finalize().as_bytes()
@@ -665,10 +888,38 @@ mod tests {
         }
 
         fn load_config(&self) -> Result<Config, ConfigError> {
+            self.load_named("lanekeep.config.ts")
+        }
+
+        fn load_json(&self) -> Result<Config, ConfigError> {
+            self.load_named("lanekeep.json")
+        }
+
+        fn load_named(&self, name: &str) -> Result<Config, ConfigError> {
             let root = RuleRoot::new(&self.dir).expect("canonicalizes");
             let sandbox =
                 sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
-            load(&sandbox, &root, &self.dir.join("lanekeep.config.ts"))
+            load(&sandbox, &root, &self.dir.join(name))
+        }
+
+        /// A sandbox over this fixture, with nothing loaded into it.
+        ///
+        /// For the component half of `ruleset_hash`, which cannot be reached through `load`:
+        /// a `.wasm` reference is refused before a `Config` is built, because this build runs
+        /// no components yet. The hash is still where a component's bytes have to be by the
+        /// time one runs, and a cache-key input nothing exercises is how one goes missing.
+        fn empty_sandbox(&self) -> Sandbox {
+            let root = RuleRoot::new(&self.dir).expect("canonicalizes");
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox")
+        }
+
+        /// A resolved reference to a component inside this fixture.
+        fn component(&self, name: &str) -> ResolvedRule {
+            ResolvedRule {
+                specifier: format!("./{name}"),
+                reference: RuleReference::Component(self.dir.join(name)),
+                options: None,
+            }
         }
     }
 
@@ -683,6 +934,21 @@ mod tests {
         format!(
             "import {{ defineRule }} from 'lanekeep';\n\
              export default defineRule({{\n\
+               id: '{id}',\n\
+               query: '(identifier) @id',\n\
+               card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.id); }},\n\
+             }});\n"
+        )
+    }
+
+    /// A rule factory: what `{ "rule": ..., "options": ... }` and `noRestrictedImports({...})`
+    /// both name. The options are captured and ignored; what matters here is that a value
+    /// reached the rule.
+    fn factory_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default (options) => defineRule({{\n\
                id: '{id}',\n\
                query: '(identifier) @id',\n\
                card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
@@ -1040,12 +1306,188 @@ mod tests {
     }
 
     #[test]
+    fn the_ruleset_hash_covers_a_components_bytes() {
+        // The component half of the same property `the_ruleset_hash_covers_an_imported_helper`
+        // asserts for modules: editing the code a rule is made of must invalidate.
+        let fixture = Fixture::new("component-bytes", &[("mine.wasm", "\u{0}asm-one")]);
+        let sandbox = fixture.empty_sandbox();
+        let resolved = [fixture.component("mine.wasm")];
+
+        let before = hash_ruleset(&sandbox, &resolved);
+        fixture.write_all(&[("mine.wasm", "\u{0}asm-two")]);
+        let after = hash_ruleset(&sandbox, &resolved);
+
+        assert_ne!(
+            hex(&before),
+            hex(&after),
+            "rebuilding a rule component must invalidate its cached results"
+        );
+    }
+
+    #[test]
+    fn two_components_cannot_run_together_into_one() {
+        // The reason a component's bytes are length-prefixed, and the reason a test for it has
+        // to use bytes that carry the marker.
+        //
+        // A module's source is text and its separator is a NUL. A component is arbitrary
+        // binary, so **any** byte used as a separator can appear inside it — including the
+        // `0x01` present-marker, which is what would be doing the delimiting if the length
+        // prefix were dropped. These two rulesets are genuinely different and fold to the
+        // identical byte sequence without it, under an identical component count:
+        //
+        //   A:  01 'A' 'A' | 01 'B' 'B' 01 'C' 'C'      a = "AA",       b = "BB\x01CC"
+        //   B:  01 'A' 'A' 01 'B' 'B' | 01 'C' 'C'      a = "AA\x01BB", b = "CC"
+        //
+        // Two different rulesets sharing a cache key is the one failure `docs/architecture.md`
+        // §8.1 exists to prevent, so it is asserted here rather than left to the fact that
+        // nothing writes a `.wasm` by hand.
+        let fixture = Fixture::new("component-run-together", &[("a.wasm", ""), ("b.wasm", "")]);
+        let sandbox = fixture.empty_sandbox();
+        let resolved = [fixture.component("a.wasm"), fixture.component("b.wasm")];
+
+        fixture.write_all(&[("a.wasm", "AA"), ("b.wasm", "BB\u{1}CC")]);
+        let split_early = hash_ruleset(&sandbox, &resolved);
+
+        fixture.write_all(&[("a.wasm", "AA\u{1}BB"), ("b.wasm", "CC")]);
+        let split_late = hash_ruleset(&sandbox, &resolved);
+
+        assert_ne!(
+            hex(&split_early),
+            hex(&split_late),
+            "two components must not be able to concatenate into one byte sequence — the \
+             present-marker is not a separator, because a component can contain it"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_ignores_where_a_component_sits() {
+        // A resolved component path is absolute. Hashing it would mean a cache thrown away by
+        // moving a checkout, for a change to nothing a rule can observe — and which component
+        // a rule *names* is already `config_hash`'s, through the specifier.
+        let fixture = Fixture::new(
+            "component-path",
+            &[("a.wasm", "\u{0}asm-same"), ("nested/b.wasm", "")],
+        );
+        fixture.write_all(&[("nested/b.wasm", "\u{0}asm-same")]);
+        let sandbox = fixture.empty_sandbox();
+
+        assert_eq!(
+            hex(&hash_ruleset(&sandbox, &[fixture.component("a.wasm")])),
+            hex(&hash_ruleset(
+                &sandbox,
+                &[fixture.component("nested/b.wasm")]
+            )),
+            "the same component bytes are the same ruleset wherever they sit"
+        );
+    }
+
+    #[test]
+    fn a_component_that_cannot_be_read_is_not_one_that_can() {
+        // §8.2's "absence is a dependency", one level up. A component that is missing and one
+        // that is present must not share a key, or adding the file changes nothing until
+        // something unrelated invalidates the entry.
+        let fixture = Fixture::new("component-absent", &[("a-present.wasm", "")]);
+        let sandbox = fixture.empty_sandbox();
+
+        assert_ne!(
+            hex(&hash_ruleset(
+                &sandbox,
+                &[fixture.component("a-present.wasm")]
+            )),
+            hex(&hash_ruleset(&sandbox, &[fixture.component("b-gone.wasm")])),
+            "an unreadable component must not hash as an empty one"
+        );
+
+        // And *which* one is missing has to be distinguishable, which is what the marker buys
+        // over simply skipping the entry. Two references, one file present at each: skip the
+        // absent one and both runs fold the identical bytes, so a ruleset with one rule broken
+        // shares a key with the ruleset that has the other one broken. The count is hashed
+        // already, so nothing else would notice.
+        fixture.write_all(&[("b-present.wasm", "")]);
+        assert_ne!(
+            hex(&hash_ruleset(
+                &sandbox,
+                &[
+                    fixture.component("a-present.wasm"),
+                    fixture.component("b-gone.wasm"),
+                ]
+            )),
+            hex(&hash_ruleset(
+                &sandbox,
+                &[
+                    fixture.component("a-gone.wasm"),
+                    fixture.component("b-present.wasm"),
+                ]
+            )),
+            "which component is missing must be part of the hash, not only how many are"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_ignores_the_order_and_the_repetition_of_a_component() {
+        // The "change nothing, assert the key does not move" half. `ruleset_hash` is about the
+        // code a run is made of; which rules a config lists, in what order and how often, is
+        // `hash_config`'s — where the order is deliberately *not* normalized. Sorting and
+        // deduplicating here means a config edit that only reorders costs no recompute.
+        let fixture = Fixture::new(
+            "component-order",
+            &[("one.wasm", "\u{0}asm-one"), ("two.wasm", "\u{0}asm-two")],
+        );
+        let sandbox = fixture.empty_sandbox();
+        let one = fixture.component("one.wasm");
+        let two = fixture.component("two.wasm");
+
+        let canonical = hex(&hash_ruleset(&sandbox, &[one.clone(), two.clone()]));
+        assert_eq!(
+            canonical,
+            hex(&hash_ruleset(&sandbox, &[two.clone(), one.clone()])),
+            "reordering two components is not a different ruleset"
+        );
+        assert_eq!(
+            canonical,
+            hex(&hash_ruleset(&sandbox, &[one.clone(), two, one])),
+            "naming one component twice is not a different ruleset"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_still_covers_modules_when_a_component_is_present() {
+        // The deviation this change makes from its own plan, asserted rather than described.
+        // The plan said the component fold *replaces* the module walk; every rule in this tree
+        // is TypeScript, so that would have taken the whole ruleset out of the cache key.
+        let files: &[(&str, &str)] = &[
+            ("rule.ts", &rule("local/example")),
+            ("lanekeep.config.ts", ""),
+        ];
+        let fixture = Fixture::new("component-and-module", files);
+        fixture.write_all(&[("lanekeep.config.ts", &config_with("rules: [rule]"))]);
+        fixture.write_all(&[("mine.wasm", "\u{0}asm")]);
+
+        let resolved = [fixture.component("mine.wasm")];
+        let root = RuleRoot::new(&fixture.dir).expect("canonicalizes");
+        let hash_after_loading = |source: &str| {
+            fixture.write_all(&[("rule.ts", source)]);
+            let sandbox =
+                sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+            evaluate_into(&sandbox, &root, &fixture.dir.join("lanekeep.config.ts"))
+                .expect("evaluates");
+            hash_ruleset(&sandbox, &resolved)
+        };
+
+        assert_ne!(
+            hex(&hash_after_loading(&rule("local/example"))),
+            hex(&hash_after_loading(&rule("local/renamed"))),
+            "a module edit must still invalidate when a component is in the ruleset too"
+        );
+    }
+
+    #[test]
     fn the_config_hash_ignores_glob_order() {
         // Include and exclude are order-insensitive in effect, so reordering them must not
         // throw away a warm cache for a change that alters nothing.
-        let make = |globs: &str| {
+        let make = |globs: &str, tag: &str| {
             Fixture::new(
-                &format!("glob-order-{}", globs.len()),
+                &format!("glob-order-{tag}"),
                 &[
                     ("rule.ts", &rule("local/example")),
                     (
@@ -1060,8 +1502,8 @@ mod tests {
         };
 
         assert_eq!(
-            hex(&make("['a/**', 'b/**']")),
-            hex(&make("['b/**', 'a/**' ]")),
+            hex(&make("['a/**', 'b/**']", "sorted")),
+            hex(&make("['b/**', 'a/**' ]", "reversed")),
             "reordering globs must not change the config hash"
         );
     }
@@ -1113,6 +1555,379 @@ mod tests {
             hex(&make("", "d")),
             hex(&make(", timeouts: { rule: 5000 }", "t"))
         );
+    }
+
+    /// A JSON rule's options are a cache-key input, and were reaching neither hash.
+    ///
+    /// The same config in the same directory, one option value edited: before this was
+    /// fixed both hashes came back byte-identical, so a warm run kept answering the
+    /// previous configuration. `docs/architecture.md` §8.1 lists options under
+    /// `config_hash`, and the JSON path is where they are known as data.
+    ///
+    /// The fixture is rewritten in place rather than built twice under different names.
+    /// Two directories would move `ruleset_hash` on their own — it hashes each module's
+    /// path alongside its source — which is a difference that looks like the assertion
+    /// passing and is not.
+    #[test]
+    fn the_config_hash_changes_with_a_json_rule_option() {
+        let config =
+            |options: &str| format!(r#"{{"rules": [{{"rule": "./rule", "options": {options}}}]}}"#);
+        let fixture = Fixture::new(
+            "json-option-hash",
+            &[
+                ("rule.ts", &factory_rule("local/example")),
+                ("lanekeep.json", &config(r#"{"limit": 1}"#)),
+            ],
+        );
+
+        let before = fixture.load_json().expect("loads");
+        fixture.write_all(&[("lanekeep.json", &config(r#"{"limit": 2}"#))]);
+        let after = fixture.load_json().expect("loads");
+
+        assert_ne!(
+            hex(&before.config_hash),
+            hex(&after.config_hash),
+            "editing a rule option must invalidate"
+        );
+        assert_eq!(
+            hex(&before.ruleset_hash),
+            hex(&after.ruleset_hash),
+            "no module changed, so the ruleset hash must not move — which is exactly why \
+             the config hash has to"
+        );
+    }
+
+    // --- hashing, the JSON path -------------------------------------------------------
+    //
+    // Matched pairs of the six above. The two formats used to be one mechanism — a JSON
+    // config was compiled into the module a TypeScript one is imported by — so asserting
+    // these properties once covered both. It no longer does, and these are what replaced
+    // that guarantee. A property that holds on one path and not the other is drift, and
+    // drift in a cache key is silent: the run completes and answers with yesterday's
+    // configuration.
+
+    #[test]
+    fn the_ruleset_hash_covers_an_imported_helper_for_json() {
+        let fixture = Fixture::new(
+            "json-helper-hash",
+            &[
+                ("helper.ts", "export const QUERY = '(identifier) @id';\n"),
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     import { QUERY } from './helper';\n\
+                     export default defineRule({\n\
+                       id: 'local/example',\n\
+                       query: QUERY,\n\
+                       card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+                       check() {},\n\
+                     });\n",
+                ),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+
+        let before = fixture.load_json().expect("loads").ruleset_hash;
+        fixture.write_all(&[("helper.ts", "export const QUERY = '(string) @s';\n")]);
+        let after = fixture.load_json().expect("loads").ruleset_hash;
+
+        assert_ne!(
+            hex(&before),
+            hex(&after),
+            "changing an imported helper must invalidate the ruleset hash"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_is_stable_when_nothing_changed_for_json() {
+        let fixture = Fixture::new(
+            "json-stable-hash",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+        let first = fixture.load_json().expect("loads").ruleset_hash;
+        let second = fixture.load_json().expect("loads").ruleset_hash;
+        assert_eq!(hex(&first), hex(&second));
+    }
+
+    #[test]
+    fn the_config_hash_ignores_glob_order_for_json() {
+        let make = |globs: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-glob-order-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "include": {globs}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_eq!(
+            hex(&make(r#"["a/**", "b/**"]"#, "sorted")),
+            hex(&make(r#"["b/**", "a/**"]"#, "reversed")),
+            "reordering globs must not change the config hash"
+        );
+    }
+
+    /// The same property one level down, for the values only this path can see.
+    ///
+    /// `serde_json::Map` is a `BTreeMap` in this build, so the options blob serializes in
+    /// key order whatever order it was written in. That is a property of a dependency's
+    /// feature set rather than of anything written here — `preserve_order` would reverse it
+    /// silently, and the only symptom would be a cache that stops hitting.
+    #[test]
+    fn the_config_hash_ignores_option_key_order() {
+        let make = |options: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-option-order-{tag}"),
+                &[
+                    ("rule.ts", &factory_rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": [{{"rule": "./rule", "options": {options}}}]}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_eq!(
+            hex(&make(r#"{"a": 1, "b": 2}"#, "sorted")),
+            hex(&make(r#"{"b": 2, "a": 1}"#, "reversed")),
+            "reordering option keys must not change the config hash"
+        );
+    }
+
+    #[test]
+    fn the_config_hash_changes_with_severity_for_json() {
+        let make = |severity: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-severity-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "severity": {severity}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make("{}", "none")),
+            hex(&make(r#"{"local/example": "warn"}"#, "warn")),
+            "changing a severity must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_config_hash_changes_with_a_timeout_for_json() {
+        let make = |timeouts: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-timeout-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "timeouts": {timeouts}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(hex(&make("{}", "d")), hex(&make(r#"{"rule": 5000}"#, "t")));
+    }
+
+    /// `"x"` and `{ "rule": "x" }` are different configurations and must not hash alike.
+    ///
+    /// One uses a rule as it comes; the other configures it, with `null`. A rule factory
+    /// reading `options?.strict` behaves differently under the two, so a key that could not
+    /// tell them apart would serve one's results for the other. The fixture's default export
+    /// is deliberately usable both ways, so the *only* difference between the two runs is
+    /// the form the config wrote.
+    #[test]
+    fn the_config_hash_tells_a_bare_rule_from_a_configured_one() {
+        let module = "import { defineRule } from 'lanekeep';\n\
+             const built = defineRule({\n\
+               id: 'local/example',\n\
+               query: '(identifier) @id',\n\
+               card: { message: 'no', remediation: 'do this', examples: { bad: 'a', good: 'b' } },\n\
+               check(ctx, m) { ctx.report(m.id); },\n\
+             });\n\
+             export default Object.assign((options) => built, built);\n";
+
+        let make = |rules: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-rule-form-{tag}"),
+                &[
+                    ("rule.ts", module),
+                    ("lanekeep.json", &format!(r#"{{"rules": [{rules}]}}"#)),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make(r#""./rule""#, "bare")),
+            hex(&make(r#"{"rule": "./rule"}"#, "configured")),
+            "a rule used as it comes and a rule configured with `null` are not the same run"
+        );
+    }
+
+    /// `config_hash` says *which* rule was configured, not merely that something was.
+    ///
+    /// Today `ruleset_hash` would notice this on its own, because two references load two
+    /// different modules. It is pinned here anyway, because Task 15 turns that hash into a
+    /// path-sorted fold over component bytes, and a property held only by the hash that is
+    /// about to be rewritten is a property about to be lost quietly. The two configs below
+    /// differ in nothing `config_hash` sees except the specifier.
+    #[test]
+    fn the_config_hash_tells_apart_two_rules_with_the_same_options() {
+        let make = |name: &str| {
+            Fixture::new(
+                &format!("json-which-rule-{name}"),
+                &[
+                    (
+                        &format!("{name}.ts"),
+                        &factory_rule(&format!("local/{name}")),
+                    ),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": [{{"rule": "./{name}", "options": {{"x": 1}}}}]}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make("a")),
+            hex(&make("b")),
+            "the same options on a different rule is a different configuration"
+        );
+    }
+
+    /// The two formats saying the same thing produce the same configuration.
+    ///
+    /// This is the assertion the shared entry module used to make unnecessary. It cannot
+    /// compare the hashes — a TypeScript config is itself a module in the rule graph, so
+    /// `ruleset_hash` legitimately differs — but everything a run actually does is decided
+    /// by the fields below, and those must agree exactly.
+    #[test]
+    fn the_two_formats_load_the_same_configuration() {
+        let typescript = Fixture::new(
+            "parity-ts",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with(
+                        "rules: [rule], include: ['src/**/*.ts'], exclude: ['**/*.test.ts'], \
+                         severity: { 'local/example': 'warn' }, \
+                         timeouts: { rule: 2000, global: 30000 }",
+                    ),
+                ),
+            ],
+        )
+        .load_config()
+        .expect("the TypeScript config loads");
+
+        let json = Fixture::new(
+            "parity-json",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./rule"], "include": ["src/**/*.ts"],
+                        "exclude": ["**/*.test.ts"], "severity": {"local/example": "warn"},
+                        "timeouts": {"rule": 2000, "global": 30000}}"#,
+                ),
+            ],
+        )
+        .load_json()
+        .expect("the JSON config loads");
+
+        assert_eq!(typescript.include, json.include);
+        assert_eq!(typescript.exclude, json.exclude);
+        assert_eq!(typescript.limits, json.limits);
+        assert_eq!(typescript.rules, json.rules);
+    }
+
+    /// The un-coupling, as a property of the source rather than of a call graph.
+    ///
+    /// `src/json.rs` names neither the sandbox crate nor any type this crate's root imports
+    /// from it. The crate as a whole still depends on it, and deliberately — see the note
+    /// above `entry_source`.
+    ///
+    /// **Grepping for `lanekeep_js` alone is not enough, and the gap is the spelling a
+    /// refactor would reach for first.** The `use lanekeep_js::{…}` below is at the crate
+    /// root, and a `use` at the root is in scope for every descendant module, so this
+    /// compiles inside `json.rs`, reaches the sandbox, and contains no `lanekeep_js` at all:
+    ///
+    /// ```ignore
+    /// use crate::{ConfigError, Sandbox};
+    /// fn probe(s: &Sandbox) -> bool { s.eval::<bool>("true").unwrap_or(false) }
+    /// ```
+    ///
+    /// The forbidden names are therefore read out of that import line rather than listed
+    /// here, so importing a fifth type from that crate extends this check instead of quietly
+    /// outgrowing it.
+    ///
+    /// What it does not cover, stated rather than left to be discovered: reaching the sandbox
+    /// without naming a type, through some crate-level function that takes one. No such
+    /// function exists for `json.rs` to call today. This is a source check, not a proof.
+    #[test]
+    fn the_json_path_names_nothing_from_the_sandbox_crate() {
+        let root = include_str!("lib.rs");
+        let import = root
+            .lines()
+            .find(|line| line.starts_with("use lanekeep_js::{"))
+            .expect("the crate root imports the sandbox crate in one braced list");
+
+        let mut forbidden: Vec<&str> = import
+            .trim_start_matches("use lanekeep_js::{")
+            .trim_end_matches("};")
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert!(
+            forbidden.len() > 1
+                && forbidden
+                    .iter()
+                    .all(|n| n.chars().all(char::is_alphanumeric)),
+            "the import list should have parsed into type names: {forbidden:?}"
+        );
+        forbidden.push("lanekeep_js");
+
+        let source = include_str!("json.rs");
+        for name in forbidden {
+            assert!(
+                !source.contains(name),
+                "src/json.rs must resolve a JSON config without the sandbox, and it names \
+                 `{name}`"
+            );
+        }
     }
 
     #[test]

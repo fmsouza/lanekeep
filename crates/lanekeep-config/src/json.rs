@@ -1,17 +1,16 @@
 //! `lanekeep.json` — configuration without writing TypeScript.
 //!
-//! Rules are TypeScript programs and that is not negotiable; it is the decision ADR-0007
-//! rests on. But *configuration* is a different thing from a rule, and requiring a Go or
-//! Python team to write a `.ts` file to say which rules they want was a coupling with
-//! nothing behind it. `lanekeep init` in a Go project scaffolding TypeScript is the shape of
-//! the problem.
+//! Rules are programs and that is not negotiable; it is the decision ADR-0007 rests on. But
+//! *configuration* is a different thing from a rule, and requiring a Go or Python team to
+//! write a `.ts` file to say which rules they want was a coupling with nothing behind it.
+//! `lanekeep init` in a Go project scaffolding TypeScript is the shape of the problem.
 //!
 //! # How it works
 //!
-//! A JSON config is compiled to the entry module the TypeScript path already produces, then
-//! handed to the same loader. Nothing downstream — extraction, validation, hashing, the
-//! cache key — knows which format it came from, so the two cannot drift in behavior. A
-//! parallel implementation would have been the obvious approach and the wrong one.
+//! This file parses, validates and resolves a JSON config in Rust, with no JavaScript
+//! evaluated at any point. A rule reference — a bare string or a `{ "rule", "options" }`
+//! object — resolves to a [`RuleReference`] naming a built-in, a compiled component or a
+//! rule module, with its `options` carried alongside as data.
 //!
 //! ```json
 //! {
@@ -24,34 +23,123 @@
 //! }
 //! ```
 //!
-//! becomes
-//!
-//! ```js
-//! import __rule0 from 'lanekeep/no-package-init';
-//! import __rule1 from 'lanekeep/no-restricted-imports';
-//! import __rule2 from './lanekeep/rules/no-naked-return.ts';
-//! globalThis.__lanekeepConfig = { include: [...], rules: [__rule0, __rule1({...}), __rule2] };
-//! ```
-//!
 //! # What the two forms mean
 //!
-//! A bare string is a rule used as it comes. The object form calls it with options, which is
-//! what `noRestrictedImports({ ... })` does in a TypeScript config — so the distinction a
-//! rule author already makes between a rule and a rule factory survives, rather than being
-//! guessed at from whether `options` happens to be present.
+//! A bare string is a rule used as it comes. The object form configures it with options,
+//! which is what `noRestrictedImports({ ... })` does in a TypeScript config — so the
+//! distinction a rule author already makes between a rule and a rule factory survives,
+//! rather than being guessed at from whether `options` happens to be present.
+//!
+//! # It used to be compiled into JavaScript, and why it no longer is
+//!
+//! Until this file was un-coupled, a JSON config was compiled into the entry module the
+//! TypeScript path produces and handed to the same loader, so that nothing downstream knew
+//! which format it came from and "the two cannot drift in behavior." That was a deliberate
+//! design and a good one; it is also the mechanism that made `lanekeep.json` depend on a
+//! JavaScript sandbox, which is why removing QuickJS would have broken *config loading*
+//! rather than only rule execution.
+//!
+//! What replaces it is convergence rather than a shared mechanism: both formats still meet
+//! at exactly one place — `crate::build` — which validates, hashes and constructs the
+//! `Config`. Nothing about a rule's identity, severity, card, query or budget is decided
+//! twice. See `lib.rs`'s note above `entry_source` for what the change costs and what now
+//! holds the two paths together.
+//!
+//! One thing does still cross into JavaScript on this path, and it is rule *execution*, not
+//! configuration: a reference naming a TypeScript rule is rendered into a rules-only entry
+//! module by [`rules_module`], because a TypeScript rule's `id`, `query` and `card` live
+//! inside its own `defineRule` call and nothing but evaluating it can read them. A JSON
+//! config naming only components needs no JavaScript at all, which is asserted in `lib.rs`.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use lanekeep_core::files::normalize;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::ConfigError;
 
+/// The prefix a built-in rule reference carries, as in `lanekeep/no-package-init`.
+const BUILTIN_PREFIX: &str = "lanekeep/";
+
+/// The extension marking a reference as a compiled rule component.
+const COMPONENT_EXTENSION: &str = "wasm";
+
 /// Whether this path is a JSON config rather than a module.
 pub(crate) fn is_json(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+}
+
+/// What a rule reference in a `lanekeep.json` names.
+///
+/// Deciding this in Rust is the whole of the un-coupling: a reference used to become an
+/// `import` statement whose meaning only the module loader knew, and is now a value the
+/// rest of the crate can read without evaluating anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleReference {
+    /// A rule shipped with lanekeep. Carries the name after the prefix, so
+    /// `"lanekeep/no-package-init"` is `Builtin("no-package-init")`.
+    ///
+    /// Which bytes that name resolves to is the loader's business today and a
+    /// `fn(&str) -> Option<&'static [u8]>` over embedded components later. Either way the
+    /// name is what a config wrote, and it is decided here.
+    Builtin(String),
+
+    /// A compiled rule component on disk, as in `"./rules/no-package-init.wasm"`.
+    ///
+    /// The path is the reference resolved against the rules root — the same anchor a
+    /// relative module specifier resolves against, since the synthetic entry module sits
+    /// there.
+    ///
+    /// Recognized, not yet executable. Nothing in the tree loads one, and refusing it at
+    /// load is deliberate: a reference that parsed and then silently checked nothing is the
+    /// failure this crate exists to avoid producing more of.
+    Component(PathBuf),
+
+    /// A rule module on disk, as in `"./lanekeep/rules/mine.ts"`.
+    ///
+    /// Carries the specifier as written rather than a path, because the extension is
+    /// optional — `./rule` finds `rule.ts` — and reproducing the loader's search here would
+    /// be a second implementation of it.
+    Module(String),
+}
+
+/// A rule reference, resolved, with the options it was configured with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRule {
+    /// The reference exactly as the config wrote it.
+    pub specifier: String,
+    /// What it names.
+    pub reference: RuleReference,
+    /// The options it was configured with, as data.
+    ///
+    /// `None` is the bare-string form — a rule used as it comes. `Some` is the object form,
+    /// including `{ "rule": "x" }` with no `options` key, which configures it with `null`.
+    /// The distinction is the one a rule author already makes between a rule and a rule
+    /// factory, and it is not inferred from whether a value happens to be present.
+    ///
+    /// **How options reach a *component* is undefined, and this task did not define it.**
+    /// A component cannot close over a host-supplied value the way a JavaScript factory
+    /// does, so it would need a `configure(options-json)` export that
+    /// `crates/lanekeep-wasm/wit/world.wit` deliberately does not declare — inventing one
+    /// here is worse than the omission, because the sub-project that first needs a
+    /// parameterized built-in would have to un-invent it. Until then a component reference
+    /// is refused outright by `rules_module`, with or without options.
+    pub options: Option<Value>,
+}
+
+/// A `lanekeep.json`, parsed and resolved.
+pub(crate) struct Parsed {
+    /// Everything that is configuration data, in the shape [`crate::build`] consumes.
+    ///
+    /// The same struct the TypeScript path fills in from `JSON.stringify`, with `rules`
+    /// left empty — those arrive from extraction, and are the one field on this path that
+    /// still comes from the sandbox.
+    pub(crate) config: crate::RawConfig,
+    /// The rule references, resolved.
+    pub(crate) rules: Vec<ResolvedRule>,
 }
 
 /// A `lanekeep.json`, as written.
@@ -73,14 +161,14 @@ struct JsonConfig {
     #[serde(default)]
     namespaces: Vec<String>,
     #[serde(default)]
-    severity: Value,
+    severity: std::collections::BTreeMap<String, String>,
     #[serde(default)]
-    timeouts: Value,
+    timeouts: crate::RawTimeouts,
     #[serde(default)]
     rules: Vec<JsonRule>,
 }
 
-/// A rule, either used as it comes or called with options.
+/// A rule, either used as it comes or configured with options.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum JsonRule {
@@ -101,15 +189,25 @@ impl JsonRule {
             Self::Configured { rule, .. } => rule,
         }
     }
+
+    fn options(&self) -> Option<Value> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Configured { options, .. } => Some(options.clone()),
+        }
+    }
 }
 
-/// Compile a JSON config into the entry module the loader evaluates.
+/// Read a JSON config and resolve every rule reference, evaluating nothing.
+///
+/// `rules_root` anchors a relative reference, because that is where the synthetic entry
+/// module sits and therefore what a relative specifier has always resolved against.
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError`] when the file cannot be read, is not valid JSON, or names a rule
-/// in a way that cannot be turned into an import.
-pub(crate) fn entry_source(config_path: &Path) -> Result<String, ConfigError> {
+/// in a way that cannot mean anything.
+pub(crate) fn parse(config_path: &Path, rules_root: &Path) -> Result<Parsed, ConfigError> {
     let display = config_path.display().to_string();
 
     let text = std::fs::read_to_string(config_path).map_err(|e| ConfigError::Unreadable {
@@ -122,33 +220,101 @@ pub(crate) fn entry_source(config_path: &Path) -> Result<String, ConfigError> {
         detail: e.to_string(),
     })?;
 
-    let mut imports = String::new();
-    let mut references = Vec::with_capacity(config.rules.len());
-
-    for (index, rule) in config.rules.iter().enumerate() {
+    let mut rules = Vec::with_capacity(config.rules.len());
+    for rule in &config.rules {
         let specifier = rule.specifier();
         validate_specifier(specifier, &display)?;
+        rules.push(ResolvedRule {
+            specifier: specifier.to_owned(),
+            reference: classify(specifier, rules_root),
+            options: rule.options(),
+        });
+    }
+
+    Ok(Parsed {
+        // Every field named, and no `..Default::default()`. This is the load-bearing line of
+        // the whole un-coupling: the two config formats no longer share a mechanism, so the
+        // thing that has to be prevented is one of them quietly not carrying a setting. An
+        // exhaustive literal against the *shared* struct makes that a compile error — adding
+        // `presets` to `RawConfig` fails here with `error[E0063]: missing field 'presets'`,
+        // naming this line — where the arrangement this replaced had no equivalent: the same
+        // omission from the old entry module's `format!` string compiled fine and produced a
+        // config silently missing a setting. Do not "tidy" this into a struct-update.
+        config: crate::RawConfig {
+            include: config.include,
+            exclude: config.exclude,
+            namespaces: config.namespaces,
+            severity: config.severity,
+            timeouts: config.timeouts,
+            rules: Vec::new(),
+        },
+        rules,
+    })
+}
+
+/// Decide what a validated specifier names.
+///
+/// Built-ins are recognized before anything else, exactly as the module loader does, so a
+/// file on disk cannot shadow one. A `.wasm` extension is what distinguishes a compiled
+/// component from a source module; nothing else is ambiguous, because a rule module's
+/// extension is optional and a component's never is — bytes are not searched for by guessing
+/// suffixes.
+fn classify(specifier: &str, rules_root: &Path) -> RuleReference {
+    if let Some(name) = specifier.strip_prefix(BUILTIN_PREFIX) {
+        return RuleReference::Builtin(name.to_owned());
+    }
+    let path = Path::new(specifier);
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(COMPONENT_EXTENSION))
+    {
+        return RuleReference::Component(normalize(&rules_root.join(path)));
+    }
+    RuleReference::Module(specifier.to_owned())
+}
+
+/// Compile the resolved rules into the entry module the loader evaluates.
+///
+/// Only the rules: `include`, `exclude`, `namespaces`, `severity` and `timeouts` are read in
+/// Rust by [`parse`] and never become JavaScript. What is left here is the one thing a
+/// sandbox is still required for — reading a TypeScript rule's own declaration.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Rule`] for a reference naming a component, which is recognized and
+/// not executable.
+pub(crate) fn rules_module(rules: &[ResolvedRule], display: &str) -> Result<String, ConfigError> {
+    let mut imports = String::new();
+    let mut references = Vec::with_capacity(rules.len());
+
+    for (index, rule) in rules.iter().enumerate() {
+        if matches!(rule.reference, RuleReference::Component(_)) {
+            return Err(ConfigError::Rule {
+                position: index + 1,
+                path: display.to_owned(),
+                detail: format!(
+                    "`{}` names a compiled rule component, which this build cannot run yet \
+                     — use a rule module or a built-in",
+                    rule.specifier
+                ),
+            });
+        }
 
         let binding = format!("__lanekeepRule{index}");
-        let _ = writeln!(imports, "import {binding} from {};", js_string(specifier));
+        let _ = writeln!(
+            imports,
+            "import {binding} from {};",
+            js_string(&rule.specifier)
+        );
 
-        references.push(match rule {
-            JsonRule::Plain(_) => binding,
-            JsonRule::Configured { options, .. } => {
-                format!("{binding}({})", literal(options))
-            }
+        references.push(match &rule.options {
+            None => binding,
+            Some(options) => format!("{binding}({})", literal(options)),
         });
     }
 
     Ok(format!(
-        "{imports}globalThis.__lanekeepConfig = {{\n  \
-         include: {},\n  exclude: {},\n  namespaces: {},\n  \
-         severity: {},\n  timeouts: {},\n  rules: [{}],\n}};\n",
-        literal(&config.include),
-        literal(&config.exclude),
-        literal(&config.namespaces),
-        object_or_empty(&config.severity),
-        object_or_empty(&config.timeouts),
+        "{imports}globalThis.__lanekeepConfig = {{ rules: [{}] }};\n",
         references.join(", "),
     ))
 }
@@ -158,6 +324,11 @@ pub(crate) fn entry_source(config_path: &Path) -> Result<String, ConfigError> {
 /// A quote or a newline would end the import statement early and let the rest of the string
 /// be read as code. Nothing legitimate needs either, so refusing is free — and a config file
 /// is exactly the kind of thing that gets generated by a script one day.
+///
+/// Applied to every reference rather than only to the ones still rendered into JavaScript.
+/// A path carrying a quote is not a path anyone means, and a check that holds for some
+/// reference kinds and not others is a check whose coverage depends on a classification made
+/// somewhere else.
 fn validate_specifier(specifier: &str, display: &str) -> Result<(), ConfigError> {
     if specifier.is_empty() {
         return Err(ConfigError::Shape {
@@ -182,22 +353,15 @@ fn validate_specifier(specifier: &str, display: &str) -> Result<(), ConfigError>
 /// are ordinary characters in a JSON string and line terminators in older JavaScript, so a
 /// config containing one would produce a module that does not parse. Escaping them costs
 /// nothing and removes the question.
-fn literal<T: serde::Serialize>(value: &T) -> String {
+///
+/// Also what the options blob is hashed as, where the escaping is irrelevant and the
+/// canonical ordering is not: `serde_json::Map` is a `BTreeMap` here, so two configs writing
+/// the same option keys in a different order serialize identically and hash the same.
+pub(crate) fn literal<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value)
         .unwrap_or_else(|_| "null".to_owned())
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029")
-}
-
-/// `severity` and `timeouts` default to `null` when absent, which the config shape reads as
-/// missing rather than as empty. An object keeps the two indistinguishable from a config
-/// that wrote `{}`.
-fn object_or_empty(value: &Value) -> String {
-    if value.is_null() {
-        "{}".to_owned()
-    } else {
-        literal(value)
-    }
 }
 
 /// A JavaScript single-quoted string. Only called on specifiers already validated above.
@@ -209,17 +373,43 @@ fn js_string(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn compile(json: &str) -> Result<String, ConfigError> {
-        let dir = std::env::temp_dir().join(format!("lanekeep-json-{:x}", json.len()));
+    /// Where a fixture config is written: one directory per caller, named by the caller.
+    ///
+    /// **Two derived names have already raced here, and the second looked like a fix.** The
+    /// first keyed the directory on the config's *length*, so two thirty-eight-byte configs
+    /// shared one file and each test read whichever had been written last. Keying on a hash
+    /// of the *content* was the obvious repair and is still wrong: two tests can legitimately
+    /// use the identical config — `a_component_reference_resolves_to_a_path` and
+    /// `a_component_reference_is_refused_for_now` both write
+    /// `{"rules": ["./rules/mine.wasm"]}` — and `std::fs::write` truncates before it writes,
+    /// so the sibling thread reads an empty file and fails with `EOF while parsing a value at
+    /// line 1 column 0`. Measured five failures in eighty runs of
+    /// `cargo test -p lanekeep-config`. Same bytes is not the same as no race; truncate-then-
+    /// write is not atomic.
+    ///
+    /// An explicit name is the only version with no derivation to be clever about. Two tests
+    /// passing the same name is a visible duplicate rather than a scheduling-dependent one.
+    fn fixture_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("lanekeep-json-{name}"))
+    }
+
+    fn parse_config(name: &str, json: &str) -> Result<Parsed, ConfigError> {
+        let dir = fixture_dir(name);
         std::fs::create_dir_all(&dir).expect("creates dir");
         let path = dir.join("lanekeep.json");
         std::fs::write(&path, json).expect("writes");
-        entry_source(&path)
+        parse(&path, &dir)
+    }
+
+    fn compile(name: &str, json: &str) -> Result<String, ConfigError> {
+        let parsed = parse_config(name, json)?;
+        rules_module(&parsed.rules, "lanekeep.json")
     }
 
     #[test]
     fn a_bare_rule_is_imported_and_used_as_it_comes() {
-        let source = compile(r#"{"rules": ["lanekeep/no-default-export"]}"#).expect("compiles");
+        let source =
+            compile("bare-rule", r#"{"rules": ["lanekeep/no-default-export"]}"#).expect("compiles");
         assert!(source.contains("import __lanekeepRule0 from 'lanekeep/no-default-export';"));
         assert!(source.contains("rules: [__lanekeepRule0]"));
     }
@@ -228,6 +418,7 @@ mod tests {
     fn a_configured_rule_is_called_with_its_options() {
         // The distinction a rule author already makes between a rule and a rule factory.
         let source = compile(
+            "configured-rule",
             r#"{"rules": [{"rule": "lanekeep/no-restricted-imports",
                 "options": {"restrictions": [{"module": "stripe"}]}}]}"#,
         )
@@ -237,42 +428,161 @@ mod tests {
 
     #[test]
     fn a_local_rule_keeps_its_relative_path() {
-        let source = compile(r#"{"rules": ["./lanekeep/rules/mine.ts"]}"#).expect("compiles");
+        let source =
+            compile("local-rule", r#"{"rules": ["./lanekeep/rules/mine.ts"]}"#).expect("compiles");
         assert!(source.contains("from './lanekeep/rules/mine.ts';"));
     }
 
     #[test]
     fn globs_and_namespaces_survive() {
-        let source = compile(
+        let parsed = parse_config(
+            "globs-and-namespaces",
             r#"{"include": ["src/**/*.go"], "exclude": ["**/*_test.go"], "namespaces": ["acme"]}"#,
         )
+        .expect("parses");
+        assert_eq!(parsed.config.include, ["src/**/*.go"]);
+        assert_eq!(parsed.config.exclude, ["**/*_test.go"]);
+        assert_eq!(parsed.config.namespaces, ["acme"]);
+    }
+
+    /// The data half never becomes JavaScript, which is what un-coupling this path meant.
+    ///
+    /// Asserted on the generated module rather than on a call graph, because the module is
+    /// the whole of what the sandbox is asked to evaluate: if a value is not in it, no
+    /// amount of evaluation can reach it.
+    #[test]
+    fn no_configuration_data_reaches_the_entry_module() {
+        let source = compile(
+            "no-data-in-module",
+            r#"{"include": ["src/**/*.go"], "exclude": ["**/*_test.go"],
+                "namespaces": ["acme"], "severity": {"acme/a": "warn"},
+                "timeouts": {"rule": 100, "global": 5000},
+                "rules": ["lanekeep/no-default-export"]}"#,
+        )
         .expect("compiles");
-        assert!(source.contains(r#"include: ["src/**/*.go"]"#));
-        assert!(source.contains(r#"exclude: ["**/*_test.go"]"#));
-        assert!(source.contains(r#"namespaces: ["acme"]"#));
+
+        for absent in [
+            "src/**/*.go",
+            "*_test.go",
+            "acme",
+            "warn",
+            "severity",
+            "timeouts",
+            "include",
+            "exclude",
+        ] {
+            assert!(
+                !source.contains(absent),
+                "`{absent}` should not reach the sandbox: {source}"
+            );
+        }
     }
 
     #[test]
-    fn an_absent_severity_map_becomes_an_empty_object() {
-        // `null` would reach the extractor as a missing field and read as "no map at all",
-        // which is the same thing here but not obviously so. Empty is unambiguous.
-        let source = compile(r#"{"rules": []}"#).expect("compiles");
-        assert!(source.contains("severity: {}"));
-        assert!(source.contains("timeouts: {}"));
+    fn severity_and_timeouts_are_read_in_rust() {
+        let parsed = parse_config(
+            "severity-and-timeouts",
+            r#"{"severity": {"acme/a": "warn"}, "timeouts": {"rule": 100, "global": 5000}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.config.severity.get("acme/a").map(String::as_str),
+            Some("warn")
+        );
+        assert_eq!(parsed.config.timeouts.rule, Some(100));
+        assert_eq!(parsed.config.timeouts.global, Some(5000));
+    }
+
+    #[test]
+    fn a_builtin_resolves_to_its_name() {
+        let parsed =
+            parse_config("builtin", r#"{"rules": ["lanekeep/no-package-init"]}"#).expect("parses");
+        assert_eq!(
+            parsed.rules[0].reference,
+            RuleReference::Builtin("no-package-init".to_owned())
+        );
+        assert_eq!(parsed.rules[0].options, None);
+    }
+
+    #[test]
+    fn a_module_reference_keeps_its_specifier() {
+        let parsed =
+            parse_config("module-ref", r#"{"rules": ["./rules/mine.ts"]}"#).expect("parses");
+        assert_eq!(
+            parsed.rules[0].reference,
+            RuleReference::Module("./rules/mine.ts".to_owned())
+        );
+    }
+
+    /// A component is recognized by its extension and resolved against the rules root.
+    #[test]
+    fn a_component_reference_resolves_to_a_path() {
+        let parsed =
+            parse_config("component-path", r#"{"rules": ["./rules/mine.wasm"]}"#).expect("parses");
+        assert_eq!(
+            parsed.rules[0].reference,
+            RuleReference::Component(
+                fixture_dir("component-path")
+                    .join("rules")
+                    .join("mine.wasm")
+            )
+        );
+    }
+
+    /// Recognized and refused, rather than accepted and quietly doing nothing.
+    #[test]
+    fn a_component_reference_is_refused_for_now() {
+        let error = compile("component-refused", r#"{"rules": ["./rules/mine.wasm"]}"#)
+            .expect_err("a component cannot be executed yet");
+        let rendered = error.to_string();
+        assert!(rendered.contains("component"), "{rendered}");
+        assert!(rendered.contains("mine.wasm"), "{rendered}");
+        assert!(
+            matches!(error, ConfigError::Rule { position: 1, .. }),
+            "the error should name which entry: {error:?}"
+        );
+    }
+
+    /// The object form's `options` are data on the way through, whatever the reference is.
+    #[test]
+    fn options_are_carried_as_data() {
+        let parsed = parse_config(
+            "options-as-data",
+            r#"{"rules": [{"rule": "lanekeep/x", "options": {"limit": 3}}, {"rule": "lanekeep/y"}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.rules[0].options,
+            Some(serde_json::json!({"limit": 3}))
+        );
+        // The object form with no `options` key configures with `null`, which is not the
+        // same as the bare-string form and must not collapse into it.
+        assert_eq!(parsed.rules[1].options, Some(Value::Null));
+    }
+
+    #[test]
+    fn an_absent_severity_map_is_empty_rather_than_missing() {
+        let parsed = parse_config("absent-severity", r#"{"rules": []}"#).expect("parses");
+        assert!(parsed.config.severity.is_empty());
+        assert_eq!(parsed.config.timeouts.rule, None);
+        assert_eq!(parsed.config.timeouts.global, None);
     }
 
     #[test]
     fn the_schema_key_is_accepted_and_ignored() {
         // Editors read it to offer completion. Rejecting it would make the one thing that
         // helps a user before lanekeep runs an error.
-        compile(r#"{"$schema": "https://example.com/s.json", "rules": []}"#)
-            .expect("a $schema key is not an error");
+        compile(
+            "schema-key",
+            r#"{"$schema": "https://example.com/s.json", "rules": []}"#,
+        )
+        .expect("a $schema key is not an error");
     }
 
     #[test]
     fn an_unknown_key_is_refused() {
         // A misspelled key is a setting that silently does nothing.
-        let error = compile(r#"{"includes": ["src/**"]}"#).expect_err("refused");
+        let error = compile("unknown-key", r#"{"includes": ["src/**"]}"#).expect_err("refused");
         assert!(
             format!("{error}").contains("includes"),
             "the error should name the key: {error}"
@@ -283,22 +593,29 @@ mod tests {
     fn a_specifier_that_would_escape_the_import_is_refused() {
         // Nothing legitimate needs a quote in a module specifier, and a config file is
         // exactly the kind of thing a script generates one day.
-        for hostile in [
-            r#"{"rules": ["a'; globalThis.x = 1; import b from 'c"]}"#,
-            "{\"rules\": [\"a\\nimport b from 'c'\"]}",
+        for (name, hostile) in [
+            (
+                "hostile-quote",
+                r#"{"rules": ["a'; globalThis.x = 1; import b from 'c"]}"#,
+            ),
+            (
+                "hostile-newline",
+                "{\"rules\": [\"a\\nimport b from 'c'\"]}",
+            ),
         ] {
-            compile(hostile).expect_err("a specifier with a quote or newline is refused");
+            compile(name, hostile).expect_err("a specifier with a quote or newline is refused");
         }
     }
 
     #[test]
     fn an_empty_specifier_is_refused() {
-        compile(r#"{"rules": [""]}"#).expect_err("an empty specifier cannot import anything");
+        compile("empty-specifier", r#"{"rules": [""]}"#)
+            .expect_err("an empty specifier cannot import anything");
     }
 
     #[test]
     fn malformed_json_is_reported_as_shape() {
-        let error = compile("{ not json }").expect_err("refused");
+        let error = compile("malformed", "{ not json }").expect_err("refused");
         assert!(matches!(error, ConfigError::Shape { .. }));
     }
 
@@ -310,8 +627,17 @@ mod tests {
     /// is how a user learns to ignore the schema.
     ///
     /// So this reads the shipped schema and checks every property it declares actually
-    /// parses, and that the set is exactly the expected one — adding a field to either side
-    /// alone fails here.
+    /// parses, and that the set is exactly the expected one.
+    ///
+    /// **It catches one of those two directions, not both, and the docstring used to claim
+    /// otherwise.** A field added to the schema alone changes `declared` and fails here. A
+    /// field added to `JsonConfig` alone changes neither the schema file nor the list below,
+    /// so it passes — the list is a hand-maintained third copy, and the check is really
+    /// "schema versus list" rather than "schema versus parser". Closing it needs the struct's
+    /// own field names, which `serde` does not expose and which nothing here can read without
+    /// parsing this file's source. Left open deliberately, and stated, because a comment
+    /// claiming a guarantee that is not there is worse than the gap: it is the reason nobody
+    /// looks again.
     #[test]
     fn the_shipped_schema_and_the_parser_agree() {
         let schema: Value =
@@ -350,7 +676,8 @@ mod tests {
             "timeouts": {"rule": 100, "global": 5000},
             "rules": ["lanekeep/no-default-export"]
         }"#;
-        compile(everything).expect("the parser accepts every field the schema declares");
+        compile("schema-agreement", everything)
+            .expect("the parser accepts every field the schema declares");
     }
 
     #[test]
