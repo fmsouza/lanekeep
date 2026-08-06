@@ -425,7 +425,7 @@ key = blake3(
     engine_version_major_minor,   // bump breaks cache intentionally
     host_api_hash,                // what a rule may reach: the ctx surface, the WIT world,
                                   //   and anything bound beside that world
-    wasm_runtime_hash,            // how a component is compiled: wasmtime's own
+    wasm_compile_env_hash,        // how a component is compiled: wasmtime's own
                                   //   precompile-compatibility hash
     every (grammar_id, grammar_abi) in the registry, sorted
     ruleset_hash,                 // rule module sources in the graph, and component bytes
@@ -443,7 +443,9 @@ Grammars enter the key as the **whole registry**, not the one language a given f
 
 `host_api_hash` covers both engines' surfaces. QuickJS's half is still `HOST_API_VERSION`, a constant in `lanekeep-js` that nothing bumps automatically: a `ctx` function added without bumping it serves results computed by a build where the function did not exist — the rule could not have called it, so its verdict was reached without evidence it would have used. The component half is a content hash of `crates/lanekeep-wasm/wit/world.wit`, the file every binding is generated from, so that half needs nobody to remember. Folded in beside it is `lanekeep_wasm::EXTERNAL_BINDINGS`, which declares every interface the host binds *outside* that world — empty today, and not optional the day one is added: a Go rule's map iteration order is decided by whatever fixed entropy source `wasi:random/random` is bound to, so changing that source changes which violation it reports with the world, the component and the config all identical.
 
-`wasm_runtime_hash` is `wasmtime`'s own `Engine::precompile_compatibility_hash`, read off an engine built from `lanekeep-wasm`'s one configuration. A precompiled `.cwasm` records the tunables it was compiled under and `wasmtime` refuses one that disagrees, so those tunables decide whether a component runs at all; the ones that survive that check still decide what the guest computes, because `MEMORY_RESERVATION` and `MEMORY_GUARD_SIZE` together decide whether Cranelift elides bounds checks. It is taken from `wasmtime` rather than listed here because `check_tunables` compares twenty-six fields, three of which are lanekeep's constants and twenty-three of which move with the `wasmtime` version, the target triple *and the resolved feature set* — Cargo's feature unification can move `concurrency_support`, `recording`, `memory_reservation` or `memory_init_cow` without the version moving.
+`wasm_compile_env_hash` is `wasmtime`'s own `Engine::precompile_compatibility_hash`, read off an engine built from `lanekeep-wasm`'s one configuration. A precompiled `.cwasm` records the tunables it was compiled under and `wasmtime` refuses one that disagrees, so those tunables decide whether a component runs at all; the ones that survive that check still decide what the guest computes, because `MEMORY_RESERVATION` and `MEMORY_GUARD_SIZE` together decide whether Cranelift elides bounds checks. It is taken from `wasmtime` rather than listed here because `check_tunables` compares twenty-six fields, three of which are lanekeep's constants and twenty-three of which move with the `wasmtime` version, the target triple *and the resolved feature set* — Cargo's feature unification can move `concurrency_support`, `recording`, `memory_reservation` or `memory_init_cow` without the version moving.
+
+It is a compilation environment and **not** a runtime, which is why it is not named one. Settings that live entirely host-side are outside it on purpose: the memory ceiling is enforced by a resource limiter the compiled code knows nothing about, and the epoch tick interval only changes *when* a breach is noticed. Those are budgets, and §6.8 already says a budget cancels a run rather than changing its answer — so neither belongs in a key.
 
 Value: `{ violations, facts, suppressions, deps }`.
 

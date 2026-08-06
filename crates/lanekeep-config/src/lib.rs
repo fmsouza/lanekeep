@@ -617,7 +617,19 @@ fn build_rule(
 /// **A component that cannot be read folds in a marker rather than nothing.** Skipping it
 /// would make "the component is missing" and "the component is there" hash alike, which is the
 /// shape §8.2 already rules out for tracked reads: absence is an input, because a run that
-/// could not read a rule and one that could must not share a key.
+/// could not read a rule and one that could must not share a key. The marker is not a
+/// separator — a `.wasm` is arbitrary binary and can contain whichever byte it is — so the
+/// bytes are length-prefixed as well, and `two_components_cannot_run_together_into_one` is
+/// what says so.
+///
+/// # `resolved` is empty for a TypeScript config, so this half is JSON-only today
+///
+/// `load` passes `Vec::new()` on the TypeScript path, because only a `lanekeep.json` produces
+/// a [`RuleReference::Component`]. That is consistent rather than a hole *while that stays
+/// true*: a TypeScript config cannot name a component at all, so there are no component bytes
+/// to miss. **The day it can, this is the branch that silently stops covering them** — a
+/// component named from `lanekeep.config.ts` would reach no hash, and nothing here would fail.
+/// Whoever adds that path owes this function the reference list, not just the loader.
 fn hash_ruleset(sandbox: &Sandbox, resolved: &[ResolvedRule]) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-ruleset-v2");
@@ -1271,6 +1283,41 @@ mod tests {
             hex(&before),
             hex(&after),
             "rebuilding a rule component must invalidate its cached results"
+        );
+    }
+
+    #[test]
+    fn two_components_cannot_run_together_into_one() {
+        // The reason a component's bytes are length-prefixed, and the reason a test for it has
+        // to use bytes that carry the marker.
+        //
+        // A module's source is text and its separator is a NUL. A component is arbitrary
+        // binary, so **any** byte used as a separator can appear inside it — including the
+        // `0x01` present-marker, which is what would be doing the delimiting if the length
+        // prefix were dropped. These two rulesets are genuinely different and fold to the
+        // identical byte sequence without it, under an identical component count:
+        //
+        //   A:  01 'A' 'A' | 01 'B' 'B' 01 'C' 'C'      a = "AA",       b = "BB\x01CC"
+        //   B:  01 'A' 'A' 01 'B' 'B' | 01 'C' 'C'      a = "AA\x01BB", b = "CC"
+        //
+        // Two different rulesets sharing a cache key is the one failure `docs/architecture.md`
+        // §8.1 exists to prevent, so it is asserted here rather than left to the fact that
+        // nothing writes a `.wasm` by hand.
+        let fixture = Fixture::new("component-run-together", &[("a.wasm", ""), ("b.wasm", "")]);
+        let sandbox = fixture.empty_sandbox();
+        let resolved = [fixture.component("a.wasm"), fixture.component("b.wasm")];
+
+        fixture.write_all(&[("a.wasm", "AA"), ("b.wasm", "BB\u{1}CC")]);
+        let split_early = hash_ruleset(&sandbox, &resolved);
+
+        fixture.write_all(&[("a.wasm", "AA\u{1}BB"), ("b.wasm", "CC")]);
+        let split_late = hash_ruleset(&sandbox, &resolved);
+
+        assert_ne!(
+            hex(&split_early),
+            hex(&split_late),
+            "two components must not be able to concatenate into one byte sequence — the \
+             present-marker is not a separator, because a component can contain it"
         );
     }
 

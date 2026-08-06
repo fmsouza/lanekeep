@@ -90,6 +90,16 @@ pub enum RunError {
     /// host where no result can be filed under a key that means anything. Guessing a value
     /// instead would put entries under a key describing nothing, which is the one failure
     /// `docs/architecture.md` §8.1 is arranged against.
+    ///
+    /// **What this costs, stated plainly: a host where `wasmtime` cannot build an engine can
+    /// now run no rules at all — including a ruleset that is entirely TypeScript and needs no
+    /// WebAssembly whatever.** That is a real reduction in reach for no benefit until a
+    /// component actually executes, and it is the price of keying every run against the
+    /// environment rather than only the runs that use it. The alternative is a sentinel for
+    /// "no wasm here", which is a second code path through the cache key whose correctness
+    /// nothing would exercise until the first component arrived. Worth revisiting if this ever
+    /// fires on a real host; nothing has seen it fire, because the configuration is three
+    /// tunables on a supported target.
     #[error(
         "the WebAssembly runtime could not be configured on this host\n  {detail}\n  \
          this is a broken build rather than anything about a rule"
@@ -1601,7 +1611,7 @@ fn run_key(
     config_hash: &[u8],
     grammars: &[GrammarKey],
 ) -> Result<RunKey, RunError> {
-    let wasm_runtime = lanekeep_wasm::compile_env_hash().map_err(|e| RunError::WasmRuntime {
+    let compile_env = lanekeep_wasm::compile_env_hash().map_err(|e| RunError::WasmRuntime {
         detail: e.to_string(),
     })?;
 
@@ -1610,7 +1620,7 @@ fn run_key(
         // invalidating every cache on one would make patch upgrades expensive for nothing.
         engine_version(),
         &host_api_hash(),
-        &wasm_runtime,
+        &compile_env,
         ruleset_hash,
         config_hash,
         grammars,
@@ -1735,7 +1745,7 @@ mod tests {
         let content = lanekeep_core::ContentHash::new([7; 32]);
         let real = run_key(b"ruleset", b"config", &grammars).expect("the runtime describes itself");
 
-        for (label, host_api, wasm_runtime) in [
+        for (label, host_api, compile_env) in [
             (
                 "the WebAssembly compilation environment",
                 host_api_hash().to_vec(),
@@ -1752,7 +1762,7 @@ mod tests {
             let without = RunKey::new(
                 engine_version(),
                 &host_api,
-                &wasm_runtime,
+                &compile_env,
                 b"ruleset",
                 b"config",
                 &grammars,

@@ -44,22 +44,36 @@ impl RunKey {
     /// hand-maintained number because a number has to be remembered: `lanekeep-js`'s
     /// `HOST_API_VERSION` says so in its own documentation, and nothing detects a missed bump.
     ///
-    /// `wasm_runtime_hash` is **how a component is compiled**, which is a different question
-    /// with the same failure mode. A precompiled `.cwasm` records the tunables it was built
-    /// under and `wasmtime` refuses one that disagrees, so those tunables decide whether a
-    /// component runs at all — and the ones that survive that check still decide what the
-    /// guest computes, because they move Cranelift's codegen. Both callers derive it from
+    /// `wasm_compile_env_hash` is **how a component is compiled**, which is a different
+    /// question with the same failure mode. A precompiled `.cwasm` records the tunables it was
+    /// built under and `wasmtime` refuses one that disagrees, so those tunables decide whether
+    /// a component runs at all — and the ones that survive that check still decide what the
+    /// guest computes, because they move Cranelift's codegen. Callers derive it from
     /// `wasmtime`'s own compatibility hash rather than by listing fields, so a `wasmtime`
     /// upgrade that moves a field nobody here has heard of still invalidates.
+    ///
+    /// **A compilation environment and not a runtime**, which is why it is not called one.
+    /// Settings that live entirely host-side are deliberately outside it: the memory ceiling
+    /// is enforced by a `ResourceLimiter` the compiled code knows nothing about, and the epoch
+    /// tick interval only changes *when* a breach is noticed. Both are budgets rather than
+    /// inputs, and neither belongs in a key. If a host-side setting ever does change a result,
+    /// it needs its own field rather than a quiet widening of this one.
     ///
     /// They are two fields rather than one because they answer to different owners — the
     /// trust boundary and the compiler — and because a test that can only move both at once
     /// cannot tell which of them the key actually covers.
+    ///
+    /// # Both are digests, and that is the caller's promise rather than this encoding's
+    ///
+    /// Every field here is length-prefixed, so nothing depends on the two being any particular
+    /// width. But they are both 32-byte `blake3` digests in practice, which is worth knowing
+    /// because it is what makes a *caller* mixing them up the only realistic way to get this
+    /// pair wrong — and this is public API, so a future caller could pass something else.
     #[must_use]
     pub fn new(
         engine_version: &str,
         host_api_hash: &[u8],
-        wasm_runtime_hash: &[u8],
+        wasm_compile_env_hash: &[u8],
         ruleset_hash: &[u8],
         config_hash: &[u8],
         grammars: &[GrammarKey],
@@ -73,7 +87,7 @@ impl RunKey {
         write_field(&mut prefix, &FORMAT_VERSION.to_le_bytes());
         write_field(&mut prefix, engine_version.as_bytes());
         write_field(&mut prefix, host_api_hash);
-        write_field(&mut prefix, wasm_runtime_hash);
+        write_field(&mut prefix, wasm_compile_env_hash);
         write_field(&mut prefix, ruleset_hash);
         write_field(&mut prefix, config_hash);
 
@@ -273,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_wasm_runtime_hash_changes_the_key() {
+    fn changing_the_wasm_compile_env_hash_changes_the_key() {
         // A precompiled component records the tunables it was compiled under, and an engine
         // configured differently cannot load it. The ones that do load still decide what the
         // guest computes — a bounds check elided or emitted is a codegen difference — so a
