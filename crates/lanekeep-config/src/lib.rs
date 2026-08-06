@@ -451,7 +451,7 @@ fn build(
         limits = limits.with_global_timeout(Duration::from_millis(ms));
     }
 
-    let ruleset_hash = hash_ruleset(sandbox);
+    let ruleset_hash = hash_ruleset(sandbox, resolved);
     let config_hash = hash_config(&raw.include, &raw.exclude, &overrides, &limits, resolved);
 
     Ok(Config {
@@ -582,7 +582,7 @@ fn build_rule(
     })
 }
 
-/// Hash every module the loader read.
+/// Hash the code every rule in this run is made of: modules the loader read, and components.
 ///
 /// # A correction to the architecture
 ///
@@ -597,9 +597,30 @@ fn build_rule(
 /// That is over-invalidation, which costs a recompute. The alternative error —
 /// under-invalidating and serving results computed by code that no longer exists — is the
 /// one §8 exists to prevent, and it is not symmetric with this one.
-fn hash_ruleset(sandbox: &Sandbox) -> Hash {
+///
+/// # Two kinds of rule code, and why both are folded here rather than one replacing the other
+///
+/// A component's bytes are the same input as a module's source: the code that decided the
+/// answer. The plan for this change described the component fold as replacing the module walk,
+/// which would be correct in a world where every rule is a component and is a silent
+/// under-invalidation in this one — every rule in this tree is TypeScript, and dropping the
+/// walk would take the whole ruleset out of the cache key. So both are folded, and the module
+/// walk leaves when the last module does.
+///
+/// A component is hashed by its **bytes and not its path**, sorted by path so the order is
+/// fixed. A resolved component path is absolute, and putting it in would make the key depend
+/// on where the checkout sits — a cache invalidated by moving a directory, for nothing. Which
+/// component a rule *names*, and with which options, is `hash_config`'s to carry; this hash is
+/// about the code. Duplicates collapse for the same reason: listing one component twice is a
+/// configuration difference, not a different program.
+///
+/// **A component that cannot be read folds in a marker rather than nothing.** Skipping it
+/// would make "the component is missing" and "the component is there" hash alike, which is the
+/// shape §8.2 already rules out for tracked reads: absence is an input, because a run that
+/// could not read a rule and one that could must not share a key.
+fn hash_ruleset(sandbox: &Sandbox, resolved: &[ResolvedRule]) -> Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lanekeep-ruleset-v1");
+    hasher.update(b"lanekeep-ruleset-v2");
 
     if let Some(loaded) = sandbox.loaded_modules() {
         // The map is ordered, so the hash does not depend on load order — which varies with
@@ -609,6 +630,30 @@ fn hash_ruleset(sandbox: &Sandbox) -> Hash {
             hasher.update(&[0]);
             hasher.update(source.as_bytes());
             hasher.update(&[0]);
+        }
+    }
+
+    let mut components: Vec<&Path> = resolved
+        .iter()
+        .filter_map(|rule| match &rule.reference {
+            RuleReference::Component(path) => Some(path.as_path()),
+            RuleReference::Builtin(_) | RuleReference::Module(_) => None,
+        })
+        .collect();
+    components.sort_unstable();
+    components.dedup();
+
+    hasher.update(b"components");
+    length_prefixed(&mut hasher, &(components.len() as u64).to_le_bytes());
+    for path in components {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                hasher.update(&[1]);
+                length_prefixed(&mut hasher, &bytes);
+            }
+            Err(_) => {
+                hasher.update(&[0]);
+            }
         }
     }
 
@@ -805,6 +850,26 @@ mod tests {
             let sandbox =
                 sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
             load(&sandbox, &root, &self.dir.join(name))
+        }
+
+        /// A sandbox over this fixture, with nothing loaded into it.
+        ///
+        /// For the component half of `ruleset_hash`, which cannot be reached through `load`:
+        /// a `.wasm` reference is refused before a `Config` is built, because this build runs
+        /// no components yet. The hash is still where a component's bytes have to be by the
+        /// time one runs, and a cache-key input nothing exercises is how one goes missing.
+        fn empty_sandbox(&self) -> Sandbox {
+            let root = RuleRoot::new(&self.dir).expect("canonicalizes");
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox")
+        }
+
+        /// A resolved reference to a component inside this fixture.
+        fn component(&self, name: &str) -> ResolvedRule {
+            ResolvedRule {
+                specifier: format!("./{name}"),
+                reference: RuleReference::Component(self.dir.join(name)),
+                options: None,
+            }
         }
     }
 
@@ -1188,6 +1253,147 @@ mod tests {
         let first = fixture.load_config().expect("loads").ruleset_hash;
         let second = fixture.load_config().expect("loads").ruleset_hash;
         assert_eq!(hex(&first), hex(&second));
+    }
+
+    #[test]
+    fn the_ruleset_hash_covers_a_components_bytes() {
+        // The component half of the same property `the_ruleset_hash_covers_an_imported_helper`
+        // asserts for modules: editing the code a rule is made of must invalidate.
+        let fixture = Fixture::new("component-bytes", &[("mine.wasm", "\u{0}asm-one")]);
+        let sandbox = fixture.empty_sandbox();
+        let resolved = [fixture.component("mine.wasm")];
+
+        let before = hash_ruleset(&sandbox, &resolved);
+        fixture.write_all(&[("mine.wasm", "\u{0}asm-two")]);
+        let after = hash_ruleset(&sandbox, &resolved);
+
+        assert_ne!(
+            hex(&before),
+            hex(&after),
+            "rebuilding a rule component must invalidate its cached results"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_ignores_where_a_component_sits() {
+        // A resolved component path is absolute. Hashing it would mean a cache thrown away by
+        // moving a checkout, for a change to nothing a rule can observe — and which component
+        // a rule *names* is already `config_hash`'s, through the specifier.
+        let fixture = Fixture::new(
+            "component-path",
+            &[("a.wasm", "\u{0}asm-same"), ("nested/b.wasm", "")],
+        );
+        fixture.write_all(&[("nested/b.wasm", "\u{0}asm-same")]);
+        let sandbox = fixture.empty_sandbox();
+
+        assert_eq!(
+            hex(&hash_ruleset(&sandbox, &[fixture.component("a.wasm")])),
+            hex(&hash_ruleset(
+                &sandbox,
+                &[fixture.component("nested/b.wasm")]
+            )),
+            "the same component bytes are the same ruleset wherever they sit"
+        );
+    }
+
+    #[test]
+    fn a_component_that_cannot_be_read_is_not_one_that_can() {
+        // §8.2's "absence is a dependency", one level up. A component that is missing and one
+        // that is present must not share a key, or adding the file changes nothing until
+        // something unrelated invalidates the entry.
+        let fixture = Fixture::new("component-absent", &[("a-present.wasm", "")]);
+        let sandbox = fixture.empty_sandbox();
+
+        assert_ne!(
+            hex(&hash_ruleset(
+                &sandbox,
+                &[fixture.component("a-present.wasm")]
+            )),
+            hex(&hash_ruleset(&sandbox, &[fixture.component("b-gone.wasm")])),
+            "an unreadable component must not hash as an empty one"
+        );
+
+        // And *which* one is missing has to be distinguishable, which is what the marker buys
+        // over simply skipping the entry. Two references, one file present at each: skip the
+        // absent one and both runs fold the identical bytes, so a ruleset with one rule broken
+        // shares a key with the ruleset that has the other one broken. The count is hashed
+        // already, so nothing else would notice.
+        fixture.write_all(&[("b-present.wasm", "")]);
+        assert_ne!(
+            hex(&hash_ruleset(
+                &sandbox,
+                &[
+                    fixture.component("a-present.wasm"),
+                    fixture.component("b-gone.wasm"),
+                ]
+            )),
+            hex(&hash_ruleset(
+                &sandbox,
+                &[
+                    fixture.component("a-gone.wasm"),
+                    fixture.component("b-present.wasm"),
+                ]
+            )),
+            "which component is missing must be part of the hash, not only how many are"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_ignores_the_order_and_the_repetition_of_a_component() {
+        // The "change nothing, assert the key does not move" half. `ruleset_hash` is about the
+        // code a run is made of; which rules a config lists, in what order and how often, is
+        // `hash_config`'s — where the order is deliberately *not* normalized. Sorting and
+        // deduplicating here means a config edit that only reorders costs no recompute.
+        let fixture = Fixture::new(
+            "component-order",
+            &[("one.wasm", "\u{0}asm-one"), ("two.wasm", "\u{0}asm-two")],
+        );
+        let sandbox = fixture.empty_sandbox();
+        let one = fixture.component("one.wasm");
+        let two = fixture.component("two.wasm");
+
+        let canonical = hex(&hash_ruleset(&sandbox, &[one.clone(), two.clone()]));
+        assert_eq!(
+            canonical,
+            hex(&hash_ruleset(&sandbox, &[two.clone(), one.clone()])),
+            "reordering two components is not a different ruleset"
+        );
+        assert_eq!(
+            canonical,
+            hex(&hash_ruleset(&sandbox, &[one.clone(), two, one])),
+            "naming one component twice is not a different ruleset"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_still_covers_modules_when_a_component_is_present() {
+        // The deviation this change makes from its own plan, asserted rather than described.
+        // The plan said the component fold *replaces* the module walk; every rule in this tree
+        // is TypeScript, so that would have taken the whole ruleset out of the cache key.
+        let files: &[(&str, &str)] = &[
+            ("rule.ts", &rule("local/example")),
+            ("lanekeep.config.ts", ""),
+        ];
+        let fixture = Fixture::new("component-and-module", files);
+        fixture.write_all(&[("lanekeep.config.ts", &config_with("rules: [rule]"))]);
+        fixture.write_all(&[("mine.wasm", "\u{0}asm")]);
+
+        let resolved = [fixture.component("mine.wasm")];
+        let root = RuleRoot::new(&fixture.dir).expect("canonicalizes");
+        let hash_after_loading = |source: &str| {
+            fixture.write_all(&[("rule.ts", source)]);
+            let sandbox =
+                sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+            evaluate_into(&sandbox, &root, &fixture.dir.join("lanekeep.config.ts"))
+                .expect("evaluates");
+            hash_ruleset(&sandbox, &resolved)
+        };
+
+        assert_ne!(
+            hex(&hash_after_loading(&rule("local/example"))),
+            hex(&hash_after_loading(&rule("local/renamed"))),
+            "a module edit must still invalidate when a component is in the ruleset too"
+        );
     }
 
     #[test]
