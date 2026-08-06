@@ -1,11 +1,15 @@
 //! The three limits, enforced against a real component.
 //!
-//! One case per case in `crates/lanekeep-js/src/sandbox.rs`'s limit tests, named the same,
-//! because the limits are the same: `lanekeep_core::limits` is shared, not copied, and a
-//! reader comparing the two engines should be comparing behavior rather than vocabulary. The
-//! guest is `tests/fixtures/limits/`, which offers a rule that never terminates, one that
-//! never stops allocating, one that returns immediately, and one that does a host-chosen
-//! amount of real work.
+//! One case per case in `crates/lanekeep-js/src/sandbox.rs`'s limit tests, named the same where
+//! they mean the same, because the limits are the same: `lanekeep_core::limits` is shared, not
+//! copied, and a reader comparing the two engines should be comparing behavior rather than
+//! vocabulary. The one exception is
+//! [`a_breach_leaves_the_diagnostic_intact_and_the_store_dead`], which is *not* named after its
+//! counterpart because half of what it asserts is the opposite of what that name claims.
+//!
+//! The guest is `tests/fixtures/limits/`: a rule that never terminates, one that never stops
+//! allocating, one that returns immediately, one that does a host-chosen amount of real work,
+//! and one that reads three struct fields through a dynamic index.
 //!
 //! # What each assertion has to survive
 //!
@@ -21,10 +25,16 @@
 //! because `AGENTS.md` records a flag that was validated and then dropped: a test that only
 //! *lowers* a limit passes against that bug, since a run completes either way.
 //!
-//! # The two cases at the end are not correctness tests
+//! # Two of these are not correctness tests
 //!
-//! [`the_run_budget_is_not_checked_between_invocations`] records a **known gap**, closed by the
-//! plan's Task 17 and not by this module. Its assertion is expected to change when that lands.
+//! [`nothing_outside_the_epoch_mechanism_consults_the_run_budget`] records a **known gap**,
+//! closed by the plan's Task 17 and not by this module. Its assertion is expected to change
+//! when that lands.
+//!
+//! [`the_probe_the_guard_decision_was_measured_on_still_works`] asserts nothing about a limit
+//! at all. It keeps the `strided` probe alive, because that probe is the evidence
+//! `lanekeep_wasm::runtime::MEMORY_GUARD_SIZE` rests on and one nothing calls is one that can
+//! rot into a measurement nobody can reproduce.
 
 // `clippy.toml`'s `allow-expect-in-tests` reaches `#[test]` functions and `#[cfg(test)]`
 // modules and nothing else, so the helpers below — which are neither — need the grant
