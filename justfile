@@ -98,6 +98,24 @@ wasm-fixtures:
            "${root}/crates/lanekeep-wasm/tests/fixtures/${name}.wasm"
     done
 
+    # And exactly one artifact built for the target every line above exists to avoid.
+    #
+    # `tests/load.rs` asserts that the load-time import check rejects a wrongly-targeted
+    # component, and a check like that is only worth as much as the artifact it is pointed
+    # at. Built here rather than described, because `AGENTS.md` records that a guest small
+    # enough to allocate nothing has zero imports on *both* targets — so the difference has
+    # to be produced to be believed.
+    #
+    # It sits one directory deeper than its siblings so the loop above cannot pick it up and
+    # build it for the right target, and so `tests/world_shape.rs`'s glob over
+    # `tests/fixtures/*.wasm` — which asserts every artifact it finds imports nothing but the
+    # host interface — does not find the one artifact that must fail that assertion.
+    echo "building wasip1 (deliberately for wasm32-wasip1)"
+    dir="crates/lanekeep-wasm/tests/fixtures/rejected/wasip1/"
+    (cd "${dir}" && cargo component build --release --target wasm32-wasip1)
+    cp "${dir}target/wasm32-wasip1/release/wasip1.wasm" \
+       "${root}/crates/lanekeep-wasm/tests/fixtures/rejected/wasip1.wasm"
+
 # Tests for the repository's own shell tooling.
 #
 # lint-commit-msg.sh gates every commit and every pull request title, and the title is

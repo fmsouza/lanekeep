@@ -536,6 +536,19 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// Importing nothing at all passes — `spike.wasm` targets its own `wit/spike.wit` and reaches
 /// no part of `std` that touches the adapter — because importing nothing is strictly less
 /// authority, never more.
+///
+/// # The one artifact this deliberately does not see
+///
+/// `tests/fixtures/rejected/wasip1.wasm` is built for `wasm32-wasip1` on purpose, so that
+/// `tests/load.rs` can point the load-time import check at a real wrongly-targeted component
+/// rather than a synthetic approximation of one. It imports ten WASI interfaces and would fail
+/// every assertion below.
+///
+/// It is out of scope here by *location* and not by name, which is the same reasoning that
+/// made this test a glob: the read below is not recursive, so an artifact in a subdirectory is
+/// not a fixture as far as this test is concerned, and there is no exemption list for anyone
+/// to add to. An artifact that ever appears beside its siblings is checked, whatever it is
+/// called.
 #[test]
 fn no_fixture_artifact_imports_ambient_authority() {
     let engine = engine().expect("the shipped wasmtime configuration builds an engine");

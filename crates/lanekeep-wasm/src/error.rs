@@ -76,6 +76,34 @@ pub enum WasmError {
         message: String,
     },
 
+    /// A component reaches for capability the sandbox does not grant.
+    ///
+    /// Read off the artifact's import list before it is instantiated, and a variant of its
+    /// own rather than an [`WasmError::Engine`] string because it is the one failure here
+    /// that is about *authority* rather than about a broken build. See `crate::load`.
+    ///
+    /// **A rejection here is not the same as a failure to instantiate**, even though today
+    /// an offending component would also fail to instantiate. That protection is a
+    /// consequence of this host declining to link WASI, and it disappears the moment any
+    /// host links WASI for any reason; this one does not.
+    #[error(
+        "rule component `{name}` imports capability the sandbox does not grant: {}\n  \
+         permitted: {}\n  \
+         the usual cause is a component built for `wasm32-wasip1` rather than \
+         `wasm32-unknown-unknown` — `cargo component` defaults to the former, whose \
+         adapter imports a wall clock and a filesystem as soon as the guest touches `std`",
+        .imports.join(", "),
+        if .permitted.is_empty() { "nothing".to_owned() } else { .permitted.join(", ") }
+    )]
+    ForbiddenImports {
+        /// Whatever identifies the artifact to a reader — a rule id, or a path.
+        name: String,
+        /// The imports that were not permitted, sorted.
+        imports: Vec<String>,
+        /// The set that was permitted, sorted.
+        permitted: Vec<String>,
+    },
+
     /// The runtime failed for a reason lanekeep does not model.
     ///
     /// Building an engine, compiling a component, linking the world, instantiating: the
@@ -184,6 +212,54 @@ mod tests {
             .is_limit_breach()
         );
         assert!(!WasmError::Engine("odd".to_owned()).is_limit_breach());
+        assert!(
+            !WasmError::ForbiddenImports {
+                name: "example".to_owned(),
+                imports: vec!["wasi:clocks/wall-clock@0.2.3".to_owned()],
+                permitted: Vec::new(),
+            }
+            .is_limit_breach()
+        );
+    }
+
+    #[test]
+    fn a_forbidden_import_is_named_and_so_is_the_usual_cause() {
+        // The whole value of this variant over `Engine(String)` is that a reader learns
+        // which import and what to do about it. A message that named neither would still
+        // fail the run and would tell nobody why.
+        let rendered = WasmError::ForbiddenImports {
+            name: "acme/no-console".to_owned(),
+            imports: vec![
+                "wasi:clocks/wall-clock@0.2.3".to_owned(),
+                "wasi:filesystem/types@0.2.3".to_owned(),
+            ],
+            permitted: vec!["lanekeep:host/types@0.1.0".to_owned()],
+        }
+        .to_string();
+        assert!(rendered.contains("acme/no-console"), "{rendered}");
+        assert!(
+            rendered.contains("wasi:clocks/wall-clock@0.2.3"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("wasi:filesystem/types@0.2.3"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("lanekeep:host/types@0.1.0"), "{rendered}");
+        assert!(rendered.contains("wasm32-wasip1"), "{rendered}");
+    }
+
+    #[test]
+    fn an_empty_permitted_set_reads_as_nothing_rather_than_as_a_blank() {
+        // `permitted: ` with an empty line after it reads as a formatting bug rather than
+        // as the deliberate answer it is.
+        let rendered = WasmError::ForbiddenImports {
+            name: "example".to_owned(),
+            imports: vec!["lanekeep:host/types@0.1.0".to_owned()],
+            permitted: Vec::new(),
+        }
+        .to_string();
+        assert!(rendered.contains("permitted: nothing"), "{rendered}");
     }
 
     #[test]

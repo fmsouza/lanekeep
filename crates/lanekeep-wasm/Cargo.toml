@@ -22,6 +22,12 @@ categories.workspace = true
 exclude = ["tests/**"]
 
 [dependencies]
+# `blake3` for the name a precompiled component is kept under. Content-addressing the
+# artifact is the whole of its invalidation strategy — a changed component is a different
+# file rather than a stale one — and it is the same hash `lanekeep-cache` and
+# `lanekeep-config` key on, so a reader meets one digest across the project rather than two.
+blake3 = { workspace = true }
+
 # `lanekeep-core` for `Fix`, which is what `report`'s `fix` parameter becomes once the node
 # it names has been resolved to a byte range, and `lanekeep-nodes` for the arena both engines
 # read. Neither edge existed before `src/host.rs`, because `cargo machete` fails an unused

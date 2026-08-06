@@ -21,6 +21,7 @@ doc-valid-idents = [
     "ESLint",
     "TypeScript",
     "JavaScript",
+    "TinyGo",
     "..",
 ]
 

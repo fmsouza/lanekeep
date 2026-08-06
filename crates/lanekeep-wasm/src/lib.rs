@@ -1,9 +1,16 @@
 //! WebAssembly component runtime for lanekeep rules.
 //!
 //! This crate owns the execution of rule components: the [`wasmtime::Engine`] they run on,
-//! the WIT host API they are linked against, and — as later milestones land — the
-//! precompiled artifacts they are loaded from. It sits beside `lanekeep-js` rather than
-//! replacing it; QuickJS leaves the tree only once the last rule has migrated.
+//! the WIT host API they are linked against, and the precompiled artifacts they are loaded
+//! from. It sits beside `lanekeep-js` rather than replacing it; QuickJS leaves the tree only
+//! once the last rule has migrated.
+//!
+//! Three modules and one order. [`load`] decides whether a component may run at all — by
+//! reading its import list, before instantiation and independently of what the host happens
+//! to link — and where its compiled form comes from, which is a mapped `.cwasm` in lanekeep's
+//! own cache directory whenever there is one. [`runtime::RuleSet`] resolves each admitted
+//! component against the host world once for the run. [`runtime::WasmRuntime`] is one store
+//! per worker, holding one lazily built instance per rule.
 //!
 //! # The boundary lives in `wit/world.wit`
 //!
@@ -95,6 +102,7 @@
 pub mod bindings;
 pub mod error;
 pub mod host;
+pub mod load;
 pub mod runtime;
 
 // Private, and the visibility is the claim: nothing outside this crate validates a fact,
@@ -104,4 +112,5 @@ pub mod runtime;
 mod facts;
 
 pub use error::WasmError;
-pub use runtime::{WasmEngine, WasmRuntime, engine};
+pub use load::{ComponentLoader, LoadSource, PermittedImports};
+pub use runtime::{RuleSet, RuleSlot, WasmEngine, WasmRuntime, engine};
