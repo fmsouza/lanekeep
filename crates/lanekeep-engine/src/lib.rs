@@ -4968,8 +4968,10 @@ export default defineRule({
     /// real work would be stopped by the interrupt handler, and the test would pass against
     /// the bug.
     ///
-    /// Measured against the commit before this one, all three of these fixtures ran to
-    /// completion: 400 files and 400 `check` invocations in 84 ms under a 1 ms budget.
+    /// Measured against the commit before this one, this corpus ran to completion: 400 files
+    /// and 400 `check` invocations in 84 ms under a 1 ms budget, with nothing ever asked to
+    /// stop. That measurement is what says these cases are not passing for a reason unrelated
+    /// to the check they are about.
     mod run_budget {
         use super::*;
 
