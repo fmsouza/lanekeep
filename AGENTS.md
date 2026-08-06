@@ -418,6 +418,15 @@ of them. Nothing fails: the rule loads, the query never runs, and the output rea
 a codebase with none of the thing in it. There is no *or* form, so a rule with no single
 covering substring omits the gate rather than writing one that is wrong.
 
+**A fixture directory named after the *length* of its content collides, and the collision reads as
+an unrelated test failing.** `json.rs`'s test helper wrote into
+`temp_dir()/lanekeep-json-{len:x}`; two configs of thirty-eight bytes shared one directory, tests
+run in parallel, and each read whichever had been written last. The suite passed most runs. It
+surfaced during mutation testing, where a mutation of the hashing code was reported as breaking a
+specifier-parsing assertion — which is worse than a flake, because the whole point of that exercise
+is trusting the attribution. Key a shared fixture path on the content (`blake3` of it, truncated),
+where a collision means identical bytes and sharing is harmless.
+
 **A node handle is an integer and the root's is `0`, so `if (!node)` discards it.** Nodes cross
 into the sandbox as handles rather than objects — one of the one-way doors in §14 — and the
 root is handle zero. A rule written the ordinary JavaScript way, `const parent = ctx.parent(n);

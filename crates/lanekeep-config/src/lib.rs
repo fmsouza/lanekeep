@@ -1,13 +1,13 @@
 //! Configuration loading and canonicalized hashing for lanekeep.
 //!
-//! Loads `lanekeep.config.ts`, resolves the rule graph, and derives the hashes feeding the
-//! cache key.
+//! Loads `lanekeep.config.ts` or `lanekeep.json`, resolves the rule graph, and derives the
+//! hashes feeding the cache key.
 //!
 //! # How the config is read
 //!
-//! The config is a TypeScript module, so reading it means running it. A synthetic entry
-//! module imports the config's default export into a global, and a second evaluation hands
-//! back `JSON.stringify` of the parts that are data.
+//! A `lanekeep.config.ts` is a TypeScript module, so reading it means running it. A
+//! synthetic entry module imports the config's default export into a global, and a second
+//! evaluation hands back `JSON.stringify` of the parts that are data.
 //!
 //! Going through JSON rather than reaching into engine values is deliberate. It keeps
 //! every value crossing the boundary plainly serializable, it makes the whole extraction
@@ -17,6 +17,12 @@
 //! extraction separately records whether each rule has a callable `check` and `reduce`.
 //! Without that, a rule whose handler was misspelled would load cleanly and silently never
 //! fire — the worst failure this tool can have, because it looks exactly like passing.
+//!
+//! A `lanekeep.json` is not a program, and is read as what it is: `src/json.rs` parses,
+//! validates and resolves it in Rust, and only a rule reference naming a *TypeScript* rule
+//! reaches the sandbox — because that rule's own declaration is the only place its `id`,
+//! `query` and `card` exist. The note above `entry_source` in this file records what
+//! that cost.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +37,8 @@ use thiserror::Error;
 pub type Hash = [u8; 32];
 
 mod json;
+
+pub use json::{ResolvedRule, RuleReference};
 
 /// Render a hash the way it appears in diagnostics and cache paths.
 #[must_use]
@@ -247,16 +255,62 @@ const EXTRACT: &str = r"
     })()
 ";
 
-/// The entry module the loader evaluates, whichever format the config is written in.
+/// The entry module the loader evaluates, and — for a JSON config — everything about it
+/// that never needed evaluating.
 ///
-/// Both formats converge here, and that is the point: a JSON config is compiled into the
-/// same module a TypeScript one is imported by, so extraction, validation, hashing and the
-/// cache key never learn which format they came from. Two loaders would be two behaviors
-/// eventually, and the divergence would show up as a rule that runs under one form and not
-/// the other.
-fn entry_source(root: &RuleRoot, config_path: &Path, display: &str) -> Result<String, ConfigError> {
+/// # The two formats no longer share a mechanism, and what holds them together now
+///
+/// They used to. A JSON config was compiled into the same module a TypeScript one is
+/// imported by, so extraction, validation, hashing and the cache key never learned which
+/// format they came from, and `json.rs`'s header said outright that this is why "the two
+/// cannot drift." That mechanism is gone from the JSON path: `lanekeep.json` is parsed,
+/// validated and resolved in Rust, and its `include`, `exclude`, `namespaces`, `severity`
+/// and `timeouts` never become JavaScript at all.
+///
+/// **That is what the un-coupling costs.** Two code paths can drift where one could not, and
+/// nothing mechanical prevents it any more. What substitutes is weaker and is named here
+/// rather than left implied: the two paths still *converge* at [`build`], which is the only
+/// place a `Config` is constructed, a severity override applied, a card validated or a hash
+/// taken — so a divergence has to be introduced upstream of a single function rather than
+/// anywhere; and the cache-key properties §8.1 depends on are asserted against **both**
+/// paths in this file's tests, deliberately in matched pairs.
+///
+/// # Why `lanekeep-js` is still a dependency of this crate
+///
+/// Because `lanekeep.config.ts` is still evaluated, and will be until the last rule has
+/// migrated to a component — the accepted ADR's condition 8. Nothing here is a step toward
+/// deleting the sandbox on this crate's own schedule.
+///
+/// The JSON path also still reaches the sandbox, for one thing and not for configuration: a
+/// reference naming a TypeScript rule is imported so its `defineRule` object can be read.
+/// That is rule execution, which is the part condition 8 keeps. Nothing else crosses, which
+/// `json::tests::no_configuration_data_reaches_the_entry_module` holds the line on.
+///
+/// # What unblocks removing QuickJS, and what does not
+///
+/// Un-coupling this path is one of condition 8's two preconditions. **The other is open and
+/// this change does not answer it**: the ADR's §7.6 asks what a programmable
+/// `lanekeep.config.ts` means once there is no JavaScript sandbox — arbitrary composition
+/// logic, a shared preset imported as a module and spread into another config, per
+/// `docs/architecture.md` §9. At least three shapes are plausible and no measurement picks
+/// between them: configuration stops being programmable and becomes JSON-only; configuration
+/// becomes its own component with a config-shaped WIT world; or a minimal JavaScript
+/// evaluator is deliberately retained for configuration alone, decoupled from rule
+/// execution. It is a decision about what lanekeep's configuration language should be, and
+/// nobody has made it.
+///
+/// This function reading JSON without a sandbox is *not* that decision, and must not be read
+/// as evidence for the first shape. It says a config format that was never programmable does
+/// not need an evaluator, which was true before this change too.
+fn entry_source(
+    root: &RuleRoot,
+    config_path: &Path,
+    display: &str,
+) -> Result<(String, Option<json::Parsed>), ConfigError> {
     if json::is_json(config_path) {
-        return json::entry_source(config_path);
+        let parsed = json::parse(config_path, root.path())?;
+        let source = json::rules_module(&parsed.rules, display)?;
+        return Ok((source, Some(parsed)));
     }
 
     let specifier =
@@ -264,8 +318,9 @@ fn entry_source(root: &RuleRoot, config_path: &Path, display: &str) -> Result<St
             path: display.to_owned(),
             detail: "the config file must sit inside the rules root".to_owned(),
         })?;
-    Ok(format!(
-        "import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n"
+    Ok((
+        format!("import config from '{specifier}';\nglobalThis.__lanekeepConfig = config;\n"),
+        None,
     ))
 }
 
@@ -286,7 +341,7 @@ pub fn evaluate_into(
 ) -> Result<(), ConfigError> {
     let display = config_path.display().to_string();
     let entry = root.path().join(ENTRY);
-    let source = entry_source(root, config_path, &display)?;
+    let (source, _) = entry_source(root, config_path, &display)?;
 
     sandbox
         .eval_module(&entry.display().to_string(), &source)
@@ -306,7 +361,7 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
     let display = config_path.display().to_string();
 
     let entry = root.path().join(ENTRY);
-    let source = entry_source(root, config_path, &display)?;
+    let (source, parsed) = entry_source(root, config_path, &display)?;
     sandbox
         .eval_module(&entry.display().to_string(), &source)
         .map_err(|e| ConfigError::Evaluation {
@@ -319,14 +374,26 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
         detail: e.to_string(),
     })?;
 
-    let raw: Option<RawConfig> = serde_json::from_str(&json).map_err(|e| ConfigError::Shape {
-        path: display.clone(),
-        detail: e.to_string(),
-    })?;
-    let raw = raw.ok_or_else(|| ConfigError::Shape {
+    let extracted: Option<RawConfig> =
+        serde_json::from_str(&json).map_err(|e| ConfigError::Shape {
+            path: display.clone(),
+            detail: e.to_string(),
+        })?;
+    let extracted = extracted.ok_or_else(|| ConfigError::Shape {
         path: display.clone(),
         detail: "the default export is not an object — did you forget `export default`?".to_owned(),
     })?;
+
+    // A JSON config supplies its own data; exactly one field comes back from the sandbox,
+    // and it is spelled out rather than merged, so a field added to `RawConfig` cannot
+    // quietly start being read from the wrong side.
+    let raw = match parsed {
+        Some(parsed) => RawConfig {
+            rules: extracted.rules,
+            ..parsed.config
+        },
+        None => extracted,
+    };
 
     build(sandbox, raw, &display)
 }
@@ -665,10 +732,18 @@ mod tests {
         }
 
         fn load_config(&self) -> Result<Config, ConfigError> {
+            self.load_named("lanekeep.config.ts")
+        }
+
+        fn load_json(&self) -> Result<Config, ConfigError> {
+            self.load_named("lanekeep.json")
+        }
+
+        fn load_named(&self, name: &str) -> Result<Config, ConfigError> {
             let root = RuleRoot::new(&self.dir).expect("canonicalizes");
             let sandbox =
                 sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
-            load(&sandbox, &root, &self.dir.join("lanekeep.config.ts"))
+            load(&sandbox, &root, &self.dir.join(name))
         }
     }
 
@@ -1112,6 +1187,192 @@ mod tests {
         assert_ne!(
             hex(&make("", "d")),
             hex(&make(", timeouts: { rule: 5000 }", "t"))
+        );
+    }
+
+    // --- hashing, the JSON path -------------------------------------------------------
+    //
+    // Matched pairs of the six above. The two formats used to be one mechanism — a JSON
+    // config was compiled into the module a TypeScript one is imported by — so asserting
+    // these properties once covered both. It no longer does, and these are what replaced
+    // that guarantee. A property that holds on one path and not the other is drift, and
+    // drift in a cache key is silent: the run completes and answers with yesterday's
+    // configuration.
+
+    #[test]
+    fn the_ruleset_hash_covers_an_imported_helper_for_json() {
+        let fixture = Fixture::new(
+            "json-helper-hash",
+            &[
+                ("helper.ts", "export const QUERY = '(identifier) @id';\n"),
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     import { QUERY } from './helper';\n\
+                     export default defineRule({\n\
+                       id: 'local/example',\n\
+                       query: QUERY,\n\
+                       card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+                       check() {},\n\
+                     });\n",
+                ),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+
+        let before = fixture.load_json().expect("loads").ruleset_hash;
+        fixture.write_all(&[("helper.ts", "export const QUERY = '(string) @s';\n")]);
+        let after = fixture.load_json().expect("loads").ruleset_hash;
+
+        assert_ne!(
+            hex(&before),
+            hex(&after),
+            "changing an imported helper must invalidate the ruleset hash"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_is_stable_when_nothing_changed_for_json() {
+        let fixture = Fixture::new(
+            "json-stable-hash",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+        let first = fixture.load_json().expect("loads").ruleset_hash;
+        let second = fixture.load_json().expect("loads").ruleset_hash;
+        assert_eq!(hex(&first), hex(&second));
+    }
+
+    #[test]
+    fn the_config_hash_ignores_glob_order_for_json() {
+        let make = |globs: &str| {
+            Fixture::new(
+                &format!("json-glob-order-{}", globs.len()),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "include": {globs}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_eq!(
+            hex(&make(r#"["a/**", "b/**"]"#)),
+            hex(&make(r#"["b/**", "a/**"]"#)),
+            "reordering globs must not change the config hash"
+        );
+    }
+
+    #[test]
+    fn the_config_hash_changes_with_severity_for_json() {
+        let make = |severity: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-severity-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "severity": {severity}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make("{}", "none")),
+            hex(&make(r#"{"local/example": "warn"}"#, "warn")),
+            "changing a severity must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_config_hash_changes_with_a_timeout_for_json() {
+        let make = |timeouts: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-timeout-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "timeouts": {timeouts}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(hex(&make("{}", "d")), hex(&make(r#"{"rule": 5000}"#, "t")));
+    }
+
+    /// The two formats saying the same thing produce the same configuration.
+    ///
+    /// This is the assertion the shared entry module used to make unnecessary. It cannot
+    /// compare the hashes — a TypeScript config is itself a module in the rule graph, so
+    /// `ruleset_hash` legitimately differs — but everything a run actually does is decided
+    /// by the fields below, and those must agree exactly.
+    #[test]
+    fn the_two_formats_load_the_same_configuration() {
+        let typescript = Fixture::new(
+            "parity-ts",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with(
+                        "rules: [rule], include: ['src/**/*.ts'], exclude: ['**/*.test.ts'], \
+                         severity: { 'local/example': 'warn' }, \
+                         timeouts: { rule: 2000, global: 30000 }",
+                    ),
+                ),
+            ],
+        )
+        .load_config()
+        .expect("the TypeScript config loads");
+
+        let json = Fixture::new(
+            "parity-json",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./rule"], "include": ["src/**/*.ts"],
+                        "exclude": ["**/*.test.ts"], "severity": {"local/example": "warn"},
+                        "timeouts": {"rule": 2000, "global": 30000}}"#,
+                ),
+            ],
+        )
+        .load_json()
+        .expect("the JSON config loads");
+
+        assert_eq!(typescript.include, json.include);
+        assert_eq!(typescript.exclude, json.exclude);
+        assert_eq!(typescript.limits, json.limits);
+        assert_eq!(typescript.rules, json.rules);
+    }
+
+    /// The un-coupling, as a property of the source rather than of a call graph.
+    ///
+    /// `src/json.rs` names no type from the sandbox crate, so no future edit can reintroduce
+    /// the dependency without this failing. The crate as a whole still depends on it, and
+    /// deliberately — see the note above `entry_source`.
+    #[test]
+    fn the_json_path_names_nothing_from_the_sandbox_crate() {
+        let source = include_str!("json.rs");
+        assert!(
+            !source.contains("lanekeep_js"),
+            "src/json.rs must resolve a JSON config without the sandbox"
         );
     }
 

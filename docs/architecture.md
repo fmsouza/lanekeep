@@ -525,9 +525,19 @@ export default defineConfig({
 })
 ```
 
-Config is a rule module like any other: same loader, same sandbox, same absence of npm resolution. Composition is ordinary TypeScript — a shared preset is a module that exports an array of rules, imported and spread. No bespoke `extends` mechanism is needed, because the language already has one.
+A `lanekeep.config.ts` is a rule module like any other: same loader, same sandbox, same absence of npm resolution. Composition is ordinary TypeScript — a shared preset is a module that exports an array of rules, imported and spread. No bespoke `extends` mechanism is needed, because the language already has one.
 
 `severity` is applied last and overrides whatever a rule declares.
+
+### 9.1 `lanekeep.json`, and why it no longer shares a mechanism
+
+A project that does not write TypeScript can say which rules it wants in `lanekeep.json`, listing rules as `"lanekeep/no-package-init"` or `{ "rule": "...", "options": { ... } }`. It is what `lanekeep init` scaffolds.
+
+It was originally *compiled* into the entry module the TypeScript path produces and handed to the same loader, so that nothing downstream knew which format a config came from and the two could not drift. That was deliberate and it is gone: the JSON path is now parsed, validated and resolved in Rust, and a rule reference becomes a value — a built-in name, a component path, or a rule module — rather than an `import` statement. The reason is §13's: with rules as components the sandbox eventually leaves, and a config format that is not a program should not have needed one to be read.
+
+**What replaces the mechanism is weaker, and is named rather than implied.** Two code paths can drift where one could not. Two things hold them together: both converge on the single function that constructs a `Config`, validates cards and severities and takes the hashes — so a divergence has to be introduced upstream of one place — and the §8.1 cache-key properties are asserted against both paths in matched pairs.
+
+What has no successor is `lanekeep.config.ts`'s programmability once there is no JavaScript sandbox. Three shapes are plausible — JSON-only, a config-shaped component, or a minimal evaluator kept for configuration alone — and picking one is an open decision, not something the JSON path being sandbox-free settles.
 
 ---
 
