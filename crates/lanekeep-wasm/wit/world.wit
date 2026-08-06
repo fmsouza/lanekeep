@@ -1,13 +1,25 @@
 // lanekeep's host API, as the component model sees it.
 //
-// This file is the single source of truth for the boundary between the engine and a rule.
-// Rust, TypeScript and Go authoring all generate their bindings from it, and the engine
-// implements exactly what it declares. Its bytes are a cache-key input — `host_api_hash` is
-// blake3 over this source, taken by `src/key.rs` — so an edit here, including to a comment,
-// invalidates every cached result. That is the point: the `0.1.0` in the package declaration
-// below is for error messages and for the component model's conventions, and is deliberately
-// not what the cache keys on, because a hand-maintained version is a thing somebody has to
-// remember to bump.
+// This file is the single source of truth for the boundary between the engine and a
+// *component* rule. `src/bindings.rs` generates the Rust bindings from it with
+// `wasmtime::component::bindgen!`, and the engine implements exactly what it declares.
+//
+// It is not yet the single source of truth for the other engine's boundary, and the difference
+// is worth stating here because the title above invites the opposite reading.
+// `packages/lanekeep/index.d.ts` — the definitions a TypeScript rule author installs — is
+// **hand-maintained**, and what holds it honest is `crates/lanekeep-js/tests/host_types.rs`,
+// which compares it against the QuickJS host in `crates/lanekeep-js/src/host.rs`. Nothing
+// generates it from this world: there is no generator, no build script and no recipe. Go
+// authoring does not exist at all yet — `src/key.rs`'s `EXTERNAL_BINDINGS` records what it
+// will need. Single-sourcing the published definitions from here is the unmet leg of the
+// decision record's condition 10, so nothing gated on that condition is unblocked by this
+// file's existence.
+//
+// Its bytes are a cache-key input — `host_api_hash` is blake3 over this source, taken by
+// `src/key.rs` — so an edit here, including to a comment, invalidates every cached result.
+// That is the point: the `0.1.0` in the package declaration below is for error messages and
+// for the component model's conventions, and is deliberately not what the cache keys on,
+// because a hand-maintained version is a thing somebody has to remember to bump.
 //
 // Adding a function widens the trust boundary described in `docs/architecture.md` §13: a
 // component reaches exactly what its world declares and nothing else, which is why the
@@ -334,11 +346,18 @@ world rule {
   /// find out the hard way which ones those are.
   use types.{node, check-context, reduce-context, match};
 
-  /// Whether this rule has a per-file pass. Probed once at prepare time, mirroring how the
-  /// presence of `check` is discovered today by inspecting the evaluated module rather than
-  /// by trusting hand-written config.
+  /// Whether this rule has a per-file pass.
+  ///
+  /// **Declared and implemented, and not yet probed by anything.** The intent is one probe at
+  /// prepare time, mirroring how the presence of `check` is discovered today by inspecting the
+  /// evaluated module rather than by trusting hand-written config. What the engine does today
+  /// is read `rule.spec.has_reduce`, which `lanekeep-config` fills in from the TypeScript
+  /// module or from JSON — so `WasmRuntime::has_check` and `WasmRuntime::has_reduce` have test
+  /// callers only, and a component is still taken at its config's word. Closing that is the
+  /// same sub-project that gives a component a `metadata` export to describe itself with;
+  /// until then this is a surface that exists rather than a mechanism that runs.
   export has-check: func() -> bool;
-  /// Whether this rule has a cross-file pass, probed the same way.
+  /// Whether this rule has a cross-file pass, on the same terms.
   ///
   /// Every component exports all four functions regardless of which passes it uses, because
   /// a WIT world has no optional exports. A check-only rule's `reduce` is a no-op its own
