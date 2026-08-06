@@ -48,12 +48,20 @@
 //! would.
 //!
 //! **Those three plus the wasmtime version and the target triple are not the whole of it.**
-//! `check_tunables` compares twenty-three fields, and the remaining twenty are covered by the
-//! version and the triple only if the wasmtime **feature set** is pinned too: enabling
-//! `signals-based-traps` moves `memory_may_move` and `signals_based_traps`, both of which that
-//! routine checks, and workspace feature unification can move them without the version moving.
-//! Whatever hashes these has to hash the resolved feature set as well, or it will hand out a
-//! cache hit for an artifact the engine cannot load.
+//! `check_tunables` performs twenty-six comparisons — seven `check_int`, sixteen `check_bool`,
+//! and one each of `check_collector`, `check_cost` and `check_inlining` — so twenty-three fields
+//! beyond the three constants above are covered by the version and the triple **only if the
+//! wasmtime feature set is pinned as well**. `component-model-async` moves `concurrency_support`
+//! (`config.rs:2627`), `rr` moves `recording` (`:2631`), and `custom-virtual-memory` moves
+//! `memory_reservation` and `memory_init_cow` (`:2654-2656`). Cargo's feature unification can
+//! move any of them without the version moving, which would hand out a cache hit for an artifact
+//! the engine cannot load.
+//!
+//! `signals_based_traps` is checked too and is *not* reachable this way — it is moved by the
+//! build cfg `has_native_signals` rather than by a Cargo feature, and there is no
+//! `signals-based-traps` feature in wasmtime 47.0.3. Worth stating because it is the example
+//! this comment used to give, and an implementer would have gone looking for a feature that does
+//! not exist.
 //!
 //! Two settings that look as though they belong beside them do not. The growth reservation is
 //! bound to `_` in that same routine, as a runtime setting that does not affect compilation —
@@ -93,55 +101,77 @@ use crate::host::{CheckContext, HostState, ReduceContext};
 /// the other direction.
 ///
 /// Measured in this workspace on 2026-08-06, Apple M3 Max, `aarch64-apple-darwin`, `rustc`
-/// 1.95.0, `wasmtime` 47.0.3, against `tests/fixtures/limits.wasm`, **in the release profile**
-/// and as minima of nine interleaved rounds. The profile is load-bearing for the last two
-/// columns: an earlier version of this table was taken in the test profile and overstated
-/// boundary crossings by about 24×, because that cost is host-side Rust rather than guest code.
+/// 1.95.0, `wasmtime` 47.0.3, against `tests/fixtures/limits.wasm`, **in the release profile**,
+/// eleven interleaved rounds, reported as the **median**.
+///
+/// Two notes on the method, both of which changed the numbers that were here before:
+///
+/// - **Minimum-of-N is the wrong statistic for this measurement.** These timings are bimodal —
+///   a 4 GiB/0 `strided` call ran 120,607 µs at its fastest and 143,022 µs at its median across
+///   eleven rounds on identical bytes — so a minimum reports whichever arm happened to catch the
+///   rare fast state. An earlier version of this table used minima and manufactured an 18%
+///   result that does not exist.
+/// - **The first version of these figures was taken on a contended machine.** An orphaned test
+///   binary from a mutation run was holding six of fourteen cores. Nothing it changed survived
+///   into this table, but it is why the numbers moved.
 ///
 /// - **strided** — one `strided 100` call: a hundred million iterations reading three fields of
-///   a struct through one opaque index, which is the access pattern
-///   [`MEMORY_GUARD_SIZE`] decides.
-/// - **work** — one `work 300` call: three hundred million `black_box`ed iterations.
-/// - **cross** — twenty thousand `tick` calls, each a component call plus two host calls.
-/// - **inst** — fourteen threads each instantiating twenty-five times.
+///   a struct through one opaque index, so its cost is dominated by bounds checks.
+/// - **work** — one `work 300` call: three hundred million `black_box`ed iterations, so its cost
+///   is dominated by ordinary loads and stores through the memory base.
 ///
-/// | reservation / guard | strided | work | 20k cross | inst ×350 |
-/// |---|---|---|---|---|
-/// | **4 GiB / 32 MiB (shipped)** | **87,732 µs** | **148,689 µs** | **6,965 µs** | **11,731 µs** |
-/// | 4 GiB / 0 | 120,283 µs | 126,474 µs | 7,304 µs | 10,915 µs |
-/// | 16 MiB / 32 MiB | 146,850 µs | 243,795 µs | 7,186 µs | 1,933 µs |
-/// | 16 MiB / 0 | 151,414 µs | 243,651 µs | 7,229 µs | 1,650 µs |
+/// | reservation / guard | strided | work | artifact |
+/// |---|---|---|---|
+/// | **4 GiB / 32 MiB (shipped)** | **86,229 µs** | **145,488 µs** | **145,792 B** |
+/// | 4 GiB / 0 | 143,022 µs | 146,996 µs | 162,184 B |
+/// | 16 MiB / 32 MiB | 139,200 µs | 238,977 µs | 162,184 B |
+/// | 16 MiB / 0 | 144,878 µs | 239,176 µs | 162,184 B |
 ///
-/// **Below 4 GiB, execution costs about 1.65× and the exact size stops mattering.** Holding the
-/// guard at its default, dropping the reservation costs 1.67× on `strided` and 1.64× on `work`.
-/// It is not a gradient: a finer sweep over 64 MiB, 16 MiB, 2 MiB and 0 puts all four within 6%
-/// of each other, so the trade is binary. What it buys back is about **9.8 ms of instantiation
-/// per run at fourteen workers** — 11.7 ms against 1.9 ms for three hundred and fifty
-/// instantiations — which is 1.2% of the 800 ms cold budget in `docs/architecture.md` §15. A
-/// bounded 10 ms against an unbounded factor of 1.65 on the quantity that grows with corpus and
-/// ruleset size.
+/// # Two independent mechanisms, and the 2×2 separates them
 ///
-/// The `cross` column is what bounds the trade rather than what settles it: a call whose cost is
-/// crossing the boundary rather than computing behind it is **flat across every configuration**,
-/// 6.9–7.3 ms for twenty thousand calls. So 1.65× is a ceiling a compute-bound guest reaches and
-/// a host-call-bound one does not.
+/// Read down a column and the story is not one effect but two, each needing a different setting
+/// and each showing up on a different workload. This is worth the space because an earlier
+/// version of this comment attributed the whole result to one of them and was wrong about which.
 ///
-/// # What 4 GiB actually buys, which is not what it looks like
+/// **The reservation buys a non-relocatable memory.** `Memory::memory_may_move`
+/// (`wasmtime-environ-47.0.3/src/types.rs:2331-2353`) returns false when the memory's maximum
+/// does not exceed the reservation; a 32-bit memory with no declared maximum has a maximum of
+/// 4 GiB, so that is false at exactly 4 GiB and true below it. A memory that cannot move has a
+/// compile-time-constant base and bound instead of two vmcontext loads per access. That is the
+/// `work` column, and it is visible **with the guard at zero**, where no elision is possible:
+/// 146,996 µs against 239,176 µs, a factor of **1.63**.
 ///
-/// The obvious explanation is bounds-check elision, and it is **wrong** — worth stating, because
-/// it is what an earlier version of this comment claimed. Elision needs
+/// **The reservation and the guard together buy bounds-check elision.** The condition is
 /// `u32::MAX <= reservation + guard - offset_and_size`
-/// (`wasmtime-internal-cranelift-47.0.3/src/bounds_checks.rs:299-300`), and at 4 GiB the sum
-/// exceeds `u32::MAX` by exactly one byte, so it is false for any access wider than a byte.
-/// Nothing here is elided.
+/// (`wasmtime-internal-cranelift-47.0.3/src/bounds_checks.rs:299-300`) — so it needs *both*, and
+/// 4 GiB with no guard misses it by a byte for any access wider than one. That is the `strided`
+/// column, and it is visible **at a fixed 4 GiB reservation**, where `memory_may_move` is
+/// already false either way: 86,229 µs against 143,022 µs, a factor of **1.66**.
 ///
-/// What the threshold actually crosses is `Memory::memory_may_move`
-/// (`wasmtime-environ-47.0.3/src/types.rs:2331-2353`): a 32-bit memory with no declared maximum
-/// has a `maximum_byte_size` of 4 GiB, so `max > reservation` is false at exactly 4 GiB and true
-/// at every smaller value. When a memory may not move, its base pointer and its bound are
-/// compile-time constants; when it may, both are loads from the vmcontext on every access. Same
-/// threshold, same decision, different reason — and the difference matters, because it says the
-/// win survives access patterns no elision would help, which is what the `strided` column shows.
+/// The two are separable because each has a row where the other is held constant, and the
+/// artifact size is the independent witness: **145,792 bytes appears in exactly the one arm
+/// where elision fires**, and every arm that emits bounds checks is 162,184 bytes.
+///
+/// Together, dropping the reservation to 16 MiB costs **1.61× on `strided` and 1.64× on `work`**.
+///
+/// # What it costs, and the assumption that bound depends on
+///
+/// About **10–13 ms** of instantiation per run at fourteen workers, for three hundred and fifty
+/// instantiations. Measured here at 11.7 ms against 1.9 ms for a 16 MiB reservation; an
+/// independent reader measured the delta at 12.6 ms.
+///
+/// The reason that is affordable is not its size but its **shape**: the instantiation penalty is
+/// bounded by workers × rules and does not grow with the corpus, while the 1.6× applies to guest
+/// compute, which grows with corpus × matches. On a run small enough for instantiation to
+/// dominate, twelve milliseconds is imperceptible; on a run large enough to care about,
+/// execution dominates.
+///
+/// **That argument assumes an instance per (worker, rule), not per file, and nothing enforces
+/// it.** [`WasmRuntime::instantiate`] is public and says nothing about how often it may be
+/// called. At ten thousand files times ten rules the penalty is on the order of three and a half
+/// seconds and 4 GiB stops being defensible — so an engine that instantiates per file has
+/// invalidated this choice, not merely made it slower. If that shape ever changes, this constant
+/// is one of the things that has to be re-measured rather than inherited.
 ///
 /// This reverses what the decision record expected without contradicting what it measured: the
 /// design spike measured instantiation and never measured execution. It is written down here
@@ -155,40 +185,33 @@ pub const MEMORY_RESERVATION: u64 = 4 * 1024 * 1024 * 1024;
 /// [`MEMORY_RESERVATION`] is: the default is platform-dependent, and this number is recorded in
 /// every precompiled artifact.
 ///
+/// At the shipped 4 GiB reservation this is what turns bounds-check elision on — see the second
+/// mechanism on [`MEMORY_RESERVATION`], and note that it takes both settings, not either. On
+/// `strided` it is worth **1.66×**: 86,229 µs against 143,022 µs with the guard at zero.
+///
 /// # A zero guard was measured, shipped, and reversed
 ///
-/// It is recorded rather than quietly corrected, because the way it was wrong is more useful
-/// than the value. A zero guard is 16–19% *faster* on `work` — a tight loop over an
-/// accumulator — and that result reproduces across profiles and across duplicated arms. It was
-/// taken as evidence, and it was the only workload measured that had any opinion at all.
+/// Recorded rather than quietly corrected, because the way it was wrong is more useful than the
+/// value. Three claims were made for it and none of them survived:
 ///
-/// On `strided`, three loads at distinct static offsets off one dynamic index, it **loses by
-/// 37–42%**. Release, minima of nine interleaved rounds, at a 4 GiB reservation, with each of
-/// the two decisive arms configured twice and independently:
+/// - **"It is 18% faster on `work`."** It is not. That came from taking minima of a bimodal
+///   distribution on a machine with an orphaned test binary on six of fourteen cores. Measured
+///   cleanly, by median, a zero guard is about **1% slower** on `work` — 146,996 µs against
+///   145,488 µs — and there is no workload here that prefers it.
+/// - **"The mechanism is `guard_before_linear_memory` costing extra mappings."** No: the step is
+///   at any nonzero guard, and 4 KiB behaves like 32 MiB, which is a codegen switch rather than
+///   a mapping cost.
+/// - **"The mechanism is the GVN'd partial check at `bounds_checks.rs:423`."** Also no, and this
+///   one is worth being precise about because it is nearly right. That path is real, but it
+///   requires `offset_and_size <= memory_guard_size` *and* is only reached when elision did not
+///   fire — so at a 4 GiB reservation neither shipped arm takes it. It is reachable at a small
+///   reservation, and there it is worth about **4%**: `16 MiB / 32 MiB` at 139,200 µs against
+///   `16 MiB / 0` at 144,878 µs. Against elision's 1.66× it is a rounding error, and the
+///   artifact size proves the two apart — the GVN arm emits 162,184 bytes, the same as every
+///   other bounds-checked configuration, where the elided arm emits 145,792.
 ///
-/// | guard | strided | work | artifact |
-/// |---|---|---|---|
-/// | **32 MiB (shipped)** | **87,732 / 87,535 µs** | 148,689 / 150,909 µs | **145,792 bytes** |
-/// | 64 KiB | 88,366 µs | 149,269 µs | 145,792 bytes |
-/// | 4 KiB | 87,731 µs | 150,751 µs | 145,792 bytes |
-/// | 0 | 120,283 / 124,505 µs | **126,474 / 126,369 µs** | 162,184 bytes |
-///
-/// **The step is at any nonzero guard, not at a large one.** Four kilobytes behaves identically
-/// to thirty-two megabytes, to within 1%, which rules out a mapping cost and points at a
-/// codegen switch. That switch is in wasmtime's source and is documented there:
-/// `wasmtime-internal-cranelift-47.0.3/src/bounds_checks.rs:423` takes a cheaper path when
-/// `offset_and_size <= memory_guard_size`, emitting the partial check `index > bound` and
-/// leaving the overshoot to the guard page — and the comment above it says why that is the
-/// point, that "a series of Wasm loads that use the same dynamic index operand but different
-/// static offset immediates" then "all emit the same `index > bound` check, which we can GVN".
-/// A zero guard turns one check into three. The artifact is 11% larger for the same reason.
-///
-/// So the two results are not symmetric. The `strided` win has a mechanism in the source and an
-/// access pattern that real code produces; the `work` win has neither, and is a
-/// microarchitectural accident of one loop. Between a measured win with a mechanism on a
-/// realistic pattern and a measured win without one on an artificial pattern, the first decides
-/// — and on the half of this task with the highest undo cost, the default is where to be when
-/// the evidence is mixed.
+/// So the guard's win here is elision, which is the mechanism [`MEMORY_RESERVATION`] needs the
+/// guard for. Both constants describe one decision.
 ///
 /// Like the reservation, this is baked into every precompiled artifact, so it is a cache-key
 /// input rather than a knob.
@@ -675,6 +698,15 @@ impl WasmRuntime {
     /// usually is not reached. That is the same gap the module header describes, seen at the
     /// shortest call there is, and it is Task 17's to close rather than something to paper over
     /// with a second clock read here.
+    ///
+    /// # How often this may be called is a load-bearing assumption
+    ///
+    /// [`MEMORY_RESERVATION`] is chosen on the basis that instantiation happens **per (worker,
+    /// rule)** and so is bounded by the product of those two, while what it buys back applies to
+    /// guest compute and grows with the corpus. A caller that instantiates per *file* breaks
+    /// that arithmetic rather than merely slowing down: at ten thousand files times ten rules the
+    /// penalty is on the order of three and a half seconds. Nothing here enforces it, and this
+    /// paragraph is the only place it is written down at the call site.
     ///
     /// # Errors
     ///

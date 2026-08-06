@@ -26,12 +26,17 @@
 //!
 //! # `strided` exists because one access pattern is not evidence
 //!
-//! `work` and `strided` disagree about `memory_guard_size` — a zero guard is 16-19% faster on
-//! the first and 37-42% slower on the second — and the engine shipped the wrong value for as
-//! long as `work` was the only probe that had an opinion. `strided` is the pattern wasmtime's
-//! own bounds-check lowering is written around, and it is kept here so the measurement in
-//! `lanekeep_wasm::runtime::MEMORY_GUARD_SIZE` stays reproducible rather than becoming a claim
-//! about a probe nobody can run.
+//! The engine shipped a zero guard for as long as `work` was the only probe with an opinion about
+//! it. `work` is dominated by loads through the memory base and barely notices the guard;
+//! `strided` is dominated by bounds checks and is 1.66× slower without one. Neither is wrong —
+//! they measure different things, and one of them alone is not evidence.
+//!
+//! Two lessons are attached to that, and both are about method rather than about wasmtime. The
+//! apparent 18% win for a zero guard came from taking **minima** of a bimodal distribution, which
+//! reports whichever arm caught the rare fast state; by median there is no win. And the session
+//! that produced it had an **orphaned test binary** from a mutation run holding six of fourteen
+//! cores. `strided` is kept here so the corrected measurement in
+//! `lanekeep_wasm::runtime::MEMORY_GUARD_SIZE` stays reproducible.
 
 #[allow(warnings)]
 mod bindings;
@@ -148,13 +153,20 @@ fn work(ctx: &CheckContext, args: &[&str]) {
 
 /// Three loads at distinct static offsets off one dynamic index.
 ///
-/// The access pattern `memory_guard_size` actually decides, and the one `work` does not
-/// exercise. `wasmtime-internal-cranelift-47.0.3/src/bounds_checks.rs:417-423` names it exactly:
-/// "a series of Wasm loads that use the same dynamic index operand but different static offset
-/// immediates -- which is a common code pattern when accessing multiple fields in the same
-/// struct that is in linear memory -- will all emit the same `index > bound` check, which we can
-/// GVN". That collapsing is available only when `offset_and_size <= memory_guard_size`, so a
-/// zero guard turns one check into three.
+/// The access pattern that decides `lanekeep_wasm::runtime::MEMORY_GUARD_SIZE`, and the one
+/// `work` does not exercise: its cost is dominated by bounds checks rather than by loads through
+/// the memory base, which is what makes the two probes disagree about the guard.
+///
+/// **What it measures is bounds-check elision**, which needs
+/// `u32::MAX <= reservation + guard - offset_and_size`
+/// (`wasmtime-internal-cranelift-47.0.3/src/bounds_checks.rs:299-300`) and therefore needs a
+/// 4 GiB reservation *and* a nonzero guard. At the shipped settings that is worth 1.66× here.
+///
+/// It is **not** measuring the GVN'd partial check at `:423`, which an earlier version of this
+/// comment claimed. That path wants `offset_and_size <= memory_guard_size` and is only reached
+/// when elision did not fire, so at a 4 GiB reservation it is never taken; at a small reservation
+/// it is, and is worth about 4%. The artifact size tells them apart — an elided build is 145,792
+/// bytes and every bounds-checked one is 162,184.
 ///
 /// A struct of three fields read through an opaque index is that pattern written out. The
 /// `black_box` on the index is what keeps it dynamic; without it the whole access folds.
