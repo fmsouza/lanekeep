@@ -673,7 +673,10 @@ fn the_engine_applies_the_tunables_the_constants_declare() {
 
         let Err(err) = loaded else {
             panic!(
-                "an artifact compiled with a {reservation} byte reservation and a {guard} byte                  guard loaded into the shipped engine, which means at least one of those                  settings is not reaching the compiler and the cache key would be hashing a                  value nothing applies"
+                "an artifact compiled with a {reservation} byte reservation and a {guard} byte \
+                 guard loaded into the shipped engine, which means at least one of those \
+                 settings is not reaching the compiler and the cache key would be hashing a \
+                 value nothing applies"
             );
         };
         err.root_cause().to_string()
