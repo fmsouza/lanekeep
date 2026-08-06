@@ -230,6 +230,25 @@ down to single items and every item gets its own. A design that relies on per-wo
 being shared is therefore untestable at small scale and only wrong at large scale. Either
 make the state per item, or accept that a test cannot distinguish the two.
 
+**And the corollary that reads the other way round: the initializer count grows with the input,
+so any "bounded by threads × N" arithmetic about it is wrong.** The entry above warns about small
+inputs; the more expensive mistake is at large ones. Measured through `lanekeep-engine` on
+2026-08-06, release, 14 threads, one initializer per chunk:
+
+| files | initializers |
+|---|---|
+| 2,000 | 579–903 |
+| 10,000 | 1,038–1,540 |
+
+Not fourteen, and not stable between runs of one corpus — rayon splits on how the work is going,
+so this is a distribution rather than a bound. `lanekeep-wasm`'s `MEMORY_RESERVATION` was
+justified on "roughly three hundred and fifty instantiations for a run, and it does not grow with
+the corpus", from workers × rules at fourteen workers; the real figure at ten thousand files times
+ten rules is 10,380. The design was right — one instance per (worker, rule) is what keeps it off
+files × rules, which would be 40,000 — and the *number* it was defended with was thirty times too
+small. If a cost is per initializer, measure the initializers; `with_min_len` is the lever that
+makes the count something you chose.
+
 **A tree-sitter query matches children in tree order.** `(import_statement source: (string)
 (import_clause ...))` can never match, because the grammar puts `import_clause` first — and
 the error is exactly that, "this pattern can never match", which is easy to read as "this
