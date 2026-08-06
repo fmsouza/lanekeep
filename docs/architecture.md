@@ -378,7 +378,7 @@ The two levels do different jobs. The per-invocation limit fires fast and **name
 
 ### 6.8 Breaching a limit cancels the run
 
-Any limit breach aborts the entire run: exit code `2`, a diagnostic naming the rule, file and phase, and no report.
+Any limit breach aborts the entire run: exit code `2`, a diagnostic, and no report. The diagnostic names the rule, file and phase whenever there is one to name — which is every breach except a global budget noticed between files, where nothing was executing and naming a rule would blame the wrong thing.
 
 The alternative — skip the offending rule and continue — is tempting and wrong. A timeout is timing-dependent by nature, so a rule that trips on a loaded machine and not on an idle one would make output vary between runs on identical input. That directly contradicts §11's guarantee that an agent reading the output twice must not see reordering as change, and it would let a partial, silently-incomplete result pass for a clean one. A checker that could not finish must not report that it found nothing.
 
