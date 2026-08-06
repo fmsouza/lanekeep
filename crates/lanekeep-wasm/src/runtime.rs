@@ -138,8 +138,9 @@ use crate::host::{CheckContext, HostState, ReduceContext};
 /// does not exceed the reservation; a 32-bit memory with no declared maximum has a maximum of
 /// 4 GiB, so that is false at exactly 4 GiB and true below it. A memory that cannot move has a
 /// compile-time-constant base and bound instead of two vmcontext loads per access. That is the
-/// `work` column, and it is visible **with the guard at zero**, where no elision is possible:
-/// 146,996 µs against 239,176 µs, a factor of **1.63**.
+/// `work` column, and it is visible **with the guard at zero**, where nothing this probe does is
+/// elided — the margin there is one byte, so a single-byte access would still qualify and a
+/// `u64` one does not: 146,996 µs against 239,176 µs, a factor of **1.63**.
 ///
 /// **The reservation and the guard together buy bounds-check elision.** The condition is
 /// `u32::MAX <= reservation + guard - offset_and_size`
