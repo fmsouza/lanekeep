@@ -857,6 +857,7 @@ dependencies = [
 name = "lanekeep-engine"
 version = "0.6.1"
 dependencies = [
+ "blake3",
  "lanekeep-cache",
  "lanekeep-config",
  "lanekeep-core",
@@ -864,6 +865,7 @@ dependencies = [
  "lanekeep-lang",
  "lanekeep-lang-js",
  "lanekeep-query",
+ "lanekeep-wasm",
  "memchr",
  "rayon",
  "thiserror",

@@ -33,10 +33,33 @@ impl RunKey {
     /// `engine_version` should be major.minor only: a patch release by definition changes no
     /// behavior a rule can observe, and invalidating every cache on it would make patch
     /// upgrades expensive for no benefit.
+    ///
+    /// # The two host inputs, and why they are separate
+    ///
+    /// `host_api_hash` is **what a rule may reach**: the `ctx` surface QuickJS installs and
+    /// the WIT world a component is linked against, plus anything the host binds beside that
+    /// world. A result computed by a build where a host function did not exist is not a valid
+    /// result for a build where it does — the rule could not have called it, so its verdict
+    /// was reached without evidence it would have used. It is a hash rather than a
+    /// hand-maintained number because a number has to be remembered: `lanekeep-js`'s
+    /// `HOST_API_VERSION` says so in its own documentation, and nothing detects a missed bump.
+    ///
+    /// `wasm_runtime_hash` is **how a component is compiled**, which is a different question
+    /// with the same failure mode. A precompiled `.cwasm` records the tunables it was built
+    /// under and `wasmtime` refuses one that disagrees, so those tunables decide whether a
+    /// component runs at all — and the ones that survive that check still decide what the
+    /// guest computes, because they move Cranelift's codegen. Both callers derive it from
+    /// `wasmtime`'s own compatibility hash rather than by listing fields, so a `wasmtime`
+    /// upgrade that moves a field nobody here has heard of still invalidates.
+    ///
+    /// They are two fields rather than one because they answer to different owners — the
+    /// trust boundary and the compiler — and because a test that can only move both at once
+    /// cannot tell which of them the key actually covers.
     #[must_use]
     pub fn new(
         engine_version: &str,
-        host_api_version: u32,
+        host_api_hash: &[u8],
+        wasm_runtime_hash: &[u8],
         ruleset_hash: &[u8],
         config_hash: &[u8],
         grammars: &[GrammarKey],
@@ -49,7 +72,8 @@ impl RunKey {
         write_field(&mut prefix, b"lanekeep-cache");
         write_field(&mut prefix, &FORMAT_VERSION.to_le_bytes());
         write_field(&mut prefix, engine_version.as_bytes());
-        write_field(&mut prefix, &host_api_version.to_le_bytes());
+        write_field(&mut prefix, host_api_hash);
+        write_field(&mut prefix, wasm_runtime_hash);
         write_field(&mut prefix, ruleset_hash);
         write_field(&mut prefix, config_hash);
 
@@ -145,7 +169,14 @@ mod tests {
     use super::*;
 
     fn run() -> RunKey {
-        RunKey::new("0.1", 1, b"ruleset", b"config", &[grammar()])
+        RunKey::new(
+            "0.1",
+            b"host-api",
+            b"runtime",
+            b"ruleset",
+            b"config",
+            &[grammar()],
+        )
     }
 
     fn grammar() -> GrammarKey {
@@ -186,35 +217,103 @@ mod tests {
 
     #[test]
     fn changing_the_ruleset_changes_the_key() {
-        let other = RunKey::new("0.1", 1, b"different", b"config", &[grammar()]);
+        let other = RunKey::new(
+            "0.1",
+            b"host-api",
+            b"runtime",
+            b"different",
+            b"config",
+            &[grammar()],
+        );
         assert_ne!(key_of(&run(), "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
     }
 
     #[test]
     fn changing_the_config_changes_the_key() {
-        let other = RunKey::new("0.1", 1, b"ruleset", b"different", &[grammar()]);
+        let other = RunKey::new(
+            "0.1",
+            b"host-api",
+            b"runtime",
+            b"ruleset",
+            b"different",
+            &[grammar()],
+        );
         assert_ne!(key_of(&run(), "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
     }
 
     #[test]
     fn changing_the_engine_version_changes_the_key() {
-        let other = RunKey::new("0.2", 1, b"ruleset", b"config", &[grammar()]);
+        let other = RunKey::new(
+            "0.2",
+            b"host-api",
+            b"runtime",
+            b"ruleset",
+            b"config",
+            &[grammar()],
+        );
         assert_ne!(key_of(&run(), "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
     }
 
     #[test]
-    fn changing_the_host_api_version_changes_the_key() {
+    fn changing_the_host_api_hash_changes_the_key() {
         // A result computed without a host function is not a valid result for a run that
         // has it: the rule could not have called something that did not exist.
-        let other = RunKey::new("0.1", 2, b"ruleset", b"config", &[grammar()]);
+        //
+        // Two different byte slices rather than two different numbers, which is the whole of
+        // the change: a number is hand-maintained and a content hash is not.
+        let other = RunKey::new(
+            "0.1",
+            b"host-api-with-one-more-function",
+            b"runtime",
+            b"ruleset",
+            b"config",
+            &[grammar()],
+        );
         assert_ne!(key_of(&run(), "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
+    }
+
+    #[test]
+    fn changing_the_wasm_runtime_hash_changes_the_key() {
+        // A precompiled component records the tunables it was compiled under, and an engine
+        // configured differently cannot load it. The ones that do load still decide what the
+        // guest computes — a bounds check elided or emitted is a codegen difference — so a
+        // result computed under one compilation environment is not a result for another.
+        let other = RunKey::new(
+            "0.1",
+            b"host-api",
+            b"a-different-compilation-environment",
+            b"ruleset",
+            b"config",
+            &[grammar()],
+        );
+        assert_ne!(key_of(&run(), "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
+    }
+
+    #[test]
+    fn the_two_host_fields_are_not_interchangeable() {
+        // Two adjacent byte-slice parameters is the shape a caller swaps by accident, and
+        // every "this input moves the key" test passes just as well against a swapped pair.
+        // This is the one that does not: it hashes the same two values in the other order.
+        let swapped = RunKey::new(
+            "0.1",
+            b"runtime",
+            b"host-api",
+            b"ruleset",
+            b"config",
+            &[grammar()],
+        );
+        assert_ne!(
+            key_of(&run(), "src/a.ts", 1),
+            key_of(&swapped, "src/a.ts", 1)
+        );
     }
 
     #[test]
     fn adding_a_grammar_changes_the_key() {
         let more = RunKey::new(
             "0.1",
-            1,
+            b"host-api",
+            b"runtime",
             b"ruleset",
             b"config",
             &[
@@ -233,7 +332,8 @@ mod tests {
         // A grammar bump changes node shapes and therefore what a query matches.
         let bumped = RunKey::new(
             "0.1",
-            1,
+            b"host-api",
+            b"runtime",
             b"ruleset",
             b"config",
             &[GrammarKey {
@@ -251,7 +351,8 @@ mod tests {
     fn changing_the_language_changes_the_key() {
         let other = RunKey::new(
             "0.1",
-            1,
+            b"host-api",
+            b"runtime",
             b"ruleset",
             b"config",
             &[GrammarKey {
@@ -267,8 +368,14 @@ mod tests {
         // The reason every field is length-prefixed. Without it `("ab", "c")` and
         // `("a", "bc")` hash alike, and two genuinely different runs share a key — which is
         // the one failure mode a cache must not have.
-        let one = RunKey::new("0.1", 1, b"ab", b"c", &[grammar()]);
-        let other = RunKey::new("0.1", 1, b"a", b"bc", &[grammar()]);
+        let one = RunKey::new("0.1", b"host-api", b"runtime", b"ab", b"c", &[grammar()]);
+        let other = RunKey::new("0.1", b"host-api", b"runtime", b"a", b"bc", &[grammar()]);
+        assert_ne!(key_of(&one, "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
+
+        // And the same on the pair this change added, which are the two fields most likely
+        // to be built by concatenating something.
+        let one = RunKey::new("0.1", b"ab", b"c", b"ruleset", b"config", &[grammar()]);
+        let other = RunKey::new("0.1", b"a", b"bc", b"ruleset", b"config", &[grammar()]);
         assert_ne!(key_of(&one, "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
 
         // And on the per-file side: a path and a content digest must not be able to run

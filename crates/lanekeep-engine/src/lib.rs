@@ -82,6 +82,23 @@ pub enum RunError {
         known: String,
     },
 
+    /// The WebAssembly runtime could not be described, so a run cannot be keyed against it.
+    ///
+    /// Not about any rule. A cached result is only valid for the compilation environment it
+    /// was produced under, and that environment is read off an engine built from
+    /// `lanekeep_wasm`'s one configuration — so a host where `wasmtime` cannot realize it is a
+    /// host where no result can be filed under a key that means anything. Guessing a value
+    /// instead would put entries under a key describing nothing, which is the one failure
+    /// `docs/architecture.md` §8.1 is arranged against.
+    #[error(
+        "the WebAssembly runtime could not be configured on this host\n  {detail}\n  \
+         this is a broken build rather than anything about a rule"
+    )]
+    WasmRuntime {
+        /// What `wasmtime` said.
+        detail: String,
+    },
+
     /// A rule's gates are malformed.
     #[error("rule `{rule}` has invalid gates: {detail}")]
     Gates {
@@ -489,16 +506,7 @@ impl Engine {
             .collect();
         grammars.sort_by(|a, b| a.id.cmp(&b.id));
 
-        let run_key = RunKey::new(
-            // Major.minor only: a patch release changes nothing a rule can observe, and
-            // invalidating every cache on one would make patch upgrades expensive for
-            // nothing.
-            engine_version(),
-            HOST_API_VERSION,
-            &config.ruleset_hash,
-            &config.config_hash,
-            &grammars,
-        );
+        let run_key = run_key(&config.ruleset_hash, &config.config_hash, &grammars)?;
 
         Ok(Self {
             rules,
@@ -1577,6 +1585,69 @@ fn unused_violations(directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Vio
     violations
 }
 
+/// Everything about a run that every file's key shares.
+///
+/// A named function rather than a call inside [`Engine::prepare`], because it is the one place
+/// the five run-wide inputs are actually assembled and a value dropped here is dropped from
+/// every key in the run. Inline it and "the compilation environment reaches a real run's key"
+/// becomes a claim about a private field of a struct that needs a project on disk to build.
+///
+/// # Errors
+///
+/// Returns [`RunError::WasmRuntime`] when `wasmtime` cannot describe its own compilation
+/// environment on this host.
+fn run_key(
+    ruleset_hash: &[u8],
+    config_hash: &[u8],
+    grammars: &[GrammarKey],
+) -> Result<RunKey, RunError> {
+    let wasm_runtime = lanekeep_wasm::compile_env_hash().map_err(|e| RunError::WasmRuntime {
+        detail: e.to_string(),
+    })?;
+
+    Ok(RunKey::new(
+        // Major.minor only: a patch release changes nothing a rule can observe, and
+        // invalidating every cache on one would make patch upgrades expensive for nothing.
+        engine_version(),
+        &host_api_hash(),
+        &wasm_runtime,
+        ruleset_hash,
+        config_hash,
+        grammars,
+    ))
+}
+
+/// Everything a rule may reach, from both engines, in one cache-key field.
+///
+/// This crate is where the two host surfaces meet, so it is where they are folded. QuickJS's
+/// `ctx` is still a hand-maintained `u32` — `lanekeep_js::HOST_API_VERSION`, whose own
+/// documentation says nothing detects a missed bump — and a component's surface is
+/// [`lanekeep_wasm::host_api_hash`], a content hash of the WIT file every binding is generated
+/// from plus whatever the host binds beside that world.
+///
+/// **Both, and not the newer one instead of the older.** Every rule in this tree is still
+/// TypeScript, so dropping the `ctx` version would take the only host surface a run actually
+/// uses out of the key: adding a `ctx` function would then serve results computed by a build
+/// where it did not exist, which is the failure the field exists to prevent. The `u32` leaves
+/// with the last JavaScript rule and not before.
+fn host_api_hash() -> [u8; 32] {
+    fold_host_api(HOST_API_VERSION, &lanekeep_wasm::host_api_hash())
+}
+
+/// The fold, separated from its inputs so a test can vary them.
+///
+/// `HOST_API_VERSION` is a `const` and the WIT hash is derived, so neither can be moved in a
+/// test against the real function — and "both halves are in the key" is exactly the claim that
+/// is worth nothing unasserted. This is the same reasoning `lanekeep_wasm::key` uses for its
+/// two folds.
+fn fold_host_api(ctx_version: u32, wasm_world: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lanekeep-host-api");
+    hasher.update(&ctx_version.to_le_bytes());
+    hasher.update(wasm_world);
+    *hasher.finalize().as_bytes()
+}
+
 /// The engine version a cache key uses: major.minor only.
 fn engine_version() -> &'static str {
     // Trimmed at the second dot. A patch release changes nothing a rule can observe, so
@@ -1623,6 +1694,76 @@ mod tests {
     use lanekeep_lang_js::{JavaScript, TypeScript};
 
     use super::*;
+
+    #[test]
+    fn both_host_surfaces_reach_the_cache_key() {
+        // Two engines, one field. A change to either has the same consequence — a rule could
+        // not have called something that did not exist — so a fold that dropped one would
+        // serve stale results for exactly the rules that engine runs.
+        let base = fold_host_api(1, b"world");
+        assert_ne!(
+            base,
+            fold_host_api(2, b"world"),
+            "a `ctx` function added to QuickJS must invalidate"
+        );
+        assert_ne!(
+            base,
+            fold_host_api(1, b"a-wider-world"),
+            "a function added to the WIT world must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_host_api_fold_reads_the_real_world_and_the_real_ctx_version() {
+        // The fold is only worth testing if the shipped call feeds it the shipped values.
+        assert_eq!(
+            host_api_hash(),
+            fold_host_api(HOST_API_VERSION, &lanekeep_wasm::host_api_hash())
+        );
+    }
+
+    #[test]
+    fn the_two_wasm_inputs_reach_a_real_runs_key() {
+        // Both of the new fields, asserted at the place they are assembled rather than at
+        // `RunKey`'s door. A hash that is derived correctly and then not passed is the same
+        // stale-answer bug as one that is never derived, and the tests either side of this one
+        // pass against exactly that.
+        let grammars = [GrammarKey {
+            id: "typescript".to_owned(),
+            abi: 15,
+        }];
+        let content = lanekeep_core::ContentHash::new([7; 32]);
+        let real = run_key(b"ruleset", b"config", &grammars).expect("the runtime describes itself");
+
+        for (label, host_api, wasm_runtime) in [
+            (
+                "the WebAssembly compilation environment",
+                host_api_hash().to_vec(),
+                Vec::new(),
+            ),
+            (
+                "the host API surface",
+                Vec::new(),
+                lanekeep_wasm::compile_env_hash()
+                    .expect("the runtime describes itself")
+                    .to_vec(),
+            ),
+        ] {
+            let without = RunKey::new(
+                engine_version(),
+                &host_api,
+                &wasm_runtime,
+                b"ruleset",
+                b"config",
+                &grammars,
+            );
+            assert_ne!(
+                real.for_file("src/a.ts", &content),
+                without.for_file("src/a.ts", &content),
+                "{label} must reach the key a run actually files results under"
+            );
+        }
+    }
 
     struct Project {
         dir: PathBuf,

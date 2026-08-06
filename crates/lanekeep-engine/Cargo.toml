@@ -12,12 +12,25 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# For folding the two engines' host surfaces into one cache-key field. Same digest the cache,
+# the config loader and the component loader already key on, so a reader meets one hash across
+# the project rather than four.
+blake3 = { workspace = true }
 lanekeep-cache = { workspace = true }
 lanekeep-config = { workspace = true }
 lanekeep-core = { workspace = true }
 lanekeep-js = { workspace = true }
 lanekeep-lang = { workspace = true }
 lanekeep-query = { workspace = true }
+# For the two cache-key inputs a component run depends on: the hash of the WIT host API and
+# whatever is bound beside it, and the hash of the compilation environment `wasmtime` checks a
+# precompiled artifact against. Both are read from where they are defined rather than restated
+# here, which is what the edge buys — a second copy of a cache-key input is a drift source, and
+# the failure it produces is a warm run serving an answer computed under conditions that no
+# longer hold. It costs `wasmtime` and `cranelift` in the binary from this point rather than
+# from Task 16, which is where the plan expected the edge; the alternative was writing the
+# reservation, the guard and the version down twice.
+lanekeep-wasm = { workspace = true }
 memchr = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }

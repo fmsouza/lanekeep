@@ -48,6 +48,13 @@ use lanekeep_query::CompiledQuery;
 /// Nothing detects this automatically. A function added without bumping it serves stale
 /// results silently, which is the failure mode the whole cache design is arranged against.
 ///
+/// **The component engine does not have this problem, and the difference is worth knowing
+/// about while this number is still here.** `lanekeep-wasm`'s half of the same cache-key field
+/// is a content hash of `wit/world.wit`, the file its bindings are generated from, so it moves
+/// when the surface moves and nobody has to remember. `lanekeep_engine` folds both into one
+/// field; this one leaves with the last JavaScript rule, and until then it is the half that
+/// can be got wrong.
+///
 /// History:
 /// - `1` — reporting, navigation, binding resolution, `emitFact`, `readFile`, `fileExists`.
 pub const HOST_API_VERSION: u32 = 1;
