@@ -81,6 +81,29 @@ pub struct RuleSpec {
     pub timeout: Option<Duration>,
     /// Whether the rule has a `reduce` phase.
     pub has_reduce: bool,
+    /// The compiled component this rule's handlers live in, or `None` for a TypeScript rule.
+    ///
+    /// **This is what sends a rule to one engine or the other.** `lanekeep-engine` runs a rule
+    /// with `None` through `lanekeep-js` and a rule with `Some` through `lanekeep-wasm`, in the
+    /// same run over the same corpus — the decision is a property of the rule and is made here,
+    /// where a rule is described, rather than by the engine guessing from anything else.
+    ///
+    /// # It is `None` for every rule a config can express today, and the reason is not this crate
+    ///
+    /// [`RuleReference::Component`] resolves a `.wasm` specifier to a path, and `rules_module`
+    /// then refuses it. That refusal stays, because the fields above it have nowhere to come
+    /// from: `crates/lanekeep-wasm/wit/world.wit` declares four exports and **none of them is
+    /// `metadata`**, so a component cannot supply its own `id`, `query`, `card`, `gates`,
+    /// `languages`, `severity` or `timeout`. The only alternatives are to add that export —
+    /// which is the Rust-authoring sub-project's ABI to design, and bumps a cache-key input —
+    /// or to invent config syntax carrying the metadata beside the reference, which that same
+    /// sub-project would then have to un-invent. Both were declined, as they were when the
+    /// options question reached the same wall.
+    ///
+    /// So the field is the seam and not yet the door: a caller holding a `Config` — a test, an
+    /// embedder, and the sub-project that adds `metadata` — can set it and get component
+    /// dispatch, and `lanekeep-config` sets it the day a component can describe itself.
+    pub component: Option<PathBuf>,
 }
 
 /// A loaded, validated configuration.
@@ -579,6 +602,10 @@ fn build_rule(
         gates: raw.gates,
         timeout: raw.timeout.map(Duration::from_millis),
         has_reduce: raw.has_reduce,
+        // Every rule that reaches here was read out of an evaluated TypeScript module, so its
+        // handlers are in that module. See [`RuleSpec::component`] for what has to exist before
+        // this can be anything else.
+        component: None,
     })
 }
 

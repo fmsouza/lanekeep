@@ -388,6 +388,28 @@ nothing.** wasmtime prefixes a host function's error with a backtrace whose top 
 survived a mutation that made the host name a different method entirely, which is how it was
 found. Assert on `err.root_cause().to_string()`, which is the host's own message and nothing else.
 
+**`wasm32-unknown-unknown` has no atomics target feature, so an `AtomicU64` is a plain load and
+store and a busy loop written around one is deleted.** A fixture that has to spend real time —
+the only kind that can test a wall-clock budget, per the interrupt-handler trap above — cannot
+rely on either of the two obvious guards. Storing the accumulator into a `static AtomicU64` once
+at the end lets LLVM strength-reduce a linear congruential step to a closed form and drop the
+loop; storing into it on *every* iteration does not help either, because without the atomics
+feature `core::sync::atomic` lowers to ordinary memory operations and every store but the last is
+removed. Both were measured: a 20 ms budget failed to notice four hundred million rounds of each,
+and the test passed in under a second. `core::hint::black_box` inside the loop is what makes it
+real — `crates/lanekeep-wasm/tests/fixtures/limits/` already used it, and
+`.../fixtures/engine-rule/` says why in its `burn`.
+
+**A trap poisons a `wasmtime::Store` for good, and the store outlives the file.**
+`bindgen!`'s `imports: { default: trappable }` means any trap sets a store-wide flag with no
+public reset, so the next call on that store fails with `cannot enter component instance` — a
+message about the runtime's bookkeeping that names nothing that went wrong. rayon keeps handing
+a worker its remaining files after one fails, and which of several simultaneous failures the
+reduction surfaces is arbitrary, so a run can be reported against a file that was fine. Nothing
+is rescued by noticing, since every such failure cancels the run either way; the *diagnostic* is.
+`lanekeep-engine`'s `Worker::poison_on` remembers the first failure and hands it back for the
+rest of that worker's share.
+
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
 and re-checks forever — pinning a core while the output looks exactly like a tool that is
