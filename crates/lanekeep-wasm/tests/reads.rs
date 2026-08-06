@@ -139,7 +139,7 @@ impl Harness {
             Arc::new(TypeScript),
         );
         if let Some(files) = files {
-            context = context.with_file_access(files);
+            context = context.with_file_access(Arc::new(files));
         }
 
         let mut store = Store::new(&engine, HostState::new());

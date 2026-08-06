@@ -393,14 +393,18 @@ pub struct CheckContext {
     /// An `Option`, where [`CheckContext::language`] above is not, and that asymmetry is this
     /// module's second decision rather than an oversight. See the module header.
     ///
-    /// Owned rather than shared. `lanekeep-js` holds an `Rc<FileAccess>` because the engine
-    /// builds one per *file* and hands it to every rule checking that file; an `Rc` here would
-    /// take `Send` away from a type the `const` block below requires to have it, and an
-    /// `Arc<FileAccess>` is not `Send` either, since `FileAccess`'s memo is a `RefCell`. Owning
-    /// it keeps the reads structurally attached to the context that made them — which is what
-    /// `files.rs` asks for — and leaves the engine free to decide, when it is wired, whether a
-    /// context is built per file or per rule.
-    files: Option<FileAccess>,
+    /// **Shared, and it took a change in `lanekeep-core` to make that possible.** This was an
+    /// owned `FileAccess`, because an `Arc<FileAccess>` was not `Send` while the memo was a
+    /// `RefCell`, and the `const` block below requires this type to be `Send`. Owning it meant
+    /// a second memo per file the moment both engines ran over one corpus — and the two lists
+    /// cannot be merged afterwards, because `lanekeep_core::tracked::sort` orders by path and
+    /// does not dedupe, so a disagreement about one path's hash becomes two contradictory
+    /// entries for it.
+    ///
+    /// `FileAccess`'s memo is now a `Mutex`, so the engine builds one access per *file* and
+    /// hands the same one to every rule checking that file, in either engine. Reading a file
+    /// rewritten mid-run therefore has one answer per run rather than one per engine.
+    files: Option<Arc<FileAccess>>,
     /// The grammar the two query methods compile against.
     ///
     /// Not an `Option`, and that is this module's answer to the question `lanekeep-js` answers
@@ -529,20 +533,19 @@ impl CheckContext {
     /// same refusal `lanekeep-js` expresses by not installing the functions at all. The module
     /// header carries why that is the answer here and what the alternatives cost.
     ///
-    /// Takes the access by value, and the reads it records are this context's. Whether the
-    /// engine builds one context per file or one per rule is its decision when it is wired, and
-    /// nothing here presumes either — but the two are not equally cheap, and the difference is
-    /// worth knowing before it is chosen.
-    ///
-    /// **One per file shares the memo; one per rule does not, and the lists do not merge
-    /// safely.** [`lanekeep_core::tracked::sort`] orders by path and *does not dedupe*, so two
-    /// per-rule lists that disagree about one path's hash concatenate into two contradictory
+    /// Takes a shared access, and that is the answer to the question this doc comment used to
+    /// leave open. **One per file shares the memo; one per rule does not, and the lists do not
+    /// merge safely.** [`lanekeep_core::tracked::sort`] orders by path and *does not dedupe*, so
+    /// two per-rule lists that disagree about one path's hash concatenate into two contradictory
     /// entries for it — and disagreeing is exactly what they do if the file was rewritten
-    /// between the two rules, which is the case a shared memo exists to prevent. Merging is
-    /// sound only when the lists already agree. One context per file avoids the question
-    /// entirely, and shares the arena and the query cache while it is there.
+    /// between the two rules, which is the case a shared memo exists to prevent.
+    ///
+    /// `lanekeep-engine` therefore builds one [`FileAccess`] per file and hands the same
+    /// [`Arc`] to every rule on that file **in both engines**, which is what the signature is
+    /// for: taking one by value would have made a second memo the only option the moment a
+    /// TypeScript rule and a component rule met on one file.
     #[must_use]
-    pub fn with_file_access(mut self, files: FileAccess) -> Self {
+    pub fn with_file_access(mut self, files: Arc<FileAccess>) -> Self {
         self.files = Some(files);
         self
     }
@@ -609,7 +612,7 @@ impl CheckContext {
     pub fn dependencies(&self) -> Vec<TrackedRead> {
         self.files
             .as_ref()
-            .map(FileAccess::dependencies)
+            .map(|files| files.dependencies())
             .unwrap_or_default()
     }
 
@@ -831,6 +834,19 @@ impl HostState {
         Self::default()
     }
 
+    /// Whether the table currently holds no context at all.
+    ///
+    /// Evidence, in the sense [`crate::runtime::WasmRuntime::instantiations`] is: nothing in
+    /// execution reads it, and it exists because "the engine gives each context back when it is
+    /// finished with the file" is a claim only a number can carry. A store lives for a whole
+    /// worker's share of the corpus and a context holds the parse tree and the file's entire
+    /// source, so an engine that pushed one per file and never took it back would grow with the
+    /// corpus, silently, until a run large enough to notice.
+    #[must_use]
+    pub fn holds_no_contexts(&self) -> bool {
+        self.table.is_empty()
+    }
+
     /// Put a context in the table, so it can be lent to a guest.
     ///
     /// # Errors
@@ -855,6 +871,31 @@ impl HostState {
         handle: &Resource<CheckContext>,
     ) -> wasmtime::Result<&mut CheckContext> {
         Ok(self.table.get_mut(handle)?)
+    }
+
+    /// Take a context back out of the table, freeing its entry.
+    ///
+    /// **The counterpart [`HostState::push_check_context`] needs in order to be called per
+    /// file.** A store lives for a whole worker's share of the corpus, and a context holds a
+    /// [`NodeArena`] — the parse tree and the file's whole source text. Pushing one per file and
+    /// never taking it back is a table that grows with the corpus and memory that grows with it,
+    /// charged against the same per-store ceiling `crate::runtime`'s `MemoryCeiling` enforces.
+    /// Nothing traps and nothing is wrong until a large enough run; that is exactly the shape of
+    /// leak that ships.
+    ///
+    /// It also ends the lend. A guest only ever receives a `borrow`, so no handle it holds can
+    /// outlive the call — but the *host*'s own resource is what keeps the arena alive, and the
+    /// engine has no other way to say it is finished with a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the table's error when the resource is not live, which for a call from the engine
+    /// means it was already taken.
+    pub fn take_check_context(
+        &mut self,
+        handle: Resource<CheckContext>,
+    ) -> wasmtime::Result<CheckContext> {
+        Ok(self.table.delete(handle)?)
     }
 
     /// Put a cross-file context in the table, so it can be lent to a guest.
@@ -886,6 +927,23 @@ impl HostState {
         handle: &Resource<ReduceContext>,
     ) -> wasmtime::Result<&mut ReduceContext> {
         Ok(self.table.get_mut(handle)?)
+    }
+
+    /// Take a cross-file context back out of the table, on the terms
+    /// [`HostState::take_check_context`] sets out.
+    ///
+    /// One per rule rather than one per file, so the growth is bounded by the ruleset — but a
+    /// reduce context holds every fact the corpus produced for that rule, which is the largest
+    /// single value either phase carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the table's error when the resource is not live.
+    pub fn take_reduce_context(
+        &mut self,
+        handle: Resource<ReduceContext>,
+    ) -> wasmtime::Result<ReduceContext> {
+        Ok(self.table.delete(handle)?)
     }
 }
 
@@ -1520,3 +1578,78 @@ impl HostReduceContext for HostState {
 /// The interface-level trait, which carries no methods of its own: everything
 /// `lanekeep:host/types` declares hangs off one of the two resources.
 impl Host for HostState {}
+
+#[cfg(test)]
+mod tests {
+    use lanekeep_lang::Language;
+    use lanekeep_lang_js::TypeScript;
+
+    use super::*;
+
+    fn context() -> CheckContext {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&TypeScript.grammar())
+            .expect("the grammar loads");
+        let tree = parser.parse("const x = 1;", None).expect("parses");
+        CheckContext::new(
+            NodeArena::new(tree, "const x = 1;".to_owned()),
+            "src/a.ts",
+            Arc::new(TypeScript),
+        )
+    }
+
+    #[test]
+    fn a_context_taken_back_leaves_the_table_empty() {
+        // The engine pushes one of these per file into a store that lives for a whole worker's
+        // share of the corpus, and each holds a parse tree and the file's entire source. Without
+        // a way to give it back, a worker's memory grows with the corpus — silently, because
+        // nothing traps and nothing is wrong until a run large enough to notice.
+        let mut state = HostState::new();
+        assert!(state.holds_no_contexts(), "a fresh state holds nothing");
+
+        let handle = state.push_check_context(context()).expect("pushes");
+        assert!(
+            !state.holds_no_contexts(),
+            "a pushed context is in the table"
+        );
+
+        let taken = state.take_check_context(handle).expect("takes");
+        assert_eq!(taken.file_path(), "src/a.ts", "the context comes back");
+        assert!(
+            state.holds_no_contexts(),
+            "taking a context back must free its entry"
+        );
+    }
+
+    #[test]
+    fn a_context_cannot_be_taken_twice() {
+        // A `Resource` is an owned claim on a table entry, so this is only reachable by forging
+        // a second one — which is exactly what a caller cloning a handle rather than moving it
+        // would do, and it must fail rather than hand out a second copy of the same state.
+        let mut state = HostState::new();
+        let handle = state.push_check_context(context()).expect("pushes");
+        let forged = Resource::new_own(handle.rep());
+
+        drop(state.take_check_context(handle).expect("takes"));
+        assert!(
+            state.take_check_context(forged).is_err(),
+            "an entry that is gone must not be handed out again"
+        );
+    }
+
+    #[test]
+    fn a_reduce_context_is_taken_back_the_same_way() {
+        let mut state = HostState::new();
+        let handle = state
+            .push_reduce_context(ReduceContext::new(Vec::new(), Vec::new()))
+            .expect("pushes");
+        assert!(!state.holds_no_contexts());
+
+        drop(state.take_reduce_context(handle).expect("takes"));
+        assert!(
+            state.holds_no_contexts(),
+            "a cross-file context holds every fact the corpus produced for its rule"
+        );
+    }
+}

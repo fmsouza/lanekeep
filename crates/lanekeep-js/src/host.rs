@@ -98,7 +98,15 @@ pub struct HostContext {
     facts: Rc<RefCell<Vec<EmittedFact>>>,
     file_path: Rc<str>,
     resolver: Option<Arc<dyn BindingResolver>>,
-    files: Option<Rc<FileAccess>>,
+    /// Tracked, confined access to the rest of the project, shared with every rule on this
+    /// file — and, since a run may execute both engines over one corpus, with the component
+    /// engine's context for the same file.
+    ///
+    /// An [`Arc`] rather than an [`Rc`], which is the one place this type's sharing is not
+    /// purely a QuickJS matter: `lanekeep_wasm::host::CheckContext` is required to be `Send`,
+    /// so the shared handle both engines hold has to be one. Nothing else about the arrangement
+    /// changes — an access still belongs to one file and is still touched by one worker.
+    files: Option<Arc<FileAccess>>,
     /// The grammar `querySubtree` and `closestAncestor` compile against.
     language: Option<Arc<dyn lanekeep_lang::Language>>,
     /// The date a rule sees as `ctx.today`, if the host supplied one.
@@ -218,8 +226,13 @@ impl HostContext {
     /// A rule reaching for them then gets a `TypeError` naming the function, which is the
     /// truthful answer — where a stub returning `undefined` would look like an empty project
     /// and produce a rule that silently checks nothing.
+    ///
+    /// Takes an [`Arc`] rather than an [`Rc`] so the *same* access can be handed to the
+    /// component engine's context for the same file. Two memos over one file would let two
+    /// rules see a file rewritten between them differently, which is the determinism invariant
+    /// and not a tidiness question — see [`FileAccess`]'s own `seen` field.
     #[must_use]
-    pub fn with_file_access(mut self, files: Rc<FileAccess>) -> Self {
+    pub fn with_file_access(mut self, files: Arc<FileAccess>) -> Self {
         self.files = Some(files);
         self
     }
@@ -663,7 +676,7 @@ impl HostContext {
             return Ok(());
         };
 
-        let reader = Rc::clone(&files);
+        let reader = Arc::clone(&files);
         object.set(
             "readFile",
             Function::new(
@@ -677,7 +690,7 @@ impl HostContext {
             )?,
         )?;
 
-        let reader = Rc::clone(&files);
+        let reader = Arc::clone(&files);
         object.set(
             "fileExists",
             Function::new(
