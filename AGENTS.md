@@ -543,10 +543,13 @@ both engines at once because it sits above the dispatch that chooses between the
 follow. **A fixture for the *inner* limits still needs a rule that burns real bytecode**, or it
 passes because the work was fast; a fixture for the *outer* check needs the opposite — a handler
 so cheap that nothing but the outer check could have stopped the run, or it passes against the
-bug. And **an aborted run has to commit the entries for files that completed and must not prune**,
-which architecture §6.8 always required and nothing did: `run_files` returned on the first error
-before it reached the save, so a corpus that overran its budget would have been stranded cold
-forever the moment the budget started being enforced.
+bug. And **an aborted run has to commit the entries for files that completed, and must not
+prune.** Those two halves have different histories and it is worth keeping them apart. The
+*commit* half architecture §6.8 always required and nothing did: `run_files` returned on the
+first error before it reached the save, so a corpus that overran its budget would have been
+stranded cold forever the moment the budget started being enforced. The *no-prune* half is
+doctrine this change added to §6.8, and it could not have been there before — an aborted run
+wrote nothing at all, so there was no save whose pruning behavior anyone had to decide.
 
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,
