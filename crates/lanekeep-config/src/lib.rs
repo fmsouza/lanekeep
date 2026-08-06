@@ -267,13 +267,22 @@ const EXTRACT: &str = r"
 /// validated and resolved in Rust, and its `include`, `exclude`, `namespaces`, `severity`
 /// and `timeouts` never become JavaScript at all.
 ///
-/// **That is what the un-coupling costs.** Two code paths can drift where one could not, and
-/// nothing mechanical prevents it any more. What substitutes is weaker and is named here
-/// rather than left implied: the two paths still *converge* at [`build`], which is the only
-/// place a `Config` is constructed, a severity override applied, a card validated or a hash
-/// taken — so a divergence has to be introduced upstream of a single function rather than
-/// anywhere; and the cache-key properties §8.1 depends on are asserted against **both**
-/// paths in this file's tests, deliberately in matched pairs.
+/// **That is what the un-coupling costs.** Two code paths can drift where one could not.
+/// Three things substitute for the mechanism, and they are named here rather than left
+/// implied, because two of them are conventions and only one is enforced.
+///
+/// *Enforced.* `json::parse` builds the **shared** `RawConfig` with an exhaustive struct
+/// literal, so a field added to it is a compile error on the JSON side rather than a setting
+/// that quietly stops being carried. This is the one guard that is stronger than what it
+/// replaced — the same omission from the old entry module's `format!` string compiled.
+///
+/// *Convention.* The two paths still converge at [`build`], the only place a `Config` is
+/// constructed, a severity override applied, a card validated or a hash taken, so a
+/// divergence has to be introduced upstream of a single function rather than anywhere.
+///
+/// *Convention.* The cache-key properties §8.1 depends on are asserted against **both** paths
+/// in this file's tests, deliberately in matched pairs. Nothing enforces that a new property
+/// gets both halves; the pairing is named in the tests so that dropping one is visible.
 ///
 /// # Why `lanekeep-js` is still a dependency of this crate
 ///
@@ -1185,9 +1194,9 @@ mod tests {
     fn the_config_hash_ignores_glob_order() {
         // Include and exclude are order-insensitive in effect, so reordering them must not
         // throw away a warm cache for a change that alters nothing.
-        let make = |globs: &str| {
+        let make = |globs: &str, tag: &str| {
             Fixture::new(
-                &format!("glob-order-{}", globs.len()),
+                &format!("glob-order-{tag}"),
                 &[
                     ("rule.ts", &rule("local/example")),
                     (
@@ -1202,8 +1211,8 @@ mod tests {
         };
 
         assert_eq!(
-            hex(&make("['a/**', 'b/**']")),
-            hex(&make("['b/**', 'a/**' ]")),
+            hex(&make("['a/**', 'b/**']", "sorted")),
+            hex(&make("['b/**', 'a/**' ]", "reversed")),
             "reordering globs must not change the config hash"
         );
     }
@@ -1354,9 +1363,9 @@ mod tests {
 
     #[test]
     fn the_config_hash_ignores_glob_order_for_json() {
-        let make = |globs: &str| {
+        let make = |globs: &str, tag: &str| {
             Fixture::new(
-                &format!("json-glob-order-{}", globs.len()),
+                &format!("json-glob-order-{tag}"),
                 &[
                     ("rule.ts", &rule("local/example")),
                     (
@@ -1371,8 +1380,8 @@ mod tests {
         };
 
         assert_eq!(
-            hex(&make(r#"["a/**", "b/**"]"#)),
-            hex(&make(r#"["b/**", "a/**"]"#)),
+            hex(&make(r#"["a/**", "b/**"]"#, "sorted")),
+            hex(&make(r#"["b/**", "a/**"]"#, "reversed")),
             "reordering globs must not change the config hash"
         );
     }
@@ -1385,9 +1394,9 @@ mod tests {
     /// silently, and the only symptom would be a cache that stops hitting.
     #[test]
     fn the_config_hash_ignores_option_key_order() {
-        let make = |options: &str| {
+        let make = |options: &str, tag: &str| {
             Fixture::new(
-                &format!("json-option-order-{}", options.find('b').unwrap_or(0)),
+                &format!("json-option-order-{tag}"),
                 &[
                     ("rule.ts", &factory_rule("local/example")),
                     (
@@ -1402,8 +1411,8 @@ mod tests {
         };
 
         assert_eq!(
-            hex(&make(r#"{"a": 1, "b": 2}"#)),
-            hex(&make(r#"{"b": 2, "a": 1}"#)),
+            hex(&make(r#"{"a": 1, "b": 2}"#, "sorted")),
+            hex(&make(r#"{"b": 2, "a": 1}"#, "reversed")),
             "reordering option keys must not change the config hash"
         );
     }
@@ -1575,16 +1584,59 @@ mod tests {
 
     /// The un-coupling, as a property of the source rather than of a call graph.
     ///
-    /// `src/json.rs` names no type from the sandbox crate, so no future edit can reintroduce
-    /// the dependency without this failing. The crate as a whole still depends on it, and
-    /// deliberately — see the note above `entry_source`.
+    /// `src/json.rs` names neither the sandbox crate nor any type this crate's root imports
+    /// from it. The crate as a whole still depends on it, and deliberately — see the note
+    /// above `entry_source`.
+    ///
+    /// **Grepping for `lanekeep_js` alone is not enough, and the gap is the spelling a
+    /// refactor would reach for first.** The `use lanekeep_js::{…}` below is at the crate
+    /// root, and a `use` at the root is in scope for every descendant module, so this
+    /// compiles inside `json.rs`, reaches the sandbox, and contains no `lanekeep_js` at all:
+    ///
+    /// ```ignore
+    /// use crate::{ConfigError, Sandbox};
+    /// fn probe(s: &Sandbox) -> bool { s.eval::<bool>("true").unwrap_or(false) }
+    /// ```
+    ///
+    /// The forbidden names are therefore read out of that import line rather than listed
+    /// here, so importing a fifth type from that crate extends this check instead of quietly
+    /// outgrowing it.
+    ///
+    /// What it does not cover, stated rather than left to be discovered: reaching the sandbox
+    /// without naming a type, through some crate-level function that takes one. No such
+    /// function exists for `json.rs` to call today. This is a source check, not a proof.
     #[test]
     fn the_json_path_names_nothing_from_the_sandbox_crate() {
-        let source = include_str!("json.rs");
+        let root = include_str!("lib.rs");
+        let import = root
+            .lines()
+            .find(|line| line.starts_with("use lanekeep_js::{"))
+            .expect("the crate root imports the sandbox crate in one braced list");
+
+        let mut forbidden: Vec<&str> = import
+            .trim_start_matches("use lanekeep_js::{")
+            .trim_end_matches("};")
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
         assert!(
-            !source.contains("lanekeep_js"),
-            "src/json.rs must resolve a JSON config without the sandbox"
+            forbidden.len() > 1
+                && forbidden
+                    .iter()
+                    .all(|n| n.chars().all(char::is_alphanumeric)),
+            "the import list should have parsed into type names: {forbidden:?}"
         );
+        forbidden.push("lanekeep_js");
+
+        let source = include_str!("json.rs");
+        for name in forbidden {
+            assert!(
+                !source.contains(name),
+                "src/json.rs must resolve a JSON config without the sandbox, and it names \
+                 `{name}`"
+            );
+        }
     }
 
     #[test]

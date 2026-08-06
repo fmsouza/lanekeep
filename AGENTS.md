@@ -430,14 +430,30 @@ whole time, so the code and the specification disagreed and neither said so. Opt
 data and hashed now, on the path that knows them — but the general fact stands: **a value that
 only ever exists in generated entry-module source is invisible to both hashes.**
 
-**A fixture directory named after the *length* of its content collides, and the collision reads as
-an unrelated test failing.** `json.rs`'s test helper wrote into
-`temp_dir()/lanekeep-json-{len:x}`; two configs of thirty-eight bytes shared one directory, tests
-run in parallel, and each read whichever had been written last. The suite passed most runs. It
-surfaced during mutation testing, where a mutation of the hashing code was reported as breaking a
-specifier-parsing assertion — which is worse than a flake, because the whole point of that exercise
-is trusting the attribution. Key a shared fixture path on the content (`blake3` of it, truncated),
-where a collision means identical bytes and sharing is harmless.
+**What hid it is worth more than the mechanism: a fixture written against a `lanekeep.config.ts`
+passes against this bug.** The two config formats reach the key by different routes — a TypeScript
+config's options live in the config module's own source, which the loader *did* read, so they were
+hashed all along — and every hashing test there was covered one format. Single-format coverage of a
+property both formats have to satisfy is not coverage of the property. When two paths can reach the
+same requirement, assert it on each of them, in matched pairs, and name the pairing so nobody drops
+half of it later.
+
+**A fixture path derived from its content races, and the *repair* for the obvious version of that
+bug races too.** `json.rs`'s test helper first keyed `temp_dir()/lanekeep-json-…` on the config's
+*length*: two thirty-eight-byte configs shared one file, tests run in parallel, and each read
+whichever had been written last. Keying on a `blake3` of the content looks like the fix and is not
+— two tests can legitimately write the *identical* config, and `std::fs::write` truncates before it
+writes, so the sibling thread reads an empty file and fails with `EOF while parsing a value at line
+1 column 0`. Measured five failures in eighty runs of `cargo test -p lanekeep-config`; **same bytes
+is not the same as no race, because truncate-then-write is not atomic.** Name the directory after
+the *test*, or write to a temporary and rename. Nothing derived is safe here, and the derivation
+that is nearly safe is the one that costs the most to disbelieve.
+
+Both versions surfaced during mutation testing, where a mutation of the hashing code was reported as
+breaking a specifier-parsing assertion — worse than an ordinary flake, because the whole point of
+that exercise is trusting the attribution. `just check` hid it: nextest runs a process per test,
+which widens the window enough that a hundred runs were clean, while the plain `cargo test` the
+brief prescribes was failing one run in sixteen.
 
 **A node handle is an integer and the root's is `0`, so `if (!node)` discards it.** Nodes cross
 into the sandbox as handles rather than objects — one of the one-way doors in §14 — and the

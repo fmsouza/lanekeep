@@ -232,6 +232,14 @@ pub(crate) fn parse(config_path: &Path, rules_root: &Path) -> Result<Parsed, Con
     }
 
     Ok(Parsed {
+        // Every field named, and no `..Default::default()`. This is the load-bearing line of
+        // the whole un-coupling: the two config formats no longer share a mechanism, so the
+        // thing that has to be prevented is one of them quietly not carrying a setting. An
+        // exhaustive literal against the *shared* struct makes that a compile error — adding
+        // `presets` to `RawConfig` fails here with `error[E0063]: missing field 'presets'`,
+        // naming this line — where the arrangement this replaced had no equivalent: the same
+        // omission from the old entry module's `format!` string compiled fine and produced a
+        // config silently missing a setting. Do not "tidy" this into a struct-update.
         config: crate::RawConfig {
             include: config.include,
             exclude: config.exclude,
@@ -365,35 +373,43 @@ fn js_string(value: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Where a fixture config is written.
+    /// Where a fixture config is written: one directory per caller, named by the caller.
     ///
-    /// Keyed on the config's *content*, not its length. Length collides: two of these tests
-    /// wrote thirty-eight-byte configs into one directory, and since they run in parallel
-    /// each read whichever had been written last — so a passing run and a failing run
-    /// differed only in scheduling, and a mutation of the code under test was reported as
-    /// breaking an unrelated assertion. Content-keyed, a collision means the same bytes,
-    /// which is the case where sharing is harmless.
-    fn fixture_dir(json: &str) -> PathBuf {
-        let digest = blake3::hash(json.as_bytes()).to_hex();
-        std::env::temp_dir().join(format!("lanekeep-json-{}", &digest[..16]))
+    /// **Two derived names have already raced here, and the second looked like a fix.** The
+    /// first keyed the directory on the config's *length*, so two thirty-eight-byte configs
+    /// shared one file and each test read whichever had been written last. Keying on a hash
+    /// of the *content* was the obvious repair and is still wrong: two tests can legitimately
+    /// use the identical config — `a_component_reference_resolves_to_a_path` and
+    /// `a_component_reference_is_refused_for_now` both write
+    /// `{"rules": ["./rules/mine.wasm"]}` — and `std::fs::write` truncates before it writes,
+    /// so the sibling thread reads an empty file and fails with `EOF while parsing a value at
+    /// line 1 column 0`. Measured five failures in eighty runs of
+    /// `cargo test -p lanekeep-config`. Same bytes is not the same as no race; truncate-then-
+    /// write is not atomic.
+    ///
+    /// An explicit name is the only version with no derivation to be clever about. Two tests
+    /// passing the same name is a visible duplicate rather than a scheduling-dependent one.
+    fn fixture_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("lanekeep-json-{name}"))
     }
 
-    fn parse_config(json: &str) -> Result<Parsed, ConfigError> {
-        let dir = fixture_dir(json);
+    fn parse_config(name: &str, json: &str) -> Result<Parsed, ConfigError> {
+        let dir = fixture_dir(name);
         std::fs::create_dir_all(&dir).expect("creates dir");
         let path = dir.join("lanekeep.json");
         std::fs::write(&path, json).expect("writes");
         parse(&path, &dir)
     }
 
-    fn compile(json: &str) -> Result<String, ConfigError> {
-        let parsed = parse_config(json)?;
+    fn compile(name: &str, json: &str) -> Result<String, ConfigError> {
+        let parsed = parse_config(name, json)?;
         rules_module(&parsed.rules, "lanekeep.json")
     }
 
     #[test]
     fn a_bare_rule_is_imported_and_used_as_it_comes() {
-        let source = compile(r#"{"rules": ["lanekeep/no-default-export"]}"#).expect("compiles");
+        let source =
+            compile("bare-rule", r#"{"rules": ["lanekeep/no-default-export"]}"#).expect("compiles");
         assert!(source.contains("import __lanekeepRule0 from 'lanekeep/no-default-export';"));
         assert!(source.contains("rules: [__lanekeepRule0]"));
     }
@@ -402,6 +418,7 @@ mod tests {
     fn a_configured_rule_is_called_with_its_options() {
         // The distinction a rule author already makes between a rule and a rule factory.
         let source = compile(
+            "configured-rule",
             r#"{"rules": [{"rule": "lanekeep/no-restricted-imports",
                 "options": {"restrictions": [{"module": "stripe"}]}}]}"#,
         )
@@ -411,13 +428,15 @@ mod tests {
 
     #[test]
     fn a_local_rule_keeps_its_relative_path() {
-        let source = compile(r#"{"rules": ["./lanekeep/rules/mine.ts"]}"#).expect("compiles");
+        let source =
+            compile("local-rule", r#"{"rules": ["./lanekeep/rules/mine.ts"]}"#).expect("compiles");
         assert!(source.contains("from './lanekeep/rules/mine.ts';"));
     }
 
     #[test]
     fn globs_and_namespaces_survive() {
         let parsed = parse_config(
+            "globs-and-namespaces",
             r#"{"include": ["src/**/*.go"], "exclude": ["**/*_test.go"], "namespaces": ["acme"]}"#,
         )
         .expect("parses");
@@ -434,6 +453,7 @@ mod tests {
     #[test]
     fn no_configuration_data_reaches_the_entry_module() {
         let source = compile(
+            "no-data-in-module",
             r#"{"include": ["src/**/*.go"], "exclude": ["**/*_test.go"],
                 "namespaces": ["acme"], "severity": {"acme/a": "warn"},
                 "timeouts": {"rule": 100, "global": 5000},
@@ -461,6 +481,7 @@ mod tests {
     #[test]
     fn severity_and_timeouts_are_read_in_rust() {
         let parsed = parse_config(
+            "severity-and-timeouts",
             r#"{"severity": {"acme/a": "warn"}, "timeouts": {"rule": 100, "global": 5000}}"#,
         )
         .expect("parses");
@@ -474,7 +495,8 @@ mod tests {
 
     #[test]
     fn a_builtin_resolves_to_its_name() {
-        let parsed = parse_config(r#"{"rules": ["lanekeep/no-package-init"]}"#).expect("parses");
+        let parsed =
+            parse_config("builtin", r#"{"rules": ["lanekeep/no-package-init"]}"#).expect("parses");
         assert_eq!(
             parsed.rules[0].reference,
             RuleReference::Builtin("no-package-init".to_owned())
@@ -484,7 +506,8 @@ mod tests {
 
     #[test]
     fn a_module_reference_keeps_its_specifier() {
-        let parsed = parse_config(r#"{"rules": ["./rules/mine.ts"]}"#).expect("parses");
+        let parsed =
+            parse_config("module-ref", r#"{"rules": ["./rules/mine.ts"]}"#).expect("parses");
         assert_eq!(
             parsed.rules[0].reference,
             RuleReference::Module("./rules/mine.ts".to_owned())
@@ -494,18 +517,22 @@ mod tests {
     /// A component is recognized by its extension and resolved against the rules root.
     #[test]
     fn a_component_reference_resolves_to_a_path() {
-        let json = r#"{"rules": ["./rules/mine.wasm"]}"#;
-        let parsed = parse_config(json).expect("parses");
+        let parsed =
+            parse_config("component-path", r#"{"rules": ["./rules/mine.wasm"]}"#).expect("parses");
         assert_eq!(
             parsed.rules[0].reference,
-            RuleReference::Component(fixture_dir(json).join("rules").join("mine.wasm"))
+            RuleReference::Component(
+                fixture_dir("component-path")
+                    .join("rules")
+                    .join("mine.wasm")
+            )
         );
     }
 
     /// Recognized and refused, rather than accepted and quietly doing nothing.
     #[test]
     fn a_component_reference_is_refused_for_now() {
-        let error = compile(r#"{"rules": ["./rules/mine.wasm"]}"#)
+        let error = compile("component-refused", r#"{"rules": ["./rules/mine.wasm"]}"#)
             .expect_err("a component cannot be executed yet");
         let rendered = error.to_string();
         assert!(rendered.contains("component"), "{rendered}");
@@ -520,6 +547,7 @@ mod tests {
     #[test]
     fn options_are_carried_as_data() {
         let parsed = parse_config(
+            "options-as-data",
             r#"{"rules": [{"rule": "lanekeep/x", "options": {"limit": 3}}, {"rule": "lanekeep/y"}]}"#,
         )
         .expect("parses");
@@ -534,7 +562,7 @@ mod tests {
 
     #[test]
     fn an_absent_severity_map_is_empty_rather_than_missing() {
-        let parsed = parse_config(r#"{"rules": []}"#).expect("parses");
+        let parsed = parse_config("absent-severity", r#"{"rules": []}"#).expect("parses");
         assert!(parsed.config.severity.is_empty());
         assert_eq!(parsed.config.timeouts.rule, None);
         assert_eq!(parsed.config.timeouts.global, None);
@@ -544,14 +572,17 @@ mod tests {
     fn the_schema_key_is_accepted_and_ignored() {
         // Editors read it to offer completion. Rejecting it would make the one thing that
         // helps a user before lanekeep runs an error.
-        compile(r#"{"$schema": "https://example.com/s.json", "rules": []}"#)
-            .expect("a $schema key is not an error");
+        compile(
+            "schema-key",
+            r#"{"$schema": "https://example.com/s.json", "rules": []}"#,
+        )
+        .expect("a $schema key is not an error");
     }
 
     #[test]
     fn an_unknown_key_is_refused() {
         // A misspelled key is a setting that silently does nothing.
-        let error = compile(r#"{"includes": ["src/**"]}"#).expect_err("refused");
+        let error = compile("unknown-key", r#"{"includes": ["src/**"]}"#).expect_err("refused");
         assert!(
             format!("{error}").contains("includes"),
             "the error should name the key: {error}"
@@ -562,22 +593,29 @@ mod tests {
     fn a_specifier_that_would_escape_the_import_is_refused() {
         // Nothing legitimate needs a quote in a module specifier, and a config file is
         // exactly the kind of thing a script generates one day.
-        for hostile in [
-            r#"{"rules": ["a'; globalThis.x = 1; import b from 'c"]}"#,
-            "{\"rules\": [\"a\\nimport b from 'c'\"]}",
+        for (name, hostile) in [
+            (
+                "hostile-quote",
+                r#"{"rules": ["a'; globalThis.x = 1; import b from 'c"]}"#,
+            ),
+            (
+                "hostile-newline",
+                "{\"rules\": [\"a\\nimport b from 'c'\"]}",
+            ),
         ] {
-            compile(hostile).expect_err("a specifier with a quote or newline is refused");
+            compile(name, hostile).expect_err("a specifier with a quote or newline is refused");
         }
     }
 
     #[test]
     fn an_empty_specifier_is_refused() {
-        compile(r#"{"rules": [""]}"#).expect_err("an empty specifier cannot import anything");
+        compile("empty-specifier", r#"{"rules": [""]}"#)
+            .expect_err("an empty specifier cannot import anything");
     }
 
     #[test]
     fn malformed_json_is_reported_as_shape() {
-        let error = compile("{ not json }").expect_err("refused");
+        let error = compile("malformed", "{ not json }").expect_err("refused");
         assert!(matches!(error, ConfigError::Shape { .. }));
     }
 
@@ -589,8 +627,17 @@ mod tests {
     /// is how a user learns to ignore the schema.
     ///
     /// So this reads the shipped schema and checks every property it declares actually
-    /// parses, and that the set is exactly the expected one — adding a field to either side
-    /// alone fails here.
+    /// parses, and that the set is exactly the expected one.
+    ///
+    /// **It catches one of those two directions, not both, and the docstring used to claim
+    /// otherwise.** A field added to the schema alone changes `declared` and fails here. A
+    /// field added to `JsonConfig` alone changes neither the schema file nor the list below,
+    /// so it passes — the list is a hand-maintained third copy, and the check is really
+    /// "schema versus list" rather than "schema versus parser". Closing it needs the struct's
+    /// own field names, which `serde` does not expose and which nothing here can read without
+    /// parsing this file's source. Left open deliberately, and stated, because a comment
+    /// claiming a guarantee that is not there is worse than the gap: it is the reason nobody
+    /// looks again.
     #[test]
     fn the_shipped_schema_and_the_parser_agree() {
         let schema: Value =
@@ -629,7 +676,8 @@ mod tests {
             "timeouts": {"rule": 100, "global": 5000},
             "rules": ["lanekeep/no-default-export"]
         }"#;
-        compile(everything).expect("the parser accepts every field the schema declares");
+        compile("schema-agreement", everything)
+            .expect("the parser accepts every field the schema declares");
     }
 
     #[test]
