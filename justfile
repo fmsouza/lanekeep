@@ -77,6 +77,11 @@ test-doc:
 # changing a fixture's WIT or source, and the resulting `.wasm` is reviewed like any other
 # change.
 #
+# The last step records what everything was built from, and it is what keeps the trade
+# above honest: without it, editing a fixture's source and not running this recipe leaves
+# every test in `lanekeep-wasm` asserting against the previous binary, green and
+# meaningless. See `crates/lanekeep-wasm/tests/fixture_currency.rs`.
+#
 # `--target wasm32-unknown-unknown` is a requirement, not a preference. `cargo component`
 # defaults to `wasm32-wasip1`, whose components import a wall clock and a filesystem as
 # soon as the guest touches anything in `std` — the two capabilities the sandbox exists to
@@ -86,10 +91,12 @@ wasm-fixtures:
     set -euo pipefail
     just _require cargo-component
     root="$(pwd)"
+    built=0
     for dir in crates/lanekeep-wasm/tests/fixtures/*/; do
         [ -f "${dir}Cargo.toml" ] || continue
         name="$(basename "${dir}")"
         echo "building ${name}"
+        built=$((built + 1))
         (cd "${dir}" && cargo component build --release --target wasm32-unknown-unknown)
         # cargo names the artifact after the crate with hyphens turned into underscores,
         # and the directory keeps the hyphens. `spike` has neither, so this only starts
@@ -97,6 +104,15 @@ wasm-fixtures:
         cp "${dir}target/wasm32-unknown-unknown/release/${name//-/_}.wasm" \
            "${root}/crates/lanekeep-wasm/tests/fixtures/${name}.wasm"
     done
+
+    # A glob that matches no package builds nothing and says so in no way at all — and the
+    # step below would then record the artifacts already in the tree as current, which is the
+    # one thing this recipe must never do quietly.
+    if [ "${built}" -eq 0 ]; then
+        echo "error: no fixture crates under crates/lanekeep-wasm/tests/fixtures/." >&2
+        echo "       nothing was rebuilt, so nothing may be re-recorded." >&2
+        exit 1
+    fi
 
     # And exactly one artifact built for the target every line above exists to avoid.
     #
@@ -115,6 +131,17 @@ wasm-fixtures:
     (cd "${dir}" && cargo component build --release --target wasm32-wasip1)
     cp "${dir}target/wasm32-wasip1/release/wasip1.wasm" \
        "${root}/crates/lanekeep-wasm/tests/fixtures/rejected/wasip1.wasm"
+
+    # Record what all of that was built from, so the gate can tell a stale artifact from a
+    # current one without needing `cargo component` to find out.
+    #
+    # `cargo test` rather than `cargo nextest run`, and not because of the runner: nextest
+    # runs each test in its own process with no way to say "this one writes a file", and the
+    # point here is the side effect rather than the verdict. The same test asserts under
+    # `just test` with the variable unset.
+    echo "recording fixture digests"
+    LANEKEEP_BLESS_WASM_FIXTURES=1 cargo test --quiet -p lanekeep-wasm \
+        --test fixture_currency -- --exact every_committed_artifact_is_the_one_its_sources_build
 
 # Tests for the repository's own shell tooling.
 #

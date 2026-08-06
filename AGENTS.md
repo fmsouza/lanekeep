@@ -429,6 +429,19 @@ is rescued by noticing, since every such failure cancels the run either way; the
 `lanekeep-engine`'s `Worker::poison_on` remembers the first failure and hands it back for the
 rest of that worker's share.
 
+**`git log -- <a committed binary>` lists the commits where its bytes changed, and a rebuild
+that produces identical bytes is not one of them.** So "the source commit is newer than the
+artifact commit" is not evidence that the artifact is stale — it is equally the signature of a
+rebuild that changed nothing, and the two are indistinguishable from history alone. Three of the
+ten WebAssembly fixtures read as stale that way and all ten turned out to be current, which only
+a rebuild could establish: `cargo component build --release` on the pinned toolchain is
+byte-reproducible, so `just wasm-fixtures` on a consistent tree leaves `git status` clean and on
+an inconsistent one does not. That is now the check rather than the investigation —
+`crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
+`tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
+there too, because nine of the ten name it as their component target and a world edit with no
+rebuild leaves every fixture satisfying an ABI that no longer exists.
+
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
 and re-checks forever — pinning a core while the output looks exactly like a tool that is
