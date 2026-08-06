@@ -47,6 +47,12 @@ lanekeep-query = { workspace = true }
 # guaranteed both under `lanekeep-js`; here they are checked, in `src/facts.rs`.
 serde_json = { workspace = true }
 
+# `thiserror` for `WasmError`, which is the wasm counterpart of `lanekeep_js::SandboxError` and
+# is derived the same way. The two enums are deliberately the same shape: one set of limits is
+# enforced by both engines, so a caller telling a timeout from a rule bug should not have to
+# learn two vocabularies.
+thiserror = { workspace = true }
+
 # Parsing, so the tests can build a real tree for a real context to be lent over. The engine
 # itself never picks a grammar — the file does, through `lanekeep-languages` — so these are
 # the tests' dependencies and not the crate's.

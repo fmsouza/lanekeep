@@ -90,7 +90,9 @@
 //! components costs, which is larger and which nobody has measured.
 
 pub mod bindings;
+pub mod error;
 pub mod host;
+pub mod runtime;
 
 // Private, and the visibility is the claim: nothing outside this crate validates a fact,
 // because nothing outside it receives one from a guest. The module exists so the three
@@ -98,32 +100,5 @@ pub mod host;
 // can reach them.
 mod facts;
 
-use wasmtime::{Config, Engine, Result};
-
-/// Builds the [`Engine`] rule components execute on.
-///
-/// One `Engine` is shared across a run. It is the unit wasmtime caches compiled code in,
-/// so building a second one would recompile everything the first already holds.
-///
-/// # Errors
-///
-/// Returns the error `wasmtime` reports when the configuration cannot be realized on this
-/// host — a compiler backend the target does not support, or a memory tunable the platform
-/// rejects.
-pub fn engine() -> Result<Engine> {
-    // Deliberately the default `Config` for now. The two tunables that must eventually be
-    // set here — `memory_reservation` and `memory_guard_size` — are baked into every
-    // precompiled artifact wasmtime writes and are therefore cache-key inputs, so they are
-    // chosen where the cache key is defined rather than here.
-    Engine::new(&Config::new())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn engine_builds() {
-        assert!(engine().is_ok());
-    }
-}
+pub use error::WasmError;
+pub use runtime::{WasmEngine, WasmRuntime, engine};

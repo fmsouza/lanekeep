@@ -291,6 +291,13 @@ fn context() -> CheckContext {
 fn a_component_targeting_the_world_instantiates_and_answers_both_probes() {
     let (engine, component, linker) = linked();
     let mut store = Store::new(&engine, StubHost::default());
+
+    // `lanekeep_wasm::engine` enables epoch interruption, and wasmtime starts every store at
+    // deadline zero — which has always elapsed. Without this line every call into a guest
+    // traps with `wasm trap: interrupt` before running a single instruction. Nothing advances
+    // the epoch in this file, so an unreachable deadline is what "no limit" means here;
+    // `lanekeep_wasm::WasmRuntime` is what arms a real one per invocation, against a ticker.
+    store.set_epoch_deadline(u64::MAX);
     let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
 
     assert!(
@@ -315,6 +322,13 @@ fn a_component_targeting_the_world_instantiates_and_answers_both_probes() {
 fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
     let (engine, component, linker) = linked();
     let mut store = Store::new(&engine, StubHost::default());
+
+    // `lanekeep_wasm::engine` enables epoch interruption, and wasmtime starts every store at
+    // deadline zero — which has always elapsed. Without this line every call into a guest
+    // traps with `wasm trap: interrupt` before running a single instruction. Nothing advances
+    // the epoch in this file, so an unreachable deadline is what "no limit" means here;
+    // `lanekeep_wasm::WasmRuntime` is what arms a real one per invocation, against a ticker.
+    store.set_epoch_deadline(u64::MAX);
     let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
 
     let ctx = store
@@ -362,6 +376,13 @@ fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
 fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
     let (engine, component, linker) = linked();
     let mut store = Store::new(&engine, StubHost::default());
+
+    // `lanekeep_wasm::engine` enables epoch interruption, and wasmtime starts every store at
+    // deadline zero — which has always elapsed. Without this line every call into a guest
+    // traps with `wasm trap: interrupt` before running a single instruction. Nothing advances
+    // the epoch in this file, so an unreachable deadline is what "no limit" means here;
+    // `lanekeep_wasm::WasmRuntime` is what arms a real one per invocation, against a ticker.
+    store.set_epoch_deadline(u64::MAX);
     let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
 
     // Empty, and nothing reads it: this file's host answers every reduce method with a

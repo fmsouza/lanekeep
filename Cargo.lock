@@ -1011,6 +1011,7 @@ dependencies = [
  "lanekeep-nodes",
  "lanekeep-query",
  "serde_json",
+ "thiserror",
  "tree-sitter",
  "wasmtime",
 ]

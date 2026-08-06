@@ -79,6 +79,13 @@ fn run(source: &str, name: &str) -> (Store<HostState>, Resource<CheckContext>) {
     let tree = parser.parse(source, None).expect("parses");
 
     let mut store = Store::new(&engine, HostState::new());
+
+    // `lanekeep_wasm::engine` enables epoch interruption, and wasmtime starts every store at
+    // deadline zero — which has always elapsed. Without this line every call into a guest
+    // traps with `wasm trap: interrupt` before running a single instruction. Nothing advances
+    // the epoch in this file, so an unreachable deadline is what "no limit" means here;
+    // `lanekeep_wasm::WasmRuntime` is what arms a real one per invocation, against a ticker.
+    store.set_epoch_deadline(u64::MAX);
     let context = store
         .data_mut()
         .push_check_context(CheckContext::new(
