@@ -418,8 +418,10 @@ impl ComponentLoader {
                 drop(std::fs::remove_file(&path));
             }
 
-            self.compilations.fetch_add(1, Ordering::Relaxed);
+            // Counted after the fact rather than before it, so the number means "components
+            // this loader compiled" and not "components it tried to".
             let compiled = engine.compile(bytes)?;
+            self.compilations.fetch_add(1, Ordering::Relaxed);
             if self.persist(&compiled, &path)
                 && let Some(component) = map(engine.engine(), &path)
             {
@@ -434,9 +436,9 @@ impl ComponentLoader {
             return self.admit(engine, name, compiled, LoadSource::Embedded);
         }
 
+        let compiled = engine.compile(bytes)?;
         self.compilations.fetch_add(1, Ordering::Relaxed);
         self.embedded.fetch_add(1, Ordering::Relaxed);
-        let compiled = engine.compile(bytes)?;
         self.admit(engine, name, compiled, LoadSource::Embedded)
     }
 

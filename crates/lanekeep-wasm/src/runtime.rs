@@ -91,11 +91,16 @@
 //! `map_init` runs its initializer per chunk rather than per thread — an `AGENTS.md` trap —
 //! so instantiating there would quietly turn "per component per worker" into something nearer
 //! "per component per file"; nothing is instantiated in a constructor here, which makes where
-//! the initializer runs irrelevant. And **a `Store` never reclaims an instance**: instantiating
-//! repeatedly into one stops at 3,333 component instances, the 3,334th failing with `resource
-//! limit exceeded: instance count too high at 10001`, three core instances per component
-//! instance against wasmtime's default cap. `tests/instantiation.rs` asserts that number,
-//! because it is the ceiling a per-file design would hit rather than merely be slow under.
+//! the initializer runs irrelevant. And **a `Store` never reclaims an instance**, so a per-file
+//! design would not merely be slow — it would run out. Two ceilings say so, and the nearer one
+//! is lanekeep's: under the shipped 64 MiB per-worker limit a store accepts about sixty
+//! instances of `tests/fixtures/world-shape.wasm` before [`WasmError::MemoryExceeded`], because
+//! linear memories never shrink and `MemoryCeiling` sums every grant. With that raised,
+//! wasmtime's own cap stops it at 3,333, the 3,334th failing with `resource limit exceeded:
+//! instance count too high at 10001` — three core instances per component instance against a
+//! default of 10,000. `tests/instantiation.rs` asserts both: the sixty as an order of magnitude,
+//! since it moves with the fixture's linear-memory minimum, and the 3,333 exactly, since it is
+//! deterministic and a store that had started reclaiming instances is worth knowing about.
 //!
 //! # A rule's `check` must be a pure function of its arguments
 //!
