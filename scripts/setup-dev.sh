@@ -39,6 +39,17 @@ info "installing the wasm32-unknown-unknown target"
 rustup target add wasm32-unknown-unknown
 ok "wasm32-unknown-unknown"
 
+# And the target every line above exists to avoid, because one fixture is built for it on
+# purpose: tests/fixtures/rejected/wasip1.wasm is what the load-time import check is pointed at,
+# and `AGENTS.md` records why it has to be built rather than described — a guest small enough to
+# allocate nothing has zero imports on *both* targets, so a synthetic approximation would prove
+# nothing. Installed here for the same reason as the target above: without it `just
+# wasm-fixtures` gets nine fixtures in and dies on a rustup error about a target nobody asked
+# for, which reads like the recipe is wrong rather than the toolchain incomplete.
+info "installing the wasm32-wasip1 target"
+rustup target add wasm32-wasip1
+ok "wasm32-wasip1"
+
 # ---------------------------------------------------------------------------
 bold "tools"
 # ---------------------------------------------------------------------------
