@@ -1,8 +1,8 @@
-//! A guest that breaches every limit the runtime enforces, and two that do not.
+//! A guest that breaches every limit the runtime enforces, and three that do not.
 //!
 //! **It is a probe, not a rule and not an assertion**, on the terms
 //! `tests/fixtures/facts/src/lib.rs` sets out: the host picks a probe by the first capture's
-//! name and asserts on what came back. Two of the four probes here never return at all, so
+//! name and asserts on what came back. Two of the five probes here never return at all, so
 //! they cannot report anything — what the host asserts on for those is the error.
 //!
 //! # Why every loop carries a `black_box`
@@ -11,9 +11,9 @@
 //! may legally reduce to nothing, and a probe that was optimized away would make the runtime
 //! look as though it stopped a rule it never actually ran. `std::hint::black_box` is the
 //! documented way to say "this value is used" without saying how, and it is what makes these
-//! four probes measurements rather than hopes. The same reasoning applies to `grow`'s
-//! allocations: without the `black_box`, nothing keeps the blocks alive and the allocator can
-//! hand back the same page forever.
+//! probes measurements rather than hopes. The same reasoning applies to `grow`'s allocations:
+//! without the `black_box`, nothing keeps the blocks alive and the allocator can hand back the
+//! same page forever.
 //!
 //! # `work` is the one that exists because a cheap rule proves nothing
 //!
@@ -23,6 +23,15 @@
 //! it exposes is the point — and `work` is its control: the same host, the same budget, a guest
 //! that keeps executing. Without the pair, a run that finishes cannot be told apart from a
 //! limit that was never wired.
+//!
+//! # `strided` exists because one access pattern is not evidence
+//!
+//! `work` and `strided` disagree about `memory_guard_size` — a zero guard is 16-19% faster on
+//! the first and 37-42% slower on the second — and the engine shipped the wrong value for as
+//! long as `work` was the only probe that had an opinion. `strided` is the pattern wasmtime's
+//! own bounds-check lowering is written around, and it is kept here so the measurement in
+//! `lanekeep_wasm::runtime::MEMORY_GUARD_SIZE` stays reproducible rather than becoming a claim
+//! about a probe nobody can run.
 
 #[allow(warnings)]
 mod bindings;
