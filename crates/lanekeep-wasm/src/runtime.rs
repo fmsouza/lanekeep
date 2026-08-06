@@ -247,12 +247,22 @@ use crate::host::{CheckContext, HostState, ReduceContext};
 /// dominate, twelve milliseconds is imperceptible; on a run large enough to care about,
 /// execution dominates.
 ///
-/// **That argument assumes an instance per (worker, rule), not per file, and nothing enforces
-/// it.** [`WasmRuntime::instantiate`] is public and says nothing about how often it may be
-/// called. At ten thousand files times ten rules the penalty is on the order of three and a half
-/// seconds and 4 GiB stops being defensible — so an engine that instantiates per file has
-/// invalidated this choice, not merely made it slower. If that shape ever changes, this constant
-/// is one of the things that has to be re-measured rather than inherited.
+/// **That argument depends on an instance per (worker, rule) rather than per file, and that is
+/// now enforced rather than assumed.** [`RuleSet`] resolves each component once for the run and
+/// each worker's [`WasmRuntime`] holds one `Option` per rule, filled by [`WasmRuntime::rule`]
+/// and by nothing else — so a cache sized to the ruleset is the ceiling, and there is nowhere
+/// to put a second instance of a rule. `tests/instantiation.rs` asserts it, and the two eager
+/// designs it is written against fail it.
+///
+/// The reason it is worth enforcing rather than documenting: at ten thousand files times ten
+/// rules the penalty is on the order of three and a half seconds and 4 GiB stops being
+/// defensible — so an engine that instantiated per file would have invalidated this choice, not
+/// merely made it slower. It would also not get that far. Under the shipped 64 MiB per-worker
+/// ceiling one store accepts about sixty instances of `tests/fixtures/world-shape.wasm` before
+/// [`WasmError::MemoryExceeded`], because linear memories never shrink and `MemoryCeiling` sums
+/// every grant; with that ceiling raised, wasmtime's own cap stops it at 3,333. If the shape
+/// ever changes, this constant is one of the things that has to be re-measured rather than
+/// inherited.
 ///
 /// This reverses what the decision record expected without contradicting what it measured: the
 /// design spike measured instantiation and never measured execution. It is written down here
