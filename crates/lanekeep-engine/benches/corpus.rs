@@ -362,6 +362,19 @@ fn rule_source(index: usize) -> String {
     )
 }
 
+/// A global budget far past anything measured here, so the product's default cannot end a
+/// measurement.
+///
+/// Not a relaxed gate — [`COLD_CEILING`] is this file's assertion about a run taking absurdly
+/// long, and it is unchanged. This is about *which* failure a slow machine gets. The default
+/// budget is fifteen seconds, and the walker checks it between files, which is a limit this
+/// corpus can genuinely reach: it is 2,000 files against 20 rules, only every twentieth of
+/// which runs a handler, so almost all of a cold pass is Rust-side work under one clock. The
+/// cold pass measures 783 ms here and this suite's first hosted run measured 10.9 s, which is
+/// margin thin enough to lose on a throttled runner. Losing it would replace the number a human
+/// reads with a panic advising `--timeout`, which says nothing about performance.
+const BENCH_GLOBAL_TIMEOUT_MS: u64 = 600_000;
+
 fn config_source() -> String {
     let imports: String = (0..RULES)
         .map(|i| format!("import r{i:02} from './rules/r{i:02}';\n"))
@@ -373,6 +386,7 @@ fn config_source() -> String {
          {imports}\
          export default defineConfig({{\n\
          \x20 include: ['src/**/*.ts'],\n\
+         \x20 timeouts: {{ global: {BENCH_GLOBAL_TIMEOUT_MS} }},\n\
          \x20 rules: [{}],\n\
          }});\n",
         names.join(", ")
