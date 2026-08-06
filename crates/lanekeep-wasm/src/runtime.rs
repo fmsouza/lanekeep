@@ -321,7 +321,10 @@ impl EpochTicker {
             })
             .map_err(|e| {
                 WasmError::Engine(format!(
-                    "could not start the epoch ticker thread: {e}\n                       both the per-invocation and the global wall-clock budgets are enforced by                      that thread advancing the engine's epoch, so a runtime without one would                      run every rule under no timeout at all"
+                    "could not start the epoch ticker thread: {e}\n  \
+                     both the per-invocation and the global wall-clock budgets are enforced by \
+                     that thread advancing the engine's epoch, so a runtime built without one \
+                     would run every rule under no timeout at all"
                 ))
             })?;
 
