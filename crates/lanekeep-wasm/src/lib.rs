@@ -112,5 +112,5 @@ pub mod runtime;
 mod facts;
 
 pub use error::WasmError;
-pub use load::{ComponentLoader, LoadSource, PermittedImports};
+pub use load::{ComponentLoader, LoadSource, Loaded, PermittedImports};
 pub use runtime::{RuleSet, RuleSlot, WasmEngine, WasmRuntime, engine};

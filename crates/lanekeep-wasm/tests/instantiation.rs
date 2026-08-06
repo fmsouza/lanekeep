@@ -45,9 +45,11 @@ use lanekeep_core::limits::{Limits, RunClock};
 use lanekeep_lang::Language;
 use lanekeep_lang_js::TypeScript;
 use lanekeep_nodes::NodeArena;
+use lanekeep_wasm::ComponentLoader;
 use lanekeep_wasm::WasmError;
 use lanekeep_wasm::bindings::types;
 use lanekeep_wasm::host::CheckContext;
+use lanekeep_wasm::load::{PermittedImports, instance_imports};
 use lanekeep_wasm::runtime::{RuleSet, RuleSlot, WasmEngine, WasmRuntime};
 use wasmtime::component::Resource;
 
@@ -56,6 +58,10 @@ const WORLD_SHAPE: &[u8] = include_bytes!("fixtures/world-shape.wasm");
 
 /// A component targeting a world of its own, for the case where resolution has to fail.
 const SPIKE: &[u8] = include_bytes!("fixtures/spike.wasm");
+
+/// The one artifact built for `wasm32-wasip1`, for the case where a permitted import is
+/// nonetheless unbound.
+const WASIP1: &[u8] = include_bytes!("fixtures/rejected/wasip1.wasm");
 
 /// The run's shared half: one engine, one rule set, one clock.
 ///
@@ -82,13 +88,17 @@ impl Run {
 
     fn with_limits(count: usize, limits: Limits) -> Self {
         let engine = WasmEngine::new().expect("the shipped configuration builds");
-        let component = engine
-            .compile(WORLD_SHAPE)
-            .expect("the fixture is a valid component");
+        // Through a loader, because `RuleSet::add` takes a `Loaded` and only a loader makes
+        // one — which is what stops a caller reaching an instance without the import check.
+        // `without_cache` here so this file writes nothing to disk; the artifact path is
+        // `tests/load.rs`'s subject, not this one's.
+        let loaded = ComponentLoader::without_cache()
+            .load(&engine, "world-shape", WORLD_SHAPE)
+            .expect("the fixture loads and imports only the declared world");
         let mut rules = RuleSet::new(&engine).expect("the world links");
         for n in 0..count {
             rules
-                .add(format!("acme/rule-{n}"), &component)
+                .add(format!("acme/rule-{n}"), &loaded)
                 .expect("the fixture satisfies the world");
         }
         Self {
@@ -370,9 +380,12 @@ fn the_bound_is_per_worker_per_rule_and_not_per_run() {
 #[test]
 fn a_component_that_does_not_satisfy_the_world_is_refused_when_it_is_added() {
     let engine = WasmEngine::new().expect("the shipped configuration builds");
-    let spike = engine
-        .compile(SPIKE)
-        .expect("the fixture is a valid component");
+    // It loads: `spike.wasm` targets its own world and so imports nothing at all, which is
+    // strictly less authority than the declared world rather than more. What it cannot do is
+    // satisfy this one, and that is a separate question answered a line later.
+    let spike = ComponentLoader::without_cache()
+        .load(&engine, "acme/spike", SPIKE)
+        .expect("importing nothing passes the import check");
     let mut rules = RuleSet::new(&engine).expect("the world links");
 
     let error = rules
@@ -383,6 +396,89 @@ fn a_component_that_does_not_satisfy_the_world_is_refused_when_it_is_added() {
         rules.is_empty(),
         "a rule that could not be resolved must not occupy a slot"
     );
+}
+
+/// Permitting an interface is not binding it, and the two fail closed independently.
+///
+/// `PermittedImports` decides what a component may *reach for*; the linker decides what the
+/// host will *answer*. They are separate on purpose, and this is the direction that matters:
+/// widening the permitted set alone grants nothing, because a component whose imports nobody
+/// bound still cannot be instantiated. So a mistake in the permitted set is a refusal one step
+/// later rather than an escape.
+///
+/// The Go authoring lane needs both halves widened together — `RuleSet::linker_mut` is the
+/// other one — and needs to know that doing only the first is safe.
+#[test]
+fn permitting_an_interface_does_not_bind_it() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+
+    // Permit literally everything the wrongly-targeted fixture reaches for, so the load-time
+    // check has nothing to say about it.
+    let mut permitted = PermittedImports::declared_world();
+    let probe = engine
+        .compile(WASIP1)
+        .expect("the fixture is a valid component");
+    for import in instance_imports(engine.engine(), &probe) {
+        permitted = permitted.allowing(import);
+    }
+
+    let loaded = ComponentLoader::without_cache()
+        .permitting(permitted)
+        .load(&engine, "acme/wasip1", WASIP1)
+        .expect("permitting everything it imports is what admitting it means");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    let error = rules
+        .add("acme/wasip1", &loaded)
+        .expect_err("nothing bound `wasi:clocks/wall-clock`, so it cannot be resolved");
+    assert!(matches!(error, WasmError::Engine(_)), "{error:?}");
+    assert!(
+        rules.is_empty(),
+        "a rule that could not be resolved must not occupy a slot"
+    );
+}
+
+/// The linker accepts bindings beyond the declared world, and the world still works.
+///
+/// Nothing in this crate needs this — a Rust rule on `wasm32-unknown-unknown` imports exactly
+/// the host interface — but the Go lane does: TinyGo's runtime imports `wasi:random/random`,
+/// `wasi:io/streams`, `wasi:io/error` and `wasi:cli/stdout` unconditionally, and those must be
+/// *bound* rather than declined, since a declined import means the component never instantiates
+/// at all. Without an accessor that lane cannot reach the linker and is blocked.
+///
+/// What is asserted is the seam, not WASI: an extra instance is bound, and a rule that does not
+/// use it still resolves and runs. A binding that had clobbered `lanekeep:host/types@0.1.0`
+/// would fail here rather than somewhere less obvious.
+#[test]
+fn the_linker_accepts_bindings_beyond_the_declared_world() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+    let loaded = ComponentLoader::without_cache()
+        .load(&engine, "world-shape", WORLD_SHAPE)
+        .expect("the fixture loads");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    rules
+        .linker_mut()
+        .instance("acme:extra/thing@0.1.0")
+        .expect("a fresh instance name is available")
+        .func_wrap("noop", |_store, (): ()| Ok(()))
+        .expect("the host can answer a function in it");
+
+    let slot = rules
+        .add("acme/rule", &loaded)
+        .expect("the world still resolves with an extra instance bound beside it");
+
+    let limits = Limits::default();
+    let clock = RunClock::start(limits.global_timeout);
+    let mut worker = Worker {
+        runtime: WasmRuntime::for_rules(engine, Arc::new(rules), limits, clock),
+        reports: Vec::new(),
+    };
+    worker
+        .checked("src/a.ts", &[(slot, "callee")])
+        .expect("and the rule runs");
+    assert_eq!(worker.reports, vec!["src/a.ts: callee".to_owned()]);
+    assert_eq!(worker.instantiations(), 1);
 }
 
 /// A slot from a different rule set is reported rather than panicked on.

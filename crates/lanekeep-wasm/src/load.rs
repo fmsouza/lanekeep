@@ -265,12 +265,41 @@ pub enum LoadSource {
     Embedded,
 }
 
-/// A component and where it was loaded from.
+/// A component that has passed the import check, and where it was loaded from.
+///
+/// **The fields are private, and that is the whole design.** This type is the only thing
+/// [`crate::runtime::RuleSet::add`] accepts, [`ComponentLoader::load`] is the only thing that
+/// produces one, and it produces one only after running [`check_imports`] — so "this
+/// component's imports were checked" is carried across the module seam by the type rather than
+/// by everyone remembering to call [`check_imports`].
+///
+/// That matters because the alternative was tried and did not hold. When `add` took a bare
+/// `&Component`, `WasmEngine::compile` followed by `add` was a complete path from bytes to a
+/// running instance that never reached the check — three tests in this crate took it — and a
+/// later task could have written exactly that with every load-path test still passing, leaving
+/// decision-record condition 4 silently off. A component failing to instantiate for want of
+/// WASI is incidental protection that disappears the moment any host links WASI, so the check
+/// being *reachable* was never the requirement; the check being *unavoidable* is.
+///
+/// A caller that legitimately holds a bare `Component` gets one of these by going through a
+/// loader, which is what [`ComponentLoader::without_cache`] is for.
 pub struct Loaded {
+    component: Component,
+    source: LoadSource,
+}
+
+impl Loaded {
     /// The compiled component, ready to be resolved against the host world.
-    pub component: Component,
+    #[must_use]
+    pub const fn component(&self) -> &Component {
+        &self.component
+    }
+
     /// Which of the two paths produced it.
-    pub source: LoadSource,
+    #[must_use]
+    pub const fn source(&self) -> LoadSource {
+        self.source
+    }
 }
 
 impl std::fmt::Debug for Loaded {
@@ -394,10 +423,15 @@ impl ComponentLoader {
     /// 3. **The embedded slice**, when there is nowhere to write. Counted, because a run that
     ///    reaches it silently is the failure this whole module is arranged to prevent.
     ///
-    /// The import check runs on whichever component results, in every case. A warm artifact
-    /// was checked by the run that wrote it, and checking it again costs a type reflection
-    /// and removes "the artifact on disk was vouched for by an earlier run" from the set of
-    /// things anyone has to believe.
+    /// The import check runs on whichever component results, in every case, and on the compile
+    /// path it runs *before* the artifact is written — so a refused component leaves no file.
+    /// A warm artifact was checked by the run that wrote it, and checking it again costs a type
+    /// reflection and removes "the artifact on disk was vouched for by an earlier run" from the
+    /// set of things anyone has to believe.
+    ///
+    /// This is the only constructor of [`Loaded`], and [`Loaded`] is the only thing
+    /// [`crate::runtime::RuleSet::add`] accepts. That is what makes the check unavoidable
+    /// rather than merely reachable.
     ///
     /// # Errors
     ///
@@ -422,10 +456,20 @@ impl ComponentLoader {
             // this loader compiled" and not "components it tried to".
             let compiled = engine.compile(bytes)?;
             self.compilations.fetch_add(1, Ordering::Relaxed);
-            if self.persist(&compiled, &path)
+
+            // Checked *before* it is written, so a component the sandbox refuses leaves nothing
+            // on disk. Writing an artifact for something that will never run is wasted work
+            // and a file a reader would have to explain.
+            let checked = self.admit(engine, name, compiled, LoadSource::Embedded)?;
+
+            if self.persist(checked.component(), &path)
                 && let Some(component) = map(engine.engine(), &path)
             {
                 self.mapped.fetch_add(1, Ordering::Relaxed);
+                // Checked again rather than inherited from `checked`. These are different
+                // bytes off a different path — the same ones a *later* run will take at step 1
+                // — and "the compilation it came from was fine" is exactly the kind of
+                // reasoning that leaves a check reachable rather than unavoidable.
                 return self.admit(engine, name, component, LoadSource::Mapped);
             }
 
@@ -433,7 +477,7 @@ impl ComponentLoader {
             // The compiled component is correct either way; what it lacks is the file behind
             // it, which is what makes this the fallback rather than a failure.
             self.embedded.fetch_add(1, Ordering::Relaxed);
-            return self.admit(engine, name, compiled, LoadSource::Embedded);
+            return Ok(checked);
         }
 
         let compiled = engine.compile(bytes)?;
@@ -507,8 +551,18 @@ impl ComponentLoader {
 /// produced rather than something shaped like it. Three things carry that here.
 ///
 /// Every artifact this reads was written by [`ComponentLoader::persist`] from
-/// `Component::serialize`, by atomic rename of a fully written temporary — so a reader sees a
-/// complete artifact or no file, never a partial one.
+/// `Component::serialize`, by atomic rename of a fully written temporary — so a *concurrent
+/// reader* sees a complete artifact or no file, never a partial one.
+///
+/// **That is a claim about concurrency and not about durability.** `persist` does not `fsync`
+/// the temporary before renaming it, so on a journaled filesystem an unclean shutdown can
+/// replay the rename ahead of the data blocks and leave a file of the right name with wrong or
+/// zeroed contents. What makes that survivable rather than a hole is the second paragraph
+/// below: wasmtime validates before it maps, so such a file is refused, and
+/// [`ComponentLoader::load`] discards and recompiles it —
+/// `an_artifact_that_cannot_be_loaded_is_recompiled_rather_than_trusted` asserts both the
+/// recompile and the repair. Adding the `fsync` would narrow the window and is not what the
+/// safety of this call rests on.
 ///
 /// wasmtime validates its own header, its version, the target triple and twenty-six compiled
 /// tunables before it maps anything, and returns an error rather than proceeding when any of

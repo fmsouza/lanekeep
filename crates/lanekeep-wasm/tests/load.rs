@@ -50,7 +50,8 @@ use lanekeep_nodes::NodeArena;
 use lanekeep_wasm::bindings::types;
 use lanekeep_wasm::host::CheckContext;
 use lanekeep_wasm::load::{
-    ComponentLoader, HOST_INTERFACE, LoadSource, PermittedImports, check_imports, instance_imports,
+    ComponentLoader, HOST_INTERFACE, LoadSource, Loaded, PermittedImports, check_imports,
+    instance_imports,
 };
 use lanekeep_wasm::runtime::{RuleSet, WasmEngine, WasmRuntime};
 use lanekeep_wasm::{WasmError, engine};
@@ -66,6 +67,13 @@ const WORLD_SHAPE: &[u8] = include_bytes!("fixtures/world-shape.wasm");
 /// which forfeits wasmtime's copy-on-write memory images — and is right for a fixture that
 /// exists to be refused.
 const WASIP1: &[u8] = include_bytes!("fixtures/rejected/wasip1.wasm");
+
+/// A second acceptable component, for the cases that need two.
+///
+/// It targets a world of its own and reaches no part of `std` that touches the WASI adapter, so
+/// it imports nothing at all — strictly less authority than the declared world rather than
+/// more, which is why the check admits it.
+const SPIKE: &[u8] = include_bytes!("fixtures/spike.wasm");
 
 /// The path the context reports as the file under check.
 const FILE: &str = "src/example.ts";
@@ -123,11 +131,11 @@ fn compiled(bytes: &[u8]) -> (wasmtime::Engine, Component) {
 /// engine that component was loaded on — a `Component` belongs to its `Engine`, and handing
 /// one to a store built on another fails with "cross-`Engine` instantiation is not currently
 /// supported" rather than with anything about the component.
-fn violations(engine: &Arc<WasmEngine>, component: &Component) -> Vec<String> {
+fn violations(engine: &Arc<WasmEngine>, loaded: &Loaded) -> Vec<String> {
     let engine = Arc::clone(engine);
     let mut rules = RuleSet::new(&engine).expect("the world links");
     let slot = rules
-        .add("world-shape", component)
+        .add("world-shape", loaded)
         .expect("the fixture satisfies the world");
 
     let limits = Limits::default();
@@ -372,7 +380,7 @@ fn a_run_with_a_writable_cache_directory_never_touches_the_slice() {
         .load(&engine, "world-shape", WORLD_SHAPE)
         .expect("the fixture loads");
 
-    assert_eq!(mapped.source, LoadSource::Mapped);
+    assert_eq!(mapped.source(), LoadSource::Mapped);
     assert_eq!(
         loader.embedded_loads(),
         0,
@@ -414,7 +422,7 @@ fn a_second_run_maps_what_the_first_compiled() {
         .load(&engine, "world-shape", WORLD_SHAPE)
         .expect("the second run loads");
 
-    assert_eq!(loaded.source, LoadSource::Mapped);
+    assert_eq!(loaded.source(), LoadSource::Mapped);
     assert_eq!(
         second.compilations(),
         0,
@@ -439,18 +447,25 @@ fn a_different_component_gets_a_different_artifact() {
     loader
         .load(&engine, "rule", WORLD_SHAPE)
         .expect("the first component loads");
-    // Same name, different bytes — which is exactly what a rule that was edited looks like.
-    let error = loader.load(&engine, "rule", WASIP1).expect_err("refused");
-    assert!(
-        matches!(error, WasmError::ForbiddenImports { .. }),
-        "{error:?}"
-    );
+    // The same name and different bytes, which is exactly what an edited rule looks like.
+    // `spike.wasm` is a different component that also passes the import check — it targets a
+    // world of its own and so imports nothing at all.
+    loader
+        .load(&engine, "rule", SPIKE)
+        .expect("the edited component loads too");
 
     assert_eq!(
         cache.artifacts().len(),
         2,
         "content-addressing means the second never overwrote the first"
     );
+
+    // And the first is still usable, which is what "never overwrote" has to mean. A cache that
+    // kept two files but had corrupted one would pass the count above.
+    let warm = cache.loader();
+    warm.load(&engine, "rule", WORLD_SHAPE)
+        .expect("the first component is still there");
+    assert_eq!(warm.compilations(), 0, "it was read back, not rebuilt");
 }
 
 /// No cache directory, so the fallback — and it is counted rather than silent.
@@ -463,7 +478,7 @@ fn a_run_with_no_cache_directory_takes_the_fallback() {
         .load(&engine, "world-shape", WORLD_SHAPE)
         .expect("the fixture still loads");
 
-    assert_eq!(fallback.source, LoadSource::Embedded);
+    assert_eq!(fallback.source(), LoadSource::Embedded);
     assert_eq!(loader.embedded_loads(), 1);
     assert_eq!(loader.mapped_loads(), 0);
     assert_eq!(
@@ -496,7 +511,7 @@ fn a_cache_directory_that_cannot_be_created_takes_the_fallback() {
         .load(&engine, "world-shape", WORLD_SHAPE)
         .expect("an unwritable cache directory must not fail the run");
 
-    assert_eq!(fallback.source, LoadSource::Embedded);
+    assert_eq!(fallback.source(), LoadSource::Embedded);
     assert_eq!(loader.embedded_loads(), 1);
     assert_eq!(loader.mapped_loads(), 0);
 }
@@ -515,22 +530,22 @@ fn both_load_paths_produce_the_same_violations() {
     let mapped = mapped_loader
         .load(&engine, "world-shape", WORLD_SHAPE)
         .expect("the mapped path loads");
-    assert_eq!(mapped.source, LoadSource::Mapped);
+    assert_eq!(mapped.source(), LoadSource::Mapped);
 
     let embedded_loader = ComponentLoader::without_cache();
     let embedded = embedded_loader
         .load(&engine, "world-shape", WORLD_SHAPE)
         .expect("the fallback loads");
-    assert_eq!(embedded.source, LoadSource::Embedded);
+    assert_eq!(embedded.source(), LoadSource::Embedded);
 
-    let from_mapped = violations(&engine, &mapped.component);
+    let from_mapped = violations(&engine, &mapped);
     assert_eq!(
         from_mapped,
         vec![format!("{FILE}: callee")],
         "the guest ran and reported through the real host"
     );
     assert_eq!(
-        violations(&engine, &embedded.component),
+        violations(&engine, &embedded),
         from_mapped,
         "the fallback is a load path and not a second engine"
     );
@@ -563,7 +578,7 @@ fn an_artifact_that_cannot_be_loaded_is_recompiled_rather_than_trusted() {
         .load(&engine, "world-shape", WORLD_SHAPE)
         .expect("a corrupt artifact must not fail the run");
 
-    assert_eq!(loaded.source, LoadSource::Mapped);
+    assert_eq!(loaded.source(), LoadSource::Mapped);
     assert_eq!(second.compilations(), 1, "it recompiled");
     assert_eq!(
         second.embedded_loads(),
@@ -581,6 +596,11 @@ fn an_artifact_that_cannot_be_loaded_is_recompiled_rather_than_trusted() {
 }
 
 /// The loader refuses a forbidden component on both paths, and writes nothing for it.
+///
+/// The second half is the reason the check runs before `persist` rather than after. An
+/// artifact written for a component that will never run is wasted work and a file a reader
+/// would have to explain — and it would sit in the cache directory looking exactly like a
+/// legitimate one.
 #[test]
 fn the_loader_refuses_a_forbidden_component_however_it_was_loaded() {
     let cache = Cache::new("refused");
@@ -593,6 +613,11 @@ fn the_loader_refuses_a_forbidden_component_however_it_was_loaded() {
     assert!(
         matches!(error, WasmError::ForbiddenImports { .. }),
         "{error:?}"
+    );
+    assert!(
+        cache.artifacts().is_empty(),
+        "a refused component must leave nothing behind: {:?}",
+        cache.artifacts()
     );
 
     let embedded = ComponentLoader::without_cache();
@@ -626,7 +651,7 @@ fn a_warm_artifact_is_checked_again_and_not_taken_on_trust() {
     let loaded = permissive
         .load(&engine, "wasip1", WASIP1)
         .expect("this loader permits what it reaches");
-    assert_eq!(loaded.source, LoadSource::Mapped);
+    assert_eq!(loaded.source(), LoadSource::Mapped);
     assert_eq!(cache.artifacts().len(), 1, "and the artifact is on disk");
 
     let strict = cache.loader();

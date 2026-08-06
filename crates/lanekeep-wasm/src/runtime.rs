@@ -168,6 +168,7 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store, UpdateDeadline};
 use crate::bindings::{Rule, RulePre, types};
 use crate::error::{WasmError, classify};
 use crate::host::{CheckContext, HostState, ReduceContext};
+use crate::load::Loaded;
 
 /// Address space reserved ahead of time for each linear memory, in bytes.
 ///
@@ -252,12 +253,20 @@ use crate::host::{CheckContext, HostState, ReduceContext};
 /// dominate, twelve milliseconds is imperceptible; on a run large enough to care about,
 /// execution dominates.
 ///
-/// **That argument depends on an instance per (worker, rule) rather than per file, and that is
-/// now enforced rather than assumed.** [`RuleSet`] resolves each component once for the run and
-/// each worker's [`WasmRuntime`] holds one `Option` per rule, filled by [`WasmRuntime::rule`]
-/// and by nothing else — so a cache sized to the ruleset is the ceiling, and there is nowhere
-/// to put a second instance of a rule. `tests/instantiation.rs` asserts it, and the two eager
-/// designs it is written against fail it.
+/// **That argument depends on an instance per (worker, rule) rather than per file, and on every
+/// path a run takes that is now enforced rather than assumed.** [`RuleSet`] resolves each
+/// component once for the run and each worker's [`WasmRuntime`] holds one `Option` per rule,
+/// filled by [`WasmRuntime::rule`] and by nothing else — so a cache sized to the ruleset is the
+/// ceiling, and there is nowhere to put a second instance of a rule.
+/// `tests/instantiation.rs` asserts it, and the two eager designs it is written against fail it.
+///
+/// **One unbounded path remains, and it is named here rather than left to be discovered.**
+/// [`WasmRuntime::instantiate`] is public, keeps no instance and adds one to the store on every
+/// call, so the cache is not what bounds *it*. It has no production caller — only
+/// `tests/limits.rs` and the two cap cases in `tests/instantiation.rs`, which exist precisely to
+/// instantiate repeatedly — and its own documentation says that calling it per file is the
+/// shape this constant rules out. If it ever acquires a production caller, this number is one
+/// of the things that has to be re-measured.
 ///
 /// The reason it is worth enforcing rather than documenting: at ten thousand files times ten
 /// rules the penalty is on the order of three and a half seconds and 4 GiB stops being
@@ -609,32 +618,61 @@ impl RuleSet {
         })
     }
 
-    /// Resolve a component against the host world and give it a slot.
+    /// Resolve a loaded component against the host world and give it a slot.
     ///
     /// This is where a component's imports are matched against what the host provides and
     /// its exports are checked against the world — once, for the run. Everything a worker
     /// does afterwards is instantiation.
     ///
+    /// # It takes a [`Loaded`] rather than a `Component`, and that is the point
+    ///
+    /// [`Loaded`] can only be produced by [`crate::load::ComponentLoader::load`], which checks
+    /// the component's import list against a permitted set before it hands one back. So there
+    /// is no path from bytes to a running instance that skips that check — not because
+    /// everyone remembers to call it, but because the unchecked path does not compile.
+    ///
+    /// It used to take a bare `&Component`, and that was a hole rather than a convenience:
+    /// `WasmEngine::compile` followed by `add` reached an instance without ever consulting the
+    /// import list, three tests in this crate took exactly that route, and every load-path test
+    /// passed regardless. Decision-record condition 4 exists because a wrongly-targeted
+    /// component failing to instantiate is *incidental* protection — it holds only while this
+    /// host declines to link WASI — so a check that can be bypassed is not the condition.
+    ///
     /// # Errors
     ///
     /// Returns [`WasmError::Engine`] when the component does not satisfy the world: an import
-    /// the host does not provide, or a missing or wrongly typed export. A component that
-    /// reaches for capability the sandbox withholds is refused earlier and more specifically,
-    /// by `crate::load::check_imports`, which does not depend on the host declining to link
-    /// it.
-    pub fn add(
-        &mut self,
-        id: impl Into<String>,
-        component: &Component,
-    ) -> Result<RuleSlot, WasmError> {
+    /// the host does not provide, or a missing or wrongly typed export.
+    pub fn add(&mut self, id: impl Into<String>, loaded: &Loaded) -> Result<RuleSlot, WasmError> {
         let pre = self
             .linker
-            .instantiate_pre(component)
+            .instantiate_pre(loaded.component())
             .and_then(RulePre::new)
             .map_err(|e| WasmError::Engine(e.to_string()))?;
         let slot = RuleSlot(self.rules.len());
         self.rules.push(Prepared { id: id.into(), pre });
         Ok(slot)
+    }
+
+    /// The linker, for a host that must bind more than the declared world.
+    ///
+    /// Nothing in this crate needs it: a Rust rule built for `wasm32-unknown-unknown` imports
+    /// exactly `lanekeep:host/types@0.1.0` and [`RuleSet::new`] has already bound that. It
+    /// exists for the Go authoring lane, whose components import `wasi:io/error`,
+    /// `wasi:io/streams`, `wasi:cli/stdout` and `wasi:random/random` unconditionally because
+    /// TinyGo's runtime does — and those have to be **bound**, not declined, since a declined
+    /// import means the component never instantiates at all.
+    ///
+    /// **Binding is one half and permitting is the other, and they are deliberately separate.**
+    /// An interface bound here but not named in
+    /// [`crate::load::PermittedImports`] is still refused at load, and one permitted but not
+    /// bound still fails to instantiate. Both orders fail closed, which is why widening either
+    /// alone is safe and only widening both grants anything.
+    ///
+    /// Whatever is bound here must be a *fixed* source rather than an ambient one — a random
+    /// stream seeded from the run rather than the host's, sinks rather than the process's real
+    /// stdout — or the determinism invariant is gone whatever the import list says.
+    pub const fn linker_mut(&mut self) -> &mut Linker<RuntimeState> {
+        &mut self.linker
     }
 
     /// How many rules are in the set.
@@ -774,9 +812,21 @@ impl ResourceLimiter for MemoryCeiling {
 /// world's — every method in `crate::host` reads it — and the ceiling is the runtime's, read
 /// by wasmtime through [`wasmtime::Store::limiter`] and by `WasmRuntime::classify`. Putting
 /// the ceiling inside `HostState` would make a limit look like part of the host API.
-struct RuntimeState {
+///
+/// **Public with private fields, and nothing here is a knob.** It is public only because
+/// [`RuleSet::linker_mut`] cannot name `Linker<RuntimeState>` otherwise, and an embedder
+/// binding an extra interface has to name the store's data type to write the closure. Nothing
+/// outside this module may read or write either field: the host state belongs to the world and
+/// the ceiling belongs to the runtime.
+pub struct RuntimeState {
     host: HostState,
     memory: MemoryCeiling,
+}
+
+impl std::fmt::Debug for RuntimeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeState").finish_non_exhaustive()
+    }
 }
 
 /// A WebAssembly component runtime that rule components execute in.
@@ -976,8 +1026,14 @@ impl WasmRuntime {
     /// [`WasmRuntime::rule`], which instantiates at most once per slot per store. This method
     /// is underneath that: it takes a `Component` rather than a slot, so it resolves the
     /// component's imports on every call and keeps no instance, and calling it per file is
-    /// exactly the shape the bound rules out. It stays public because the fixture tests in
-    /// this crate drive one component directly and have no ruleset to speak of.
+    /// exactly the shape the bound rules out.
+    ///
+    /// It stays public for two callers, both of them tests and neither of them a run.
+    /// `tests/limits.rs` drives one component under four different budgets and wants the
+    /// primitive rather than a ruleset; and the two cap cases in `tests/instantiation.rs`
+    /// instantiate into one store until it refuses, which is the one thing a bounded API
+    /// cannot express. **It performs no import check**, because it takes a component rather
+    /// than a [`Loaded`] — which is another reason it is not the door a run comes through.
     ///
     /// # Errors
     ///
