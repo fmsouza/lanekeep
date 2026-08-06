@@ -347,9 +347,17 @@ fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
 
 /// The cross-file phase, end to end, over the types only it can reach.
 ///
-/// `reduce-location` carries `option<u32>` positions because the reduce phase never touches
-/// parse trees and so has no node to take a position from. That the guest sends `none` for
-/// both and the host receives `None` is the assertion.
+/// `reduce-location` declares `option<u32>` positions, so absence is representable and has to
+/// survive the canonical ABI. That the guest sends `none` for both and the host receives `None`
+/// is the assertion, and that is the whole of it: the stub below records whatever it is handed.
+///
+/// **The real host refuses this call, and the shape is exercised here anyway.**
+/// `lanekeep_wasm::host` fails a report with no line or column — a cross-file violation with no
+/// site is unactionable, and 1:1 cannot be told apart from a rule that meant 1:1. See
+/// `wit/world.wit`'s `reduce-location` and `tests/reduce.rs`'s
+/// `reporting_without_a_position_fails_the_call`. The option is in the record because the
+/// published TypeScript `ReduceLocation` has it, not because a positionless report works, so the
+/// ABI has to carry a case no rule may rely on.
 #[test]
 fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
     let (engine, component, linker) = linked();

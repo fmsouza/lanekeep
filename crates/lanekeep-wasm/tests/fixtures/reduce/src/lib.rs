@@ -30,6 +30,12 @@
 //! claim, together with the absence of any trace on the other phase's host state, proves the
 //! call died in the runtime before the host was reached.
 //!
+//! **The announcement is load-bearing rather than decorative, proven by removing it.** With it
+//! deleted, the trap assertions still pass — the message still matches and the other phase's
+//! reports are still empty — so a fixture that died *before* reaching the forgery would be
+//! indistinguishable from one that forged and trapped. The announcement is what tells the two
+//! apart, and it is why this fixture is evidence rather than a hopeful arrangement.
+//!
 //! The `unsafe` is the point rather than an accident. This crate is its own workspace and does
 //! not inherit the engine's `unsafe_code = "deny"`, which is what lets a fixture do the thing a
 //! rule author must not.
@@ -62,6 +68,11 @@ impl Guest for Component {
 
     fn check(ctx: &CheckContext, m: Match) {
         match m.first().map_or("", |entry| entry.name.as_str()) {
+            // A real per-file call that does nothing but succeed. It exists so a host can put
+            // one *before* a forgery from the other phase — the adversarial ordering, where the
+            // guest's `check-context` table has held a live handle at the index the forgery
+            // guesses.
+            "warm" => report(ctx, "warm"),
             "forge-reduce" => forge_reduce(ctx),
             other => report(ctx, &format!("unknown probe `{other}`")),
         }

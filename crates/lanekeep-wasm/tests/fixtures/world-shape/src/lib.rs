@@ -55,8 +55,17 @@ impl Guest for Component {
         ctx.report(
             &ReduceLocation {
                 file: files.first().cloned().unwrap_or_default(),
-                // A reduce-phase report may know only the file: the reduce phase never
-                // touches parse trees, so it has no node to take a position from.
+                // `none` for both, deliberately, and this is an ABI test rather than a
+                // model of a real report. The record declares `option<u32>`, so absence
+                // has to survive the canonical ABI and arrive at the host as `None` —
+                // which is what this world's stub host asserts.
+                //
+                // The *real* host refuses this call. `lanekeep_wasm::host` fails a report
+                // with no line or column: a cross-file violation with no site is
+                // unactionable, and 1:1 cannot be told apart from a rule that meant 1:1.
+                // The option is in the record because the published TypeScript
+                // `ReduceLocation` has it, not because a positionless report works. See
+                // `wit/world.wit`'s `reduce-location`, and `tests/reduce.rs`.
                 line: None,
                 column: None,
             },

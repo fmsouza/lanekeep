@@ -28,7 +28,9 @@
 //! 3. **A forged handle traps in the runtime, and this one is automated.** It is the
 //!    load-bearing layer: a compile error only guards a rule someone compiles from source and
 //!    says nothing about a component that arrives prebuilt. See
-//!    [`a_forged_reduce_handle_traps_before_the_host_is_reached`].
+//!    [`a_forged_reduce_handle_traps_before_the_host_is_reached`], and
+//!    [`a_forged_reduce_handle_traps_even_after_a_real_reduce_has_run`] for the ordering where
+//!    the index being guessed at has genuinely been live.
 //!
 //! **What is not claimed is that the other phase is unnameable, because it is not.** Both
 //! contexts live in one imported interface, so the guest's bindings contain both types and both
@@ -496,6 +498,82 @@ fn a_forged_check_handle_traps_before_the_host_is_reached() {
         "the runtime refused the handle, rather than the host refusing the call: {cause}"
     );
 
+    assert!(
+        harness.check_facts().is_empty(),
+        "the per-file host recorded no fact, because it was never called"
+    );
+    assert_eq!(
+        harness.messages(),
+        ["forging a check-context handle"],
+        "the announcement before the forgery, and not the claim of success after it"
+    );
+}
+
+#[test]
+fn a_forged_reduce_handle_traps_even_after_a_real_reduce_has_run() {
+    // The adversarial ordering, and worth checking rather than assuming. The two tests above
+    // forge into a table that has never held anything, where a miss is the unsurprising outcome
+    // — a fresh instance proves the least. Here a genuine `reduce` runs first, so the guest's
+    // `reduce-context` table *has* held a live handle at index zero, which is the case where a
+    // forged index might plausibly collide with something.
+    //
+    // It still misses, and the reason is the one that makes `borrow<>` the right shape in the
+    // world: a borrow is scoped to the call that lent it, so the entry is gone the moment
+    // `reduce` returns and there is nothing stale to hit.
+    let mut harness = Harness::new(&["files", "src/a.ts"], Vec::new());
+
+    harness.reduce().expect("the real cross-file pass returns");
+    assert_eq!(
+        harness.messages(),
+        ["files=files,src/a.ts"],
+        "the real pass ran, so the table this forgery guesses at was genuinely populated first"
+    );
+
+    let error = harness
+        .check("forge-reduce")
+        .expect_err("a forged handle does not resolve, whatever ran before it");
+
+    let cause = error.root_cause().to_string();
+    assert!(
+        cause.contains("unknown handle index"),
+        "the runtime refused the handle, rather than the host refusing the call: {cause}"
+    );
+    assert!(
+        harness.reports().is_empty(),
+        "the cross-file host recorded nothing, because it was never called"
+    );
+    assert_eq!(
+        harness.check_messages(),
+        ["forging a reduce-context handle"],
+        "the announcement before the forgery, and not the claim of success after it"
+    );
+}
+
+#[test]
+fn a_forged_check_handle_traps_even_after_a_real_check_has_run() {
+    // The mirror of the ordering above. `warm` is a per-file probe that does nothing but
+    // succeed, so the guest's `check-context` table has held a live handle at index zero before
+    // the cross-file pass reaches for one.
+    let mut harness = Harness::new(&["forge-check"], Vec::new());
+
+    harness
+        .check("warm")
+        .expect("the real per-file pass returns");
+    assert_eq!(
+        harness.check_messages(),
+        ["warm"],
+        "the real pass ran, so the table this forgery guesses at was genuinely populated first"
+    );
+
+    let error = harness
+        .reduce()
+        .expect_err("a forged handle does not resolve, whatever ran before it");
+
+    let cause = error.root_cause().to_string();
+    assert!(
+        cause.contains("unknown handle index"),
+        "the runtime refused the handle, rather than the host refusing the call: {cause}"
+    );
     assert!(
         harness.check_facts().is_empty(),
         "the per-file host recorded no fact, because it was never called"
