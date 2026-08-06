@@ -2638,6 +2638,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn all_three_run_budget_breaches_are_worded_identically() {
+        // `RunError::RunTimeout`'s own documentation says the wording is "deliberately the same
+        // as both engines'", and until this test that was a claim rather than a fact: the
+        // string is written out in full in three crates and nothing compared any copy to any
+        // other. This is the only crate that could — `lanekeep-js` does not depend on
+        // `lanekeep-wasm`, and `lanekeep-core`, which both depend on, holds no copy to share.
+        //
+        // Drift is quiet because which copy a user sees is a race. QuickJS notices from its
+        // interrupt handler, wasmtime from an epoch check compiled into guest code, and
+        // `check_file` between one file and the next; on the same corpus under the same budget,
+        // two runs can be stopped by two different mechanisms. Reword one and lanekeep says two
+        // different things about one fact, with nothing to say which run gets which.
+        //
+        // It is also the text `crates/lanekeep-cli/tests/timeout.rs` matches on to tell a
+        // global breach from a per-rule one, since every limit exits 2. That test cannot tell
+        // which copy produced the output it read, so a reworded copy leaves it green against
+        // the other two.
+        let budget = Duration::from_millis(250);
+        let elapsed = Duration::from_millis(1_337);
+
+        // Unqualified because `unused_qualifications` is denied and all three are already in
+        // scope; the crate each comes from is `lanekeep-engine`, `lanekeep-js` and
+        // `lanekeep-wasm` in that order.
+        let walker = RunError::RunTimeout { budget, elapsed }.to_string();
+        let quickjs = SandboxError::RunTimeout { budget, elapsed }.to_string();
+        let wasm = WasmError::RunTimeout { budget, elapsed }.to_string();
+
+        assert_eq!(
+            walker, quickjs,
+            "the walker and QuickJS report one breach in two voices"
+        );
+        assert_eq!(
+            walker, wasm,
+            "the walker and wasmtime report one breach in two voices"
+        );
+
+        // And that what all three agree on is what the CLI's timeout test looks for, rather
+        // than three copies in perfect agreement about some other text. Both halves: the
+        // opening is what distinguishes this breach from a per-rule one, and the closing is the
+        // actionable half — `crates/lanekeep-cli/src/main.rs` records that it was once a lie,
+        // printed by the code that had dropped the flag it names.
+        for phrase in ["the run exceeded its", "raise it with `--timeout`"] {
+            assert!(walker.contains(phrase), "`{phrase}` is gone from: {walker}");
+        }
+    }
+
     struct Project {
         dir: PathBuf,
     }
