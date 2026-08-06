@@ -483,3 +483,65 @@ fn the_world_puts_emit_fact_on_the_check_context_and_nowhere_else() {
         "both blocks were read, and both declare the method they share"
     );
 }
+
+/// Every method name a `resource` block declares, in declaration order.
+///
+/// A method is a line carrying `<name>: func(`, which is what every declaration in this world
+/// looks like. Reading names rather than substrings is what turns the memberships asserted above
+/// into the *set* property they are evidence for — see
+/// [`the_two_phases_share_exactly_one_method`].
+fn resource_methods(source: &str, name: &str) -> Vec<String> {
+    resource_body(source, name)
+        .lines()
+        .filter_map(|line| line.split_once(": func("))
+        .map(|(name, _)| name.trim().to_owned())
+        .collect()
+}
+
+#[test]
+fn the_two_phases_share_exactly_one_method() {
+    // The general form of the test above, and the property the whole two-resource design rests
+    // on: **the method sets are disjoint apart from `report`.** That is what makes a wrong-phase
+    // call fail to compile in every guest language — the method is not on the type the rule
+    // holds — rather than fail at runtime, or not fail at all.
+    //
+    // Written as a set intersection rather than as more memberships, because the memberships can
+    // only ever catch the pairs someone thought to name. A `files` added to `check-context` in a
+    // later change is caught by the test above; a `file-text` added to `reduce-context` is not,
+    // and it is the same invariant breaking. This catches both, and it catches them at the
+    // declaration rather than after a rule has been written against it.
+    //
+    // The runtime half of the split — a forged handle for the other phase's resource — is
+    // `tests/reduce.rs`, which is where it can be asserted. This file owns the declaration.
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("wit/world.wit"),
+    )
+    .expect("the world is where this crate says it is");
+
+    let check = resource_methods(&source, "check-context");
+    let reduce = resource_methods(&source, "reduce-context");
+
+    let shared: Vec<&String> = check.iter().filter(|name| reduce.contains(name)).collect();
+    assert_eq!(
+        shared,
+        vec!["report"],
+        "the two phases share `report` and nothing else\n  check-context: {check:?}\n  \
+         reduce-context: {reduce:?}"
+    );
+
+    // The cross-file surface in full, because it is small, it is complete, and a fourth method
+    // on it is exactly the change this invariant exists to make someone argue for. No tree, no
+    // file text, no tracked read, no `emit-fact`.
+    assert_eq!(
+        reduce,
+        vec!["files", "facts", "report"],
+        "the reduce phase consumes facts and the file list, and reports"
+    );
+
+    // Not vacuous, for the reason the test above says so: an empty `check` would satisfy the
+    // intersection assertion on its own.
+    assert!(
+        check.len() > reduce.len(),
+        "both sets were read, and the per-file surface is the larger one: {check:?}"
+    );
+}

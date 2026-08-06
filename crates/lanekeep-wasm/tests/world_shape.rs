@@ -356,10 +356,14 @@ fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
     let mut store = Store::new(&engine, StubHost::default());
     let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
 
+    // Empty, and nothing reads it: this file's host answers every reduce method with a
+    // constant. What has to exist is a value to lend, because a `borrow<reduce-context>` needs
+    // something in the table to borrow from. `tests/reduce.rs` is where a populated one is
+    // driven through the real host.
     let ctx = store
         .data_mut()
         .table
-        .push(ReduceContext)
+        .push(ReduceContext::new(Vec::new(), Vec::new()))
         .expect("the resource table accepts a context");
 
     rule.call_reduce(&mut store, Resource::new_borrow(ctx.rep()))

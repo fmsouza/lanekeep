@@ -8,22 +8,30 @@
 //! are structural. Adding a function there widens the trust boundary and bumps the host API
 //! version that feeds the cache key. Adding one here implements what is already declared.
 //!
-//! # What is implemented so far
+//! # What is implemented
 //!
-//! The whole of `check-context`. `reduce-context` — the cross-file phase, all three methods —
-//! returns an error naming itself, which traps the call.
+//! All of it: `check-context`'s twenty-four methods and `reduce-context`'s three. Nothing on
+//! this surface is a placeholder any more.
 //!
-//! **Trapping rather than answering, deliberately.** Every plausible placeholder is a
-//! plausible *answer*: an empty list from `files` reads as "the run considered nothing", an
-//! empty list from `facts` reads as "nothing was emitted". A rule built against either would
-//! look like it was working, and the run would be wrong quietly. An error is the one response
-//! no caller can mistake for a result.
+//! **The placeholder's trap retires with it, and it leaves no gap behind.** Until now the
+//! three reduce methods returned an error naming themselves, on the argument that every
+//! plausible placeholder is a plausible *answer* — an empty list from `files` reads as "the run
+//! considered nothing", an empty list from `facts` reads as "nothing was emitted". That was
+//! right, and it is now moot. Nothing asserted it: `tests/world_shape.rs` is the only caller of
+//! `call_reduce` and it drives a stub host, never this one, so the posture was never under
+//! test. What replaces it is not a weaker assertion but `tests/reduce.rs`, which asserts what
+//! each of the three now answers.
+//!
+//! **Two refusals below are decisions rather than placeholders, and they stay.** `read-file`
+//! and `file-exists` fail the call on a host with no file access; `reduce-context.report` fails
+//! it on a location with no line or column. Each has its own section, and each was decided on
+//! its own evidence rather than by inheriting the argument above.
 //!
 //! **Binding resolution is not one of those, and the difference is not a relaxation.** `false`
 //! and `none` are what "nothing resolves" *is*: a name nothing declares, a handle no arena
 //! issued, and a language whose [`lanekeep_lang::Language::resolver`] returns `None` are three
-//! ways of having no binding, and a rule acts on all three identically. The unimplemented
-//! methods trap because they have no answer to give; these have one.
+//! ways of having no binding, and a rule acts on all three identically. The two refusals trap
+//! because they have no answer to give; these have one.
 //!
 //! # Two engines, one arena, one answer
 //!
@@ -197,6 +205,85 @@
 //! engine refuse a run the other accepted, which is a disagreement about the run rather than
 //! about the rule.
 //!
+//! # The reduce phase hands over two things, and the fact shape is not `lanekeep-js`'s
+//!
+//! [`ReduceContext`] holds a file list and a fact list, and there is nothing else on it to
+//! hold: the reduce phase consumes facts and the file list and nothing else, which is what
+//! keeps cross-file rules parallel and cacheable. The absence of a tree here is structural
+//! rather than declined — `wit/world.wit` puts no navigation method on the resource, so a rule
+//! holding one cannot ask.
+//!
+//! **Neither list is ordered here.** `files` returns the engine's list unchanged and `facts`
+//! returns the stored order, filtered. The engine already sorts facts by
+//! `(rule_id, file, sequence)` through [`lanekeep_core::fact::sort`] and already walks files in
+//! a deterministic order, so a sort at this boundary would be a *second* ordering — and two
+//! orderings that ever disagreed would make a rule that stops at the first match see a
+//! different corpus depending on which one ran last. The check side takes the same posture:
+//! [`CheckContext::take_facts`] is a plain `std::mem::take`, matching `lanekeep-js`.
+//!
+//! **The fact a rule reads carries its file in a field, not in its payload — and this is the
+//! one place the two engines hand over genuinely different bytes.** `lanekeep-js` has nowhere
+//! to put the file except inside the payload, because a JavaScript reduce phase receives parsed
+//! objects and reads `f.file` off them; `lanekeep_js::merge_file` splices the key in, and
+//! `lanekeep-engine` calls it at *reduce* time. The world has somewhere else to put it:
+//! `emitted-fact` declares `file` as its own field. So a component rule reads `fact.file`, and
+//! `fact.data` is the payload byte for byte as the guest emitted it.
+//!
+//! The protection that `merge_file` exists for is unchanged and the mechanism differs. Under
+//! QuickJS the splice *overrides* a `"file"` the rule wrote itself, so a rule cannot attribute
+//! its own fact to a file it did not come from. Here the authoritative field is the host's, set
+//! from the context that emitted the fact, and a rule's own `"file"` key stays inert inside
+//! `data` — unreachable as an attribution, because nothing reads `data` looking for one. What
+//! must not happen is merging at emit time; [`HostState::emit_fact`] carries why, and it is a
+//! literal duplicate key rather than an argument.
+//!
+//! **A context holds one rule's facts, and that selection is the engine's.** Letting one rule
+//! read another's would turn a private payload shape into a contract between rules, and would
+//! make the result depend on the order rules were declared in. `lanekeep-engine` already
+//! filters by `rule_id` when it builds the QuickJS context, and nothing here needs to know it
+//! happened.
+//!
+//! # What a reduce report answers with no position: the call fails
+//!
+//! The fourth decision of this shape and the second to land on refusal. It is also the first
+//! where reading the world does not end the argument, so it is worth being explicit about why.
+//!
+//! `reduce-location` declares `line` and `column` as `option<u32>`, so unlike a grammar or a
+//! `FileAccess` there is a representable "did not say" and something has to be decided about
+//! it. The option is not a decision that a positionless report works — it mirrors the published
+//! TypeScript `ReduceLocation`, whose `line?` and `column?` have been optional in the *type*
+//! and required by the *runtime* since long before this world existed.
+//!
+//! Three things agree on the requirement, and none of them is this file. `docs/architecture.md`
+//! §6.5 says the reduce form of `report` takes `{ file, line, column }`, and says why: there
+//! are no nodes in that phase, so the position has to be captured during the per-file pass
+//! while the tree is still there. `lanekeep_js::ReduceContext`'s `report` throws unless all
+//! three are present, and tells the author exactly that. And [`lanekeep_core::Position`] has no
+//! representation for an unknown line, so a report accepted without one has to acquire one
+//! somewhere downstream.
+//!
+//! Downstream, the only thing to acquire is 1:1 — which is the one answer that actively
+//! misleads. It points a reader at an unrelated line, and it is indistinguishable from a rule
+//! that meant 1:1. A rule that genuinely means "the whole file" is entitled to say so; what it
+//! may not do is leave the engine to say it on its behalf, invisibly. Refusing keeps that
+//! decision with the rule, where it is visible in the rule's source.
+//!
+//! **Not a value on a `result` channel, and it should not become one.** `report` declares no
+//! error case, so failing the call is the only refusal available — but even if the world were
+//! open, a handleable refusal would let a rule branch on whether its report was accepted, and
+//! there is nothing to branch to. Every alternative it could take is the 1:1 above with an
+//! extra step.
+//!
+//! **Parity is the other half.** Under QuickJS the throw becomes `RunError::Rule` and the run
+//! fails; here the trap does the same. Two engines that disagreed about whether a report was
+//! accepted would make the same rule report on one and not on the other, which is a
+//! disagreement about the run rather than about the rule.
+//!
+//! The residue is named rather than hidden: `file` itself is not checked, and an empty path is
+//! accepted. `lanekeep-js` accepts one too — its `at.get::<_, String>("file")` succeeds for
+//! `''` — and refusing it here would be this crate deciding a rule is wrong on evidence the
+//! other engine does not have.
+//!
 //! # No interior mutability, and why that is not an oversight
 //!
 //! `lanekeep-js` holds its arena as `Rc<RefCell<NodeArena>>` because rquickjs requires
@@ -226,9 +313,12 @@ use lanekeep_nodes::{Handle, NodeArena};
 use lanekeep_query::CompiledQuery;
 use wasmtime::component::{Resource, ResourceTable};
 
+// No `CheckContext` or `ReduceContext` here, and their absence is the `with` mapping showing
+// through: `bindings::types` re-exports each one as an alias for the type defined below, so
+// importing either would collide with its own definition.
 use crate::bindings::types::{
     self, BindingKind, EmittedFact, FactError, Host, HostCheckContext, HostReduceContext,
-    NodeLocation, ReadError, ReduceContext, ReduceLocation,
+    NodeLocation, ReadError, ReduceLocation,
 };
 
 /// A violation a rule asked for.
@@ -604,6 +694,103 @@ impl CheckContext {
     }
 }
 
+/// A cross-file violation a rule asked for.
+///
+/// The reduce-phase counterpart of [`Report`], carrying a `file` of its own instead of a node:
+/// a cross-file rule reports at the site a fact came from, which is by definition not "the file
+/// being checked" — there is not one. The same four fields as `lanekeep_js::ReduceReport`, and
+/// a separate type for the reason [`Report`] is one.
+///
+/// `line` and `column` are plain `u32` where `wit/world.wit`'s `reduce-location` declares
+/// `option<u32>`, and that narrowing is this module's decision rather than an oversight: a
+/// report that named no site is refused at the boundary rather than recorded with one missing.
+/// See the module header for the three sources that agree on the requirement and what accepting
+/// it would have cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReduceReport {
+    /// Path of the file to report against, as the rule gave it.
+    ///
+    /// Not checked against the corpus, and not checked for emptiness. A cross-file rule may
+    /// legitimately report at a file the walker excluded — a config, a generated file — and
+    /// `lanekeep-js` accepts the same paths this does.
+    pub file: String,
+    /// One-based line.
+    pub line: u32,
+    /// One-based column.
+    pub column: u32,
+    /// A message overriding the rule card's, when the rule supplied one.
+    pub message: Option<String>,
+}
+
+/// Host state for the cross-file phase of one rule: the corpus as facts, and nothing else.
+///
+/// This is the representation `wit/world.wit`'s `reduce-context` resource is stored as — the
+/// second type named in [`crate::bindings`]'s `with` mapping. It is the whole of what the
+/// reduce phase can see, and the list of fields is the invariant: no arena, no source text, no
+/// file access, because the reduce phase never touches parse trees.
+///
+/// Built per rule rather than per run, exactly as `lanekeep_js::ReduceContext` is. A rule sees
+/// only its own facts; letting one read another's would make an internal payload shape into a
+/// contract between rules, and would make the result depend on the order rules were declared
+/// in. The filtering that achieves it belongs to the engine, which knows which rule emitted
+/// what.
+///
+/// `Debug` is hand-written because the derived one would print every fact's payload — the whole
+/// corpus, at whatever size the corpus is — for a line of diagnostic output. Counts are what a
+/// reader of that line wants, on the same reasoning [`CheckContext`]'s hand-written `Debug`
+/// prints `interned_nodes` rather than the arena.
+pub struct ReduceContext {
+    /// Every file the run considered, in the order the engine supplied.
+    ///
+    /// Returned unchanged: the engine's order is already deterministic, and sorting here would
+    /// be a second ordering for the same list. See the module header.
+    files: Vec<String>,
+    /// This rule's facts, in the order the engine supplied.
+    ///
+    /// The world's own record, and not a mirror of it. `emitted-fact` *is* the reduce phase's
+    /// fact — `kind`, the `file` it came from, and the payload as the guest serialized it —
+    /// where [`Fact`] above is deliberately a different shape for a different phase, carrying
+    /// no file because at emit time the engine has not attached one.
+    facts: Vec<EmittedFact>,
+    /// What the rule reported, in call order.
+    reports: Vec<ReduceReport>,
+}
+
+impl std::fmt::Debug for ReduceContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReduceContext")
+            .field("files", &self.files.len())
+            .field("facts", &self.facts.len())
+            .field("reports", &self.reports.len())
+            .finish()
+    }
+}
+
+impl ReduceContext {
+    /// Build a context over one rule's facts and the discovered file list.
+    ///
+    /// The same signature `lanekeep_js::ReduceContext::new` has, and the same responsibility on
+    /// the caller: the facts are the ones this rule emitted, already ordered by
+    /// [`lanekeep_core::fact::sort`], and the files are the run's own list.
+    #[must_use]
+    pub const fn new(files: Vec<String>, facts: Vec<EmittedFact>) -> Self {
+        Self {
+            files,
+            facts,
+            reports: Vec::new(),
+        }
+    }
+
+    /// Take everything reported so far, leaving the context empty.
+    ///
+    /// Emptying rather than copying, for the reason [`CheckContext::take_reports`] empties: a
+    /// context read twice must not report a violation twice.
+    #[must_use]
+    pub fn take_reports(&mut self) -> Vec<ReduceReport> {
+        std::mem::take(&mut self.reports)
+    }
+}
+
 /// The store's data stays `Send`, checked at compile time rather than believed.
 ///
 /// A [`wasmtime::Store`] is `Send` when its data is, and the engine will run rules across
@@ -624,6 +811,7 @@ const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<HostState>();
     assert_send::<CheckContext>();
+    assert_send::<ReduceContext>();
 };
 
 /// The store's data: the table the lent contexts live in.
@@ -666,6 +854,37 @@ impl HostState {
         &mut self,
         handle: &Resource<CheckContext>,
     ) -> wasmtime::Result<&mut CheckContext> {
+        Ok(self.table.get_mut(handle)?)
+    }
+
+    /// Put a cross-file context in the table, so it can be lent to a guest.
+    ///
+    /// One table holds both kinds, and that is the component model's arrangement rather than a
+    /// convenience: the guest's own handle space is per resource *type*, so a `check-context`
+    /// and a `reduce-context` living in one [`ResourceTable`] are still two disjoint tables as
+    /// far as a guest is concerned. A handle forged for the wrong one does not resolve — see
+    /// `tests/reduce.rs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the table's error when it cannot accept another entry.
+    pub fn push_reduce_context(
+        &mut self,
+        context: ReduceContext,
+    ) -> wasmtime::Result<Resource<ReduceContext>> {
+        Ok(self.table.push(context)?)
+    }
+
+    /// The cross-file context a resource names, for the caller that owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the table's error when the resource is not live, on the terms
+    /// [`HostState::check_context_mut`] sets out.
+    pub fn reduce_context_mut(
+        &mut self,
+        handle: &Resource<ReduceContext>,
+    ) -> wasmtime::Result<&mut ReduceContext> {
         Ok(self.table.get_mut(handle)?)
     }
 }
@@ -762,15 +981,20 @@ fn no_file_access(method: &str) -> wasmtime::Error {
     ))
 }
 
-/// The error a method the world declares but nothing has implemented yet returns.
+/// The error a cross-file report with no line or column returns.
 ///
-/// Naming the method and what is missing is the whole value: a trap that says only
-/// "unreachable" sends a reader to the guest, which is the one place the fault is not.
-fn not_yet(method: &str, missing: &str) -> wasmtime::Error {
+/// Names the file the rule did supply, because that is the one thing it said and it is what a
+/// reader needs in order to find the `report` call that was wrong. See the module header for
+/// why this is a refusal rather than a recorded report at 1:1.
+fn reporting_without_a_position(file: &str) -> wasmtime::Error {
     wasmtime::Error::msg(format!(
-        "`{method}` is declared by lanekeep:host@0.1.0 and not implemented yet: {missing} \
-         lands in a later change. Trapping rather than answering, because every value this \
-         could return instead is indistinguishable from a real answer."
+        "`reduce-context.report` was called for `{file}` with no line or column. A cross-file \
+         violation with no site is unactionable, and 1:1 is not a safe stand-in: it points a \
+         reader at an unrelated line and is indistinguishable from a rule that meant 1:1. \
+         Capture the position during the per-file pass, where the tree is still there, and \
+         carry it on the fact. `lanekeep-js` refuses the same call the same way — its reduce \
+         `ctx.report` throws unless `file`, `line` and `column` are all present, which ends \
+         the invocation."
     ))
 }
 
@@ -1212,31 +1436,79 @@ impl HostCheckContext for HostState {
     }
 }
 
-/// The cross-file phase, declared and not yet implemented.
+/// The cross-file phase: three methods, and the shape of the set is the invariant.
 ///
-/// It has to be here regardless: the world declares both resources, so the linker will not
-/// accept a host that implements only one, and a rule with no reduce phase still exports a
-/// `reduce` its language's scaffolding supplied.
+/// There is no navigation here, no file text, no tracked read and no `emit-fact` — not
+/// withheld, but absent from the resource `wit/world.wit` declares, so a rule holding one of
+/// these cannot ask. That is what keeps cross-file rules parallel and cacheable: a `check` that
+/// could read the corpus would make a file's result depend on files other than itself, and a
+/// `reduce` that could emit facts could feed itself with no second pass for the result to
+/// reach.
+///
+/// It has to be implemented regardless of whether a rule uses it: the world declares both
+/// resources, so the linker will not accept a host that implements only one, and a rule with no
+/// reduce phase still exports a `reduce` its language's scaffolding supplied.
 impl HostReduceContext for HostState {
-    fn files(&mut self, _: Resource<ReduceContext>) -> wasmtime::Result<Vec<String>> {
-        Err(not_yet("reduce-context.files", "the cross-file phase"))
+    /// The run's file list, unchanged.
+    ///
+    /// One crossing for the whole list, which is the shape this phase wants: `lanekeep-js`
+    /// hands JavaScript one array built in one pass for the same reason, since a phase whose
+    /// job is bulk work must not pay per item at the boundary.
+    fn files(&mut self, this: Resource<ReduceContext>) -> wasmtime::Result<Vec<String>> {
+        Ok(self.reduce_context_mut(&this)?.files.clone())
     }
 
+    /// This rule's facts, optionally narrowed to one kind.
+    ///
+    /// `none` means every fact and an unknown kind means none of them — an empty list rather
+    /// than anything a rule has to test for, so `for fact in ctx.facts("nope")` is a no-op
+    /// instead of a failure. The same two answers `lanekeep-js` gives.
+    ///
+    /// Filtered, never sorted and never deduplicated. The order is the one the engine supplied,
+    /// which it produced with [`lanekeep_core::fact::sort`]; a second ordering here could
+    /// disagree with that one, and a rule that stops at the first match would then see a
+    /// different corpus depending on which ran last.
     fn facts(
         &mut self,
-        _: Resource<ReduceContext>,
-        _: Option<String>,
+        this: Resource<ReduceContext>,
+        kind: Option<String>,
     ) -> wasmtime::Result<Vec<EmittedFact>> {
-        Err(not_yet("reduce-context.facts", "the cross-file phase"))
+        let context = self.reduce_context_mut(&this)?;
+        Ok(context
+            .facts
+            .iter()
+            .filter(|fact| kind.as_ref().is_none_or(|wanted| *wanted == fact.kind))
+            .cloned()
+            .collect())
     }
 
+    /// Record a cross-file violation, or fail the call when it names no site.
+    ///
+    /// The context is resolved first, as every sibling on both resources resolves first, so a
+    /// dead handle is reported as a dead handle rather than as a bad location.
     fn report(
         &mut self,
-        _: Resource<ReduceContext>,
-        _: ReduceLocation,
-        _: Option<String>,
+        this: Resource<ReduceContext>,
+        at: ReduceLocation,
+        message: Option<String>,
     ) -> wasmtime::Result<()> {
-        Err(not_yet("reduce-context.report", "the cross-file phase"))
+        let context = self.reduce_context_mut(&this)?;
+
+        // Both, and independently: a report carrying a line and no column is as unactionable as
+        // one carrying neither, and `wit/world.wit` makes them two options rather than one
+        // optional pair. Nothing is recorded — see the module header on why 1:1 is the one
+        // stand-in that actively misleads.
+        let (Some(line), Some(column)) = (at.line, at.column) else {
+            return Err(reporting_without_a_position(&at.file));
+        };
+
+        context.reports.push(ReduceReport {
+            file: at.file,
+            line,
+            column,
+            message,
+        });
+        Ok(())
     }
 
     fn drop(&mut self, this: Resource<ReduceContext>) -> wasmtime::Result<()> {

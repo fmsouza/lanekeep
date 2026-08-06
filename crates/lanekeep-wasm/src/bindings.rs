@@ -19,9 +19,11 @@
 //! can be pushed into a [`wasmtime::component::ResourceTable`], and no export taking
 //! `borrow<check-context>` can be called at all.
 //!
-//! `check-context`'s representation is [`crate::host::CheckContext`], which holds the state
-//! and lives beside the methods that read it. [`ReduceContext`] below is still the empty
-//! placeholder both were, for the same reason it was needed in the first place.
+//! Both representations are [`crate::host`]'s — [`crate::host::CheckContext`] and
+//! [`crate::host::ReduceContext`] — each holding its phase's state and living beside the
+//! methods that read it. Neither is a placeholder any more; the empty struct this module used
+//! to declare existed only to make the world runnable while the reduce phase was unimplemented,
+//! and a mapping that names a type from another module is not a weaker mapping.
 //!
 //! # Why the module wrapper, and why the suppression is on it rather than on the crate
 //!
@@ -35,18 +37,6 @@
 //! crate-level `#![expect(missing_docs)]` would cover every hand-written item added to this
 //! crate afterwards, silently, which is the drift the `warn` exists to catch.
 
-/// The engine's cross-file context, as the resource table stores it.
-///
-/// Empty, and that is the current state rather than the design — the same placeholder
-/// [`crate::host::CheckContext`] was until it acquired an arena. Its eventual contents are
-/// the file list and the collected facts, and nothing that could reach a parse tree: the
-/// reduce phase consumes facts and the file list and nothing else, which is what keeps
-/// cross-file rules parallel and cacheable. What it already does is make the world runnable:
-/// a resource with no named representation is uninhabited, and an uninhabited context cannot
-/// be lent to anything.
-#[derive(Debug, Default)]
-pub struct ReduceContext;
-
 /// The macro expansion itself, walled off so the suppression it needs reaches nothing else.
 #[expect(
     missing_docs,
@@ -57,12 +47,17 @@ mod generated {
         path: "wit",
         world: "rule",
 
-        // The host-implemented half of the world. Naming a Rust type here is what turns
-        // `check-context` from an uninhabited placeholder into something the engine can
-        // create, put in a resource table and lend to a guest export.
+        // The host-implemented half of the world. Naming a Rust type here is what turns each
+        // context from an uninhabited placeholder into something the engine can create, put in
+        // a resource table and lend to a guest export.
+        //
+        // The key is `package/interface@version.resource`, with a *dot* before the resource
+        // name. A slash there fails with "interfaces were specified in the `with` config option
+        // but are not referenced in the target world", which reads like the interface name is
+        // wrong.
         with: {
             "lanekeep:host/types@0.1.0.check-context": crate::host::CheckContext,
-            "lanekeep:host/types@0.1.0.reduce-context": super::ReduceContext,
+            "lanekeep:host/types@0.1.0.reduce-context": crate::host::ReduceContext,
         },
 
         // Every host method returns `wasmtime::Result<T>` rather than a bare `T`.

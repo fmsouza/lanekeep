@@ -44,8 +44,21 @@ package lanekeep:host@0.1.0;
 /// empty during this call — the host is never reached, and it records that it was never
 /// reached. That second layer is the load-bearing one, since a compile error only guards a
 /// rule someone compiles from source and says nothing about a component that arrives
-/// prebuilt. It was measured on a two-method prototype of this shape rather than on this
-/// world; a fixture that forges a handle against *this* world is still owed.
+/// prebuilt.
+///
+/// **Both layers are now measured against this world rather than against the prototype, and
+/// in both directions.** `tests/fixtures/reduce/` forges the other phase's handle from each
+/// phase, with the bindings' own `unsafe fn from_handle(0)` — zero being the handle the call
+/// already holds for its own phase, which is the most plausible forgery available. Measured
+/// 2026-08-06, `wasmtime` 47.0.3, `cargo-component` 0.21.1, `rustc` 1.95.0: the trap's root
+/// cause is exactly `unknown handle index 0`, the other phase's host state records nothing,
+/// and the guest's own announcement immediately before the forgery *is* recorded — so the
+/// call died at the forgery and not earlier. The compile-time layer was confirmed by hand in
+/// the same fixture: `ctx.files()` inside `check` fails with ``error[E0599]: no method named
+/// `files` found for reference `&types::CheckContext` in the current scope``. Both are
+/// described in `tests/reduce.rs`, which owns the runtime half; the declaration half — that
+/// the two blocks below share exactly one method name — is asserted against this file in
+/// `tests/facts.rs`.
 interface types {
   /// An opaque reference into the arena of the check-context that produced it. Meaningless
   /// outside the call that handed it out — the same discipline the published `Node` type
@@ -66,8 +79,21 @@ interface types {
   }
 
   /// Where a cross-file violation is reported. The reduce phase never touches parse trees
-  /// (`docs/architecture.md`'s reduce invariant), so it has no node to take a position
-  /// from and may know only the file.
+  /// (`docs/architecture.md`'s reduce invariant), so it has no node to take a position from
+  /// and must carry one captured earlier — on a fact, during the per-file pass, while the
+  /// tree was still there.
+  ///
+  /// **`line` and `column` are optional in this record and required by the host.** The option
+  /// mirrors the published TypeScript `ReduceLocation`, where both have always been optional
+  /// in the type and required by the runtime; it is not permission to omit them. A `report`
+  /// naming no site fails the call, in both engines, because the only stand-in available
+  /// downstream is 1:1 — which points a reader at an unrelated line and cannot be told apart
+  /// from a rule that meant 1:1. A rule that means "the whole file" says `1, 1` itself.
+  ///
+  /// Declaring them `u32` would make that structural rather than enforced, and is the stronger
+  /// shape. It is not taken here because it would put this record out of step with the
+  /// published type it mirrors, and because it is an ABI change — cheap only while no
+  /// authoring crate binds against this world, which is true today and will not stay true.
   record reduce-location {
     file: string,
     line: option<u32>,
