@@ -63,6 +63,86 @@
 //! this comment used to give, and an implementer would have gone looking for a feature that does
 //! not exist.
 //!
+//! # Instantiation happens once per (worker, rule), and this module is what makes that true
+//!
+//! [`MEMORY_RESERVATION`]'s whole argument rests on that bound: roughly three hundred and
+//! fifty instantiations for a run, against a 1.6× on guest compute that grows with the corpus.
+//! It used to be a paragraph asking callers to behave. It is now the shape of the API:
+//! [`RuleSet`] resolves each component's imports once for the whole run (`RulePre`, from
+//! `Linker::instantiate_pre`), and each worker's [`WasmRuntime`] holds **one `Option` per
+//! rule** — [`WasmRuntime::instantiations`] counts what it built — filled the first time that
+//! rule is actually asked to run. At ten thousand files times ten rules the penalty of getting
+//! this wrong is about three and a half seconds, and 4 GiB stops being defensible.
+//!
+//! **An `Option` per rule and not one flag per worker.** One lazy flag covering the whole
+//! ruleset recovers only the all-cache-hits case and pays in full the moment a single file
+//! misses. Measured 2026-08-05 at twenty rules and fourteen workers: eager instantiation costs
+//! 12,010 µs from `Component::from_file`, 12,115 µs from a byte slice and 10,967 µs on the
+//! mapped path, against 135.2, 125.8 and 133.4 µs for creating the same fourteen stores and
+//! instantiating nothing — a factor of **82 to 96** (medians, n = 30 per arm). The
+//! same-session QuickJS baseline is a 34.6 ms warm run, so eager instantiation adds about a
+//! third to a warm run in order to be *able* to do work a warm run never does. This engine
+//! already found and fixed the same shape once: `docs/architecture.md` §15 records a warm run
+//! that built a QuickJS sandbox per worker and evaluated every rule module into it at 4.7×
+//! the lazy version. The difference is that the QuickJS cost grew with *workers* and this one
+//! grows with *rules × workers*, and `lanekeep.json` already runs twenty-three rules.
+//!
+//! Two adjacent hazards, both of which this arrangement is shaped around. `rayon`'s
+//! `map_init` runs its initializer per chunk rather than per thread — an `AGENTS.md` trap —
+//! so instantiating there would quietly turn "per component per worker" into something nearer
+//! "per component per file"; nothing is instantiated in a constructor here, which makes where
+//! the initializer runs irrelevant. And **a `Store` never reclaims an instance**: instantiating
+//! repeatedly into one stops at 3,333 component instances, the 3,334th failing with `resource
+//! limit exceeded: instance count too high at 10001`, three core instances per component
+//! instance against wasmtime's default cap. `tests/instantiation.rs` asserts that number,
+//! because it is the ceiling a per-file design would hit rather than merely be slow under.
+//!
+//! # A rule's `check` must be a pure function of its arguments
+//!
+//! Stated here because nobody had stated it for either engine, and reusing one instance across
+//! every file a worker handles is what makes it load-bearing. A rule that carries state
+//! between files is **outside what lanekeep's determinism invariant covers**: rayon's
+//! work-stealing makes the file-to-worker assignment run-dependent, so such a rule's answer
+//! depends on which files its worker happened to see first, and can differ between runs on
+//! identical input.
+//!
+//! This is not new and components neither introduce it nor remove it — `docs/architecture.md`
+//! §4 already records that each worker owns one JavaScript runtime and context "created once
+//! per run and reused across that worker's files". What is new is that it is written down, so
+//! the alternative is a decision rather than an inheritance. That alternative should be priced
+//! when it is proposed rather than assumed cheap: a fresh instance per file per rule is 40,000
+//! instantiations against 280 for the same corpus and ruleset, measured at 331.5 ms
+//! single-threaded — a different cost class by a factor of 143.
+//!
+//! # No pooling allocator, and no dividing an instantiation cost by the worker count
+//!
+//! Both halves are measured, and both are conditions of the decision record's acceptance.
+//!
+//! **Pooling lost in all four configurations.** At fourteen workers it loses to the on-demand
+//! allocator at both reservation sizes and in both component shapes — 18,033 against 13,679 µs
+//! and 14,998 against 10,795 µs at the 4 GiB default, 7,657 against 6,010 µs and 3,881 against
+//! 1,907 µs at 2 MiB. Its worst penalty, 2.04×, is in the cell that is otherwise the best and
+//! had most reason to favor it: pre-mapped pool slots at a small reservation. Single-threaded
+//! the two are within run-to-run noise and the sign flips, so no advantage should be claimed
+//! there in either direction. There is no dependency-policy objection to add on top —
+//! wasmtime defines `pooling-allocator = ["runtime", "std"]`, both already in the cleared set,
+//! and `cargo tree --edges normal` gives 113 external packages with the feature and 113
+//! without. The measurement is the whole argument, which is why this module's one
+//! [`wasmtime::Config`] does not name an allocation strategy, and why turning one on is a
+//! re-measurement rather than a flag.
+//!
+//! **Instantiation does not parallelize.** The same per-worker work at fourteen workers takes
+//! **30 to 59×** as long as at one, against 1.5 to 2.1× for a pure-arithmetic control at the
+//! same thread counts on the same machine. The mechanism is XNU's per-process `vm_map` lock,
+//! taken exclusively for `mmap`, `munmap` and `mprotect`, so every mapping in a process
+//! serializes against every other regardless of thread — demonstrated with a ninety-line C
+//! program containing no wasmtime, where the same mapping pattern scales at 20.2× across
+//! threads in one address space and 5.0× across forked processes doing identical work. So any
+//! arithmetic of the form "one instantiation costs X, we have N workers, therefore X/N" is
+//! wrong, and the lever worth designing around is fewer mappings per instance rather than more
+//! threads. Every figure here is from one 14-core M3 Max running XNU; Linux's `mmap_lock` has
+//! different characteristics and this does not transfer unmeasured, in either direction.
+//!
 //! Two settings that look as though they belong beside them do not. The growth reservation is
 //! bound to `_` in that same routine, as a runtime setting that does not affect compilation —
 //! and it is left at its default here for a second reason: it applies only once a memory
@@ -80,7 +160,7 @@ use lanekeep_core::limits::{Budget, Limits, RunClock};
 use wasmtime::component::{Component, HasSelf, Linker, Resource};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, UpdateDeadline};
 
-use crate::bindings::{Rule, types};
+use crate::bindings::{Rule, RulePre, types};
 use crate::error::{WasmError, classify};
 use crate::host::{CheckContext, HostState, ReduceContext};
 
@@ -443,6 +523,141 @@ impl WasmEngine {
     }
 }
 
+/// Where a rule sits in a [`RuleSet`], and therefore which `Option` holds its instance.
+///
+/// An index rather than a name, because it is read on the hot path — once per rule per file —
+/// and because it is what makes the per-worker cache a `Vec` of `Option`s with no lookup at
+/// all. Only meaningful against the set that issued it; [`RuleSet`] and every
+/// slot-taking method on [`WasmRuntime`] refuse one that is out of range rather than
+/// panicking, because a slot arrives from a caller and an engine that panics on a malformed
+/// input has failed at its job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RuleSlot(usize);
+
+impl RuleSlot {
+    /// The index, for a caller keeping its own parallel array.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// One rule, resolved against the host world once for the whole run.
+struct Prepared {
+    /// Whatever identifies the rule to a reader — a rule id. Diagnostics only.
+    id: String,
+    pre: RulePre<RuntimeState>,
+}
+
+/// Every rule component a run will execute, linked and type-checked once.
+///
+/// Shared by every worker, which is the point: `Linker::instantiate_pre` resolves and
+/// type-checks a component's imports independently of how many stores end up instantiating
+/// it, so doing it per worker would repeat that work fourteen times for an answer that cannot
+/// differ. The [`wasmtime::component::Linker`] lives here for the same reason — it is built
+/// from the host world and carries no per-store state.
+///
+/// Built before the workers start and then shared behind an [`Arc`]. Nothing here is
+/// instantiated: an instance belongs to a store, and a store belongs to a worker.
+pub struct RuleSet {
+    linker: Linker<RuntimeState>,
+    rules: Vec<Prepared>,
+}
+
+impl std::fmt::Debug for RuleSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuleSet")
+            .field(
+                "rules",
+                &self.rules.iter().map(|rule| &rule.id).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuleSet {
+    /// An empty set, with the host world linked and no rules in it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmError::Engine`] if the world cannot be linked, which means a broken
+    /// build rather than anything about a rule.
+    pub fn new(engine: &WasmEngine) -> Result<Self, WasmError> {
+        let mut linker = Linker::new(engine.engine());
+        Rule::add_to_linker::<RuntimeState, HasSelf<HostState>>(&mut linker, |state| {
+            &mut state.host
+        })
+        .map_err(|e| WasmError::Engine(e.to_string()))?;
+        Ok(Self {
+            linker,
+            rules: Vec::new(),
+        })
+    }
+
+    /// Resolve a component against the host world and give it a slot.
+    ///
+    /// This is where a component's imports are matched against what the host provides and
+    /// its exports are checked against the world — once, for the run. Everything a worker
+    /// does afterwards is instantiation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmError::Engine`] when the component does not satisfy the world: an import
+    /// the host does not provide, or a missing or wrongly typed export. A component that
+    /// reaches for capability the sandbox withholds is refused earlier and more specifically,
+    /// by `crate::load::check_imports`, which does not depend on the host declining to link
+    /// it.
+    pub fn add(
+        &mut self,
+        id: impl Into<String>,
+        component: &Component,
+    ) -> Result<RuleSlot, WasmError> {
+        let pre = self
+            .linker
+            .instantiate_pre(component)
+            .and_then(RulePre::new)
+            .map_err(|e| WasmError::Engine(e.to_string()))?;
+        let slot = RuleSlot(self.rules.len());
+        self.rules.push(Prepared { id: id.into(), pre });
+        Ok(slot)
+    }
+
+    /// How many rules are in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Whether the set holds no rules.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Every slot in the set, in the order the rules were added.
+    pub fn slots(&self) -> impl Iterator<Item = RuleSlot> {
+        (0..self.rules.len()).map(RuleSlot)
+    }
+
+    /// What a slot's rule is called, or `None` for a slot this set never issued.
+    #[must_use]
+    pub fn id(&self, slot: RuleSlot) -> Option<&str> {
+        self.rules.get(slot.0).map(|rule| rule.id.as_str())
+    }
+
+    /// The pre-instantiation a slot names.
+    fn rule(&self, slot: RuleSlot) -> Result<&Prepared, WasmError> {
+        self.rules.get(slot.0).ok_or_else(|| {
+            WasmError::Engine(format!(
+                "rule slot {} is not in this rule set, which holds {}\n  \
+                 a slot is only meaningful against the set that issued it",
+                slot.0,
+                self.rules.len()
+            ))
+        })
+    }
+}
+
 /// The memory ceiling, summed across every linear memory in one store.
 ///
 /// **Hand-written rather than `StoreLimitsBuilder::memory_size`, and the difference is the
@@ -552,12 +767,32 @@ struct RuntimeState {
 /// A WebAssembly component runtime that rule components execute in.
 ///
 /// Not `Sync`: a [`wasmtime::Store`] is single-threaded, so each rayon worker owns one. They
-/// share a [`WasmEngine`], so there is one compiled-code cache and one epoch ticker, and a
-/// [`RunClock`], so the global budget is measured once for the run rather than once per
-/// worker.
+/// share a [`WasmEngine`], so there is one compiled-code cache and one epoch ticker, a
+/// [`RuleSet`], so each component's imports are resolved once for the run rather than once
+/// per worker, and a [`RunClock`], so the global budget is measured once for the run rather
+/// than once per worker.
 pub struct WasmRuntime {
     engine: Arc<WasmEngine>,
-    linker: Linker<RuntimeState>,
+    rules: Arc<RuleSet>,
+    /// One `Option` per rule in [`Self::rules`], filled on that rule's first use in this
+    /// store.
+    ///
+    /// **Per rule and not per worker, and that is the whole of condition 1.** A single flag
+    /// covering the ruleset recovers only the all-cache-hits case and pays for every rule the
+    /// moment one file misses; this pays for exactly the rules that ran. Sized once at
+    /// construction, so a slot lookup is an index and the hot path allocates nothing.
+    ///
+    /// Nothing ever clears an entry. A `Store` does not reclaim an instance — instantiating
+    /// repeatedly into one stops at 3,333 — so an entry that could be dropped and rebuilt
+    /// would consume a slot without releasing one.
+    instances: Vec<Option<Rule>>,
+    /// How many instances this store has built, as evidence.
+    ///
+    /// Nothing in execution reads it. It exists because "instantiation is lazy" and
+    /// "instantiation is reused" are both claims a test can only make about a number, and a
+    /// counter kept by a test harness proves something about the harness. This one is
+    /// incremented in the single place that instantiates.
+    instantiations: usize,
     store: Store<RuntimeState>,
     limits: Limits,
     budget: Arc<Budget>,
@@ -589,11 +824,28 @@ impl WasmRuntime {
         limits: Limits,
         clock: Arc<RunClock>,
     ) -> Result<Self, WasmError> {
-        let mut linker = Linker::new(engine.engine());
-        Rule::add_to_linker::<RuntimeState, HasSelf<HostState>>(&mut linker, |state| {
-            &mut state.host
-        })
-        .map_err(|e| WasmError::Engine(e.to_string()))?;
+        let rules = Arc::new(RuleSet::new(&engine)?);
+        Ok(Self::for_rules(engine, rules, limits, clock))
+    }
+
+    /// Build a worker's runtime over the run's rule set.
+    ///
+    /// **The per-worker constructor, and it instantiates nothing.** That is deliberate rather
+    /// than incidental: `rayon`'s `map_init` runs its initializer per chunk rather than per
+    /// thread, so any instantiation done here would multiply by chunks instead of by workers.
+    /// What it allocates is one `None` per rule.
+    ///
+    /// Infallible, and that is a consequence rather than a convenience: the one thing that
+    /// could fail — linking the host world — happens once in [`RuleSet::new`] for the whole
+    /// run, so a worker cannot fail to start for a reason the run had not already found.
+    #[must_use]
+    pub fn for_rules(
+        engine: Arc<WasmEngine>,
+        rules: Arc<RuleSet>,
+        limits: Limits,
+        clock: Arc<RunClock>,
+    ) -> Self {
+        let instances = (0..rules.len()).map(|_| None).collect();
 
         let mut store = Store::new(
             engine.engine(),
@@ -624,14 +876,16 @@ impl WasmRuntime {
             Ok(UpdateDeadline::Continue(1))
         });
 
-        Ok(Self {
+        Self {
             engine,
-            linker,
+            rules,
+            instances,
+            instantiations: 0,
             store,
             limits,
             budget,
             interrupted,
-        })
+        }
     }
 
     /// Build a runtime with its own engine and run clock, starting now.
@@ -700,14 +954,15 @@ impl WasmRuntime {
     /// shortest call there is, and it is Task 17's to close rather than something to paper over
     /// with a second clock read here.
     ///
-    /// # How often this may be called is a load-bearing assumption
+    /// # How often this may be called is a load-bearing assumption, and this is the raw form
     ///
     /// [`MEMORY_RESERVATION`] is chosen on the basis that instantiation happens **per (worker,
-    /// rule)** and so is bounded by the product of those two, while what it buys back applies to
-    /// guest compute and grows with the corpus. A caller that instantiates per *file* breaks
-    /// that arithmetic rather than merely slowing down: at ten thousand files times ten rules the
-    /// penalty is on the order of three and a half seconds. Nothing here enforces it, and this
-    /// paragraph is the only place it is written down at the call site.
+    /// rule)**. What makes that true is [`RuleSet`] plus the per-rule `Option` behind
+    /// [`WasmRuntime::rule`], which instantiates at most once per slot per store. This method
+    /// is underneath that: it takes a `Component` rather than a slot, so it resolves the
+    /// component's imports on every call and keeps no instance, and calling it per file is
+    /// exactly the shape the bound rules out. It stays public because the fixture tests in
+    /// this crate drive one component directly and have no ruleset to speak of.
     ///
     /// # Errors
     ///
@@ -716,9 +971,208 @@ impl WasmRuntime {
     pub fn instantiate(&mut self, component: &Component) -> Result<Rule, WasmError> {
         let timeout = self.limits.rule_timeout;
         self.arm(timeout);
-        let outcome = Rule::instantiate(&mut self.store, component, &self.linker);
+        let outcome = Rule::instantiate(&mut self.store, component, &self.rules.linker);
+        self.disarm();
+        self.instantiations += 1;
+        outcome.map_err(|error| self.classify(&error, timeout))
+    }
+
+    /// The rule set this runtime executes against.
+    #[must_use]
+    pub fn rules(&self) -> &Arc<RuleSet> {
+        &self.rules
+    }
+
+    /// How many instances this store has built since it was created.
+    ///
+    /// Evidence, exactly as [`WasmRuntime::epoch_fired`] is. Two claims depend on it and
+    /// neither can be made about anything else: that a worker whose files all hit the cache
+    /// instantiates *nothing*, and that a worker handling three files that match the same rule
+    /// instantiates that rule *once*. A counter kept by a test harness would prove a property
+    /// of the harness.
+    #[must_use]
+    pub const fn instantiations(&self) -> usize {
+        self.instantiations
+    }
+
+    /// Whether a slot's rule has been instantiated in this store yet.
+    #[must_use]
+    pub fn is_instantiated(&self, slot: RuleSlot) -> bool {
+        self.instances
+            .get(slot.index())
+            .is_some_and(Option::is_some)
+    }
+
+    /// This store's instance of a rule, building it on first use.
+    ///
+    /// **The lazy per-rule instance cache, and condition 1 in one method.** The first call for
+    /// a slot instantiates; every later call for the same slot returns what that one built.
+    /// A rule whose query never matches anything this worker saw is never instantiated at all,
+    /// which is the case eager instantiation pays 82 to 96× for.
+    ///
+    /// A failure is not remembered. `Worker::sandbox` in `lanekeep-engine` caches its build
+    /// failure so it is reported once per worker rather than retried per file, and the
+    /// reasoning does not carry: every failure this can return cancels the run, so there is no
+    /// next file to retry for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmError`] on a breached limit — instantiation runs the component's own
+    /// initialization and allocates its linear memory's minimum — or [`WasmError::Engine`] for
+    /// a slot this runtime's rule set never issued.
+    pub fn rule(&mut self, slot: RuleSlot) -> Result<&Rule, WasmError> {
+        if !self.is_instantiated(slot) {
+            let rules = Arc::clone(&self.rules);
+            let pre = &rules.rule(slot)?.pre;
+
+            let timeout = self.limits.rule_timeout;
+            self.arm(timeout);
+            let outcome = pre.instantiate(&mut self.store);
+            self.disarm();
+            let instance = outcome.map_err(|error| self.classify(&error, timeout))?;
+
+            self.instantiations += 1;
+            // `rules.rule(slot)` above already refused an out-of-range slot, and `instances`
+            // is sized from the same set, so this index is in range. `get_mut` rather than
+            // `[]` regardless: the workspace denies panicking outside tests, and an engine
+            // that panics on a malformed input has failed at its job.
+            if let Some(entry) = self.instances.get_mut(slot.index()) {
+                *entry = Some(instance);
+            }
+        }
+
+        self.instances
+            .get(slot.index())
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                WasmError::Engine(format!(
+                    "rule slot {} was instantiated and then could not be found",
+                    slot.index()
+                ))
+            })
+    }
+
+    /// Ask a slot's rule whether it has a per-file pass, instantiating it if needed.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmRuntime::rule`] and [`WasmRuntime::call_check`].
+    pub fn has_check(&mut self, slot: RuleSlot) -> Result<bool, WasmError> {
+        self.rule(slot)?;
+        let timeout = self.limits.rule_timeout;
+        self.arm(timeout);
+        let outcome = self.with_instance(slot, |rule, store| rule.call_has_check(store));
         self.disarm();
         outcome.map_err(|error| self.classify(&error, timeout))
+    }
+
+    /// Ask a slot's rule whether it has a cross-file pass, instantiating it if needed.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmRuntime::rule`] and [`WasmRuntime::call_check`].
+    pub fn has_reduce(&mut self, slot: RuleSlot) -> Result<bool, WasmError> {
+        self.rule(slot)?;
+        let timeout = self.limits.rule_timeout;
+        self.arm(timeout);
+        let outcome = self.with_instance(slot, |rule, store| rule.call_has_reduce(store));
+        self.disarm();
+        outcome.map_err(|error| self.classify(&error, timeout))
+    }
+
+    /// Run a slot's per-file pass for one query match, under the default budget.
+    ///
+    /// **This is the call the bound is about.** It is reached once per (rule, match) and
+    /// instantiates at most once per (worker, rule), because the instance it needs is the one
+    /// [`WasmRuntime::rule`] cached.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmRuntime::rule`] and [`WasmRuntime::call_check`].
+    pub fn check(
+        &mut self,
+        slot: RuleSlot,
+        context: &Resource<CheckContext>,
+        captures: &Vec<types::MatchEntry>,
+    ) -> Result<(), WasmError> {
+        self.check_with_timeout(slot, context, captures, self.limits.rule_timeout)
+    }
+
+    /// Run a slot's per-file pass under an explicit budget, for a rule that declared its own.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmRuntime::rule`] and [`WasmRuntime::call_check`].
+    pub fn check_with_timeout(
+        &mut self,
+        slot: RuleSlot,
+        context: &Resource<CheckContext>,
+        captures: &Vec<types::MatchEntry>,
+        timeout: Duration,
+    ) -> Result<(), WasmError> {
+        self.rule(slot)?;
+        let borrow = Resource::new_borrow(context.rep());
+        self.arm(timeout);
+        let outcome =
+            self.with_instance(slot, |rule, store| rule.call_check(store, borrow, captures));
+        self.disarm();
+        outcome.map_err(|error| self.classify(&error, timeout))
+    }
+
+    /// Run a slot's cross-file pass, under the default budget.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmRuntime::rule`] and [`WasmRuntime::call_check`].
+    pub fn reduce(
+        &mut self,
+        slot: RuleSlot,
+        context: &Resource<ReduceContext>,
+    ) -> Result<(), WasmError> {
+        self.reduce_with_timeout(slot, context, self.limits.rule_timeout)
+    }
+
+    /// Run a slot's cross-file pass under an explicit budget.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmRuntime::rule`] and [`WasmRuntime::call_check`].
+    pub fn reduce_with_timeout(
+        &mut self,
+        slot: RuleSlot,
+        context: &Resource<ReduceContext>,
+        timeout: Duration,
+    ) -> Result<(), WasmError> {
+        self.rule(slot)?;
+        let borrow = Resource::new_borrow(context.rep());
+        self.arm(timeout);
+        let outcome = self.with_instance(slot, |rule, store| rule.call_reduce(store, borrow));
+        self.disarm();
+        outcome.map_err(|error| self.classify(&error, timeout))
+    }
+
+    /// Call into a slot's already-built instance.
+    ///
+    /// The instance and the store are separate fields, so lending one immutably while the
+    /// other is borrowed mutably is a disjoint-field borrow rather than a problem. It is a
+    /// closure and not a returned reference because the caller needs `&mut self` again
+    /// afterwards, to classify.
+    ///
+    /// The caller is expected to have called [`WasmRuntime::rule`] first; a slot with no
+    /// instance is reported rather than instantiated here, so that "this call instantiated"
+    /// stays true of exactly one place.
+    fn with_instance<T>(
+        &mut self,
+        slot: RuleSlot,
+        call: impl FnOnce(&Rule, &mut Store<RuntimeState>) -> wasmtime::Result<T>,
+    ) -> wasmtime::Result<T> {
+        let Some(rule) = self.instances.get(slot.index()).and_then(Option::as_ref) else {
+            return Err(wasmtime::Error::msg(format!(
+                "rule slot {} has no instance in this store",
+                slot.index()
+            )));
+        };
+        call(rule, &mut self.store)
     }
 
     /// Ask a rule whether it has a per-file pass.

@@ -76,3 +76,12 @@ mod generated {
 
 pub use generated::Rule;
 pub use generated::lanekeep::host::types;
+
+/// The pre-instantiated form of [`Rule`]: a component whose imports have been resolved and
+/// type-checked against the host world once, ready to be instantiated into any store.
+///
+/// `pub(crate)` rather than exported. It is the thing `crate::runtime::RuleSet` holds one of
+/// per rule, and what a caller wants is a `RuleSlot` into that set — handing out the
+/// pre-instantiation directly would let a caller instantiate outside the per-worker cache,
+/// which is the bound `MEMORY_RESERVATION` depends on.
+pub(crate) use generated::RulePre;
