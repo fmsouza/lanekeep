@@ -54,11 +54,10 @@ const TWO_STATEMENTS: &str = "const x = 1;\nconst y = 2;";
 
 /// One instantiated component, one store, and one context lent across every call.
 ///
-/// The context outlives each call deliberately, on the terms `tests/reads.rs`'s harness sets
-/// out: whether the engine builds one context per file or one per rule is still open — see
-/// `CheckContext::with_file_access` — and under the per-file shape every rule on a file runs
-/// through a single one of these. A harness that rebuilt one per call could not observe
-/// anything that accumulates, and the date-read flag is exactly that.
+/// The context outlives each call deliberately, and that is now the engine's shape rather than
+/// an open question: `lanekeep-engine` builds **one context per file** and lends it to every
+/// rule checking that file, so this harness mirrors production. A harness that rebuilt one per
+/// call could not observe anything that accumulates, and the date-read flag is exactly that.
 struct Run {
     store: Store<HostState>,
     rule: Rule,

@@ -119,6 +119,14 @@ pub mod runtime;
 // can reach them.
 mod facts;
 
+/// The handle a host context is held by while it is lent to a guest.
+///
+/// Re-exported because it is unavoidably part of this crate's surface —
+/// [`runtime::WasmRuntime::check`] takes one, and [`host::HostState::push_check_context`]
+/// hands one back — and an embedder should not have to take a direct `wasmtime` dependency to
+/// name a type this crate already requires of it. `lanekeep-engine` is the first such caller.
+pub use wasmtime::component::Resource;
+
 pub use error::WasmError;
 pub use key::{EXTERNAL_BINDINGS, ExternalBinding, compile_env_hash, host_api_hash};
 pub use load::{ComponentLoader, LoadSource, Loaded, PermittedImports};
