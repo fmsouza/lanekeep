@@ -1137,9 +1137,17 @@ impl WasmRuntime {
     /// during an instantiation is a race: instantiating this crate's fixtures takes tens of
     /// microseconds and the epoch advances every millisecond, so the check that would catch it
     /// usually is not reached. That is the same gap the module header describes, seen at the
-    /// shortest call there is, and it is closed outside this crate — `lanekeep_engine` asks the
-    /// clock at each file boundary, so a spent run never reaches an instantiation to race with.
-    /// A second clock read here would paper over it in one place and leave the rest.
+    /// shortest call there is, and it is bounded outside this crate — `lanekeep_engine` asks the
+    /// clock at each file boundary, so a run already spent when a file begins never reaches an
+    /// instantiation at all.
+    ///
+    /// **That bound is at file granularity, and the race survives inside one file.** A budget
+    /// that expires after the boundary check and before an instantiation later in the same file
+    /// is back to depending on whether a tick lands in those tens of microseconds. The
+    /// conclusion is unchanged and the reason is the conclusion: a second clock read here would
+    /// close this one call site and leave every other guest entry point exactly as it was, which
+    /// is how a limit ends up enforced in some places and not others. One check where a file's
+    /// work begins is the whole of it.
     ///
     /// # How often this may be called is a load-bearing assumption, and this is the raw form
     ///
