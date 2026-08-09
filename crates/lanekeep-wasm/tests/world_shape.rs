@@ -517,7 +517,7 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// so a fixture on the wrong target passes every shape assertion right up until a real rule
 /// formats a string.
 ///
-/// The two tests above check one artifact out of five. Each new fixture widened that gap
+/// The two tests above check one artifact out of eleven. Each new fixture widened that gap
 /// silently, which is why this one is written the way it is.
 ///
 /// # Globbed, and that is the whole point
@@ -531,7 +531,7 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// # A property, not a snapshot
 ///
 /// What is asserted is that every *instance* import is the one host interface. Not a
-/// transcript of what the five artifacts import today: that would be a list again, and it
+/// transcript of what the eleven artifacts import today: that would be a list again, and it
 /// would have to be edited by whoever adds a fixture, which is the failure mode being fixed.
 /// Importing nothing at all passes — `spike.wasm` targets its own `wit/spike.wit` and reaches
 /// no part of `std` that touches the adapter — because importing nothing is strictly less

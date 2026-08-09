@@ -427,7 +427,7 @@ world rule {
   export has-check: func() -> bool;
   /// Whether this rule has a cross-file pass, on the same terms.
   ///
-  /// Every component exports all four functions regardless of which passes it uses, because
+  /// Every component exports all six functions regardless of which passes it uses, because
   /// a WIT world has no optional exports. A check-only rule's `reduce` is a no-op its own
   /// language's scaffolding supplies.
   export has-reduce: func() -> bool;

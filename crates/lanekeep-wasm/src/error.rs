@@ -85,8 +85,16 @@ pub enum WasmError {
     /// own doc in `wit/world.wit` says why the difference is worth a caller's attention: "a
     /// rule that cannot use its configuration has not merely misbehaved, it has been
     /// misconfigured, and the user needs to be told which." Reusing [`WasmError::Guest`] would
-    /// erase exactly that distinction, which is what the tests in `tests/metadata.rs` assert
-    /// against.
+    /// erase exactly that distinction.
+    ///
+    /// **The message alone cannot prove the two are distinguished, and asserting on it alone
+    /// so nearly did.** [`WasmError::Guest`]'s own `Display` is `"rule failed: {message}"`,
+    /// which contains any guest-written text this variant's does too — so a test asserting
+    /// only `format!("{error}").contains(...)` passes whichever variant `configure` maps a
+    /// refusal onto, and proves nothing about the mapping.
+    /// `tests/metadata.rs::a_guest_that_refuses_its_options_fails_the_call_with_its_own_message`
+    /// asserts `matches!(error, WasmError::Misconfigured { .. })` for exactly this reason, kept
+    /// beside the message assertion rather than instead of it.
     #[error("rule refused its configured options: {message}")]
     Misconfigured {
         /// The guest's own refusal message.

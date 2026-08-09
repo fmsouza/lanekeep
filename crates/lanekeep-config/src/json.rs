@@ -120,13 +120,14 @@ pub struct ResolvedRule {
     /// The distinction is the one a rule author already makes between a rule and a rule
     /// factory, and it is not inferred from whether a value happens to be present.
     ///
-    /// **How options reach a *component* is undefined, and this task did not define it.**
-    /// A component cannot close over a host-supplied value the way a JavaScript factory
-    /// does, so it would need a `configure(options-json)` export that
-    /// `crates/lanekeep-wasm/wit/world.wit` deliberately does not declare — inventing one
-    /// here is worse than the omission, because the sub-project that first needs a
-    /// parameterized built-in would have to un-invent it. Until then a component reference
-    /// is refused outright by `rules_module`, with or without options.
+    /// **How options reach a *component* is declared and not yet wired.** A component cannot
+    /// close over a host-supplied value the way a JavaScript factory does, so
+    /// `crates/lanekeep-wasm/wit/world.wit` declares `configure(options-json)` for exactly
+    /// that reason — a call made once after instantiation, taking this field serialized as
+    /// JSON (`null` for the bare-string form). Nothing in this crate calls it yet: a
+    /// component reference is still refused outright by `rules_module`, with or without
+    /// options, so this field has nowhere to be read from for a component-backed rule until
+    /// that refusal is lifted.
     pub options: Option<Value>,
 }
 
