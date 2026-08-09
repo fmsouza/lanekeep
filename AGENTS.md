@@ -183,13 +183,32 @@ nothing. Only `cargo +<version>` overrides the pin. This is why `just msrv` exis
 `group_imports`, `wrap_comments` and friends emit a warning per file on stable and change
 nothing. `rustfmt.toml` is stable-only on purpose; do not add them back.
 
-`skip_children` is the exception, and it is worth knowing because the rule crates depend on it.
-Measured on rustfmt 1.9.0-stable: `--config skip_children=true` suppresses the diffs rustfmt
-would otherwise report inside a rule's generated `src/bindings.rs`, *and* stops it failing with
-`failed to resolve mod` when that gitignored file has never been generated. An option rustfmt
-does not know is rejected outright — `invalid key=val pair` — so "it was accepted" is itself
-evidence it is real. `just fmt` passes it on the command line rather than in `rustfmt.toml`,
-because the root workspace's `cargo fmt` must keep descending into child modules.
+**And an unstable rustfmt option applies from `--config` while being ignored from
+`rustfmt.toml`, which is why `just fmt` reaches the rule crates at all.** `skip_children` is
+nightly-only like the rest, but the two ways of setting it do not behave the same on stable.
+Measured on rustfmt 1.9.0-stable, against `rust-rules/no-unwrap/src/lib.rs`:
+
+| how it is set | what stable rustfmt does |
+| --- | --- |
+| `skip_children = true` in `rustfmt.toml` | `Warning: can't set skip_children = true, unstable features are only available in nightly channel`, and the setting is **dropped** — 578 lines of diff come back, 39 of them inside the generated `bindings.rs` |
+| `--config skip_children=true` on the command line | **applied**, silently, no warning, no diff |
+
+`just fmt` and `just fmt-check` depend on that asymmetry: passing it lets rustfmt check a rule
+crate's own source without descending into the `src/bindings.rs` that `cargo component build`
+generates — a file that is gitignored, that rustfmt would otherwise want to rewrite, and that
+does not exist at all on a checkout which has never run `cargo component`, where rustfmt fails
+outright with `failed to resolve mod`.
+
+**So moving that flag into a `rust-rules/rustfmt.toml` breaks it without failing.** That move
+reads like tidying — a repeated command-line argument consolidated into the config file next to
+it — and its result is a silent no-op: `just fmt` starts rewriting a generated file, and
+`just fmt-check` starts failing on a fresh checkout. The flag stays on the command line.
+
+Do not try to establish that an option is stable by observing that rustfmt accepted it. It
+rejects an option it does not *know* — `invalid key=val pair` — and accepts every option it
+knows, stable or not: `--config wrap_comments=true`, named nightly-only two paragraphs above,
+is accepted exactly as `skip_children` is. The test tells known from unknown, not stable from
+unstable, so it returns the wrong verdict on the example already written down here.
 
 **`typos` runs with `locale = "en-us"`.** Write `behavior`, `analyze`, `capitalize` — the
 American forms — in prose and comments alike. British variants fail the gate. This is

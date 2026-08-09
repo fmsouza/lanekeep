@@ -63,12 +63,14 @@ fmt-check: (_fmt-rust-rules "--check")
 # `cargo component` when they deliberately do not.
 #
 # So rustfmt is invoked directly, on a file list git produces, with `skip_children=true`.
-# Measured on rustfmt 1.9.0-stable rather than assumed, because `AGENTS.md` records that most
-# interesting rustfmt options are nightly-only and silently do nothing: with the option set,
-# no diff is reported for `bindings.rs` when it is present and no error when it is absent,
-# while an unknown option is rejected outright. It is a command-line `--config` rather than a
-# line in `rustfmt.toml` on purpose — the root workspace's `cargo fmt` must keep descending
-# into child modules.
+#
+# **`skip_children` is a nightly-only option, and this line works only because `--config`
+# does not enforce that.** Put the same setting in a `rustfmt.toml` on stable and rustfmt
+# warns — `can't set skip_children = true, unstable features are only available in nightly
+# channel` — and ignores it; passed as `--config` it applies, silently. So consolidating this
+# flag into a `rust-rules/rustfmt.toml`, which reads like tidying, is a silent no-op that
+# makes `just fmt` start rewriting the generated file. It stays on the command line, and
+# `AGENTS.md` carries the measurement.
 #
 # The file list comes from `git ls-files` rather than from `find`, so the exclusions are
 # git's own: `target/` and `src/bindings.rs` are gitignored, which is the same fact
@@ -87,7 +89,19 @@ _fmt-rust-rules *ARGS:
     # `${#array[@]}` on an empty array is an unbound-variable error under `set -u`.
     list="$(mktemp)"
     trap 'rm -f "${list}"' EXIT
-    git ls-files --cached --others --exclude-standard -z -- 'rust-rules/*.rs' > "${list}"
+
+    # `--cached` lists what the index holds, which mid-refactor includes a file deleted from
+    # the working tree but not yet staged as deleted — and rustfmt errors on a path that is
+    # not there. Filtered here rather than left to fail, because that failure names the
+    # formatter and the cause is the rename you are halfway through.
+    #
+    # An `if` rather than `[ -f ... ] && printf`: under `set -e` the `&&` list is the last
+    # command in the loop body, so a missing file would exit the loop with a status nobody
+    # asked for.
+    git ls-files --cached --others --exclude-standard -z -- 'rust-rules/*.rs' \
+        | while IFS= read -r -d '' file; do
+              if [ -f "${file}" ]; then printf '%s\0' "${file}"; fi
+          done > "${list}"
 
     # A file list that came back empty would format nothing and report success, which is the
     # one way this recipe could pass while checking no rule source at all.
@@ -245,6 +259,28 @@ rust-rules:
         exit 1
     fi
 
+    # Clippy and rustdoc over the *whole* second workspace, which is possible here and nowhere
+    # else. `just lint` and `just docs` run over `default-members`, because a rule crate does not
+    # compile without the `src/bindings.rs` that the loop above just generated and no gate may
+    # require `cargo component` to produce one. This recipe has already produced them, so this is
+    # the one place the rule crates' own source can be held to the workspace lints and to
+    # docs.rs's link resolution.
+    #
+    # **Before the recording, and that is what makes it more than advice.** These artifacts only
+    # reach a commit through this recipe, and the digest manifest is what forces the recipe to be
+    # run: a changed rule source with no re-record is a red gate. So placing the checks ahead of
+    # the recording puts them on the only path to a green tree — a contributor who ignores a
+    # clippy failure here has no recorded digest either, and `just check` says so. Recording
+    # first would make this pair skippable by ignoring one exit code.
+    #
+    # The cost is that a failure here leaves rebuilt artifacts copied and their digests stale,
+    # so the next `just check` reports the currency failure as well. That is not extra work:
+    # the fix for it is to run this recipe again, which is what fixing the clippy error leads
+    # to anyway.
+    echo "checking the rule crates, now that their bindings exist"
+    cargo clippy --manifest-path rust-rules/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path rust-rules/Cargo.toml --workspace --no-deps --all-features
+
     # Record what all of that was built from, so the gate can tell a stale component from a
     # current one without needing `cargo component` to find out. Exactly what `wasm-fixtures`
     # does, and for the same reason: without it, editing a rule's source and not running this
@@ -259,30 +295,15 @@ rust-rules:
     LANEKEEP_BLESS_RULE_COMPONENTS=1 cargo test --quiet -p lanekeep-wasm \
         --test fixture_currency -- --exact every_committed_rule_component_is_the_one_its_sources_build
 
-    # Clippy and rustdoc over the *whole* second workspace, which is possible here and nowhere
-    # else. `just lint` and `just docs` run over `default-members`, because a rule crate does not
-    # compile without the `src/bindings.rs` that the loop above just generated and no gate may
-    # require `cargo component` to produce one. This recipe has already produced them, so this is
-    # the one place the rule crates' own source can be held to the workspace lints and to
-    # docs.rs's link resolution — and it is the recipe a rule author runs before committing an
-    # artifact, which is when it is worth knowing.
-    #
-    # After the recording rather than before. A failure here leaves rebuilt artifacts in the
-    # tree; if it aborted first, their digests would be unrecorded too, and the author would
-    # meet a stale-fixture failure on top of the one they actually have to fix.
-    echo "checking the rule crates, now that their bindings exist"
-    cargo clippy --manifest-path rust-rules/Cargo.toml --workspace --all-targets --all-features -- -D warnings
-    RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path rust-rules/Cargo.toml --workspace --no-deps --all-features
-
 # Test rust-rules/: its own workspace, so `cargo test --workspace` at the root does not reach
 # it.
 #
 # Part of both gates, unlike `rust-rules` — that recipe is excluded because it needs
 # `cargo component` and rewrites committed artifacts, neither of which is true here: this is
 # a zero-dependency host-target test that runs in under a second, and leaving it opt-in would
-# mean nothing here runs until someone remembers to ask for it by name. Extending the gate
-# further — deny, machete, fmt, msrv — over this second workspace is still separate, later
-# work.
+# mean nothing here runs until someone remembers to ask for it by name. `deny`, `machete`,
+# `fmt-check`, `lint`, `docs` and `msrv` reach this workspace too now, each in its own recipe;
+# what none of them reaches without `cargo component` is covered here and in `rust-rules`.
 #
 # **No `--workspace`, and that is load-bearing.** A rule crate's `src/bindings.rs` is generated
 # by `cargo component build` and gitignored, so on a fresh checkout it does not exist and the
