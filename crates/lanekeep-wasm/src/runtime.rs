@@ -1265,6 +1265,24 @@ impl WasmRuntime {
             })
     }
 
+    /// What this rule says it is.
+    ///
+    /// Instantiates the rule if it is not already, on the same terms as [`Self::rule`] —
+    /// prepare time is the one point where every rule is instantiated regardless of whether
+    /// its query will match, because a rule that cannot describe itself cannot be run at all.
+    ///
+    /// # Errors
+    ///
+    /// [`WasmError`] if the slot is unknown, instantiation fails, or the guest traps.
+    pub fn metadata(&mut self, slot: RuleSlot) -> Result<types::RuleMetadata, WasmError> {
+        self.rule(slot)?;
+        let timeout = self.limits.rule_timeout;
+        self.arm(timeout);
+        let outcome = self.with_instance(slot, |rule, store| rule.call_metadata(store));
+        self.disarm();
+        outcome.map_err(|error| self.classify(&error, timeout))
+    }
+
     /// Ask a slot's rule whether it has a per-file pass, instantiating it if needed.
     ///
     /// # Errors
@@ -1386,6 +1404,19 @@ impl WasmRuntime {
             )));
         };
         call(rule, &mut self.store)
+    }
+
+    /// Ask a rule what it says it is.
+    ///
+    /// # Errors
+    ///
+    /// As [`WasmRuntime::call_check`].
+    pub fn call_metadata(&mut self, rule: &Rule) -> Result<types::RuleMetadata, WasmError> {
+        let timeout = self.limits.rule_timeout;
+        self.arm(timeout);
+        let outcome = rule.call_metadata(&mut self.store);
+        self.disarm();
+        outcome.map_err(|error| self.classify(&error, timeout))
     }
 
     /// Ask a rule whether it has a per-file pass.

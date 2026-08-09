@@ -402,6 +402,29 @@ when something tries to run. The `with` key is `package/interface@version.resour
 before the resource name; a slash there fails with "interfaces were specified in the `with` config
 option but are not referenced in the target world", which reads like the interface name is wrong.
 
+**A WIT world has no optional exports, so widening it breaks every existing guest that already
+targets it, not only guests written afterward.** Adding `export metadata: func() -> rule-metadata;`
+to `world rule` made `cargo component build` refuse every one of the ten committed fixtures that
+already had an `impl Guest for Component` block, all with the same message: ``error[E0046]: not
+all trait items implemented, missing: `metadata` ``. `wit-bindgen` generates a new export as a
+required trait method with no default body, so the fix is a stub `metadata()` in each fixture —
+mechanical, but not visible from the world change alone, only from actually building a fixture
+against it. `spike` is the one committed fixture this does not reach, because it targets its own
+`wit/spike.wit` rather than the shared world. Budget for the identical fan-out the next time an
+export is added — `configure` will hit every one of the same fixtures for the same reason.
+
+**A reference's own `Clone` impl shadows the pointee's, silently, whenever the pointee has one
+too.** `self.rule(slot)?.clone()`, where `rule` returns `Result<&Rule, WasmError>`, does not clone
+`Rule` — Rust always implements `Clone` for `&T` regardless of whether `T: Clone`, and method
+resolution tries the receiver's own type before it tries autoderef, so `.clone()` on a `&Rule`
+resolves to `<&Rule>::clone`, handing back the same reference. Nothing here even needed `Rule:
+Clone` to compile — it does not implement it — which is why the failure surfaces one line later as
+a borrow-checker error (`cannot borrow *self as mutable more than once at a time`) rather than as
+a missing-trait error at the call site itself, and reads like a lifetime problem rather than the
+method-resolution one it is. `(*self.rule(slot)?).clone()` or `Clone::clone(self.rule(slot)?)`
+would have forced the right impl; the fix that was actually right here was to not clone at all and
+reuse the `with_instance` pattern `has_check`/`has_reduce` already established.
+
 **A wasm trap's rendered error already contains the method name, so asserting on it proves
 nothing.** wasmtime prefixes a host function's error with a backtrace whose top frame is spelled
 `wit-component:shim!indirect-lanekeep:host/types@0.1.0-[method]check-context.today`. A test doing

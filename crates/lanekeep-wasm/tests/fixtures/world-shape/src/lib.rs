@@ -19,12 +19,38 @@ mod bindings;
 // appear in an export signature and the world does not name it. That is the whole rule for
 // what a guest gets flat and what it reaches through the interface path, and it is worth
 // knowing before sub-project 3 writes an authoring crate around it.
-use bindings::lanekeep::host::types::ReduceLocation;
+use bindings::lanekeep::host::types::{
+    ReduceLocation, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
 
 impl Guest for Component {
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
+    fn metadata() -> RuleMetadata {
+        RuleMetadata {
+            id: "fixture/world-shape".to_owned(),
+            languages: vec!["rust".to_owned()],
+            severity: "error".to_owned(),
+            card: RuleCard {
+                message: String::new(),
+                remediation: String::new(),
+                examples: RuleExamples {
+                    bad: String::new(),
+                    good: String::new(),
+                },
+            },
+            query: String::new(),
+            gates: RuleGates {
+                path_matches: Vec::new(),
+                file_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
     fn has_check() -> bool {
         true
     }

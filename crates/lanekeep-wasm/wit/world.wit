@@ -161,6 +161,49 @@ interface types {
     data: string,
   }
 
+  /// The three strings `lanekeep explain`, the agent reporter and context injection all
+  /// read. Mandatory, together — a card with a message and no remediation tells an agent
+  /// what is wrong and not what to do instead, which is the half that matters.
+  record rule-examples {
+    bad: string,
+    good: string,
+  }
+
+  record rule-card {
+    message: string,
+    remediation: string,
+    examples: rule-examples,
+  }
+
+  /// Evaluated in Rust before the file is read or parsed. Purely an optimization.
+  ///
+  /// `file-contains` is an **and**: every listed substring must be present. A rule matching
+  /// either of two tokens cannot express its gate here and omits it instead.
+  record rule-gates {
+    path-matches: list<string>,
+    file-contains: list<string>,
+  }
+
+  /// What a component says it is, read once at prepare time.
+  ///
+  /// A plain record returned by a function rather than a resource: it is read once and
+  /// never again, and there is no per-call state for a resource to hold.
+  ///
+  /// The field set is exactly what `lanekeep-config`'s `EXTRACT` already harvests from a
+  /// TypeScript module, and deliberately nothing more — a second, wider description of a
+  /// rule is the drift `host-api-matches-types` exists to police.
+  record rule-metadata {
+    id: string,
+    /// One or several. A rule does not run on a file whose language it does not name.
+    languages: list<string>,
+    severity: string,
+    card: rule-card,
+    query: string,
+    gates: rule-gates,
+    /// Milliseconds. None means the default per-invocation budget.
+    timeout: option<u64>,
+  }
+
   /// How a name was introduced, as resolved by the language's binding resolution.
   ///
   /// Exactly two cases collide with a WIT keyword and are `%`-escaped for that reason
@@ -303,25 +346,25 @@ interface types {
   }
 }
 
-/// What a rule component is today: four exports over the host surface.
+/// What a rule component is today: five exports over the host surface.
 ///
-/// **This list is provisional, and the version number is where that shows.** Two more
-/// exports are already expected by a sub-project that binds against this world — a
-/// `metadata` export carrying what a TypeScript rule's default export carries today (id,
-/// language, severity, card, gates, query, timeout), and a `configure(options-json)` call
-/// made once after instantiation, since a component cannot close over a host-supplied value
-/// the way a factory rule does in JavaScript. Neither is written here, because inventing a
-/// shape that the sub-project needing it would then have to un-invent is worse than the
-/// omission.
+/// **This list is still provisional, and the version number is where that shows.**
+/// `metadata` is now one of the five: it carries what a TypeScript rule's default export
+/// carries today (id, languages, severity, card, gates, query, timeout), read once at
+/// prepare time. One export is still expected by a sub-project that binds against this
+/// world and is still absent — `configure(options-json)`, a call made once after
+/// instantiation, since a component cannot close over a host-supplied value the way a
+/// factory rule does in JavaScript. It is not written here, because inventing a shape that
+/// the sub-project needing it would then have to un-invent is worse than the omission.
 ///
 /// Where the decision lands is not left open: the plan's Task 14 owns how a configured
 /// rule's `options` reach a component, and its acceptable outcome includes documenting the
 /// gap and deferring it rather than inventing one. What is worth knowing before that point
-/// is the cost. **Adding an export bumps `host_api_version`, which is a cache-key input**,
-/// so every cached result in every checkout is invalidated by it — which is the right
-/// behavior, since a result computed against a world without `configure` is not a valid
-/// result for a run that has it. The cost is real and one-time, and it is a reason to add
-/// exports deliberately rather than a reason to add them all now on speculation.
+/// is the cost. **Adding an export bumps `host_api_hash`, which is a cache-key input**, so
+/// every cached result in every checkout is invalidated by it — which is the right
+/// behavior, since a result computed against a world without the addition is not a valid
+/// result for a run that has it. `metadata` already paid that cost once, the moment this
+/// file changed; `configure` will pay it again when its turn comes.
 world rule {
   import types;
 
@@ -336,15 +379,18 @@ world rule {
   /// there in `types`, twenty lines up.
   ///
   /// This list is what a guest gets at the top level of its bindings; everything else in
-  /// `types` is reached through the interface path. `check-context`, `reduce-context` and
-  /// `match` are here because the exports below name them. `node` is not named below and is
-  /// here anyway — for a Rust guest that buys nothing, measured: `wit-bindgen` 0.41.0
-  /// resolves `type node = u32` to `u32` and emits no alias, so the top of the generated
-  /// bindings is the same three names with or without it, and the whole cost is 23 bytes of
-  /// artifact metadata. It stays because languages that render an alias for a primitive
-  /// typedef would put `node` where rule authors expect it, and 23 bytes is not a reason to
-  /// find out the hard way which ones those are.
-  use types.{node, check-context, reduce-context, match};
+  /// `types` is reached through the interface path. `check-context`, `reduce-context`,
+  /// `match` and `rule-metadata` are here because the exports below name them. `node` is not
+  /// named below and is here anyway — for a Rust guest that buys nothing, measured:
+  /// `wit-bindgen` 0.41.0 resolves `type node = u32` to `u32` and emits no alias, so the top
+  /// of the generated bindings is the same four names with or without it, and the whole cost
+  /// is 23 bytes of artifact metadata. It stays because languages that render an alias for a
+  /// primitive typedef would put `node` where rule authors expect it, and 23 bytes is not a
+  /// reason to find out the hard way which ones those are.
+  use types.{node, check-context, reduce-context, match, rule-metadata};
+
+  /// What this rule is. Read once, at prepare time, before any file is checked.
+  export metadata: func() -> rule-metadata;
 
   /// Whether this rule has a per-file pass.
   ///

@@ -27,6 +27,7 @@
 #[allow(warnings)]
 mod bindings;
 
+use bindings::lanekeep::host::types::{RuleCard, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 /// A handle no arena in these tests will have issued.
@@ -41,6 +42,30 @@ const MALFORMED: &str = "(((";
 struct Component;
 
 impl Guest for Component {
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
+    fn metadata() -> RuleMetadata {
+        RuleMetadata {
+            id: "fixture/queries".to_owned(),
+            languages: vec!["rust".to_owned()],
+            severity: "error".to_owned(),
+            card: RuleCard {
+                message: String::new(),
+                remediation: String::new(),
+                examples: RuleExamples {
+                    bad: String::new(),
+                    good: String::new(),
+                },
+            },
+            query: String::new(),
+            gates: RuleGates {
+                path_matches: Vec::new(),
+                file_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
     fn has_check() -> bool {
         true
     }
