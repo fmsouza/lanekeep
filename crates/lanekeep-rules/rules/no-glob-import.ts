@@ -25,39 +25,61 @@ import { defineRule } from 'lanekeep'
  * })
  * ```
  */
-export default defineRule({
-  id: 'lanekeep/no-glob-import',
-  language: 'rust',
-  severity: 'error',
+function build(options) {
+  // Preludes are the one shape a glob is the intended spelling of, and a project that uses
+  // one should not have to suppress this on every file. An explicit list replaces this
+  // rather than extending it: a project that names its own exceptions has said what they are.
+  const allow = options?.allow ?? ['*prelude*']
 
-  card: {
-    message: 'glob import',
-    remediation: 'name what you import, so a reader can tell where each name comes from',
-    examples: {
-      bad: 'use crate::models::*;',
-      good: 'use crate::models::{User, Session};',
+  return defineRule({
+    id: 'lanekeep/no-glob-import',
+    language: 'rust',
+    severity: 'error',
+
+    card: {
+      message: 'glob import',
+      remediation: 'name what you import, so a reader can tell where each name comes from',
+      examples: {
+        bad: 'use crate::models::*;',
+        good: 'use crate::models::{User, Session};',
+      },
     },
-  },
 
-  gates: { fileContains: ['use'] },
+    gates: { fileContains: ['use'] },
 
-  query: '(use_declaration argument: (use_wildcard) @wildcard) @use',
+    query: '(use_declaration argument: (use_wildcard) @wildcard) @use',
 
-  check(ctx, m, options) {
-    const path = ctx.text(m.wildcard)
+    check(ctx, m) {
+      // Already ends in `::*`. tree-sitter-rust's `use_wildcard` is `(path '::')? '*'`, so
+      // the captured text carries the whole thing — appending another `::*` to build the
+      // message produced `use crate::models::*::*`, which nothing caught because no test
+      // asserted a message and the default pattern matches either spelling.
+      const path = ctx.text(m.wildcard)
 
-    // Preludes are the one shape a glob is the intended spelling of, and a project that uses
-    // one should not have to suppress this on every file.
-    const allowed = options?.allow ?? ['*prelude*']
-    for (const pattern of allowed) {
-      if (matches(pattern, path)) return
-    }
+      for (const pattern of allow) {
+        if (matches(pattern, path)) return
+      }
 
-    ctx.report(m.use, {
-      message: `\`use ${path}::*\` hides where every name in this file comes from`,
-    })
-  },
-})
+      ctx.report(m.use, {
+        message: `\`use ${path}\` hides where every name in this file comes from`,
+      })
+    },
+  })
+}
+
+/**
+ * Callable for options, usable bare for none.
+ *
+ * See `no-unwrap.ts` for why both shapes have to work and why this is not `Object.assign`.
+ */
+function noGlobImport(options) {
+  return build(options)
+}
+
+const unconfigured = build(undefined)
+for (const key in unconfigured) noGlobImport[key] = unconfigured[key]
+
+export default noGlobImport
 
 /** A `*` wildcard match, anchored at both ends. */
 function matches(pattern: string, value: string): boolean {

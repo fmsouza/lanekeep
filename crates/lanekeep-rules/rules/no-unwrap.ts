@@ -25,58 +25,84 @@ import { defineRule } from 'lanekeep'
  * })
  * ```
  */
-export default defineRule({
-  id: 'lanekeep/no-unwrap',
-  language: 'rust',
-  severity: 'error',
+function build(options) {
+  const allow = options?.allow ?? []
 
-  card: {
-    message: 'unwrap or expect outside a test',
-    remediation:
-      'propagate with `?` and a typed error, so the caller decides what a failure means',
-    examples: {
-      bad: 'let config = load().unwrap();',
-      good: 'let config = load()?;',
+  return defineRule({
+    id: 'lanekeep/no-unwrap',
+    language: 'rust',
+    severity: 'error',
+
+    card: {
+      message: 'unwrap or expect outside a test',
+      remediation:
+        'propagate with `?` and a typed error, so the caller decides what a failure means',
+      examples: {
+        bad: 'let config = load().unwrap();',
+        good: 'let config = load()?;',
+      },
     },
-  },
 
-  // No `fileContains` gate, deliberately.
-  //
-  // It would be the obvious optimization and it is not expressible: `fileContains` is an
-  // *and* — every listed substring must be present — so `['unwrap', 'expect']` rejects any
-  // file containing only one of them, which is nearly all of them. The failure is silent:
-  // the rule loads, runs on nothing, and reads as a codebase with no unwraps in it.
-  //
-  // There is no single substring covering both, so the gate is omitted rather than written
-  // wrong. The query is still the real gate; this only costs a parse on files that would
-  // have been rejected.
+    // No `fileContains` gate, deliberately.
+    //
+    // It would be the obvious optimization and it is not expressible: `fileContains` is an
+    // *and* — every listed substring must be present — so `['unwrap', 'expect']` rejects any
+    // file containing only one of them, which is nearly all of them. The failure is silent:
+    // the rule loads, runs on nothing, and reads as a codebase with no unwraps in it.
+    //
+    // There is no single substring covering both, so the gate is omitted rather than written
+    // wrong. The query is still the real gate; this only costs a parse on files that would
+    // have been rejected.
 
-  query: `
-    (call_expression
-      function: (field_expression
-        field: (field_identifier) @method)) @call
-  `,
+    query: `
+      (call_expression
+        function: (field_expression
+          field: (field_identifier) @method)) @call
+    `,
 
-  check(ctx, m, options) {
-    const method = ctx.text(m.method)
-    if (method !== 'unwrap' && method !== 'expect') return
+    check(ctx, m) {
+      const method = ctx.text(m.method)
+      if (method !== 'unwrap' && method !== 'expect') return
 
-    const path = ctx.filePath
+      const path = ctx.filePath
 
-    // An integration test directory, and the conventional unit-test module name. Panicking
-    // is the failure mechanism there, which is the whole point of a test.
-    if (path.includes('/tests/') || path.startsWith('tests/')) return
-    if (inTestCode(ctx, m.call)) return
+      // An integration test directory, and the conventional unit-test module name. Panicking
+      // is the failure mechanism there, which is the whole point of a test.
+      if (path.includes('/tests/') || path.startsWith('tests/')) return
+      if (inTestCode(ctx, m.call)) return
 
-    for (const pattern of options?.allow ?? []) {
-      if (matches(pattern, path)) return
-    }
+      for (const pattern of allow) {
+        if (matches(pattern, path)) return
+      }
 
-    ctx.report(m.call, {
-      message: `\`${method}()\` aborts the process where the caller wanted an error it could handle`,
-    })
-  },
-})
+      ctx.report(m.call, {
+        message: `\`${method}()\` aborts the process where the caller wanted an error it could handle`,
+      })
+    },
+  })
+}
+
+/**
+ * Callable for options, usable bare for none.
+ *
+ * `packages/lanekeep/builtin.d.ts` has always declared a built-in as
+ * `Rule & ((options?) => Rule)`, and this is what makes that true at run time rather than
+ * only in the type. Both shapes have to work: `lanekeep init` writes a bare
+ * `"lanekeep/no-unwrap"` into a Rust project's config, which `lanekeep-config` renders as the
+ * imported binding itself, while the usage this rule documents calls it. A plain factory
+ * would break the first; a plain object breaks the second, which is what it did.
+ *
+ * `for...in` rather than `Object.assign`: the sandbox's intrinsics are an allowlist and
+ * `Object` is not on it.
+ */
+function noUnwrap(options) {
+  return build(options)
+}
+
+const unconfigured = build(undefined)
+for (const key in unconfigured) noUnwrap[key] = unconfigured[key]
+
+export default noUnwrap
 
 /**
  * Whether this node sits inside `#[test]` or `#[cfg(test)]`.

@@ -128,7 +128,28 @@ impl RuleTester {
     ///
     /// As [`RuleTester::new`].
     pub fn configured(name: &str, rule_source: &str, options: &str) -> Result<Self, TestError> {
-        Self::build(name, rule_source, "ts", &format!("rule({options})"))
+        Self::configured_with_extension(name, rule_source, "ts", options)
+    }
+
+    /// Build a tester for a factory rule whose subject files use a given extension.
+    ///
+    /// [`RuleTester::configured`] and [`RuleTester::with_extension`] each vary one axis, and
+    /// a rule that is both parameterized and non-TypeScript needs both — every built-in
+    /// targeting Rust, Go or Python is in that position the moment it takes an option. The
+    /// absence was not a decision: `configured` predates any parameterized rule outside
+    /// TypeScript, and the two Rust-targeting built-ins that document an `allow` option had
+    /// no test reaching them here at all.
+    ///
+    /// # Errors
+    ///
+    /// As [`RuleTester::new`].
+    pub fn configured_with_extension(
+        name: &str,
+        rule_source: &str,
+        extension: &str,
+        options: &str,
+    ) -> Result<Self, TestError> {
+        Self::build(name, rule_source, extension, &format!("rule({options})"))
     }
 
     /// Write the throwaway project.
