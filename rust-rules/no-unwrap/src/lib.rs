@@ -302,9 +302,17 @@ fn is_word_byte(byte: u8) -> bool {
 /// across the rule's own code, which the workspace still denies it in. The macro takes bare
 /// identifiers rather than paths, which is why the two it names are imported rather than
 /// spelled out.
+///
+/// `warnings` alongside `unsafe_code`, on the same terms as `mod bindings` above: the expansion
+/// calls `bindings`' own underscore-prefixed shims, which is six `clippy::used_underscore_items`
+/// under this workspace's `pedantic`. The `engine-rule` fixture this crate is modeled on has no
+/// `[lints]` table of its own, so the template never had to answer for the expansion's lints and
+/// dropping `warnings` here looks harmless right up until `cargo clippy` runs.
 #[allow(
+    warnings,
     unsafe_code,
-    reason = "The expansion implements the canonical ABI, which cannot be written in safe Rust."
+    reason = "The expansion implements the canonical ABI, which cannot be written in safe Rust, \
+              and reaches into the generated bindings' internal shims to do it."
 )]
 mod export {
     use super::{Component, bindings};
