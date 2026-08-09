@@ -14,6 +14,15 @@ fn tester() -> RuleTester {
     RuleTester::with_extension("no-unwrap", source, "rs").expect("builds")
 }
 
+/// A tester for the rule as its own documentation spells it: `noUnwrap({ allow: [...] })`.
+///
+/// Every case above reaches the rule *bare*, which is the shape `lanekeep init` writes into a
+/// Rust project's config. Both shapes have to work, and only one of them was covered.
+fn configured(options: &str) -> RuleTester {
+    let source = lanekeep_rules::source("no-unwrap").expect("the rule ships");
+    RuleTester::configured_with_extension("no-unwrap", source, "rs", options).expect("builds")
+}
+
 #[test]
 fn the_question_mark_passes() {
     tester()
@@ -71,6 +80,44 @@ fn a_method_named_expect_on_a_mock_is_still_reported() {
     tester()
         .reports_at("fn f() {\n    mock.expect(\"calls\");\n}\n", &[(2, 5)])
         .expect("indistinguishable from Result::expect without types");
+}
+
+#[test]
+fn an_allowed_path_passes() {
+    // The option the rule's own JSDoc documents — `noUnwrap({ allow: ['src/main.rs'] })` —
+    // and which reached the handler as `undefined` on every run, because the default export
+    // was a plain object rather than a factory. `src/main.rs` is the usual one.
+    configured("{ allow: ['subject/input.rs'] }")
+        .accepts("fn f() {\n    let c = load().unwrap();\n}\n")
+        .expect("an allowed path is exempt");
+}
+
+#[test]
+fn a_path_outside_the_allow_list_is_still_reported() {
+    // The other half, and the one that makes the test above mean something: an `allow` that
+    // exempted everything would pass it just as well.
+    configured("{ allow: ['src/main.rs'] }")
+        .reports_at("fn f() {\n    let c = load().unwrap();\n}\n", &[(2, 13)])
+        .expect("a path the list does not name is still checked");
+}
+
+#[test]
+fn a_wildcard_in_an_allowed_path_matches() {
+    configured("{ allow: ['subject/*.rs'] }")
+        .accepts("fn f() {\n    let c = load().unwrap();\n}\n")
+        .expect("`*` spans a path segment");
+}
+
+#[test]
+fn the_message_names_the_method_that_was_called() {
+    // No message was asserted anywhere for this rule. `reports_at` pins positions only, so a
+    // template that interpolated the wrong capture would read fine and go unnoticed.
+    tester()
+        .reports_messages(
+            "fn f() {\n    let c = load().expect(\"boom\");\n}\n",
+            &["`expect()` aborts the process where the caller wanted an error it could handle"],
+        )
+        .expect("the message names the method the call site used");
 }
 
 #[test]

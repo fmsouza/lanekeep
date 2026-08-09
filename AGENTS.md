@@ -489,6 +489,31 @@ of them. Nothing fails: the rule loads, the query never runs, and the output rea
 a codebase with none of the thing in it. There is no *or* form, so a rule with no single
 covering substring omits the gate rather than writing one that is wrong.
 
+**A rule that declares `check(ctx, m, options)` and exports a plain object silently ignores every
+option it documents.** A handler is invoked with two arguments — `...rules[i].check(ctx, {...})` —
+so a third parameter is always `undefined`. Options reach a rule only by being closed over, which
+means the default export has to be a *factory*. `no-unwrap` and `no-glob-import` both declared the
+parameter, both documented an `allow` option in their own JSDoc and in `docs/built-in-rules.md`,
+and both exported `defineRule({...})` directly, so `allow` did nothing from the day each shipped.
+
+Three things hid it, and the third is the one worth carrying forward. No test configured either
+rule — `RuleTester::configured` existed but had no `with_extension` variant, so no non-TypeScript
+rule could be tested with options at all. The failure is invisible in the passing direction: an
+ignored `allow` only ever *adds* violations, and a user who sees one assumes their pattern is
+wrong. And `packages/lanekeep/builtin.d.ts` declares a built-in as `Rule & ((options?) => Rule)` —
+a superset covering both shapes deliberately, because the specifier cannot say which one a rule is
+— so TypeScript accepts the call that throws `not a function` at run time.
+
+Both shapes have to keep working, which is why the fix is neither "make it a factory" nor "leave
+it an object": `lanekeep init` writes a bare `"lanekeep/no-unwrap"` into a Rust project's config
+and `lanekeep-config` renders that as the imported binding itself, while the documented usage
+calls it. The rule is now a factory whose properties are copied onto the function
+(`for...in`, not `Object.assign` — the sandbox's intrinsics are an allowlist and `Object` is not
+on it), which is what `builtin.d.ts` claimed all along. **The three genuine factories —
+`no-restricted-imports`, `no-circular-imports`, `no-unused-exports` — are the mirror image and are
+not fixed: referenced bare from a JSON config they render as a function where a rule object is
+expected.** No scaffold emits one, so nothing trips it today.
+
 **`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
 `ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a
 module something *imported*; the entry is handed straight to `Module::evaluate`. Everything the

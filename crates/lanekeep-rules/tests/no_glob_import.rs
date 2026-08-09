@@ -14,6 +14,12 @@ fn tester() -> RuleTester {
     RuleTester::with_extension("no-glob-import", source, "rs").expect("builds")
 }
 
+/// A tester for the rule as its own documentation spells it: `noGlobImport({ allow: [...] })`.
+fn configured(options: &str) -> RuleTester {
+    let source = lanekeep_rules::source("no-glob-import").expect("the rule ships");
+    RuleTester::configured_with_extension("no-glob-import", source, "rs", options).expect("builds")
+}
+
 #[test]
 fn a_named_use_passes() {
     tester()
@@ -42,6 +48,49 @@ fn a_prelude_glob_passes_by_default() {
     tester()
         .accepts("use std::prelude::v1::*;\nuse crate::prelude::*;\n")
         .expect("preludes are allowed by default");
+}
+
+#[test]
+fn an_allowed_pattern_passes() {
+    // The option the rule's own JSDoc documents, which reached the handler as `undefined` on
+    // every run because the default export was a plain object rather than a factory.
+    configured("{ allow: ['crate::internal::*'] }")
+        .accepts("use crate::internal::*;\n")
+        .expect("a configured pattern exempts the glob");
+}
+
+#[test]
+fn a_configured_allow_list_replaces_the_prelude_default() {
+    // `allow` is a replacement, not an addition — the default is a fallback for a rule that
+    // was given nothing. Asserted because the opposite reading is just as plausible from the
+    // source, and silently keeping the default would make the list above look wider than it is.
+    configured("{ allow: ['crate::internal::*'] }")
+        .reports_at("use crate::prelude::*;\n", &[(1, 1)])
+        .expect("an explicit list replaces the default rather than extending it");
+}
+
+#[test]
+fn a_prefix_alone_does_not_match_a_glob_path() {
+    // `super` must not match `super::*`: the pattern is anchored at both ends, so a bare
+    // prefix is not a match. Load-bearing history — the anchoring is what makes `allow`
+    // narrow enough to be safe.
+    configured("{ allow: ['super'] }")
+        .reports_at("use super::*;\n", &[(1, 1)])
+        .expect("an allow pattern is anchored at both ends");
+}
+
+#[test]
+fn the_message_names_the_glob_once() {
+    // tree-sitter-rust's `use_wildcard` is `(path '::')? '*'`, so the captured text already
+    // ends in `::*`. Appending another produced `use crate::models::*::*` in every message
+    // this rule has ever reported. Nothing caught it: no test asserted a message, and the
+    // default `*prelude*` pattern matches either spelling.
+    tester()
+        .reports_messages(
+            "use crate::models::*;\n",
+            &["`use crate::models::*` hides where every name in this file comes from"],
+        )
+        .expect("the wildcard text already carries its own `::*`");
 }
 
 #[test]
