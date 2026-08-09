@@ -142,6 +142,48 @@ pub struct ComponentRule {
     /// Behind an [`std::sync::Arc`], because a `RuleSpec` is cloned per rule when the engine
     /// prepares and a per-rule copy of a megabyte is a cost with nothing to buy it.
     pub bytes: ComponentBytes,
+    /// Whether these exact bytes were folded into the `ruleset_hash` of the `Config` this
+    /// rule sits in.
+    ///
+    /// `true` for every `ComponentRule` `describe_components` builds — the only constructor
+    /// in this crate, and its output is exactly what `build` folds into `ruleset_hash` a few
+    /// lines later, over the very `rules` this value ends up attached to. Private, so nothing
+    /// outside this crate can construct one that claims coverage it does not have: the only
+    /// other way to get a `ComponentRule` is [`ComponentRule::uncounted`], which is honest
+    /// about the alternative.
+    ///
+    /// This is `Engine::caching`'s one input for the question its field doc calls "asking
+    /// where the field came from" — a `RuleSpec` an embedder or a test attaches after
+    /// `lanekeep_config::load` returns carries a component whose bytes reached no hash, and
+    /// `lanekeep-engine` reads this flag to refuse the cache for exactly that run.
+    counted_in_ruleset_hash: bool,
+}
+
+impl ComponentRule {
+    /// Whether these bytes are folded into the `ruleset_hash` of the `Config` they arrived
+    /// with — see the field.
+    #[must_use]
+    pub const fn counted_in_ruleset_hash(&self) -> bool {
+        self.counted_in_ruleset_hash
+    }
+
+    /// Build a `ComponentRule` outside `lanekeep_config::load`.
+    ///
+    /// **Whatever this produces is not folded into any `Config`'s `ruleset_hash`,** because
+    /// nothing here computes one — that happens exactly once, inside `load`, over whichever
+    /// rules were in `Config.rules` at the moment it returned. This is for an embedder, or a
+    /// test, that attaches a component to a `RuleSpec` afterward: `lanekeep-engine`'s own
+    /// component tests are exactly that, which is why `Engine::caching` refuses the cache for
+    /// a run carrying one of these.
+    #[must_use]
+    pub fn uncounted(path: PathBuf, options: String, bytes: impl Into<ComponentBytes>) -> Self {
+        Self {
+            path,
+            options,
+            bytes: bytes.into(),
+            counted_in_ruleset_hash: false,
+        }
+    }
 }
 
 /// A component's bytes, shared rather than copied.
@@ -771,6 +813,9 @@ fn describe_components(
                 path: confined,
                 options,
                 bytes,
+                // The one constructor whose output `build` folds into `ruleset_hash` —
+                // see the field.
+                counted_in_ruleset_hash: true,
             },
         ));
     }
@@ -1295,6 +1340,10 @@ mod tests {
                 path,
                 options: "null".to_owned(),
                 bytes: bytes.into(),
+                // Irrelevant to what is under test here — these tests drive `hash_ruleset`
+                // directly rather than through `Engine::caching` — but `true` is the honest
+                // answer: a real `load` is what every one of these fixtures simulates.
+                counted_in_ruleset_hash: true,
             }
         }
     }
@@ -1760,6 +1809,10 @@ mod tests {
                 path: PathBuf::from("silent.wasm"),
                 options: "null".to_owned(),
                 bytes: Vec::new().into(),
+                // This test drives `build_rule` directly, below `describe_components` and
+                // `hash_ruleset` both — irrelevant to either, so `true` for the same reason
+                // `Fixture::component` gives it.
+                counted_in_ruleset_hash: true,
             },
         };
 

@@ -671,6 +671,25 @@ git push --force-with-lease
 
 That replays only the child's own commits onto the new `main` and drops the duplicate.
 
+**When an encoding changes, a test pinned to it needs its data re-derived, not merely re-run.**
+`two_components_cannot_run_together_into_one` (`lanekeep-config`) proved two components could
+not concatenate into one cache key by constructing a real collision under the *old* encoding:
+`hash_ruleset` used to write a `\x01` presence marker before each component's bytes, with no
+length prefix, so `a.wasm = "AA"`, `b.wasm = "BB\x01CC"` and `a.wasm = "AA\x01BB"`, `b.wasm =
+"CC"` produced the identical nine bytes `\x01AA\x01BB\x01CC` either way — the marker embedded in
+the content played the real marker's own role at the split point. Removing the marker
+(`hash_ruleset` now only length-prefixes) left that data proving nothing: with no marker to
+fake, the same two rows differ even with the length prefix hypothetically gone, so
+`length_prefixed` could be deleted from the component fold and this test stayed green — the
+code under test never changed, only what the data meant. The change that invalidated it sat
+three hundred lines away in the same commit, and two mutation-testing runs missed the identical
+gap twice, because both mutated `hash_ruleset` itself, and a mutation of the code under test
+cannot reveal that its data stopped exercising the property the test claims to check. The fix
+rederived the data — `"AA" + "BBCC"` against `"AABB" + "CC"`, which really do collide once
+concatenated without a length — rather than trusting "still passes" to mean "still tests." A
+fixture is a claim about the encoding it was built against, and it goes stale exactly like
+documentation does: silently, and without whatever broke it saying so.
+
 ## What not to do
 
 - Do not add a dependency without checking `deny.toml`. Network crates are banned
