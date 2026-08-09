@@ -2403,14 +2403,13 @@ fn load_components(
         let Some(component) = rule.spec.component.clone() else {
             continue;
         };
-        let path = component.path;
         let name = rule.spec.id.to_string();
-        let bytes = std::fs::read(&path).map_err(|e| RunError::Component {
-            rule: name.clone(),
-            detail: format!("cannot read `{}`: {e}", path.display()),
-        })?;
+        // The bytes the rule carries, not a fresh read of the path beside them. `hash_ruleset`
+        // folded these exact bytes and `lanekeep-config` read this rule's metadata out of them,
+        // so executing a second read would let a file that changed in between describe one
+        // rule, key another and run a third — with every check passing and nothing to notice.
         let admitted = loader
-            .load(&engine, &name, &bytes)
+            .load(&engine, &name, component.bytes.as_slice())
             .map_err(|e: WasmError| RunError::Component {
                 rule: name.clone(),
                 detail: e.to_string(),
@@ -5210,15 +5209,13 @@ export default defineRule({
         /// The query the fixture is written against: it reports at `@target`.
         const QUERY: &str = "(variable_declarator name: (identifier) @target)";
 
-        /// A `RuleSpec` backed by the fixture component.
+        /// A component at a path, as the field the engine dispatches on.
         ///
-        /// Built by hand, and that is not a shortcut around anything — `lanekeep-config` still
-        /// cannot produce one: the world now declares a `metadata` export a component answers
-        /// with its own `id`, `query` and `card` (`crates/lanekeep-wasm/wit/world.wit`), but
-        /// nothing in `lanekeep-config` calls it yet. See [`RuleSpec::component`]. What the
-        /// engine dispatches on is this field, so a hand-built spec exercises exactly the
-        /// production path.
-        /// The fixture, as the field the engine dispatches on.
+        /// **The bytes are read here, which is where they come from in production too.**
+        /// `lanekeep-config` reads a component once, at config load, and carries the bytes on
+        /// the rule; nothing downstream reads the path again, so the rule that was described is
+        /// the rule that runs. These tests hand-build the spec rather than going through a
+        /// config, so this is the equivalent read.
         ///
         /// `"null"` because none of these tests configures the rule: it is the shape the world
         /// gives a rule named with no options, and it is what the fixture's `configure`
@@ -5226,12 +5223,25 @@ export default defineRule({
         /// that reaches a worker with nothing recorded for it would be configured with
         /// whatever this crate guessed.
         fn backed_by(path: PathBuf) -> ComponentRule {
+            let bytes = fs::read(&path).expect("the component is where the test put it");
+            with_bytes(path, bytes)
+        }
+
+        /// The same, with the bytes chosen — for the cases about a component that cannot run.
+        fn with_bytes(path: PathBuf, bytes: Vec<u8>) -> ComponentRule {
             ComponentRule {
                 path,
                 options: "null".to_owned(),
+                bytes: bytes.into(),
             }
         }
 
+        /// A `RuleSpec` backed by the fixture component.
+        ///
+        /// Built by hand, and that is not a shortcut around anything: `lanekeep-config` can
+        /// produce one now, and what the engine dispatches on is this field either way, so a
+        /// hand-built spec exercises exactly the production path without needing a `.wasm`
+        /// reference in every fixture config.
         fn component_rule(id: &str, index: usize, has_reduce: bool) -> RuleSpec {
             RuleSpec {
                 index,
@@ -5573,11 +5583,12 @@ export default defineRule({
         #[test]
         fn swapping_a_component_between_runs_changes_the_answer() {
             // **This is a real staleness bug the shipped guard prevents, demonstrated rather
-            // than argued.** `RuleSpec::component` is set on a `Config` *after*
-            // `lanekeep_config::load` computed `ruleset_hash`, and `load_components` reads the
-            // bytes with an untracked `std::fs::read` — so a component's bytes reach no
-            // cache-key input at all. With the cache on and no guard, swapping the component
-            // for a different one between two runs serves the first one's answer forever.
+            // than argued.** A hand-built `RuleSpec::component` is attached to a `Config`
+            // *after* `lanekeep_config::load` computed `ruleset_hash`, so its bytes reach no
+            // cache-key input. With the cache on and no guard, swapping the component for a
+            // different one between two runs would serve the first one's answer forever. (A
+            // component a *config* names is folded into `ruleset_hash` by `lanekeep-config`;
+            // this path is the one that is not.)
             //
             // Written against the copy the run actually loads, so the swap is the only
             // difference: same rule id, same path, same query, different bytes.
@@ -5592,11 +5603,19 @@ export default defineRule({
             let installed = project.dir.join("rule.wasm");
             fs::copy(fixture(), &installed).expect("installs the rule-shaped component");
 
-            let mut rule = component_rule("local/middle", 1, false);
-            rule.component = Some(backed_by(installed.clone()));
+            // Rebuilt from the path on each run, because that is what a run does: a component's
+            // bytes are read when the config is loaded, and each run loads the config again. A
+            // spec built once and reused across both runs would be carrying the *first*
+            // component's bytes into the second run, which is a property of this test rather
+            // than of the engine.
+            let with_installed = || {
+                let mut rule = component_rule("local/middle", 1, false);
+                rule.component = Some(backed_by(installed.clone()));
+                rule
+            };
 
             let outcome = project
-                .prepared(vec![rule.clone()])
+                .prepared(vec![with_installed()])
                 .expect("prepares")
                 .run()
                 .expect("runs");
@@ -5613,7 +5632,7 @@ export default defineRule({
             .expect("swaps the component");
 
             let outcome = project
-                .prepared(vec![rule])
+                .prepared(vec![with_installed()])
                 .expect("prepares")
                 .run()
                 .expect("runs");
@@ -5968,13 +5987,22 @@ export default defineRule({
             );
         }
 
+        /// A component that cannot be used is reported against its rule, before any file is read.
+        ///
+        /// **It used to be a missing *file*, and the engine no longer reads one.** A rule
+        /// carries its component's bytes, read once when the config was loaded, so the case
+        /// "the path is not there" belongs to `lanekeep-config` now —
+        /// `a_component_that_is_not_there_is_refused_by_position` is where it lives. What is
+        /// left here is the property that survived the move and matters at this layer: bytes
+        /// that cannot become a component stop the run at prepare time, naming the rule, rather
+        /// than on whichever file happened to match it first.
         #[test]
-        fn a_missing_component_is_reported_against_its_rule_before_any_file_is_read() {
+        fn an_unusable_component_is_reported_against_its_rule_before_any_file_is_read() {
             let mut rule = component_rule("local/middle", 1, false);
-            rule.component = Some(backed_by(PathBuf::from("/does/not/exist/rule.wasm")));
+            rule.component = Some(with_bytes(PathBuf::from("rule.wasm"), Vec::new()));
 
             let project = Project::new(
-                "component-missing",
+                "component-unusable",
                 &[
                     ("rule-a.ts", &debugger_rule("local/alpha")),
                     ("lanekeep.config.ts", &config_with(&["./rule-a"])),

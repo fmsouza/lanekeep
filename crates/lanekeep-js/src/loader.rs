@@ -204,8 +204,55 @@ impl RuleRoot {
         self.resolve_within(specifier, &normalize(&base_dir.join(specifier)))
     }
 
+    /// Confine an already-joined path to the root, and hand back its canonical form.
+    ///
+    /// **The containment rules, in one place, for callers that resolved a path some other
+    /// way.** [`RuleRoot::resolve`] uses it for the candidate it found; `lanekeep-config` uses
+    /// it for a `.wasm` rule reference, which is joined against the root by
+    /// `json::classify` and never goes near module resolution. Two sets of confinement rules
+    /// would be two things to keep right, and the second one is always the one that is wrong:
+    /// a lexical check alone looks complete and does not see a symlink.
+    ///
+    /// Both checks, in this order, and the order is the point. The lexical one fires whatever
+    /// is on disk, so `../../secrets` is refused identically whether or not it is there — an
+    /// error that depended on that would tell a reader something about the filesystem instead
+    /// of about their config. The canonical one is what sees through a symlink, and it can
+    /// only be made after the file is known to exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolveError::EscapesRoot`] when the path is outside the root either
+    /// lexically or after canonicalization, and [`ResolveError::Unreadable`] when it cannot be
+    /// canonicalized — which for a path that is simply not there is what "not found" looks
+    /// like at this level.
+    pub fn confine(&self, specifier: &str, joined: &Path) -> Result<PathBuf, ResolveError> {
+        if !joined.starts_with(&self.root) {
+            return Err(ResolveError::EscapesRoot {
+                specifier: specifier.to_owned(),
+            });
+        }
+
+        // Canonicalize the file that was actually found. This is the check that holds against
+        // symlinks — the lexical test above cannot see through one.
+        let canonical = joined
+            .canonicalize()
+            .map_err(|e| ResolveError::Unreadable {
+                path: joined.display().to_string(),
+                detail: e.to_string(),
+            })?;
+        if !canonical.starts_with(&self.root) {
+            return Err(ResolveError::EscapesRoot {
+                specifier: specifier.to_owned(),
+            });
+        }
+        Ok(canonical)
+    }
+
     /// Find a file for an already-joined path, enforcing containment.
     fn resolve_within(&self, specifier: &str, joined: &Path) -> Result<PathBuf, ResolveError> {
+        // Ahead of the candidate loop as well as inside [`RuleRoot::confine`], because a
+        // traversal that matches no file at all must still be reported as an escape rather
+        // than as "nothing found".
         if !joined.starts_with(&self.root) {
             return Err(ResolveError::EscapesRoot {
                 specifier: specifier.to_owned(),
@@ -218,21 +265,7 @@ impl RuleRoot {
             if !candidate.is_file() {
                 continue;
             }
-
-            // Canonicalize the file that was actually found. This is the check that holds
-            // against symlinks — the lexical test above cannot see through one.
-            let canonical = candidate
-                .canonicalize()
-                .map_err(|e| ResolveError::Unreadable {
-                    path: candidate.display().to_string(),
-                    detail: e.to_string(),
-                })?;
-            if !canonical.starts_with(&self.root) {
-                return Err(ResolveError::EscapesRoot {
-                    specifier: specifier.to_owned(),
-                });
-            }
-            return Ok(canonical);
+            return self.confine(specifier, &candidate);
         }
 
         Err(ResolveError::NotFound {

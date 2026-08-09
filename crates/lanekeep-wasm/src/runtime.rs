@@ -471,10 +471,17 @@ pub fn engine() -> wasmtime::Result<Engine> {
 
 /// The thread that advances an engine's epoch, and stops when the run does.
 ///
-/// One per [`WasmEngine`], which is one per run. `AGENTS.md` names the shape this must not
-/// take: a `--watch` loop or a long-lived server that leaked one of these per iteration would
-/// accumulate threads for the life of the process, each advancing a counter nothing reads.
-/// The [`Drop`] impl is what prevents it.
+/// One per [`WasmEngine`], and a run builds **two** when its config names a component:
+/// `lanekeep_config::describe_components` builds an engine to ask each component what it is
+/// and drops it before returning, and `lanekeep_engine::load_components` builds the one the
+/// run executes on. They do not overlap in what they are for and they barely overlap in time,
+/// but "one per run" was the claim this made and it is no longer the shape.
+///
+/// `AGENTS.md` names what must not happen: a `--watch` loop or a long-lived server that leaked
+/// one of these per iteration would accumulate threads for the life of the process, each
+/// advancing a counter nothing reads. The [`Drop`] impl is what prevents it, and it is what
+/// makes the config-time engine cost nothing beyond the moment it is used — which is worth
+/// knowing now that a run builds one more than it used to.
 ///
 /// The wait is a [`Condvar`] rather than a sleep, and that is load-bearing rather than tidy:
 /// `tests/limits.rs` builds an engine with an interval measured in hours to pin down what
