@@ -19,14 +19,15 @@
 //! against one shared table of cases in `crates/lanekeep-rules/tests/no_unwrap.rs`, and the
 //! claim that table exists to hold is that they report the same violations at the same positions
 //! with the same messages. So a difference here is a bug even when it reads like an improvement:
-//! [`Options`] does not reject an unknown key, for instance, because the TypeScript rule ignores
-//! one and a stricter component would fail a run that used to pass.
+//! `Options` below does not reject an unknown key, for instance, because the TypeScript rule
+//! ignores one and a stricter component would fail a run that used to pass.
 //!
 //! There are no unit tests in this crate, and that is a decision rather than an omission. It does
 //! not compile at all without the `src/bindings.rs` that `cargo component build` generates, which
 //! neither gate runs — so a `#[cfg(test)]` module here would be a test nobody executes, and one
-//! of those is worse than none. Everything worth asserting, down to the `\b` in [`mentions_test`],
-//! is a case in that shared table instead, where both implementations are held to it at once.
+//! of those is worse than none. Everything worth asserting, down to the `\b` in `mentions_test`
+//! below, is a case in that shared table instead, where both implementations are held to it at
+//! once.
 //!
 //! # Nothing here may panic
 //!
