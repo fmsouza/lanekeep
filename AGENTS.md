@@ -413,17 +413,29 @@ against it. `spike` is the one committed fixture this does not reach, because it
 `wit/spike.wit` rather than the shared world. Budget for the identical fan-out the next time an
 export is added — `configure` will hit every one of the same fixtures for the same reason.
 
-**A reference's own `Clone` impl shadows the pointee's, silently, whenever the pointee has one
-too.** `self.rule(slot)?.clone()`, where `rule` returns `Result<&Rule, WasmError>`, does not clone
-`Rule` — Rust always implements `Clone` for `&T` regardless of whether `T: Clone`, and method
-resolution tries the receiver's own type before it tries autoderef, so `.clone()` on a `&Rule`
-resolves to `<&Rule>::clone`, handing back the same reference. Nothing here even needed `Rule:
-Clone` to compile — it does not implement it — which is why the failure surfaces one line later as
-a borrow-checker error (`cannot borrow *self as mutable more than once at a time`) rather than as
-a missing-trait error at the call site itself, and reads like a lifetime problem rather than the
-method-resolution one it is. `(*self.rule(slot)?).clone()` or `Clone::clone(self.rule(slot)?)`
-would have forced the right impl; the fix that was actually right here was to not clone at all and
-reuse the `with_instance` pattern `has_check`/`has_reduce` already established.
+**A reference's own `Clone` impl is reached only when the pointee has none — this reads backwards
+on first sight, and it is worth stating the right way round rather than the intuitive-sounding
+wrong one.** `&T: Clone` holds unconditionally (`impl<T: ?Sized> Clone for &T`), but when `T`
+itself is also `Clone`, method resolution still reaches through the reference and calls `T`'s own
+impl — that is the ordinary case, relied on everywhere `x.clone()` is written on a `&T` to get an
+owned `T`. It is only when `T` has *no* `Clone` of its own that resolution falls back to the
+reference's, silently handing back the same reference. Confirmed with a two-line probe: `(&NoClone
+{}).clone()` compiles to a no-op with `#[warn(noop_method_call)]` naming the exact cause ("the type
+`NoClone` does not implement `Clone`, so calling `clone` on `&NoClone` copies the reference"); the
+identical call on `&YesClone` where `YesClone: Clone` returns an owned value with no warning at
+all. `self.rule(slot)?.clone()`, where `rule` returns `Result<&Rule, WasmError>`, hit the silent
+case — `Rule` (`bindgen!`'s generated struct) implements neither `Clone` nor `Copy`.
+
+**And chaining it into a second use is what turns a silent no-op into a diagnostic that names the
+wrong cause.** `let n = self.get()?.clone(); self.use_it(&n)` — reproduced standalone, same shape —
+fails with `E0499: cannot borrow *self as mutable more than once at a time` and prints no
+`noop_method_call` warning at all, even though the identical `.clone()` on its own does. So the one
+diagnostic that appears blames a lifetime, and the lint that would have named the real cause never
+fires in this shape. `(*self.rule(slot)?).clone()` or `Clone::clone(self.rule(slot)?)` would have
+at least traded `E0499` for `E0599: no method named `clone` found for struct `Rule``, a diagnostic
+that points at the actual problem — not a working clone, since `Rule` has none to reach. The fix
+that was actually right here was to not clone at all and reuse the `with_instance` pattern
+`has_check`/`has_reduce` already established.
 
 **A wasm trap's rendered error already contains the method name, so asserting on it proves
 nothing.** wasmtime prefixes a host function's error with a backtrace whose top frame is spelled

@@ -39,7 +39,9 @@ impl Guest for Component {
             query: String::new(),
             gates: RuleGates {
                 path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
                 file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
             },
             timeout: None,
         }
@@ -58,7 +60,11 @@ impl Guest for Component {
         // the target rather than of how little this guest does.
         let path = ctx.file_path();
         let names: Vec<&str> = m.iter().map(|entry| entry.name.as_str()).collect();
-        ctx.report(ctx.root(), Some(&format!("{path}: {}", names.join(","))), None);
+        ctx.report(
+            ctx.root(),
+            Some(&format!("{path}: {}", names.join(","))),
+            None,
+        );
     }
 
     fn reduce(_: &ReduceContext) {}

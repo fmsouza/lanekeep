@@ -76,7 +76,9 @@ impl Guest for Component {
             query: String::new(),
             gates: RuleGates {
                 path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
                 file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
             },
             timeout: None,
         }

@@ -30,10 +30,12 @@ impl Guest for Component {
             },
             query: "(call_expression) @call".to_owned(),
             gates: RuleGates {
-                path_matches: Vec::new(),
+                path_matches: vec!["src/**/*.rs".to_owned()],
+                path_not_matches: vec!["**/generated/**".to_owned()],
                 file_contains: vec!["call".to_owned()],
+                file_not_contains: vec!["skip".to_owned()],
             },
-            timeout: None,
+            timeout: Some(1500),
         }
     }
 

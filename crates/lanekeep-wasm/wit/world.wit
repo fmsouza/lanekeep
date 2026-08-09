@@ -161,27 +161,35 @@ interface types {
     data: string,
   }
 
-  /// The three strings `lanekeep explain`, the agent reporter and context injection all
-  /// read. Mandatory, together — a card with a message and no remediation tells an agent
-  /// what is wrong and not what to do instead, which is the half that matters.
+  /// A short code snippet on each side of the rule: `bad` triggers it, `good` does not.
   record rule-examples {
     bad: string,
     good: string,
   }
 
+  /// The three strings `lanekeep explain`, the agent reporter and context injection all
+  /// read. Mandatory, together — a card with a message and no remediation tells an agent
+  /// what is wrong and not what to do instead, which is the half that matters.
   record rule-card {
     message: string,
     remediation: string,
     examples: rule-examples,
   }
 
-  /// Evaluated in Rust before the file is read or parsed. Purely an optimization.
+  /// Evaluated in Rust before the file is read or parsed. Purely an optimization — narrowing
+  /// what gets read and parsed, never what a rule that ran would have reported.
   ///
-  /// `file-contains` is an **and**: every listed substring must be present. A rule matching
-  /// either of two tokens cannot express its gate here and omits it instead.
+  /// Mirrors `lanekeep_core::Gates` field for field. `path-matches` admits only a path
+  /// matching one of these; `path-not-matches` is checked first and wins over it, skipping a
+  /// path matching any of these even if `path-matches` would have admitted it. `file-contains`
+  /// is an **and** — every listed substring must be present, so a rule matching either of two
+  /// tokens cannot express it here and omits the gate instead — and `file-not-contains` is an
+  /// **or**: a file whose bytes contain any of these is skipped.
   record rule-gates {
     path-matches: list<string>,
+    path-not-matches: list<string>,
     file-contains: list<string>,
+    file-not-contains: list<string>,
   }
 
   /// What a component says it is, read once at prepare time.
@@ -190,11 +198,14 @@ interface types {
   /// never again, and there is no per-call state for a resource to hold.
   ///
   /// The field set is exactly what `lanekeep-config`'s `EXTRACT` already harvests from a
-  /// TypeScript module, and deliberately nothing more — a second, wider description of a
-  /// rule is the drift `host-api-matches-types` exists to police.
+  /// TypeScript module, and deliberately nothing more — a second, wider description of a rule
+  /// is drift this record must not accumulate.
   record rule-metadata {
     id: string,
-    /// One or several. A rule does not run on a file whose language it does not name.
+    /// One or several. A rule does not run on a file whose language it does not name — which
+    /// means an empty list is not "every language," it is **no file at all**, and silently: a
+    /// component that forgot to say what it targets would simply never fire, with nothing to
+    /// report the mistake. The host refuses an empty list at load, before any file is checked.
     languages: list<string>,
     severity: string,
     card: rule-card,

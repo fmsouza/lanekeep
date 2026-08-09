@@ -34,9 +34,7 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::lanekeep::host::types::{
-    FactError, RuleCard, RuleExamples, RuleGates, RuleMetadata,
-};
+use bindings::lanekeep::host::types::{FactError, RuleCard, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
@@ -60,7 +58,9 @@ impl Guest for Component {
             query: String::new(),
             gates: RuleGates {
                 path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
                 file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
             },
             timeout: None,
         }

@@ -88,13 +88,14 @@ pub struct RuleSpec {
     /// same run over the same corpus — the decision is a property of the rule and is made here,
     /// where a rule is described, rather than by the engine guessing from anything else.
     ///
-    /// # It is `None` for every rule a config can express today, and the reason is not this crate
+    /// # It is `None` for every rule a config can express today, and the reason has moved
     ///
     /// [`RuleReference::Component`] resolves a `.wasm` specifier to a path, and `rules_module`
-    /// then refuses it. That refusal stays, because the fields above it have nowhere to come
-    /// from: `crates/lanekeep-wasm/wit/world.wit` declares four exports and **none of them is
-    /// `metadata`**, so a component cannot supply its own `id`, `query`, `card`, `gates`,
-    /// `languages`, `severity` or `timeout`.
+    /// then refuses it. That refusal stays, and what it stays *for* has changed: the world now
+    /// declares a `metadata` export (`crates/lanekeep-wasm/wit/world.wit`) a component answers
+    /// with its own `id`, `query`, `card`, `gates`, `languages`, `severity` and `timeout` — but
+    /// nothing in this crate calls it yet. The fields above have nowhere to come from *here*,
+    /// not because the world cannot describe them.
     ///
     /// [`RuleSpec::has_reduce`] is the exception and is worth naming rather than leaving out of
     /// the list, because it is the one field a second source of truth already exists for. The
@@ -102,18 +103,19 @@ pub struct RuleSpec {
     /// nothing asks: the engine reads that field, which this crate fills in by inspecting the
     /// TypeScript module or from JSON, and `lanekeep_wasm::WasmRuntime::has_reduce` has test
     /// callers only. So a component-backed rule is taken at its config's word about a question
-    /// it can answer itself, and the two can disagree with nothing to notice. Closing that is
-    /// the same sub-project as `metadata`, and it should close both at once.
+    /// it can answer itself, and the two can disagree with nothing to notice. Closing that and
+    /// reading `metadata` are the same piece of work, and should close together.
     ///
-    /// The only alternatives are to add that export —
-    /// which is the Rust-authoring sub-project's ABI to design, and bumps a cache-key input —
-    /// or to invent config syntax carrying the metadata beside the reference, which that same
-    /// sub-project would then have to un-invent. Both were declined, as they were when the
-    /// options question reached the same wall.
+    /// The two alternatives that were on the table for `metadata` were adding the export — the
+    /// Rust-authoring sub-project's ABI to design, and a cache-key bump — or inventing config
+    /// syntax carrying the metadata beside the reference, which that same sub-project would
+    /// then have had to un-invent. The first happened: the export exists now. Reading the
+    /// answer from here has not.
     ///
     /// So the field is the seam and not yet the door: a caller holding a `Config` — a test, an
-    /// embedder, and the sub-project that adds `metadata` — can set it and get component
-    /// dispatch, and `lanekeep-config` sets it the day a component can describe itself.
+    /// embedder, and the sub-project finishing this wiring — can set it and get component
+    /// dispatch, and `lanekeep-config` sets it the day it reads what a component already
+    /// answers.
     pub component: Option<PathBuf>,
 }
 

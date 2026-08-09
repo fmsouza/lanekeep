@@ -24,7 +24,12 @@ fn a_component_declares_its_own_identity() {
     assert_eq!(declared.card.remediation, "do the other thing");
     assert_eq!(declared.card.examples.bad, "bad()");
     assert_eq!(declared.card.examples.good, "good()");
+    assert_eq!(declared.gates.path_matches, vec!["src/**/*.rs".to_owned()]);
+    assert_eq!(
+        declared.gates.path_not_matches,
+        vec!["**/generated/**".to_owned()]
+    );
     assert_eq!(declared.gates.file_contains, vec!["call".to_owned()]);
-    assert!(declared.gates.path_matches.is_empty());
-    assert_eq!(declared.timeout, None);
+    assert_eq!(declared.gates.file_not_contains, vec!["skip".to_owned()]);
+    assert_eq!(declared.timeout, Some(1500));
 }

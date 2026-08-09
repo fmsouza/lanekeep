@@ -428,10 +428,13 @@ pub struct Engine {
     /// cache-key encoding in a second crate is exactly the drift that produced this
     /// sub-project's one real cache bug, where reusing a text separator for arbitrary binary let
     /// two rulesets share a key. The fold belongs beside the existing one, on the day
-    /// `lanekeep-config` can produce a component-backed rule at all — which it cannot, because
-    /// the world has no `metadata` export, so this costs nothing today. And a guard that turns
-    /// the cache *off* has no encoding to get wrong: the failure mode of getting it wrong is a
-    /// cold run, where the failure mode of a wrong fold is a wrong answer.
+    /// `lanekeep-config` can produce a component-backed rule at all — which it cannot yet:
+    /// `rules_module` still refuses a `.wasm` specifier (see `RuleSpec::component`), even
+    /// though the world can now describe one through its `metadata` export. So this costs
+    /// nothing today, and revisiting it tracks that wiring landing rather than the export
+    /// having landed. And a guard that turns the cache *off* has no encoding to get wrong: the
+    /// failure mode of getting it wrong is a cold run, where the failure mode of a wrong fold is
+    /// a wrong answer.
     ///
     /// It is per run rather than per rule because a cache entry is per *file* and holds every
     /// rule's findings for it, so there is no finer granularity that is sound.
@@ -5191,11 +5194,12 @@ export default defineRule({
 
         /// A `RuleSpec` backed by the fixture component.
         ///
-        /// Built by hand, and that is not a shortcut around anything — `lanekeep-config` cannot
-        /// produce one, because `wit/world.wit` has no `metadata` export and a component has
-        /// therefore nowhere to put its own `id`, `query` or `card`. See [`RuleSpec::component`].
-        /// What the engine dispatches on is this field, so a hand-built spec exercises exactly
-        /// the production path.
+        /// Built by hand, and that is not a shortcut around anything — `lanekeep-config` still
+        /// cannot produce one: the world now declares a `metadata` export a component answers
+        /// with its own `id`, `query` and `card` (`crates/lanekeep-wasm/wit/world.wit`), but
+        /// nothing in `lanekeep-config` calls it yet. See [`RuleSpec::component`]. What the
+        /// engine dispatches on is this field, so a hand-built spec exercises exactly the
+        /// production path.
         fn component_rule(id: &str, index: usize, has_reduce: bool) -> RuleSpec {
             RuleSpec {
                 index,

@@ -89,7 +89,13 @@ impl Guest for Component {
     fn metadata() -> RuleMetadata {
         RuleMetadata {
             id: "fixture/engine-rule".to_owned(),
-            languages: vec!["rust".to_owned()],
+            // Not `"rust"`: `crates/lanekeep-engine/src/lib.rs`'s `component_rule` is the only
+            // place this fixture is actually driven, and it builds the real `RuleSpec` by hand
+            // with `languages: vec!["typescript".to_owned()]` and the same query this guest
+            // matches against. `metadata()` here is unexercised by any test, but this is the one
+            // field with a real answer sitting elsewhere in the tree, so it agrees rather than
+            // inventing a second one.
+            languages: vec!["typescript".to_owned()],
             severity: "error".to_owned(),
             card: RuleCard {
                 message: String::new(),
@@ -102,7 +108,9 @@ impl Guest for Component {
             query: String::new(),
             gates: RuleGates {
                 path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
                 file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
             },
             timeout: None,
         }

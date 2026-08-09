@@ -64,7 +64,9 @@ impl Guest for Component {
             query: String::new(),
             gates: RuleGates {
                 path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
                 file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
             },
             timeout: None,
         }
@@ -96,7 +98,10 @@ impl Guest for Component {
             ("kind", Some(node)) => kind(ctx, node),
             ("all", Some(node)) => all(ctx, node),
             ("unresolvable", _) => all(ctx, UNRESOLVABLE),
-            (other, None) => say(ctx, &format!("shape: probe `{other}` has no target capture")),
+            (other, None) => say(
+                ctx,
+                &format!("shape: probe `{other}` has no target capture"),
+            ),
             (other, Some(_)) => say(ctx, &format!("unknown probe `{other}`")),
         }
     }

@@ -60,7 +60,9 @@ impl Guest for Component {
             query: String::new(),
             gates: RuleGates {
                 path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
                 file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
             },
             timeout: None,
         }
@@ -237,13 +239,11 @@ fn nearest(ctx: &CheckContext) {
         return say(ctx, "shape: no declarator to start from");
     };
 
-    let found = match ctx.closest_ancestor(
-        start,
-        "(function_declaration name: (identifier) @name) @fn",
-    ) {
-        Ok(found) => found,
-        Err(problem) => return say(ctx, &format!("unexpected error: {problem}")),
-    };
+    let found =
+        match ctx.closest_ancestor(start, "(function_declaration name: (identifier) @name) @fn") {
+            Ok(found) => found,
+            Err(problem) => return say(ctx, &format!("unexpected error: {problem}")),
+        };
 
     let Some(m) = found else {
         return say(ctx, "nothing matched");
