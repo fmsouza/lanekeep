@@ -143,6 +143,20 @@ wasm-fixtures:
     LANEKEEP_BLESS_WASM_FIXTURES=1 cargo test --quiet -p lanekeep-wasm \
         --test fixture_currency -- --exact every_committed_artifact_is_the_one_its_sources_build
 
+# Build and test rust-rules/: its own workspace, so `cargo test --workspace` at the root does
+# not reach it.
+#
+# Deliberately not part of `check`/`check-fast` yet, the same way `wasm-fixtures` is
+# deliberately not: extending the gate — deny, machete, fmt, msrv — over this second workspace
+# is separate, later work. This is what building and testing what exists here needs today.
+#
+# Plain `cargo test` rather than `cargo nextest run`: the crates here are host-target unit
+# tests over pure functions, with no wasm target and no fixture side effects to isolate a
+# process per test for, and `cargo test` also runs doctests in the same pass that nextest
+# would need a second invocation for.
+test-rust-rules:
+    cargo test --manifest-path rust-rules/Cargo.toml --workspace --all-features
+
 # Tests for the repository's own shell tooling.
 #
 # lint-commit-msg.sh gates every commit and every pull request title, and the title is

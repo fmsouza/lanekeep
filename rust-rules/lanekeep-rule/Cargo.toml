@@ -1,0 +1,19 @@
+# The SDK a Rust-authored rule crate depends on: a name lookup over a query match, and a
+# glob matcher. Nothing else — see the module doc in src/lib.rs for why a query-parsing
+# capture macro is declined rather than merely deferred.
+#
+# Unlike `no-unwrap` and `no-glob-import` (Tasks 6, 7), this crate is not itself compiled to
+# a WebAssembly component — it is a plain host-target library the component crates depend on
+# — so it carries no `[package.metadata.component.target]` and generates no bindings.rs.
+[package]
+name = "lanekeep-rule"
+description = "The SDK a lanekeep rule authored in Rust depends on."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

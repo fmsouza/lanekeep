@@ -1,0 +1,60 @@
+# Rule crates, authored in the language they inspect and compiled to WebAssembly components.
+#
+# Its own workspace, not a member of the root one. `members = ["crates/*"]` there is a
+# single-level glob so nothing here is swept in, and a crate that cross-compiles to wasm32
+# has a different dependency graph and a different default target from everything that builds
+# for the host — `cargo build --workspace` overrides `default-members`, so exclusion there is
+# not enough on its own.
+#
+# One workspace for all rule crates rather than one per crate, unlike the fixtures under
+# crates/lanekeep-wasm/tests/fixtures/: those are fixtures and can afford a lockfile each,
+# while these are shipped artifacts whose dependency graph has to pass the supply-chain gate,
+# and one workspace means one `cargo deny` invocation rather than a loop.
+[workspace]
+resolver = "3"
+# `no-unwrap` and `no-glob-import` (Tasks 6 and 7) join this list when they exist. Listing
+# them ahead of that would make every `cargo` invocation here fail to load the workspace at
+# all — a missing member is a manifest error, not an empty package — so until then this
+# workspace has one member.
+members = ["lanekeep-rule"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+# `deny.toml` has no exemption for unpublished crates — every crate in the root workspace
+# carries a real `license` field, and `cargo deny check licenses` fails on one that does not.
+# Matches the root `Cargo.toml`'s own value, which is what the code these rules ship beside
+# is actually licensed under.
+license = "MIT OR Apache-2.0"
+
+# `[lints] workspace = true` resolves only within one workspace, so the root Cargo.toml's
+# table does not reach here and this is a copy of its `[workspace.lints.*]` (lines 100-132)
+# rather than a reference. Kept identical on purpose; a divergence is a finding.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+expect_used = "warn"
+unwrap_used = "warn"
+panic = "warn"
+cast_possible_truncation = "warn"
+cast_precision_loss = "warn"
+cast_sign_loss = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+opt-level = "s"
+strip = true
