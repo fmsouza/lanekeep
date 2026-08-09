@@ -70,6 +70,21 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
     ("no-unwrap", include_str!("../rules/no-unwrap.ts")),
 ];
 
+/// The rule components this build ships, as `(name, bytes)`.
+///
+/// Beside [`BUILT_IN_RULES`] rather than replacing an entry in it, because for now a migrated
+/// rule exists twice: `rules/no-unwrap.ts` is still what a config resolves, and the component is
+/// what `tests/no_unwrap.rs` holds to the same expectations. A rule appearing in both lists is
+/// the state a migration passes through — the swap is its own change, and it is what makes the
+/// TypeScript source stop being reachable.
+///
+/// Built from `rust-rules/<name>/` by `just rust-rules`, which is also what copies the artifact
+/// here. The bytes are committed, so the gate needs neither `cargo component` nor a wasm target.
+///
+/// Ordered, on the same terms as [`BUILT_IN_RULES`].
+const BUILT_IN_COMPONENTS: &[(&str, &[u8])] =
+    &[("no-unwrap", include_bytes!("../components/no-unwrap.wasm"))];
+
 /// Shared modules the built-in rules import, and project rules may too.
 ///
 /// Separate from the rules because they are not rules: they have no id, no card and no
@@ -89,6 +104,18 @@ pub fn source(name: &str) -> Option<&'static str> {
         .chain(BUILT_IN_MODULES)
         .find(|(candidate, _)| *candidate == name)
         .map(|(_, source)| *source)
+}
+
+/// The component behind a built-in rule's name, or `None` for one that has none.
+///
+/// Bytes rather than a path, on the same terms as [`source`]: a built-in is embedded in the
+/// binary, so nothing is written to disk and no file in the project can shadow it.
+#[must_use]
+pub fn component(name: &str) -> Option<&'static [u8]> {
+    BUILT_IN_COMPONENTS
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, bytes)| *bytes)
 }
 
 /// Every built-in rule's name, in a stable order.
@@ -125,6 +152,40 @@ mod tests {
         assert_eq!(source("no-such-rule"), None);
         assert_eq!(source(""), None);
         assert_eq!(source("no-default-export.ts"), None);
+    }
+
+    #[test]
+    fn every_component_is_a_rule_that_ships() {
+        // A component whose name is not a built-in is a rule nothing can reach: `component` is
+        // looked up by the same name `source` is, so a mismatch is an artifact embedded in the
+        // binary and never executed.
+        for (name, _) in BUILT_IN_COMPONENTS {
+            assert!(
+                names().any(|rule| rule == *name),
+                "`{name}` has a component but is not a built-in rule"
+            );
+        }
+    }
+
+    #[test]
+    fn a_component_is_webassembly_rather_than_a_placeholder() {
+        // `include_bytes!` of a stub or a half-written file compiles, and the failure would be a
+        // load error inside whichever test ran first. Four bytes are enough to tell them apart.
+        for (name, bytes) in BUILT_IN_COMPONENTS {
+            assert_eq!(
+                bytes.get(..4),
+                Some(b"\0asm".as_slice()),
+                "`{name}`'s component does not begin with the WebAssembly magic"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_without_a_component_has_none() {
+        assert_eq!(component("no-such-rule"), None);
+        // Still authored in TypeScript, and asked by name rather than assumed: this is what
+        // distinguishes "not migrated" from "migrated and the table was not updated".
+        assert_eq!(component("no-default-export"), None);
     }
 
     #[test]

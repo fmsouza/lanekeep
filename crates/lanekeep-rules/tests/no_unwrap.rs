@@ -85,6 +85,23 @@ const CASES: &[Case] = &[
         options: None,
         expected: Expected::Accepts,
     },
+    // The exemption is `/\btest\b/` over the attribute's text, and these are the two edges of
+    // that `\b`. They matter to a *port* more than to the original: the obvious Rust spelling of
+    // "contains test" exempts `#[my_test]`, and a rule that exempts too much reports nothing and
+    // reads exactly like clean code. `_` being a word character is what decides the second one,
+    // in JavaScript and here alike.
+    Case {
+        name: "a_test_attribute_behind_a_path_still_exempts",
+        source: "#[tokio::test]\nasync fn works() {\n    let c = load().unwrap();\n}\n",
+        options: None,
+        expected: Expected::Accepts,
+    },
+    Case {
+        name: "an_attribute_that_merely_contains_test_does_not_exempt",
+        source: "#[my_test]\nfn works() {\n    let c = load().unwrap();\n}\n",
+        options: None,
+        expected: Expected::ReportsAt(&[(3, 13)]),
+    },
     Case {
         name: "a_cfg_test_module_passes",
         source: "#[cfg(test)]\nmod tests {\n    fn helper() {\n        let c = load().unwrap();\n    }\n}\n",
@@ -175,12 +192,44 @@ fn assert_case(tester: &RuleTester, case: &Case) -> Result<(), TestError> {
 /// that exists for one engine and not the other is the thing this file is arranged to make
 /// unrepresentable. Collecting the failures is what keeps that from costing anything — a
 /// migration that gets three cases wrong says so once, rather than three runs in a row.
-fn assert_every_case(build: impl Fn(&Case) -> RuleTester) {
+///
+/// # A thread per case, which nextest would otherwise have given for free
+///
+/// Every case builds its own throwaway project and runs the real engine over it, and for the
+/// component arm that means compiling the rule twice — once when the config asks it what it is,
+/// once when the engine prepares — with a Cranelift that is itself an unoptimized build under
+/// `cargo test`. Measured before this: **29.6 seconds** for the component arm run in sequence,
+/// against 0.4 for the TypeScript one, in a recipe that runs on every commit.
+///
+/// Splitting the table into a `#[test]` per case would let nextest's process-per-test do this,
+/// and would need a macro to generate them from the table — which is a lot of machinery, and
+/// puts the count of cases somewhere other than the table. The scope below is the same
+/// parallelism without either cost. Each case already has a directory of its own, which is what
+/// makes it safe: a tester is never shared, so there is nothing between the threads to
+/// synchronize.
+fn assert_every_case(build: impl Fn(&Case) -> RuleTester + Sync) {
+    let build = &build;
+    let results: Vec<Option<String>> = std::thread::scope(|scope| {
+        let running: Vec<_> = CASES
+            .iter()
+            .map(|case| scope.spawn(move || assert_case(&build(case), case)))
+            .collect();
+        running
+            .into_iter()
+            .zip(CASES)
+            .map(|(thread, case)| match thread.join() {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("\n--- {} ---\n{error}\n", case.name)),
+                // A panicked case is a failure like any other, and swallowing it would turn the
+                // one failure that carries no `TestError` into a silent pass.
+                Err(_) => Some(format!("\n--- {} ---\npanicked\n", case.name)),
+            })
+            .collect()
+    });
+
     let mut failures = String::new();
-    for case in CASES {
-        if let Err(error) = assert_case(&build(case), case) {
-            let _ = write!(failures, "\n--- {} ---\n{error}\n", case.name);
-        }
+    for reported in results.iter().flatten() {
+        let _ = write!(failures, "{reported}");
     }
     assert!(failures.is_empty(), "{failures}");
 }
@@ -201,7 +250,27 @@ fn typescript(case: &Case) -> RuleTester {
     .expect("builds")
 }
 
+/// The same rule, migrated: a WebAssembly component built from `rust-rules/no-unwrap/`.
+///
+/// The options reach it as data rather than as source. A component cannot close over a
+/// host-supplied value the way a JavaScript factory does, so `configure(options-json)` is where
+/// they arrive — which is why the table's option strings are JSON, and why the bare case is not
+/// "no call" but a call with `null`.
+fn component(case: &Case) -> RuleTester {
+    let bytes = lanekeep_rules::component("no-unwrap").expect("the component ships");
+    match case.options {
+        None => RuleTester::for_component("no-unwrap", bytes, "rs"),
+        Some(options) => RuleTester::for_component_configured("no-unwrap", bytes, "rs", options),
+    }
+    .expect("builds")
+}
+
 #[test]
 fn the_typescript_rule_satisfies_every_case() {
     assert_every_case(typescript);
+}
+
+#[test]
+fn the_component_rule_satisfies_every_case() {
+    assert_every_case(component);
 }

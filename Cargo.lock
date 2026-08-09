@@ -1001,6 +1001,7 @@ dependencies = [
  "lanekeep-js",
  "lanekeep-lang-js",
  "lanekeep-languages",
+ "serde_json",
  "thiserror",
 ]
 

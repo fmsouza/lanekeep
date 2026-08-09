@@ -143,22 +143,76 @@ wasm-fixtures:
     LANEKEEP_BLESS_WASM_FIXTURES=1 cargo test --quiet -p lanekeep-wasm \
         --test fixture_currency -- --exact every_committed_artifact_is_the_one_its_sources_build
 
-# Build and test rust-rules/: its own workspace, so `cargo test --workspace` at the root does
-# not reach it.
+# Rebuild the committed rule components from rust-rules/.
 #
-# Part of both gates, unlike `wasm-fixtures` — that recipe is excluded because it needs
+# Deliberately not part of any gate, exactly as `wasm-fixtures` is not: it needs
+# `cargo component`, which CI does not install, and it rewrites committed artifacts. The
+# artifacts under `crates/lanekeep-rules/components/` are what the gate reads, through
+# `lanekeep_rules::component`, so a machine with neither `cargo component` nor a wasm target
+# still runs every rule component against `crates/lanekeep-rules/tests/`.
+#
+# `--target wasm32-unknown-unknown` is a requirement, not a preference — the same one
+# `wasm-fixtures` documents at length. `cargo component` defaults to `wasm32-wasip1`, whose
+# components import a wall clock and two filesystem interfaces as soon as the guest touches
+# anything in `std`, and a rule crate parsing JSON touches plenty. On this target the import
+# list is exactly the declared world, which `lanekeep-wasm`'s loader checks at load.
+rust-rules:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _require cargo-component
+    root="$(pwd)"
+    built=0
+    for dir in rust-rules/*/; do
+        [ -f "${dir}Cargo.toml" ] || continue
+        # A crate declaring a component target is a rule; one that does not is the SDK the
+        # rules depend on, which is a plain host-target library and has no artifact to build.
+        #
+        # Anchored, and with the brackets: the SDK's manifest explains in a comment that it
+        # carries no `[package.metadata.component.target]`, and an unanchored match found that
+        # sentence and tried to copy an artifact the SDK never builds.
+        grep -qE '^\[package\.metadata\.component\.target\]' "${dir}Cargo.toml" || continue
+        name="$(basename "${dir}")"
+        echo "building ${name}"
+        built=$((built + 1))
+        (cd "${dir}" && cargo component build --release --target wasm32-unknown-unknown)
+        # One workspace, so one target directory for all of them. cargo names the artifact
+        # after the crate with hyphens turned into underscores; the directory keeps them.
+        cp "${root}/rust-rules/target/wasm32-unknown-unknown/release/${name//-/_}.wasm" \
+           "${root}/crates/lanekeep-rules/components/${name}.wasm"
+    done
+
+    # A glob that matches no package builds nothing and says so in no way at all, leaving the
+    # artifacts already in the tree in place and this recipe reporting success.
+    if [ "${built}" -eq 0 ]; then
+        echo "error: no rule crates under rust-rules/." >&2
+        echo "       nothing was rebuilt, so nothing was refreshed." >&2
+        exit 1
+    fi
+
+# Test rust-rules/: its own workspace, so `cargo test --workspace` at the root does not reach
+# it.
+#
+# Part of both gates, unlike `rust-rules` — that recipe is excluded because it needs
 # `cargo component` and rewrites committed artifacts, neither of which is true here: this is
 # a zero-dependency host-target test that runs in under a second, and leaving it opt-in would
 # mean nothing here runs until someone remembers to ask for it by name. Extending the gate
 # further — deny, machete, fmt, msrv — over this second workspace is still separate, later
 # work.
 #
+# **No `--workspace`, and that is load-bearing.** A rule crate's `src/bindings.rs` is generated
+# by `cargo component build` and gitignored, so on a fresh checkout it does not exist and the
+# crate does not compile at all — for any target, host included. `--workspace` would therefore
+# make this recipe, and both gates through it, depend on a tool the gates deliberately do not
+# require. `default-members` in `rust-rules/Cargo.toml` names what is buildable without one;
+# what that leaves out is covered by running the committed artifact through the real engine in
+# `crates/lanekeep-rules/tests/`, which is a stronger check than a host-target unit test.
+#
 # Plain `cargo test` rather than `cargo nextest run`: the crates here are host-target unit
 # tests over pure functions, with no wasm target and no fixture side effects to isolate a
 # process per test for, and `cargo test` also runs doctests in the same pass that nextest
 # would need a second invocation for.
 test-rust-rules:
-    cargo test --manifest-path rust-rules/Cargo.toml --workspace --all-features
+    cargo test --manifest-path rust-rules/Cargo.toml --all-features
 
 # Tests for the repository's own shell tooling.
 #
