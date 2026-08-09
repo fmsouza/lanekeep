@@ -20,7 +20,11 @@ workspace = true
 [dependencies]
 # The SDK: a name lookup over a query match, and the glob matcher that ports the TypeScript
 # `matches` helper. A plain host-target library — it is not itself a component.
-lanekeep-rule = { path = "../lanekeep-rule" }
+#
+# `version` beside `path`, on the terms `no-unwrap`'s manifest sets out: a path dependency
+# without one is a `*` requirement, and `deny.toml`'s `wildcards = "deny"` — which `just deny`
+# now applies to this workspace too — refuses those.
+lanekeep-rule = { path = "../lanekeep-rule", version = "0.0.0" }
 # A rule's options cross the boundary as JSON, because a component cannot close over a
 # host-supplied value the way a JavaScript factory does. Parsing them with serde rather than by
 # hand follows the example `no-unwrap` set: a hand-rolled reader of one rule's option shape is a

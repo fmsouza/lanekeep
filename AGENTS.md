@@ -183,6 +183,14 @@ nothing. Only `cargo +<version>` overrides the pin. This is why `just msrv` exis
 `group_imports`, `wrap_comments` and friends emit a warning per file on stable and change
 nothing. `rustfmt.toml` is stable-only on purpose; do not add them back.
 
+`skip_children` is the exception, and it is worth knowing because the rule crates depend on it.
+Measured on rustfmt 1.9.0-stable: `--config skip_children=true` suppresses the diffs rustfmt
+would otherwise report inside a rule's generated `src/bindings.rs`, *and* stops it failing with
+`failed to resolve mod` when that gitignored file has never been generated. An option rustfmt
+does not know is rejected outright — `invalid key=val pair` — so "it was accepted" is itself
+evidence it is real. `just fmt` passes it on the command line rather than in `rustfmt.toml`,
+because the root workspace's `cargo fmt` must keep descending into child modules.
+
 **`typos` runs with `locale = "en-us"`.** Write `behavior`, `analyze`, `capitalize` — the
 American forms — in prose and comments alike. British variants fail the gate. This is
 deliberate: Rust's own vocabulary is American (`serialize`, `color`), and consistency
@@ -659,6 +667,23 @@ appeared to succeed regardless of what it did. Any script whose control flow tur
 exit code could fail all of its cases there and still be reported as tolerating CRLF. `set -o
 pipefail` in the stub is the fix. Worth remembering generally: a stub is test code, and test
 code that always passes is worse than none.
+
+**A rule crate cannot be mutation-tested, because cargo-mutants works in a copy of the workspace
+and the crate reaches outside it.** Each rule under `rust-rules/` names the engine's world with
+`[package.metadata.component.target] path = "../../crates/lanekeep-wasm/wit"` — deliberately, so
+there is no second copy of the world to drift. cargo-mutants tests every mutant in a scratch copy
+of the workspace root, and in that copy the path resolves to nothing: `failed to parse local
+target`, then `No such file or directory`. So the component cannot be rebuilt there, and the
+custom test command the obvious wiring needs — rebuild the component, then run the cross-workspace
+expectations in `crates/lanekeep-rules/tests/` — cannot run either.
+
+What makes this worth writing down is that the *scoped* invocation looks like it works.
+`cd rust-rules && cargo mutants -p no-glob-import` finds eight mutants and reports seven MISSED,
+which reads as a rule with no test coverage. It is the opposite: that workspace has no tests at
+all, because every assertion about these rules lives in the other one. A wall of false MISSED
+results is the expected output of pointing mutation testing at the wrong workspace, not a finding.
+`--in-place` avoids the copy and mutates the real tree, which for a build that rewrites committed
+artifacts is not something to put near a gate.
 
 **A stacked pull request conflicts as soon as its parent is squash-merged.** Squashing
 replaces the parent's commits with one new commit that has a different SHA, so git sees the

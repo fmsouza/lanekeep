@@ -19,7 +19,14 @@ workspace = true
 [dependencies]
 # The SDK: a name lookup over a query match, and the glob matcher that ports the TypeScript
 # `matches` helper. A plain host-target library — it is not itself a component.
-lanekeep-rule = { path = "../lanekeep-rule" }
+#
+# `version` beside `path`, and it is not decoration. A path dependency without one is a `*`
+# requirement, and `deny.toml`'s `wildcards = "deny"` refuses those — for the good reason that a
+# published crate carrying one accepts any future version of it. `just deny` runs that same
+# policy file over this workspace, so stating the version is what satisfies the check rather
+# than exempting this workspace from it. It matches `[workspace.package] version`; a bump there
+# without one here fails resolution loudly.
+lanekeep-rule = { path = "../lanekeep-rule", version = "0.0.0" }
 # A rule's options cross the boundary as JSON, because a component cannot close over a
 # host-supplied value the way a JavaScript factory does. Parsing them with serde rather than by
 # hand is the example this crate sets for every rule that follows: a hand-rolled reader of one
