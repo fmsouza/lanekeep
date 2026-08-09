@@ -301,15 +301,20 @@ fn assert_every_case(build: impl Fn(&Case) -> RuleTester + Sync) {
     assert!(failures.is_empty(), "{failures}");
 }
 
-/// The rule as authored: a TypeScript module, evaluated in the sandbox.
+/// The rule as originally authored: a TypeScript module, evaluated in the sandbox.
 ///
 /// `configured_with_extension` for a case with options and `with_extension` for one without,
 /// because that distinction is the rule's own: `lanekeep init` writes a bare
 /// `"lanekeep/no-glob-import"` into a Rust project's config, which `lanekeep-config` renders as
 /// the imported binding itself, while the usage the rule documents calls it. Both shapes have to
 /// work, and for a while only one of them did.
+///
+/// **The source is read from the file rather than from `lanekeep_rules::source`, because it is
+/// no longer a built-in.** `lanekeep/no-glob-import` resolves to the component now. This arm is
+/// what holds the swap to having changed nothing: it runs the implementation that was replaced,
+/// against the same table, in the same commit that replaced it. It leaves with the file.
 fn typescript(case: &Case) -> RuleTester {
-    let source = lanekeep_rules::source("no-glob-import").expect("the rule ships");
+    let source = include_str!("../rules/no-glob-import.ts");
     match case.options {
         None => RuleTester::with_extension("no-glob-import", source, "rs"),
         Some(options) => {

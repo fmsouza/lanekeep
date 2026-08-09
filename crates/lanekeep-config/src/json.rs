@@ -68,6 +68,20 @@ use serde_json::Value;
 
 use crate::ConfigError;
 
+/// Resolves a built-in rule name to its embedded component.
+///
+/// Structurally the same type the rules root carries and `crate::load` hands in — a `fn` alias
+/// is transparent, so the two are one type and a change to either is a compile error at the
+/// call site rather than a drift.
+///
+/// **Declared here rather than imported, and the reason is the point of this file.** Resolving a
+/// `lanekeep.json` reaches no sandbox, and `the_json_path_names_nothing_from_the_sandbox_crate`
+/// enforces that by refusing the sandbox crate's name anywhere in this source. A lookup function
+/// is not a sandbox and importing the alias would not make it one — but the check reads names
+/// rather than intent, deliberately, because the alternative is a check that has to be argued
+/// with every time it fires. This file does not need the import, so it does not take it.
+pub(crate) type BuiltinComponent = fn(&str) -> Option<&'static [u8]>;
+
 /// The prefix a built-in rule reference carries, as in `lanekeep/no-package-init`.
 const BUILTIN_PREFIX: &str = "lanekeep/";
 
@@ -87,13 +101,25 @@ pub(crate) fn is_json(path: &Path) -> bool {
 /// rest of the crate can read without evaluating anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleReference {
-    /// A rule shipped with lanekeep. Carries the name after the prefix, so
-    /// `"lanekeep/no-package-init"` is `Builtin("no-package-init")`.
+    /// A rule shipped with lanekeep, authored in TypeScript. Carries the name after the
+    /// prefix, so `"lanekeep/no-package-init"` is `Builtin("no-package-init")`.
     ///
-    /// Which bytes that name resolves to is the loader's business today and a
-    /// `fn(&str) -> Option<&'static [u8]>` over embedded components later. Either way the
-    /// name is what a config wrote, and it is decided here.
+    /// Which bytes that name resolves to is the loader's business; the name is what a config
+    /// wrote, and it is decided here.
     Builtin(String),
+
+    /// A rule shipped with lanekeep, compiled to a component.
+    ///
+    /// **The distinction is not one a config writes.** Both spellings are `lanekeep/<name>`,
+    /// and which of the two a name is depends only on how that rule happens to be authored in
+    /// the build the user is running. A rule migrating from TypeScript to Rust must not require
+    /// anybody to edit their config, which is the whole point of resolving the prefix here
+    /// rather than making the format carry the answer.
+    ///
+    /// Its own variant rather than a [`RuleReference::Component`] holding a synthetic path,
+    /// because a built-in has no path: its bytes are embedded in the binary, so there is
+    /// nothing to confine, nothing to read and nothing a project file could shadow.
+    BuiltinComponent(String),
 
     /// A compiled rule component on disk, as in `"./rules/no-package-init.wasm"`.
     ///
@@ -112,6 +138,21 @@ pub enum RuleReference {
     /// optional — `./rule` finds `rule.ts` — and reproducing the loader's search here would
     /// be a second implementation of it.
     Module(String),
+}
+
+impl RuleReference {
+    /// Whether this reference's handlers live in a component rather than in JavaScript.
+    ///
+    /// One question asked in three places — the entry module's placeholder, the early return in
+    /// `crate::describe_components`, and the description loop — so that adding a third way for a
+    /// component to be named cannot leave one of them behind. A `matches!` at each site is what
+    /// let `BuiltinComponent` be added and forgotten, and every symptom of forgetting is silent:
+    /// a placeholder not emitted shifts every later rule's handler by one, and a reference not
+    /// described becomes a rule with no `check`.
+    #[must_use]
+    pub const fn is_component(&self) -> bool {
+        matches!(self, Self::Component(_) | Self::BuiltinComponent(_))
+    }
 }
 
 /// A rule reference, resolved, with the options it was configured with.
@@ -214,7 +255,11 @@ impl JsonRule {
 ///
 /// Returns [`ConfigError`] when the file cannot be read, is not valid JSON, or names a rule
 /// in a way that cannot mean anything.
-pub(crate) fn parse(config_path: &Path, rules_root: &Path) -> Result<Parsed, ConfigError> {
+pub(crate) fn parse(
+    config_path: &Path,
+    rules_root: &Path,
+    components: BuiltinComponent,
+) -> Result<Parsed, ConfigError> {
     let display = config_path.display().to_string();
 
     let text = std::fs::read_to_string(config_path).map_err(|e| ConfigError::Unreadable {
@@ -233,7 +278,7 @@ pub(crate) fn parse(config_path: &Path, rules_root: &Path) -> Result<Parsed, Con
         validate_specifier(specifier, &display)?;
         rules.push(ResolvedRule {
             specifier: specifier.to_owned(),
-            reference: classify(specifier, rules_root),
+            reference: classify(specifier, rules_root, components),
             options: rule.options(),
         });
     }
@@ -266,9 +311,25 @@ pub(crate) fn parse(config_path: &Path, rules_root: &Path) -> Result<Parsed, Con
 /// component from a source module; nothing else is ambiguous, because a rule module's
 /// extension is optional and a component's never is — bytes are not searched for by guessing
 /// suffixes.
-fn classify(specifier: &str, rules_root: &Path) -> RuleReference {
+///
+/// # Whether a built-in is a component is asked, not spelled
+///
+/// `components` is the same lookup the rules root answers module resolution from, so one value
+/// decides what `lanekeep/<name>` means everywhere. Splitting it would let a name be a module
+/// here and a component there — and the failure would be a rule that loads and never runs,
+/// which reads exactly like a clean codebase.
+///
+/// A name the lookup does not know stays a [`RuleReference::Builtin`] rather than becoming an
+/// error here: an unknown built-in is refused by the loader, with the message that already
+/// names the specifier and says no such rule ships. Two refusals for one mistake would differ
+/// in wording by the format the user happened to write.
+fn classify(specifier: &str, rules_root: &Path, components: BuiltinComponent) -> RuleReference {
     if let Some(name) = specifier.strip_prefix(BUILTIN_PREFIX) {
-        return RuleReference::Builtin(name.to_owned());
+        return if components(name).is_some() {
+            RuleReference::BuiltinComponent(name.to_owned())
+        } else {
+            RuleReference::Builtin(name.to_owned())
+        };
     }
     let path = Path::new(specifier);
     if path
@@ -312,7 +373,7 @@ pub(crate) fn rules_module(rules: &[ResolvedRule]) -> String {
     let mut references = Vec::with_capacity(rules.len());
 
     for (index, rule) in rules.iter().enumerate() {
-        if matches!(rule.reference, RuleReference::Component(_)) {
+        if rule.reference.is_component() {
             references.push("null".to_owned());
             continue;
         }
@@ -410,12 +471,40 @@ mod tests {
         std::env::temp_dir().join(format!("lanekeep-json-{name}"))
     }
 
+    /// No built-in ships as a component, so `lanekeep/<name>` is a module.
+    ///
+    /// The default for these tests, so that the ones about imports and options say what they
+    /// always said regardless of which real rules have migrated.
+    fn no_components(_name: &str) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// One built-in ships as a component, named for what it is rather than after a real rule.
+    ///
+    /// A stub rather than `lanekeep_rules::component`, on the same terms as the loader's own
+    /// stub: which rules ship is not what these tests are about, and pinning them to the real
+    /// table would make a future migration edit assertions that have nothing to do with it.
+    fn one_component(name: &str) -> Option<&'static [u8]> {
+        match name {
+            "compiled" => Some(b"\0asm\x01\x00\x00\x00"),
+            _ => None,
+        }
+    }
+
     fn parse_config(name: &str, json: &str) -> Result<Parsed, ConfigError> {
+        parse_config_with(name, json, no_components)
+    }
+
+    fn parse_config_with(
+        name: &str,
+        json: &str,
+        components: BuiltinComponent,
+    ) -> Result<Parsed, ConfigError> {
         let dir = fixture_dir(name);
         std::fs::create_dir_all(&dir).expect("creates dir");
         let path = dir.join("lanekeep.json");
         std::fs::write(&path, json).expect("writes");
-        parse(&path, &dir)
+        parse(&path, &dir, components)
     }
 
     fn compile(name: &str, json: &str) -> Result<String, ConfigError> {
@@ -570,6 +659,86 @@ mod tests {
             r#"{"rules": ["./rules/mine.wasm", "lanekeep/no-default-export", "./mine.ts"]}"#,
         )
         .expect("compiles");
+
+        assert!(
+            source.contains("import __lanekeepRule1 from 'lanekeep/no-default-export';"),
+            "{source}"
+        );
+        assert!(
+            source.contains("rules: [null, __lanekeepRule1, __lanekeepRule2]"),
+            "{source}"
+        );
+    }
+
+    /// A built-in that ships as a component is one, and the config says nothing about it.
+    #[test]
+    fn a_built_in_with_a_component_resolves_to_one() {
+        let parsed = parse_config_with(
+            "builtin-component",
+            r#"{"rules": ["lanekeep/compiled"]}"#,
+            one_component,
+        )
+        .expect("parses");
+
+        assert_eq!(
+            parsed.rules[0].reference,
+            RuleReference::BuiltinComponent("compiled".to_owned())
+        );
+        // The specifier is unchanged, which is the property that matters to a user: a rule
+        // migrating from TypeScript to Rust must not need anybody to edit a config.
+        assert_eq!(parsed.rules[0].specifier, "lanekeep/compiled");
+    }
+
+    /// The same name, in a build where that rule is still TypeScript.
+    ///
+    /// The pair is the point. One config, two builds, and the only difference is which table
+    /// the rule is in — so an assertion on either alone would pass against a `classify` that
+    /// ignored the lookup entirely.
+    #[test]
+    fn the_same_built_in_is_a_module_when_no_component_ships() {
+        let parsed = parse_config_with(
+            "builtin-still-typescript",
+            r#"{"rules": ["lanekeep/compiled"]}"#,
+            no_components,
+        )
+        .expect("parses");
+
+        assert_eq!(
+            parsed.rules[0].reference,
+            RuleReference::Builtin("compiled".to_owned())
+        );
+    }
+
+    /// A built-in component contributes no import, exactly as a `.wasm` path does.
+    #[test]
+    fn a_built_in_component_imports_nothing() {
+        let source = {
+            let parsed = parse_config_with(
+                "builtin-component-placeholder",
+                r#"{"rules": ["lanekeep/compiled"]}"#,
+                one_component,
+            )
+            .expect("parses");
+            rules_module(&parsed.rules)
+        };
+        assert_eq!(source, "globalThis.__lanekeepConfig = { rules: [null] };\n");
+    }
+
+    /// And holds its place, for the same reason a `.wasm` path does.
+    ///
+    /// Asserted separately from `a_rule_after_a_component_keeps_its_position_in_the_array`
+    /// rather than trusted to it: the two reach the placeholder through different arms of
+    /// `classify`, and a `matches!` that named only one of them would leave this arm shifting
+    /// every later rule's handler by one — silently, since the call still succeeds.
+    #[test]
+    fn a_rule_after_a_built_in_component_keeps_its_position() {
+        let parsed = parse_config_with(
+            "builtin-component-numbering",
+            r#"{"rules": ["lanekeep/compiled", "lanekeep/no-default-export", "./mine.ts"]}"#,
+            one_component,
+        )
+        .expect("parses");
+        let source = rules_module(&parsed.rules);
 
         assert!(
             source.contains("import __lanekeepRule1 from 'lanekeep/no-default-export';"),

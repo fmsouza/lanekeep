@@ -50,8 +50,27 @@ const HOST_MODULE_SOURCE: &str = r"
 /// layering for no gain.
 pub type BuiltinSource = fn(&str) -> Option<&'static str>;
 
+/// Resolves a built-in rule name to its embedded component.
+///
+/// The sibling of [`BuiltinSource`], and it lives here for one reason: **`lanekeep/<name>` has
+/// to mean one thing.** A built-in shipped as a component is not importable, and the resolver
+/// is what has to say so — a name it did not know about would come back "no built-in rule by
+/// that name", which is what a typo looks like and would send a reader hunting for a
+/// misspelling that is not there.
+///
+/// Nothing in this crate loads the bytes. `lanekeep-config` reads them through
+/// [`RuleRoot::builtin_component`] when a config names one, exactly as it reads a `.wasm` path.
+/// Keeping both lookups on one value is what stops a name resolving to a module in one place
+/// and a component in another.
+pub type BuiltinComponent = fn(&str) -> Option<&'static [u8]>;
+
 /// The default: no built-ins, so a bare `lanekeep-js` resolves only project modules.
 fn no_builtins(_name: &str) -> Option<&'static str> {
+    None
+}
+
+/// The default: no built-in components.
+fn no_builtin_components(_name: &str) -> Option<&'static [u8]> {
     None
 }
 
@@ -104,6 +123,30 @@ pub enum ResolveError {
         /// The underlying reason.
         detail: String,
     },
+
+    /// The specifier names a built-in that ships as a component rather than as a module.
+    ///
+    /// Its own variant rather than a [`ResolveError::NotFound`] with a different string,
+    /// because the two are different facts and only one of them is the user's mistake. A
+    /// built-in that is not there is a typo; a built-in that is a component is spelled
+    /// correctly and simply cannot be imported, and telling a reader to check their spelling
+    /// would send them looking for something that is not wrong.
+    ///
+    /// **The first line carries the whole fact, and that is not a style choice.** QuickJS
+    /// truncates a thrown error at 256 bytes, and a resolution failure reaches the user as
+    /// `Error resolving module '<specifier>' from '<absolute path>': <this>` — so a long
+    /// project path can eat most of the budget before this message starts. Measured on a
+    /// 126-character path: 81 bytes left. Whatever a reader needs in order to know what
+    /// happened has to be in front; the remedy is second because it is the half that can be
+    /// lost. See `AGENTS.md`.
+    #[error(
+        "cannot import `lanekeep/{name}`: it is a rule component, not a module\n  \
+         a component has no JavaScript to import — name it in a `lanekeep.json` instead"
+    )]
+    NotAModule {
+        /// The built-in's name, without the `lanekeep/` prefix.
+        name: String,
+    },
 }
 
 /// Where rule modules live, and what may be imported.
@@ -111,6 +154,7 @@ pub enum ResolveError {
 pub struct RuleRoot {
     root: PathBuf,
     builtins: BuiltinSource,
+    builtin_components: BuiltinComponent,
 }
 
 impl RuleRoot {
@@ -128,6 +172,7 @@ impl RuleRoot {
         Ok(Self {
             root: canonical,
             builtins: no_builtins,
+            builtin_components: no_builtin_components,
         })
     }
 
@@ -140,6 +185,32 @@ impl RuleRoot {
     pub const fn with_builtins(mut self, builtins: BuiltinSource) -> Self {
         self.builtins = builtins;
         self
+    }
+
+    /// Serve built-in rules that ship as components from embedded bytes.
+    ///
+    /// Beside [`RuleRoot::with_builtins`] rather than replacing it: a built-in is one or the
+    /// other, and which one it is is not something a config writes or a user chooses. Both
+    /// resolve under the same `lanekeep/` prefix and both resolve before the filesystem.
+    #[must_use]
+    pub const fn with_builtin_components(mut self, components: BuiltinComponent) -> Self {
+        self.builtin_components = components;
+        self
+    }
+
+    /// The component behind a built-in's name, or `None` for one that has none.
+    ///
+    /// `lanekeep-config` asks this when a config names `lanekeep/<name>`, because a component
+    /// is resolved in Rust and never crosses into the sandbox. Nothing in this crate loads it.
+    #[must_use]
+    pub fn builtin_component(&self, name: &str) -> Option<&'static [u8]> {
+        (self.builtin_components)(name)
+    }
+
+    /// The lookup itself, for a caller that classifies many names at once.
+    #[must_use]
+    pub const fn builtin_components(&self) -> BuiltinComponent {
+        self.builtin_components
     }
 
     /// The canonical root.
@@ -161,14 +232,21 @@ impl RuleRoot {
 
         // Built-ins resolve before the filesystem is consulted at all.
         if let Some(name) = specifier.strip_prefix(BUILTIN_PREFIX) {
-            return if (self.builtins)(name).is_some() {
-                Ok(PathBuf::from(specifier))
-            } else {
-                Err(ResolveError::NotFound {
-                    specifier: specifier.to_owned(),
-                    tried: "no built-in rule by that name".to_owned(),
-                })
-            };
+            if (self.builtins)(name).is_some() {
+                return Ok(PathBuf::from(specifier));
+            }
+            // A built-in that ships as a component is spelled correctly and is still not
+            // importable, so it is refused on its own terms. Asked after the source lookup
+            // because a name is never both, and a source that exists is the answer.
+            if (self.builtin_components)(name).is_some() {
+                return Err(ResolveError::NotAModule {
+                    name: name.to_owned(),
+                });
+            }
+            return Err(ResolveError::NotFound {
+                specifier: specifier.to_owned(),
+                tried: "no built-in rule by that name".to_owned(),
+            });
         }
 
         // The entry module arrives as an already-resolved absolute path, because that is
@@ -562,6 +640,92 @@ mod tests {
             "expected NotFound, got {error:?}"
         );
         assert!(error.to_string().contains("built-in"), "{error}");
+    }
+
+    /// Stands in for the real component table, on the same terms as [`stub_builtins`].
+    fn stub_builtin_components(name: &str) -> Option<&'static [u8]> {
+        match name {
+            "compiled" => Some(b"\0asm\x01\x00\x00\x00"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_built_in_that_is_a_component_is_refused_as_a_module() {
+        // And refused *as itself*. A component-backed built-in is spelled correctly, so the
+        // "no built-in rule by that name" message would send its author looking for a
+        // misspelling that is not there. The two facts are different and only one is a typo.
+        let fixture = Fixture::new("builtin-component", &[("a.ts", "export const a = 1;")]);
+        let root = fixture
+            .root()
+            .with_builtins(stub_builtins)
+            .with_builtin_components(stub_builtin_components);
+
+        let error = root
+            .resolve("", "lanekeep/compiled")
+            .expect_err("a component is not importable");
+
+        assert!(
+            matches!(&error, ResolveError::NotAModule { name } if name == "compiled"),
+            "expected NotAModule, got {error:?}"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("component"), "{rendered}");
+        assert!(
+            rendered.contains("lanekeep.json"),
+            "the message has to name the format that can reach it: {rendered}"
+        );
+
+        // The first line has to stand alone, because it is the only part guaranteed to reach a
+        // user: QuickJS truncates a thrown error at 256 bytes and prefixes this one with the
+        // specifier and the importing module's absolute path. A remedy on line two is a bonus;
+        // a *fact* on line two would be lost exactly when the project path is long.
+        let first = rendered.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("lanekeep/compiled") && first.contains("component"),
+            "the first line must name the rule and say what it is: {first}"
+        );
+        assert!(
+            first.len() <= 80,
+            "the first line has to fit beside a long path: {} bytes",
+            first.len()
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_is_still_not_found_when_components_ship() {
+        // The component lookup must not turn every miss into "it is a component".
+        let fixture = Fixture::new("builtin-component-miss", &[("a.ts", "export const a = 1;")]);
+        let root = fixture
+            .root()
+            .with_builtins(stub_builtins)
+            .with_builtin_components(stub_builtin_components);
+
+        let error = root
+            .resolve("", "lanekeep/no-such-rule")
+            .expect_err("does not resolve");
+
+        assert!(
+            matches!(error, ResolveError::NotFound { .. }),
+            "expected NotFound, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_component_is_reachable_by_name_without_being_importable() {
+        let fixture = Fixture::new(
+            "builtin-component-bytes",
+            &[("a.ts", "export const a = 1;")],
+        );
+        let root = fixture
+            .root()
+            .with_builtin_components(stub_builtin_components);
+
+        assert_eq!(
+            root.builtin_component("compiled"),
+            Some(b"\0asm\x01\x00\x00\x00".as_slice())
+        );
+        assert_eq!(root.builtin_component("always"), None);
     }
 
     #[test]

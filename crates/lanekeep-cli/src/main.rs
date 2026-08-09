@@ -844,7 +844,12 @@ fn prepare(
 ) -> anyhow::Result<(Engine, usize)> {
     let root = RuleRoot::new(project_root)
         .map_err(|e| anyhow::anyhow!("cannot use `{}`: {e}", project_root.display()))?
-        .with_builtins(lanekeep_rules::source);
+        .with_builtins(lanekeep_rules::source)
+        // The two halves of one table. A built-in is a module or a component depending only on
+        // how it happens to be authored in this build, and a config writes `lanekeep/<name>`
+        // either way — so both lookups have to be installed together, or a rule that migrated
+        // stops resolving for everyone who never changed anything.
+        .with_builtin_components(lanekeep_rules::component);
     let config_path = config_path(project_root, config)?;
 
     let sandbox = lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))

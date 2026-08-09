@@ -62,6 +62,8 @@ pub use lanekeep_core::limits::{
 /// Re-exported so consumers can supply languages without depending on `lanekeep-lang` directly.
 pub use lanekeep_lang::Language;
 pub use lanekeep_nodes::{Handle, NodeArena};
-pub use loader::{BuiltinSource, HOST_MODULE, ResolveError, RuleLoader, RuleResolver, RuleRoot};
+pub use loader::{
+    BuiltinComponent, BuiltinSource, HOST_MODULE, ResolveError, RuleLoader, RuleResolver, RuleRoot,
+};
 pub use sandbox::Sandbox;
 pub use typescript::{StripError, Unsupported, strip_types};

@@ -114,10 +114,16 @@ pub struct RuleSpec {
 /// downstream knows what to do with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentRule {
-    /// Where the bytes came from, confined to the rules root.
+    /// Where the bytes came from: a path confined to the rules root, or `lanekeep/<name>` for
+    /// a built-in embedded in the binary.
     ///
     /// Kept for diagnostics and for the order [`ComponentBytes`] are folded into
     /// `ruleset_hash` in. Nothing reads the file again — see [`ComponentRule::bytes`].
+    ///
+    /// **A built-in's is a specifier rather than a path, and cannot collide with one.** A
+    /// confined path is absolute, because `RuleRoot::confine` canonicalizes; `lanekeep/no-unwrap`
+    /// is relative. So a project that happens to have `lanekeep/no-unwrap.wasm` inside its rules
+    /// root sorts and dedups separately, as two different rules should.
     pub path: PathBuf,
     /// What `configure` is called with, as JSON — `"null"` for a rule named with no options.
     ///
@@ -451,7 +457,7 @@ fn entry_source(
     display: &str,
 ) -> Result<(String, Option<json::Parsed>), ConfigError> {
     if json::is_json(config_path) {
-        let parsed = json::parse(config_path, root.path())?;
+        let parsed = json::parse(config_path, root.path(), root.builtin_components())?;
         let source = json::rules_module(&parsed.rules);
         return Ok((source, Some(parsed)));
     }
@@ -697,7 +703,13 @@ fn parse_severity_overrides(
 /// guest's own message, and the same call happens again on every worker that later builds an
 /// instance of its own.
 ///
-/// # Confinement, before a byte is read
+/// # Confinement, before a byte is read — and a built-in has nothing to confine
+///
+/// A built-in component is embedded in this binary. There is no path in the config, no file on
+/// disk and nothing to canonicalize, so the paragraphs below are about a `.wasm` *path*
+/// reference and only about that. That is not a weaker check for built-ins; it is the absence
+/// of the thing the check exists to constrain, and it is the same reason a built-in module
+/// cannot be shadowed by a project file.
 ///
 /// A rule reference is a string in a config file and a component is *executed*, so where it is
 /// allowed to point is a trust boundary rather than a convenience. `json::classify` joins the
@@ -733,10 +745,7 @@ fn describe_components(
     limits: Limits,
 ) -> Result<Vec<Option<Described>>, ConfigError> {
     let mut described: Vec<Option<Described>> = resolved.iter().map(|_| None).collect();
-    if !resolved
-        .iter()
-        .any(|rule| matches!(rule.reference, RuleReference::Component(_)))
-    {
+    if !resolved.iter().any(|rule| rule.reference.is_component()) {
         return Ok(described);
     }
 
@@ -760,9 +769,6 @@ fn describe_components(
 
     let mut added = Vec::new();
     for (position, rule) in resolved.iter().enumerate() {
-        let RuleReference::Component(path) = &rule.reference else {
-            continue;
-        };
         // `null` for a rule named with no options, which is the world's own shape for it —
         // serialized once here so that every worker's `configure` is handed the same bytes.
         let options = rule
@@ -770,35 +776,12 @@ fn describe_components(
             .as_ref()
             .map_or_else(|| "null".to_owned(), json::literal);
 
-        // Before the read, and before anything is compiled or run.
-        //
-        // The message is this crate's rather than the resolver's, because the resolver's is
-        // written for an `import` and says so — "rule modules may only import from within it"
-        // names nothing a user who wrote a `.wasm` path would recognize. The *check* is the
-        // resolver's, which is the half that must not be duplicated.
-        let confined = root.confine(&rule.specifier, path).map_err(|e| {
-            let detail = match e {
-                ResolveError::EscapesRoot { .. } => format!(
-                    "`{}` resolves outside the rules root, and a rule component must sit \
-                     inside it",
-                    rule.specifier
-                ),
-                ResolveError::Unreadable { detail, .. } => {
-                    format!("cannot read `{}`: {detail}", path.display())
-                }
-                other => other.to_string(),
-            };
-            fail(position, detail)
-        })?;
+        let Some((origin, bytes)) =
+            component_bytes(root, rule).map_err(|detail| fail(position, detail))?
+        else {
+            continue;
+        };
 
-        let bytes: ComponentBytes = std::fs::read(&confined)
-            .map_err(|e| {
-                fail(
-                    position,
-                    format!("cannot read `{}`: {e}", confined.display()),
-                )
-            })?
-            .into();
         let admitted = loader
             .load(&engine, &rule.specifier, bytes.as_slice())
             .map_err(|e| fail(position, e.to_string()))?;
@@ -810,7 +793,7 @@ fn describe_components(
             position,
             slot,
             ComponentRule {
-                path: confined,
+                path: origin,
                 options,
                 bytes,
                 // The one constructor whose output `build` folds into `ruleset_hash` —
@@ -843,6 +826,75 @@ fn describe_components(
     }
 
     Ok(described)
+}
+
+/// Where one reference's component bytes come from, or `None` if it names no component.
+///
+/// **The two sources of a component, in one place.** A built-in is embedded in this binary and a
+/// project rule is a file inside the rules root, and everything downstream — admission, the rule
+/// set, `metadata`, `ruleset_hash`, execution — treats them identically from here on. Keeping the
+/// two arms together is what makes that reading true rather than approximately true: a difference
+/// between them has to be written in this function, where it can be seen.
+///
+/// The first element is provenance for [`ComponentRule::path`] — a canonical path for a file, and
+/// the `lanekeep/<name>` specifier for a built-in, which is relative and so can never collide
+/// with one.
+///
+/// # Errors
+///
+/// Returns the diagnostic detail, without a position: the caller knows which rule this was and
+/// wraps it. A built-in that the lookup does not know is *unreachable* while `json::classify`
+/// asks the very lookup this reads — the reference is only that variant because the name
+/// answered. It is refused rather than assumed away because the two calls are in different
+/// crates, and a rules root rebuilt between them without its components would otherwise produce
+/// a rule with no `check` rather than an explanation.
+fn component_bytes(
+    root: &RuleRoot,
+    rule: &ResolvedRule,
+) -> Result<Option<(PathBuf, ComponentBytes)>, String> {
+    match &rule.reference {
+        // Embedded in this binary, so there is no path to confine and no file to read — and
+        // nothing a project file could shadow, which is the guarantee a built-in module has too.
+        RuleReference::BuiltinComponent(name) => {
+            let bytes = root.builtin_component(name).ok_or_else(|| {
+                format!(
+                    "`lanekeep/{name}` was resolved as a built-in component and this build has \
+                     no component by that name"
+                )
+            })?;
+            Ok(Some((
+                PathBuf::from(format!("lanekeep/{name}")),
+                bytes.to_vec().into(),
+            )))
+        }
+
+        RuleReference::Component(path) => {
+            // Confinement before the read, and before anything is compiled or run.
+            //
+            // The message is this crate's rather than the resolver's, because the resolver's is
+            // written for an `import` and says so — "rule modules may only import from within
+            // it" names nothing a user who wrote a `.wasm` path would recognize. The *check* is
+            // the resolver's, which is the half that must not be duplicated.
+            let confined = root.confine(&rule.specifier, path).map_err(|e| match e {
+                ResolveError::EscapesRoot { .. } => format!(
+                    "`{}` resolves outside the rules root, and a rule component must sit \
+                     inside it",
+                    rule.specifier
+                ),
+                ResolveError::Unreadable { detail, .. } => {
+                    format!("cannot read `{}`: {detail}", path.display())
+                }
+                other => other.to_string(),
+            })?;
+
+            let bytes: ComponentBytes = std::fs::read(&confined)
+                .map_err(|e| format!("cannot read `{}`: {e}", confined.display()))?
+                .into();
+            Ok(Some((confined, bytes)))
+        }
+
+        RuleReference::Builtin(_) | RuleReference::Module(_) => Ok(None),
+    }
 }
 
 /// A component's own account of itself, in the shape [`build_rule`] validates.
@@ -1365,6 +1417,52 @@ mod tests {
         load(&sandbox, &root, &dir.join(name))
     }
 
+    /// The same, with a built-in component table installed.
+    ///
+    /// Separate rather than a parameter on every caller, because "no built-in ships as a
+    /// component" is what the rest of this suite means and should keep saying.
+    fn load_with_components(
+        dir: &Path,
+        name: &str,
+        components: lanekeep_js::BuiltinComponent,
+    ) -> Result<Config, ConfigError> {
+        let root = RuleRoot::new(dir)
+            .expect("canonicalizes")
+            .with_builtin_components(components);
+        let sandbox =
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+        load(&sandbox, &root, &dir.join(name))
+    }
+
+    /// The `metadata` fixture's bytes, served as though they were embedded in the binary.
+    ///
+    /// Read at run time rather than `include_bytes!`, for the reason [`Fixture::write_component`]
+    /// records: `lanekeep-wasm` excludes its whole `tests/` tree from the published package, and
+    /// a compile-time include would put a path that does not exist for a vendored checkout into
+    /// this crate's source. A `OnceLock` is what turns a run-time read into the `&'static [u8]`
+    /// a [`lanekeep_js::BuiltinComponent`] has to return.
+    fn built_in_component_bytes() -> &'static [u8] {
+        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        BYTES.get_or_init(|| {
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/metadata.wasm"),
+            )
+            .expect("the fixture ships")
+        })
+    }
+
+    /// A built-in table with exactly one component in it, standing in for `lanekeep_rules`.
+    ///
+    /// A stub rather than the real table: which rules have migrated is not what these tests are
+    /// about, and naming one would make the next migration edit assertions unrelated to it.
+    fn built_in_components(name: &str) -> Option<&'static [u8]> {
+        match name {
+            "metadata" => Some(built_in_component_bytes()),
+            _ => None,
+        }
+    }
+
     /// A minimal, valid rule module.
     fn rule(id: &str) -> String {
         format!(
@@ -1747,6 +1845,77 @@ mod tests {
         assert!(
             component.counted_in_ruleset_hash(),
             "a component `load` resolved must be counted in `ruleset_hash`"
+        );
+    }
+
+    #[test]
+    fn a_built_in_that_ships_as_a_component_resolves_without_a_path() {
+        // The same claim as the test above, for the reference a *user* writes. `lanekeep init`
+        // scaffolds `"lanekeep/<name>"`, and two of the rules that spelling names are compiled
+        // components — so this is the shape every real config takes, where a `.wasm` path is
+        // the shape a project rule takes.
+        let fixture = Fixture::new("builtin-component-load", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/metadata"]}"#,
+        )]);
+
+        let config = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
+            .expect("a built-in component is resolvable by specifier");
+
+        let rule = &config.rules[0];
+        // Everything about the rule is the component's own answer, exactly as for a path
+        // reference. Nothing in the config said any of it.
+        assert_eq!(rule.id.to_string(), "fixture/metadata");
+        assert_eq!(rule.query, "(call_expression) @call");
+        assert_eq!(rule.languages, ["rust"]);
+
+        let component = rule
+            .component
+            .as_ref()
+            .expect("a built-in component reaches the engine as a component");
+        assert_eq!(
+            component.bytes.as_slice(),
+            built_in_component_bytes(),
+            "the rule carries the embedded bytes it was described from"
+        );
+        // A specifier, not a path: there is no file, so there is nothing to canonicalize. It is
+        // relative, which is what keeps it from ever colliding with a confined path — those are
+        // absolute.
+        assert_eq!(component.path, PathBuf::from("lanekeep/metadata"));
+        assert!(
+            !component.path.is_absolute(),
+            "a built-in's provenance must not look like a resolved path"
+        );
+        assert!(
+            component.counted_in_ruleset_hash(),
+            "a built-in component `load` resolved must be counted in `ruleset_hash`"
+        );
+    }
+
+    #[test]
+    fn the_same_specifier_is_a_module_in_a_build_where_no_component_ships() {
+        // The pair, and it is the assertion that makes the one above mean something. With no
+        // component table installed, `lanekeep/metadata` is an ordinary built-in module
+        // specifier — and no such module ships, so it is refused as a missing rule rather than
+        // silently becoming something else. A `classify` that ignored the lookup would pass the
+        // test above and fail here.
+        let fixture = Fixture::new("builtin-component-absent", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/metadata"]}"#,
+        )]);
+
+        let error = fixture
+            .load_json()
+            .expect_err("nothing ships under that name in this build");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("lanekeep/metadata"),
+            "the refusal has to name the specifier: {rendered}"
         );
     }
 

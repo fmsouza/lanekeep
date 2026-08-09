@@ -114,13 +114,14 @@ crates/
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
   lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring
-  lanekeep-rules     built-in rules, authored in TypeScript
+  lanekeep-rules     built-in rules: TypeScript sources, plus the committed components
   lanekeep-report    human, json, sarif, agent reporters
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
   lanekeep-testkit   RuleTester
   lanekeep-cli       the binary
 rust-rules/          a second Cargo workspace: rule crates authored in Rust
   lanekeep-rule      the SDK they share: a capture lookup and a glob matcher
+                     see docs/authoring-rust-rules.md before adding one
 cmd/lanekeep/        the Go launcher, so `go tool lanekeep` works
 docs/                architecture, playbooks
 scripts/             repository tooling, with its own tests
@@ -552,6 +553,18 @@ so a rule matching either of two tokens — `unwrap` or `expect` — cannot expr
 of them. Nothing fails: the rule loads, the query never runs, and the output reads exactly like
 a codebase with none of the thing in it. There is no *or* form, so a rule with no single
 covering substring omits the gate rather than writing one that is wrong.
+
+**QuickJS truncates a thrown error at 256 bytes, and a module-resolution failure spends most of
+that on a path before your message begins.** rquickjs renders one as
+`Error resolving module '<specifier>' from '<absolute path of the importing module>': <the
+`ResolveError`>`, and QuickJS copies the result into a fixed buffer — 255 bytes plus the
+terminator, measured. A `lanekeep.config.ts` in a macOS temporary directory gives a 175-byte
+prefix, leaving 81 bytes: enough for one line. Nothing fails, and the loss is at the *end*, so a
+message whose first line is a greeting and whose second is the actual reason arrives as a
+greeting. Every `ResolveError` in `crates/lanekeep-js/src/loader.rs` therefore front-loads: the
+first line carries the whole fact, and the remedy goes second because it is the half that can be
+lost. The full text is asserted in that crate's unit tests, where there is no prefix; a test
+driving the binary can only assert what survives, and should say which.
 
 **A rule that declares `check(ctx, m, options)` and exports a plain object silently ignores every
 option it documents.** A handler is invoked with two arguments — `...rules[i].check(ctx, {...})` —

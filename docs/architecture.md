@@ -141,7 +141,11 @@ Implement this on day one even though only `lanekeep-lang-js` exists. It is chea
 
 ## 4. Rule definition format
 
-A rule is a TypeScript module with a default export: metadata, a tree-sitter query that gates execution, and a handler invoked once per match.
+A rule declares metadata, a tree-sitter query that gates execution, and a handler invoked once per match. There are two ways to author one, and the rest of the engine treats them alike: **a TypeScript module with a default export**, evaluated in the sandbox of §5, or **a WebAssembly component** exporting the `rule` world of §6.9, executed by wasmtime. `RuleSpec::component` is the single field that decides which engine a rule goes to, and it is set where a rule is described rather than guessed at anywhere downstream.
+
+Neither is privileged. A component is held to the same validation a TypeScript rule is — namespace, card, query, `has-check` — by the same code, and both engines run in one pass over one corpus. Which form a rule takes is invisible to a config: `lanekeep/no-unwrap` names the rule, not its implementation, so a rule migrating from one to the other requires no config change. Two of the built-ins are components today, both of them the ones that check Rust; `docs/authoring-rust-rules.md` is how one is written.
+
+The TypeScript form is the one everything below is written in, because it is the one a project starts from.
 
 ```ts
 import { defineRule } from 'lanekeep'
@@ -238,6 +242,8 @@ A rule sees only its own facts. Reading another rule's would turn a private payl
 
 ## 5. The JavaScript host
 
+One of the two rule-execution engines, and the one every project starts from. It runs the TypeScript form of §4; §6.9 is the other. Everything in this section is about that engine specifically — a component reaches none of it, and neither the stripper nor the module loader nor QuickJS is on its path at all.
+
 ### 5.1 Engine
 
 QuickJS, embedded via `rquickjs`. Chosen over V8 and Boa for a combination of reasons: it compiles into a static binary at roughly a megabyte rather than tens, it starts in microseconds rather than milliseconds — which matters when the warm-run budget is 25 ms — and its runtime is straightforwardly one-per-thread, which is what rayon wants.
@@ -282,6 +288,8 @@ Rule modules are compiled to QuickJS bytecode once per run, then instantiated in
 The previous design's security posture was "rules are data, so there is nothing to execute." That is gone. What replaces it is narrower but still strong: **rules are code, but the only things they can reach are the functions lanekeep hands them.** There is no ambient `fs`, no `process`, no network, no dynamic import. Those globals are not restricted — they are absent.
 
 This is a stronger position than a conventional plugin system offers, where a plugin inherits the full authority of the host process.
+
+**It is one API with two spellings.** The tables below give the JavaScript one, which is what a TypeScript rule calls. A component reaches the same functions as methods on `check-context` and `reduce-context`, declared in `crates/lanekeep-wasm/wit/world.wit` — `ctx.report(node)` is `ctx.report(node)` there too, in kebab-case. §6.9 covers what a component has that a TypeScript rule does not, and it is only what the difference in form forces. The two are not generated from one source and that gap is recorded in the world's own header; the *absence* claims below are structural in both, because a component reaches exactly what its world declares.
 
 ### 6.1 Reporting
 
@@ -387,6 +395,25 @@ Mechanically: the per-invocation limit uses QuickJS's interrupt handler for a Ty
 **Cache entries for files that fully completed are still committed.** Each entry is independently valid — it records the result of running every rule against that file to completion — and discarding them would mean a corpus that times out on a cold run times out identically on every retry, with no way to make progress. Files that were in flight when the run aborted are not written. An aborted run also **merges rather than prunes**: pruning is what ages a deleted file out and is sound only for a run that saw the whole corpus, so a run that stopped early would otherwise age out every file it never reached and leave the next run colder than the one that failed.
 
 Both halves became true in the same release and neither had been true before it, which is worth stating because this section has a history of describing behavior nothing implemented. The *commit* half this section always required and nothing did: `run_files` returned on the first error before it reached the save, so an aborted run wrote no entry at all, and a corpus that overran its budget would have been stranded cold forever the moment that budget started being enforced. The *no-prune* half is doctrine added alongside that fix, and it could not have been stated earlier — there was no save whose pruning behavior anyone had to decide. `lanekeep-engine`'s `an_aborted_run_still_commits_the_files_that_finished`, `an_aborted_run_does_not_prune_what_it_never_reached` and `a_full_run_still_prunes` are what hold the three claims above, and a claim added here without one is a claim in the position these were.
+
+### 6.9 The component surface
+
+A component rule is a WebAssembly component exporting the `rule` world. It reaches the same host API as §6.1–6.5 and is subject to the same limits as §6.7 — enforced by wasmtime's epoch interruption where a TypeScript rule is enforced by QuickJS's interrupt handler — and its absences are §6.6's, structurally: it imports exactly one interface, `lanekeep:host/types`, so there is no wall clock, no filesystem and no entropy to remove, because none was ever bound. A component built for `wasm32-wasip1` imports three of those and is refused at load.
+
+It has four exports a TypeScript rule has no need of, and each exists because a component cannot do what a module does:
+
+| Export | Why it exists |
+|---|---|
+| `metadata() -> rule-metadata` | A TypeScript rule's id, languages, severity, card, query, gates and timeout live in its `defineRule` call, and evaluating the module is how they are read. Nothing can evaluate a component to read a literal, so it answers for itself — once, at config load. |
+| `configure(options-json) -> result<_, string>` | A JavaScript factory closes over its options. A component cannot close over a host-supplied value, so options cross as JSON data, once per instance, before any handler runs. A component that refuses its options fails config load with its own message, which is a refusal rather than a trap. |
+| `has-check() -> bool` | Extraction records whether a TypeScript rule's `check` is callable, because a misspelled handler would otherwise load cleanly and never fire. A component is asked the same question rather than taken at its config's word. |
+| `has-reduce() -> bool` | The same, for the cross-file phase. |
+
+`configure` is a permanent expressiveness difference and not an implementation gap: a factory can be handed a function or a regular expression, and JSON cannot carry either. That is the cost of a boundary that serializes, and it is paid deliberately.
+
+The world's bytes are a cache-key input (§8.1, `host_api_hash`), so widening this surface invalidates every cached result — the same property `HOST_API_VERSION` gives the JavaScript half, except that this one needs nobody to remember.
+
+`docs/authoring-rust-rules.md` is the playbook for writing one.
 
 ---
 
