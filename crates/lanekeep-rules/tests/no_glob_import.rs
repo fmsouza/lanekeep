@@ -319,7 +319,29 @@ fn typescript(case: &Case) -> RuleTester {
     .expect("builds")
 }
 
+/// The same rule, migrated: a WebAssembly component built from `rust-rules/no-glob-import/`.
+///
+/// The options reach it as data rather than as source. A component cannot close over a
+/// host-supplied value the way a JavaScript factory does, so `configure(options-json)` is where
+/// they arrive — which is why the table's option strings are JSON, and why the bare case is not
+/// "no call" but a call with `null`.
+fn component(case: &Case) -> RuleTester {
+    let bytes = lanekeep_rules::component("no-glob-import").expect("the component ships");
+    match case.options {
+        None => RuleTester::for_component("no-glob-import", bytes, "rs"),
+        Some(options) => {
+            RuleTester::for_component_configured("no-glob-import", bytes, "rs", options)
+        }
+    }
+    .expect("builds")
+}
+
 #[test]
 fn the_typescript_rule_satisfies_every_case() {
     assert_every_case(typescript);
+}
+
+#[test]
+fn the_component_rule_satisfies_every_case() {
+    assert_every_case(component);
 }

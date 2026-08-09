@@ -73,17 +73,23 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
 /// The rule components this build ships, as `(name, bytes)`.
 ///
 /// Beside [`BUILT_IN_RULES`] rather than replacing an entry in it, because for now a migrated
-/// rule exists twice: `rules/no-unwrap.ts` is still what a config resolves, and the component is
-/// what `tests/no_unwrap.rs` holds to the same expectations. A rule appearing in both lists is
-/// the state a migration passes through — the swap is its own change, and it is what makes the
-/// TypeScript source stop being reachable.
+/// rule exists twice: `rules/no-unwrap.ts` and `rules/no-glob-import.ts` are still what a config
+/// resolves, and the component is what `tests/no_unwrap.rs` and `tests/no_glob_import.rs` each
+/// hold to the same expectations. A rule appearing in both lists is the state a migration passes
+/// through — the swap is its own change, and it is what makes the TypeScript source stop being
+/// reachable.
 ///
 /// Built from `rust-rules/<name>/` by `just rust-rules`, which is also what copies the artifact
 /// here. The bytes are committed, so the gate needs neither `cargo component` nor a wasm target.
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
-const BUILT_IN_COMPONENTS: &[(&str, &[u8])] =
-    &[("no-unwrap", include_bytes!("../components/no-unwrap.wasm"))];
+const BUILT_IN_COMPONENTS: &[(&str, &[u8])] = &[
+    (
+        "no-glob-import",
+        include_bytes!("../components/no-glob-import.wasm"),
+    ),
+    ("no-unwrap", include_bytes!("../components/no-unwrap.wasm")),
+];
 
 /// Shared modules the built-in rules import, and project rules may too.
 ///
