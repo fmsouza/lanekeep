@@ -682,13 +682,25 @@ the content played the real marker's own role at the split point. Removing the m
 fake, the same two rows differ even with the length prefix hypothetically gone, so
 `length_prefixed` could be deleted from the component fold and this test stayed green — the
 code under test never changed, only what the data meant. The change that invalidated it sat
-three hundred lines away in the same commit, and two mutation-testing runs missed the identical
-gap twice, because both mutated `hash_ruleset` itself, and a mutation of the code under test
-cannot reveal that its data stopped exercising the property the test claims to check. The fix
-rederived the data — `"AA" + "BBCC"` against `"AABB" + "CC"`, which really do collide once
-concatenated without a length — rather than trusting "still passes" to mean "still tests." A
-fixture is a claim about the encoding it was built against, and it goes stale exactly like
-documentation does: silently, and without whatever broke it saying so.
+three hundred lines away in the same commit. The fix rederived the data — `"AA" + "BBCC"`
+against `"AABB" + "CC"`, which really do collide once concatenated without a length — rather
+than trusting "still passes" to mean "still tests," and shipped in `e85521d`: a reader who goes
+looking for the corresponding change in whichever commit this paragraph sits in will not find
+it there.
+
+**"A mutation of the code under test cannot reveal a stale fixture" is not the lesson, and is
+not even true.** Two mutation-testing runs against `hash_ruleset` missed this gap, but not
+because mutating the code under test categorically cannot expose stale data under it —
+`cargo-mutants` mutates by replacing a *whole function body*, so `length_prefixed with ()` guts
+every caller at once, and `hash_config` calls `length_prefixed` too and has several tests of its
+own. That mutant dies there regardless of what `two_components_cannot_run_together_into_one`
+does. The real mechanism is narrower and more worth knowing: a mutation run reporting a shared
+helper as "caught" does not say *which* caller's test caught it, so `hash_config`'s coverage
+stood in for `hash_ruleset`'s missing coverage without either number saying so — masking
+exactly the gap it looked like it was closing. A fixture is a claim about the encoding it was
+built against, and it goes stale exactly like documentation does: silently, and without whatever
+broke it saying so. Checking whether a mutation run actually exercises the code path you think
+it does means checking which test failed, not only that one did.
 
 ## What not to do
 

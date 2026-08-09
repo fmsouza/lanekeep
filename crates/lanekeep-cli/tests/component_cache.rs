@@ -85,6 +85,45 @@ impl Project {
     fn cache_exists(&self) -> bool {
         self.dir.join(".lanekeep").join("cache").exists()
     }
+
+    /// Change a component's bytes in place, without changing its behavior or its validity —
+    /// the point being to simulate "the same rule, rebuilt" without a second committed
+    /// fixture. Appends an inert custom section, which `wasm-tools validate --features
+    /// component-model` accepts and `wasm-tools print` shows landing beside the artifact's own
+    /// `version` section, verified by hand against `metadata.wasm` before this was written. A
+    /// real rebuild changes bytes the same way — `hash_ruleset` folds bytes, not intent — so
+    /// this is a faithful stand-in for one rather than a shortcut around what a rebuild does.
+    fn append_custom_section(&self, at: &str, marker: &str) {
+        let path = self.dir.join(at);
+        let mut bytes = std::fs::read(&path).expect("the component is there to mutate");
+
+        let name = b"lanekeep-test";
+        let content = marker.as_bytes();
+        let mut inner = leb128(name.len() as u64);
+        inner.extend_from_slice(name);
+        inner.extend_from_slice(content);
+
+        bytes.push(0x00); // custom section id
+        bytes.extend(leb128(inner.len() as u64));
+        bytes.extend(inner);
+        std::fs::write(&path, bytes).expect("writes");
+    }
+}
+
+/// Unsigned LEB128, for the one custom-section length prefix `append_custom_section` writes.
+/// Every value that method ever encodes with this fits in one byte, but spelling out the
+/// general form is what lets a reader check it against the spec rather than trust that it does.
+fn leb128(mut n: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
 }
 
 impl Drop for Project {
@@ -130,7 +169,6 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
             ("src/a.rs", "fn f() { call(); }\n"),
         ],
     );
-    project.write(".gitignore", "");
     project.write("lanekeep.json", CONFIG);
     project.write_component("rules/probe.wasm", "metadata");
 
@@ -196,5 +234,95 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
     assert!(
         !warm_stderr.contains("lanekeep/no-default-export"),
         "the TypeScript rule ran again on a warm pass — the cache was not read: {combined}"
+    );
+}
+
+/// The other direction the test above does not reach: a *configured* component's bytes
+/// changing must invalidate every file's entry, not just fail to serve a stale one by luck.
+///
+/// `swapping_a_component_between_runs_changes_the_answer` (`lanekeep-engine`) is this
+/// property's existing mirror, and says outright which half it does not cover: "(A component a
+/// *config* names is folded into `ruleset_hash` by `lanekeep-config`; this path is the one that
+/// is not.)" Every rule in that test is hand-built, so its `ComponentRule`s are never counted in
+/// any `ruleset_hash` and the run never caches at all — there is nothing for a byte change to
+/// invalidate. Here the component is configured, `ruleset_hash` covers its bytes, and the run
+/// caches, so the property under test is real: change the bytes, and does the *next* run notice
+/// on its own, the moment it happens, or does it take something extra?
+///
+/// It does not take anything extra. A fresh process re-reads `lanekeep.json` and the `.wasm`
+/// beside it on every invocation — there is no warm state held across two runs of the CLI other
+/// than the cache file itself — so `hash_ruleset` is recomputed from whatever bytes are on disk
+/// *before* the cache is even consulted. The mechanism is the same one that already makes a
+/// module edit invalidate a TypeScript rule's cache; this just exercises it for a component.
+#[test]
+fn a_configured_components_bytes_changing_forces_a_recompute() {
+    let project = Project::new(
+        "recompute",
+        &[
+            ("src/a.ts", "export default 1;\n"),
+            ("src/a.rs", "fn f() { call(); }\n"),
+        ],
+    );
+    project.write("lanekeep.json", CONFIG);
+    project.write_component("rules/probe.wasm", "metadata");
+
+    let cold = project.check_profiled();
+    assert_eq!(cold.status.code(), Some(1), "{}", describe(&cold));
+    let cold_stderr = String::from_utf8_lossy(&cold.stderr).into_owned();
+    assert!(
+        cold_stderr.contains("fixture/metadata")
+            && cold_stderr.contains("lanekeep/no-default-export"),
+        "both rules should have run cold: {}",
+        describe(&cold)
+    );
+
+    let warm = project.check_profiled();
+    let warm_stderr = String::from_utf8_lossy(&warm.stderr).into_owned();
+    assert!(
+        !warm_stderr.contains("fixture/metadata")
+            && !warm_stderr.contains("lanekeep/no-default-export"),
+        "the second run over unchanged input should have been a full cache hit: {}",
+        describe(&warm)
+    );
+
+    // The rule's own answers — its id, query, card, gates — come from `metadata()`, which this
+    // does not touch. What changes is the code the rule is *made of*, exactly as editing a
+    // TypeScript rule's source does, and `ruleset_hash` is defined to cover that.
+    project.append_custom_section("rules/probe.wasm", "first-mutation");
+
+    let recomputed = project.check_profiled();
+    let combined = describe(&recomputed);
+    assert_eq!(recomputed.status.code(), cold.status.code(), "{combined}");
+    assert_eq!(
+        String::from_utf8_lossy(&recomputed.stdout),
+        String::from_utf8_lossy(&cold.stdout),
+        "the same rules over the same source should still report the same violations: {combined}"
+    );
+    let recomputed_stderr = String::from_utf8_lossy(&recomputed.stderr).into_owned();
+    // The one assertion this test exists for. `caching` is a per-*run* flag — see
+    // `Engine::caching`'s doc on why there is no finer granularity that is sound — so a moved
+    // `ruleset_hash` invalidates every file's entry in this run, whether or not that file's own
+    // rule is the component that changed. Both rows have to reappear, not just the component's.
+    assert!(
+        recomputed_stderr.contains("fixture/metadata"),
+        "the component did not run again after its own bytes changed: {combined}"
+    );
+    assert!(
+        recomputed_stderr.contains("lanekeep/no-default-export"),
+        "the TypeScript rule did not run again after the component's bytes changed — the \
+         whole run's key should have moved, not just the changed rule's: {combined}"
+    );
+
+    // And the new bytes are themselves cacheable — this is what shows the recompute above
+    // actually wrote a fresh entry rather than merely refusing to serve a stale one. A design
+    // that invalidated correctly but then failed to re-cache would pass every assertion above
+    // and run cold forever after.
+    let warm_again = project.check_profiled();
+    let combined = describe(&warm_again);
+    let warm_again_stderr = String::from_utf8_lossy(&warm_again.stderr).into_owned();
+    assert!(
+        !warm_again_stderr.contains("fixture/metadata")
+            && !warm_again_stderr.contains("lanekeep/no-default-export"),
+        "the run after the recompute should have warmed on the new bytes: {combined}"
     );
 }

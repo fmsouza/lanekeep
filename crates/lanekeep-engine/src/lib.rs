@@ -448,8 +448,8 @@ pub struct Engine {
     /// tell them apart is to ask where the `ComponentRule` came from, which is exactly what
     /// `counted_in_ruleset_hash` answers — `true` for the one constructor `lanekeep-config` uses
     /// while building a `Config`, `false` for `ComponentRule::uncounted`, the only other way to
-    /// produce one. `a_run_with_a_component_rule_does_not_touch_the_cache` asserts this field
-    /// directly for a hand-built spec and still must find it `false`.
+    /// produce one. `a_run_with_a_component_rule_does_not_touch_the_cache` asserts `caching`
+    /// itself directly for a hand-built spec and still must find it `false`.
     ///
     /// **Refusing the cache rather than folding the bytes here**, still, for two reasons that
     /// both held before this could tell rules apart and hold just as well now. The correct fold

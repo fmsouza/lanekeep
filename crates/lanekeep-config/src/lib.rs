@@ -1734,6 +1734,38 @@ mod tests {
                 .as_slice(),
             "the rule carries the component it was described from"
         );
+        // This crate is the only one that can truthfully answer this: `describe_components`'s
+        // output is exactly what `build` folds into `ruleset_hash`, a few lines below where the
+        // rule this test just built came from. `Engine::caching` (`lanekeep-engine`) trusts this
+        // flag rather than re-deriving it, so a `false` here would silently take every
+        // component-backed run's cache off — and nothing outside this crate can tell, because a
+        // hand-built `ComponentRule` looks identical otherwise. Paired with
+        // `an_uncounted_component_is_not_counted_in_ruleset_hash` below, this closes both
+        // mutants of `ComponentRule::counted_in_ruleset_hash` inside this crate's own suite: this
+        // one alone only kills `replace ... with false`, since nothing here is `false` for a
+        // mutant hardcoding `true` to disagree with.
+        assert!(
+            component.counted_in_ruleset_hash(),
+            "a component `load` resolved must be counted in `ruleset_hash`"
+        );
+    }
+
+    /// The other half of the pair above. `load` is not the only way to build a
+    /// `ComponentRule` — `ComponentRule::uncounted` is the door this crate hands an embedder or
+    /// a test that attaches a component outside `load` — and it has to answer honestly too, or
+    /// a mutant hardcoding `counted_in_ruleset_hash` to `true` would pass every test in this
+    /// crate: nothing above ever exercises a value that is genuinely `false`.
+    #[test]
+    fn an_uncounted_component_is_not_counted_in_ruleset_hash() {
+        let component = ComponentRule::uncounted(
+            PathBuf::from("rules/mine.wasm"),
+            "null".to_owned(),
+            b"\0asm".to_vec(),
+        );
+        assert!(
+            !component.counted_in_ruleset_hash(),
+            "bytes nobody hashed must not claim to be counted"
+        );
     }
 
     // --- an empty language list ---------------------------------------------------------
