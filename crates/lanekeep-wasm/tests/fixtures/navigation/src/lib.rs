@@ -61,6 +61,15 @@ impl Guest for Component {
         }
     }
 
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `configure` itself is tested.
+    ///
+    /// Refuses unconditionally rather than accepting anything, so a caller that reached this
+    /// export on this fixture fails loudly instead of passing on a vacuous success.
+    fn configure(_options_json: String) -> Result<(), String> {
+        Err("fixture/navigation does not implement configure".to_owned())
+    }
+
     fn has_check() -> bool {
         true
     }

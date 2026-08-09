@@ -1,10 +1,12 @@
-//! A guest that answers `metadata`, and nothing else.
+//! A guest that answers `metadata` and `configure`, and nothing else.
 //!
 //! Every field carries a distinct value, so a host that transposed two of them — `message`
-//! for `remediation`, say — fails rather than passing on a plausible-looking answer. The
-//! other four exports are stubs: a WIT world has no optional exports, so every component
-//! answers all of them regardless of which passes it uses, and this one is not shaped like a
-//! real rule — see `tests/fixtures/engine-rule/` for that.
+//! for `remediation`, say — fails rather than passing on a plausible-looking answer.
+//! `configure` accepts an object or `null` and refuses anything else with its own message,
+//! which is what `tests/metadata.rs`'s three `configure` tests drive. The other four exports
+//! are stubs: a WIT world has no optional exports, so every component answers all of them
+//! regardless of which passes it uses, and this one is not shaped like a real rule — see
+//! `tests/fixtures/engine-rule/` for that.
 
 #[allow(warnings)]
 mod bindings;
@@ -37,6 +39,21 @@ impl Guest for Component {
             },
             timeout: Some(1500),
         }
+    }
+
+    /// Accepts an object or `null`; refuses anything else with its own message.
+    ///
+    /// `tests/metadata.rs` drives all three shapes: a well-formed object, `null` (the
+    /// bare-reference case), and a JSON array, which is refused rather than trapped so the
+    /// refusal carries a message a user can act on.
+    fn configure(options_json: String) -> Result<(), String> {
+        if options_json == "null" {
+            return Ok(());
+        }
+        if !options_json.starts_with('{') {
+            return Err("expected an object".to_owned());
+        }
+        Ok(())
     }
 
     fn has_check() -> bool {

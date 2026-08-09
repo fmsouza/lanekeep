@@ -1283,6 +1283,36 @@ impl WasmRuntime {
         outcome.map_err(|error| self.classify(&error, timeout))
     }
 
+    /// Hand a slot's rule its configured options, once, before any `check`.
+    ///
+    /// Instantiates the rule if it is not already, on the same terms as [`Self::rule`].
+    ///
+    /// `options_json` crosses as data rather than as a typed value because a component has no
+    /// way to close over a host-supplied value the way a JavaScript factory does — see
+    /// `configure`'s own doc in `wit/world.wit`. `null` is the bare-reference shape: a rule
+    /// named with no options is still configured, with `null`, so a guest has one code path
+    /// rather than two.
+    ///
+    /// # Errors
+    ///
+    /// [`WasmError`] if the slot is unknown, instantiation fails, or the guest traps. Returns
+    /// [`WasmError::Misconfigured`], carrying the guest's own message, when the guest ran to
+    /// completion and declined the options it was handed — a refusal rather than a trap, and
+    /// deliberately not folded into [`WasmError::Guest`]: see that variant's own doc for why.
+    pub fn configure(&mut self, slot: RuleSlot, options_json: &str) -> Result<(), WasmError> {
+        self.rule(slot)?;
+        let timeout = self.limits.rule_timeout;
+        self.arm(timeout);
+        let outcome =
+            self.with_instance(slot, |rule, store| rule.call_configure(store, options_json));
+        self.disarm();
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(WasmError::Misconfigured { message }),
+            Err(error) => Err(self.classify(&error, timeout)),
+        }
+    }
+
     /// Ask a slot's rule whether it has a per-file pass, instantiating it if needed.
     ///
     /// # Errors

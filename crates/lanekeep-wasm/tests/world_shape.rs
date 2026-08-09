@@ -1,6 +1,6 @@
 //! The world in `wit/world.wit` is satisfiable from both sides.
 //!
-//! `tests/fixtures/world-shape/` is a component that exports all five of the `rule` world's
+//! `tests/fixtures/world-shape/` is a component that exports all six of the `rule` world's
 //! functions; this file implements the host half of the same world and links the two
 //! together. Neither half proves much alone — a world nobody can target is a document, and a
 //! world no host can implement is the same document from the other end.

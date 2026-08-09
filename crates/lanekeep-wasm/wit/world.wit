@@ -357,25 +357,21 @@ interface types {
   }
 }
 
-/// What a rule component is today: five exports over the host surface.
+/// What a rule component is today: six exports over the host surface.
 ///
 /// **This list is still provisional, and the version number is where that shows.**
-/// `metadata` is now one of the five: it carries what a TypeScript rule's default export
-/// carries today (id, languages, severity, card, gates, query, timeout), read once at
-/// prepare time. One export is still expected by a sub-project that binds against this
-/// world and is still absent — `configure(options-json)`, a call made once after
-/// instantiation, since a component cannot close over a host-supplied value the way a
-/// factory rule does in JavaScript. It is not written here, because inventing a shape that
-/// the sub-project needing it would then have to un-invent is worse than the omission.
+/// `metadata` carries what a TypeScript rule's default export carries today (id, languages,
+/// severity, card, gates, query, timeout), read once at prepare time. `configure` is what a
+/// sub-project binding against this world needed and this file did not yet have: a call made
+/// once after instantiation, since a component cannot close over a host-supplied value the
+/// way a factory rule does in JavaScript, so a rule's options cross as JSON data instead —
+/// see `configure`'s own doc comment below for why that is a permanent expressiveness loss
+/// against a factory rather than a gap to design around.
 ///
-/// Where the decision lands is not left open: the plan's Task 14 owns how a configured
-/// rule's `options` reach a component, and its acceptable outcome includes documenting the
-/// gap and deferring it rather than inventing one. What is worth knowing before that point
-/// is the cost. **Adding an export bumps `host_api_hash`, which is a cache-key input**, so
-/// every cached result in every checkout is invalidated by it — which is the right
-/// behavior, since a result computed against a world without the addition is not a valid
-/// result for a run that has it. `metadata` already paid that cost once, the moment this
-/// file changed; `configure` will pay it again when its turn comes.
+/// **Adding an export bumps `host_api_hash`, which is a cache-key input**, so every cached
+/// result in every checkout is invalidated by it — which is the right behavior, since a
+/// result computed against a world without the addition is not a valid result for a run that
+/// has it. `metadata` paid that cost once; `configure` pays it again here.
 world rule {
   import types;
 
@@ -402,6 +398,21 @@ world rule {
 
   /// What this rule is. Read once, at prepare time, before any file is checked.
   export metadata: func() -> rule-metadata;
+
+  /// Hand this rule its configured options, once, after instantiation and before any
+  /// `check`.
+  ///
+  /// JSON rather than a typed record, because a rule's options are its own design and this
+  /// interface cannot know their shape. A component has no way to close over a host-supplied
+  /// value the way a JavaScript factory does, so the value crosses as data — which is a
+  /// permanent expressiveness loss against a factory, named rather than designed around: no
+  /// functions, no regular expressions, nothing a `Deserialize` cannot represent.
+  ///
+  /// `null` when a rule was named with no options, so a guest has one code path rather than
+  /// two. The error is the guest's own message, and it fails the run rather than trapping —
+  /// a rule that cannot use its configuration has not merely misbehaved, it has been
+  /// misconfigured, and the user needs to be told which.
+  export configure: func(options-json: string) -> result<_, string>;
 
   /// Whether this rule has a per-file pass.
   ///
