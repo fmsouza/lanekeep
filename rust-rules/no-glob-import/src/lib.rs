@@ -13,7 +13,7 @@
 //!
 //! The prelude conventions are the exception worth allowing, and `allow` exists for them,
 //! defaulting to `*prelude*` and replacing that default entirely when configured — see
-//! [`Options`].
+//! `Options` below.
 //!
 //! # A port, held to reporting identically
 //!
