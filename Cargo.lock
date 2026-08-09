@@ -979,6 +979,7 @@ dependencies = [
 name = "lanekeep-rules"
 version = "0.6.1"
 dependencies = [
+ "lanekeep-core",
  "lanekeep-testkit",
 ]
 

@@ -12,6 +12,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dev-dependencies]
+# For the fields of a `Violation` that the testkit's assertions do not pin — `rule_id`,
+# `severity` and `remediation`, which a rule can get wrong without moving a position or a message.
+lanekeep-core = { workspace = true }
 lanekeep-testkit = { workspace = true }
 
 [lints]

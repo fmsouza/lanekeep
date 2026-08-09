@@ -600,6 +600,102 @@ mod tests {
             .expect("should report the element");
     }
 
+    /// Not a component. These cases assert what the harness *writes*, which is the whole of what
+    /// the component constructors do; running one is `crates/lanekeep-rules/tests/no_unwrap.rs`'s
+    /// job, and it has real components to do it with. Four bytes of magic keep the fixture from
+    /// looking like something that could be loaded.
+    const NOT_A_COMPONENT: &[u8] = b"\0asm not really";
+
+    /// The generated config, parsed back.
+    fn written_config(tester: &RuleTester) -> serde_json::Value {
+        let text = std::fs::read_to_string(tester.dir.join(JSON_CONFIG)).expect("config written");
+        serde_json::from_str(&text).expect("the generated config is JSON")
+    }
+
+    #[test]
+    fn a_component_tester_writes_the_bytes_and_points_a_json_config_at_them() {
+        let tester = RuleTester::for_component("component", NOT_A_COMPONENT, "rs").expect("builds");
+
+        assert_eq!(
+            std::fs::read(tester.dir.join(COMPONENT_PATH)).expect("component written"),
+            NOT_A_COMPONENT,
+            "the bytes must reach disk unchanged — a component is identified by them"
+        );
+        assert_eq!(
+            written_config(&tester)["rules"][0],
+            serde_json::json!("./rules/rule.wasm"),
+            "the bare form is a string, which is what `lanekeep-config` reads as a rule used \
+             as it comes"
+        );
+        assert!(
+            !tester.dir.join(TS_CONFIG).exists(),
+            "a component project must not also carry a TypeScript config"
+        );
+    }
+
+    #[test]
+    fn a_configured_component_tester_embeds_its_options_as_data() {
+        // The distinction `configured` cannot make: those options are spliced into JavaScript
+        // source, and these have to survive as a value, because `configure(options-json)` is
+        // where they arrive. A harness that stringified them would hand the rule `"{...}"`.
+        let tester = RuleTester::for_component_configured(
+            "configured",
+            NOT_A_COMPONENT,
+            "rs",
+            r#"{"allow": ["subject/input.rs"]}"#,
+        )
+        .expect("builds");
+
+        assert_eq!(
+            written_config(&tester)["rules"][0],
+            serde_json::json!({
+                "rule": "./rules/rule.wasm",
+                "options": { "allow": ["subject/input.rs"] },
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_null_options_are_a_different_config_from_the_bare_form() {
+        // Three states, not two. `lanekeep-config` reads a bare string as a rule used as it
+        // comes and the object form as one configured, so a rule named with `null` options is
+        // not the same config as a rule named with none — and a harness collapsing them would
+        // make the bare case untestable.
+        let configured =
+            RuleTester::for_component_configured("null-options", NOT_A_COMPONENT, "rs", "null")
+                .expect("builds");
+        let bare = RuleTester::for_component("bare", NOT_A_COMPONENT, "rs").expect("builds");
+
+        assert_eq!(
+            written_config(&configured)["rules"][0],
+            serde_json::json!({ "rule": "./rules/rule.wasm", "options": null })
+        );
+        assert_ne!(
+            written_config(&configured)["rules"][0],
+            written_config(&bare)["rules"][0]
+        );
+    }
+
+    #[test]
+    fn options_that_are_not_json_are_refused_naming_the_options() {
+        // The failure mode this branch exists to prevent: spliced into the config unchecked, a
+        // malformed value becomes a parse error against a generated file the caller never wrote,
+        // pointing at a line number that means nothing to them.
+        let err = RuleTester::for_component_configured(
+            "bad-options",
+            NOT_A_COMPONENT,
+            "rs",
+            "{ allow: ['subject/input.rs'] }",
+        )
+        .expect_err("JavaScript object syntax is not JSON");
+
+        assert!(matches!(err, TestError::Setup(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("`options` is not valid JSON"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn the_temporary_project_is_cleaned_up() {
         let path = {

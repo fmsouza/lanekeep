@@ -23,9 +23,13 @@
 
 use std::fmt::Write as _;
 
+use lanekeep_core::{Severity, Violation};
 use lanekeep_testkit::{RuleTester, TestError};
 
-/// What a case asserts about what the rule reported.
+/// What a case asserts about *which* violations were reported, and where.
+///
+/// Deliberately not the whole of what a case asserts: [`assert_identity`] holds every violation
+/// of every case to the three fields none of these variants mentions.
 enum Expected {
     /// Nothing at all.
     Accepts,
@@ -34,6 +38,16 @@ enum Expected {
     /// Exactly these messages, in order.
     ReportsMessages(&'static [&'static str]),
 }
+
+/// The rule id every violation carries.
+const RULE_ID: &str = "lanekeep/no-unwrap";
+
+/// The severity every violation carries, resolved by config rather than declared by the rule.
+const SEVERITY: Severity = Severity::Error;
+
+/// The remediation every violation carries, from the rule's card.
+const REMEDIATION: &str =
+    "propagate with `?` and a typed error, so the caller decides what a failure means";
 
 /// One case, written once and run against both engines.
 struct Case {
@@ -85,11 +99,17 @@ const CASES: &[Case] = &[
         options: None,
         expected: Expected::Accepts,
     },
-    // The exemption is `/\btest\b/` over the attribute's text, and these are the two edges of
-    // that `\b`. They matter to a *port* more than to the original: the obvious Rust spelling of
-    // "contains test" exempts `#[my_test]`, and a rule that exempts too much reports nothing and
-    // reads exactly like clean code. `_` being a word character is what decides the second one,
-    // in JavaScript and here alike.
+    // The exemption is `/\btest\b/` over the attribute's text, and these are its edges: one
+    // attribute that must still exempt despite what precedes `test`, and one on each side of the
+    // word that must not. They matter to a *port* more than to the original, because the obvious
+    // Rust spelling of "contains test" exempts all three — and a rule that exempts too much
+    // reports nothing, which reads exactly like clean code. `_` being a word character in
+    // JavaScript's `\w` is what decides `my_test`, and it decides it the same way here.
+    //
+    // **Both edges, and the trailing one was missing.** With `mentions_test` mutated to drop its
+    // trailing boundary check, every case in this table still passed: `tokio::test` and `my_test`
+    // between them pin only what comes *before* the word. `#[testing]` is what makes the other
+    // half fail.
     Case {
         name: "a_test_attribute_behind_a_path_still_exempts",
         source: "#[tokio::test]\nasync fn works() {\n    let c = load().unwrap();\n}\n",
@@ -99,6 +119,12 @@ const CASES: &[Case] = &[
     Case {
         name: "an_attribute_that_merely_contains_test_does_not_exempt",
         source: "#[my_test]\nfn works() {\n    let c = load().unwrap();\n}\n",
+        options: None,
+        expected: Expected::ReportsAt(&[(3, 13)]),
+    },
+    Case {
+        name: "an_attribute_that_merely_starts_with_test_does_not_exempt",
+        source: "#[testing]\nfn works() {\n    let c = load().unwrap();\n}\n",
         options: None,
         expected: Expected::ReportsAt(&[(3, 13)]),
     },
@@ -178,12 +204,112 @@ const CASES: &[Case] = &[
 ];
 
 /// Assert one case against a tester built for it.
+///
+/// One `run` rather than one per assertion. The harness's `accepts`/`reports_at`/
+/// `reports_messages` each run the engine themselves and hand back only a verdict, and a case
+/// needs both the verdict and the violations behind it — so the comparison is done here, against
+/// one set of results. For the component arm that also halves the work: a run there compiles the
+/// rule twice, and two runs per case would be four.
 fn assert_case(tester: &RuleTester, case: &Case) -> Result<(), TestError> {
+    let violations = tester.run(case.source)?;
+    assert_identity(&violations, case)?;
+
     match case.expected {
-        Expected::Accepts => tester.accepts(case.source),
-        Expected::ReportsAt(positions) => tester.reports_at(case.source, positions),
-        Expected::ReportsMessages(messages) => tester.reports_messages(case.source, messages),
+        Expected::Accepts if violations.is_empty() => Ok(()),
+        Expected::Accepts => Err(mismatch(
+            case,
+            "expected no violations",
+            &rendered(&violations),
+        )),
+        Expected::ReportsAt(expected) => {
+            let actual: Vec<(u32, u32)> = violations
+                .iter()
+                .map(|v| (v.location.position.line, v.location.position.column))
+                .collect();
+            if actual == expected {
+                return Ok(());
+            }
+            Err(mismatch(
+                case,
+                &format!("positions {expected:?}"),
+                &format!("{actual:?}"),
+            ))
+        }
+        Expected::ReportsMessages(expected) => {
+            let actual: Vec<&str> = violations.iter().map(|v| v.message.as_str()).collect();
+            if actual == expected {
+                return Ok(());
+            }
+            Err(mismatch(
+                case,
+                &format!("messages {expected:?}"),
+                &format!("{actual:?}"),
+            ))
+        }
     }
+}
+
+/// Hold every violation to the three fields no [`Expected`] variant pins.
+///
+/// **Measured rather than supposed.** With the component's `metadata()` returning
+/// `id: "lanekeep/no-unwrapp"`, `severity: "warn"` and a remediation reading
+/// `MUTANT REMEDIATION`, every case in this table passed on both arms — so a table asserting
+/// only positions and messages says nothing about half of what a violation is, in a migration
+/// whose whole claim is that the two implementations report identically.
+///
+/// Each of the three is load-bearing somewhere a position is not. The rule id is what a
+/// suppression comment names and what the canonical `(ruleId, file, line, column)` sort orders
+/// on, so a wrong one reorders unrelated output. Severity decides the exit code. The remediation
+/// is what `lanekeep explain` and the agent reporter print, and is the half of a card that says
+/// what to do rather than what is wrong.
+///
+/// Checked on every violation of every case rather than in a case of its own, so a rule migrated
+/// after this one inherits it without anyone remembering to.
+fn assert_identity(violations: &[Violation], case: &Case) -> Result<(), TestError> {
+    for violation in violations {
+        let id = violation.rule_id.to_string();
+        if id != RULE_ID {
+            return Err(mismatch(case, &format!("rule id `{RULE_ID}`"), &id));
+        }
+        if violation.severity != SEVERITY {
+            return Err(mismatch(
+                case,
+                &format!("severity {SEVERITY:?}"),
+                &format!("{:?}", violation.severity),
+            ));
+        }
+        if violation.remediation != REMEDIATION {
+            return Err(mismatch(
+                case,
+                &format!("remediation `{REMEDIATION}`"),
+                &format!("`{}`", violation.remediation),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A failure naming both sides and the source that produced them.
+fn mismatch(case: &Case, expected: &str, actual: &str) -> TestError {
+    let source = case.source.lines().fold(String::new(), |mut out, line| {
+        let _ = writeln!(out, "  | {line}");
+        out
+    });
+    TestError::Mismatch(format!(
+        "  expected: {expected}\n  actual:   {actual}\n\nsource:\n{source}"
+    ))
+}
+
+/// Violations as one line each, for a case that expected none.
+fn rendered(violations: &[Violation]) -> String {
+    violations.iter().fold(String::new(), |mut out, violation| {
+        let _ = write!(
+            out,
+            "{}:{} {}; ",
+            violation.location.position.line, violation.location.position.column, violation.message
+        );
+        out
+    })
 }
 
 /// Run the whole table, reporting every failure rather than only the first.
