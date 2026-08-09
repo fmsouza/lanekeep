@@ -65,16 +65,18 @@ pub fn capture<C: Capture>(m: &[C], name: &str) -> Option<Node> {
 }
 
 /// Whether `c` is a line terminator under ECMAScript's definition: the four characters a
-/// `RegExp`'s `.` does not match without the `s`/`dotAll` flag, which is how
-/// `crates/lanekeep-rules/rules/no-unwrap.ts` and `no-glob-import.ts` build theirs.
+/// `RegExp`'s `.` does not match without the `s`/`dotAll` flag, which is how the TypeScript
+/// rules these two were ported from built theirs — see [`glob_matches`].
 fn is_line_terminator(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
 
 /// Whether `value` matches the `*`-wildcard `pattern`, anchored at both ends.
 ///
-/// Ports the `matches` helper duplicated in `crates/lanekeep-rules/rules/no-unwrap.ts` and
-/// `no-glob-import.ts`. That original builds a `RegExp`, escaping every regex metacharacter
+/// Ports the `matches` helper that was duplicated in
+/// `crates/lanekeep-rules/rules/no-unwrap.ts` and `no-glob-import.ts` — both deleted when their
+/// components became the shipped rules, and recoverable with
+/// `git log --diff-filter=D -- <path>`. That original builds a `RegExp`, escaping every metacharacter
 /// except `*` and then substituting `*` for `.*` — so everything but `*` is a literal, and
 /// (carrying no `s`/`dotAll` flag) `*` does not span a line terminator. This is the same rule
 /// without a regex engine: `pattern` is peeled into literal segments around its `*`s, and
@@ -167,8 +169,8 @@ mod tests {
     #[test]
     fn a_star_does_not_span_a_line_terminator() {
         // The TypeScript original's `RegExp` carries no `s`/`dotAll` flag, so `.` — and by
-        // extension `*` — does not match a line terminator. Reachable: `no-glob-import.ts`
-        // defaults `allow` to `['*prelude*']` and reports at `ctx.text(m.wildcard)`, whose
+        // extension `*` — does not match a line terminator. Reachable: `no-glob-import`
+        // defaults `allow` to `['*prelude*']` and reports at the wildcard's text, whose
         // `use_wildcard` node can legitimately wrap onto a second line —
         // `use std::\n    prelude::*;` — where the TypeScript original does not match and
         // reports a violation. `\r\n` closes the same gap on Windows line endings.

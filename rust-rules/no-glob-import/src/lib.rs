@@ -17,10 +17,13 @@
 //!
 //! # A port, held to reporting identically
 //!
-//! This is the same rule as `crates/lanekeep-rules/rules/no-glob-import.ts`, in Rust. The two
-//! are run against one shared table of cases in `crates/lanekeep-rules/tests/no_glob_import.rs`,
-//! and the claim that table exists to hold is that they report the same violations at the same
-//! positions with the same messages.
+//! This is `lanekeep/no-glob-import`, which was a TypeScript module until it was this. The
+//! original was `crates/lanekeep-rules/rules/no-glob-import.ts`, deleted in the commit that made
+//! this the shipped rule; `git log --diff-filter=D -- <that path>` finds it. The two ran against
+//! one shared table of cases in `crates/lanekeep-rules/tests/no_glob_import.rs` until then, and
+//! the claim that table exists to hold is that they report the same violations at the same
+//! positions with the same messages — a claim that outlives the file it was written against,
+//! because the users being kept faith with are the ones whose configs did not change.
 //!
 //! **The one detail a direct translation loses easily.** tree-sitter-rust's `use_wildcard` is
 //! `(path '::')? '*'`, so the captured text already ends in `::*` — `ctx.text(wildcard)` for

@@ -15,12 +15,17 @@
 //!
 //! # A port, held to reporting identically
 //!
-//! This is the same rule as `crates/lanekeep-rules/rules/no-unwrap.ts`, in Rust. The two are run
-//! against one shared table of cases in `crates/lanekeep-rules/tests/no_unwrap.rs`, and the
-//! claim that table exists to hold is that they report the same violations at the same positions
-//! with the same messages. So a difference here is a bug even when it reads like an improvement:
-//! `Options` below does not reject an unknown key, for instance, because the TypeScript rule
-//! ignores one and a stricter component would fail a run that used to pass.
+//! This is `lanekeep/no-unwrap`, which was a TypeScript module until it was this. The original
+//! was `crates/lanekeep-rules/rules/no-unwrap.ts`, deleted in the commit that made this the
+//! shipped rule; `git log --diff-filter=D -- <that path>` finds it. The two ran against one
+//! shared table of cases in `crates/lanekeep-rules/tests/no_unwrap.rs` until then, and the claim
+//! that table exists to hold is that they report the same violations at the same positions with
+//! the same messages.
+//!
+//! **That claim outlives the file it was written against.** A difference here is a bug even when
+//! it reads like an improvement, because the users being kept faith with are the ones whose
+//! configs did not change: `Options` below does not reject an unknown key, for instance, because
+//! the TypeScript rule ignored one and a stricter component would fail a run that used to pass.
 //!
 //! There are no unit tests in this crate, and that is a decision rather than an omission. It does
 //! not compile at all without the `src/bindings.rs` that `cargo component build` generates, which

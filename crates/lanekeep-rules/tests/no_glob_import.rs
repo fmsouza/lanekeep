@@ -3,13 +3,19 @@
 //! # Why the cases are a table
 //!
 //! Every case is a [`Case`] in [`CASES`], and a test function runs the whole table against a
-//! tester it is handed. That indirection buys nothing today, with one implementation of the
-//! rule and one arm to run it through, and it is what makes a second implementation testable
-//! against *the same* expectations rather than against a second file that looks reasonable.
+//! tester it is handed. That indirection is what made a second implementation of this rule
+//! testable against *the same* expectations rather than against a second file that looks
+//! reasonable.
 //!
 //! Two independently written test files could each look sensible and still assert different
 //! things, and the difference would be invisible: a case only one of them has is a case the
 //! other is not held to. A table cannot express that.
+//!
+//! **There is one arm again, and the table is what earned the right to say so.** The rule was
+//! a TypeScript module; it is a component now, and the two ran side by side against every case
+//! in this table until the swap landed. The indirection stays because the next migration needs
+//! it and because a case written against a tester rather than against an engine is the shape
+//! that survives one.
 //!
 //! So a case belongs here rather than in a `#[test]` of its own, and one that could only be
 //! written for a single arm is worth stopping over rather than working around.
@@ -260,13 +266,16 @@ fn rendered(violations: &[Violation]) -> String {
 /// unrepresentable. Collecting the failures is what keeps that from costing anything — a
 /// migration that gets three cases wrong says so once, rather than three runs in a row.
 ///
+/// One engine today. The parameter is not vestigial: it is the seam a second arm is added at,
+/// and this file has had two arms before.
+///
 /// # A thread per case, which nextest would otherwise have given for free
 ///
-/// Every case builds its own throwaway project and runs the real engine over it, and for the
-/// component arm that means compiling the rule twice — once when the config asks it what it is,
+/// Every case builds its own throwaway project and runs the real engine over it, and for a
+/// component that means compiling the rule twice — once when the config asks it what it is,
 /// once when the engine prepares — with a Cranelift that is itself an unoptimized build under
 /// `cargo test`. `no_unwrap.rs` measured 29.6s for a sequential run of its (larger) table against
-/// 0.4s for the TypeScript one, in a recipe that runs on every commit.
+/// 0.4s for the TypeScript arm it then had, in a recipe that runs on every commit.
 ///
 /// Splitting the table into a `#[test]` per case would let nextest's process-per-test do this,
 /// and would need a macro to generate them from the table — which is a lot of machinery, and
@@ -301,35 +310,17 @@ fn assert_every_case(build: impl Fn(&Case) -> RuleTester + Sync) {
     assert!(failures.is_empty(), "{failures}");
 }
 
-/// The rule as originally authored: a TypeScript module, evaluated in the sandbox.
-///
-/// `configured_with_extension` for a case with options and `with_extension` for one without,
-/// because that distinction is the rule's own: `lanekeep init` writes a bare
-/// `"lanekeep/no-glob-import"` into a Rust project's config, which `lanekeep-config` renders as
-/// the imported binding itself, while the usage the rule documents calls it. Both shapes have to
-/// work, and for a while only one of them did.
-///
-/// **The source is read from the file rather than from `lanekeep_rules::source`, because it is
-/// no longer a built-in.** `lanekeep/no-glob-import` resolves to the component now. This arm is
-/// what holds the swap to having changed nothing: it runs the implementation that was replaced,
-/// against the same table, in the same commit that replaced it. It leaves with the file.
-fn typescript(case: &Case) -> RuleTester {
-    let source = include_str!("../rules/no-glob-import.ts");
-    match case.options {
-        None => RuleTester::with_extension("no-glob-import", source, "rs"),
-        Some(options) => {
-            RuleTester::configured_with_extension("no-glob-import", source, "rs", options)
-        }
-    }
-    .expect("builds")
-}
-
-/// The same rule, migrated: a WebAssembly component built from `rust-rules/no-glob-import/`.
+/// The rule: a WebAssembly component built from `rust-rules/no-glob-import/`.
 ///
 /// The options reach it as data rather than as source. A component cannot close over a
 /// host-supplied value the way a JavaScript factory does, so `configure(options-json)` is where
 /// they arrive — which is why the table's option strings are JSON, and why the bare case is not
 /// "no call" but a call with `null`.
+///
+/// Both shapes have to work and for a while only one of them did: `lanekeep init` writes a bare
+/// `"lanekeep/no-glob-import"` into a Rust project's config, while the usage the rule documents
+/// configures it. That is why the table carries cases of each kind rather than only the
+/// configured ones.
 fn component(case: &Case) -> RuleTester {
     let bytes = lanekeep_rules::component("no-glob-import").expect("the component ships");
     match case.options {
@@ -339,11 +330,6 @@ fn component(case: &Case) -> RuleTester {
         }
     }
     .expect("builds")
-}
-
-#[test]
-fn the_typescript_rule_satisfies_every_case() {
-    assert_every_case(typescript);
 }
 
 #[test]
