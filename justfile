@@ -35,10 +35,10 @@ _require tool:
 # ---------------------------------------------------------------------------
 
 # Pre-commit gate. Fast enough to run on every commit without being resented.
-check-fast: fmt-check lint test test-scripts test-go
+check-fast: fmt-check lint test test-rust-rules test-scripts test-go
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-scripts test-go docs deny machete typos-check msrv
+check: fmt-check lint test test-rust-rules test-scripts test-go docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -146,9 +146,12 @@ wasm-fixtures:
 # Build and test rust-rules/: its own workspace, so `cargo test --workspace` at the root does
 # not reach it.
 #
-# Deliberately not part of `check`/`check-fast` yet, the same way `wasm-fixtures` is
-# deliberately not: extending the gate — deny, machete, fmt, msrv — over this second workspace
-# is separate, later work. This is what building and testing what exists here needs today.
+# Part of both gates, unlike `wasm-fixtures` — that recipe is excluded because it needs
+# `cargo component` and rewrites committed artifacts, neither of which is true here: this is
+# a zero-dependency host-target test that runs in under a second, and leaving it opt-in would
+# mean nothing here runs until someone remembers to ask for it by name. Extending the gate
+# further — deny, machete, fmt, msrv — over this second workspace is still separate, later
+# work.
 #
 # Plain `cargo test` rather than `cargo nextest run`: the crates here are host-target unit
 # tests over pure functions, with no wasm target and no fixture side effects to isolate a

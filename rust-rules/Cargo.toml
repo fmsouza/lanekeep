@@ -27,6 +27,11 @@ publish = false
 # Matches the root `Cargo.toml`'s own value, which is what the code these rules ship beside
 # is actually licensed under.
 license = "MIT OR Apache-2.0"
+# Matches the root `Cargo.toml`'s own floor. Nothing here has a stricter requirement of its
+# own yet, so there is no reason to diverge — `just msrv` does not reach this workspace yet
+# (extending the gate over it is Task 8), but the promise is worth declaring regardless of
+# whether anything enforces it today.
+rust-version = "1.94"
 
 # `[lints] workspace = true` resolves only within one workspace, so the root Cargo.toml's
 # table does not reach here and this is a copy of its `[workspace.lints.*]` (lines 100-132)

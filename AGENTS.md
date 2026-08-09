@@ -119,6 +119,8 @@ crates/
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
   lanekeep-testkit   RuleTester
   lanekeep-cli       the binary
+rust-rules/          a second Cargo workspace: rule crates authored in Rust
+  lanekeep-rule      the SDK they share: a capture lookup and a glob matcher
 cmd/lanekeep/        the Go launcher, so `go tool lanekeep` works
 docs/                architecture, playbooks
 scripts/             repository tooling, with its own tests
