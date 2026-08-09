@@ -417,23 +417,28 @@ pub struct Engine {
     /// **Off for any run that loaded a component, and that is a correctness guard rather than a
     /// policy.** It was written when a component's bytes could reach no cache-key input at all:
     /// `RuleSpec::component` was set on a `Config` *after* `lanekeep_config::load` computed
-    /// `ruleset_hash`, and `load_components` reads the file with an untracked `std::fs::read`.
-    /// So without this, swapping a rule's component for a different one between two runs serves
-    /// the first one's answer forever — demonstrated by
+    /// `ruleset_hash`, and `load_components` then read the file itself, untracked. So without
+    /// this, swapping a rule's component for a different one between two runs serves the first
+    /// one's answer forever — demonstrated by
     /// `swapping_a_component_between_runs_changes_the_answer`, which fails without it.
     ///
     /// **That is now true of a hand-built spec and false of a configured one**, which is why
     /// this is still here and is no longer right. `lanekeep-config` resolves a `.wasm`
-    /// reference itself, so a component named by a config is in `hash_ruleset`'s fold before
-    /// any `Config` exists — the condition the paragraph below names as the one that has to
-    /// hold. What is *not* covered is a component attached to a `RuleSpec` afterwards, by an
-    /// embedder or by the tests below, and a guard that could tell those apart would have to
-    /// ask where the field came from. Removing this is its own change, with the two-run
-    /// assertion that says the cache is now correct rather than merely off.
+    /// reference itself, reads its bytes once and folds *those* into `ruleset_hash` before any
+    /// `Config` exists — the condition the paragraph below names as the one that has to hold.
+    /// `load_components` no longer reads anything: it loads the component from the bytes the
+    /// rule carries, so what runs is what was hashed, which
+    /// `a_run_executes_the_bytes_its_rule_carries_and_not_the_path_beside_them` is what says.
+    ///
+    /// What is *not* covered is a component attached to a `RuleSpec` afterwards, by an embedder
+    /// or by the tests below: those bytes reached no hash, because there was no configuration
+    /// that named them. A guard that could tell the two apart would have to ask where the field
+    /// came from. Removing this is its own change, with the two-run assertion that says the
+    /// cache is now correct rather than merely off.
     ///
     /// **Refusing the cache rather than folding the bytes here**, for three reasons. The correct
-    /// fold already exists in `lanekeep-config`'s `hash_ruleset` — sorted, deduplicated,
-    /// length-prefixed, with a present/absent marker — and a second implementation of a
+    /// fold already exists in `lanekeep-config`'s `hash_ruleset` — sorted and deduplicated by
+    /// path, hashed by length-prefixed bytes — and a second implementation of a
     /// cache-key encoding in a second crate is exactly the drift that produced this
     /// sub-project's one real cache bug, where reusing a text separator for arbitrary binary let
     /// two rulesets share a key. The fold belongs beside the existing one, on the day
@@ -5640,6 +5645,61 @@ export default defineRule({
             assert!(
                 second.iter().any(|m| m.contains("unknown probe")),
                 "a swapped component must not be answered from the first one's cache: {second:?}"
+            );
+        }
+
+        /// A run executes the bytes its rule carries, not whatever is at the path beside them.
+        ///
+        /// **The engine leg of "one read".** `lanekeep-config` reads a component once, when the
+        /// config is loaded: it asks those bytes what the rule is and folds those bytes into
+        /// `ruleset_hash`. If the engine read the path again it would run a *third* version —
+        /// code no cache key describes and no metadata described — and every check in the
+        /// system would pass while doing it.
+        ///
+        /// The exact mirror of `swapping_a_component_between_runs_changes_the_answer`. There a
+        /// swap between two runs has to be **noticed**, because each run reads the file afresh.
+        /// Here a swap inside one run has to be **ignored**, because the read already happened.
+        /// Both directions are needed: a design that re-read the path would pass the first and
+        /// fail this one, and a design that cached bytes across runs would pass this one and
+        /// fail the first.
+        #[test]
+        fn a_run_executes_the_bytes_its_rule_carries_and_not_the_path_beside_them() {
+            let project = Project::new(
+                "component-carried-bytes",
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config_with(&["./rule-a"])),
+                    ("src/a.ts", "const alpha = 1;\n"),
+                ],
+            );
+            let installed = project.dir.join("rule.wasm");
+            fs::copy(fixture(), &installed).expect("installs the rule-shaped component");
+
+            let mut rule = component_rule("local/middle", 1, false);
+            // Reads the file, exactly as `lanekeep-config` does at config load.
+            rule.component = Some(backed_by(installed.clone()));
+
+            // A different component at the same path, after the rule was built and before the
+            // run. `limits.wasm` answers an unrecognized probe by saying so, which is a message
+            // the rule-shaped fixture cannot produce — so which bytes ran is readable from the
+            // output rather than inferred.
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/limits.wasm"),
+                &installed,
+            )
+            .expect("swaps the component on disk");
+
+            let outcome = project.run_with(vec![rule]).expect("runs");
+            let reported = messages(&outcome);
+
+            assert!(
+                reported.contains(&"component saw `alpha`"),
+                "the run must execute the bytes the rule carried: {reported:?}"
+            );
+            assert!(
+                !reported.iter().any(|m| m.contains("unknown probe")),
+                "nothing may re-read the path: {reported:?}"
             );
         }
 

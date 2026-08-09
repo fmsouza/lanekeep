@@ -663,11 +663,20 @@ fn parse_severity_overrides(
 /// confine anything: `Path::join` lets an absolute specifier replace the root outright, and no
 /// lexical rule can see through a symlink.
 ///
-/// [`RuleRoot::confine`] is the check, and it is the same one a module import goes through
-/// rather than a second set written here — `../../evil.wasm`, `/tmp/evil.wasm` and a symlink
-/// out of the root are refused for the same reason and with the same error as
-/// `import '../../evil'`. It runs before [`std::fs::read`], so a reference that escapes is
+/// [`RuleRoot::confine`] is the check, and it is the containment half of the one a module
+/// import goes through rather than a second set written here: the lexical test that refuses
+/// `../../evil.wasm` whatever is on disk, then the canonicalization that refuses a symlink
+/// pointing out of the root. It runs before [`std::fs::read`], so a reference that escapes is
 /// refused without its bytes ever being loaded, let alone compiled or instantiated.
+///
+/// **Containment is all of it, and a module import is held to more.** `RuleRoot::resolve`
+/// additionally refuses *any* absolute specifier a rule writes, as a bare specifier, before
+/// containment is considered at all — so `import '/etc/passwd'` and
+/// `import '/inside/the/root/x'` are both refused, and only the first would be refused here.
+/// An absolute `.wasm` path that lands inside the rules root is therefore accepted. That is not
+/// an escape and nothing about the trust boundary turns on it; it is written down because the
+/// two paths are otherwise easy to read as identical, and the next person to compare them
+/// should find the difference recorded rather than discover it.
 ///
 /// # One read
 ///
@@ -728,7 +737,8 @@ fn describe_components(
         let confined = root.confine(&rule.specifier, path).map_err(|e| {
             let detail = match e {
                 ResolveError::EscapesRoot { .. } => format!(
-                    "`{}` resolves outside the rules root, and a rule component must sit                      inside it — the same boundary a rule module's imports are held to",
+                    "`{}` resolves outside the rules root, and a rule component must sit \
+                     inside it",
                     rule.specifier
                 ),
                 ResolveError::Unreadable { detail, .. } => {
@@ -1273,10 +1283,18 @@ mod tests {
         /// calls this again afterwards. Reading at hash time is exactly the bug that shape
         /// removes: the hash would then be over a read nobody else made.
         fn component(&self, name: &str) -> ComponentRule {
+            let path = self.dir.join(name);
+            // `expect`, not `unwrap_or_default`: a mistyped name would otherwise become empty
+            // bytes, and two tests here compare hashes that would then be equal for the wrong
+            // reason — `the_ruleset_hash_ignores_where_a_component_sits` and
+            // `..._ignores_the_order_and_the_repetition_of_a_component` both assert *equality*,
+            // so they pass vacuously against two empty files. The engine's `backed_by` says the
+            // same thing for the same reason.
+            let bytes = fs::read(&path).expect("the component file is where the test put it");
             ComponentRule {
-                path: self.dir.join(name),
+                path,
                 options: "null".to_owned(),
-                bytes: fs::read(self.dir.join(name)).unwrap_or_default().into(),
+                bytes: bytes.into(),
             }
         }
     }
@@ -2130,16 +2148,23 @@ mod tests {
 
     #[test]
     fn two_components_cannot_run_together_into_one() {
-        // The reason a component's bytes are length-prefixed.
+        // The reason a component's bytes are length-prefixed, and now the only thing that says
+        // so — the length is the whole of the delimiting.
         //
         // A module's source is text and its separator is a NUL. A component is arbitrary
-        // binary, so **any** byte used as a separator can appear inside it — whichever byte
-        // would be doing the delimiting if the length prefix were dropped. These two rulesets
-        // are genuinely different and fold to the identical byte sequence without it, under an
-        // identical component count:
+        // binary, so there is no byte available to separate one from the next: whichever were
+        // chosen could appear inside a component. Without the length, these two rulesets are
+        // genuinely different and fold to the identical byte sequence, under an identical
+        // component count:
         //
-        //   A:  'A' 'A' | 'B' 'B' 01 'C' 'C'      a = "AA",       b = "BB\x01CC"
-        //   B:  'A' 'A' 01 'B' 'B' | 'C' 'C'      a = "AA\x01BB", b = "CC"
+        //   A:  'A' 'A' | 'B' 'B' 'C' 'C'      a = "AA",   b = "BBCC"
+        //   B:  'A' 'A' 'B' 'B' | 'C' 'C'      a = "AABB", b = "CC"
+        //
+        // **The data used to carry a `\x01` and stopped discriminating when it was no longer
+        // needed.** The bytes were built around the old present/absent marker acting as the
+        // delimiter, so removing the marker made the two rows genuinely different sequences and
+        // this test passed with `length_prefixed` deleted. Concatenation is the property; the
+        // data has to be a real collision under it.
         //
         // Two different rulesets sharing a cache key is the one failure `docs/architecture.md`
         // §8.1 exists to prevent, so it is asserted here rather than left to the fact that
@@ -2147,13 +2172,13 @@ mod tests {
         let fixture = Fixture::new("component-run-together", &[("a.wasm", ""), ("b.wasm", "")]);
         let sandbox = fixture.empty_sandbox();
 
-        fixture.write_all(&[("a.wasm", "AA"), ("b.wasm", "BB\u{1}CC")]);
+        fixture.write_all(&[("a.wasm", "AA"), ("b.wasm", "BBCC")]);
         let split_early = hash_ruleset(
             &sandbox,
             &[&fixture.component("a.wasm"), &fixture.component("b.wasm")],
         );
 
-        fixture.write_all(&[("a.wasm", "AA\u{1}BB"), ("b.wasm", "CC")]);
+        fixture.write_all(&[("a.wasm", "AABB"), ("b.wasm", "CC")]);
         let split_late = hash_ruleset(
             &sandbox,
             &[&fixture.component("a.wasm"), &fixture.component("b.wasm")],
@@ -2163,8 +2188,8 @@ mod tests {
             hex(&split_early),
             hex(&split_late),
             "two components must not be able to concatenate into one byte sequence — the \
-             length is what delimits them, because any separator byte can appear inside a \
-             component"
+             length is the only thing delimiting them, because any separator byte can appear \
+             inside a component"
         );
     }
 
