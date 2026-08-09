@@ -26,6 +26,7 @@ use lanekeep_wasm::bindings::types::{
 };
 use lanekeep_wasm::bindings::{Rule, types};
 use lanekeep_wasm::engine;
+use lanekeep_wasm::load::{HOST_INTERFACE, PermittedImports, check_imports, instance_imports};
 use wasmtime::Store;
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
@@ -617,5 +618,93 @@ fn no_fixture_artifact_imports_ambient_authority() {
          it was built for the wrong target:\n  {}\n\nevery artifact:\n  {}",
         offenders.join("\n  "),
         observed.join("\n  ")
+    );
+}
+
+/// **And the same check on the components that actually ship — the ones inside the binary.**
+///
+/// The test above covers `tests/fixtures/`, which is every component this crate builds for its
+/// own purposes and none of the ones a user runs. `crates/lanekeep-rules/components/*.wasm` are
+/// `include_bytes!`d into `lanekeep_rules::component` and executed against real source on every
+/// run, so a wrongly-targeted one is not a red test somewhere — it is ambient authority in a
+/// shipped binary. This is the decision record's fourth condition: a load-time import check
+/// rather than relying on instantiation to fail by accident.
+///
+/// # Reusing the engine's own filter rather than a second copy of it
+///
+/// [`instance_imports`] is what `lanekeep_wasm::load::check_imports` calls before every
+/// instantiation, and calling it here means this test and the production path cannot disagree
+/// about what an import is. A hand-written `imports().len() == 1` would reject every one of
+/// these artifacts, because the component model adds bare `check-context` and `reduce-context`
+/// resource-type imports for the types the exports name — the trap the test above documents at
+/// length and the reason there is one filter rather than two.
+///
+/// # Equality here, a subset above
+///
+/// A fixture importing nothing at all passes the test above, because nothing is strictly less
+/// authority than the host interface. A *rule* cannot: a rule reports, and `report` is a host
+/// method, so a shipped component whose instance import list is empty is a rule that can never
+/// say anything. Asserting equality rather than containment is what makes this fail on a rule
+/// that was gutted as well as on one that was over-permitted.
+///
+/// Globbed, for the reason the test above is: a named list is a step someone has to remember,
+/// and Task 9 adds rules to this directory.
+#[test]
+fn no_shipped_rule_component_imports_ambient_authority() {
+    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lanekeep-rules/components");
+    let mut artifacts: Vec<std::path::PathBuf> = std::fs::read_dir(&directory)
+        .expect("the shipped components directory is there")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "wasm"))
+        .collect();
+    artifacts.sort();
+
+    // A glob that matched nothing would make every assertion below vacuous, which is the one
+    // way this test could pass while checking not a single shipped component.
+    assert!(
+        !artifacts.is_empty(),
+        "no components under {}: either none are built, or the directory moved and this test \
+         has been asserting nothing",
+        directory.display()
+    );
+
+    let mut wrong: Vec<String> = Vec::new();
+    for path in &artifacts {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        let bytes = std::fs::read(path).expect("the artifact is readable");
+        let component = Component::new(&engine, &bytes)
+            .expect("every committed rule component is a valid component");
+
+        let imports = instance_imports(&engine, &component);
+        if imports != vec![HOST_INTERFACE.to_owned()] {
+            wrong.push(format!("{name} imports {imports:?}"));
+        }
+
+        // And the production check itself, on the set the loader defaults to. The equality
+        // above is the stronger claim; this one is the claim that matters, because it is the
+        // code that runs.
+        if let Err(refused) = check_imports(
+            &engine,
+            &name,
+            &component,
+            &PermittedImports::declared_world(),
+        ) {
+            wrong.push(format!("{name} is refused by the loader: {refused}"));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "a shipped rule component does not import exactly `{HOST_INTERFACE}`, which on this \
+         evidence means it was built for the wrong target — and unlike a fixture, this one is \
+         inside the binary:\n  {}",
+        wrong.join("\n  ")
     );
 }

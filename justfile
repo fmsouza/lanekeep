@@ -189,6 +189,20 @@ rust-rules:
         exit 1
     fi
 
+    # Record what all of that was built from, so the gate can tell a stale component from a
+    # current one without needing `cargo component` to find out. Exactly what `wasm-fixtures`
+    # does, and for the same reason: without it, editing a rule's source and not running this
+    # recipe leaves `crates/lanekeep-rules/tests/` holding the *previous* component to the
+    # current expectations, green and meaningless.
+    #
+    # A manifest and a variable of its own rather than the fixtures'. Sharing one would mean
+    # this recipe re-recording the fixtures it did not build and `wasm-fixtures` re-recording
+    # the components it did not build, which is how a stale artifact gets blessed by someone
+    # doing the right thing elsewhere. `--exact` keeps this to the one test.
+    echo "recording rule component digests"
+    LANEKEEP_BLESS_RULE_COMPONENTS=1 cargo test --quiet -p lanekeep-wasm \
+        --test fixture_currency -- --exact every_committed_rule_component_is_the_one_its_sources_build
+
 # Test rust-rules/: its own workspace, so `cargo test --workspace` at the root does not reach
 # it.
 #

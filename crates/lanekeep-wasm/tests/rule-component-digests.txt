@@ -1,0 +1,22 @@
+# What every committed rule component under `crates/lanekeep-rules/components/` was built from.
+#
+# Written by `just rust-rules`, asserted by `crates/lanekeep-wasm/tests/fixture_currency.rs`,
+# and not to be edited by hand: a value here that no build produced is exactly the claim this
+# file exists to deny. `<path> <blake3>`, sorted, paths relative to the repository root.
+#
+# A line that moves when no artifact did means a rule's source, or the world it is built
+# against, was changed without rebuilding — run `just rust-rules`.
+crates/lanekeep-rules/components/no-glob-import.wasm 97de6e6b3b54f809a48434c98d17fe608f187d357f21b4f5cd2de1b543d6305d
+crates/lanekeep-rules/components/no-unwrap.wasm 982ebae3748c72ac1aec4a15743848bcc986a331af8a64ded7ee8656d6356631
+crates/lanekeep-wasm/wit/world.wit 1313efba6c7b401ecdb4d0747acd0e71009bf1a34dc2fee19f9409d000cbc1f9
+rust-rules/.gitignore 084ea2569f638ccc64f50f72b805897bd927cfa3cee75e81f3081dd598ab0773
+rust-rules/Cargo.lock ccd218c190ce88c0c7e61f2f17cb588d7f50834e196a1a842a94019c1061a3a8
+rust-rules/Cargo.toml 2d23b04aa238ab247ca622adc428ad36619063ef893b714657493b73c6b748c7
+rust-rules/lanekeep-rule/Cargo.toml 3f59c77203fc4806f3c2e62fac5abe31efe04a0fc973ed37ac145793f62001f3
+rust-rules/lanekeep-rule/src/lib.rs 1cd23bfe919f8268cf307c0dc5382df0f8f0a62ff06d7b1b7366104ff797cb70
+rust-rules/no-glob-import/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
+rust-rules/no-glob-import/Cargo.toml 2f486211f6fdb452950d65dcab863cf7d729f30d8044467891586877b42646f9
+rust-rules/no-glob-import/src/lib.rs 6b5d50412137aa3d7b73310affe7204cfeb4fe9ca5354e675ef1718ecc16d1a5
+rust-rules/no-unwrap/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
+rust-rules/no-unwrap/Cargo.toml 276678eabcfdce04dafccf5ba7756a7c3c20857f31073c4906be7a86adbe6a95
+rust-rules/no-unwrap/src/lib.rs 9c8f40765bacfb7fcf18e92e05e0e161b1c21fb7626dd830c9ce683c0b378845
