@@ -657,6 +657,14 @@ struct Prepared {
     /// Whatever identifies the rule to a reader — a rule id. Diagnostics only.
     id: String,
     pre: RulePre<RuntimeState>,
+    /// The options this rule's `configure` is called with, as JSON.
+    ///
+    /// Not diagnostics: [`WasmRuntime::rule`] reads it on every worker, because the world's
+    /// `configure` is declared "once, after instantiation and before any `check`" and an
+    /// instance is built per worker. Held here rather than per worker because the answer is
+    /// the run's, not the store's — two workers configuring one rule differently is the
+    /// determinism failure this arrangement exists to make impossible.
+    options: String,
 }
 
 /// Every rule component a run will execute, linked and type-checked once.
@@ -731,18 +739,44 @@ impl RuleSet {
     /// component failing to instantiate is *incidental* protection — it holds only while this
     /// host declines to link WASI — so a check that can be bypassed is not the condition.
     ///
+    /// # `options_json` is a parameter and not a later call, for the reason `loaded` is a
+    /// [`Loaded`]
+    ///
+    /// The world declares `configure` as happening "once, after instantiation and before any
+    /// `check`", and an instance is built lazily *per worker* — so a configuration step a
+    /// caller performs is a step that runs on whichever worker the caller happened to hold and
+    /// on none of the others. A rule configured on some workers and not others answers
+    /// differently depending on which files rayon gave which worker, which is the determinism
+    /// invariant rather than a nicety.
+    ///
+    /// Taking the options here makes it unavoidable instead: [`WasmRuntime::rule`] configures
+    /// every instance it builds, and there is no way to reach a slot's instance that skips it.
+    /// `"null"` is the shape for a rule named with no options — the world says so, so a guest
+    /// has one code path rather than two — and it is spelled out by the caller rather than
+    /// defaulted here, because "this rule has no options" and "nobody said" are different
+    /// claims and only the caller can tell them apart.
+    ///
     /// # Errors
     ///
     /// Returns [`WasmError::Engine`] when the component does not satisfy the world: an import
     /// the host does not provide, or a missing or wrongly typed export.
-    pub fn add(&mut self, id: impl Into<String>, loaded: &Loaded) -> Result<RuleSlot, WasmError> {
+    pub fn add(
+        &mut self,
+        id: impl Into<String>,
+        loaded: &Loaded,
+        options_json: impl Into<String>,
+    ) -> Result<RuleSlot, WasmError> {
         let pre = self
             .linker
             .instantiate_pre(loaded.component())
             .and_then(RulePre::new)
             .map_err(|e| WasmError::Engine(e.to_string()))?;
         let slot = RuleSlot(self.rules.len());
-        self.rules.push(Prepared { id: id.into(), pre });
+        self.rules.push(Prepared {
+            id: id.into(),
+            pre,
+            options: options_json.into(),
+        });
         Ok(slot)
     }
 
@@ -1163,6 +1197,12 @@ impl WasmRuntime {
     /// rather than a ruleset; and the two cap cases in `tests/instantiation.rs` instantiate
     /// into one store until it refuses, which is the one thing a bounded API cannot express.
     ///
+    /// **It does not configure what it builds, and cannot.** A slot carries the options
+    /// [`RuleSet::add`] recorded; a bare component carries none, so there is nothing to hand
+    /// over. That is a second reason this is not the door a run comes through: an instance
+    /// from here has never seen `configure`, which the world declares must happen before any
+    /// `check`. [`WasmRuntime::rule`] is where both obligations are met at once.
+    ///
     /// # It takes a [`Loaded`] for the same reason [`RuleSet::add`] does
     ///
     /// It took a bare `&Component` until a review found what that meant: a published method
@@ -1228,23 +1268,53 @@ impl WasmRuntime {
     /// reasoning does not carry: every failure this can return cancels the run, so there is no
     /// next file to retry for.
     ///
+    /// # This is where `configure` happens, and it is the only place it can happen
+    ///
+    /// The world declares `configure` as running "once, after instantiation and before any
+    /// `check`". Instantiation is lazy and per worker, so nothing a *caller* does can satisfy
+    /// that: a rule first instantiated inside `check` on worker N would never have passed
+    /// through a configuration step performed anywhere else, and a rule running configured on
+    /// some workers and unconfigured on others answers differently depending on how rayon
+    /// split the corpus. That is a determinism failure, not a missing feature.
+    ///
+    /// So the call sits between the instantiation and the instance being handed out, reading
+    /// the options [`RuleSet::add`] recorded. Both halves of "once" follow from where it is:
+    /// once per (worker, rule) because the surrounding branch runs once, and before any
+    /// `check` because every entry point goes through here first.
+    ///
+    /// **A refusal leaves no instance behind.** The instance is stored only after the guest
+    /// has accepted its options, so a run that ends here never had a live-but-unconfigured
+    /// instance to reach. The store keeps the memory either way — nothing reclaims an instance
+    /// — but that costs a run which is already over.
+    ///
     /// # Errors
     ///
     /// Returns [`WasmError`] on a breached limit — instantiation runs the component's own
-    /// initialization and allocates its linear memory's minimum — or [`WasmError::Engine`] for
-    /// a slot this runtime's rule set never issued.
+    /// initialization and allocates its linear memory's minimum — [`WasmError::Misconfigured`]
+    /// when the guest declines the options it was handed, or [`WasmError::Engine`] for a slot
+    /// this runtime's rule set never issued.
     pub fn rule(&mut self, slot: RuleSlot) -> Result<&Rule, WasmError> {
         if !self.is_instantiated(slot) {
             let rules = Arc::clone(&self.rules);
-            let pre = &rules.rule(slot)?.pre;
+            let prepared = rules.rule(slot)?;
 
             let timeout = self.limits.rule_timeout;
             self.arm(timeout);
-            let outcome = pre.instantiate(&mut self.store);
+            let outcome = prepared.pre.instantiate(&mut self.store);
             self.disarm();
             let instance = outcome.map_err(|error| self.classify(&error, timeout))?;
 
             self.instantiations += 1;
+
+            self.arm(timeout);
+            let configured = instance.call_configure(&mut self.store, &prepared.options);
+            self.disarm();
+            match configured {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => return Err(WasmError::Misconfigured { message }),
+                Err(error) => return Err(self.classify(&error, timeout)),
+            }
+
             // `rules.rule(slot)` above already refused an out-of-range slot, and `instances`
             // is sized from the same set, so this index is in range. `get_mut` rather than
             // `[]` regardless: the workspace denies panicking outside tests, and an engine
@@ -1267,13 +1337,21 @@ impl WasmRuntime {
 
     /// What this rule says it is.
     ///
-    /// Instantiates the rule if it is not already, on the same terms as [`Self::rule`] —
-    /// prepare time is the one point where every rule is instantiated regardless of whether
-    /// its query will match, because a rule that cannot describe itself cannot be run at all.
+    /// Instantiates and configures the rule if it is not already, on the same terms as
+    /// [`Self::rule`] — prepare time is the one point where every rule is instantiated
+    /// regardless of whether its query will match, because a rule that cannot describe itself
+    /// cannot be run at all.
+    ///
+    /// **A rule that refuses its options never gets to describe itself**, because
+    /// configuration happens on the way to the instance this reads from. That ordering is the
+    /// world's rather than this method's, and it is the useful one: a component handed
+    /// configuration it cannot use has been misconfigured, and reporting that is more use than
+    /// reporting the metadata of a rule the run is about to refuse anyway.
     ///
     /// # Errors
     ///
-    /// [`WasmError`] if the slot is unknown, instantiation fails, or the guest traps.
+    /// [`WasmError`] if the slot is unknown, instantiation fails, the guest declines its
+    /// options, or the guest traps.
     pub fn metadata(&mut self, slot: RuleSlot) -> Result<types::RuleMetadata, WasmError> {
         self.rule(slot)?;
         let timeout = self.limits.rule_timeout;
@@ -1281,36 +1359,6 @@ impl WasmRuntime {
         let outcome = self.with_instance(slot, |rule, store| rule.call_metadata(store));
         self.disarm();
         outcome.map_err(|error| self.classify(&error, timeout))
-    }
-
-    /// Hand a slot's rule its configured options, once, before any `check`.
-    ///
-    /// Instantiates the rule if it is not already, on the same terms as [`Self::rule`].
-    ///
-    /// `options_json` crosses as data rather than as a typed value because a component has no
-    /// way to close over a host-supplied value the way a JavaScript factory does — see
-    /// `configure`'s own doc in `wit/world.wit`. `null` is the bare-reference shape: a rule
-    /// named with no options is still configured, with `null`, so a guest has one code path
-    /// rather than two.
-    ///
-    /// # Errors
-    ///
-    /// [`WasmError`] if the slot is unknown, instantiation fails, or the guest traps. Returns
-    /// [`WasmError::Misconfigured`], carrying the guest's own message, when the guest ran to
-    /// completion and declined the options it was handed — a refusal rather than a trap, and
-    /// deliberately not folded into [`WasmError::Guest`]: see that variant's own doc for why.
-    pub fn configure(&mut self, slot: RuleSlot, options_json: &str) -> Result<(), WasmError> {
-        self.rule(slot)?;
-        let timeout = self.limits.rule_timeout;
-        self.arm(timeout);
-        let outcome =
-            self.with_instance(slot, |rule, store| rule.call_configure(store, options_json));
-        self.disarm();
-        match outcome {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(message)) => Err(WasmError::Misconfigured { message }),
-            Err(error) => Err(self.classify(&error, timeout)),
-        }
     }
 
     /// Ask a slot's rule whether it has a per-file pass, instantiating it if needed.

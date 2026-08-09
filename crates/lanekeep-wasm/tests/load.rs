@@ -135,7 +135,7 @@ fn violations(engine: &Arc<WasmEngine>, loaded: &Loaded) -> Vec<String> {
     let engine = Arc::clone(engine);
     let mut rules = RuleSet::new(&engine).expect("the world links");
     let slot = rules
-        .add("world-shape", loaded)
+        .add("world-shape", loaded, "null")
         .expect("the fixture satisfies the world");
 
     let limits = Limits::default();

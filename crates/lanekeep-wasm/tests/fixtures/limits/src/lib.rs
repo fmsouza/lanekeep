@@ -73,13 +73,18 @@ impl Guest for Component {
         }
     }
 
-    /// Not exercised by any test — every export is mandatory because a WIT world has no
-    /// optional ones. `tests/fixtures/metadata/` is where `configure` itself is tested.
+    /// Accepts the no-options shape and refuses everything else.
     ///
-    /// Refuses unconditionally rather than accepting anything, so a caller that reached this
-    /// export on this fixture fails loudly instead of passing on a vacuous success.
-    fn configure(_options_json: String) -> Result<(), String> {
-        Err("fixture/limits does not implement configure".to_owned())
+    /// `tests/limits.rs` drives this guest through `WasmRuntime::instantiate`, which does not
+    /// configure — but `lanekeep-engine`'s `swapping_a_component_between_runs_changes_the_answer`
+    /// installs these bytes as a *rule*, and `WasmRuntime::rule` configures every instance it
+    /// builds. An unconditional refusal would stop that run inside instantiation, which is not
+    /// what it is testing.
+    fn configure(options_json: String) -> Result<(), String> {
+        if options_json == "null" {
+            return Ok(());
+        }
+        Err("fixture/limits takes no options".to_owned())
     }
 
     fn has_check() -> bool {

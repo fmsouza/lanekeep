@@ -116,13 +116,22 @@ impl Guest for Component {
         }
     }
 
-    /// Not exercised by any test — every export is mandatory because a WIT world has no
-    /// optional ones. `tests/fixtures/metadata/` is where `configure` itself is tested.
+    /// Accepts `null` and an object, and refuses anything else.
     ///
-    /// Refuses unconditionally rather than accepting anything, so a caller that reached this
-    /// export on this fixture fails loudly instead of passing on a vacuous success.
-    fn configure(_options_json: String) -> Result<(), String> {
-        Err("fixture/engine-rule does not implement configure".to_owned())
+    /// It used to refuse unconditionally, which was right while nothing called it and is not
+    /// now: `WasmRuntime::rule` configures every instance it builds, and this is the fixture
+    /// `lanekeep-engine`'s component-dispatch tests actually run — so an unconditional refusal
+    /// would fail every one of them, from inside instantiation, with a message about an export
+    /// none of those tests mention.
+    ///
+    /// An object is accepted as well as `null` so that a test configuring this rule with real
+    /// options is testing the engine's plumbing rather than this guest's opinion of it. What
+    /// stays refused is the shape that is not options at all.
+    fn configure(options_json: String) -> Result<(), String> {
+        if options_json == "null" || options_json.starts_with('{') {
+            return Ok(());
+        }
+        Err("fixture/engine-rule expects an object or null".to_owned())
     }
 
     fn has_check() -> bool {

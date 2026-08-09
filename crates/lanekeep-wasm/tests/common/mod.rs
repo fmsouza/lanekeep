@@ -10,7 +10,16 @@ use lanekeep_core::limits::{Limits, RunClock};
 use lanekeep_wasm::{ComponentLoader, RuleSet, RuleSlot, WasmEngine, WasmRuntime};
 
 /// A runtime holding exactly the named fixture, and its slot.
+///
+/// The rule is registered with `"null"` options, which is the shape the world gives a rule
+/// named with no options. Nothing is instantiated yet: `WasmRuntime::rule` does that, and
+/// configures what it built, on first use.
 pub(crate) fn runtime_for(name: &str) -> (WasmRuntime, RuleSlot) {
+    runtime_for_options(name, "null")
+}
+
+/// The same, with the options the rule will be configured with.
+pub(crate) fn runtime_for_options(name: &str, options_json: &str) -> (WasmRuntime, RuleSlot) {
     let engine = WasmEngine::new().expect("an engine");
     let bytes = std::fs::read(format!("tests/fixtures/{name}.wasm")).expect("the artifact ships");
     let loaded = ComponentLoader::without_cache()
@@ -18,7 +27,7 @@ pub(crate) fn runtime_for(name: &str) -> (WasmRuntime, RuleSlot) {
         .expect("imports are permitted");
 
     let mut set = RuleSet::new(&engine).expect("a set");
-    let slot = set.add(name, &loaded).expect("added");
+    let slot = set.add(name, &loaded, options_json).expect("added");
 
     let limits = Limits::default();
     let clock = RunClock::start(limits.global_timeout);

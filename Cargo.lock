@@ -835,6 +835,7 @@ dependencies = [
  "lanekeep-core",
  "lanekeep-js",
  "lanekeep-lang-js",
+ "lanekeep-wasm",
  "serde",
  "serde_json",
  "thiserror",

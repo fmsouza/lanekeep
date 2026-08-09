@@ -3,7 +3,10 @@
 //! Every field carries a distinct value, so a host that transposed two of them — `message`
 //! for `remediation`, say — fails rather than passing on a plausible-looking answer.
 //! `configure` accepts an object or `null` and refuses anything else with its own message,
-//! which is what `tests/metadata.rs`'s three `configure` tests drive. The other four exports
+//! which is what `tests/metadata.rs`'s four `configure` tests drive — through `RuleSet::add`
+//! and `WasmRuntime::rule`, because that is the only door there is: an instance is configured
+//! on the way to being handed out. This guest is also what `lanekeep-config`'s own tests point
+//! a `.wasm` reference at, so its `metadata` values are asserted from two crates. The other four exports
 //! are stubs: a WIT world has no optional exports, so every component answers all of them
 //! regardless of which passes it uses, and this one is not shaped like a real rule — see
 //! `tests/fixtures/engine-rule/` for that.
@@ -45,7 +48,9 @@ impl Guest for Component {
     ///
     /// `tests/metadata.rs` drives all three shapes: a well-formed object, `null` (the
     /// bare-reference case), and a JSON array, which is refused rather than trapped so the
-    /// refusal carries a message a user can act on.
+    /// refusal carries a message a user can act on. The array case is driven twice — once
+    /// through `rule` and once through `check` — because "a refusal is its own variant" and
+    /// "nothing checks anything before it has been configured" are different claims.
     fn configure(options_json: String) -> Result<(), String> {
         if options_json == "null" {
             return Ok(());

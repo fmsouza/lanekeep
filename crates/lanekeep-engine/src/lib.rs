@@ -415,12 +415,21 @@ pub struct Engine {
     /// Whether results may be read from and written to the cache.
     ///
     /// **Off for any run that loaded a component, and that is a correctness guard rather than a
-    /// policy.** A component's bytes reach no cache-key input: `RuleSpec::component` is set on a
-    /// `Config` *after* `lanekeep_config::load` computed `ruleset_hash`, and `load_components`
-    /// reads the file with an untracked `std::fs::read`. So without this, swapping a rule's
-    /// component for a different one between two runs serves the first one's answer forever —
-    /// demonstrated by `swapping_a_component_between_runs_changes_the_answer`, which fails
-    /// without it.
+    /// policy.** It was written when a component's bytes could reach no cache-key input at all:
+    /// `RuleSpec::component` was set on a `Config` *after* `lanekeep_config::load` computed
+    /// `ruleset_hash`, and `load_components` reads the file with an untracked `std::fs::read`.
+    /// So without this, swapping a rule's component for a different one between two runs serves
+    /// the first one's answer forever — demonstrated by
+    /// `swapping_a_component_between_runs_changes_the_answer`, which fails without it.
+    ///
+    /// **That is now true of a hand-built spec and false of a configured one**, which is why
+    /// this is still here and is no longer right. `lanekeep-config` resolves a `.wasm`
+    /// reference itself, so a component named by a config is in `hash_ruleset`'s fold before
+    /// any `Config` exists — the condition the paragraph below names as the one that has to
+    /// hold. What is *not* covered is a component attached to a `RuleSpec` afterwards, by an
+    /// embedder or by the tests below, and a guard that could tell those apart would have to
+    /// ask where the field came from. Removing this is its own change, with the two-run
+    /// assertion that says the cache is now correct rather than merely off.
     ///
     /// **Refusing the cache rather than folding the bytes here**, for three reasons. The correct
     /// fold already exists in `lanekeep-config`'s `hash_ruleset` — sorted, deduplicated,
@@ -428,13 +437,11 @@ pub struct Engine {
     /// cache-key encoding in a second crate is exactly the drift that produced this
     /// sub-project's one real cache bug, where reusing a text separator for arbitrary binary let
     /// two rulesets share a key. The fold belongs beside the existing one, on the day
-    /// `lanekeep-config` can produce a component-backed rule at all — which it cannot yet:
-    /// `rules_module` still refuses a `.wasm` specifier (see `RuleSpec::component`), even
-    /// though the world can now describe one through its `metadata` export. So this costs
-    /// nothing today, and revisiting it tracks that wiring landing rather than the export
-    /// having landed. And a guard that turns the cache *off* has no encoding to get wrong: the
-    /// failure mode of getting it wrong is a cold run, where the failure mode of a wrong fold is
-    /// a wrong answer.
+    /// `lanekeep-config` can produce a component-backed rule at all — **which it now can**: a
+    /// `.wasm` reference is resolved from the component's own `metadata` export, and its bytes
+    /// go through `hash_ruleset` on the way. And a guard that turns the cache *off* has no
+    /// encoding to get wrong: the failure mode of getting it wrong is a cold run, where the
+    /// failure mode of a wrong fold is a wrong answer.
     ///
     /// It is per run rather than per rule because a cache entry is per *file* and holds every
     /// rule's findings for it, so there is no finer granularity that is sound.
@@ -2393,9 +2400,10 @@ fn load_components(
     let loader = ComponentLoader::for_project_root(project_root);
 
     for rule in rules.iter_mut() {
-        let Some(path) = rule.spec.component.clone() else {
+        let Some(component) = rule.spec.component.clone() else {
             continue;
         };
+        let path = component.path;
         let name = rule.spec.id.to_string();
         let bytes = std::fs::read(&path).map_err(|e| RunError::Component {
             rule: name.clone(),
@@ -2407,10 +2415,18 @@ fn load_components(
                 rule: name.clone(),
                 detail: e.to_string(),
             })?;
-        let slot = set.add(&name, &admitted).map_err(|e| RunError::Component {
-            rule: name,
-            detail: e.to_string(),
-        })?;
+        // The options travel with the rule rather than being handed over later, because an
+        // instance is built lazily per worker: `RuleSet::add` records them and
+        // `WasmRuntime::rule` hands them to every instance it builds. A configuration step
+        // performed here instead would reach whichever store this thread happens to hold and
+        // none of the others, which is a rule answering differently depending on how rayon
+        // split the corpus.
+        let slot =
+            set.add(&name, &admitted, component.options)
+                .map_err(|e| RunError::Component {
+                    rule: name,
+                    detail: e.to_string(),
+                })?;
         rule.slot = Some(slot);
     }
 
@@ -5177,6 +5193,8 @@ export default defineRule({
     /// makes this module a check that a path was *added*. The two engines share one corpus, one
     /// clock, one read memo per file, and one sorted output.
     mod components {
+        use lanekeep_config::ComponentRule;
+
         use super::*;
 
         /// The rule-shaped fixture, built by `just wasm-fixtures`.
@@ -5200,6 +5218,20 @@ export default defineRule({
         /// nothing in `lanekeep-config` calls it yet. See [`RuleSpec::component`]. What the
         /// engine dispatches on is this field, so a hand-built spec exercises exactly the
         /// production path.
+        /// The fixture, as the field the engine dispatches on.
+        ///
+        /// `"null"` because none of these tests configures the rule: it is the shape the world
+        /// gives a rule named with no options, and it is what the fixture's `configure`
+        /// accepts. It is spelled out at every call rather than defaulted, because a component
+        /// that reaches a worker with nothing recorded for it would be configured with
+        /// whatever this crate guessed.
+        fn backed_by(path: PathBuf) -> ComponentRule {
+            ComponentRule {
+                path,
+                options: "null".to_owned(),
+            }
+        }
+
         fn component_rule(id: &str, index: usize, has_reduce: bool) -> RuleSpec {
             RuleSpec {
                 index,
@@ -5218,7 +5250,7 @@ export default defineRule({
                 gates: lanekeep_core::Gates::default(),
                 timeout: None,
                 has_reduce,
-                component: Some(fixture()),
+                component: Some(backed_by(fixture())),
             }
         }
 
@@ -5561,7 +5593,7 @@ export default defineRule({
             fs::copy(fixture(), &installed).expect("installs the rule-shaped component");
 
             let mut rule = component_rule("local/middle", 1, false);
-            rule.component = Some(installed.clone());
+            rule.component = Some(backed_by(installed.clone()));
 
             let outcome = project
                 .prepared(vec![rule.clone()])
@@ -5903,10 +5935,10 @@ export default defineRule({
             // The `limits` fixture spins forever when the first capture is named `spin`, which
             // is the shortest route to a store that has trapped.
             let mut spinner = component_rule("local/middle", 1, false);
-            spinner.component = Some(
+            spinner.component = Some(backed_by(
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../lanekeep-wasm/tests/fixtures/limits.wasm"),
-            );
+            ));
             spinner.query = "(variable_declarator) @spin".to_owned();
             spinner.timeout = Some(Duration::from_millis(30));
 
@@ -5939,7 +5971,7 @@ export default defineRule({
         #[test]
         fn a_missing_component_is_reported_against_its_rule_before_any_file_is_read() {
             let mut rule = component_rule("local/middle", 1, false);
-            rule.component = Some(PathBuf::from("/does/not/exist/rule.wasm"));
+            rule.component = Some(backed_by(PathBuf::from("/does/not/exist/rule.wasm")));
 
             let project = Project::new(
                 "component-missing",
@@ -5969,7 +6001,7 @@ export default defineRule({
             );
 
             let mut rule = component_rule("local/middle", 1, false);
-            rule.component = Some(project.dir.join("not-a-rule.wasm"));
+            rule.component = Some(backed_by(project.dir.join("not-a-rule.wasm")));
 
             let error = project.run_with(vec![rule]).expect_err("must not run");
             assert!(matches!(error, RunError::Component { .. }), "{error}");

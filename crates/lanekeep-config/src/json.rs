@@ -48,8 +48,16 @@
 //! One thing does still cross into JavaScript on this path, and it is rule *execution*, not
 //! configuration: a reference naming a TypeScript rule is rendered into a rules-only entry
 //! module by [`rules_module`], because a TypeScript rule's `id`, `query` and `card` live
-//! inside its own `defineRule` call and nothing but evaluating it can read them. A JSON
-//! config naming only components needs no JavaScript at all, which is asserted in `lib.rs`.
+//! inside its own `defineRule` call and nothing but evaluating it can read them. A component
+//! is the other way round — it answers `metadata` itself, so it contributes no import and
+//! nothing for the sandbox to evaluate.
+//!
+//! **A config naming only components still evaluates an entry module, and that is a residue
+//! rather than a requirement.** `crate::load` always evaluates and always runs `EXTRACT`, so a
+//! components-only config produces `globalThis.__lanekeepConfig = { rules: [null] }` and gets
+//! a list of nulls back. Nothing is read from it. Skipping the sandbox when no reference names
+//! a module is a real simplification and is not made here, because the same entry module is
+//! what every worker evaluates and that path has to agree with this one.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -93,9 +101,9 @@ pub enum RuleReference {
     /// relative module specifier resolves against, since the synthetic entry module sits
     /// there.
     ///
-    /// Recognized, not yet executable. Nothing in the tree loads one, and refusing it at
-    /// load is deliberate: a reference that parsed and then silently checked nothing is the
-    /// failure this crate exists to avoid producing more of.
+    /// Resolved rather than merely recognized: `crate::describe_components` loads these bytes
+    /// at config load and asks the component what it is, because a `.wasm` carries its own
+    /// `id`, `query`, `card` and gates and there is no config syntax for any of them.
     Component(PathBuf),
 
     /// A rule module on disk, as in `"./lanekeep/rules/mine.ts"`.
@@ -120,14 +128,12 @@ pub struct ResolvedRule {
     /// The distinction is the one a rule author already makes between a rule and a rule
     /// factory, and it is not inferred from whether a value happens to be present.
     ///
-    /// **How options reach a *component* is declared and not yet wired.** A component cannot
-    /// close over a host-supplied value the way a JavaScript factory does, so
-    /// `crates/lanekeep-wasm/wit/world.wit` declares `configure(options-json)` for exactly
+    /// A component cannot close over a host-supplied value the way a JavaScript factory does,
+    /// so `crates/lanekeep-wasm/wit/world.wit` declares `configure(options-json)` for exactly
     /// that reason — a call made once after instantiation, taking this field serialized as
-    /// JSON (`null` for the bare-string form). Nothing in this crate calls it yet: a
-    /// component reference is still refused outright by `rules_module`, with or without
-    /// options, so this field has nowhere to be read from for a component-backed rule until
-    /// that refusal is lifted.
+    /// JSON (`null` for the bare-string form). `crate::describe_components` serializes it once
+    /// and records it with the rule, so the bytes every worker's `configure` is handed are the
+    /// same bytes.
     pub options: Option<Value>,
 }
 
@@ -280,25 +286,35 @@ fn classify(specifier: &str, rules_root: &Path) -> RuleReference {
 /// Rust by [`parse`] and never become JavaScript. What is left here is the one thing a
 /// sandbox is still required for — reading a TypeScript rule's own declaration.
 ///
-/// # Errors
+/// # A component holds its place in the array and contributes no JavaScript
 ///
-/// Returns [`ConfigError::Rule`] for a reference naming a component, which is recognized and
-/// not executable.
-pub(crate) fn rules_module(rules: &[ResolvedRule], display: &str) -> Result<String, ConfigError> {
+/// A component is resolved in Rust: its `id`, `query` and card come from its own `metadata`
+/// export, so there is nothing here to import and nothing for the sandbox to evaluate. What
+/// it emits instead is a literal `null` in the array, and that is load-bearing rather than
+/// tidy.
+///
+/// `RuleSpec::index` is how the engine reaches a *TypeScript* handler — it is spelled
+/// `globalThis.__lanekeepConfig.rules[index].check(...)` — and it is also the position
+/// `lanekeep-config` builds every rule at. Skipping a component would make those two numbers
+/// disagree the moment a config mixes the kinds: rule 3 in the config would be rule 2 in the
+/// array, and every rule after a component would dispatch to its neighbor. That failure is
+/// silent — a rule object is a rule object, the call succeeds, and the violations are simply
+/// attributed to the wrong rule. A placeholder keeps one numbering for both, so there is no
+/// mapping to get wrong.
+///
+/// Nothing ever reads the placeholder: a component-backed rule dispatches on
+/// `RuleSpec::component`, not through this array. The one thing that touches it is `EXTRACT`,
+/// which is written with `?.` throughout and yields a rule with no `id` and no `check` — which
+/// is exactly what a component's entry in the extracted array should look like, since its real
+/// answers come from somewhere else entirely.
+pub(crate) fn rules_module(rules: &[ResolvedRule]) -> String {
     let mut imports = String::new();
     let mut references = Vec::with_capacity(rules.len());
 
     for (index, rule) in rules.iter().enumerate() {
         if matches!(rule.reference, RuleReference::Component(_)) {
-            return Err(ConfigError::Rule {
-                position: index + 1,
-                path: display.to_owned(),
-                detail: format!(
-                    "`{}` names a compiled rule component, which this build cannot run yet \
-                     — use a rule module or a built-in",
-                    rule.specifier
-                ),
-            });
+            references.push("null".to_owned());
+            continue;
         }
 
         let binding = format!("__lanekeepRule{index}");
@@ -314,10 +330,10 @@ pub(crate) fn rules_module(rules: &[ResolvedRule], display: &str) -> Result<Stri
         });
     }
 
-    Ok(format!(
+    format!(
         "{imports}globalThis.__lanekeepConfig = {{ rules: [{}] }};\n",
         references.join(", "),
-    ))
+    )
 }
 
 /// Reject a specifier that cannot mean what it says.
@@ -381,7 +397,7 @@ mod tests {
     /// shared one file and each test read whichever had been written last. Keying on a hash
     /// of the *content* was the obvious repair and is still wrong: two tests can legitimately
     /// use the identical config — `a_component_reference_resolves_to_a_path` and
-    /// `a_component_reference_is_refused_for_now` both write
+    /// `a_component_reference_imports_nothing` both write
     /// `{"rules": ["./rules/mine.wasm"]}` — and `std::fs::write` truncates before it writes,
     /// so the sibling thread reads an empty file and fails with `EOF while parsing a value at
     /// line 1 column 0`. Measured five failures in eighty runs of
@@ -404,7 +420,7 @@ mod tests {
 
     fn compile(name: &str, json: &str) -> Result<String, ConfigError> {
         let parsed = parse_config(name, json)?;
-        rules_module(&parsed.rules, "lanekeep.json")
+        Ok(rules_module(&parsed.rules))
     }
 
     #[test]
@@ -530,17 +546,38 @@ mod tests {
         );
     }
 
-    /// Recognized and refused, rather than accepted and quietly doing nothing.
+    /// A component is resolved in Rust, so it contributes no import and no rule object.
     #[test]
-    fn a_component_reference_is_refused_for_now() {
-        let error = compile("component-refused", r#"{"rules": ["./rules/mine.wasm"]}"#)
-            .expect_err("a component cannot be executed yet");
-        let rendered = error.to_string();
-        assert!(rendered.contains("component"), "{rendered}");
-        assert!(rendered.contains("mine.wasm"), "{rendered}");
+    fn a_component_reference_imports_nothing() {
+        let source = compile(
+            "component-placeholder",
+            r#"{"rules": ["./rules/mine.wasm"]}"#,
+        )
+        .expect("a component is resolved without the sandbox");
+        assert_eq!(source, "globalThis.__lanekeepConfig = { rules: [null] };\n");
+    }
+
+    /// And the reason its place is held rather than closed up.
+    #[test]
+    fn a_rule_after_a_component_keeps_its_position_in_the_array() {
+        // `RuleSpec::index` is spelled `__lanekeepConfig.rules[index].check(...)` by the
+        // engine, and it is also the position `build` numbers every rule at. Skipping the
+        // component would make rule 2 of the config rule 1 of the array, so every rule after a
+        // component would dispatch to its neighbor — a call that succeeds, and violations
+        // attributed to the wrong rule.
+        let source = compile(
+            "component-numbering",
+            r#"{"rules": ["./rules/mine.wasm", "lanekeep/no-default-export", "./mine.ts"]}"#,
+        )
+        .expect("compiles");
+
         assert!(
-            matches!(error, ConfigError::Rule { position: 1, .. }),
-            "the error should name which entry: {error:?}"
+            source.contains("import __lanekeepRule1 from 'lanekeep/no-default-export';"),
+            "{source}"
+        );
+        assert!(
+            source.contains("rules: [null, __lanekeepRule1, __lanekeepRule2]"),
+            "{source}"
         );
     }
 

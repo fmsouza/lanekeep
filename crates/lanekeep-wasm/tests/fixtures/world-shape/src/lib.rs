@@ -53,13 +53,22 @@ impl Guest for Component {
         }
     }
 
-    /// Not exercised by any test — every export is mandatory because a WIT world has no
-    /// optional ones. `tests/fixtures/metadata/` is where `configure` itself is tested.
+    /// Accepts the no-options shape and refuses everything else.
     ///
-    /// Refuses unconditionally rather than accepting anything, so a caller that reached this
-    /// export on this fixture fails loudly instead of passing on a vacuous success.
-    fn configure(_options_json: String) -> Result<(), String> {
-        Err("fixture/world-shape does not implement configure".to_owned())
+    /// It used to refuse unconditionally, on the reasoning that reaching an unimplemented
+    /// export should fail loudly rather than pass vacuously. That reasoning is now wrong for
+    /// this fixture and right for the eight probes beside it: `WasmRuntime::rule` configures
+    /// every instance it builds, so `null` is reached on the ordinary path — by
+    /// `tests/instantiation.rs` and `tests/load.rs`, which drive this guest through a
+    /// `RuleSet` — and refusing it would mean this fixture could not be instantiated at all.
+    ///
+    /// Refusing anything else keeps the loud half: a caller that hands this fixture real
+    /// options is still told that it has no idea what to do with them.
+    fn configure(options_json: String) -> Result<(), String> {
+        if options_json == "null" {
+            return Ok(());
+        }
+        Err("fixture/world-shape takes no options".to_owned())
     }
 
     fn has_check() -> bool {
