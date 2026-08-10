@@ -832,6 +832,33 @@ It goes to stderr, so `--profile --format json` still pipes a clean document, an
 
 Off by default, because measuring costs a clock read per handler invocation and the warm path is the one place that matters most.
 
+### 15.1 What a host-API crossing costs, in each engine
+
+§4's invariant is that JavaScript executes proportional to matches and that any change increasing boundary crossings per file needs a benchmark rather than an argument. Putting a rule in a WebAssembly component was expected to leave the number of crossings alone and change what one costs, because the canonical ABI copies strings and lists through linear memory where `rquickjs` handed QuickJS a value. That was the one unmeasured quantity that could have inverted the case for components, and the decision record made measuring it a condition of acceptance. `benches/crossings.rs` is the measurement.
+
+**The subject is `lanekeep/no-unwrap`, run as both.** It exists in two forms — the TypeScript module that was the shipped rule until `1fb5d06`, and the component that replaced it — and it is the heavier of the two ported built-ins by a wide margin. The two corpora are byte-identical except for a six-character method name: `unwrap`, which sends the rule up the ancestor chain looking for a `#[test]`, against `mapmap`, which it drops after one call. Everything that is not a crossing — reading, hashing, parsing, query matching, the invocation itself — is identical on both sides and subtracts out.
+
+Measured 2026-08-10, Apple M3 Max (14 cores), macOS 26.5.2, rustc 1.95.0, wasmtime 47.0.3, rquickjs 0.12, tree-sitter 0.26. **Both arms in one session on one machine**, single-threaded so that a figure printed as nanoseconds per call is nanoseconds per call and not a throughput divided by the width of the machine.
+
+| Arm | Cold corpus | Hot corpus | Difference | Host calls | Per call |
+|---|---|---|---|---|---|
+| TypeScript, QuickJS | 115 ms | 294 ms | 179 ms | 593,280 | ~302 ns |
+| component, wasmtime | 78 ms | 216 ms | 138 ms | 414,720 | ~332 ns |
+
+**A host call costs about 1.1× through a component.** Ten runs on a settled machine gave 1.08 to 1.12 — QuickJS 298–304 ns, component 322–335 ns — which is the whole of the spread. (A run started immediately after a rebuild reads high, up to 1.15; the QuickJS side is the steady one and the component side is where the noise lives.) The performance argument is not inverted, and it is not close to inverted.
+
+**The denominators are different on purpose, and that is half the result.** The port hoisted `line(ancestor)` and `column(ancestor)` out of the sibling loop, so the component saves two calls per sibling it scans; against that it pays one more per match, because `filePath` is a property under QuickJS and a method on `check-context`. Over this corpus the component makes 30% fewer host calls than the rule it replaced. A benchmark that divided both times by one crossing count would have reported the two rules' relative efficiency and called it the cost of the boundary — and would have concluded, wrongly, that a component crossing is *cheaper*.
+
+So the end-to-end direction and the per-call direction disagree, and both are true: the component arm is **faster** on this corpus, by 27% on the hot one, while each of its host calls is dearer.
+
+Three things this does not say.
+
+- **It is not the cost of the boundary alone.** Between two crossings a rule also executes, and that execution is interpreted bytecode in one arm and compiled code in the other. The bench separates the arena work — the same call sequence replayed against the same `NodeArena` with no engine in the way, ~201 ns and ~236 ns of the two figures — but what remains is the crossing *plus* the in-guest execution, and nothing here splits it further. The honest reading of a residue that favors the component is not that the canonical ABI is cheaper than `rquickjs`; it is that whatever the ABI costs extra, compiled guest code more than pays back.
+- **It is this rule's call mix.** Mostly scalar and short-string returns, plus one `named-children` per match returning a list as long as the file's top-level items. A rule that moves large lists will meet the copy cost more directly than this one does.
+- **The call counts are replayed, not counted by the engine.** Neither engine exposes a host-call counter and neither grew one for this: an increment on the trust boundary's hot path is a poor trade for a benchmark. The bench instead follows the rule's decision procedure statement for statement over the same trees, counting what it would have called — and asserts that the set of violations the replay produces is exactly what both engines reported. Control flow determines the count and the reported set is what control flow produced, so a transcription that took a different path could not agree. What it does not catch is a call made on a path both implementations take and the replay also takes, but which the replay omits; the risk is bounded by the two implementations' `check` and `in_test_code` being about ninety lines each, and read side by side.
+
+**No budget moved.** This measures one thing and writes it down; the table above is re-baselined once the remaining authoring paths land.
+
 ---
 
 ## 16. Milestones
