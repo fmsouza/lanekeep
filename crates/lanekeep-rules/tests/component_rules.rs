@@ -85,6 +85,20 @@ fn the_table_agrees_with_every_component_it_names() {
         ("no-unwrap", 0, "no-unwrap"),
     ];
 
+    // A row added to `COMPONENT_RULES` and not to `EXPECTED` would be a rule this test never
+    // looks at — and every assertion below would still pass, because they all iterate
+    // `EXPECTED`. Counting the shipped component rules through the crate's public face is what
+    // forces the new row in here rather than leaving it silently uncovered.
+    let shipped = lanekeep_rules::names()
+        .filter(|name| lanekeep_rules::component(name).is_some())
+        .count();
+    assert_eq!(
+        EXPECTED.len(),
+        shipped,
+        "{shipped} rules ship as components and this test names {} of them",
+        EXPECTED.len()
+    );
+
     // Grouped by the artifact's bytes, so each component is compiled once.
     let mut by_component: Vec<Hosted> = Vec::new();
     for (rule, index, component) in EXPECTED {

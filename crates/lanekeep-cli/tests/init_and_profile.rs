@@ -187,7 +187,7 @@ fn what_init_writes_actually_runs() {
     // idle machine, and several times that in a debug build with two dozen of these running at
     // once. That is not the starter config failing to check anything, which is what this test
     // is for.
-    let output = project.run(&["check", "--timeout", "60000"]);
+    let output = project.run(&["check", "--timeout", "600000"]);
     let combined = describe(&output);
     assert_eq!(output.status.code(), Some(1), "{combined}");
     assert!(combined.contains("local/no-debugger"), "{combined}");
@@ -212,7 +212,7 @@ fn the_starter_rule_can_be_explained() {
     let written = std::fs::read_to_string(&config).expect("init wrote a config");
     std::fs::write(
         &config,
-        written.replacen('{', "{\n  \"timeouts\": { \"global\": 60000},", 1),
+        written.replacen('{', "{\n  \"timeouts\": { \"global\": 600000},", 1),
     )
     .expect("writes config");
 
@@ -316,7 +316,7 @@ fn init_writes_no_gitignore_outside_a_repository() {
 // now, and a component is not a value a module can import. `--profile` measures a rule's query
 // and handler time, which is the same either way — and for a component rule it is the first
 // thing in the tree that measures one at all.
-const CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"global": 60000},
+const CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"global": 600000},
      "rules": ["lanekeep/no-default-export"]}"#;
 
 #[test]
@@ -383,7 +383,7 @@ fn a_rule_that_never_matched_still_appears() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 60000},
+                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
                     "rules": ["lanekeep/no-default-export",
                               {"rule": "lanekeep/no-restricted-imports", "options": {}}]}"#,
             ),

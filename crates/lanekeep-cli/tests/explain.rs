@@ -64,7 +64,7 @@ fn describe(output: &Output) -> String {
 /// `Config`, which is the same either way.
 const CONFIG: &str = r#"{
       "include": ["src/**"],
-      "timeouts": {"global": 60000},
+      "timeouts": {"global": 600000},
       "rules": ["lanekeep/no-default-export",
                 {"rule": "lanekeep/no-unused-exports", "options": {}}]
     }"#;

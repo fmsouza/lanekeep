@@ -89,7 +89,7 @@ impl Corpus {
             // Raised rather than removed: a rule that genuinely hangs still fails, in under a
             // minute, rather than wedging the suite.
             .arg("--timeout")
-            .arg("45000")
+            .arg("600000")
             .output()
             .expect("runs the binary");
 

@@ -924,35 +924,35 @@ fn describe_components(
         lanekeep_wasm::ComponentLoader::for_project_root,
     );
 
+    // **Compilation first, and outside the clock that starts below.** Reading and compiling a
+    // component is host work: it is bounded by the machine and by whether `.lanekeep/components`
+    // is warm, and by nothing a rule or a config did. Charging it to the run budget made a cold
+    // run and a warm run over identical input take different exits — a 12.4 MiB JavaScript
+    // component is seconds to compile and microseconds to map — which puts the compile cache
+    // into the determinism tuple, where `(bytes, path, ruleset, config, tracked reads)` has no
+    // term for it.
+    //
+    // It has a budget of its own rather than none, and its own diagnostic: the global budget's
+    // message ends "narrow what is being checked", which is advice that cannot work against a
+    // fixed compile cost.
+
+    let compiled = compile_components(root, resolved, &engine, &loader)
+        .map_err(|(position, detail)| fail(position, detail))?;
+
     // The one clock, started before any guest code runs and shared by the enumeration and the
     // description. Two clocks would give each phase the whole global budget, so a config load
-    // could take twice what the user set and report neither overrun.
+    // could take twice what the user set and report neither overrun — and the split above does
+    // not make a second one, because it takes *host* work out of this one rather than putting
+    // guest work under another.
     let clock = RunClock::start(limits.global_timeout);
 
     let mut added = Vec::new();
-    for (position, rule) in resolved.iter().enumerate() {
-        // Whether this reference is a component at all comes first, so a config of TypeScript
-        // rules with one component in it does no work per rule that is thrown away. Extracting
-        // the two byte sources into `component_bytes` put the serialization above this test for
-        // a while, which was a small silent regression on the common shape.
-        let Some((origin, bytes, only)) =
-            component_bytes(root, rule).map_err(|detail| fail(position, detail))?
-        else {
-            continue;
-        };
+    for entry in &compiled {
+        let position = entry.position;
+        let rule = &resolved[position];
+        let options = &entry.options;
 
-        // `null` for a rule named with no options, which is the world's own shape for it —
-        // serialized once here so that every worker's `configure` is handed the same bytes.
-        let options = rule
-            .options
-            .as_ref()
-            .map_or_else(|| "null".to_owned(), json::literal);
-
-        let admitted = loader
-            .load(&engine, &rule.specifier, bytes.as_slice())
-            .map_err(|e| fail(position, e.to_string()))?;
-
-        let ids = hosted_rules(&engine, limits, &clock, &admitted)
+        let ids = hosted_rules(&engine, limits, &clock, &entry.admitted)
             .map_err(|e| fail(position, e.to_string()))?;
 
         // A component hosting nothing is a configured rule that can never report, which is the
@@ -970,14 +970,14 @@ fn describe_components(
             ));
         }
 
-        let wanted =
-            contributed(&ids, only, &rule.specifier).map_err(|detail| fail(position, detail))?;
+        let wanted = contributed(&ids, entry.only, &rule.specifier)
+            .map_err(|detail| fail(position, detail))?;
 
         for (index, id) in wanted {
             // The rule's own id rather than the specifier, because a slot's name is what a
             // diagnostic shows a reader and one specifier now stands for several rules.
             let slot = set
-                .add(&id, &admitted, index, options.clone())
+                .add(&id, &entry.admitted, index, options.clone())
                 .map_err(|e| fail(position, e.to_string()))?;
 
             added.push((
@@ -990,12 +990,12 @@ fn describe_components(
                 // user was shown would silently match nothing.
                 id,
                 ComponentRule {
-                    path: origin.clone(),
+                    path: entry.origin.clone(),
                     index,
                     options: options.clone(),
                     // An `Arc` clone: the rules of one component share the read, which is what
                     // makes "read once" per reference rather than per rule.
-                    bytes: bytes.clone(),
+                    bytes: entry.bytes.clone(),
                     // The one constructor whose output `build` folds into `ruleset_hash` —
                     // see the field.
                     counted_in_ruleset_hash: true,
@@ -1043,6 +1043,122 @@ fn describe_components(
     }
 
     Ok(described)
+}
+
+/// How long one component may take to read, compile and admit.
+///
+/// **Not the global run budget, and deliberately not user-configurable.** Compilation is host
+/// work — it scales with the machine and with whether `.lanekeep/components` is warm, and with
+/// nothing a rule or a config did — so charging it to the budget that bounds *rule execution*
+/// makes a cold run and a warm run over identical input take different exits. That is the
+/// determinism invariant, and `(bytes, path, ruleset, config, tracked reads)` has no term for a
+/// compile cache.
+///
+/// Bounded rather than unbounded, because "it is host work" is not "it may take forever": a
+/// component that never finishes compiling is a hung tool, and a diagnostic naming compilation
+/// is one a user can act on. Sixty seconds is roughly ten times the 6.2 s a 12.4 MiB
+/// StarlingMonkey component takes on an idle laptop, which leaves room for a slow shared runner
+/// and still fires long before anybody would think the process had crashed.
+///
+/// **It cannot preempt a single compilation**, and nothing here pretends otherwise: wasmtime's
+/// compile is synchronous with no interrupt, so this is checked between components. A config
+/// naming one component that hangs is bounded by nothing here. What it does bound is the
+/// aggregate, which is the case that scales — and the check is written per component so that a
+/// config with twenty of them is not held to one component's budget.
+const COMPILE_BUDGET_PER_COMPONENT: Duration = Duration::from_mins(1);
+
+/// One config entry's component, read and compiled, before any guest code runs.
+///
+/// Carried by value between the two passes so the compilation is done once. `admitted` is the
+/// only thing `RuleSet::add` accepts, and it is what makes the import check unavoidable.
+struct Compiled {
+    /// The entry's position in `resolved`, for the diagnostic and for `described`.
+    position: usize,
+    /// Provenance for [`ComponentRule::path`].
+    origin: PathBuf,
+    /// The bytes this was compiled from, folded into `ruleset_hash`.
+    bytes: ComponentBytes,
+    /// Which rule of the component this entry names, or every one of them.
+    only: Option<u32>,
+    /// The entry's options as JSON, serialized once so every worker gets the same bytes.
+    options: String,
+    /// The compiled, import-checked component.
+    admitted: lanekeep_wasm::Loaded,
+}
+
+/// Read and compile every component the config names, before the run clock starts.
+///
+/// **The first of two passes, and the split is what keeps host work out of the run budget.**
+/// See [`COMPILE_BUDGET_PER_COMPONENT`] for why, and for what bounds this instead.
+///
+/// # Errors
+///
+/// Returns `(position, detail)` — the caller knows the config's path and wraps it. A component
+/// that cannot be read, that escapes the rules root, that this build does not have, or that the
+/// loader refuses fails here, before anything is executed.
+fn compile_components(
+    root: &RuleRoot,
+    resolved: &[ResolvedRule],
+    engine: &std::sync::Arc<WasmEngine>,
+    loader: &lanekeep_wasm::ComponentLoader,
+) -> Result<Vec<Compiled>, (usize, String)> {
+    let started = std::time::Instant::now();
+    let mut compiled = Vec::new();
+
+    for (position, rule) in resolved.iter().enumerate() {
+        // Whether this reference is a component at all comes first, so a config of TypeScript
+        // rules with one component in it does no work per rule that is thrown away. Extracting
+        // the two byte sources into `component_bytes` put the serialization above this test for
+        // a while, which was a small silent regression on the common shape.
+        let Some((origin, bytes, only)) =
+            component_bytes(root, rule).map_err(|detail| (position, detail))?
+        else {
+            continue;
+        };
+
+        // `null` for a rule named with no options, which is the world's own shape for it —
+        // serialized once here so that every worker's `configure` is handed the same bytes.
+        let options = rule
+            .options
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), json::literal);
+
+        let admitted = loader
+            .load(engine, &rule.specifier, bytes.as_slice())
+            .map_err(|e| (position, e.to_string()))?;
+
+        compiled.push(Compiled {
+            position,
+            origin,
+            bytes,
+            only,
+            options,
+            admitted,
+        });
+
+        // Checked after each component rather than before, because a compilation cannot be
+        // interrupted once it has started. The budget scales with how many were asked for, so a
+        // config with twenty components is not held to one component's allowance.
+        let elapsed = started.elapsed();
+        let allowed = COMPILE_BUDGET_PER_COMPONENT
+            .saturating_mul(u32::try_from(compiled.len()).unwrap_or(u32::MAX));
+        if elapsed > allowed {
+            return Err((
+                position,
+                format!(
+                    "compiling the rule components took {elapsed:.1?}, past the {allowed:.1?} \
+                     allowed for {} of them\n  \
+                     this is the cost of turning WebAssembly into machine code and not of \
+                     running any rule, so narrowing what is checked will not help\n  \
+                     a warm `.lanekeep/components` skips it entirely — if this recurs on every \
+                     run, that directory is not writable",
+                    compiled.len()
+                ),
+            ));
+        }
+    }
+
+    Ok(compiled)
 }
 
 /// Which of a component's rules one config entry stands for, as `(index, id)`.
@@ -1883,6 +1999,33 @@ mod tests {
         })
     }
 
+    /// The `js-globals` fixture's bytes: 12.4 MiB of StarlingMonkey hosting five rules.
+    ///
+    /// The only component in the tree whose *compilation* costs enough to be measured against a
+    /// budget, which is what `compiling_a_component_is_not_charged_to_the_run_budget` needs.
+    fn big_component_bytes() -> &'static [u8] {
+        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        BYTES.get_or_init(|| {
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/js-globals.wasm"),
+            )
+            .expect("the fixture ships")
+        })
+    }
+
+    /// The `two-faced` fixture's bytes: a component whose `rules()` and `metadata()` disagree.
+    fn two_faced_component_bytes() -> &'static [u8] {
+        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        BYTES.get_or_init(|| {
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/two-faced.wasm"),
+            )
+            .expect("the fixture ships")
+        })
+    }
+
     /// A built-in table standing in for `lanekeep_rules`.
     ///
     /// A stub rather than the real table: which rules have migrated is not what these tests are
@@ -1900,6 +2043,11 @@ mod tests {
             // An index past the end of what that component hosts, for the disagreement a
             // drifted table would produce.
             "shared-missing" => Some((shared_component_bytes(), 7)),
+            // A component that answers its own id differently from its two exports.
+            "two-faced" => Some((two_faced_component_bytes(), 0)),
+            // The big one, at `probe/context` — index 1 of five, and the rule of that fixture
+            // with an ordinary `check`.
+            "big" => Some((big_component_bytes(), 1)),
             _ => None,
         }
     }
@@ -2354,6 +2502,50 @@ mod tests {
         );
     }
 
+    /// Compiling a component is not charged to the run budget.
+    ///
+    /// **The invariant this protects is determinism, not speed.** The global budget bounds rule
+    /// execution; compiling WebAssembly to machine code is host work whose cost depends on the
+    /// machine and on whether `.lanekeep/components` is warm. Charging it to that budget made a
+    /// cold run and a warm run over *identical input* take different exits — 12.4 MiB is seconds
+    /// to compile and microseconds to map — which puts the compile cache into
+    /// `(bytes, path, ruleset, config, tracked reads)`, where it has no term.
+    ///
+    /// **The ratio is what makes this a test rather than a race.** `js-globals.wasm` is the
+    /// 12.4 MiB StarlingMonkey fixture: measured 6.2 s to compile in a release build and about
+    /// twice that in a debug one, against guest work here — five `rules()` entries, five
+    /// `metadata` reads — of well under a millisecond. A 1 s budget therefore sits three orders
+    /// of magnitude above what the clocked phase spends and an order of magnitude below what the
+    /// unclocked one does, so no plausible machine makes this decide the wrong way. Before the
+    /// split it failed; there is no arrangement of this fixture under which it passes by luck.
+    ///
+    /// No artifacts directory, deliberately: with one, the second run of this test would map
+    /// rather than compile and the test would stop testing anything.
+    ///
+    /// Reached as a *built-in* rather than by path so that one of the fixture's five rules is
+    /// described rather than all of them — `probe/cross` is `reduce`-only and `build_rule`
+    /// rightly refuses a rule with neither pass, which is a different failure and would mask
+    /// this one.
+    #[test]
+    fn compiling_a_component_is_not_charged_to_the_run_budget() {
+        let fixture = Fixture::new("config-compile-unclocked", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.ts"], "namespaces": ["probe"],
+                "timeouts": {"global": 1000},
+                "rules": ["lanekeep/big"]}"#,
+        )]);
+
+        let config = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
+            .expect("a 1 s budget bounds guest work, and compiling is not guest work");
+        assert_eq!(
+            config.rules.len(),
+            1,
+            "the component's rule has to have been described, or nothing was clocked at all"
+        );
+        assert_eq!(config.rules[0].id.to_string(), "probe/context");
+    }
+
     /// A caller's `--timeout` has to govern config load, because config load runs guest code.
     ///
     /// **Asserts the raise, which is the direction that can fail.** `AGENTS.md` records why: a
@@ -2456,6 +2648,207 @@ mod tests {
             component.counted_in_ruleset_hash(),
             "a built-in component `load` resolved must be counted in `ruleset_hash`"
         );
+    }
+
+    /// A built-in names **one** rule of its component, and it is the one the table recorded.
+    ///
+    /// **The defect this is written against is silent and it is the whole point of the change
+    /// that introduced it.** A built-in reference used to contribute every rule its component
+    /// hosts, which was indistinguishable from correct while every component hosted one. With a
+    /// shared artifact it means `lanekeep/no-default-export` runs four rules — each of them
+    /// configured with options meant for one — and a run that reports four rules' violations
+    /// where one was configured looks like a thorough tool rather than a broken one.
+    ///
+    /// `shared-second` is the sharp case: index 1 of a component whose index 0 is a perfectly
+    /// good rule to run by mistake. Asserting the *count* alone would pass against a reference
+    /// that contributed rule 0 instead, and asserting the id alone would pass against one that
+    /// contributed both. Both, together, are what pin it.
+    #[test]
+    fn a_built_in_contributes_the_one_rule_its_table_recorded() {
+        let fixture = Fixture::new("builtin-component-narrowed", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/shared-second"]}"#,
+        )]);
+
+        let config = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
+            .expect("a rule of a shared component is resolvable by specifier");
+
+        assert_eq!(
+            config.rules.len(),
+            1,
+            "one entry naming one rule of a two-rule component must produce one rule, not the \
+             component's whole list: {:?}",
+            config
+                .rules
+                .iter()
+                .map(|rule| rule.id.to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let rule = &config.rules[0];
+        assert_eq!(
+            rule.id.to_string(),
+            "fixture/second",
+            "the reference is recorded at index 1 and index 0 is a rule that would run happily"
+        );
+        assert_eq!(
+            rule.component
+                .as_ref()
+                .expect("a built-in component reaches the engine as a component")
+                .index,
+            1,
+            "the engine dispatches on this, so it has to be the recorded index and not a \
+             position in the config"
+        );
+        // And the *first* rule of the same component is reachable in its own right, so this is
+        // narrowing rather than an artifact of only ever asking for one thing.
+        assert_ne!(rule.query, "(call_expression) @0");
+    }
+
+    /// The other index of the same artifact, so "it narrows" is not "it always picks index 1".
+    #[test]
+    fn each_rule_of_one_shared_component_is_reachable_as_itself() {
+        let fixture = Fixture::new("builtin-component-both", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/shared-first", "lanekeep/shared-second"]}"#,
+        )]);
+
+        let config = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
+            .expect("two rules of one artifact both resolve");
+
+        let ids: Vec<String> = config
+            .rules
+            .iter()
+            .map(|rule| rule.id.to_string())
+            .collect();
+        assert_eq!(ids, vec!["fixture/first", "fixture/second"]);
+
+        let indices: Vec<u32> = config
+            .rules
+            .iter()
+            .filter_map(|rule| rule.component.as_ref().map(|component| component.index))
+            .collect();
+        assert_eq!(indices, vec![0, 1], "each names its own slot");
+
+        // One artifact, read once per reference and carried by value, so both rules hold the
+        // same bytes — which is what lets `ruleset_hash` collapse them and `RuleSet::add` give
+        // them one instance.
+        let bytes: Vec<&[u8]> = config
+            .rules
+            .iter()
+            .filter_map(|rule| rule.component.as_ref().map(|c| c.bytes.as_slice()))
+            .collect();
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes[0], bytes[1], "two rules, one component");
+    }
+
+    /// A table recording an index the component does not have is refused, naming the disagreement.
+    ///
+    /// The failure mode a name-to-index table has that a lookup through the component does not:
+    /// it can drift. Refused here rather than left to `RuleSet::add`, whose message would be
+    /// about a slot — nobody reading "index 7 is out of range" would go looking for a built-in
+    /// table that had moved.
+    #[test]
+    fn a_table_recording_an_index_its_component_does_not_have_is_refused() {
+        let fixture = Fixture::new("builtin-component-drifted", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/shared-missing"]}"#,
+        )]);
+
+        let error = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
+            .expect_err("a recorded index the component does not have cannot be dispatched");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("lanekeep/shared-missing"),
+            "the refusal has to name the entry: {rendered}"
+        );
+        assert!(
+            rendered.contains("index 7"),
+            "and the index it could not find: {rendered}"
+        );
+        assert!(
+            rendered.contains("hosting 2 rule(s)"),
+            "and what the component actually hosts, which is the other half of a \
+             disagreement: {rendered}"
+        );
+        assert!(
+            rendered.contains("disagree"),
+            "the diagnostic is about two things not matching, not about a bad number: \
+             {rendered}"
+        );
+    }
+
+    /// A component has to answer its own id the same way twice.
+    ///
+    /// `world rule` splits `rules` from `metadata` because a rule's id must be knowable before
+    /// the rule is configured, and `metadata` is read after `configure`. Two exports therefore
+    /// answer one question, and until this check nothing compared them.
+    ///
+    /// **What a disagreement costs, and why it is silent.** The slot is registered under the id
+    /// `rules()` reported and the `RuleSpec` is built from `metadata()`, so the rule *runs* under
+    /// one name and is *reported* under another. Nothing fails: a violation appears, carrying an
+    /// id that a suppression comment or a `--rule` filter naming the configured rule will not
+    /// match, and neither of those says so.
+    ///
+    /// The fixture exists for this and nothing else — every other component in
+    /// `crates/lanekeep-wasm/tests/fixtures/` answers consistently, which is exactly why none of
+    /// them can catch a host that never asked. It also reaches `rule_specifier`, whose fallback
+    /// nothing else exercises: this diagnostic is raised in the description pass, after the loop
+    /// that had the entry's specifier in hand.
+    #[test]
+    fn a_component_that_answers_two_different_ids_for_one_rule_is_refused() {
+        let fixture = Fixture::new("component-two-faced", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/two-faced"]}"#,
+        )]);
+
+        let error = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
+            .expect_err("a component whose two accounts of itself disagree cannot be loaded");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("lanekeep/two-faced"),
+            "the refusal has to name the config entry, which is what a reader can act on: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("fixture/enumerated"),
+            "and the id it was registered under: {rendered}"
+        );
+        assert!(
+            rendered.contains("fixture/described"),
+            "and the id its metadata answered, or a reader cannot see what disagreed: \
+             {rendered}"
+        );
+    }
+
+    /// And a component that agrees with itself loads, so the check above is not rejecting
+    /// everything.
+    ///
+    /// The pair matters more than usual here: an agreement check written as an unconditional
+    /// refusal would pass the test above and fail nothing else in this file, because most of
+    /// this suite's components are reached by path rather than as built-ins.
+    #[test]
+    fn a_component_that_agrees_with_itself_is_not_refused() {
+        let fixture = Fixture::new("component-consistent", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/metadata"]}"#,
+        )]);
+
+        let config = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
+            .expect("a component whose two exports agree must load");
+        assert_eq!(config.rules[0].id.to_string(), "fixture/metadata");
     }
 
     #[test]
