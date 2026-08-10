@@ -412,6 +412,22 @@ interface types {
 /// result computed against a world without the addition is not a valid result for a run that
 /// has it. `metadata` paid that cost once, `configure` paid it again, and this change pays it
 /// a third time while also changing five signatures.
+///
+/// **The rules of one component share an instance, and therefore share every global the guest
+/// keeps.** The host instantiates once per (worker, component) rather than once per rule —
+/// resident bytes are not artifact bytes, and four copies of a 12.34 MiB engine in one store
+/// breaches the memory ceiling rather than merely wasting it. So a `static mut`, a lazily
+/// built table, a memo: all of them are visible to every rule this component hosts, and *when*
+/// each rule sees them depends on the order the host's work-stealing scheduler handed a worker
+/// its files. `configure` is the only per-index state the arrangement guarantees.
+///
+/// The rule that keeps this sound: **state outliving a `check` call must be derivable from
+/// that call's inputs.** A memo keyed on the file path is fine, because being handed a
+/// populated one is indistinguishable from being handed an empty one. A counter of files seen
+/// is not, and neither is anything `reduce` reads that `check` wrote to a variable rather than
+/// emitting as a fact — facts are the hand-off between the two phases and are per file by
+/// construction. A rule breaking this reports different violations depending on scheduling,
+/// which is the nondeterminism the whole design exists to make impossible.
 world rule {
   import types;
 

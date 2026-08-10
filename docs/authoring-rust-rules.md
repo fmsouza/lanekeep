@@ -99,7 +99,7 @@ from your crate's own generated `bindings` module, which is why `ruleset!` is a 
 a trait the SDK declares: the SDK cannot name a type that is private to your crate, and a
 `macro_rules!` expansion resolves those names where it is written.
 
-## Two things that will bite
+## Three things that will bite
 
 **A node handle is an integer and the root's is zero.** `parent` returns `Option<Node>`, and
 `Some(0)` is the root — distinct from `None`, which is what the TypeScript original's
@@ -111,6 +111,25 @@ components import a wall clock and two filesystem interfaces the moment the gues
 anything in `std` — exactly the capabilities the sandbox exists to withhold. The loader refuses
 them, and a small fixture will not warn you: a guest that allocates nothing has zero imports on
 *both* targets. `just rust-rules` passes the target; do not build these by hand.
+
+**A crate's globals are shared by every rule it hosts.** One crate can export several rules,
+and the host instantiates once per (worker, **component**) rather than once per rule — so a
+`static`, a `OnceLock`, a lazily built table is one thing that all of them see, and the order
+they see it in is whichever order rayon handed a worker its files. Only `configure`'s options
+are per rule index.
+
+That is not a reason to avoid state; it is a reason for one rule about it. **Anything outliving
+a `check` call must be derivable from that call's inputs.** A memo keyed on the file path
+qualifies — being handed a populated one is indistinguishable from being handed an empty one,
+so nothing observes the sharing. A counter of files seen does not, and neither does a value
+`check` stashes in a `static` for `reduce` to read: facts are the hand-off between the two
+phases, and they are per file by construction. Breaking this gives a rule whose violations
+depend on scheduling, which is exactly the nondeterminism the sandbox withholds `Math.random`
+and the clock to prevent — reached this time through a `static`.
+
+`crates/lanekeep-wasm/tests/fixtures/two-rules/` is the shape that stays correct: it keeps its
+per-rule state in an array indexed by the rule index it is handed, and writes nothing a later
+call reads back.
 
 ## Building, testing, committing
 
