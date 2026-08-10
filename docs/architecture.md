@@ -842,8 +842,8 @@ Measured 2026-08-10, Apple M3 Max (14 cores), macOS 26.5.2, rustc 1.95.0, wasmti
 
 | Arm | Cold corpus | Hot corpus | Difference | Host calls | Per call |
 |---|---|---|---|---|---|
-| TypeScript, QuickJS | 115 ms | 294 ms | 179 ms | 593,280 | ~302 ns |
-| component, wasmtime | 78 ms | 216 ms | 138 ms | 414,720 | ~332 ns |
+| TypeScript, QuickJS | 115 ms | 294 ms | 179 ms | 597,120 | ~300 ns |
+| component, wasmtime | 78 ms | 216 ms | 138 ms | 418,560 | ~330 ns |
 
 **A host call costs about 1.1× through a component.** More than a dozen runs on a settled machine gave 1.06 to 1.12 — QuickJS 298–308 ns, component 322–335 ns — which is the whole of the spread. (A run started immediately after a rebuild reads outside it, up to 1.15; the QuickJS side is the steady one and the component side is where the noise lives.) The performance argument is not inverted, and it is not close to inverted.
 
