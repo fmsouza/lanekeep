@@ -73,6 +73,20 @@ const DEFAULT_LANGUAGES = ['typescript', 'tsx']
  * or `metadata()` to report it through later, and a component that traps at prepare time tells
  * a user nothing about which rule was wrong.
  *
+ * # Everything {@link metadata} reads without checking is checked here
+ *
+ * `metadata` returns a record rather than a result, so a missing `card` is a `TypeError` on
+ * `undefined.message` **inside a wasm call** — which reaches the host as `wasm trap:
+ * unreachable` with the message, the type and the stack gone, naming neither the field nor the
+ * rule. The build is the only place that failure can be made legible, and it is also the only
+ * place it can be made *early*: a rule that traps at prepare time has already shipped.
+ *
+ * Shape only, and deliberately not validity. Whether `severity` is one of the three lanekeep
+ * accepts, whether `query` parses, whether the id's namespace is declared — all of that is
+ * `lanekeep-config`'s `build_rule`, which holds a component to exactly the same rules as a
+ * TypeScript module and is where the diagnostics for it already live. Restating any of it here
+ * would be a second opinion that can disagree.
+ *
  * @param {(object | Function)[]} entries Rule objects, factories, or a mix.
  */
 export function register(entries) {
@@ -88,6 +102,37 @@ export function register(entries) {
       throw new TypeError(
         `the rule at index ${index} has no \`id\` — a rule's id is how a config names it, so ` +
           'it cannot be omitted or produced from its options',
+      )
+    }
+
+    // From here on the rule can be named, so every message does.
+    const missing = []
+    if (typeof rule.severity !== 'string' || rule.severity.length === 0) {
+      missing.push('severity')
+    }
+    if (typeof rule.query !== 'string' || rule.query.length === 0) missing.push('query')
+
+    const card = rule.card
+    if (card === null || typeof card !== 'object') {
+      missing.push('card')
+    } else {
+      if (typeof card.message !== 'string') missing.push('card.message')
+      if (typeof card.remediation !== 'string') missing.push('card.remediation')
+
+      const examples = card.examples
+      if (examples === null || typeof examples !== 'object') {
+        missing.push('card.examples')
+      } else {
+        if (typeof examples.bad !== 'string') missing.push('card.examples.bad')
+        if (typeof examples.good !== 'string') missing.push('card.examples.good')
+      }
+    }
+
+    if (missing.length > 0) {
+      throw new TypeError(
+        `\`${id}\` (index ${index}) is missing ${missing.join(', ')} — a rule declares all of ` +
+          'these, and a component whose `metadata` cannot read one traps with nothing to say ' +
+          'which rule or which field it was',
       )
     }
 

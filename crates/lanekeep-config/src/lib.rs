@@ -935,7 +935,7 @@ fn describe_components(
         // rules with one component in it does no work per rule that is thrown away. Extracting
         // the two byte sources into `component_bytes` put the serialization above this test for
         // a while, which was a small silent regression on the common shape.
-        let Some((origin, bytes)) =
+        let Some((origin, bytes, only)) =
             component_bytes(root, rule).map_err(|detail| fail(position, detail))?
         else {
             continue;
@@ -970,25 +970,25 @@ fn describe_components(
             ));
         }
 
-        for (index, id) in ids.iter().enumerate() {
-            let index = u32::try_from(index).map_err(|_| {
-                fail(
-                    position,
-                    format!(
-                        "`{}` lists more rules than an index can name",
-                        rule.specifier
-                    ),
-                )
-            })?;
+        let wanted =
+            contributed(&ids, only, &rule.specifier).map_err(|detail| fail(position, detail))?;
+
+        for (index, id) in wanted {
             // The rule's own id rather than the specifier, because a slot's name is what a
             // diagnostic shows a reader and one specifier now stands for several rules.
             let slot = set
-                .add(id, &admitted, index, options.clone())
+                .add(&id, &admitted, index, options.clone())
                 .map_err(|e| fail(position, e.to_string()))?;
 
             added.push((
                 position,
                 slot,
+                // The id the component *enumerated*, carried to where its `metadata` is read.
+                // Two exports answer this question and nothing had ever compared them: a guest
+                // whose `rules()` and `metadata()` disagree registers a slot under one id and
+                // builds a `RuleSpec` with another, so a suppression comment naming the id a
+                // user was shown would silently match nothing.
+                id,
                 ComponentRule {
                     path: origin.clone(),
                     index,
@@ -1006,10 +1006,27 @@ fn describe_components(
 
     let mut runtime = WasmRuntime::for_rules(engine, std::sync::Arc::new(set), limits, clock);
 
-    for (position, slot, component) in added {
+    for (position, slot, enumerated, component) in added {
         let metadata = runtime
             .metadata(slot)
             .map_err(|e| fail(position, e.to_string()))?;
+
+        // The guest's two accounts of itself, compared once, here. `rules()` is what a rule was
+        // registered under and `metadata().id` is what it reports as; the world declares them
+        // separately because a rule's id has to be knowable before it is configured, and
+        // separate answers can differ. Everything downstream trusts one or the other without
+        // being in a position to notice.
+        if metadata.id != enumerated {
+            return Err(fail(
+                position,
+                format!(
+                    "`{}` enumerates a rule as `{enumerated}` and that rule's metadata calls \
+                     it `{}` — a component has to answer its own id the same way twice",
+                    rule_specifier(resolved, position),
+                    metadata.id
+                ),
+            ));
+        }
         let has_check = runtime
             .has_check(slot)
             .map_err(|e| fail(position, e.to_string()))?;
@@ -1026,6 +1043,66 @@ fn describe_components(
     }
 
     Ok(described)
+}
+
+/// Which of a component's rules one config entry stands for, as `(index, id)`.
+///
+/// **A built-in names one rule; a `.wasm` path names the artifact.** `lanekeep/no-unwrap` is a
+/// rule, and the fact that its artifact happens to host one is an accident of how it was built —
+/// `lanekeep/no-default-export` names a rule of an artifact hosting four, and a reference
+/// contributing every rule of that component would turn one config entry into four, each of them
+/// configured with options meant for one. A path has no name to narrow by, so it contributes the
+/// whole component, which is what a family of rules shipped together is.
+///
+/// # Errors
+///
+/// Returns the diagnostic detail, without a position: the caller knows which entry this was.
+///
+/// An index the component does not have is refused here rather than left to `RuleSet::add`,
+/// whose message would be about a slot. What went wrong is that `lanekeep_rules`' table and the
+/// artifact it names disagree, and nobody reading "index 3 is out of range" would go looking for
+/// that.
+///
+/// Whether the *right* rule sits at that index is not answerable from here — a component's ids
+/// are its own, and a fixture's need not look like a built-in's. `lanekeep-rules`'
+/// `tests/component_rules.rs` makes that claim, against the real artifacts, in the gate.
+fn contributed(
+    ids: &[String],
+    only: Option<u32>,
+    specifier: &str,
+) -> Result<Vec<(u32, String)>, String> {
+    let Some(index) = only else {
+        return ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                u32::try_from(index)
+                    .map_err(|_| format!("`{specifier}` lists more rules than an index can name"))
+                    .map(|index| (index, id.clone()))
+            })
+            .collect();
+    };
+
+    let declared = ids.get(index as usize).ok_or_else(|| {
+        format!(
+            "`{specifier}` is recorded at index {index} of a component hosting {} rule(s) — \
+             the built-in table and the component disagree",
+            ids.len()
+        )
+    })?;
+    Ok(vec![(index, declared.clone())])
+}
+
+/// The specifier of the rule at a position, for a diagnostic raised after the loop that had it.
+///
+/// The description phase runs over `added` rather than over `resolved`, so the entry a failure
+/// belongs to is reached by position. An empty string rather than a panic for a position that
+/// is not there, which cannot happen — every position in `added` came from `resolved` — because
+/// a diagnostic is not worth aborting a load over.
+fn rule_specifier(resolved: &[ResolvedRule], position: usize) -> &str {
+    resolved
+        .get(position)
+        .map_or("", |rule| rule.specifier.as_str())
 }
 
 /// Which rules a component hosts, by id, in the order it lists them.
@@ -1072,7 +1149,9 @@ fn hosted_rules(
 ///
 /// The first element is provenance for [`ComponentRule::path`] — a canonical path for a file, and
 /// the `lanekeep/<name>` specifier for a built-in, which is relative and so can never collide
-/// with one.
+/// with one. The third says **which** of the component's rules the reference names: `Some(index)`
+/// for a built-in, whose name is a rule's, and `None` for a path, which names the artifact and so
+/// contributes every rule in it.
 ///
 /// # A loose `.wasm` is reachable and is not a supported interface
 ///
@@ -1105,12 +1184,12 @@ fn hosted_rules(
 fn component_bytes(
     root: &RuleRoot,
     rule: &ResolvedRule,
-) -> Result<Option<(PathBuf, ComponentBytes)>, String> {
+) -> Result<Option<(PathBuf, ComponentBytes, Option<u32>)>, String> {
     match &rule.reference {
         // Embedded in this binary, so there is no path to confine and no file to read — and
         // nothing a project file could shadow, which is the guarantee a built-in module has too.
         RuleReference::BuiltinComponent(name) => {
-            let bytes = root.builtin_component(name).ok_or_else(|| {
+            let (bytes, index) = root.builtin_component(name).ok_or_else(|| {
                 format!(
                     "`lanekeep/{name}` was resolved as a built-in component and this build has \
                      no component by that name"
@@ -1119,6 +1198,7 @@ fn component_bytes(
             Ok(Some((
                 PathBuf::from(format!("lanekeep/{name}")),
                 bytes.to_vec().into(),
+                Some(index),
             )))
         }
 
@@ -1144,7 +1224,7 @@ fn component_bytes(
             let bytes: ComponentBytes = std::fs::read(&confined)
                 .map_err(|e| format!("cannot read `{}`: {e}", confined.display()))?
                 .into();
-            Ok(Some((confined, bytes)))
+            Ok(Some((confined, bytes, None)))
         }
 
         RuleReference::Builtin(_) | RuleReference::Module(_) => Ok(None),
@@ -1791,13 +1871,35 @@ mod tests {
         })
     }
 
-    /// A built-in table with exactly one component in it, standing in for `lanekeep_rules`.
+    /// The `two-rules` fixture's bytes, on the same terms as [`built_in_component_bytes`].
+    fn shared_component_bytes() -> &'static [u8] {
+        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        BYTES.get_or_init(|| {
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/two-rules.wasm"),
+            )
+            .expect("the fixture ships")
+        })
+    }
+
+    /// A built-in table standing in for `lanekeep_rules`.
     ///
     /// A stub rather than the real table: which rules have migrated is not what these tests are
     /// about, and naming one would make the next migration edit assertions unrelated to it.
-    fn built_in_components(name: &str) -> Option<&'static [u8]> {
+    ///
+    /// Three entries, and the last two are the shape this crate has to get right: one artifact,
+    /// two names, a different index each. `shared-second` is the case a lookup returning only
+    /// bytes cannot express — it is the *second* rule of a component whose first rule is a
+    /// perfectly good one to run by mistake.
+    fn built_in_components(name: &str) -> Option<(&'static [u8], u32)> {
         match name {
-            "metadata" => Some(built_in_component_bytes()),
+            "metadata" => Some((built_in_component_bytes(), 0)),
+            "shared-first" => Some((shared_component_bytes(), 0)),
+            "shared-second" => Some((shared_component_bytes(), 1)),
+            // An index past the end of what that component hosts, for the disagreement a
+            // drifted table would produce.
+            "shared-missing" => Some((shared_component_bytes(), 7)),
             _ => None,
         }
     }

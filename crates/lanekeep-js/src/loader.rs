@@ -62,9 +62,15 @@ pub type BuiltinSource = fn(&str) -> Option<&'static str>;
 /// [`RuleRoot::builtin_component`] when a config names one, exactly as it reads a `.wasm` path.
 /// Keeping both lookups on one value is what stops a name resolving to a module in one place
 /// and a component in another.
-pub type BuiltinComponent = fn(&str) -> Option<&'static [u8]>;
+///
+/// **The index is part of the answer.** One artifact hosts several rules — the four TypeScript
+/// built-ins share one — so bytes alone name a program rather than a rule. A lookup returning
+/// only bytes would leave the caller to run whichever rule the component enumerates first, and
+/// a wrong rule reporting is indistinguishable from a right one reporting.
+pub type BuiltinComponent = fn(&str) -> Option<(&'static [u8], u32)>;
 
-/// The longest a built-in component's name may be before refusing it stops being actionable.
+/// The longest a component-hosted built-in's name may be before refusing it stops being
+/// actionable.
 ///
 /// Not a limit on rule names in general, and nothing enforces it here — it is a budget derived
 /// from one number this crate does not control. [`ResolveError::NotAModule`] reaches a user
@@ -74,15 +80,28 @@ pub type BuiltinComponent = fn(&str) -> Option<&'static [u8]>;
 /// whatever is left for the *project's own path*, and what gets cut is the end of the message,
 /// which is the half telling the user what to do.
 ///
-/// At this length the whole message survives beside a 120-byte config path;
-/// `no-mutable-default-argument`, at 27 characters, would survive only 96.
+/// The name is the *rule's*, as a config writes it, not the artifact's: `typescript-builtins`
+/// hosts four rules and appears in no message.
 ///
-/// **Raising it is a decision rather than a formality.** The honest ways are to shorten the
-/// message or to accept a smaller path budget and say so — not to raise this number and leave
-/// the arithmetic where it was. `the_refusal_survives_quickjs_beside_a_long_path` derives it and
-/// `lanekeep-rules`' `every_component_name_fits_the_refusal_message` enforces it against the
-/// names that actually ship, because this crate sits below that one and cannot see them.
-pub const MAX_COMPONENT_NAME: usize = 15;
+/// # It was 15, and 21 is what the TypeScript built-ins cost
+///
+/// The four rules compiled into `typescript-builtins` are 17 to 21 characters —
+/// `no-restricted-imports` is the longest thing that can appear here — and the arithmetic is
+/// `35 + (9 + name) + path + (61 + name) <= 255`, so `path <= 150 - 2 * name`. The whole
+/// message survived beside a **120**-byte config path at 15 and survives beside a **108**-byte
+/// one at 21.
+///
+/// **That is a smaller path budget, accepted deliberately and stated here**, which is one of
+/// the two honest ways this constant may move; the other is shortening the message, which costs
+/// a user the wording that tells them what to do. 108 bytes still clears
+/// `/Users/alice/projects/acme/packages/checkout/lanekeep.config.ts` — 63 — with 45 to spare,
+/// and it does not clear everything: at 27 characters `no-mutable-default-argument` would leave
+/// 96, so migrating *that* rule is a decision to take here rather than a table edit.
+///
+/// `the_refusal_survives_quickjs_beside_a_long_path` derives it and `lanekeep-rules`'
+/// `every_component_name_fits_the_refusal_message` enforces it against the names that actually
+/// ship, because this crate sits below that one and cannot see them.
+pub const MAX_COMPONENT_NAME: usize = 21;
 
 /// The default: no built-ins, so a bare `lanekeep-js` resolves only project modules.
 fn no_builtins(_name: &str) -> Option<&'static str> {
@@ -90,7 +109,7 @@ fn no_builtins(_name: &str) -> Option<&'static str> {
 }
 
 /// The default: no built-in components.
-fn no_builtin_components(_name: &str) -> Option<&'static [u8]> {
+fn no_builtin_components(_name: &str) -> Option<(&'static [u8], u32)> {
     None
 }
 
@@ -229,12 +248,12 @@ impl RuleRoot {
         self
     }
 
-    /// The component behind a built-in's name, or `None` for one that has none.
+    /// The component behind a built-in's name and the index it sits at, or `None`.
     ///
     /// `lanekeep-config` asks this when a config names `lanekeep/<name>`, because a component
     /// is resolved in Rust and never crosses into the sandbox. Nothing in this crate loads it.
     #[must_use]
-    pub fn builtin_component(&self, name: &str) -> Option<&'static [u8]> {
+    pub fn builtin_component(&self, name: &str) -> Option<(&'static [u8], u32)> {
         (self.builtin_components)(name)
     }
 
@@ -263,16 +282,24 @@ impl RuleRoot {
 
         // Built-ins resolve before the filesystem is consulted at all.
         if let Some(name) = specifier.strip_prefix(BUILTIN_PREFIX) {
-            if (self.builtins)(name).is_some() {
-                return Ok(PathBuf::from(specifier));
-            }
             // A built-in that ships as a component is spelled correctly and is still not
-            // importable, so it is refused on its own terms. Asked after the source lookup
-            // because a name is never both, and a source that exists is the answer.
+            // importable, so it is refused on its own terms.
+            //
+            // **Asked before the source lookup, and the order is the whole of the guarantee.**
+            // A name can be both: the four TypeScript rules compiled into one component keep
+            // their sources, because that is what the component was built from and what their
+            // tests run through this engine. Asking the source first would answer an `import`
+            // with the QuickJS copy while a `lanekeep.json` ran the component — one id, two
+            // programs, and nothing in the output to say which one reported. The component is
+            // what ships, so the component is the answer, and the other spelling is refused
+            // rather than quietly served.
             if (self.builtin_components)(name).is_some() {
                 return Err(ResolveError::NotAModule {
                     name: name.to_owned(),
                 });
+            }
+            if (self.builtins)(name).is_some() {
+                return Ok(PathBuf::from(specifier));
             }
             return Err(ResolveError::NotFound {
                 specifier: specifier.to_owned(),
@@ -643,6 +670,12 @@ mod tests {
     fn stub_builtins(name: &str) -> Option<&'static str> {
         match name {
             "always" => Some("export default { id: 'lanekeep/always' } satisfies unknown;"),
+            // A rule with a source *and* a component: the ordinary shape of a TypeScript rule
+            // compiled ahead of time, where the source is what the artifact was built from and
+            // is kept for the tests that run it through this engine.
+            "compiled-from-source" => {
+                Some("export default { id: 'lanekeep/compiled-from-source' } satisfies unknown;")
+            }
             _ => None,
         }
     }
@@ -674,9 +707,12 @@ mod tests {
     }
 
     /// Stands in for the real component table, on the same terms as [`stub_builtins`].
-    fn stub_builtin_components(name: &str) -> Option<&'static [u8]> {
+    fn stub_builtin_components(name: &str) -> Option<(&'static [u8], u32)> {
         match name {
-            "compiled" => Some(b"\0asm\x01\x00\x00\x00"),
+            "compiled" => Some((b"\0asm\x01\x00\x00\x00", 0)),
+            // Also served by `stub_builtins`, and at a non-zero index so that a caller
+            // discarding the index cannot pass by accident.
+            "compiled-from-source" => Some((b"\0asm\x01\x00\x00\x00", 3)),
             _ => None,
         }
     }
@@ -721,10 +757,16 @@ mod tests {
     /// characters, and the assertion was green throughout.
     ///
     /// **The rule's name is spent twice** — once in rquickjs's framing, once inside the message
-    /// — so every character of it costs two of the path budget. A name of 15 characters clears a
-    /// 120-byte path; `no-mutable-default-argument`, at 27, would clear only 96. So this is
-    /// stated as a *name-length* budget rather than measured against whichever names happen to
-    /// ship, which this crate cannot see anyway: it sits below `lanekeep-rules` deliberately.
+    /// — so every character of it costs two of the path budget. A name of 21 characters clears a
+    /// 108-byte path; at 15 it cleared 120, and `no-mutable-default-argument`, at 27, would
+    /// clear only 96. So this is stated as a *name-length* budget rather than measured against
+    /// whichever names happen to ship, which this crate cannot see anyway: it sits below
+    /// `lanekeep-rules` deliberately.
+    ///
+    /// `PATH` moved with `MAX_COMPONENT_NAME` rather than staying put, and that is the point of
+    /// the pair: the constraint is one inequality with two knobs, so raising the name budget
+    /// without lowering the path budget would be asserting something false. See
+    /// [`MAX_COMPONENT_NAME`] for why 108 was judged enough.
     ///
     /// `lanekeep-rules`' `every_component_name_fits_the_refusal_message` is the other half, and
     /// it is what makes this test's premise true rather than assumed. Neither is any use alone:
@@ -736,7 +778,7 @@ mod tests {
         const BUDGET: usize = 255;
         /// A project path this message must not be truncated beside. Roughly
         /// `/Users/<name>/work/<org>-monorepo/apps/<app>/packages/<pkg>/lanekeep.config.ts`.
-        const PATH: usize = 120;
+        const PATH: usize = 108;
 
         // Not a literal: this is rquickjs's framing with both holes empty, so the constant
         // cannot drift from the string it is measuring.
@@ -752,6 +794,38 @@ mod tests {
             "QuickJS keeps {BUDGET} bytes and this needs {total} beside a {PATH}-byte path \
              ({} of them the message): the remedy is what gets cut\n  {message}",
             message.len(),
+        );
+    }
+
+    #[test]
+    fn a_component_wins_over_a_source_of_the_same_name() {
+        // The one that decides what `lanekeep/<name>` means when both lookups answer, which is
+        // the ordinary shape of a rule authored in TypeScript and compiled ahead of time.
+        //
+        // **The failure this is written against is silent.** With the lookups asked the other
+        // way round the import succeeds, the sandbox evaluates the author's source, and the
+        // run reports — correctly, plausibly, and from a different program than the one a
+        // `lanekeep.json` would have run for the same name. Nothing in the output distinguishes
+        // them, so the only place this can be caught is here.
+        let fixture = Fixture::new("builtin-both", &[("a.ts", "export const a = 1;")]);
+        let root = fixture
+            .root()
+            .with_builtins(stub_builtins)
+            .with_builtin_components(stub_builtin_components);
+
+        let error = root
+            .resolve("", "lanekeep/compiled-from-source")
+            .expect_err("the component is what ships, so the import is refused");
+        assert!(
+            matches!(&error, ResolveError::NotAModule { name } if name == "compiled-from-source"),
+            "expected NotAModule, got {error:?}"
+        );
+
+        // And the source is still there to be read by whatever built the component, which is
+        // why the two lookups can disagree at all.
+        assert!(
+            stub_builtins("compiled-from-source").is_some(),
+            "the fixture must have both, or this test asserts nothing"
         );
     }
 
@@ -786,7 +860,13 @@ mod tests {
 
         assert_eq!(
             root.builtin_component("compiled"),
-            Some(b"\0asm\x01\x00\x00\x00".as_slice())
+            Some((b"\0asm\x01\x00\x00\x00".as_slice(), 0))
+        );
+        // The index travels with the bytes, so a rule of a shared component is reachable as
+        // itself rather than as whichever rule that artifact enumerates first.
+        assert_eq!(
+            root.builtin_component("compiled-from-source"),
+            Some((b"\0asm\x01\x00\x00\x00".as_slice(), 3))
         );
         assert_eq!(root.builtin_component("always"), None);
     }

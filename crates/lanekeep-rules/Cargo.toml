@@ -12,6 +12,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dev-dependencies]
+# For the digest that freezes the five rule sources this migration was required not to touch.
+# The same hash `lanekeep-cache`, `lanekeep-config` and `lanekeep-wasm` key on, so a reader
+# meets one digest across the project rather than two.
+blake3 = { workspace = true }
 # For the fields of a `Violation` that the testkit's assertions do not pin — `rule_id`,
 # `severity` and `remediation`, which a rule can get wrong without moving a position or a message.
 lanekeep-core = { workspace = true }
@@ -22,6 +26,11 @@ lanekeep-core = { workspace = true }
 # and no new publication-order constraint, since `lanekeep-testkit` already reaches it.
 lanekeep-js = { workspace = true }
 lanekeep-testkit = { workspace = true }
+# For `tests/component_rules.rs`, which is the only place the name → (component, index) table
+# can be checked against what the components actually host: this crate has no wasm runtime, and
+# `lanekeep-wasm` sits below it and cannot see which rules ship. A dev-dependency because
+# nothing in the crate's own code runs a guest — it is a table and four `include_bytes!`es.
+lanekeep-wasm = { workspace = true }
 
 [lints]
 workspace = true

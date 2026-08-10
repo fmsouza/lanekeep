@@ -6,7 +6,7 @@
 #
 # A line that moves when no artifact did means a fixture's source was changed without
 # rebuilding it — run `just wasm-fixtures`.
-../../packages/lanekeep/runtime/entry.js be03c32087b2ad46755bf223c06c28d653f1ce90cb9f4574694a18c6d3491976
+../../packages/lanekeep/runtime/entry.js a334f1d316af9c925d9f37511008416d55abd72fe6e0c83900cf13e8043b0fdc
 ../../packages/lanekeep/runtime/host.js 013bfdc9c8913ba474aa4784a4a97a888706bd9ff4f9d39666accbfe69d1264f
 tests/fixtures/bindings.wasm 95b60714793f2bbad4b65a6af2572493ca15d2925d199002138fab3a17334f90
 tests/fixtures/bindings/.gitignore 3ee89155884ab1b709cb6c36e015fe13407a7e3d667a152989d6a6d9f7be095b
@@ -23,7 +23,7 @@ tests/fixtures/facts/.gitignore 3ee89155884ab1b709cb6c36e015fe13407a7e3d667a1529
 tests/fixtures/facts/Cargo.lock 37084136f7298ce9ca9c9676f8bfebe3249a18ab2e2e709f361ac8a9d3b149f0
 tests/fixtures/facts/Cargo.toml e2eb89e182c8ba18fb763f9fb90c9c947faf62cd6bc10f6da4921d6edd72b5c3
 tests/fixtures/facts/src/lib.rs 5dd24613a0d8edafb72ae5489616de4398d9eb3623faa6baf2282fb0d4688878
-tests/fixtures/js-globals.wasm 011a85a100b9499c2e3043f608bb9513afd098d4b3ff12ee4a6b99af9730f779
+tests/fixtures/js-globals.wasm e3c2670e6dada2c299057b31126e600cbc167f9d9ddc5588c1a6fc24a68f071f
 tests/fixtures/js-globals/probe.js 51bd4e673e5c3a0415105b81033438b122a0c2a804ae48f5087c9c8fbd8994b5
 tests/fixtures/js-globals/rule.js a839637b1ff47f3eec689d83741c228045b726b1ad7ff92036b4ea4f9e28316d
 tests/fixtures/limits.wasm ed4dad7876c62ff6131f7c4d87ac52a8b2ae927163a3f8639dc2d217327c9171

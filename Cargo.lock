@@ -982,9 +982,11 @@ dependencies = [
 name = "lanekeep-rules"
 version = "0.6.1"
 dependencies = [
+ "blake3",
  "lanekeep-core",
  "lanekeep-js",
  "lanekeep-testkit",
+ "lanekeep-wasm",
 ]
 
 [[package]]
