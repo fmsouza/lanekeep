@@ -15,7 +15,7 @@ import { dirname, join, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
 
-import { resolve } from './resolve.js'
+import { confine, resolve } from './resolve.js'
 import * as host from '../index.js'
 
 /**
@@ -325,4 +325,70 @@ test('reports what it tried when nothing matches', (t) => {
   assert.equal(error.code, 'not-found')
   assert.match(error.message, /nope\.ts/, `should list candidates: ${error.message}`)
   assert.match(error.message, /index\.ts/, `should list index candidates: ${error.message}`)
+})
+
+// --- confinement on its own ---------------------------------------------------------
+//
+// `confine` is the containment rules with the resolution taken away, for whatever ends up
+// reading a rule's bytes. `RuleRoot::read` re-checks rather than trusting `RuleRoot::resolve`,
+// because the operation that touches a file should be the one enforcing the boundary; the
+// build-time reader has to be able to do the same without reimplementing it.
+
+// from `RuleRoot::confine`'s success path, which `resolve` reaches through every time
+test('confine returns the canonical path of a file inside the root', (t) => {
+  const f = fixture(t, 'confine-ok', { 'a.ts': 'export const a = 1;' })
+  const { path } = confine(join(f.dir, 'a.ts'), { rulesRoot: f.dir })
+  assert.equal(path, f.entry('a.ts'))
+})
+
+// from `reading_refuses_a_path_outside_the_root_even_if_resolution_was_skipped`
+test('confine refuses a path outside the root even if resolution was skipped', (t) => {
+  // Defense in depth. `resolve` already enforces this, but a caller that builds a path some
+  // other way must not be able to read past the boundary.
+  const f = fixture(t, 'confine-escape', {
+    'nested/main.ts': '',
+    'outside.ts': 'export const o = 1;',
+  })
+  const { error } = confine(join(f.dir, 'outside.ts'), { rulesRoot: join(f.dir, 'nested') })
+  assert.equal(error?.code, 'escapes-root', JSON.stringify(error))
+})
+
+// from `rejects_a_symlink_pointing_outside_the_root`, applied to `confine` rather than to
+// `resolve`: the canonical check is the half of this that a lexical one cannot do.
+test('confine sees through a symlink out of the root', { skip: process.platform === 'win32' }, (t) => {
+  const f = fixture(t, 'confine-symlink', {
+    'nested/main.ts': '',
+    'outside.ts': 'export const o = 1;',
+  })
+  const link = join(f.dir, 'nested', 'link.ts')
+  symlinkSync(join(f.dir, 'outside.ts'), link)
+
+  const { error } = confine(link, { rulesRoot: join(f.dir, 'nested') })
+  assert.equal(error?.code, 'escapes-root', JSON.stringify(error))
+})
+
+// No `loader.rs` counterpart: `RuleRoot::confine` leaves normalizing to its callers, and every
+// one of them does it. The exported function does it itself — see the note at its definition.
+test('confine refuses a traversal lexically, whatever is on disk', (t) => {
+  const f = fixture(t, 'confine-traversal', { 'nested/main.ts': '' })
+  const root = join(f.dir, 'nested')
+
+  // Concatenated rather than `join`ed, and that is the whole test. `path.join` normalizes its
+  // own arguments, so `join(root, '..', 'secret.ts')` hands over an already-resolved path and
+  // asserts nothing about `confine` doing it — a mutation removing the normalizing left this
+  // green until the fixture was built by hand.
+  const traversal = `${root}${sep}..${sep}secret.ts`
+  assert.ok(traversal.includes(`${sep}..${sep}`), 'the fixture must still carry the traversal')
+
+  // Nothing is there, so only the lexical check can answer. Unnormalized, this path starts
+  // with `<root>/` as a *string*, so without normalizing it reaches the canonical check and
+  // comes back `unreadable` — a fact about the filesystem rather than about the mistake.
+  const { error } = confine(traversal, { rulesRoot: root })
+  assert.equal(error?.code, 'escapes-root', JSON.stringify(error))
+})
+
+test('confine reports a missing file inside the root as unreadable', (t) => {
+  const f = fixture(t, 'confine-missing', { 'a.ts': '' })
+  const { error } = confine(join(f.dir, 'nope.ts'), { rulesRoot: f.dir })
+  assert.equal(error?.code, 'unreadable', JSON.stringify(error))
 })

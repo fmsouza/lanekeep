@@ -122,9 +122,57 @@ export function resolve(specifier, importer, options = {}) {
 }
 
 /**
+ * Confine a path to the rules root, and hand back its canonical form.
+ *
+ * The containment rules on their own, for a caller that arrived at a path some other way.
+ * `RuleRoot::confine` is public for the same reason: `lanekeep-config` uses it for a `.wasm`
+ * rule reference that is joined against the root directly and never goes near module
+ * resolution, and two sets of confinement rules would be two things to keep right — the second
+ * one always being the one that is wrong, because a lexical check alone looks complete and
+ * does not see a symlink.
+ *
+ * **Anything that reads a rule's bytes should call this rather than trusting `resolve`.**
+ * `RuleRoot::read` re-checks rather than trusting its own resolver, on the grounds that the
+ * operation which actually touches a file should be the one that enforces the boundary —
+ * otherwise the guarantee holds only while every caller goes through the resolver first, which
+ * is the sort of assumption that survives until someone adds a second caller.
+ *
+ * Returns `{ path }` or `{ error }`, on the same terms as `resolve`.
+ *
+ * Two things here are deliberately not what `RuleRoot::confine` does, both because that method
+ * is reached from inside a `RuleRoot` that already holds a canonical root and this function is
+ * reached by a caller who holds a string.
+ *
+ * It **normalizes** its argument, which `RuleRoot::confine` leaves to its callers because all
+ * of them already have. A lexical prefix test cannot be trusted on a path still carrying `..`:
+ * `<root>/../secret.ts` does start with `<root>/`. Canonicalizing catches that one anyway, but
+ * only for a path that exists, so without this a traversal to somewhere that is not there
+ * comes back `unreadable` — a fact about the filesystem rather than about the mistake.
+ *
+ * And its lexical gate accepts the root **as the caller spelled it** as well as canonically,
+ * because those differ constantly and invisibly: `/var/…` against `/private/var/…` is every
+ * path under `os.tmpdir()` on macOS. Refusing a legitimate file for that reason is fail-closed
+ * and so not dangerous, but it looks exactly like a confinement violation and would send
+ * somebody hunting for one. **Nothing is loosened by it**: the canonical gate below is the
+ * actual boundary and is untouched, and a traversal escapes both spellings alike.
+ */
+export function confine(path, options = {}) {
+  const root = canonicalize(options.rulesRoot)
+  if (root.error !== undefined) return { error: unreadable(options.rulesRoot, root.error) }
+
+  const normalized = normalize(path)
+  const spellings = [root.path, normalize(options.rulesRoot)]
+  if (!spellings.some((spelling) => isWithin(spelling, normalized))) {
+    return { error: escapesRoot(path) }
+  }
+
+  return canonicalWithin(root.path, path, normalized)
+}
+
+/**
  * Find a file for an already-joined path, enforcing containment.
  *
- * The lexical check is repeated here as well as inside `confine`, because a traversal that
+ * The lexical check is repeated here as well as inside `confineTo`, because a traversal that
  * matches no file at all must still be reported as an escape rather than as "nothing found".
  */
 function within(root, specifier, joined) {
@@ -134,7 +182,7 @@ function within(root, specifier, joined) {
   for (const candidate of candidates(joined)) {
     tried.push(candidate)
     if (!isFile(candidate)) continue
-    return confine(root, specifier, candidate)
+    return confineTo(root, specifier, candidate)
   }
 
   return { error: notFound(specifier, tried) }
@@ -147,9 +195,20 @@ function within(root, specifier, joined) {
  * disk, so `../../secrets` is refused identically whether or not it is there. The canonical
  * one is what sees through a symlink, and it can only be made once the file is known to exist.
  */
-function confine(root, specifier, joined) {
+function confineTo(root, specifier, joined) {
   if (!isWithin(root, joined)) return { error: escapesRoot(specifier) }
+  return canonicalWithin(root, specifier, joined)
+}
 
+/**
+ * The half of confinement a lexical check cannot do: resolve the path and look again.
+ *
+ * Split out because the two callers gate lexically on different things — `confineTo` on the
+ * canonical root it built the candidate from, `confine` on either spelling of a root the
+ * caller supplied — and neither may skip this one. `root` is always canonical here, because
+ * what is being compared against it came back from the OS.
+ */
+function canonicalWithin(root, specifier, joined) {
   const canonical = canonicalize(joined)
   if (canonical.error !== undefined) return { error: unreadable(joined, canonical.error) }
   if (!isWithin(root, canonical.path)) return { error: escapesRoot(specifier) }
@@ -295,19 +354,26 @@ function canonicalize(path) {
 // --- refusals -------------------------------------------------------------------------
 //
 // The messages are `ResolveError`'s renderings, word for word. A rule refused by a bundler
-// and the same rule refused by the sandbox have to read identically, or an author who hits
-// one and then searches for the other finds nothing.
+// and the same rule refused by the sandbox have to read identically, or an author who hits one
+// and then searches for the other finds nothing.
+//
+// **Each message is one unbroken template literal, and splitting one over a `+` breaks a test
+// rather than only a convention.** `crates/lanekeep-js/tests/resolver_parity.rs` renders every
+// `ResolveError` variant and looks for the prose between its holes in this file's source,
+// which is the only thing holding the two copies together — there is no shared string table
+// and there cannot be one, since these are two programs in two languages. The lines are long
+// on purpose, and a reworded message has to be reworded in both places or the gate says so.
+//
+// The messages are also the cheapest canary for the thing that actually matters. These
+// resolution rules are enforced twice, deliberately; if the wording of a refusal has drifted,
+// the rule behind it very likely has too.
 
 /** A bare specifier, which would be an npm package. */
 function bareSpecifier(specifier) {
   return {
     code: 'bare-specifier',
     specifier,
-    message:
-      `cannot import \`${specifier}\`\n  ` +
-      'rule modules run in a sandbox with no package resolution, so only `lanekeep` and ' +
-      'relative paths starting with `./` or `../` can be imported\n  ' +
-      'if this needs a package, inline what you need from it instead',
+    message: `cannot import \`${specifier}\`\n  rule modules run in a sandbox with no package resolution, so only \`lanekeep\` and relative paths starting with \`./\` or \`../\` can be imported\n  if this needs a package, inline what you need from it instead`,
   }
 }
 
@@ -316,10 +382,7 @@ function escapesRoot(specifier) {
   return {
     code: 'escapes-root',
     specifier,
-    message:
-      `cannot import \`${specifier}\`\n  ` +
-      'it resolves outside the rules directory, and rule modules may only import from ' +
-      'within it',
+    message: `cannot import \`${specifier}\`\n  it resolves outside the rules directory, and rule modules may only import from within it`,
   }
 }
 

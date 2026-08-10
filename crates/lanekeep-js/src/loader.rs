@@ -909,6 +909,36 @@ mod tests {
     }
 
     #[test]
+    fn a_file_beats_a_same_named_directory_index() {
+        // `candidates` puts every extension ahead of every `index.<extension>`, and until this
+        // test nothing held it there — `resolves_a_directory_index` only proves an index wins
+        // when no file competes, which it would do under either order.
+        //
+        // The rule is the one every bundler and TypeScript itself follows, so getting it wrong
+        // would not look like a bug from inside a rule: `./rules` would simply mean the other
+        // file, and both readings are individually plausible. It is also enforced twice now —
+        // `packages/lanekeep/runtime/resolve.js` resolves a rule's imports at build time — so
+        // leaving it unpinned here would let the port diverge from the specification with
+        // nothing to notice, which is most of what makes this file the specification.
+        let fixture = Fixture::new(
+            "file-over-index",
+            &[
+                ("main.ts", ""),
+                ("rules.ts", "export const from = 'file';"),
+                ("rules/index.ts", "export const from = 'index';"),
+            ],
+        );
+        let resolved = fixture
+            .root()
+            .resolve(&fixture.entry("main.ts"), "./rules")
+            .expect("resolves");
+        assert!(
+            resolved.ends_with("rules.ts"),
+            "expected the file, not the directory: {resolved:?}"
+        );
+    }
+
+    #[test]
     fn resolves_an_explicit_extension() {
         let fixture = Fixture::new(
             "explicit",
