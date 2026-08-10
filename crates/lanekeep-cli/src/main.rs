@@ -854,26 +854,34 @@ fn prepare(
 
     let sandbox = lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // `load_with_artifact_cache` rather than `load`: it hands config load the same
-    // `.lanekeep/components` the engine's own loader uses, so a component is compiled once for
-    // the project instead of once per config load and again per prepare. `prepare` runs per LSP
-    // request, per MCP tool call and per `--watch` iteration, and a plain `load` put ~58 ms per
-    // component on each of them.
-    let mut loaded =
-        lanekeep_config::load_with_artifact_cache(&sandbox, &root, &config_path, project_root)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let declared = loaded.rules.len();
-
-    // `--timeout` overrides whatever the config settled on, because a flag a user typed on
-    // this run is a more specific statement than a file that applies to every run.
+    // Both of these have to be known *before* the load, and for the same reason: config load is
+    // itself a phase that runs guest code, so anything applied to the `Config` it returns arrives
+    // after the phase it was meant to govern.
     //
-    // It was validated in `check` and then dropped on the floor: the flag parsed, `--timeout 0`
-    // was rejected with a message, and the budget never moved. A run given two minutes still
-    // died at fifteen seconds — and the message it died with says "raise it with `--timeout`",
-    // which was advice that could not work.
-    if let Some(ms) = global_timeout {
-        loaded.limits.global_timeout = std::time::Duration::from_millis(ms);
-    }
+    // `artifacts` hands config load the same `.lanekeep/components` the engine's own loader uses,
+    // so a component is compiled once for the project instead of once per config load and again
+    // per prepare. `prepare` runs per LSP request, per MCP tool call and per `--watch` iteration,
+    // and without it that was ~58 ms per component on each of them.
+    //
+    // `global_timeout` is `--timeout`, which overrides whatever the config settled on because a
+    // flag a user typed on this run is a more specific statement than a file that applies to every
+    // run. It has now been dropped on the floor twice, in two different phases, which is why it is
+    // passed in rather than assigned afterwards. The first time, the flag parsed, `--timeout 0`
+    // was rejected with a message, and the budget never moved. The second time — this branch — it
+    // moved the *run's* budget from a line below a config load that had already instantiated,
+    // configured and read metadata from every component under the config file's number. Both times
+    // the breach message ended "raise it with `--timeout`", which was advice that could not work.
+    let loaded = lanekeep_config::load_with(
+        &sandbox,
+        &root,
+        &config_path,
+        lanekeep_config::LoadOptions {
+            artifacts: Some(project_root),
+            global_timeout: global_timeout.map(std::time::Duration::from_millis),
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let declared = loaded.rules.len();
 
     let engine = Engine::prepare(
         &loaded,

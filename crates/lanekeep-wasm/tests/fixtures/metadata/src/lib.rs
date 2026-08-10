@@ -51,12 +51,28 @@ impl Guest for Component {
     /// refusal carries a message a user can act on. The array case is driven twice — once
     /// through `rule` and once through `check` — because "a refusal is its own variant" and
     /// "nothing checks anything before it has been configured" are different claims.
+    ///
+    /// # `"burn"` makes this the one fixture that can breach a config-load budget
+    ///
+    /// Config load is a phase that runs guest code under a clock of its own, and until this
+    /// option existed nothing could test that clock. Every other budget fixture burns inside
+    /// `check`, which config load never calls — and the calls it *does* make are microseconds,
+    /// with compilation sitting outside the clock, so no budget small enough to be reached by
+    /// them is expressible. A test for that phase therefore needs a guest that spends real time
+    /// in `configure`, which is what this branch is.
+    ///
+    /// Opt-in by substring so that every existing caller is unaffected: `tests/metadata.rs`
+    /// passes `null`, `{"allow":["a.rs"]}` and `[]`, none of which contains `"burn"`, and a
+    /// fixture that got slower for everyone would be a poor trade for one test.
     fn configure(options_json: String) -> Result<(), String> {
         if options_json == "null" {
             return Ok(());
         }
         if !options_json.starts_with('{') {
             return Err("expected an object".to_owned());
+        }
+        if options_json.contains("\"burn\"") {
+            burn();
         }
         Ok(())
     }
@@ -72,6 +88,35 @@ impl Guest for Component {
     fn check(_ctx: &CheckContext, _m: Match) {}
 
     fn reduce(_ctx: &ReduceContext) {}
+}
+
+/// Roughly a third of a second of guest work, against a budget a test sets far below it.
+///
+/// Sized for a ratio rather than a deadline. The breach case gives it ~50 ms and the raise case
+/// gives it seconds, so the margin is more than an order of magnitude either way — which is what
+/// keeps it honest on a loaded hosted runner, where a slower machine only makes the breach case
+/// breach harder and leaves the raise case with room to spare.
+const BURN_ITERATIONS: u64 = 300_000_000;
+
+/// Somewhere the result has to go, or nothing above it survives the optimizer.
+static SINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Spend real time, in a way `wasm32-unknown-unknown` cannot optimize away.
+///
+/// **`black_box` inside the loop, and `AGENTS.md` records both weaker guards failing first.**
+/// That target has no atomics feature, so `core::sync::atomic` lowers to ordinary loads and
+/// stores and every write but the last is removed; and a linear congruential step whose result is
+/// only stored at the end strength-reduces to a closed form and the loop disappears. A 20 ms
+/// budget failed to notice four hundred million rounds of each. `core::hint::black_box` on every
+/// iteration is what makes this a measurement rather than a hope, and it is what the `limits` and
+/// `engine-rule` fixtures beside this one already use for the same reason.
+#[inline(never)]
+fn burn() {
+    let mut acc: u64 = 1;
+    for i in 0..BURN_ITERATIONS {
+        acc = core::hint::black_box(acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i));
+    }
+    SINK.store(acc, core::sync::atomic::Ordering::Relaxed);
 }
 
 bindings::export!(Component with_types_in bindings);

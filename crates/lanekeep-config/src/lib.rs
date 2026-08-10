@@ -507,49 +507,67 @@ pub fn evaluate_into(
 /// Returns [`ConfigError`] when the file cannot be read, the module fails to evaluate, or
 /// the result is not shaped like a config.
 pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Config, ConfigError> {
-    load_inner(sandbox, root, config_path, None)
+    load_with(sandbox, root, config_path, LoadOptions::default())
 }
 
-/// [`load`], with somewhere to cache the components it compiles.
+/// What a load needs beyond the config file, for a caller that has more to say than [`load`]
+/// can carry.
 ///
-/// **This is the difference between a component costing tens of milliseconds per config load and
-/// costing nothing.** [`load`] has no writable directory, so `describe_components` compiles every
-/// component from scratch to ask it what it is, throws the compilation away, and the engine
-/// compiles the same bytes again at prepare time. Measured on the release binary, one component
-/// added ~58 ms to a `lanekeep rules` that checks no files at all, and two added ~116 ms — against
-/// a §15 warm-run budget of 25 ms for the whole invocation. Config load runs per LSP request, per
-/// MCP tool call and per `--watch` iteration, so this is paid on every one of them.
+/// A struct rather than two more parameters, for the reason `lanekeep-cli`'s `CheckOptions`
+/// gives: `artifacts` and the config path are both `&Path`, and adjacent parameters of one
+/// type are the shape that gets silently transposed at a call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions<'a> {
+    /// A project root under which compiled components may be cached, or `None` for a load with
+    /// nowhere to write.
+    ///
+    /// **This is the difference between a component costing tens of milliseconds per config load
+    /// and costing nothing.** With `None`, `describe_components` compiles every component from
+    /// scratch to ask it what it is, throws the compilation away, and the engine compiles the
+    /// same bytes again at prepare time. Measured on the release binary, one component added
+    /// ~58 ms to a `lanekeep rules` that checks no files at all, and two added ~116 ms — against
+    /// a §15 warm-run budget of 25 ms for the whole invocation. Config load runs per LSP request,
+    /// per MCP tool call and per `--watch` iteration, so this is paid on every one of them.
+    ///
+    /// Given a root, both loads write and map artifacts under the same [`COMPONENT_CACHE_PATH`],
+    /// keyed on the specifier and the bytes — so the first run compiles once instead of twice and
+    /// every later run maps what that run wrote. The two loaders agree because both build their
+    /// `wasmtime::Engine` with `WasmEngine::new`; an artifact a different build wrote fails to
+    /// deserialize and is discarded rather than trusted.
+    ///
+    /// Named by the caller rather than inferred, because a rules root is the project root only by
+    /// the CLI's choice — `lanekeep-testkit` anchors one at a temporary fixture directory — and
+    /// guessing would make loading a config write somewhere nobody asked for.
+    ///
+    /// [`COMPONENT_CACHE_PATH`]: lanekeep_wasm::COMPONENT_CACHE_PATH
+    pub artifacts: Option<&'a Path>,
+
+    /// Overrides `timeouts.global` from the config file, for a caller holding a more specific
+    /// statement — `--timeout`, which a user typed on this run.
+    ///
+    /// **It has to arrive here rather than be applied to the returned [`Config`], because config
+    /// load is itself a phase that runs guest code.** `describe_components` instantiates,
+    /// `configure`s and calls `metadata` on every component under a clock of its own, and that
+    /// clock is built before this function returns. A caller that loaded first and assigned to
+    /// `Config::limits` afterwards would leave that phase governed by the config file's number
+    /// while the message a breach prints tells the user to raise it with `--timeout` — advice
+    /// that could not work. `AGENTS.md` records the original instance of exactly this shape.
+    pub global_timeout: Option<Duration>,
+}
+
+/// [`load`], with everything a caller knows that the config file does not.
 ///
-/// Given a project root, both loads write and map artifacts under the same
-/// [`COMPONENT_CACHE_PATH`], keyed on the specifier and the bytes — so the first run compiles once
-/// instead of twice and every later run maps what that run wrote. The two loaders agree because
-/// both build their `wasmtime::Engine` with `WasmEngine::new`; an artifact a different build wrote
-/// fails to deserialize and is discarded rather than trusted.
-///
-/// Separate from [`load`] rather than a parameter on it because the caller has to *name* the
-/// directory. This crate is handed a rules root, which is the project root only by the CLI's
-/// choice — `lanekeep-testkit` anchors one at a temporary fixture directory — and inferring a
-/// cache location from it would make loading a config write somewhere nobody asked for.
-///
-/// [`COMPONENT_CACHE_PATH`]: lanekeep_wasm::COMPONENT_CACHE_PATH
+/// See [`LoadOptions`] for what each field buys and why it has to be known before the load
+/// rather than applied to the [`Config`] it returns.
 ///
 /// # Errors
 ///
 /// As [`load`].
-pub fn load_with_artifact_cache(
+pub fn load_with(
     sandbox: &Sandbox,
     root: &RuleRoot,
     config_path: &Path,
-    project_root: &Path,
-) -> Result<Config, ConfigError> {
-    load_inner(sandbox, root, config_path, Some(project_root))
-}
-
-fn load_inner(
-    sandbox: &Sandbox,
-    root: &RuleRoot,
-    config_path: &Path,
-    artifacts: Option<&Path>,
+    options: LoadOptions<'_>,
 ) -> Result<Config, ConfigError> {
     let display = config_path.display().to_string();
 
@@ -591,7 +609,7 @@ fn load_inner(
         None => (extracted, Vec::new()),
     };
 
-    build(sandbox, root, raw, &display, &resolved, artifacts)
+    build(sandbox, root, raw, &display, &resolved, options)
 }
 
 fn build(
@@ -600,7 +618,7 @@ fn build(
     raw: RawConfig,
     display: &str,
     resolved: &[ResolvedRule],
-    artifacts: Option<&Path>,
+    options: LoadOptions<'_>,
 ) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
@@ -628,6 +646,13 @@ fn build(
     // guest code — instantiation, `configure`, `metadata` — and a component asked what it is
     // under a budget the config did not set is a limit that was parsed and then dropped, which
     // `AGENTS.md` records as the shape of the `--timeout` bug: accepted, validated, ignored.
+    //
+    // **The caller's override is folded in *here*, not applied to the `Config` this returns.**
+    // That is the same bug in a new phase, and it was live for the length of this branch: the CLI
+    // loaded the config, then assigned `--timeout` to `loaded.limits`, one statement after the
+    // phase it was meant to govern had already finished. A component whose `configure` overran
+    // failed with a message ending "raise it with `--timeout`", and raising it changed nothing.
+    // Resolving it before `describe_components` is what makes one number govern both phases.
     let mut limits = Limits::default();
     if let Some(ms) = raw.timeouts.rule {
         limits = limits.with_rule_timeout(Duration::from_millis(ms));
@@ -635,12 +660,15 @@ fn build(
     if let Some(ms) = raw.timeouts.global {
         limits = limits.with_global_timeout(Duration::from_millis(ms));
     }
+    if let Some(global) = options.global_timeout {
+        limits = limits.with_global_timeout(global);
+    }
 
     // Every component in the config, asked what it is. Once, here, before a `RuleSpec` exists
     // — not per worker: instantiation is 82 to 96 times the cost of not instantiating, which
     // is why `lanekeep_wasm::WasmRuntime::rule` defers it, and reading metadata through a
     // worker's runtime would undo that for every rule in the set.
-    let mut described = describe_components(root, resolved, display, limits, artifacts)?;
+    let mut described = describe_components(root, resolved, display, limits, options.artifacts)?;
 
     let mut rules = Vec::with_capacity(raw.rules.len());
     for (index, rule) in raw.rules.into_iter().enumerate() {
@@ -1968,11 +1996,14 @@ mod tests {
         let root = RuleRoot::new(&cached.dir).expect("canonicalizes");
         let sandbox =
             sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
-        load_with_artifact_cache(
+        load_with(
             &sandbox,
             &root,
             &cached.dir.join("lanekeep.json"),
-            &cached.dir,
+            LoadOptions {
+                artifacts: Some(&cached.dir),
+                ..LoadOptions::default()
+            },
         )
         .expect("the component resolves");
 
@@ -1987,6 +2018,64 @@ mod tests {
             1,
             "one component was described, so one artifact should be cached; found {written:?}"
         );
+    }
+
+    /// A caller's `--timeout` has to govern config load, because config load runs guest code.
+    ///
+    /// **Asserts the raise, which is the direction that can fail.** `AGENTS.md` records why: a
+    /// test that only *lowers* a budget passes against a budget that is ignored, because the run
+    /// completes either way and completion is what such a test asserts. Raising is different —
+    /// the un-overridden load must fail first, so the override is the only thing that can make
+    /// the second one succeed.
+    ///
+    /// This is the `--timeout` trap recurring in a phase that did not exist when it was first
+    /// found. The flag used to be applied to the `Config` *after* `load` returned, one statement
+    /// below a config load that had already instantiated, configured and read `metadata` from
+    /// every component under the config file's number. A component whose `configure` overran
+    /// failed with a message ending "raise it with `--timeout`", and raising it changed nothing.
+    ///
+    /// The 50 ms against a burn of roughly a third of a second is a ratio, not a deadline: a
+    /// slower machine only makes the breach breach harder, and the raised case has seconds of
+    /// room. Both halves go through `load_with` rather than the CLI, because the CLI is where the
+    /// bug was and a test that reproduced its structure would inherit it.
+    #[test]
+    fn a_raised_global_timeout_governs_config_load_and_not_only_the_run() {
+        let files: &[(&str, &str)] = &[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "timeouts": {"global": 50},
+                "rules": [{"rule": "./rules/metadata.wasm", "options": {"burn": true}}]}"#,
+        )];
+        let fixture = Fixture::new("config-load-budget", files);
+        fixture.write_component("rules/metadata.wasm", "metadata");
+        let root = RuleRoot::new(&fixture.dir).expect("canonicalizes");
+        let sandbox =
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+        let config_path = fixture.dir.join("lanekeep.json");
+
+        // The config's own budget is far below what the fixture spends in `configure`, so the
+        // phase breaches. Asserted on the message as well as on the failure, because a fixture
+        // that failed to load for some unrelated reason would satisfy `is_err` and would make
+        // the raise below prove nothing.
+        let breached = load_with(&sandbox, &root, &config_path, LoadOptions::default())
+            .expect_err("50 ms is far below what the fixture's `configure` spends");
+        let text = breached.to_string();
+        assert!(
+            text.contains("budget"),
+            "the breach must be the budget rather than something incidental, got: {text}"
+        );
+
+        // And raising it is what that message tells the user to do.
+        load_with(
+            &sandbox,
+            &root,
+            &config_path,
+            LoadOptions {
+                global_timeout: Some(Duration::from_secs(30)),
+                ..LoadOptions::default()
+            },
+        )
+        .expect("a raised budget must reach the phase that breached under the lower one");
     }
 
     #[test]
