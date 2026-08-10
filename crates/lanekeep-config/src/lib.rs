@@ -1245,13 +1245,33 @@ fn hash_ruleset(sandbox: &Sandbox, components: &[&ComponentRule]) -> Hash {
         }
     }
 
-    // Sorted by path and deduplicated by path, so that reordering a config's rules or naming
+    // Sorted and deduplicated by path *and bytes*, so that reordering a config's rules or naming
     // one component twice is not a different ruleset. The path itself is deliberately not
     // hashed: it is absolute, so it would throw a cache away for moving a checkout, and which
     // component a rule *names* is `hash_config`'s through the specifier.
+    //
+    // **The bytes are in the key because "read once" is per reference, not per path.**
+    // `component_bytes` reads once per `ResolvedRule`, and nothing deduplicates `rules`, so a
+    // config may legitimately name one file twice — `["./r.wasm", {"rule": "./r.wasm", "options":
+    // {…}}]` is how a rule is used bare and configured in the same run. If the file is rewritten
+    // between those two reads, two `ComponentRule`s carry one path and different bytes, and both
+    // execute what they carry. Deduplicating on the path alone would then keep one of them
+    // arbitrarily — `sort_unstable` does not order equal keys — and hash a ruleset that is not
+    // the one running, which is the single claim this whole function exists to make.
+    //
+    // Keying rather than preventing, deliberately. Caching the first read and reusing it would
+    // close the window by changing which bytes the second rule *runs*, which is a semantic change
+    // to fix a hashing bug — and it cannot make the read atomic either, since there is no
+    // snapshot of a live filesystem to take. Hashing what actually ran is the property that was
+    // claimed, and it is the one restored here. In the ordinary case both entries have identical
+    // bytes and this deduplicates exactly as it did before.
     let mut components: Vec<&&ComponentRule> = components.iter().collect();
-    components.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    components.dedup_by(|a, b| a.path == b.path);
+    components.sort_unstable_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.bytes.as_slice().cmp(b.bytes.as_slice()))
+    });
+    components.dedup_by(|a, b| a.path == b.path && a.bytes.as_slice() == b.bytes.as_slice());
 
     hasher.update(b"components");
     length_prefixed(&mut hasher, &(components.len() as u64).to_le_bytes());
@@ -2723,6 +2743,52 @@ mod tests {
             canonical,
             hex(&hash_ruleset(&sandbox, &[&one, &two, &one])),
             "naming one component twice is not a different ruleset"
+        );
+    }
+
+    /// One path can carry two byte sequences, and both have to reach the key.
+    ///
+    /// `component_bytes` reads once per `ResolvedRule` and nothing deduplicates `rules`, so a
+    /// config naming one file twice — bare in one entry and with options in another — reads it
+    /// twice. A rewrite between those reads produces exactly the pair below, and both rules go on
+    /// to execute the bytes they carry. Deduplicating on the path alone kept one of them
+    /// arbitrarily, so the key described a ruleset that was not running.
+    ///
+    /// The window is microseconds and the trigger is exotic. It is asserted anyway because the
+    /// claim it falsifies — the bytes hashed are the bytes that run — is the one the component
+    /// half of `ruleset_hash` exists to make, and a claim with one shape that breaks it is not
+    /// quite the claim.
+    #[test]
+    fn one_path_with_two_byte_sequences_reaches_the_ruleset_hash_as_both() {
+        let fixture = Fixture::new("component-torn-read", &[("r.wasm", "\u{0}asm-before")]);
+        let sandbox = fixture.empty_sandbox();
+
+        // The first reference's read.
+        let before = fixture.component("r.wasm");
+        // The file is rewritten, and the second reference reads what is there now. Both carry
+        // the same path, because it is the same file.
+        fixture.write_all(&[("r.wasm", "\u{0}asm-after")]);
+        let after = fixture.component("r.wasm");
+        assert_eq!(
+            before.path, after.path,
+            "the fixture is one file, read twice"
+        );
+        assert_ne!(
+            before.bytes.as_slice(),
+            after.bytes.as_slice(),
+            "the rewrite is what makes this pair interesting"
+        );
+
+        assert_ne!(
+            hex(&hash_ruleset(&sandbox, &[&before, &after])),
+            hex(&hash_ruleset(&sandbox, &[&before, &before])),
+            "a run executing two different components must not key as one executing the first \
+             twice — deduplicating on the path alone made these equal"
+        );
+        assert_ne!(
+            hex(&hash_ruleset(&sandbox, &[&before, &after])),
+            hex(&hash_ruleset(&sandbox, &[&after, &after])),
+            "nor as one executing the second twice"
         );
     }
 
