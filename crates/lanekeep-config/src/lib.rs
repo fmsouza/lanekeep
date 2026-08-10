@@ -507,6 +507,50 @@ pub fn evaluate_into(
 /// Returns [`ConfigError`] when the file cannot be read, the module fails to evaluate, or
 /// the result is not shaped like a config.
 pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Config, ConfigError> {
+    load_inner(sandbox, root, config_path, None)
+}
+
+/// [`load`], with somewhere to cache the components it compiles.
+///
+/// **This is the difference between a component costing tens of milliseconds per config load and
+/// costing nothing.** [`load`] has no writable directory, so `describe_components` compiles every
+/// component from scratch to ask it what it is, throws the compilation away, and the engine
+/// compiles the same bytes again at prepare time. Measured on the release binary, one component
+/// added ~58 ms to a `lanekeep rules` that checks no files at all, and two added ~116 ms — against
+/// a §15 warm-run budget of 25 ms for the whole invocation. Config load runs per LSP request, per
+/// MCP tool call and per `--watch` iteration, so this is paid on every one of them.
+///
+/// Given a project root, both loads write and map artifacts under the same
+/// [`COMPONENT_CACHE_PATH`], keyed on the specifier and the bytes — so the first run compiles once
+/// instead of twice and every later run maps what that run wrote. The two loaders agree because
+/// both build their `wasmtime::Engine` with `WasmEngine::new`; an artifact a different build wrote
+/// fails to deserialize and is discarded rather than trusted.
+///
+/// Separate from [`load`] rather than a parameter on it because the caller has to *name* the
+/// directory. This crate is handed a rules root, which is the project root only by the CLI's
+/// choice — `lanekeep-testkit` anchors one at a temporary fixture directory — and inferring a
+/// cache location from it would make loading a config write somewhere nobody asked for.
+///
+/// [`COMPONENT_CACHE_PATH`]: lanekeep_wasm::COMPONENT_CACHE_PATH
+///
+/// # Errors
+///
+/// As [`load`].
+pub fn load_with_artifact_cache(
+    sandbox: &Sandbox,
+    root: &RuleRoot,
+    config_path: &Path,
+    project_root: &Path,
+) -> Result<Config, ConfigError> {
+    load_inner(sandbox, root, config_path, Some(project_root))
+}
+
+fn load_inner(
+    sandbox: &Sandbox,
+    root: &RuleRoot,
+    config_path: &Path,
+    artifacts: Option<&Path>,
+) -> Result<Config, ConfigError> {
     let display = config_path.display().to_string();
 
     let entry = root.path().join(ENTRY);
@@ -547,7 +591,7 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
         None => (extracted, Vec::new()),
     };
 
-    build(sandbox, root, raw, &display, &resolved)
+    build(sandbox, root, raw, &display, &resolved, artifacts)
 }
 
 fn build(
@@ -556,6 +600,7 @@ fn build(
     raw: RawConfig,
     display: &str,
     resolved: &[ResolvedRule],
+    artifacts: Option<&Path>,
 ) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
@@ -595,7 +640,7 @@ fn build(
     // — not per worker: instantiation is 82 to 96 times the cost of not instantiating, which
     // is why `lanekeep_wasm::WasmRuntime::rule` defers it, and reading metadata through a
     // worker's runtime would undo that for every rule in the set.
-    let mut described = describe_components(root, resolved, display, limits)?;
+    let mut described = describe_components(root, resolved, display, limits, artifacts)?;
 
     let mut rules = Vec::with_capacity(raw.rules.len());
     for (index, rule) in raw.rules.into_iter().enumerate() {
@@ -743,6 +788,7 @@ fn describe_components(
     resolved: &[ResolvedRule],
     display: &str,
     limits: Limits,
+    artifacts: Option<&Path>,
 ) -> Result<Vec<Option<Described>>, ConfigError> {
     let mut described: Vec<Option<Described>> = resolved.iter().map(|_| None).collect();
     if !resolved.iter().any(|rule| rule.reference.is_component()) {
@@ -761,11 +807,20 @@ fn describe_components(
 
     let engine = WasmEngine::new().map_err(|e| broken(e.to_string()))?;
     let mut set = RuleSet::new(&engine).map_err(|e| broken(e.to_string()))?;
-    // Without the on-disk artifact cache, because this crate is handed a rules root rather
-    // than a project root and guessing one to write `.lanekeep/components` into would make
-    // loading a config write to a directory the caller never named. The engine compiles these
-    // again at prepare time, through its own loader, which does have somewhere to put them.
-    let loader = lanekeep_wasm::ComponentLoader::without_cache();
+    // With the on-disk artifact cache when the caller named a project root, and without one
+    // otherwise. A rules root is not a project root — `lanekeep-testkit` anchors one at a
+    // temporary fixture directory — so guessing a location to write `.lanekeep/components` into
+    // would make loading a config write somewhere nobody asked for. Naming it is
+    // `load_with_artifact_cache`, and the CLI names it.
+    //
+    // It matters because without one this compiles every component only to throw the
+    // compilation away, and the engine compiles the same bytes again at prepare time: ~58 ms per
+    // component, on every config load, and config load runs per LSP request, per MCP tool call
+    // and per `--watch` iteration. With one, both loads map the same artifact.
+    let loader = artifacts.map_or_else(
+        lanekeep_wasm::ComponentLoader::without_cache,
+        lanekeep_wasm::ComponentLoader::for_project_root,
+    );
 
     let mut added = Vec::new();
     for (position, rule) in resolved.iter().enumerate() {
@@ -1849,6 +1904,62 @@ mod tests {
         assert!(
             component.counted_in_ruleset_hash(),
             "a component `load` resolved must be counted in `ruleset_hash`"
+        );
+    }
+
+    /// The two entry points differ in exactly one observable way, and it is worth tens of
+    /// milliseconds per config load.
+    ///
+    /// `load` has nowhere to write, so it compiles each component only to discard the
+    /// compilation, and the engine compiles the same bytes again at prepare time.
+    /// `load_with_artifact_cache` is handed a project root and leaves a `.cwasm` under
+    /// `COMPONENT_CACHE_PATH` that both this load and the engine's own loader map — measured at
+    /// ~58 ms per component per load before, and at TypeScript parity after.
+    ///
+    /// Asserted on the artifact rather than on a duration: a timing assertion on a loaded machine
+    /// is a flake, and the file either exists or it does not. Both directions are asserted,
+    /// because a change making *every* load write would pass a one-sided test while putting a
+    /// cache directory inside every `lanekeep-testkit` fixture — which is the reason `load` does
+    /// not do it.
+    #[test]
+    fn only_a_load_given_a_project_root_caches_what_it_compiled() {
+        let files = &[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["./rules/metadata.wasm"]}"#,
+        )];
+
+        let plain = Fixture::new("artifact-cache-absent", files);
+        plain.write_component("rules/metadata.wasm", "metadata");
+        plain.load_json().expect("the component resolves");
+        assert!(
+            !plain.dir.join(lanekeep_wasm::COMPONENT_CACHE_PATH).exists(),
+            "`load` names no project root, so it must not write a cache directory into one"
+        );
+
+        let cached = Fixture::new("artifact-cache-present", files);
+        cached.write_component("rules/metadata.wasm", "metadata");
+        let root = RuleRoot::new(&cached.dir).expect("canonicalizes");
+        let sandbox =
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+        load_with_artifact_cache(
+            &sandbox,
+            &root,
+            &cached.dir.join("lanekeep.json"),
+            &cached.dir,
+        )
+        .expect("the component resolves");
+
+        let artifacts = cached.dir.join(lanekeep_wasm::COMPONENT_CACHE_PATH);
+        let written: Vec<_> = fs::read_dir(&artifacts)
+            .expect("the cache directory is there")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "cwasm"))
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "one component was described, so one artifact should be cached; found {written:?}"
         );
     }
 

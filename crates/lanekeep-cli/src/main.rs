@@ -854,8 +854,14 @@ fn prepare(
 
     let sandbox = lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // `load_with_artifact_cache` rather than `load`: it hands config load the same
+    // `.lanekeep/components` the engine's own loader uses, so a component is compiled once for
+    // the project instead of once per config load and again per prepare. `prepare` runs per LSP
+    // request, per MCP tool call and per `--watch` iteration, and a plain `load` put ~58 ms per
+    // component on each of them.
     let mut loaded =
-        lanekeep_config::load(&sandbox, &root, &config_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        lanekeep_config::load_with_artifact_cache(&sandbox, &root, &config_path, project_root)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     let declared = loaded.rules.len();
 
     // `--timeout` overrides whatever the config settled on, because a flag a user typed on
