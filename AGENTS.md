@@ -333,6 +333,29 @@ earlier gate than the one under test passes for the wrong reason, or fails with 
 sends you to the wrong place.** All three of these produced a red test that named JSON, or
 quoting, while the property they were written for went unasserted.
 
+**And a fourth wearing different clothes: a fixture built by a helper that performs the thing
+under test asserts nothing at all.** A test for a resolver's refusal of a `..` traversal built
+its input with `path.join(root, '..', 'secret.ts')` — and `path.join` normalizes, so the
+function under test was handed an already-resolved path and never saw a `..`. Deleting the
+normalizing step from the function left every test in the file green; only mutation testing
+found it. Build such a path by concatenation, and assert that it still carries the traversal
+before handing it over.
+
+This one hides better than the three above, because the offending call looks like ordinary path
+hygiene rather than like a gate. `path.join`, `path.resolve`, `URL`, `serde_json::to_string` and
+`canonicalize` all normalize or escape; any of them standing between a test's literal and its
+assertion is worth a second look, and the question to ask is whether the helper and the subject
+do the same job.
+
+**`node --test <dir>/` executes the directory as a module on Node ≥ 23, so a suite can pass
+while running nothing.** `node --test packages/lanekeep/` reports `pass 1`: it resolved the
+directory to `index.js`, a file that declares no tests at all, and counted it. Older Node walked
+a directory for test files, so a command copied from anywhere older is silently a no-op now. The
+working form names files — `node --test 'packages/lanekeep/runtime/*.test.js'`. `just test-js`
+carries three guards for the same reason: no directory argument, an empty glob is an error, and
+node's own reported test count is asserted nonzero. "It exited 0" is precisely what this failure
+looks like.
+
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
 
@@ -596,6 +619,69 @@ version. Measured 2026-08-10 in `node:20-bookworm`, on arm64 and x86-64 alike. `
 only so that nobody mistakes it for the fix. Neither recipe is in any gate, so this cannot redden
 CI; it costs a maintainer an afternoon instead.
 
+**And `npx --prefix` fixes the directory, not the install, so a fresh clone can still fetch a
+stranger's package.** `packages/lanekeep/node_modules` is gitignored. On a checkout where nobody
+has run `npm ci` there, `npx --prefix packages/lanekeep jco …` finds no local `jco`, falls
+through to the registry, and offers to fetch `jco@1.0.0` — an unrelated package that happens to
+hold that bare name. In CI that is loud. In an interactive terminal npx *prompts*, and Enter
+accepts, so the answer to "did it work?" is yes and what ran was not this repository's toolchain.
+`just _require node` and `just _require npx` cannot catch it, because both binaries exist.
+`--no-install` closes it, turning an empty `node_modules` into an error naming the prefix.
+
+It does **not** close the case above it, which is the correction worth carrying: on too old a
+Node, `npm ci` *succeeds* and skips only the optional native binding, so `.bin/jco` is present
+and `--no-install` is satisfied — and the failure is still `MODULE_NOT_FOUND` from inside a
+dependency. Two different faults with one symptom shape; `_componentize` carries a check for
+`packages/lanekeep/node_modules/.bin/jco` for the first and nothing but this note for the second.
+
+**`componentize-js` leaves `Date.now()` and `Math.random()` present and *frozen*, and
+`--disable all` does not touch them.** Measured 2026-08-10, jco 1.27.0 with componentize-js
+0.22.0: a component built with `--disable all` imports exactly one interface — checked at the
+component's import list *and* at all 29 of its core-module imports — and rule code inside it
+still read `Date.now=1786352655014`, `Math.random=0.48401551228016615`, `fetch=function`,
+`setTimeout=function`. Byte-identical across two calls in one process and across two processes
+minutes apart, because `Date.now()` is the instant the component was **built**, snapshotted into
+the `wizer` heap image, and `Math.random()` is a constant.
+
+Nothing is nondeterministic, which is exactly why nothing catches it: the component's bytes are a
+`ruleset_hash` input, so even the frozen timestamp is part of the cache key. What breaks is the
+sandbox invariant above, and present-and-frozen is worse than either absence or failure — an
+author calling `Date.now()` gets a stale build timestamp with nothing anywhere to say so.
+
+**The general form outlives this toolchain: absence at the import level is not absence at the
+JavaScript level.** The component model withholds what an engine reaches through an *import*;
+whatever the engine implements internally is there regardless of what the import list says.
+`packages/lanekeep/runtime/host.js` deletes 37 such names, from the runtime module's top level,
+before any rule module is evaluated — the ordering is load-bearing, since ES modules evaluate
+depth-first in source order and a rule imported ahead of the runtime would have module scope in
+which to capture them.
+
+**The QuickJS backend's artifact is nearly eight times smaller and its WASI imports cannot be
+dropped, so it is unusable — structurally, not for want of a flag.** Measured 2026-08-11 on one
+rule: `jco componentize --backend qjs` produces 1,702,540 bytes against StarlingMonkey's
+13,062,599, and imports **19** instances rather than one, among them `wasi:clocks/wall-clock`,
+`wasi:filesystem/types`, `wasi:filesystem/preopens` and `wasi:random/insecure-seed`. Passing
+`--disable all` with it is refused: `The --disable option is only supported by the starlingmonkey
+backend.` That refusal is honest rather than an oversight — jco's own
+`dist/cmd/componentize.js` shows `componentizeQJS` forwarding `witPath`, `jsSource`, `jsPath`,
+`world` and `sync` and computing no feature set at all, where the StarlingMonkey path calls
+`calculateFeatureSet(opts)`. So the saving is real and out of reach until that backend grows a
+feature-set parameter of its own, and "try the smaller backend" is not a lever anyone should
+spend a day rediscovering.
+
+**An uncaught throw inside a component arrives at the host as a bare `wasm trap: unreachable`.**
+The message, the thrown value's type and the whole stack are gone, because a trap carries no
+payload and there is nowhere for any of them to go. A rule failing for a perfectly nameable
+reason — `undefined.message` on a missing `card` — is therefore indistinguishable from one that
+ran off the end of memory, and the diagnostic names neither the rule nor the field.
+
+There is nothing for the host to catch better, so the conversion belongs to the guest: `check`
+and `reduce` return `result<_, rule-error>`, and `packages/lanekeep/runtime/entry.js` wraps every
+handler so a throw becomes a message plus parsed stack frames. What runs *outside* that wrapper
+has no such channel — `metadata`, and the engine's own module evaluation — which is why
+`register` validates a rule's shape at build time. That is the only remaining place where "this
+rule is missing `card.examples.bad`" can still be said in words.
+
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
 and re-checks forever — pinning a core while the output looks exactly like a tool that is
@@ -802,6 +888,22 @@ exit code could fail all of its cases there and still be reported as tolerating 
 pipefail` in the stub is the fix. Worth remembering generally: a stub is test code, and test
 code that always passes is worse than none.
 
+**A `[profile.dev.package.*]` stanza naming a crate that does not exist is a silent no-op, and
+cargo reports the wrong spelling only as a per-build warning at exit 0.** wasmtime 47 renamed its
+internals: the crate is `wasmtime-internal-cranelift`, and the obvious `wasmtime-cranelift`
+matches nothing at all. Measured here — `warning: profile package spec … did not match any
+packages`, exit code **0**, and the profile silently unapplied. With the right name, `just check`
+went from 92.90 s to 15.42 s: the workspace tests compile a 12.4 MiB JavaScript component, and
+Cranelift built at `opt-level = 0` is what makes that take a minute and a half. A 6× difference
+in the pre-commit gate, sitting behind a spelling that nothing turns red.
+
+**And `cargo remove` silently deletes `[profile.dev.package.*]` stanzas and
+`[workspace.dependencies]` entries it did not add.** Observed on the root `Cargo.toml`: removing
+one dependency took three profile stanzas and an unrelated workspace-dependency entry with it.
+Put beside the entry above, that is the 6× given back without a word — the stanza vanishes, the
+build stays green, and the only symptom is a gate that got slow again. Diff the root manifest
+after any `cargo add` or `cargo remove`, or make the edit by hand.
+
 **`just mutants -- --file <path>` does not narrow anything, and does not fail in a way that says
 so.** `just` keeps the `--` inside a recipe's variadic arguments rather than consuming it, so the
 recipe expands to `cargo mutants --workspace -- --file <path>` — and `--` is cargo-mutants' own
@@ -875,6 +977,33 @@ exactly the gap it looked like it was closing. A fixture is a claim about the en
 built against, and it goes stale exactly like documentation does: silently, and without whatever
 broke it saying so. Checking whether a mutation run actually exercises the code path you think
 it does means checking which test failed, not only that one did.
+
+**A figure measured against a working tree is reproducible by nobody who lacks that tree.** A
+fidelity check reported "87 violations over 106 files", the number went into a pull request body,
+and from there into a plan as the expected result of a later change — which came out at 99 over
+107 and read as a regression. Neither figure was wrong. The 87/106 run was made on a branch
+*before* that same branch added a file the merged commit introduces, so **no commit in history
+produces it**: the delta closes to the unit, one added file and twelve more violations, all
+twelve inside that one file. Only a run against a pinned `git archive <sha>` could establish
+that, and only because someone went looking.
+
+So name the commit beside the number, measure against it rather than against a checkout, and
+read "measured on my tree at the time" as an anecdote. Two corollaries, both cheap. Compare two
+binaries over **one** unchanging corpus, never one binary over two trees — the second measures
+the trees. And when a count does not reproduce, report the difference rather than adjusting the
+expectation to match what you now see: it is either a regression or a moved corpus, and which of
+the two it is decides everything.
+
+**Grepping a formula finds the formula, not the claim.** A stated bound moved from
+"(worker, rule)" to "(worker, component)", and the sweep that found the places to fix matched the
+string `(worker, rule)`. It found five. There were nine — the other four said the same thing in
+prose, "one instance per rule", "one `None` per rule", "one lazily built instance per rule" —
+and not one of them contains the formula. They were found by a reviewer reading, which is not a
+process anybody should rely on twice.
+
+Search for the *claim* in the several ways someone would have written it, and expect the plainest
+spelling to be the one the pattern misses. Prose is where a fact goes stale most quietly, because
+nothing about it looks like code that could be wrong.
 
 ## What not to do
 
