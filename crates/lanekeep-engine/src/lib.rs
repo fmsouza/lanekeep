@@ -2450,11 +2450,18 @@ fn load_components(
         // performed here instead would reach whichever store this thread happens to hold and
         // none of the others, which is a rule answering differently depending on how rayon
         // split the corpus.
-        // Rule `0`, matching what `lanekeep_config::describe_components` described this
-        // component's rule as. The two have to agree: config read `metadata(0)` to build this
-        // rule's spec, so running any other index would execute a rule the config never saw.
-        // A component hosting a list of rules reaches neither of them yet — see the comment
-        // beside the `add` in `lanekeep-config`.
+        // Rule `0`, which is **no longer what the config described** and is left that way
+        // deliberately. `lanekeep_config::describe_components` enumerates a component with the
+        // world's `rules` export and reads `metadata(index)` per rule, so a component hosting a
+        // list now produces one `RuleSpec` per rule, each carrying its own
+        // `ComponentRule::index`. This site still names `0` for every one of them, so any rule
+        // but the first would execute code the config never described — its neighbor's.
+        //
+        // Nothing reaches it today: every component a test or a built-in names hosts exactly one
+        // rule, so `ComponentRule::index` is `0` wherever it is read. It is written down rather
+        // than closed here because closing it is the whole of the next task, whose first step is
+        // a red test over exactly this config — a fix landing early would leave that step with
+        // nothing to fail against. Dispatch on `component.index`, and this comment goes.
         let slot = set
             .add(&name, &admitted, 0, component.options)
             .map_err(|e| RunError::Component {

@@ -2991,6 +2991,30 @@ mod tests {
             one, twice,
             "distinct rule indices must not hash the same as the same index twice"
         );
+
+        // And the once-ness the name is about, which the inequality above does not reach: it
+        // holds whether the bytes were folded once or twice, so on its own this test survived
+        // `distinct.dedup()` being deleted.
+        //
+        // **Repetition is the only lever that can observe how many times a component was
+        // folded, and that is forced by the encoding rather than chosen.** The two halves cannot
+        // be compared separately — a hash has no halves — so seeing the component fold's
+        // multiplicity means holding the rule fold still while it moves, and the rule fold
+        // encodes the rule count. Listing a rule a second time is the one edit that changes
+        // nothing there, because rules deduplicate too. So: a component named three times for
+        // two rules is folded exactly as it is when it is named twice.
+        let listed_again = hash_ruleset(
+            &sandbox,
+            &[
+                &fixture.component_at("a.wasm", 0),
+                &fixture.component_at("a.wasm", 1),
+                &fixture.component_at("a.wasm", 0),
+            ],
+        );
+        assert_eq!(
+            one, listed_again,
+            "a component's bytes must reach the fold once however many times it is listed"
+        );
     }
 
     /// A rule index means nothing on its own, so the fold has to say which component it is in.
