@@ -568,6 +568,34 @@ behavioral rather than byte-wise: `tests/js_globals.rs` derives its probes from 
 an artifact that no longer satisfies the contract fails the moment the contract moves. That is
 weaker — it catches a stale artifact only where the two disagree — and it is what there is.
 
+**There are three digest manifests now, one per recipe that rewrites a committed artifact, and
+what may be shared between them is an input rather than an artifact.** `just wasm-fixtures`
+writes `fixture-digests.txt`, `just rust-rules` writes `rule-component-digests.txt`, and
+`just typescript-builtins` writes `typescript-component-digests.txt`. All three record
+`wit/world.wit`, deliberately: it is a build input to every component in the tree, and a change
+to it has to send you to every recipe. An *artifact* is the opposite case, because exactly one
+recipe can produce it — and `typescript-builtins.wasm` sits in
+`crates/lanekeep-rules/components/`, beside two artifacts a different recipe builds. Recording
+it in that recipe's manifest as well would mean a rebuild of the TypeScript component, whose
+bytes change every time, leaves the *Rust* manifest red until somebody runs `just rust-rules`: a
+recipe about other artifacts, needing `cargo component` and a wasm target, to fix a build it had
+no part in. `fixture_currency.rs`'s `TYPESCRIPT_ARTIFACTS` is the one list that partitions them,
+read by the manifest that owns them and by the manifest that must subtract them.
+
+**And `jco componentize` needs a far newer Node than `just test-js` does, which is discovered at
+*install* time and reported at build time, by neither.** `test-js` requires Node 18, the floor
+for `node --test`. The componentize toolchain's floor is set by a transitive native dependency —
+`@napi-rs/lzma@1.5.1`, reached through jco 1.27.0, declares
+`engines.node = "^22.20 || ^24.12 || >=25"`. On Node 20, `npm ci` prints a single `EBADENGINE`
+warning and **skips the platform binding**, since it is an optional dependency; whoever next runs
+`just wasm-fixtures` or `just typescript-builtins` — possibly days later — gets
+`MODULE_NOT_FOUND` from inside `@napi-rs/lzma/index.js`, on a stack that names neither Node nor a
+version. Measured 2026-08-10 in `node:20-bookworm`, on arm64 and x86-64 alike. `node:24-bookworm`
+(v24.19.0) builds the same component from the same committed lock and says nothing. Deleting
+`package-lock.json` also makes it work, by resolving a different tree — which is worth knowing
+only so that nobody mistakes it for the fix. Neither recipe is in any gate, so this cannot redden
+CI; it costs a maintainer an afternoon instead.
+
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
 and re-checks forever — pinning a core while the output looks exactly like a tool that is

@@ -87,7 +87,16 @@ const FILE: &str = "src/a.ts";
 ///
 /// Asserted against the component's own `rules()` below rather than trusted: an index that
 /// slipped would run a different rule than the one a failure named.
-const IDS: [&str; 4] = ["probe/reach", "probe/context", "probe/cross", "probe/throw"];
+///
+/// `probe/order` is last and comes from a *second module*, which is the whole of its point —
+/// see [`the_runtime_is_evaluated_before_any_rule_module`].
+const IDS: [&str; 5] = [
+    "probe/reach",
+    "probe/context",
+    "probe/cross",
+    "probe/throw",
+    "probe/order",
+];
 
 // --- the two claims -----------------------------------------------------------------------
 
@@ -190,7 +199,51 @@ fn the_component_withholds_the_clock_and_randomness() {
         );
     }
 
+    the_runtime_is_evaluated_before_any_rule_module(&mut probe);
     the_rest_of_the_glue_module(&mut probe);
+}
+
+/// A rule's *module scope* is evaluated after `withhold()` has run, and not merely its handlers.
+///
+/// `packages/lanekeep/runtime/entry.js` calls `withhold()` at its own top level and documents
+/// the requirement this creates: a generated entry must import the runtime **before** any rule
+/// module, because ES modules evaluate depth-first in the order their imports are written. A
+/// rule imported first would have its module body run while `Date` was still reachable and could
+/// close over it — and nothing afterwards would notice, since `check` sees the same withheld
+/// globals either way.
+///
+/// # Why this needs a second module, and why the fixture did not have one
+///
+/// Every other rule here is defined in `rule.js`, the module that imports the runtime. Those
+/// cannot be evaluated before the import at the top of their own file whatever anyone writes, so
+/// they demonstrate nothing about the ordering — a claim made and withdrawn during B2.
+/// `probe.js` is a second module, imported after the runtime, and it records what it could see
+/// while it was being evaluated.
+///
+/// # And why a bundler makes it worth building rather than reasoning about
+///
+/// The ordering rule is a property of ES modules; what actually ships is a *bundle*. rolldown
+/// flattens every module into one before `wizer` runs, and this is where its having preserved
+/// the order is checked. Verified in the failing direction on 2026-08-10 by moving
+/// `import order from './probe.js'` above the runtime import and rebuilding: the report came
+/// back `Date=function ; Math.random=function ; fetch=function ; setTimeout=function` and this
+/// assertion failed. The order in the source is carried into the bundle, and the bundle is what
+/// makes it matter.
+fn the_runtime_is_evaluated_before_any_rule_module(probe: &mut Probe) {
+    let (outcome, reports) = probe.check(4, "p");
+    outcome.expect("the ordering probe runs");
+
+    let seen = reports
+        .first()
+        .and_then(|report| report.message.clone())
+        .expect("the ordering probe reports what its module scope could see");
+
+    assert_eq!(
+        seen, "Date=undefined ; Math.random=undefined ; fetch=undefined ; setTimeout=undefined",
+        "a rule module was evaluated before the runtime withheld the clock, so its module scope \
+         could have captured one. The generated entry must import `lanekeep/runtime/entry` \
+         before any rule — see `packages/lanekeep/runtime/entry.js`."
+    );
 }
 
 /// Every name a rule can still see, pinned, so that a toolchain bump cannot add one quietly.

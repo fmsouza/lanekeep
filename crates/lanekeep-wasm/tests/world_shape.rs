@@ -38,6 +38,14 @@ use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
 /// precompiled and never shipped.
 const WORLD_SHAPE: &[u8] = include_bytes!("fixtures/world-shape.wasm");
 
+/// The TypeScript built-ins, as built by `just typescript-builtins`.
+///
+/// Named here rather than left to the glob below so that its *absence* is a compile error —
+/// see [`the_typescript_builtins_component_imports_no_ambient_authority`], which is the whole
+/// reason this constant exists.
+const TYPESCRIPT_BUILTINS: &[u8] =
+    include_bytes!("../../lanekeep-rules/components/typescript-builtins.wasm");
+
 /// The path the stub reports as the file under check.
 const FILE: &str = "src/lib.ts";
 
@@ -621,6 +629,43 @@ fn no_fixture_artifact_imports_ambient_authority() {
          it was built for the wrong target:\n  {}\n\nevery artifact:\n  {}",
         offenders.join("\n  "),
         observed.join("\n  ")
+    );
+}
+
+/// **The one shipped component that is built from JavaScript, named rather than globbed.**
+///
+/// [`no_shipped_rule_component_imports_ambient_authority`] below already makes this claim about
+/// every artifact in that directory, and it makes it the better way — a glob cannot go stale. So
+/// this test exists for the one thing a glob cannot do: **a directory listing is satisfied by a
+/// directory that does not contain the artifact at all.** `include_bytes!` is not. Delete
+/// `typescript-builtins.wasm`, or never build it, and this crate does not compile, naming the
+/// path; the glob goes green over the two Rust components beside it and says nothing.
+///
+/// That is not hypothetical here. This artifact is the only one in the tree produced by a recipe
+/// that needs Node, and `just typescript-builtins` is outside every gate for the reason
+/// `just rust-rules` is. A contributor who has never run it has a checkout where the glob is
+/// still green.
+///
+/// # Equality, not containment
+///
+/// `{"lanekeep:host/types@0.1.0"}` exactly. A component built without `--disable all` imports
+/// `wasi:filesystem/{types,preopens}`, `wasi:clocks/{wall-clock,monotonic-clock}`,
+/// `wasi:random/random` and `wasi:http/{types,outgoing-handler}` — filesystem, clock, randomness
+/// and network, in a component whose whole purpose is to have none of them — and a containment
+/// check would pass an artifact that imports the host interface *and* all seven. The other
+/// direction matters too: a component that imports nothing is a rule that cannot call `report`,
+/// and it is what a bundle that silently dropped the runtime looks like.
+#[test]
+fn the_typescript_builtins_component_imports_no_ambient_authority() {
+    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+    let component = Component::new(&engine, TYPESCRIPT_BUILTINS)
+        .expect("the shipped TypeScript built-ins are a valid component");
+
+    let imports = instance_imports(&engine, &component);
+    assert_eq!(
+        imports,
+        vec![HOST_INTERFACE.to_owned()],
+        "equality, not containment: a component importing nothing is also wrong"
     );
 }
 

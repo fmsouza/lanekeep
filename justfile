@@ -140,6 +140,53 @@ test *ARGS:
 test-doc:
     cargo test --workspace --doc
 
+# Build one WebAssembly component from a JavaScript or TypeScript entry module.
+#
+# Shared by `wasm-fixtures` and `typescript-builtins`, which are the only two recipes that
+# produce a component this way and which must not differ in a single flag: the JavaScript
+# fixture exists to establish what a rule can still reach once `componentize-js` has put it
+# inside StarlingMonkey, and a fixture built differently from the thing it stands in for
+# establishes nothing. Both are outside every gate, and both rewrite a committed artifact.
+#
+# **`--disable all` is load-bearing and is not tidiness.** Measured on the built-ins entry,
+# 2026-08-10, jco 1.27.0: without it the artifact imports **eighteen** WASI interfaces beside
+# the host one — `wasi:filesystem/{types,preopens}`, `wasi:clocks/{wall-clock,monotonic-clock}`,
+# `wasi:random/random`, `wasi:http/{types,outgoing-handler}`, `wasi:io/{error,poll,streams}` and
+# eight of `wasi:cli` — which is a filesystem, a clock, randomness, network and stdio in a
+# component whose whole purpose is to have none of them. `crates/lanekeep-wasm/src/load.rs`
+# refuses such an artifact at load, naming all eighteen. The flag costs 42,584 bytes
+# (13,070,681 without against 13,028,097 with) — to a few dozen bytes, since neither side is
+# reproducible — so the capabilities are nearly free to carry and would be very expensive to
+# have.
+#
+# **A missing Node is an error here and not a skip**, unlike in `test-js`. Both of this
+# recipe's callers end by recording digests of every source they were built from, and a build
+# that was skipped would have its sources recorded against a binary nobody rebuilt — turning
+# "a determined hand can bless without building" into the ordinary result of running the
+# recipe, which is the one thing `crates/lanekeep-wasm/tests/fixture_currency.rs` says must
+# never happen. Nothing in any gate needs Node: every artifact is committed and read with
+# `include_bytes!`.
+#
+# **And unlike every component built from Rust, these are not byte-reproducible.** Measured
+# 2026-08-10 with jco 1.27.0: three builds from an unchanged tree gave 13,023,574 / 13,023,571
+# / 13,023,630 bytes and three distinct sha256s, differing in 2,968,012 bytes. The `wizer`
+# snapshot is a heap image and SpiderMonkey's layout of it is not stable between processes. So
+# `git status` is dirty after every run of either caller, and `AGENTS.md`'s "rebuild and see
+# that nothing moved" check does not reach these two artifacts — restore one with
+# `git checkout` when its digest is the only line that moved.
+#
+# `{{ ARGS }}` is unquoted on purpose, so that `--bundle-config <path>` arrives as two words.
+# Every value is written in this file; none comes from a caller outside it.
+_componentize source out *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _require node
+    just _require npx
+    echo "componentizing {{ source }}"
+    npx --prefix packages/lanekeep jco componentize "{{ source }}" \
+        --wit crates/lanekeep-wasm/wit --world-name rule --disable all --bundle \
+        {{ ARGS }} -o "{{ out }}"
+
 # Rebuild the committed WebAssembly test fixtures from their sources.
 #
 # Deliberately not part of any gate. The built components are committed, so the gate does
@@ -214,29 +261,14 @@ wasm-fixtures:
     # without building" into the ordinary result of running the recipe, which is the one thing
     # `fixture_currency.rs` says it must never do.
     #
-    # So a missing Node is an error and not a skip, for the same reason. Nothing in any gate
-    # needs Node — the artifact is committed and read with `include_bytes!`-shaped code — and
-    # this recipe is outside every gate exactly as `cargo component` is.
-    #
-    # `--disable all` is load-bearing and is not tidiness: without it the artifact imports
-    # `wasi:filesystem`, `wasi:clocks/wall-clock`, `wasi:random` and `wasi:http`, and
-    # `crates/lanekeep-wasm/src/load.rs`'s import check refuses it at load. Measured cost of
-    # the flag on 2026-08-10: 42,552 bytes against a 12.4 MiB component.
-    #
-    # **And unlike every artifact above it, this one is not byte-reproducible.** Measured
-    # 2026-08-10 with jco 1.27.0: two builds from an unchanged tree differ in 2,861,081 bytes
-    # and in length. The `wizer` snapshot is a heap image, and SpiderMonkey's layout of it is
-    # not stable between processes. So `git status` is dirty after every run of this recipe,
-    # and the "rebuild and see that nothing moved" check `fixture_currency.rs` documents does
-    # not reach this fixture — restore it with `git checkout` when its digest is the only line
-    # that moved.
-    just _require node
-    just _require npx
-    echo "building js-globals (componentize-js)"
-    npx --prefix packages/lanekeep jco componentize \
+    # Everything else about the build — the flags, why a missing Node is an error rather than a
+    # skip, and why the result is not byte-reproducible — is in `_componentize`, which the
+    # shipped built-ins component shares. That sharing is not tidiness either: this fixture
+    # stands in for that component, and a fixture built with different flags stands in for
+    # nothing.
+    just _componentize \
         crates/lanekeep-wasm/tests/fixtures/js-globals/rule.js \
-        --wit crates/lanekeep-wasm/wit --world-name rule --disable all --bundle \
-        -o "${root}/crates/lanekeep-wasm/tests/fixtures/js-globals.wasm"
+        crates/lanekeep-wasm/tests/fixtures/js-globals.wasm
 
     # Record what all of that was built from, so the gate can tell a stale artifact from a
     # current one without needing `cargo component` to find out.
@@ -330,6 +362,43 @@ rust-rules:
     echo "recording rule component digests"
     LANEKEEP_BLESS_RULE_COMPONENTS=1 cargo test --quiet -p lanekeep-wasm \
         --test fixture_currency -- --exact every_committed_rule_component_is_the_one_its_sources_build
+
+# Rebuild the committed TypeScript built-ins component.
+#
+# The third recipe that rewrites a committed artifact, and outside every gate for the reason the
+# other two are: it needs a toolchain the gate deliberately does not — Node here, rather than
+# `cargo component` — and the artifact it produces is committed and read with `include_bytes!`.
+# `just check` passes on a machine with no Node at all.
+#
+# **One component for every TypeScript rule, and not one each.** Measured on this entry,
+# 2026-08-10: hosting `no-default-export` alone gives 13,021,569 bytes and hosting all four
+# gives 13,028,097 — **6,528 bytes for three more rules**, against a per-rule cost of 13 MiB if
+# each got its own component. What is being paid for is a StarlingMonkey build, and the rules
+# are rounding error on it. `crates/lanekeep-rules/typescript/entry.ts` is where they are
+# listed, and the index a rule sits at there is what `lanekeep_rules` dispatches on.
+#
+# `--bundle-config` is what makes lanekeep's own resolution rules apply to a bundler that would
+# otherwise resolve imports the way npm does — see `typescript/rolldown.config.mjs`, which wires
+# `packages/lanekeep/runtime/resolve.js` into rolldown rather than restating it. Everything else
+# about the build is in `_componentize`, which the JavaScript fixture shares.
+#
+# The last step records what the artifact was built from, and it is the whole of the staleness
+# check rather than half of it: `componentize-js` is not byte-reproducible, so there is no
+# rebuild-and-diff to fall back on. See `crates/lanekeep-wasm/tests/fixture_currency.rs`.
+typescript-builtins:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _componentize \
+        crates/lanekeep-rules/typescript/entry.ts \
+        crates/lanekeep-rules/components/typescript-builtins.wasm \
+        --bundle-config crates/lanekeep-rules/typescript/rolldown.config.mjs
+
+    # `cargo test` rather than `cargo nextest run`, for the reason `wasm-fixtures` gives: what
+    # is wanted here is the side effect and not the verdict, and nextest has no way to say
+    # "this one writes a file". The same test asserts under `just test` with the variable unset.
+    echo "recording TypeScript component digests"
+    LANEKEEP_BLESS_TYPESCRIPT_BUILTINS=1 cargo test --quiet -p lanekeep-wasm \
+        --test fixture_currency -- --exact every_committed_typescript_component_is_the_one_its_sources_build
 
 # Test rust-rules/: its own workspace, so `cargo test --workspace` at the root does not reach
 # it.

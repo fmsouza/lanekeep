@@ -66,6 +66,32 @@
 //!
 //! The two overlap on `wit/world.wit`, deliberately: it is a build input to the fixtures *and*
 //! to the rule components, and a change to it has to invalidate both.
+//!
+//! # And a third, for the one shipped component that is not built from Rust
+//!
+//! `crates/lanekeep-rules/components/typescript-builtins.wasm` is built by
+//! `just typescript-builtins` from TypeScript rule sources, the runtime under
+//! `packages/lanekeep/runtime/` and a rolldown configuration — none of which any recipe above
+//! knows about. A third recipe rebuilding a disjoint artifact gets a third manifest and a third
+//! variable, for the reason the second one exists.
+//!
+//! **Inputs may be shared between manifests; artifacts may not.** `wit/world.wit` is in all
+//! three, and that is right: it is a build input to every component in the tree, and a change to
+//! it must send you to every recipe. An *artifact* is different, because exactly one recipe can
+//! produce it. Recording `typescript-builtins.wasm` in the rule components' manifest as well
+//! would mean that rebuilding it — which changes its bytes every time, since `componentize-js`
+//! is not reproducible — leaves that manifest red until somebody runs `just rust-rules`, a
+//! recipe about other artifacts entirely that needs `cargo component` and a wasm target to run
+//! at all. [`TYPESCRIPT_ARTIFACTS`] is the one list that says which artifacts belong to which,
+//! read by the test that owns them and by the test that must not.
+//!
+//! What that costs, and it is worth stating: `componentize-js` output is **not
+//! byte-reproducible** — measured 2026-08-10, three builds from an unchanged tree gave three
+//! sizes and three digests — so `AGENTS.md`'s protocol for telling a stale artifact from a
+//! current one, rebuild and see that `git status` is clean, cannot be used on it. Digests are
+//! the whole of the check here rather than a convenience on top of reproducibility, and they
+//! catch staleness in one direction only: blessing re-records without building, so an edited
+//! source blessed without a rebuild leaves a stale binary behind a green gate.
 
 // `clippy.toml`'s `allow-expect-in-tests` reaches `#[test]` functions and `#[cfg(test)]`
 // modules and nothing else, so the helpers below — which are neither — need the grant
@@ -126,6 +152,84 @@ const RULE_HEADER: &str = "\
 # against, was changed without rebuilding — run `just rust-rules`.
 ";
 
+/// Rewrite the TypeScript built-ins' manifest instead of asserting against it.
+///
+/// Set by `just typescript-builtins` and by nothing else, on the same terms as the two above.
+const TYPESCRIPT_BLESS: &str = "LANEKEEP_BLESS_TYPESCRIPT_BUILTINS";
+
+/// Where the TypeScript built-ins' digests live, relative to this crate.
+const TYPESCRIPT_MANIFEST: &str = "tests/typescript-component-digests.txt";
+
+/// The header written above the TypeScript built-ins' digests.
+const TYPESCRIPT_HEADER: &str = "\
+# What the committed TypeScript built-ins component was built from.
+#
+# Written by `just typescript-builtins`, asserted by
+# `crates/lanekeep-wasm/tests/fixture_currency.rs`, and not to be edited by hand: a value here
+# that no build produced is exactly the claim this file exists to deny. `<path> <blake3>`,
+# sorted, paths relative to the repository root.
+#
+# A line that moves when the artifact did not means a rule's source, the runtime it is bundled
+# with, the world it is built against or the toolchain it is pinned to was changed without
+# rebuilding — run `just typescript-builtins`.
+";
+
+/// The components under `crates/lanekeep-rules/components/` that `just rust-rules` does not
+/// build.
+///
+/// Read twice, with opposite signs: as the artifact list of
+/// [`every_committed_typescript_component_is_the_one_its_sources_build`], and as what
+/// [`every_committed_rule_component_is_the_one_its_sources_build`] must leave out of its walk.
+/// One list rather than two, so the partition cannot drift into either an artifact in both
+/// manifests or an artifact in neither.
+///
+/// This crate's own directory is the base, so the paths are the repository-relative ones both
+/// manifests are keyed on.
+const TYPESCRIPT_ARTIFACTS: &[&str] =
+    &["crates/lanekeep-rules/components/typescript-builtins.wasm"];
+
+/// Everything the TypeScript built-ins component is built from, other than its own artifact.
+///
+/// Named files where a directory would drag in something that is not a build input, which is
+/// most of them:
+///
+/// - **The four rule sources, individually.** `crates/lanekeep-rules/rules/` holds eight, and
+///   the other four are TypeScript modules that no component is built from. Recording the
+///   directory would demand a rebuild — Node and a 13 MiB artifact — after editing a rule this
+///   component does not contain.
+/// - **`modules/paths.ts`**, which two of the four import through `lanekeep/paths`, and which
+///   the bundler inlines.
+/// - **`packages/lanekeep/index.js`**, which is where `defineRule` comes from. It is an identity
+///   function and it is a build input all the same: every rule calls it, and the bundle carries
+///   its body.
+/// - **`packages/lanekeep/package.json`**, for the pinned `jco` and `componentize-js` versions.
+///   A version bump changes the bytes, the bytes are a `ruleset_hash` input, so a bump that
+///   nobody rebuilt against is exactly the staleness this file is about. It also carries the
+///   `exports` map and the package's module type, which decide what a specifier means.
+/// - **The four runtime files**, not the directory: `runtime/` also holds two `.test.js` files
+///   that nothing is built from, and covering it would demand a componentize after editing a
+///   JavaScript test. `resolve.js` is in here because the bundle's resolver *is* it —
+///   `rolldown.config.mjs` imports it rather than restating the rules.
+///
+/// `crates/lanekeep-rules/typescript/` is a directory because everything in it, today and
+/// later, is a build input by construction: it holds the entry module and the bundler
+/// configuration and exists for no other purpose.
+const TYPESCRIPT_SOURCES: &[&str] = &[
+    "crates/lanekeep-rules/modules/paths.ts",
+    "crates/lanekeep-rules/rules/no-circular-imports.ts",
+    "crates/lanekeep-rules/rules/no-default-export.ts",
+    "crates/lanekeep-rules/rules/no-restricted-imports.ts",
+    "crates/lanekeep-rules/rules/no-unused-exports.ts",
+    "crates/lanekeep-rules/typescript",
+    "crates/lanekeep-wasm/wit",
+    "packages/lanekeep/index.js",
+    "packages/lanekeep/package.json",
+    "packages/lanekeep/runtime/entry.js",
+    "packages/lanekeep/runtime/host.js",
+    "packages/lanekeep/runtime/package.json",
+    "packages/lanekeep/runtime/resolve.js",
+];
+
 #[test]
 fn every_committed_artifact_is_the_one_its_sources_build() {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -185,10 +289,17 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
 ///
 /// The generated `src/bindings.rs` stays out without being named, exactly as `target/` does:
 /// each rule crate's own `.gitignore` is read on the way in, and it excludes both.
+///
+/// [`TYPESCRIPT_ARTIFACTS`] is dropped from the walk, and it is the only thing in any of these
+/// three walks that is named rather than derived. `just rust-rules` does not build it, so
+/// recording it here would put a rebuild of the *TypeScript* component behind a run of the
+/// *Rust* one — see this file's own documentation for why an artifact belongs to exactly one
+/// manifest while an input may be in every one of them. A stray artifact nobody owns is still
+/// caught, by [`reconcile`]'s "present but was never recorded".
 #[test]
 fn every_committed_rule_component_is_the_one_its_sources_build() {
     let root = repository_root();
-    let computed = digests(
+    let mut computed = digests(
         &root,
         &[
             "crates/lanekeep-wasm/wit",
@@ -196,6 +307,15 @@ fn every_committed_rule_component_is_the_one_its_sources_build() {
             "crates/lanekeep-rules/components",
         ],
     );
+    for artifact in TYPESCRIPT_ARTIFACTS {
+        assert!(
+            computed.remove(*artifact).is_some(),
+            "`{artifact}` is not there. It is a shipped component that `just rust-rules` does \
+             not build, so it is subtracted from this walk — and subtracting something that is \
+             absent means the path moved and this manifest has silently taken ownership of an \
+             artifact it cannot rebuild."
+        );
+    }
 
     // Three claims, one per root, because a walk that stopped looking at any one of them would
     // leave this green while covering less than it says. Properties rather than counts: a rule
@@ -222,6 +342,71 @@ fn every_committed_rule_component_is_the_one_its_sources_build() {
         "the committed rule components",
         "just rust-rules",
     );
+}
+
+/// The same claim again, for the shipped component built from TypeScript rather than from Rust.
+///
+/// It is the same staleness with a longer list of ways in. `crates/lanekeep-rules/tests/` runs
+/// the four built-ins this component hosts, so a rule source edited without a rebuild leaves
+/// those expectations held against the previous binary — but so does an edit to the runtime that
+/// assembles `ctx`, to the resolver the bundler resolves imports through, to `defineRule`, to
+/// the world, or to the pinned `jco` version. Six directions rather than two, none of them in a
+/// directory a reader would think to look at while editing a rule.
+///
+/// **And here the digests are the whole of the check rather than a second opinion.** For a Rust
+/// component `AGENTS.md` offers a stronger protocol — rebuild, and on a consistent tree
+/// `git status` is clean — because `cargo component` is byte-reproducible on a pinned toolchain.
+/// `componentize-js` is not: three builds from an unchanged tree gave three sizes and three
+/// digests, differing in millions of bytes, because the `wizer` snapshot is a heap image whose
+/// layout is not stable between processes. So there is no rebuild-and-diff to fall back on, and
+/// what these digests cannot see — a source edited, then blessed, without a build — cannot be
+/// recovered by any byte-wise means. `crates/lanekeep-wasm/tests/js_globals.rs` is the
+/// behavioral check that partly stands in for it.
+#[test]
+fn every_committed_typescript_component_is_the_one_its_sources_build() {
+    let root = repository_root();
+    let mut roots: Vec<&str> = TYPESCRIPT_SOURCES.to_vec();
+    roots.extend_from_slice(TYPESCRIPT_ARTIFACTS);
+    let computed = digests(&root, &roots);
+
+    // A named root that is missing already panics inside `digests`, so what is left to check is
+    // the two that are directories — either could come back empty and agree with an empty
+    // manifest. Named rather than counted: these are the two files the component is bundled
+    // from and the one it is built against, and none of the three is optional.
+    let artifacts = counted(&computed, "crates/lanekeep-rules/components/", "wasm");
+    assert!(
+        artifacts == TYPESCRIPT_ARTIFACTS.len()
+            && computed.contains_key("crates/lanekeep-rules/typescript/entry.ts")
+            && computed.contains_key("crates/lanekeep-rules/typescript/rolldown.config.mjs")
+            && computed.contains_key("crates/lanekeep-wasm/wit/world.wit"),
+        "the walk found {artifacts} components, and {} the entry, {} the bundler configuration \
+         and {} the world: it is no longer looking where this component is built from, and has \
+         been asserting nothing",
+        found(&computed, "crates/lanekeep-rules/typescript/entry.ts"),
+        found(
+            &computed,
+            "crates/lanekeep-rules/typescript/rolldown.config.mjs"
+        ),
+        found(&computed, "crates/lanekeep-wasm/wit/world.wit"),
+    );
+
+    reconcile(
+        &computed,
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join(TYPESCRIPT_MANIFEST),
+        TYPESCRIPT_BLESS,
+        TYPESCRIPT_HEADER,
+        "the committed TypeScript built-ins component",
+        "just typescript-builtins",
+    );
+}
+
+/// `did find` or `did not find`, for a message that has to name which of several went missing.
+fn found(computed: &BTreeMap<String, String>, path: &str) -> &'static str {
+    if computed.contains_key(path) {
+        "did find"
+    } else {
+        "did not find"
+    }
 }
 
 /// The repository root, from this crate's location.

@@ -10,7 +10,13 @@
 // The runtime import is written first on purpose. ES modules evaluate depth-first in source
 // order, so this is what makes `withhold()` run before any rule module's own body — see
 // `entry.js`. A generated entry emits exactly this shape.
+//
+// `./probe.js` is what makes that observable: the rules below are defined in *this* module, so
+// they cannot be evaluated before the import above whatever order anyone writes, and a fixture
+// of one module therefore demonstrates nothing about the ordering. That one is a second module,
+// imported after the runtime, and it reports what it could see while it was being evaluated.
 import { register } from '../../../../../packages/lanekeep/runtime/entry.js'
+import order from './probe.js'
 
 export {
   rules,
@@ -159,4 +165,4 @@ function describe(value) {
   return `${typeof value}:${String(value)}`
 }
 
-register([reach, context, cross, thrower])
+register([reach, context, cross, thrower, order])
