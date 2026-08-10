@@ -64,11 +64,26 @@
 //! hot path of the trust boundary for the sake of a benchmark. What this file does instead is
 //! **replay** the rule: [`Crossings::of`] walks the same trees the run walked, through the same
 //! [`NodeArena`] both engines call, and follows `no-unwrap`'s decision procedure statement for
-//! statement, counting each call the rule would have made. It is a transcription, and it is
-//! held to the one thing a wrong transcription cannot fake: the replay records what it would
-//! have reported, and [`gate`] asserts that set is exactly the run's violations, from both
-//! engines. Control flow is what determines the count, and the reported set is what control
-//! flow produced.
+//! statement, counting each call the rule would have made.
+//!
+//! Two things hold that transcription honest, and the weaker one is the one that looks
+//! convincing.
+//!
+//! **The assertion.** The replay records what it would have reported, and [`gate`] holds *each
+//! arm* to *its own branch* of the replay, then the two branches to each other. Control flow
+//! determines the count and the reported set is what control flow produced, so a branch that
+//! took a different path could not agree. What this cannot see is a call on a path all three
+//! take which the replay simply omits — the count would be low and every report identical.
+//!
+//! **The arithmetic, which is what actually pins the numbers.** The corpus is regular enough
+//! that both denominators are derivable by hand and were: `FILES` files of `FUNCTIONS`
+//! functions, an ancestor chain of four, and a call in the *k*-th function scanning *k*
+//! siblings, gives `13 + 3k` calls per subject under QuickJS and `14 + 2k` under the component,
+//! which sums to exactly the 597,120 and 418,560 the replay prints. A count that agrees with
+//! closed-form arithmetic over the corpus geometry is not resting on the transcription being
+//! faithful; it is two independent derivations of one number. **Anyone changing the corpus
+//! shape or the rule should redo that sum rather than trust these two paragraphs**, because the
+//! assertion alone would not notice.
 //!
 //! **The two arms do not make the same number of calls, and that is the reason the denominator
 //! is per-engine.** The port hoisted `line(ancestor)` and `column(ancestor)` out of the sibling
@@ -319,16 +334,26 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
             ns - arena_ns,
         );
     }
-    // Said here rather than left to a reader to assume, because the obvious assumption is the
-    // wrong one. `rest` is not the boundary: it is the boundary *plus* whatever the rule itself
-    // executes between two calls, which is interpreted bytecode on one side and compiled code on
-    // the other. Those two move in opposite directions, so the column bounds how much room the
-    // boundary has rather than measuring it.
+    // Two warnings, said here rather than left to a reader to assume, because the obvious
+    // assumption is wrong in both cases.
+    //
+    // `rest` is not the boundary: it is the boundary *plus* whatever the rule itself executes
+    // between two calls, which is interpreted bytecode on one side and compiled code on the
+    // other. Those move in opposite directions, so the column bounds how much room the boundary
+    // has rather than measuring it.
+    //
+    // And `rest` is a residue. It is a difference of two separately timed quantities, so it
+    // inherits the whole of the engine measurement's absolute noise on about a third of the
+    // magnitude — measured at roughly 15% run to run on the component arm against 4% for the
+    // `ns/call` it came from. The `arena` figures are steady to a percent or two; the gap
+    // between the two arms' `rest` is not larger than the spread of the noisier one. Read the
+    // split as a scale rather than as a measurement, and read the ratio below as the result.
     println!(
         "\n  `arena` is that same call sequence replayed against the same NodeArena with no \
          engine in the way.\n  `rest` is everything else: the crossing, and the rule's own \
          execution between crossings — interpreted\n  in one arm and compiled in the other, \
-         which is why this cannot separate them."
+         which is why this cannot separate them. It is also a residue, and\n  moves by ~15% \
+         between runs where `ns/call` moves by ~4%: indicative, not measured."
     );
 
     println!("\n  calls counted by replay — the two rules do not make the same ones:");
@@ -350,27 +375,75 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
     }
 }
 
-/// The one machine-independent assertion: the replay agrees with both engines.
+/// The machine-independent assertions: each branch of the replay agrees with its own engine.
 ///
 /// Nothing above means anything if the replay followed a different path through the rule than
-/// the rule did, and the reported set is what a path produces. Both arms are checked, because
-/// the two implementations are held to reporting identically and a divergence here would be
-/// that claim failing rather than this bench being wrong.
+/// the rule did, and the reported set is what a path produces.
+///
+/// **Each arm against its own branch, which is a stronger claim than it looks.** The replay has
+/// two branches, one per arm, and they produce the two different denominators the report
+/// divides by. Holding both engines to *one* of those branches would leave the other validated
+/// by nothing — the engines would agree with each other and with whichever branch was collected,
+/// and the uncollected branch could count anything at all. So the comparison is per arm, and
+/// the two branches are then also compared against each other: they transcribe one rule and are
+/// held to the reporting parity the port itself was held to.
+///
+/// That is not a theory about an earlier version, it is what the earlier version did. Measured
+/// by breaking the TypeScript branch alone — an extra `continue` before its `report`, leaving
+/// the component branch untouched — which this gate fails on and which the version that
+/// collected only from the component branch passed. An assertion that cannot fail on half the
+/// code it is supposed to cover is worth less than its wording suggests.
 fn gate(reported: &[(Corpus, Arm, Vec<Violation>)], cold: &Crossings, hot: &Crossings) {
     for (corpus, arm, violations) in reported {
         let replayed = match corpus {
-            Corpus::Cold => &cold.reports,
-            Corpus::Hot => &hot.reports,
+            Corpus::Cold => cold,
+            Corpus::Hot => hot,
         };
-        assert_eq!(
-            violations,
-            replayed,
-            "the replay and the {} arm disagree about what {corpus:?} reports, so the call \
-             counts above describe a rule neither engine ran",
-            arm.label(),
-        );
+        if let Some(detail) = disagreement(violations, replayed.reports(*arm)) {
+            panic!(
+                "the {} arm and its branch of the replay disagree about what {corpus:?} reports, \
+                 so that arm's call count above describes a rule the engine did not run\n                   {detail}",
+                arm.label(),
+            );
+        }
     }
-    println!("  replay agrees with both engines on every violation\n");
+
+    for (corpus, replayed) in [(Corpus::Cold, cold), (Corpus::Hot, hot)] {
+        if let Some(detail) = disagreement(
+            replayed.reports(Arm::TypeScript),
+            replayed.reports(Arm::Component),
+        ) {
+            panic!(
+                "the two branches of the replay disagree about what {corpus:?} reports, so they \
+                 are not two transcriptions of one rule\n  {detail}"
+            );
+        }
+    }
+
+    println!("  each arm agrees with its own branch of the replay, and the branches agree\n");
+}
+
+/// How two report sets differ, in one line, or `None` when they do not.
+///
+/// Hand-rolled rather than `assert_eq!`, which prints both vectors in full: the hot corpus
+/// produces 3,840 violations, so a failure was 100 KB of output with the one differing entry
+/// somewhere inside it. The counts and the first divergence are what a reader needs, and they
+/// fit on a line.
+fn disagreement(left: &[Violation], right: &[Violation]) -> Option<String> {
+    if left == right {
+        return None;
+    }
+
+    let first = left.iter().zip(right).find(|(l, r)| l != r).map_or_else(
+        || "they agree as far as the shorter one goes".to_owned(),
+        |(l, r)| format!("first difference: engine {l:?} against replay {r:?}"),
+    );
+
+    Some(format!(
+        "{} against {} violations; {first}",
+        left.len(),
+        right.len()
+    ))
 }
 
 /// One corpus, with both configs beside it.
@@ -564,8 +637,17 @@ struct Crossings {
     /// Time in [`replay`] alone, per arm. Parsing and [`subjects`] are outside it.
     typescript_arena: Duration,
     component_arena: Duration,
-    /// The set [`gate`] holds both engines to, sorted.
-    reports: Vec<Violation>,
+    /// What each arm's branch of the replay would report, sorted.
+    ///
+    /// **Per arm, and it has to be.** An earlier version collected from the component branch
+    /// only and held both engines to that one set, which establishes TypeScript engine ≡
+    /// component engine ≡ component replay — and leaves the *TypeScript* branch of the replay,
+    /// the branch producing the larger denominator, compared against nothing at all. The two
+    /// branches differ in more than counters: the component's has an `else { continue }` on an
+    /// absent position that the TypeScript branch does not, which is inert on this corpus and
+    /// is exactly the kind of thing an unchecked branch accumulates.
+    typescript_reports: Vec<Violation>,
+    component_reports: Vec<Violation>,
 }
 
 impl Crossings {
@@ -583,6 +665,13 @@ impl Crossings {
         }
     }
 
+    const fn reports(&self, arm: Arm) -> &Vec<Violation> {
+        match arm {
+            Arm::TypeScript => &self.typescript_reports,
+            Arm::Component => &self.component_reports,
+        }
+    }
+
     /// Walk every file the run walked, and count.
     ///
     /// The arenas are rebuilt for every attempt and every arm, which looks wasteful and is the
@@ -596,7 +685,6 @@ impl Crossings {
         let mut component = 0;
         let mut typescript_arena = Duration::MAX;
         let mut component_arena = Duration::MAX;
-        let mut reports = Vec::new();
 
         let sources: Vec<(String, String)> = (0..FILES)
             .map(|index| {
@@ -607,26 +695,16 @@ impl Crossings {
             })
             .collect();
 
-        for attempt in 0..ATTEMPTS {
+        for _ in 0..ATTEMPTS {
             for arm in Arm::ALL {
-                // Collected on the last attempt of one arm only. Both arms report the same set —
-                // that is the claim the port was held to — so collecting from either is enough,
-                // and collecting from every pass would only build the same vector six times.
-                let collecting = attempt + 1 == ATTEMPTS && arm == Arm::Component;
                 let mut calls = 0;
                 let mut elapsed = Duration::ZERO;
 
                 for (relative, source) in &sources {
                     let (mut arena, matches) = parsed(source);
-                    let mut collected = collecting.then(|| Vec::with_capacity(matches.len()));
-
                     let start = Instant::now();
-                    calls += replay(arm, &mut arena, relative, &matches, &mut collected);
+                    calls += replay(arm, &mut arena, relative, &matches, &mut None);
                     elapsed += start.elapsed();
-
-                    for position in collected.unwrap_or_default() {
-                        reports.push((relative.clone(), position.0, position.1));
-                    }
                 }
 
                 match arm {
@@ -642,14 +720,36 @@ impl Crossings {
             }
         }
 
-        reports.sort_unstable();
+        // A pass of its own, per arm, with the clock off. The timed passes above collect
+        // nothing at all: pushing a position happens *inside* `replay`, so a collecting pass is
+        // a slower pass, and folding it into the attempts either biases whichever arm collects
+        // or forces both to pay a cost neither engine has.
+        let [typescript_reports, component_reports] =
+            Arm::ALL.map(|arm| Self::collect(arm, &sources));
+
         Self {
             typescript,
             component,
             typescript_arena,
             component_arena,
-            reports,
+            typescript_reports,
+            component_reports,
         }
+    }
+
+    /// One arm's branch of the replay, run for what it reports rather than for what it costs.
+    fn collect(arm: Arm, sources: &[(String, String)]) -> Vec<Violation> {
+        let mut reports = Vec::new();
+        for (relative, source) in sources {
+            let (mut arena, matches) = parsed(source);
+            let mut collected = Some(Vec::with_capacity(matches.len()));
+            replay(arm, &mut arena, relative, &matches, &mut collected);
+            for position in collected.unwrap_or_default() {
+                reports.push((relative.clone(), position.0, position.1));
+            }
+        }
+        reports.sort_unstable();
+        reports
     }
 }
 
@@ -709,11 +809,17 @@ fn subjects(arena: &NodeArena) -> Vec<(Vec<u32>, Vec<u32>)> {
 /// differ, the difference is called out at the line it happens on — those differences are the
 /// whole reason the denominators are per-arm.
 ///
-/// **Every counted call performs its arena lookup**, including the ones one arm repeats and the
-/// other hoists. Reusing a position already in hand would be the natural way to write this and
-/// would break the timing the caller takes off it: the TypeScript arm's extra `line(ancestor)`
-/// and `column(ancestor)` would then cost nothing, and the arena work would come out identical
-/// for two arms that do measurably different amounts of it.
+/// **Every counted call that has an arena lookup performs it**, including the ones one arm
+/// repeats and the other hoists. Reusing a position already in hand would be the natural way to
+/// write this and would break the timing the caller takes off it: the TypeScript arm's extra
+/// `line(ancestor)` and `column(ancestor)` would then cost nothing, and the arena work would
+/// come out identical for two arms that do measurably different amounts of it.
+///
+/// The exception is the component's `file-path`, counted below and modeled by nothing, because
+/// the host answers it by cloning a `String` and never touches the arena
+/// (`lanekeep_wasm::host`'s `HostCheckContext::file_path`). Its cost lands in `rest` rather than
+/// in `arena`, which is where a string copy belongs — but it is a modeling choice rather than a
+/// measurement, and it is one call per matched site against the ~13 + 2k that site costs.
 ///
 /// `reports` collects the positions when it is `Some`, which is how [`gate`] gets the set both
 /// engines are held to.
