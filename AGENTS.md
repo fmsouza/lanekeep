@@ -316,6 +316,20 @@ Build the string with `serde_json::to_string`, which escapes the separators, rat
 interpolating. This applies to any fixture that puts a real path in JSON, which is most of the
 ones that name a file outside the project root.
 
+**And that fix uncovers a third layer, which is the one that matters: `validate_specifier`
+rejects any rule specifier containing a backslash**, so on Windows a native absolute path can
+never reach the confinement check at all. The guard predates components and is right — a
+specifier is interpolated into generated JavaScript, where a backslash or a quote could break
+out — but it means a test aiming at `confine` is answered by a message about quoting instead.
+Spell the path with forward slashes: `C:/Users/...` is still absolute, because Rust accepts
+either separator on Windows, and it carries nothing the specifier guard refuses. On Unix the
+replacement is a no-op.
+
+The general shape is worth more than the three instances: **a fixture that is refused by an
+earlier gate than the one under test passes for the wrong reason, or fails with a message that
+sends you to the wrong place.** All three of these produced a red test that named JSON, or
+quoting, while the property they were written for went unasserted.
+
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
 

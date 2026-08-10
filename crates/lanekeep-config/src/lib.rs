@@ -2368,13 +2368,22 @@ mod tests {
         let outside = fixture.dir.join("outside.wasm");
         let inner = fixture.dir.join("project");
         fs::create_dir_all(&inner).expect("creates the inner root");
-        // `serde_json` rather than interpolating the path, because on Windows an absolute path
-        // is `C:\Users\...` and a backslash begins an escape inside a JSON string. Written
-        // literally, `\U` is an invalid escape, the config fails to *parse*, and the assertion
-        // below never reaches the confinement check it exists for — so this test asserted
-        // nothing on the one platform where the path shape it names is the unusual one.
-        let specifier =
-            serde_json::to_string(&outside.display().to_string()).expect("a path is a JSON string");
+        // Two platform hazards sit between this path and the check it is here to reach, and
+        // both refuse it for a reason that is not confinement.
+        //
+        // Forward slashes, because `validate_specifier` rejects any specifier containing a
+        // backslash — a guard that predates components and exists because a specifier is
+        // interpolated into generated JavaScript. A Windows path spelled `C:\Users\...` is
+        // therefore refused one layer above `confine`, with a message about quoting. Spelled
+        // `C:/Users/...` it is still absolute — Rust accepts either separator on Windows — and
+        // it reaches the confinement check this test names. On Unix the replacement is a no-op.
+        //
+        // Then `serde_json` rather than `format!`, because a backslash also begins an escape
+        // inside a JSON string, so an interpolated Windows path makes the config fail to
+        // *parse*. Belt and braces: the replacement above already removes them, and encoding
+        // properly keeps this true if the path ever carries something else JSON reserves.
+        let forward = outside.display().to_string().replace('\\', "/");
+        let specifier = serde_json::to_string(&forward).expect("a path is a JSON string");
         fs::write(
             inner.join("lanekeep.json"),
             format!(r#"{{"namespaces": ["fixture"], "rules": [{specifier}]}}"#),
