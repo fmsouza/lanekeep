@@ -216,7 +216,7 @@ impl SourceMap {
     ///
     /// A frame naming this map's generated file is remapped. A frame naming anything else is
     /// **dropped**, provided at least one frame was remapped — for the shipped component those
-    /// are the three innermost frames of `componentize-js`'s own generated glue, which name
+    /// are the three outermost frames, `componentize-js`'s own generated glue, which name
     /// `/var/folders/…/T/…/sources/initializer.js`: a path in a temporary directory on whichever
     /// machine built the artifact, which exists nowhere else and means nothing to a reader.
     ///
@@ -225,7 +225,6 @@ impl SourceMap {
     /// no stack, which is strictly less than it arrived with. In that case nothing is touched.
     pub(crate) fn remap(&self, frames: Vec<StackFrame>) -> Vec<StackFrame> {
         let mut remapped = Vec::with_capacity(frames.len());
-        let mut explained = 0_usize;
 
         for frame in &frames {
             if frame.file != self.file {
@@ -234,7 +233,6 @@ impl SourceMap {
             let Some(position) = self.lookup(frame.line, frame.column) else {
                 continue;
             };
-            explained += 1;
             remapped.push(StackFrame {
                 function: frame.function.clone(),
                 file: position.file.to_owned(),
@@ -243,7 +241,11 @@ impl SourceMap {
             });
         }
 
-        if explained == 0 { frames } else { remapped }
+        if remapped.is_empty() {
+            frames
+        } else {
+            remapped
+        }
     }
 }
 
