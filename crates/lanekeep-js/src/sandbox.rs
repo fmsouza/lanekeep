@@ -589,9 +589,16 @@ mod tests {
 
     #[test]
     fn there_is_no_randomness() {
+        // `type_of` and not a bare `eval`, though the two say the same thing here. This module's
+        // absence assertions are *read* — `crates/lanekeep-wasm/tests/js_globals.rs` extracts
+        // them and holds the component engine to the same set — and that extraction recognizes
+        // three shapes. An `assert_eq!(s.eval::<String>(...), "undefined", ...)` is a fourth,
+        // and a name added in it would be withheld here and reachable in a component with
+        // nothing going red. `type_of` evaluates `typeof (Math.random)`, so the dotted form
+        // needs nothing special.
         let s = sandbox();
         assert_eq!(
-            s.eval::<String>("typeof Math.random").expect("evaluates"),
+            type_of(&s, "Math.random"),
             "undefined",
             "Math.random must be gone"
         );

@@ -545,8 +545,28 @@ eleven committed WebAssembly fixtures then read as stale that way — `bindings`
 does not. That is now the check rather than the investigation —
 `crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
 `tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
-there too, because eleven of the twelve committed today name it as their component target and a
+there too, because twelve of the thirteen committed today name it as their component target and a
 world edit with no rebuild leaves every fixture satisfying an ABI that no longer exists.
+
+**And the thirteenth breaks that protocol, because `componentize-js` output is not reproducible
+at all.** `js-globals.wasm` is built by `jco componentize` rather than by `cargo component`, and
+three builds over one unchanged tree — jco 1.27.0, measured 2026-08-10 — gave 13,023,574,
+13,023,571 and 13,023,630 bytes, three distinct sha256s, with 2,968,012 bytes differing between
+the first two. The `wizer` snapshot is a heap image and SpiderMonkey does not lay one out the same
+way twice. So **`just wasm-fixtures` on a *consistent* tree now leaves that artifact and its
+digest line dirty**, which the paragraph above would have you read as a stale fixture. It is not.
+Restore it with `git checkout` when its digest is the only line that moved.
+
+What is lost with it is worth naming, because the digest manifest replaces only half of it.
+Reproducibility catches staleness in *both* directions: a source edited without a rebuild, and an
+artifact that no source in the tree produces. Digests catch the first. They cannot catch the
+second, because `LANEKEEP_BLESS_WASM_FIXTURES=1` re-records whatever is in the tree without
+building it — so editing `packages/lanekeep/runtime/host.js`, blessing, and committing leaves a
+stale binary behind a green gate, and no byte-wise check can notice. What stands in for it is
+behavioral rather than byte-wise: `tests/js_globals.rs` derives its probes from what
+`crates/lanekeep-js/src/sandbox.rs` withholds and runs them *inside* the committed component, so
+an artifact that no longer satisfies the contract fails the moment the contract moves. That is
+weaker — it catches a stale artifact only where the two disagree — and it is what there is.
 
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,

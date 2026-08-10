@@ -139,6 +139,8 @@ fn the_component_withholds_the_clock_and_randomness() {
         assert_eq!(probe.has_reduce(rule), reduce, "hasReduce({rule})");
     }
 
+    the_whole_global_surface_is_the_one_that_was_reviewed(&mut probe);
+
     // The five the brief names, spelled as a rule author would reach them, and then everything
     // `sandbox.rs` withholds. The first five are here explicitly because they are the ones the
     // measurement was taken on, and a derivation that stopped covering them should be loud.
@@ -189,6 +191,82 @@ fn the_component_withholds_the_clock_and_randomness() {
     }
 
     the_rest_of_the_glue_module(&mut probe);
+}
+
+/// Every name a rule can still see, pinned, so that a toolchain bump cannot add one quietly.
+///
+/// # Why the two tests above do not already cover this
+///
+/// They are both *denial* checks: given a list of names, prove each one is unreachable. Neither
+/// can notice a name arriving. And the parity check is an equality, so `host.js` cannot
+/// pre-emptively withhold a StarlingMonkey-only hazard without a matching assertion in
+/// `sandbox.rs` — which nobody would write for a global they have never heard of.
+///
+/// `Temporal` is the concrete case rather than a hypothetical. SpiderMonkey ships it, this build
+/// does not have it, and `Temporal.Now.instant()` is a clock. If a `componentize-js` bump turns
+/// it on, every other assertion in this file stays green and rules gain a clock.
+///
+/// This is the same claim the load-time import check makes about the component's *imports*, made
+/// about what its runtime provides — an import list that says "no clock" while the engine hands
+/// one out is exactly the gap this whole file exists for.
+///
+/// # When this fails
+///
+/// A **removed** name is nothing: drop it from the string. An **added** one is a decision, and
+/// the question is whether it is a capability or a source of nondeterminism. If it is, it goes
+/// into `sandbox.rs`'s absence assertions and into `host.js`'s `WITHHELD` — and then it is not in
+/// this list, because it will have been deleted. Only after answering that does the string move.
+fn the_whole_global_surface_is_the_one_that_was_reviewed(probe: &mut Probe) {
+    /// Sorted, comma-separated, as `Object.getOwnPropertyNames(globalThis)` reports it after
+    /// `withhold()` has run. Measured 2026-08-10: jco 1.27.0, componentize-js 0.22.0.
+    const SURVIVING: &str = "AbortController,AbortSignal,AggregateError,Array,ArrayBuffer,\
+        AsyncDisposableStack,BigInt,BigInt64Array,BigUint64Array,Blob,Boolean,\
+        ByteLengthQueuingStrategy,CompressionStream,CountQueuingStrategy,CustomEvent,\
+        DOMException,DataView,DecompressionStream,DisposableStack,Error,EvalError,Event,\
+        EventTarget,File,Float16Array,Float32Array,Float64Array,FormData,\
+        Function,Infinity,Int16Array,Int32Array,Int8Array,InternalError,Iterator,JSON,Map,Math,\
+        MultipartFormData,NaN,Number,Object,Promise,Proxy,RangeError,\
+        ReadableByteStreamController,ReadableStream,ReadableStreamBYOBReader,\
+        ReadableStreamBYOBRequest,ReadableStreamDefaultController,ReadableStreamDefaultReader,\
+        ReferenceError,Reflect,RegExp,Set,String,SuppressedError,Symbol,SyntaxError,TextDecoder,\
+        TextEncoder,TransformStream,TypeError,URIError,URL,URLSearchParams,Uint16Array,\
+        Uint32Array,Uint8Array,Uint8ClampedArray,WeakMap,WeakSet,WritableStream,addEventListener,\
+        atob,btoa,decodeURI,decodeURIComponent,dispatchEvent,encodeURI,encodeURIComponent,escape,\
+        eval,globalThis,isFinite,isNaN,parseFloat,parseInt,queueMicrotask,removeEventListener,\
+        structuredClone,undefined,unescape";
+
+    let (outcome, reports) =
+        probe.check(0, "Object.getOwnPropertyNames(globalThis).sort().join(',')");
+    outcome.expect("enumerating the globals is not itself withheld");
+
+    let reported = reports
+        .first()
+        .and_then(|report| report.message.clone())
+        .expect("the probe reports what it enumerated");
+    let seen = reported
+        .rsplit_once("string:")
+        .map(|(_, names)| names)
+        .expect("the probe reports the value it evaluated to");
+
+    let expected: BTreeSet<&str> = SURVIVING.split(',').collect();
+    let actual: BTreeSet<&str> = seen.split(',').collect();
+
+    let arrived: Vec<&&str> = actual.difference(&expected).collect();
+    let gone: Vec<&&str> = expected.difference(&actual).collect();
+
+    assert!(
+        arrived.is_empty(),
+        "the component's engine now provides {arrived:?}, which nothing in this repository has \
+         looked at. Decide whether each is a capability or a source of nondeterminism before \
+         adding it to the string in this function: if it is, it belongs in \
+         `crates/lanekeep-js/src/sandbox.rs`'s absence assertions and in `host.js`'s WITHHELD \
+         instead, and it will then not be here at all."
+    );
+    assert!(
+        gone.is_empty(),
+        "the component's engine no longer provides {gone:?}. Nothing is at risk — a name that is \
+         not there cannot be reached — so drop it from the string in this function."
+    );
 }
 
 /// Everything else `host.js` and `entry.js` do, driven through the same instance.
@@ -308,8 +386,21 @@ fn the_rest_of_the_glue_module(probe: &mut Probe) {
 /// Whitespace is removed entirely before matching, which is what makes the patterns below
 /// survive rustfmt moving an argument onto its own line. Comments go first, or removing the
 /// newlines would fold the rest of a line into a `//`.
+///
+/// # Three shapes, and a refusal to grow a fourth
+///
+/// An absence can be asserted in more ways than this reads, and one of them used to be in that
+/// file: `assert_eq!(s.eval::<String>("typeof Math.random"), "undefined", …)` says exactly what
+/// `type_of(&s, "Math.random")` says and is invisible here. A name added in that shape would be
+/// withheld under QuickJS and reachable in a component with every test green — and the anchor
+/// check below does not catch it, since the anchors are drawn from the shapes that *are* read.
+///
+/// The fix was to delete the shape rather than to parse it, and [`no_fourth_shape`] is what
+/// keeps it deleted. A smarter extractor is a worse answer: it has to be right about a language,
+/// where the guard only has to be right about one string.
 fn withheld_by_quickjs() -> BTreeSet<String> {
     let source = uncommented(SANDBOX);
+    no_fourth_shape(&source);
     let mut names = BTreeSet::new();
 
     // --- what the bootstrap deletes ---
@@ -361,6 +452,41 @@ fn withheld_by_quickjs() -> BTreeSet<String> {
         );
     }
     names
+}
+
+/// Refuse an absence asserted in a shape [`withheld_by_quickjs`] cannot read.
+///
+/// Keyed on the *comparison* rather than on the call, because `s.eval` is ordinary in that file
+/// — `assert_eq!(s.eval::<i32>("1 + 1")…, 2)` is how it checks that the engine works at all.
+/// What makes an assertion an absence is that it compares against `"undefined"`, so every such
+/// comparison is found and the enclosing macro walked back to; only the ones reached through
+/// `s.eval` are refused.
+///
+/// `assert_ne!` has to be one of the openers even though it is never the offender: it is the
+/// *presence* test for what rules do need, and walking past it would attribute its `"undefined"`
+/// to whichever `assert_eq!` came earlier in the file — which is a `s.eval` call in
+/// `evaluates_ordinary_javascript`, and a false positive that would be very hard to read.
+///
+/// `source` is already uncommented and whitespace-free, so prose cannot trip this.
+fn no_fourth_shape(source: &str) {
+    for (index, _) in source.match_indices(",\"undefined\"") {
+        let before = &source[..index];
+        let opener = before
+            .rfind("assert_eq!(")
+            .max(before.rfind("assert_ne!("))
+            .unwrap_or(0);
+
+        assert!(
+            !before[opener..].contains("s.eval::"),
+            "sandbox.rs asserts an absence through `s.eval` rather than through `type_of`:\n\n    \
+             {}…\n\n\
+             That shape is invisible to the extraction in this file, so a name withheld by it \
+             would be reachable inside a WebAssembly component with nothing going red. Write it \
+             as `assert_eq!(type_of(&s, \"the.name\"), \"undefined\", …)` — `type_of` evaluates \
+             `typeof (the.name)`, so a dotted name needs nothing special.",
+            &before[opener..].chars().take(70).collect::<String>()
+        );
+    }
 }
 
 /// Every global `packages/lanekeep/runtime/host.js` deletes.
