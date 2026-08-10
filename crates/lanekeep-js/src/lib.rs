@@ -63,7 +63,8 @@ pub use lanekeep_core::limits::{
 pub use lanekeep_lang::Language;
 pub use lanekeep_nodes::{Handle, NodeArena};
 pub use loader::{
-    BuiltinComponent, BuiltinSource, HOST_MODULE, ResolveError, RuleLoader, RuleResolver, RuleRoot,
+    BuiltinComponent, BuiltinSource, HOST_MODULE, MAX_COMPONENT_NAME, ResolveError, RuleLoader,
+    RuleResolver, RuleRoot,
 };
 pub use sandbox::Sandbox;
 pub use typescript::{StripError, Unsupported, strip_types};

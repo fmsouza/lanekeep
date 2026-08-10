@@ -769,18 +769,22 @@ fn describe_components(
 
     let mut added = Vec::new();
     for (position, rule) in resolved.iter().enumerate() {
+        // Whether this reference is a component at all comes first, so a config of TypeScript
+        // rules with one component in it does no work per rule that is thrown away. Extracting
+        // the two byte sources into `component_bytes` put the serialization above this test for
+        // a while, which was a small silent regression on the common shape.
+        let Some((origin, bytes)) =
+            component_bytes(root, rule).map_err(|detail| fail(position, detail))?
+        else {
+            continue;
+        };
+
         // `null` for a rule named with no options, which is the world's own shape for it —
         // serialized once here so that every worker's `configure` is handed the same bytes.
         let options = rule
             .options
             .as_ref()
             .map_or_else(|| "null".to_owned(), json::literal);
-
-        let Some((origin, bytes)) =
-            component_bytes(root, rule).map_err(|detail| fail(position, detail))?
-        else {
-            continue;
-        };
 
         let admitted = loader
             .load(&engine, &rule.specifier, bytes.as_slice())

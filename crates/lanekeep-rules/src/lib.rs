@@ -230,6 +230,26 @@ mod tests {
     }
 
     #[test]
+    fn every_component_name_fits_the_refusal_message() {
+        // The other half of `lanekeep-js`'s `the_refusal_survives_quickjs_beside_a_long_path`,
+        // which derives this budget and cannot see these names — that crate sits below this one.
+        //
+        // What breaks if this fails is not a build: it is that a user who imports a
+        // component-backed built-in from a `lanekeep.config.ts` is told they have a problem and
+        // not what to do about it, because QuickJS truncated the remedy off the end. The
+        // constant's own documentation says what the honest ways to raise it are.
+        for (name, _) in BUILT_IN_COMPONENTS {
+            assert!(
+                name.len() <= lanekeep_js::MAX_COMPONENT_NAME,
+                "`{name}` is {} characters and the budget is {} — refusing an import of it \
+                 would be truncated before it said what to do instead",
+                name.len(),
+                lanekeep_js::MAX_COMPONENT_NAME,
+            );
+        }
+    }
+
+    #[test]
     fn a_component_is_webassembly_rather_than_a_placeholder() {
         // `include_bytes!` of a stub or a half-written file compiles, and the failure would be a
         // load error inside whichever test ran first. Four bytes are enough to tell them apart.

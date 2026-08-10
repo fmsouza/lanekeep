@@ -15,6 +15,12 @@ categories.workspace = true
 # For the fields of a `Violation` that the testkit's assertions do not pin — `rule_id`,
 # `severity` and `remediation`, which a rule can get wrong without moving a position or a message.
 lanekeep-core = { workspace = true }
+# For `MAX_COMPONENT_NAME`, which is derived there and enforced here: that crate owns the
+# arithmetic (QuickJS's 255-byte truncation of a refused import) and sits below this one, so it
+# cannot see which names actually ship. Taking the constant rather than copying the number is
+# what makes the two halves unable to drift. No cycle — `lanekeep-js` depends on nothing here —
+# and no new publication-order constraint, since `lanekeep-testkit` already reaches it.
+lanekeep-js = { workspace = true }
 lanekeep-testkit = { workspace = true }
 
 [lints]

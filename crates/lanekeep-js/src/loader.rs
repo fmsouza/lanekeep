@@ -64,6 +64,26 @@ pub type BuiltinSource = fn(&str) -> Option<&'static str>;
 /// and a component in another.
 pub type BuiltinComponent = fn(&str) -> Option<&'static [u8]>;
 
+/// The longest a built-in component's name may be before refusing it stops being actionable.
+///
+/// Not a limit on rule names in general, and nothing enforces it here — it is a budget derived
+/// from one number this crate does not control. [`ResolveError::NotAModule`] reaches a user
+/// through QuickJS, which truncates a thrown error at 255 bytes, behind rquickjs's
+/// `Error resolving module '<specifier>' from '<path>': ` framing. The name is spent twice in
+/// that — once in the specifier, once inside the message — so each character costs two bytes of
+/// whatever is left for the *project's own path*, and what gets cut is the end of the message,
+/// which is the half telling the user what to do.
+///
+/// At this length the whole message survives beside a 120-byte config path;
+/// `no-mutable-default-argument`, at 27 characters, would survive only 96.
+///
+/// **Raising it is a decision rather than a formality.** The honest ways are to shorten the
+/// message or to accept a smaller path budget and say so — not to raise this number and leave
+/// the arithmetic where it was. `the_refusal_survives_quickjs_beside_a_long_path` derives it and
+/// `lanekeep-rules`' `every_component_name_fits_the_refusal_message` enforces it against the
+/// names that actually ship, because this crate sits below that one and cannot see them.
+pub const MAX_COMPONENT_NAME: usize = 15;
+
 /// The default: no built-ins, so a bare `lanekeep-js` resolves only project modules.
 fn no_builtins(_name: &str) -> Option<&'static str> {
     None
@@ -132,17 +152,28 @@ pub enum ResolveError {
     /// correctly and simply cannot be imported, and telling a reader to check their spelling
     /// would send them looking for something that is not wrong.
     ///
-    /// **The first line carries the whole fact, and that is not a style choice.** QuickJS
-    /// truncates a thrown error at 256 bytes, and a resolution failure reaches the user as
-    /// `Error resolving module '<specifier>' from '<absolute path>': <this>` — so a long
-    /// project path can eat most of the budget before this message starts. Measured on a
-    /// 126-character path: 81 bytes left. Whatever a reader needs in order to know what
-    /// happened has to be in front; the remedy is second because it is the half that can be
-    /// lost. See `AGENTS.md`.
-    #[error(
-        "cannot import `lanekeep/{name}`: it is a rule component, not a module\n  \
-         a component has no JavaScript to import — name it in a `lanekeep.json` instead"
-    )]
+    /// **One line, carrying both the fact and the remedy, and that is not a style choice.**
+    /// QuickJS truncates a thrown error at 255 bytes, and a resolution failure reaches the user
+    /// as `Error resolving module '<specifier>' from '<absolute path>': <this>` — 35 bytes of
+    /// framing plus the specifier plus the *project's own path* before this message starts. So
+    /// a second line is not a place to put anything: it is the first thing a real path spends
+    /// the budget on.
+    ///
+    /// A two-line version of this shipped and was wrong in exactly that way. It front-loaded
+    /// the fact and put "name it in a `lanekeep.json`" second, which survived only for a config
+    /// path of 47 characters or fewer — so every user deep enough in a monorepo to have the
+    /// problem was told they had it and not what to do. There is no in-format escape either:
+    /// `packages/lanekeep/index.d.ts` types `rules` as `Rule[]`, so a `.config.ts` cannot name
+    /// a rule by string. Converting to JSON is the only route, and that was the sentence being
+    /// cut.
+    ///
+    /// The specifier is repeated here even though the framing already carries it, because this
+    /// is a public error type and a sibling variant read alone names its subject. It costs the
+    /// budget twice over, which is why the rest is as short as it is.
+    ///
+    /// `the_refusal_survives_quickjs_beside_a_long_path` is what holds the arithmetic. See
+    /// `AGENTS.md`.
+    #[error("`lanekeep/{name}` is a rule component; name it in a `lanekeep.json`")]
     NotAModule {
         /// The built-in's name, without the `lanekeep/` prefix.
         name: String,
@@ -670,25 +701,57 @@ mod tests {
             "expected NotAModule, got {error:?}"
         );
         let rendered = error.to_string();
+        assert!(rendered.contains("lanekeep/compiled"), "{rendered}");
         assert!(rendered.contains("component"), "{rendered}");
         assert!(
             rendered.contains("lanekeep.json"),
             "the message has to name the format that can reach it: {rendered}"
         );
+    }
 
-        // The first line has to stand alone, because it is the only part guaranteed to reach a
-        // user: QuickJS truncates a thrown error at 256 bytes and prefixes this one with the
-        // specifier and the importing module's absolute path. A remedy on line two is a bonus;
-        // a *fact* on line two would be lost exactly when the project path is long.
-        let first = rendered.lines().next().unwrap_or_default();
+    /// The whole message reaches a user whose project is nested as deeply as a real one.
+    ///
+    /// **The constraint is not "the message is short", and a test asserting that passed against
+    /// the bug it was written for.** QuickJS copies a thrown error into a 255-byte buffer, and
+    /// rquickjs hands it `Error resolving module '<specifier>' from '<path>': <message>` — so
+    /// what has to hold is `35 + specifier + path + message <= 255`, and the *project's path* is
+    /// two of those four terms' worth of budget that this crate does not control. A previous
+    /// version of this assertion pinned the first line at 80 bytes, which is a quantity nothing
+    /// depends on: the message it was guarding lost its remedy at any config path beyond 47
+    /// characters, and the assertion was green throughout.
+    ///
+    /// **The rule's name is spent twice** — once in rquickjs's framing, once inside the message
+    /// — so every character of it costs two of the path budget. A name of 15 characters clears a
+    /// 120-byte path; `no-mutable-default-argument`, at 27, would clear only 96. So this is
+    /// stated as a *name-length* budget rather than measured against whichever names happen to
+    /// ship, which this crate cannot see anyway: it sits below `lanekeep-rules` deliberately.
+    ///
+    /// `lanekeep-rules`' `every_component_name_fits_the_refusal_message` is the other half, and
+    /// it is what makes this test's premise true rather than assumed. Neither is any use alone:
+    /// this one would pass while a longer name silently ate a user's remedy, and that one would
+    /// be enforcing a number with no derivation behind it.
+    #[test]
+    fn the_refusal_survives_quickjs_beside_a_long_path() {
+        /// What QuickJS will keep, terminator excluded.
+        const BUDGET: usize = 255;
+        /// A project path this message must not be truncated beside. Roughly
+        /// `/Users/<name>/work/<org>-monorepo/apps/<app>/packages/<pkg>/lanekeep.config.ts`.
+        const PATH: usize = 120;
+
+        // Not a literal: this is rquickjs's framing with both holes empty, so the constant
+        // cannot drift from the string it is measuring.
+        let framing = "Error resolving module '' from '': ".len();
+
+        let name = "x".repeat(MAX_COMPONENT_NAME);
+        let specifier = format!("lanekeep/{name}").len();
+        let message = ResolveError::NotAModule { name }.to_string();
+
+        let total = framing + specifier + PATH + message.len();
         assert!(
-            first.contains("lanekeep/compiled") && first.contains("component"),
-            "the first line must name the rule and say what it is: {first}"
-        );
-        assert!(
-            first.len() <= 80,
-            "the first line has to fit beside a long path: {} bytes",
-            first.len()
+            total <= BUDGET,
+            "QuickJS keeps {BUDGET} bytes and this needs {total} beside a {PATH}-byte path \
+             ({} of them the message): the remedy is what gets cut\n  {message}",
+            message.len(),
         );
     }
 

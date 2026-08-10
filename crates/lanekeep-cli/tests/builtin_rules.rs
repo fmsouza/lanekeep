@@ -281,11 +281,14 @@ fn a_built_in_component_can_be_configured() {
 /// this would otherwise get — "no built-in rule by that name" — which is what a typo looks like
 /// and would send its author hunting for a misspelling that is not there.
 ///
-/// **Asserted on the first line only.** QuickJS truncates a thrown error at 256 bytes and
-/// prefixes a resolution failure with the importing module's absolute path, which here is a
-/// temporary directory over a hundred characters long. So the remedy — naming `lanekeep.json` —
-/// is not asserted here; it is asserted where the message is not truncated, in `lanekeep-js`'s
-/// `a_built_in_that_is_a_component_is_refused_as_a_module`.
+/// **The remedy is asserted here, and it is the half worth asserting.** QuickJS truncates a
+/// thrown error at 255 bytes and rquickjs spends the front of that on the importing module's
+/// absolute path — here a temporary directory over a hundred characters long, which is what
+/// makes this the realistic test rather than the unit one. An earlier two-line version of the
+/// message lost "name it in a `lanekeep.json`" to exactly this path, and this test passed,
+/// because it only checked the first line. Telling a user their config is wrong without telling
+/// them the one thing that fixes it is barely better than the "no built-in rule by that name"
+/// this replaced.
 #[test]
 fn a_typescript_config_cannot_import_a_built_in_component() {
     let project = Project::new(
@@ -313,8 +316,12 @@ fn a_typescript_config_cannot_import_a_built_in_component() {
         "the error does not name the specifier:\n{combined}"
     );
     assert!(
-        combined.contains("it is a rule component, not a module"),
+        combined.contains("is a rule component"),
         "the error must say what the rule is, not that it is missing:\n{combined}"
+    );
+    assert!(
+        combined.contains("name it in a `lanekeep.json`"),
+        "the remedy has to survive the truncation, or the error is not actionable:\n{combined}"
     );
     assert!(
         !combined.contains("no built-in rule by that name"),

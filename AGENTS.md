@@ -554,17 +554,27 @@ of them. Nothing fails: the rule loads, the query never runs, and the output rea
 a codebase with none of the thing in it. There is no *or* form, so a rule with no single
 covering substring omits the gate rather than writing one that is wrong.
 
-**QuickJS truncates a thrown error at 256 bytes, and a module-resolution failure spends most of
-that on a path before your message begins.** rquickjs renders one as
+**QuickJS truncates a thrown error at 255 bytes, and a module-resolution failure spends most of
+that on the user's own path before your message begins.** rquickjs renders one as
 `Error resolving module '<specifier>' from '<absolute path of the importing module>': <the
-`ResolveError`>`, and QuickJS copies the result into a fixed buffer — 255 bytes plus the
-terminator, measured. A `lanekeep.config.ts` in a macOS temporary directory gives a 175-byte
-prefix, leaving 81 bytes: enough for one line. Nothing fails, and the loss is at the *end*, so a
-message whose first line is a greeting and whose second is the actual reason arrives as a
-greeting. Every `ResolveError` in `crates/lanekeep-js/src/loader.rs` therefore front-loads: the
-first line carries the whole fact, and the remedy goes second because it is the half that can be
-lost. The full text is asserted in that crate's unit tests, where there is no prefix; a test
-driving the binary can only assert what survives, and should say which.
+`ResolveError`>`, so the budget is `35 + specifier + path + message <= 255` — the framing is 35
+bytes and the specifier is spent *twice* when the message names it too. Nothing fails, and the
+loss is at the end.
+
+**A `ResolveError` therefore gets one line, carrying the fact and the remedy together.** Not a
+front-loaded first line with the remedy under it: that arrangement shipped here and was measured
+wrong. `\`lanekeep/x\` is a rule component` on line one with `name it in a \`lanekeep.json\`` on
+line two survived whole only to a config path of 47 characters — and
+`/Users/alice/projects/acme/packages/checkout/lanekeep.config.ts` is 63, so every user deep
+enough in a monorepo to hit the error was told they had a problem and not what to do about it.
+The one-line form clears 120.
+
+The trap inside the trap is the assertion that guarded it: "the first line is at most 80 bytes"
+is a quantity nothing depends on, and it was green for the whole life of the bug.
+`the_refusal_survives_quickjs_beside_a_long_path` in `crates/lanekeep-js/src/loader.rs` asserts
+the real inequality instead, against a stated path budget and the longest rule name that ships —
+and a test driving the binary is where the *whole* message should be asserted, because that is
+the only place a realistic path is in front of it.
 
 **A rule that declares `check(ctx, m, options)` and exports a plain object silently ignores every
 option it documents.** A handler is invoked with two arguments — `...rules[i].check(ctx, {...})` —
@@ -582,14 +592,20 @@ a superset covering both shapes deliberately, because the specifier cannot say w
 — so TypeScript accepts the call that throws `not a function` at run time.
 
 Both shapes have to keep working, which is why the fix is neither "make it a factory" nor "leave
-it an object": `lanekeep init` writes a bare `"lanekeep/no-unwrap"` into a Rust project's config
-and `lanekeep-config` renders that as the imported binding itself, while the documented usage
-calls it. The rule is now a factory whose properties are copied onto the function
-(`for...in`, not `Object.assign` — the sandbox's intrinsics are an allowlist and `Object` is not
-on it), which is what `builtin.d.ts` claimed all along. **The three genuine factories —
-`no-restricted-imports`, `no-circular-imports`, `no-unused-exports` — are the mirror image and are
-not fixed: referenced bare from a JSON config they render as a function where a rule object is
-expected.** No scaffold emits one, so nothing trips it today.
+it an object": a config naming a built-in bare — `"lanekeep/no-default-export"` — has
+`lanekeep-config` render it as the imported binding itself, while the documented usage calls it.
+Such a rule is a factory whose properties are copied onto the function (`for...in`, not
+`Object.assign` — the sandbox's intrinsics are an allowlist and `Object` is not on it), which is
+what `builtin.d.ts` claimed all along. **The three genuine factories — `no-restricted-imports`,
+`no-circular-imports`, `no-unused-exports` — are the mirror image and are not fixed: referenced
+bare from a JSON config they render as a function where a rule object is expected.** No scaffold
+emits one, so nothing trips it today.
+
+The two rules this was found on, `no-unwrap` and `no-glob-import`, are components now, so neither
+is an example of it any more — a bare reference to one renders as `null`, the placeholder holding
+a component's place in the entry module's array, and its options reach it through `configure` as
+data. The trap is unchanged for the eight built-ins that are still TypeScript modules, which is
+why the example above was repointed at one of them rather than deleted.
 
 **`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
 `ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a
