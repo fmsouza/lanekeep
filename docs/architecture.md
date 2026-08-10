@@ -409,7 +409,7 @@ Both halves became true in the same release and neither had been true before it,
 
 ### 6.9 The component surface
 
-A component rule is a WebAssembly component exporting the `rule` world. It reaches the same host API as §6.1–6.5 and is subject to the same limits as §6.7 — enforced by wasmtime's epoch interruption where a TypeScript rule is enforced by QuickJS's interrupt handler — and its absences are §6.6's, structurally: it imports exactly one interface, `lanekeep:host/types`, so there is no wall clock, no filesystem and no entropy to remove, because none was ever bound. A component built for `wasm32-wasip1` imports three of those and is refused at load.
+A component rule is a WebAssembly component exporting the `rule` world. It reaches the same host API as §6.1–6.5 and is subject to the same limits as §6.7 — enforced by wasmtime's epoch interruption where a TypeScript rule is enforced by QuickJS's interrupt handler — and its absences are §6.6's, structurally: it imports exactly one interface, `lanekeep:host/types`, so there is no wall clock, no filesystem and no entropy to remove, because none was ever bound. A component built for `wasm32-wasip1` imports eleven instances rather than one — the host interface plus ten WASI ones — and is refused at load. Two of those three categories are among them, a wall clock and a filesystem; `wasi:random` is not imported, so the entropy an unconstrained build *could* reach is one this particular artifact does not.
 
 It has four exports a TypeScript rule has no need of, and each exists because a component cannot do what a module does:
 
@@ -690,7 +690,7 @@ One-shot is the default and CI runs it unchanged. `--watch` is a foreground loop
 
 Rules are executable code. The posture is therefore about **confinement**, not absence:
 
-- **No ambient authority, in either engine.** Rule code reaches exactly the host functions in §6 and nothing else. For a TypeScript rule that is QuickJS with `fs`, `process`, `child_process`, network and dynamic import absent from the context rather than restricted within it. For a WebAssembly component (§6.9) it is structural: the component imports exactly one interface, `lanekeep:host/types`, so a clock, a filesystem and an entropy source were never bound and there is nothing to remove. A component importing anything else — a `wasm32-wasip1` build imports three — is refused at load rather than sandboxed at run time.
+- **No ambient authority, in either engine.** Rule code reaches exactly the host functions in §6 and nothing else. For a TypeScript rule that is QuickJS with `fs`, `process`, `child_process`, network and dynamic import absent from the context rather than restricted within it. For a WebAssembly component (§6.9) it is structural: the component imports exactly one interface, `lanekeep:host/types`, so a clock, a filesystem and an entropy source were never bound and there is nothing to remove. A component importing anything else is refused at load rather than sandboxed at run time: the `wasm32-wasip1` build kept as a fixture imports **eleven** instances — the host interface plus ten WASI ones, among them `wasi:clocks/wall-clock`, `wasi:filesystem/types`, `wasi:filesystem/preopens` and the five `wasi:cli` interfaces — which is the ambient authority this check exists to keep out.
 - **No network.** Ever, in any mode, with no configuration that enables it.
 - **Config load executes guest code, including WebAssembly.** A component answers `metadata`, `configure`, `has-check` and `has-reduce` when a config naming it is read, so `lanekeep rules` and `lanekeep explain` — which check no files — run guest code where they previously ran none. The confinement is the same one; the surface is that reading a config is enough to reach it. A `lanekeep.config.ts` has always had this property, and a `lanekeep.json` naming a component now has it too.
 - **Filesystem confinement.** Reads happen only through `ctx.readFile`, only within the project root, with traversal rejected. Writes happen only under `--fix`, only to files a rule reported on, and only within the byte range of a node that rule matched.
@@ -860,8 +860,10 @@ Measured 2026-08-10, Apple M3 Max (14 cores), macOS 26.5.2, rustc 1.95.0, wasmti
 
 | Arm | Cold corpus | Hot corpus | Difference | Host calls | Per call |
 |---|---|---|---|---|---|
-| TypeScript, QuickJS | 115 ms | 294 ms | 179 ms | 597,120 | ~300 ns |
-| component, wasmtime | 78 ms | 216 ms | 138 ms | 418,560 | ~330 ns |
+| TypeScript, QuickJS | 115 ms | 294 ms | 179 ms | 593,280 | ~302 ns |
+| component, wasmtime | 78 ms | 216 ms | 138 ms | 414,720 | ~332 ns |
+
+**"Host calls" is the *marginal* count, `hot − cold`, which is what "Difference" is divided by.** The cold corpus makes 3,840 calls in either arm — one per subject, before the method name sends the rule up the ancestor chain — so the marginal counts are 3,840 below the hot totals of 597,120 and 418,560 that the prose below cites and the bench prints in its own block. Both quantities are right and they are not the same one: a per-call figure has to divide a marginal time by a marginal count, or it is a rate between two different populations. This has been "corrected" once, in the direction of making the table agree with the prose and stop agreeing with the measurement. Run `cargo bench -p lanekeep-engine --bench crossings` before changing it; its `calls` column is this one.
 
 **A host call costs about 1.1× through a component.** More than a dozen runs on a settled machine gave 1.06 to 1.12 — QuickJS 298–308 ns, component 322–335 ns — which is the whole of the spread. (A run started immediately after a rebuild reads outside it, up to 1.15; the QuickJS side is the steady one and the component side is where the noise lives.) The performance argument is not inverted, and it is not close to inverted.
 

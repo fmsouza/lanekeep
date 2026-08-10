@@ -839,7 +839,7 @@ fn describe_components(
     // otherwise. A rules root is not a project root — `lanekeep-testkit` anchors one at a
     // temporary fixture directory — so guessing a location to write `.lanekeep/components` into
     // would make loading a config write somewhere nobody asked for. Naming it is
-    // `load_with_artifact_cache`, and the CLI names it.
+    // `LoadOptions::artifacts`, passed through `load_with`, and the CLI names it.
     //
     // It matters because without one this compiles every component only to throw the
     // compilation away, and the engine compiles the same bytes again at prepare time: ~58 ms per
@@ -1986,7 +1986,7 @@ mod tests {
     ///
     /// `load` has nowhere to write, so it compiles each component only to discard the
     /// compilation, and the engine compiles the same bytes again at prepare time.
-    /// `load_with_artifact_cache` is handed a project root and leaves a `.cwasm` under
+    /// [`load_with`] given a [`LoadOptions::artifacts`] root leaves a `.cwasm` under
     /// `COMPONENT_CACHE_PATH` that both this load and the engine's own loader map — measured at
     /// ~58 ms per component per load before, and at TypeScript parity after.
     ///
