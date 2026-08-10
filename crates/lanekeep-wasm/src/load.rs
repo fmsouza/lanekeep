@@ -118,13 +118,6 @@ const ARTIFACT_EXTENSION: &str = "cwasm";
 /// replace the component it was compiled from.
 const DIGEST_CHARS: usize = 32;
 
-/// The longest a sanitized rule name may be inside an artifact filename.
-///
-/// The name is a readability affordance — the digest is what identifies the artifact — so
-/// truncating it costs nothing, and not truncating it lets a rule id decide how long a path
-/// component gets.
-const NAME_CHARS: usize = 48;
-
 /// The instance imports a component may declare.
 ///
 /// A *set* the caller supplies rather than a fixed list, for the reason the module
@@ -434,9 +427,13 @@ impl ComponentLoader {
     ///
     /// `None` when it has no cache directory. Public so a test can assert on the artifact
     /// rather than on the counters alone.
+    ///
+    /// **The bytes decide, and nothing else does.** A rule's name is not a parameter, which is
+    /// what makes several rules of one component share one artifact — `artifact_name`, below,
+    /// says what that cost when it was otherwise.
     #[must_use]
-    pub fn artifact_path(&self, name: &str, bytes: &[u8]) -> Option<PathBuf> {
-        self.artifact_path_for(name, &blake3::hash(bytes))
+    pub fn artifact_path(&self, bytes: &[u8]) -> Option<PathBuf> {
+        self.artifact_path_for(&blake3::hash(bytes))
     }
 
     /// The same, for a caller that has already hashed the bytes.
@@ -445,10 +442,10 @@ impl ComponentLoader {
     /// [`Loaded::identity`]. Hashing twice would be a second pass over the whole component,
     /// which for the 12.34 MiB JavaScript engine is milliseconds paid per rule reference at
     /// config load.
-    fn artifact_path_for(&self, name: &str, digest: &blake3::Hash) -> Option<PathBuf> {
+    fn artifact_path_for(&self, digest: &blake3::Hash) -> Option<PathBuf> {
         self.cache_dir
             .as_ref()
-            .map(|dir| dir.join(artifact_name(name, digest)))
+            .map(|dir| dir.join(artifact_name(digest)))
     }
 
     /// Load a rule component, preferring a mapped precompiled artifact.
@@ -487,7 +484,7 @@ impl ComponentLoader {
         let digest = blake3::hash(bytes);
         let identity = *digest.as_bytes();
 
-        if let Some(path) = self.artifact_path_for(name, &digest) {
+        if let Some(path) = self.artifact_path_for(&digest) {
             if path.is_file() {
                 if let Some(component) = map(engine.engine(), &path) {
                     self.mapped.fetch_add(1, Ordering::Relaxed);
@@ -645,37 +642,37 @@ fn map(engine: &Engine, path: &Path) -> Option<Component> {
 ///
 /// Content-addressed, so a changed component is a different file rather than a stale one:
 /// there is no invalidation step to get wrong, and two checkouts of different revisions
-/// sharing a cache directory do not fight. The rule's name is a prefix purely so a human
-/// looking at the directory can tell what is in it.
-fn artifact_name(name: &str, digest: &blake3::Hash) -> String {
+/// sharing a cache directory do not fight.
+///
+/// # The rule's name was a prefix, and it had to stop being one
+///
+/// It was there purely so a human looking at the directory could tell what was in it, and both
+/// this function's own documentation and `NAME_CHARS`' said as much: the digest identifies the
+/// artifact, the name was a readability affordance. That was harmless while every component
+/// hosted exactly one rule, and it stopped being harmless the moment one did not.
+///
+/// `lanekeep-config` loads once per rule *reference* — deliberately, so the two byte sources are
+/// read in one place — so a `lanekeep.json` naming the four rules of `typescript-builtins.wasm`
+/// calls [`ComponentLoader::load`] four times with identical bytes and four different names.
+/// With the name in the filename, none of those four could see the artifact the others wrote:
+/// measured 2026-08-10 on a release binary, **25.4 s cold against 6.2 s for a config naming one
+/// rule of the same component, and 133 MB of `.lanekeep/components` in four byte-identical
+/// 33 MB files.** The entire reason those rules share a component is that the 12.4 MiB engine
+/// underneath them is compiled once; naming its artifact after a rule handed that back.
+///
+/// So the name is gone, and what replaced the readability it bought is that there is now one
+/// file per component rather than one per rule — a directory of four files where the four rules
+/// of one component are concerned is *less* legible than one, because the four names all claimed
+/// an artifact that served all four.
+///
+/// **A rule id also cannot decide where its artifact is written, and now by construction.** That
+/// was `sanitize`'s job, mapping a namespaced or hostile id onto one safe path component; a name
+/// that never reaches the filename cannot escape it.
+/// `a_rule_id_cannot_decide_where_its_artifact_is_written` asserts the stronger form.
+fn artifact_name(digest: &blake3::Hash) -> String {
     let digest = digest.to_hex();
     let digest: String = digest.chars().take(DIGEST_CHARS).collect();
-    format!("{}-{digest}.{ARTIFACT_EXTENSION}", sanitize(name))
-}
-
-/// A rule name reduced to something that is safe as one path component.
-///
-/// Rule ids are namespaced — `lanekeep/no-unwrap` — so they carry separators, and an id is
-/// configuration rather than something this crate controls. Mapping everything outside a
-/// conservative set to `_` means no id can decide where the artifact is written; the digest
-/// is what makes the name unique, so collapsing two ids to the same prefix costs nothing.
-fn sanitize(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .take(NAME_CHARS)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "rule".to_owned()
-    } else {
-        cleaned
-    }
+    format!("{digest}.{ARTIFACT_EXTENSION}")
 }
 
 #[cfg(test)]
@@ -713,13 +710,34 @@ mod tests {
         assert!(!PermittedImports::none().contains(HOST_INTERFACE));
     }
 
+    /// A rule id cannot decide where its artifact is written — and no longer *could*.
+    ///
+    /// **Re-derived rather than re-run.** It used to hand `artifact_name` a hostile id and check
+    /// that `sanitize` had flattened it: the escape it was written against is a rule id, which is
+    /// configuration, reaching a path. Now no id reaches the filename at all, so the old data
+    /// proves nothing — there is no parameter to make hostile. What is asserted instead is the
+    /// shape the filename is now restricted to, which is a strictly stronger claim: thirty-two
+    /// hex characters and an extension can contain neither a separator nor a `..`, whatever any
+    /// config says.
+    ///
+    /// `two_rules_with_the_same_bytes_still_get_their_own_artifacts` was the other test over this
+    /// function and is deliberately gone rather than adjusted. It asserted that two rules over
+    /// identical bytes get different filenames, which was true, deliberate and harmless while a
+    /// component hosted one rule — and is the defect itself now that one hosts four. See
+    /// [`artifact_name`], and `tests/load.rs`'s `several_rules_of_one_component_compile_it_once`,
+    /// which asserts the property that replaced it.
     #[test]
     fn a_rule_id_cannot_decide_where_its_artifact_is_written() {
-        // Namespaced ids carry separators, and a hostile one carries more than that.
-        let name = artifact_name("../../etc/passwd", &blake3::hash(b"bytes"));
+        let name = artifact_name(&blake3::hash(b"bytes"));
+        let (stem, extension) = name
+            .split_once('.')
+            .expect("an artifact filename carries an extension");
+
+        assert_eq!(extension, ARTIFACT_EXTENSION);
+        assert_eq!(stem.len(), DIGEST_CHARS);
         assert!(
-            !name.contains('/') && !name.contains(".."),
-            "the name must be one path component: {name}"
+            stem.chars().all(|c| c.is_ascii_hexdigit()),
+            "the whole filename is a digest, so nothing configuration supplies is in it: {name}"
         );
         assert_eq!(
             Path::new(&name).components().count(),
@@ -730,39 +748,45 @@ mod tests {
 
     #[test]
     fn the_artifact_name_changes_when_the_component_does() {
-        let one = artifact_name("rule", &blake3::hash(b"first"));
-        let two = artifact_name("rule", &blake3::hash(b"second"));
+        let one = artifact_name(&blake3::hash(b"first"));
+        let two = artifact_name(&blake3::hash(b"second"));
         assert_ne!(
             one, two,
             "content-addressing is the whole invalidation strategy"
         );
         assert_eq!(
             one,
-            artifact_name("rule", &blake3::hash(b"first")),
+            artifact_name(&blake3::hash(b"first")),
             "and the same bytes have to give the same name, or nothing is ever reused"
         );
     }
 
+    /// One component, one artifact, however many rules name it.
+    ///
+    /// The inverse of the test this replaced, and the property that is true now: sameness is the
+    /// bytes a component was compiled from, which is exactly what `RuleSet::add` already decided
+    /// one layer up — it keys instances on `Loaded::identity`, a digest of the bytes and
+    /// deliberately not the `Loaded` value, *because* `lanekeep-config` loads once per rule
+    /// reference. The cache path disagreeing with that was the defect.
     #[test]
-    fn two_rules_with_the_same_bytes_still_get_their_own_artifacts() {
-        assert_ne!(
-            artifact_name("a", &blake3::hash(b"same")),
-            artifact_name("b", &blake3::hash(b"same"))
-        );
-    }
+    fn every_rule_of_one_component_names_one_artifact() {
+        let digest = blake3::hash(b"one component");
+        assert_eq!(artifact_name(&digest), artifact_name(&digest));
 
-    #[test]
-    fn a_name_that_sanitizes_away_entirely_still_produces_a_filename() {
-        let name = artifact_name("///", &blake3::hash(b"bytes"));
-        assert!(name.starts_with("___-"), "{name}");
-        assert!(!artifact_name("", &blake3::hash(b"bytes")).starts_with('-'));
+        let loader = ComponentLoader::for_project_root(Path::new("/projects/example"));
+        assert_eq!(
+            loader.artifact_path(b"one component"),
+            loader.artifact_path(b"one component"),
+            "two references to one component must resolve to one file, or neither can see \
+             what the other compiled"
+        );
     }
 
     #[test]
     fn a_loader_without_a_cache_directory_has_nowhere_to_put_an_artifact() {
         assert!(
             ComponentLoader::without_cache()
-                .artifact_path("rule", b"bytes")
+                .artifact_path(b"bytes")
                 .is_none()
         );
     }
@@ -771,7 +795,7 @@ mod tests {
     fn a_loader_puts_its_artifacts_under_the_project_cache_directory() {
         let loader = ComponentLoader::for_project_root(Path::new("/projects/example"));
         let path = loader
-            .artifact_path("rule", b"bytes")
+            .artifact_path(b"bytes")
             .expect("a loader with a cache directory has a path");
         assert!(
             path.starts_with(Path::new("/projects/example").join(COMPONENT_CACHE_PATH)),
