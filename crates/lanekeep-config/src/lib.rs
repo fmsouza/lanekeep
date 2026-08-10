@@ -2368,12 +2368,16 @@ mod tests {
         let outside = fixture.dir.join("outside.wasm");
         let inner = fixture.dir.join("project");
         fs::create_dir_all(&inner).expect("creates the inner root");
+        // `serde_json` rather than interpolating the path, because on Windows an absolute path
+        // is `C:\Users\...` and a backslash begins an escape inside a JSON string. Written
+        // literally, `\U` is an invalid escape, the config fails to *parse*, and the assertion
+        // below never reaches the confinement check it exists for — so this test asserted
+        // nothing on the one platform where the path shape it names is the unusual one.
+        let specifier =
+            serde_json::to_string(&outside.display().to_string()).expect("a path is a JSON string");
         fs::write(
             inner.join("lanekeep.json"),
-            format!(
-                r#"{{"namespaces": ["fixture"], "rules": ["{}"]}}"#,
-                outside.display()
-            ),
+            format!(r#"{{"namespaces": ["fixture"], "rules": [{specifier}]}}"#),
         )
         .expect("writes");
 

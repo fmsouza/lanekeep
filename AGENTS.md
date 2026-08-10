@@ -298,6 +298,24 @@ macOS and fail on Windows.** `/etc/passwd` is absolute on Unix and merely *roote
 Windows; `C:\...` is the reverse. Build an absolute path from `std::env::temp_dir()` rather
 than writing a literal, or the same input takes a different code branch on each platform.
 
+**And the sequel to that one, which the fix for it walks straight into: a Windows path
+interpolated into a JSON string is invalid JSON.** Having built an absolute path from
+`temp_dir()` to dodge the trap above, the natural next line writes it into a fixture config with
+`format!(r#"{{"rules": ["{}"]}}"#, path.display())`. On Unix that is fine. On Windows the path is
+`C:\Users\RUNNER~1\AppData\...`, a backslash opens an escape inside a JSON string, and `\U` is not
+one — so the config fails to **parse**, with `invalid escape at line 1 column 43`.
+
+The failure is worse than a wrong answer. A test whose fixture does not parse never reaches the
+thing it was written to assert, and it fails with a message about JSON rather than about the
+property — so the property is simply unasserted on that platform, and the test reads as though it
+covers it. `a_component_reference_may_not_be_an_absolute_path` was the absolute-path half of the
+component confinement check, and it asserted nothing on the one platform where an absolute path
+has the unusual shape. Its symlink sibling is `#[cfg(unix)]`, so Windows had neither.
+
+Build the string with `serde_json::to_string`, which escapes the separators, rather than
+interpolating. This applies to any fixture that puts a real path in JSON, which is most of the
+ones that name a file outside the project root.
+
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
 
