@@ -1159,9 +1159,9 @@ fn build_rule(
 /// A component's bytes are the same input as a module's source: the code that decided the
 /// answer. The plan for this change described the component fold as replacing the module walk,
 /// which would be correct in a world where every rule is a component and is a silent
-/// under-invalidation in this one — every rule in this tree is TypeScript, and dropping the
-/// walk would take the whole ruleset out of the cache key. So both are folded, and the module
-/// walk leaves when the last module does.
+/// under-invalidation in this one — two built-ins are components and every other rule in this
+/// tree is a module, so dropping the walk would take almost the whole ruleset out of the cache
+/// key. So both are folded, and the module walk leaves when the last module does.
 ///
 /// A component is hashed by its **bytes and not its path**, sorted by path so the order is
 /// fixed. A resolved component path is absolute, and putting it in would make the key depend

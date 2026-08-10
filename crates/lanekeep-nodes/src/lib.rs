@@ -7,9 +7,9 @@
 //!
 //! # Why this is its own crate rather than living in `lanekeep-js`
 //!
-//! It used to. `lanekeep-js`'s QuickJS sandbox is still the only engine that runs a rule
-//! today, but `lanekeep-wasm`'s component runtime is expected to become a second one before
-//! the first is retired, and both would need this exact type: what a node is, and how a
+//! It used to. `lanekeep-js`'s QuickJS sandbox was the only engine that ran a rule then;
+//! `lanekeep-wasm`'s component runtime is the second one now, and both need this exact type:
+//! what a node is, and how a
 //! handle resolves to one, cannot differ between them without a single run being able to
 //! disagree with itself about whether two handles name the same node. Defining it once,
 //! here, is what keeps that question from being askable — the alternative, a copy per

@@ -37,10 +37,10 @@ publish = false
 # Matches the root `Cargo.toml`'s own value, which is what the code these rules ship beside
 # is actually licensed under.
 license = "MIT OR Apache-2.0"
-# Matches the root `Cargo.toml`'s own floor. Nothing here has a stricter requirement of its
-# own yet, so there is no reason to diverge — `just msrv` does not reach this workspace yet
-# (extending the gate over it is Task 8), but the promise is worth declaring regardless of
-# whether anything enforces it today.
+# Matches the root `Cargo.toml`'s own floor. Nothing here has a stricter requirement of its own,
+# so there is no reason to diverge — and `just msrv` reads this number rather than assuming it
+# equals the root's, then checks this workspace against it. Two separate promises about two
+# separate workspaces, enforced separately, which is why the number is written here at all.
 rust-version = "1.94"
 
 # `[lints] workspace = true` resolves only within one workspace, so the root Cargo.toml's

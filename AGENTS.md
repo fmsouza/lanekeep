@@ -406,7 +406,8 @@ therefore reject every real rule. The comparable thing is the set of imported in
 **A rustup toolchain's *name* reaches a component's bytes, so "same compiler" is not the same as
 "same artifact".** Component builds are otherwise reproducible here — measured 2026-08-06, the nine
 `wasm32-unknown-unknown` fixtures in `crates/lanekeep-wasm/tests/fixtures/` that existed then
-(`engine-rule` arrived after, making ten) built twice from clean with `cargo component` 0.21.1
+(`engine-rule` arrived after, making ten, and `metadata` after that, making eleven) built twice
+from clean with `cargo component` 0.21.1
 produced nine pairs of byte-identical artifacts, each matching what is committed, and the
 checkout's absolute path does not appear in any of them. What does appear is a standard-library source path in a panic location, which carries the
 *toolchain directory*: `.../toolchains/stable-aarch64-apple-darwin/...` against
@@ -441,7 +442,9 @@ required trait method with no default body, so the fix is a stub `metadata()` in
 mechanical, but not visible from the world change alone, only from actually building a fixture
 against it. `spike` is the one committed fixture this does not reach, because it targets its own
 `wit/spike.wit` rather than the shared world. Budget for the identical fan-out the next time an
-export is added — `configure` will hit every one of the same fixtures for the same reason.
+export is added — `configure` hit every one of the same fixtures for the same reason, and by then
+the set was one fixture larger. That is the pattern: each export added to the shared world costs a
+stub in every fixture targeting it, and the bill grows as fixtures do.
 
 **A reference's own `Clone` impl is reached only when the pointee has none — this reads backwards
 on first sight, and it is worth stating the right way round rather than the intuitive-sounding
@@ -500,15 +503,15 @@ rest of that worker's share.
 that produces identical bytes is not one of them.** So "the source commit is newer than the
 artifact commit" is not evidence that the artifact is stale — it is equally the signature of a
 rebuild that changed nothing, and the two are indistinguishable from history alone. Three of the
-eleven committed WebAssembly fixtures read as stale that way — `bindings`, `spike` and
+eleven committed WebAssembly fixtures then read as stale that way — `bindings`, `spike` and
 `world-shape` — and all eleven turned out to be current, which only a rebuild could establish:
 `cargo component build --release` on the pinned toolchain is byte-reproducible, so
 `just wasm-fixtures` on a consistent tree leaves `git status` clean and on an inconsistent one
 does not. That is now the check rather than the investigation —
 `crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
 `tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
-there too, because ten of the eleven name it as their component target and a world edit with no
-rebuild leaves every fixture satisfying an ABI that no longer exists.
+there too, because eleven of the twelve committed today name it as their component target and a
+world edit with no rebuild leaves every fixture satisfying an ABI that no longer exists.
 
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
@@ -715,6 +718,19 @@ appeared to succeed regardless of what it did. Any script whose control flow tur
 exit code could fail all of its cases there and still be reported as tolerating CRLF. `set -o
 pipefail` in the stub is the fix. Worth remembering generally: a stub is test code, and test
 code that always passes is worse than none.
+
+**`just mutants -- --file <path>` does not narrow anything, and does not fail in a way that says
+so.** `just` keeps the `--` inside a recipe's variadic arguments rather than consuming it, so the
+recipe expands to `cargo mutants --workspace -- --file <path>` — and `--` is cargo-mutants' own
+passthrough to `cargo test`. The filter never reaches cargo-mutants. Measured here: the intended
+form finds **1** mutant in `crates/lanekeep-wasm/src/facts.rs`, and the `--` form announces
+`Found 1765 mutants to test` — the whole workspace — then fails the unmutated baseline, because
+`cargo test` rejects the `--file` it was handed. So the run tests zero mutants after paying the
+full build, and the number it printed first was never the number it was going to test.
+
+The working form is `just mutants --file <path>`, with no `--`. Use `just --dry-run mutants ...`
+to see the expansion before committing to a long run. `--list` hides the whole thing: it does not
+invoke `cargo test`, so the broken form lists all 1765 without erroring at all.
 
 **A rule crate cannot be mutation-tested, because cargo-mutants works in a copy of the workspace
 and the crate reaches outside it.** Each rule under `rust-rules/` names the engine's world with

@@ -55,7 +55,10 @@ const SEVERITY: Severity = Severity::Error;
 const REMEDIATION: &str =
     "propagate with `?` and a typed error, so the caller decides what a failure means";
 
-/// One case, written once and run against both engines.
+/// One case, written once and run against every engine this rule has an arm for.
+///
+/// One today, the component. The shape is what let the same expectations hold the
+/// TypeScript implementation that preceded it, and is the seam the next arm attaches at.
 struct Case {
     /// What it is called in a failure report. Named as the `#[test]` function it replaces was,
     /// so a failure here is greppable against the history that motivated the case.
@@ -74,7 +77,7 @@ struct Case {
     expected: Expected,
 }
 
-/// Every case, run against both engines.
+/// Every case, run against every arm below.
 ///
 /// Several exist because an earlier version got them wrong. Those say so, because a case whose
 /// reason is not written down is a case somebody deletes while tidying.

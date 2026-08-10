@@ -57,7 +57,9 @@ impl Guest for Component {
     ///
     /// It used to refuse unconditionally, on the reasoning that reaching an unimplemented
     /// export should fail loudly rather than pass vacuously. That reasoning is now wrong for
-    /// this fixture and right for the eight probes beside it: `WasmRuntime::rule` configures
+    /// this fixture and stays right for every sibling whose `configure` still answers `does not
+    /// implement configure` — stated as a property rather than a count, because the count was
+    /// wrong within two commits of being written: `WasmRuntime::rule` configures
     /// every instance it builds, so `null` is reached on the ordinary path — by
     /// `tests/instantiation.rs` and `tests/load.rs`, which drive this guest through a
     /// `RuleSet` — and refusing it would mean this fixture could not be instantiated at all.

@@ -324,16 +324,23 @@ use crate::load::Loaded;
 /// this constant cannot be justified for all of them.** It is left at 4 GiB rather than reversed,
 /// for three reasons and none of them is that the old argument still holds. Changing it
 /// invalidates every precompiled artifact and every cached result in every checkout, so it is
-/// not a knob to flip on one machine's numbers. The rules that will actually run here do not
-/// exist yet — every rule in this tree is TypeScript — so the guest-compute term has no
-/// realistic measurement behind it, only a synthetic one. And the lever that would remove the
+/// not a knob to flip on one machine's numbers. The guest-compute term still has only a
+/// synthetic measurement behind it: two real components ship now, `lanekeep/no-unwrap` and
+/// `lanekeep/no-glob-import`, and both are light — they walk a short ancestor chain and compare
+/// strings, which §15.1 measured at the low end of the range this constant was reasoned over, so
+/// they do not exercise the case that would settle it. And the lever that would remove the
 /// question is not this constant: **`with_min_len` on `lanekeep-engine`'s `par_iter` would bound
 /// the store count directly**, and it is a bigger change than it looks, because the same
 /// initializer builds the QuickJS sandbox and the change would move the JavaScript path's
 /// measured behavior too.
 ///
-/// Revisit when a real component ruleset exists. Whoever does should re-measure both terms rather
-/// than either half.
+/// The trigger this used to carry — "revisit when a real component ruleset exists" — has half
+/// fired, and the half that fired is not the informative one. A component ruleset exists; a
+/// component ruleset doing heavy in-guest analysis does not, and that is the shape the constant
+/// is unjustified for. So the revisit condition is restated rather than discharged: **revisit when
+/// a component does real per-match computation**, and re-measure both terms rather than either
+/// half. A rule that walks a subtree and compares a few strings will keep answering "fine"
+/// however many of them ship.
 ///
 /// **The argument depends on an instance per (worker, rule) rather than per file, and on every
 /// path a run takes that is now enforced rather than assumed.** [`RuleSet`] resolves each
@@ -1489,19 +1496,6 @@ impl WasmRuntime {
             )));
         };
         call(rule, &mut self.store)
-    }
-
-    /// Ask a rule what it says it is.
-    ///
-    /// # Errors
-    ///
-    /// As [`WasmRuntime::call_check`].
-    pub fn call_metadata(&mut self, rule: &Rule) -> Result<types::RuleMetadata, WasmError> {
-        let timeout = self.limits.rule_timeout;
-        self.arm(timeout);
-        let outcome = rule.call_metadata(&mut self.store);
-        self.disarm();
-        outcome.map_err(|error| self.classify(&error, timeout))
     }
 
     /// Ask a rule whether it has a per-file pass.

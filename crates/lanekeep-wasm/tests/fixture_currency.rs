@@ -20,7 +20,7 @@
 //!
 //! `wit/world.wit` is in here too, and it is the sharpest case rather than an afterthought.
 //! Every fixture but `spike` names that directory under `[package.metadata.component.target]`,
-//! so the world is a build input to ten of the eleven committed artifacts. Nine spell the path
+//! so the world is a build input to eleven of the twelve committed artifacts. Ten spell the path
 //! `../../../wit`; `rejected/wasip1` sits a directory deeper and spells it `../../../../wit`,
 //! which is worth knowing before grepping for the three-level form and concluding it is not a
 //! consumer. Change the world without rebuilding and the fixtures still load, still instantiate
@@ -292,7 +292,7 @@ fn reconcile(
 /// Every file the committed artifacts are built from, and the artifacts themselves.
 ///
 /// `roots` are relative to `base`, and `base` is what the recorded paths are relative to. For
-/// the fixtures that is this crate, whose two roots are `wit/` — ten of the eleven fixtures name
+/// the fixtures that is this crate, whose two roots are `wit/` — eleven of the twelve fixtures name
 /// it as their component target — and `tests/fixtures/`, which holds both the guest crates and
 /// their build output. The `.wasm` files need no separate pass; they sit in a root as ordinary
 /// files.

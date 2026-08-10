@@ -648,7 +648,8 @@ fn no_fixture_artifact_imports_ambient_authority() {
 /// that was gutted as well as on one that was over-permitted.
 ///
 /// Globbed, for the reason the test above is: a named list is a step someone has to remember,
-/// and Task 9 adds rules to this directory.
+/// and rules land in this directory as they are migrated — two are here now, and the glob picked
+/// both up without this test being touched, which is the property it was written for.
 #[test]
 fn no_shipped_rule_component_imports_ambient_authority() {
     let engine = engine().expect("the shipped wasmtime configuration builds an engine");

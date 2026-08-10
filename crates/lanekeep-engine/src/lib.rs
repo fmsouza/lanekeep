@@ -204,8 +204,8 @@ struct Prepared {
     /// [`RuleSpec::component`] rather than derived from anything else, so a rule that names a
     /// component runs as a component and a rule that does not cannot accidentally become one.
     /// Both kinds coexist in one run over one corpus, which is what the second path exists for:
-    /// every built-in and every self-check rule is TypeScript today, so replacing the first
-    /// path rather than adding beside it would leave nothing able to run.
+    /// two built-ins are components and the rest are TypeScript, so replacing the first path
+    /// rather than adding beside it would leave most of the ruleset unable to run.
     slot: Option<RuleSlot>,
 }
 
@@ -408,17 +408,17 @@ pub struct Engine {
     /// The component engine and the run's linked rule set, or `None` when no rule is backed
     /// by a component.
     ///
-    /// `None` is the state every run in this tree is in today, and it is not merely an empty
-    /// set: building one starts an epoch ticker thread and compiles nothing, so a run with no
-    /// component rule must not build one at all.
+    /// `None` is no longer the common case in this tree — two built-ins are components, so any
+    /// config naming one is `Some` — and it is not merely an empty set: building one starts an
+    /// epoch ticker thread, so a run with no component rule must not build one at all.
     components: Option<Components>,
     /// Whether results may be read from and written to the cache.
     ///
     /// **On exactly when every rule's component bytes reached `ruleset_hash`, off when any one
     /// of them did not** — a correctness condition rather than a policy, read per rule off
     /// `ComponentRule::counted_in_ruleset_hash` rather than off whether this run has a
-    /// component at all. Vacuously on for a run with no component, which is every run in this
-    /// tree until the first `.wasm` reference ships.
+    /// component at all. Vacuously on for a run with no component, which is now only a run whose
+    /// config names neither of the two built-ins that ship as one.
     ///
     /// **Why bytes have to reach the key at all.** A component's bytes are the code that
     /// decides a rule's answer, exactly as a TypeScript module's source is, so a cache key that
