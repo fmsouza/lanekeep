@@ -339,22 +339,44 @@ test('a sibling directory whose name extends the root is outside it', (t) => {
 
 // No `loader.rs` counterpart: `RuleRoot` canonicalizes its root once at construction, so a
 // base and a root spelled differently cannot arise there. Here every call takes a string.
-test('the root and the importer may be spelled either way', (t) => {
-  const f = fixture(t, 'spelling', { 'entry.ts': '', 'helper.ts': 'export const h = 1;' })
+//
+// **The second spelling is built here rather than borrowed from the environment**, and that is
+// the whole difference between a test and a platform quirk. The motivating case is macOS,
+// where `os.tmpdir()` is `/var/…` and canonically `/private/var/…` — but on Linux `/tmp` is
+// `/tmp`, so a version of this test that asserted the two differ failed the gate on the one
+// platform CI runs, and failed *before* reaching anything that would catch a regression. A
+// guard against a vacuous test must not turn "this environment cannot show the property" into
+// "the build is broken". Making the alias is also the only honest way: `spellingsOf` compares
+// normalized paths, so every lexical dodge — a trailing separator, a `.`, a `sub/..` — collapses
+// back to the canonical spelling and exercises nothing.
+test('the root and the importer may be spelled either way', { skip: process.platform === 'win32' }, (t) => {
+  const f = fixture(t, 'spelling', {
+    'real/entry.ts': '',
+    'real/helper.ts': 'export const h = 1;',
+  })
+  const canonical = join(f.dir, 'real')
+  const alias = join(f.dir, 'alias')
+  symlinkSync(canonical, alias)
 
-  // `f.dir` is `/var/…` on macOS and canonically `/private/var/…`. A caller who configured
-  // the first and built an entry path from it must not be told it escapes.
-  assert.notEqual(f.dir, realpathSync.native(f.dir), 'this fixture needs the two to differ')
+  // The premise, now true wherever symlinks are: `alias` is a second spelling of one directory.
+  assert.notEqual(alias, realpathSync.native(alias), 'the alias must be a second spelling')
+  assert.equal(realpathSync.native(alias), realpathSync.native(canonical))
 
-  const entry = resolve(join(f.dir, 'entry.ts'), '', { rulesRoot: f.dir })
-  assert.equal(entry.path, f.entry('entry.ts'), JSON.stringify(entry))
+  // A caller who configured `alias` and built an entry path from it must not be told it
+  // escapes a directory it is plainly inside.
+  const entry = resolve(join(alias, 'entry.ts'), '', { rulesRoot: alias })
+  assert.equal(entry.path, join(realpathSync.native(canonical), 'entry.ts'), JSON.stringify(entry))
 
   // And an importer spelled the same way the caller spelled the root.
-  const sibling = resolve('./helper', join(f.dir, 'entry.ts'), { rulesRoot: f.dir })
-  assert.equal(sibling.path, f.entry('helper.ts'), JSON.stringify(sibling))
+  const sibling = resolve('./helper', join(alias, 'entry.ts'), { rulesRoot: alias })
+  assert.equal(
+    sibling.path,
+    join(realpathSync.native(canonical), 'helper.ts'),
+    JSON.stringify(sibling),
+  )
 
   // Whatever the spelling, a traversal out is still refused.
-  const out = resolve('../elsewhere', join(f.dir, 'entry.ts'), { rulesRoot: f.dir })
+  const out = resolve('../elsewhere', join(alias, 'entry.ts'), { rulesRoot: alias })
   assert.equal(out.error?.code, 'escapes-root', JSON.stringify(out))
 })
 
