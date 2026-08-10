@@ -1736,8 +1736,13 @@ impl WasmRuntime {
     ///
     /// **The enumeration [`RuleSet::add`] cannot perform for itself.** `rules` is an export, so
     /// asking it needs a store and an instance, and a rule set holds neither — which is why the
-    /// index is a parameter there and an answer here. A caller asks once per component,
-    /// typically at config load, and adds one slot per id.
+    /// index is a parameter there and an answer here.
+    ///
+    /// `lanekeep_config::describe_components` is the caller: once per component at config load,
+    /// through a throwaway runtime built and dropped for the question, then one
+    /// [`RuleSet::add`] per id it answered with. That costs an instantiation the description
+    /// then repeats, which is the price of an index that cannot be discovered without a store —
+    /// and it is paid once for the run rather than once per worker.
     ///
     /// It takes no index, and it is the only export that does not: the list is the component's
     /// rather than any one rule's. It is also the one export that is meaningful *before*

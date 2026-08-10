@@ -5272,7 +5272,9 @@ export default defineRule({
 
         /// The same, with the bytes chosen — for the cases about a component that cannot run.
         fn with_bytes(path: PathBuf, bytes: Vec<u8>) -> ComponentRule {
-            ComponentRule::uncounted(path, "null".to_owned(), bytes)
+            // Rule `0`: every fixture component these tests reach hosts exactly one rule, and
+            // the engine's own dispatch still names that index — see `load_components`.
+            ComponentRule::uncounted(path, 0, "null".to_owned(), bytes)
         }
 
         /// A `RuleSpec` backed by the fixture component.
