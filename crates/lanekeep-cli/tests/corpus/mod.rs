@@ -44,6 +44,11 @@ impl Corpus {
 
         let config = serde_json::json!({
             "include": ["src/**"],
+            // Both budgets, and neither is what these tests are about. The per-rule one is the
+            // half the first attempt missed: raising `global` alone left a cross-file rule's
+            // own handler on the 1 s default, which a component rule breaches on emulated or
+            // heavily contended hardware while passing in 1.5 s natively.
+            "timeouts": { "rule": 600_000, "global": 600_000 },
             "rules": [{ "rule": format!("lanekeep/{rule}"), "options": as_json(options) }],
         });
 

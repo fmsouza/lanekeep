@@ -1056,16 +1056,37 @@ fn describe_components(
 ///
 /// Bounded rather than unbounded, because "it is host work" is not "it may take forever": a
 /// component that never finishes compiling is a hung tool, and a diagnostic naming compilation
-/// is one a user can act on. Sixty seconds is roughly ten times the 6.2 s a 12.4 MiB
-/// StarlingMonkey component takes on an idle laptop, which leaves room for a slow shared runner
-/// and still fires long before anybody would think the process had crashed.
+/// is one a user can act on.
+///
+/// # Ten minutes, and the first number tried was sixty seconds
+///
+/// **This is a safety net and not a performance limit, and the difference is the whole
+/// calibration.** Sixty seconds was picked as roughly ten times the 6.2 s a 12.4 MiB
+/// StarlingMonkey component takes on an idle laptop — which is exactly the mistake of
+/// calibrating a wall-clock bound on the fastest machine in the loop. Measured 2026-08-10, the
+/// `lanekeep-cli` tests cross-compiled for `x86_64-unknown-linux-gnu` and run on Linux under
+/// QEMU with eight test binaries at once: **one component took 231.3 s to compile**, tripped
+/// this, and turned twenty-odd unrelated CLI tests red with a message about compilation. The
+/// same test alone on the same machine finished in 23.6 s.
+///
+/// So a bound whose whole purpose is "this cannot possibly be legitimate" has to sit above the
+/// slowest *legitimate* case, and emulated or heavily contended hardware is an order of
+/// magnitude slower than an idle laptop rather than a factor of two. Ten minutes per component
+/// is above everything observed and still far below the point at which a user would conclude
+/// the process had crashed.
+///
+/// **Nothing exercises it**, and that is stated rather than papered over: no component in this
+/// repository takes ten minutes to compile, and a fixture that did would cost ten minutes to
+/// run. What is tested is the *phase separation* it belongs to —
+/// `compiling_a_component_is_not_charged_to_the_run_budget` — and this constant is the bound on
+/// what that separation would otherwise leave unbounded.
 ///
 /// **It cannot preempt a single compilation**, and nothing here pretends otherwise: wasmtime's
 /// compile is synchronous with no interrupt, so this is checked between components. A config
 /// naming one component that hangs is bounded by nothing here. What it does bound is the
 /// aggregate, which is the case that scales — and the check is written per component so that a
 /// config with twenty of them is not held to one component's budget.
-const COMPILE_BUDGET_PER_COMPONENT: Duration = Duration::from_mins(1);
+const COMPILE_BUDGET_PER_COMPONENT: Duration = Duration::from_mins(10);
 
 /// One config entry's component, read and compiled, before any guest code runs.
 ///

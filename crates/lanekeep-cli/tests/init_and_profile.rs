@@ -212,7 +212,11 @@ fn the_starter_rule_can_be_explained() {
     let written = std::fs::read_to_string(&config).expect("init wrote a config");
     std::fs::write(
         &config,
-        written.replacen('{', "{\n  \"timeouts\": { \"global\": 600000},", 1),
+        written.replacen(
+            '{',
+            "{\n  \"timeouts\": { \"rule\": 600000, \"global\": 600000},",
+            1,
+        ),
     )
     .expect("writes config");
 
@@ -316,7 +320,7 @@ fn init_writes_no_gitignore_outside_a_repository() {
 // now, and a component is not a value a module can import. `--profile` measures a rule's query
 // and handler time, which is the same either way — and for a component rule it is the first
 // thing in the tree that measures one at all.
-const CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+const CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
      "rules": ["lanekeep/no-default-export"]}"#;
 
 #[test]
@@ -383,7 +387,7 @@ fn a_rule_that_never_matched_still_appears() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": ["lanekeep/no-default-export",
                               {"rule": "lanekeep/no-restricted-imports", "options": {}}]}"#,
             ),

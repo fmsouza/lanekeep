@@ -127,7 +127,7 @@ fn a_built_in_factory_rule_can_be_configured() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": [{"rule": "lanekeep/no-restricted-imports",
                                "options": {"restrictions": [
                                    {"module": "lodash",
@@ -170,7 +170,7 @@ fn a_built_in_that_is_not_a_factory_refuses_options() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": [{"rule": "lanekeep/no-default-export",
                                "options": {"allow": ["src/a.ts"]}}]}"#,
             ),
@@ -230,7 +230,7 @@ fn a_project_file_cannot_shadow_a_built_in() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": ["lanekeep/no-default-export"]}"#,
             ),
             // A rule that reports nothing, sitting exactly where naive path resolution
@@ -288,7 +288,7 @@ fn a_built_in_component_can_be_named_by_specifier() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": ["lanekeep/no-unwrap"]}"#,
             ),
             ("src/a.rs", "fn f() {\n    let c = load().unwrap();\n}\n"),
@@ -321,7 +321,7 @@ fn a_built_in_component_can_be_configured() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": [{"rule": "lanekeep/no-unwrap", "options": {"allow": ["src/a.rs"]}}]}"#,
             ),
             ("src/a.rs", "fn f() {\n    let c = load().unwrap();\n}\n"),
@@ -439,7 +439,7 @@ fn the_rules_command_lists_a_built_in() {
         "builtin-listed",
         &[(
             "lanekeep.json",
-            r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+            r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": ["lanekeep/no-default-export"]}"#,
         )],
     );
@@ -465,7 +465,7 @@ fn a_clean_project_using_built_ins_exits_zero() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": ["lanekeep/no-default-export"]}"#,
             ),
             ("src/a.ts", "export function parse() {}\n"),
@@ -485,7 +485,7 @@ fn built_ins_are_reachable_without_a_lanekeep_directory() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "timeouts": {"global": 600000},
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": ["lanekeep/no-default-export"]}"#,
             ),
             ("src/a.ts", "export default 1;\n"),
