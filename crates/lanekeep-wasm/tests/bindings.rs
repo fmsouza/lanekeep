@@ -140,8 +140,16 @@ fn probe(source: &str, name: &str, target: Option<&str>, resolution: Resolution)
         .expect("the resource table accepts a context");
 
     let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
-    rule.call_check(&mut store, Resource::new_borrow(context.rep()), &captures)
-        .expect("check returns without trapping");
+    // Rule 0: this fixture hosts one rule, so `rules()` has one entry and every other export
+    // answers to index zero.
+    rule.call_check(
+        &mut store,
+        0,
+        Resource::new_borrow(context.rep()),
+        &captures,
+    )
+    .expect("check returns without trapping")
+    .expect("the rule does not report a failure");
 
     store
         .data_mut()

@@ -62,7 +62,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -80,7 +80,7 @@ const USE: &str = "use";
 
 /// Preludes are the one shape a glob is the intended spelling of, and a project that uses one
 /// should not have to suppress this on every file. Replaced rather than extended by a configured
-/// `allow`; see [`Options`] and [`Guest::configure`].
+/// `allow`; see [`Options`] and [`NoGlobImport::configure`].
 const DEFAULT_ALLOW: &str = "*prelude*";
 
 thread_local! {
@@ -134,9 +134,9 @@ impl Capture for MatchEntry {
     }
 }
 
-struct Component;
+struct NoGlobImport;
 
-impl Guest for Component {
+impl Rule for NoGlobImport {
     fn metadata() -> RuleMetadata {
         RuleMetadata {
             id: "lanekeep/no-glob-import".to_owned(),
@@ -189,12 +189,12 @@ impl Guest for Component {
         false
     }
 
-    fn check(ctx: &CheckContext, m: Match) {
+    fn check(ctx: &CheckContext, m: Match) -> Result<(), RuleError> {
         let (Some(wildcard), Some(use_decl)) = (capture(&m, WILDCARD), capture(&m, USE)) else {
             // The query below binds both on every match, so this is unreachable — and it is a
             // `return` rather than an assertion because the alternative in a guest is a trap,
             // which the host cannot tell apart from a rule that found nothing.
-            return;
+            return Ok(());
         };
 
         // Already ends in `::*`; see the module doc for why appending another here would be
@@ -204,7 +204,7 @@ impl Guest for Component {
         let exempt =
             ALLOW.with_borrow(|allow| allow.iter().any(|pattern| glob_matches(pattern, &path)));
         if exempt {
-            return;
+            return Ok(());
         }
 
         ctx.report(
@@ -214,13 +214,28 @@ impl Guest for Component {
             )),
             None,
         );
+        Ok(())
     }
 
-    /// Nothing. This rule has no cross-file pass; see [`Guest::has_reduce`].
-    fn reduce(_ctx: &ReduceContext) {}
+    /// Nothing. This rule has no cross-file pass; see [`NoGlobImport::has_reduce`].
+    fn reduce(_ctx: &ReduceContext) -> Result<(), RuleError> {
+        Ok(())
+    }
 }
 
-/// The canonical-ABI shims that make the six exports reachable from the host.
+// The rules this component hosts, and the dispatch the world's rule index drives.
+//
+// One rule, so this component is a ruleset of one and answers to index zero. The macro is what
+// keeps that true without this file spelling a number: `rules` reports the list and every other
+// export looks its index back up in the same list, so an id and a type cannot drift apart.
+//
+// A plain comment rather than `///`: a doc comment on a macro invocation documents nothing, and
+// `unused_doc_comments` is an error under this workspace's lints.
+lanekeep_rule::ruleset! {
+    "lanekeep/no-glob-import" => NoGlobImport,
+}
+
+/// The canonical-ABI shims that make the seven exports reachable from the host.
 ///
 /// In a module of its own so the `unsafe_code` the expansion needs is allowed *here* and not
 /// across the rule's own code, which the workspace still denies it in. The macro takes bare
@@ -228,7 +243,7 @@ impl Guest for Component {
 /// spelled out.
 ///
 /// `warnings` alongside `unsafe_code`, on the same terms as `mod bindings` above: the expansion
-/// calls `bindings`' own underscore-prefixed shims, which is six `clippy::used_underscore_items`
+/// calls `bindings`' own underscore-prefixed shims, which is seven `clippy::used_underscore_items`
 /// under this workspace's `pedantic`. The `engine-rule` fixture this crate is modeled on has no
 /// `[lints]` table of its own, so the template never had to answer for the expansion's lints and
 /// dropping `warnings` here looks harmless right up until `cargo clippy` runs.

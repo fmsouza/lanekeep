@@ -671,6 +671,14 @@ struct Prepared {
     /// Whatever identifies the rule to a reader — a rule id. Diagnostics only.
     id: String,
     pre: RulePre<RuntimeState>,
+    /// Which of the component's rules this slot names.
+    ///
+    /// A component hosts a *list* of rules and every export but `rules` takes an index into
+    /// it, so this is what every call this set's slots reach has to carry. Recorded once at
+    /// [`RuleSet::add`] rather than passed per call, for the reason [`Prepared::options`] is:
+    /// two callers disagreeing about which rule a slot means is a rule answering to another
+    /// rule's configuration, silently.
+    index: u32,
     /// The options this rule's `configure` is called with, as JSON.
     ///
     /// Not diagnostics: [`WasmRuntime::rule`] reads it on every worker, because the world's
@@ -770,6 +778,23 @@ impl RuleSet {
     /// defaulted here, because "this rule has no options" and "nobody said" are different
     /// claims and only the caller can tell them apart.
     ///
+    /// # `index` names one of the component's rules, and the caller has to know it
+    ///
+    /// A component hosts a list of rules; `index` is the position in that list, which is what
+    /// the world's `rules` export enumerates and what every other export takes. A component
+    /// hosting one rule is added at `0`, and pays a `u32` for the arrangement that lets one
+    /// 12.34 MiB JavaScript engine serve every rule built on it rather than one copy each.
+    ///
+    /// It is a parameter rather than something this method discovers, because discovering it
+    /// means *running* the component: `rules` is an export, so enumerating requires a store and
+    /// an instance, and this type deliberately holds neither — it resolves imports once for the
+    /// whole run and leaves instantiation to whichever worker needs it.
+    /// [`WasmRuntime::call_rules`] is the enumeration, and a caller asks it once.
+    ///
+    /// Two slots naming the same component at different indices is the ordinary case for a
+    /// multi-rule component and is not a duplicate: each gets its own pre-instantiation and,
+    /// per worker, its own instance.
+    ///
     /// # Errors
     ///
     /// Returns [`WasmError::Engine`] when the component does not satisfy the world: an import
@@ -778,6 +803,7 @@ impl RuleSet {
         &mut self,
         id: impl Into<String>,
         loaded: &Loaded,
+        index: u32,
         options_json: impl Into<String>,
     ) -> Result<RuleSlot, WasmError> {
         let pre = self
@@ -789,6 +815,7 @@ impl RuleSet {
         self.rules.push(Prepared {
             id: id.into(),
             pre,
+            index,
             options: options_json.into(),
         });
         Ok(slot)
@@ -865,6 +892,18 @@ impl RuleSet {
     #[must_use]
     pub fn id(&self, slot: RuleSlot) -> Option<&str> {
         self.rules.get(slot.0).map(|rule| rule.id.as_str())
+    }
+
+    /// Which of its component's rules a slot names, or `None` for a slot this set never
+    /// issued.
+    ///
+    /// The `rule` parameter every export but `rules` takes. Distinct from
+    /// [`RuleSlot::index`], which is a position in *this set* — the two agree only for a run
+    /// whose every component hosts exactly one rule, which is why neither is derived from the
+    /// other.
+    #[must_use]
+    pub fn rule_index(&self, slot: RuleSlot) -> Option<u32> {
+        self.rules.get(slot.0).map(|rule| rule.index)
     }
 
     /// The pre-instantiation a slot names.
@@ -1321,7 +1360,8 @@ impl WasmRuntime {
             self.instantiations += 1;
 
             self.arm(timeout);
-            let configured = instance.call_configure(&mut self.store, &prepared.options);
+            let configured =
+                instance.call_configure(&mut self.store, prepared.index, &prepared.options);
             self.disarm();
             match configured {
                 Ok(Ok(())) => {}
@@ -1368,11 +1408,25 @@ impl WasmRuntime {
     /// options, or the guest traps.
     pub fn metadata(&mut self, slot: RuleSlot) -> Result<types::RuleMetadata, WasmError> {
         self.rule(slot)?;
+        let index = self.rule_index(slot)?;
         let timeout = self.limits.rule_timeout;
         self.arm(timeout);
-        let outcome = self.with_instance(slot, |rule, store| rule.call_metadata(store));
+        let outcome = self.with_instance(slot, |rule, store| rule.call_metadata(store, index));
         self.disarm();
         outcome.map_err(|error| self.classify(&error, timeout))
+    }
+
+    /// Which of its component's rules a slot names.
+    ///
+    /// A method rather than an inline `self.rules.rule(slot)?.index` at five call sites: the
+    /// index is `Copy`, so reading it here ends the borrow of the rule set before the caller
+    /// needs `&mut self` again to call into the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmError::Engine`] for a slot this runtime's rule set never issued.
+    fn rule_index(&self, slot: RuleSlot) -> Result<u32, WasmError> {
+        Ok(self.rules.rule(slot)?.index)
     }
 
     /// Ask a slot's rule whether it has a per-file pass, instantiating it if needed.
@@ -1382,9 +1436,10 @@ impl WasmRuntime {
     /// As [`WasmRuntime::rule`] and [`WasmRuntime::call_check`].
     pub fn has_check(&mut self, slot: RuleSlot) -> Result<bool, WasmError> {
         self.rule(slot)?;
+        let index = self.rule_index(slot)?;
         let timeout = self.limits.rule_timeout;
         self.arm(timeout);
-        let outcome = self.with_instance(slot, |rule, store| rule.call_has_check(store));
+        let outcome = self.with_instance(slot, |rule, store| rule.call_has_check(store, index));
         self.disarm();
         outcome.map_err(|error| self.classify(&error, timeout))
     }
@@ -1396,9 +1451,10 @@ impl WasmRuntime {
     /// As [`WasmRuntime::rule`] and [`WasmRuntime::call_check`].
     pub fn has_reduce(&mut self, slot: RuleSlot) -> Result<bool, WasmError> {
         self.rule(slot)?;
+        let index = self.rule_index(slot)?;
         let timeout = self.limits.rule_timeout;
         self.arm(timeout);
-        let outcome = self.with_instance(slot, |rule, store| rule.call_has_reduce(store));
+        let outcome = self.with_instance(slot, |rule, store| rule.call_has_reduce(store, index));
         self.disarm();
         outcome.map_err(|error| self.classify(&error, timeout))
     }
@@ -1434,12 +1490,14 @@ impl WasmRuntime {
         timeout: Duration,
     ) -> Result<(), WasmError> {
         self.rule(slot)?;
+        let index = self.rule_index(slot)?;
         let borrow = Resource::new_borrow(context.rep());
         self.arm(timeout);
-        let outcome =
-            self.with_instance(slot, |rule, store| rule.call_check(store, borrow, captures));
+        let outcome = self.with_instance(slot, |rule, store| {
+            rule.call_check(store, index, borrow, captures)
+        });
         self.disarm();
-        outcome.map_err(|error| self.classify(&error, timeout))
+        self.settle(outcome, timeout)
     }
 
     /// Run a slot's cross-file pass, under the default budget.
@@ -1467,11 +1525,13 @@ impl WasmRuntime {
         timeout: Duration,
     ) -> Result<(), WasmError> {
         self.rule(slot)?;
+        let index = self.rule_index(slot)?;
         let borrow = Resource::new_borrow(context.rep());
         self.arm(timeout);
-        let outcome = self.with_instance(slot, |rule, store| rule.call_reduce(store, borrow));
+        let outcome =
+            self.with_instance(slot, |rule, store| rule.call_reduce(store, index, borrow));
         self.disarm();
-        outcome.map_err(|error| self.classify(&error, timeout))
+        self.settle(outcome, timeout)
     }
 
     /// Call into a slot's already-built instance.
@@ -1498,48 +1558,75 @@ impl WasmRuntime {
         call(rule, &mut self.store)
     }
 
-    /// Ask a rule whether it has a per-file pass.
+    /// Every rule an instance hosts, by id, in index order.
+    ///
+    /// **The enumeration [`RuleSet::add`] cannot perform for itself.** `rules` is an export, so
+    /// asking it needs a store and an instance, and a rule set holds neither — which is why the
+    /// index is a parameter there and an answer here. A caller asks once per component,
+    /// typically at config load, and adds one slot per id.
+    ///
+    /// It takes no index, and it is the only export that does not: the list is the component's
+    /// rather than any one rule's. It is also the one export that is meaningful *before*
+    /// `configure` — a rule's id cannot depend on its options, because the id is how a config
+    /// names the rule in the first place — which is why the world splits it from `metadata`
+    /// rather than returning a list of those.
     ///
     /// # Errors
     ///
     /// As [`WasmRuntime::call_check`].
-    pub fn call_has_check(&mut self, rule: &Rule) -> Result<bool, WasmError> {
+    pub fn call_rules(&mut self, rule: &Rule) -> Result<Vec<String>, WasmError> {
         let timeout = self.limits.rule_timeout;
         self.arm(timeout);
-        let outcome = rule.call_has_check(&mut self.store);
+        let outcome = rule.call_rules(&mut self.store);
         self.disarm();
         outcome.map_err(|error| self.classify(&error, timeout))
     }
 
-    /// Ask a rule whether it has a cross-file pass.
+    /// Ask one of an instance's rules whether it has a per-file pass.
     ///
     /// # Errors
     ///
     /// As [`WasmRuntime::call_check`].
-    pub fn call_has_reduce(&mut self, rule: &Rule) -> Result<bool, WasmError> {
+    pub fn call_has_check(&mut self, rule: &Rule, index: u32) -> Result<bool, WasmError> {
         let timeout = self.limits.rule_timeout;
         self.arm(timeout);
-        let outcome = rule.call_has_reduce(&mut self.store);
+        let outcome = rule.call_has_check(&mut self.store, index);
         self.disarm();
         outcome.map_err(|error| self.classify(&error, timeout))
     }
 
-    /// Run a rule's per-file pass for one query match, under the default budget.
+    /// Ask one of an instance's rules whether it has a cross-file pass.
     ///
     /// # Errors
     ///
-    /// Returns [`WasmError`] on a breached budget or a trapping guest. Every variant cancels
-    /// the run.
+    /// As [`WasmRuntime::call_check`].
+    pub fn call_has_reduce(&mut self, rule: &Rule, index: u32) -> Result<bool, WasmError> {
+        let timeout = self.limits.rule_timeout;
+        self.arm(timeout);
+        let outcome = rule.call_has_reduce(&mut self.store, index);
+        self.disarm();
+        outcome.map_err(|error| self.classify(&error, timeout))
+    }
+
+    /// Run one of an instance's rules' per-file pass for one query match, under the default
+    /// budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmError`] on a breached budget, a trapping guest, or a guest that reported
+    /// its own failure through the world's `rule-error`. Every variant cancels the run.
     pub fn call_check(
         &mut self,
         rule: &Rule,
+        index: u32,
         context: &Resource<CheckContext>,
         captures: &Vec<types::MatchEntry>,
     ) -> Result<(), WasmError> {
-        self.call_check_with_timeout(rule, context, captures, self.limits.rule_timeout)
+        self.call_check_with_timeout(rule, index, context, captures, self.limits.rule_timeout)
     }
 
-    /// Run a rule's per-file pass under an explicit budget, for a rule that declared its own.
+    /// Run one of an instance's rules' per-file pass under an explicit budget, for a rule that
+    /// declared its own.
     ///
     /// The context is lent rather than handed over: what crosses is a fresh borrow of the
     /// resource the caller owns, so the handle the guest holds is dead the moment the call
@@ -1551,18 +1638,19 @@ impl WasmRuntime {
     pub fn call_check_with_timeout(
         &mut self,
         rule: &Rule,
+        index: u32,
         context: &Resource<CheckContext>,
         captures: &Vec<types::MatchEntry>,
         timeout: Duration,
     ) -> Result<(), WasmError> {
         let borrow = Resource::new_borrow(context.rep());
         self.arm(timeout);
-        let outcome = rule.call_check(&mut self.store, borrow, captures);
+        let outcome = rule.call_check(&mut self.store, index, borrow, captures);
         self.disarm();
-        outcome.map_err(|error| self.classify(&error, timeout))
+        self.settle(outcome, timeout)
     }
 
-    /// Run a rule's cross-file pass, under the default budget.
+    /// Run one of an instance's rules' cross-file pass, under the default budget.
     ///
     /// # Errors
     ///
@@ -1570,12 +1658,13 @@ impl WasmRuntime {
     pub fn call_reduce(
         &mut self,
         rule: &Rule,
+        index: u32,
         context: &Resource<ReduceContext>,
     ) -> Result<(), WasmError> {
-        self.call_reduce_with_timeout(rule, context, self.limits.rule_timeout)
+        self.call_reduce_with_timeout(rule, index, context, self.limits.rule_timeout)
     }
 
-    /// Run a rule's cross-file pass under an explicit budget.
+    /// Run one of an instance's rules' cross-file pass under an explicit budget.
     ///
     /// # Errors
     ///
@@ -1583,14 +1672,15 @@ impl WasmRuntime {
     pub fn call_reduce_with_timeout(
         &mut self,
         rule: &Rule,
+        index: u32,
         context: &Resource<ReduceContext>,
         timeout: Duration,
     ) -> Result<(), WasmError> {
         let borrow = Resource::new_borrow(context.rep());
         self.arm(timeout);
-        let outcome = rule.call_reduce(&mut self.store, borrow);
+        let outcome = rule.call_reduce(&mut self.store, index, borrow);
         self.disarm();
-        outcome.map_err(|error| self.classify(&error, timeout))
+        self.settle(outcome, timeout)
     }
 
     /// Start the clock on one invocation.
@@ -1610,6 +1700,30 @@ impl WasmRuntime {
     /// Stop enforcing an invocation budget.
     fn disarm(&self) {
         self.budget.disarm();
+    }
+
+    /// Fold a handler's two ways of failing into one.
+    ///
+    /// `check` and `reduce` return `result<_, rule-error>`, so there are three outcomes rather
+    /// than two: the call succeeded, the call succeeded and the *rule* said it failed, or the
+    /// call did not return at all. The middle one is a value the guest built on purpose and is
+    /// passed through untouched; the last is a trap and goes to [`Self::classify`], which is
+    /// where a breached budget outranks whatever the engine said.
+    ///
+    /// Keeping the distinction is the whole reason the world's signature changed. A guest that
+    /// traps loses its message, its error type and its stack, so collapsing a returned failure
+    /// into a trap here would throw away exactly what the channel was added to carry — and it
+    /// would do it invisibly, since both spellings end the run.
+    fn settle(
+        &mut self,
+        outcome: wasmtime::Result<Result<(), types::RuleError>>,
+        timeout: Duration,
+    ) -> Result<(), WasmError> {
+        match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(failure)) => Err(WasmError::from(failure)),
+            Err(error) => Err(self.classify(&error, timeout)),
+        }
     }
 
     /// Turn a raw wasmtime failure into something that says what actually happened.

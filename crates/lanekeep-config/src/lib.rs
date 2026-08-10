@@ -872,8 +872,15 @@ fn describe_components(
         let admitted = loader
             .load(&engine, &rule.specifier, bytes.as_slice())
             .map_err(|e| fail(position, e.to_string()))?;
+        // Rule `0` of the component, because a reference in a config names a component and not
+        // one of the rules inside it. Every component this repository ships hosts exactly one,
+        // so this is that rule — but it is an assumption rather than a fact about the world,
+        // which now lets a component host a list. Enumerating with the `rules` export and
+        // naming one of them from a config is the next task in this sub-project; until it
+        // lands, a hand-built component hosting several would have its first rule described
+        // and the rest ignored.
         let slot = set
-            .add(&rule.specifier, &admitted, options.clone())
+            .add(&rule.specifier, &admitted, 0, options.clone())
             .map_err(|e| fail(position, e.to_string()))?;
 
         added.push((

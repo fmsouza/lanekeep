@@ -130,10 +130,12 @@ impl Harness {
         self.rule
             .call_check(
                 &mut self.store,
+                0,
                 Resource::new_borrow(self.context.rep()),
                 &captures,
             )
-            .expect("check returns without trapping");
+            .expect("check returns without trapping")
+            .expect("the rule does not report a failure");
 
         self.store
             .data_mut()

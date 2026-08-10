@@ -99,7 +99,7 @@ impl Run {
         let mut rules = RuleSet::new(&engine).expect("the world links");
         for n in 0..count {
             rules
-                .add(format!("acme/rule-{n}"), &loaded, "null")
+                .add(format!("acme/rule-{n}"), &loaded, 0, "null")
                 .expect("the fixture satisfies the world");
         }
         Self {
@@ -390,7 +390,7 @@ fn a_component_that_does_not_satisfy_the_world_is_refused_when_it_is_added() {
     let mut rules = RuleSet::new(&engine).expect("the world links");
 
     let error = rules
-        .add("acme/spike", &spike, "null")
+        .add("acme/spike", &spike, 0, "null")
         .expect_err("a component targeting another world does not satisfy this one");
     assert!(matches!(error, WasmError::Engine(_)), "{error:?}");
     assert!(
@@ -430,7 +430,7 @@ fn permitting_an_interface_does_not_bind_it() {
 
     let mut rules = RuleSet::new(&engine).expect("the world links");
     let error = rules
-        .add("acme/wasip1", &loaded, "null")
+        .add("acme/wasip1", &loaded, 0, "null")
         .expect_err("nothing bound `wasi:clocks/wall-clock`, so it cannot be resolved");
     assert!(matches!(error, WasmError::Engine(_)), "{error:?}");
     assert!(
@@ -485,7 +485,7 @@ fn the_linker_accepts_bindings_beyond_the_declared_world() {
     );
 
     let slot = rules
-        .add("acme/rule", &loaded, "null")
+        .add("acme/rule", &loaded, 0, "null")
         .expect("the world still resolves with an extra instance bound beside it");
 
     let limits = Limits::default();

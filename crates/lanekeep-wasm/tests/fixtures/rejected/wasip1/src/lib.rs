@@ -15,15 +15,21 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::lanekeep::host::types::{RuleCard, RuleExamples, RuleGates, RuleMetadata};
+use bindings::lanekeep::host::types::{RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
 
 impl Guest for Component {
+    /// The one rule this component hosts. Every other export takes its index.
+    fn rules() -> Vec<String> {
+        vec!["fixture/wasip1".to_owned()]
+    }
+
     /// Not exercised by any test — every export is mandatory because a WIT world has no
     /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
-    fn metadata() -> RuleMetadata {
+    fn metadata(rule: u32) -> RuleMetadata {
+        only(rule);
         RuleMetadata {
             id: "fixture/wasip1".to_owned(),
             languages: vec!["rust".to_owned()],
@@ -52,19 +58,23 @@ impl Guest for Component {
     ///
     /// Refuses unconditionally rather than accepting anything, so a caller that reached this
     /// export on this fixture fails loudly instead of passing on a vacuous success.
-    fn configure(_options_json: String) -> Result<(), String> {
+    fn configure(rule: u32, _options_json: String) -> Result<(), String> {
+        only(rule);
         Err("fixture/wasip1 does not implement configure".to_owned())
     }
 
-    fn has_check() -> bool {
+    fn has_check(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn has_reduce() -> bool {
+    fn has_reduce(rule: u32) -> bool {
+        only(rule);
         false
     }
 
-    fn check(ctx: &CheckContext, m: Match) {
+    fn check(rule: u32, ctx: &CheckContext, m: Match) -> Result<(), RuleError> {
+        only(rule);
         // Two allocations and a format, so the artifact's import list is a measurement of
         // the target rather than of how little this guest does.
         let path = ctx.file_path();
@@ -74,9 +84,23 @@ impl Guest for Component {
             Some(&format!("{path}: {}", names.join(","))),
             None,
         );
+        Ok(())
     }
 
-    fn reduce(_: &ReduceContext) {}
+    fn reduce(rule: u32, _ctx: &ReduceContext) -> Result<(), RuleError> {
+        only(rule);
+        Ok(())
+    }
+}
+
+/// The one rule this component hosts.
+///
+/// A component hosts a *list* of rules and every export but `rules` takes an index into it.
+/// This one hosts a single rule, so zero is the only index that answers — and a host asking
+/// for another has disagreed with what `rules` reported, which is worth trapping on rather
+/// than answering with the one rule's data under another rule's name.
+fn only(rule: u32) {
+    assert_eq!(rule, 0, "this component hosts one rule");
 }
 
 bindings::export!(Component with_types_in bindings);

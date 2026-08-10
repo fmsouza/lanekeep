@@ -14,13 +14,19 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::lanekeep::host::types::{RuleCard, RuleExamples, RuleGates, RuleMetadata};
+use bindings::lanekeep::host::types::{RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
 
 impl Guest for Component {
-    fn metadata() -> RuleMetadata {
+    /// The one rule this component hosts. Every other export takes its index.
+    fn rules() -> Vec<String> {
+        vec!["fixture/metadata".to_owned()]
+    }
+
+    fn metadata(rule: u32) -> RuleMetadata {
+        only(rule);
         RuleMetadata {
             id: "fixture/metadata".to_owned(),
             languages: vec!["rust".to_owned()],
@@ -64,7 +70,8 @@ impl Guest for Component {
     /// Opt-in by substring so that every existing caller is unaffected: `tests/metadata.rs`
     /// passes `null`, `{"allow":["a.rs"]}` and `[]`, none of which contains `"burn"`, and a
     /// fixture that got slower for everyone would be a poor trade for one test.
-    fn configure(options_json: String) -> Result<(), String> {
+    fn configure(rule: u32, options_json: String) -> Result<(), String> {
+        only(rule);
         if options_json == "null" {
             return Ok(());
         }
@@ -77,17 +84,25 @@ impl Guest for Component {
         Ok(())
     }
 
-    fn has_check() -> bool {
+    fn has_check(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn has_reduce() -> bool {
+    fn has_reduce(rule: u32) -> bool {
+        only(rule);
         false
     }
 
-    fn check(_ctx: &CheckContext, _m: Match) {}
+    fn check(rule: u32, _ctx: &CheckContext, _m: Match) -> Result<(), RuleError> {
+        only(rule);
+        Ok(())
+    }
 
-    fn reduce(_ctx: &ReduceContext) {}
+    fn reduce(rule: u32, _ctx: &ReduceContext) -> Result<(), RuleError> {
+        only(rule);
+        Ok(())
+    }
 }
 
 /// Roughly a third of a second of guest work, against a budget a test sets far below it.
@@ -117,6 +132,16 @@ fn burn() {
         acc = core::hint::black_box(acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i));
     }
     SINK.store(acc, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The one rule this component hosts.
+///
+/// A component hosts a *list* of rules and every export but `rules` takes an index into it.
+/// This one hosts a single rule, so zero is the only index that answers — and a host asking
+/// for another has disagreed with what `rules` reported, which is worth trapping on rather
+/// than answering with the one rule's data under another rule's name.
+fn only(rule: u32) {
+    assert_eq!(rule, 0, "this component hosts one rule");
 }
 
 bindings::export!(Component with_types_in bindings);

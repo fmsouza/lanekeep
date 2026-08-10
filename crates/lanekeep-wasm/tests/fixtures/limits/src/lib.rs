@@ -41,15 +41,21 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::lanekeep::host::types::{RuleCard, RuleExamples, RuleGates, RuleMetadata};
+use bindings::lanekeep::host::types::{RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
 
 impl Guest for Component {
+    /// The one rule this component hosts. Every other export takes its index.
+    fn rules() -> Vec<String> {
+        vec!["fixture/limits".to_owned()]
+    }
+
     /// Not exercised by any test — every export is mandatory because a WIT world has no
     /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
-    fn metadata() -> RuleMetadata {
+    fn metadata(rule: u32) -> RuleMetadata {
+        only(rule);
         RuleMetadata {
             id: "fixture/limits".to_owned(),
             languages: vec!["rust".to_owned()],
@@ -80,22 +86,26 @@ impl Guest for Component {
     /// installs these bytes as a *rule*, and `WasmRuntime::rule` configures every instance it
     /// builds. An unconditional refusal would stop that run inside instantiation, which is not
     /// what it is testing.
-    fn configure(options_json: String) -> Result<(), String> {
+    fn configure(rule: u32, options_json: String) -> Result<(), String> {
+        only(rule);
         if options_json == "null" {
             return Ok(());
         }
         Err("fixture/limits takes no options".to_owned())
     }
 
-    fn has_check() -> bool {
+    fn has_check(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn has_reduce() -> bool {
+    fn has_reduce(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn check(ctx: &CheckContext, m: Match) {
+    fn check(rule: u32, ctx: &CheckContext, m: Match) -> Result<(), RuleError> {
+        only(rule);
         // Every entry after the first is an argument, by position rather than by name, on the
         // terms `tests/fixtures/facts/src/lib.rs` sets out: these are not query captures, they
         // are a list of strings the host chose and the order is the whole content.
@@ -109,6 +119,7 @@ impl Guest for Component {
             "strided" => strided(ctx, &args),
             other => say(ctx, &format!("unknown probe `{other}`")),
         }
+        Ok(())
     }
 
     /// The cross-file half of the same two runaway probes.
@@ -116,13 +127,15 @@ impl Guest for Component {
     /// `reduce` is handed nothing but the context, so the only host-chosen list of strings it
     /// can read is `files()` — the channel `tests/fixtures/reduce/` already uses. The first
     /// entry is the probe name.
-    fn reduce(ctx: &ReduceContext) {
+    fn reduce(rule: u32, ctx: &ReduceContext) -> Result<(), RuleError> {
+        only(rule);
         let files = ctx.files();
         match files.first().map_or("", String::as_str) {
             "spin" => spin(),
             "grow" => grow(),
             _ => tell(ctx, "reduced"),
         }
+        Ok(())
     }
 }
 
@@ -238,6 +251,16 @@ fn strided(ctx: &CheckContext, args: &[&str]) {
             .wrapping_add(row.c);
     }
     say(ctx, &format!("strided {millions}m, sum {acc}"));
+}
+
+/// The one rule this component hosts.
+///
+/// A component hosts a *list* of rules and every export but `rules` takes an index into it.
+/// This one hosts a single rule, so zero is the only index that answers — and a host asking
+/// for another has disagreed with what `rules` reported, which is worth trapping on rather
+/// than answering with the one rule's data under another rule's name.
+fn only(rule: u32) {
+    assert_eq!(rule, 0, "this component hosts one rule");
 }
 
 bindings::export!(Component with_types_in bindings);

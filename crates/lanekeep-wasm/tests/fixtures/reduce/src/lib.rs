@@ -44,7 +44,7 @@
 mod bindings;
 
 use bindings::lanekeep::host::types::{
-    ReduceLocation, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+    ReduceLocation, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
@@ -58,9 +58,15 @@ struct Component;
 const SAY: &str = "<probe>";
 
 impl Guest for Component {
+    /// The one rule this component hosts. Every other export takes its index.
+    fn rules() -> Vec<String> {
+        vec!["fixture/reduce".to_owned()]
+    }
+
     /// Not exercised by any test — every export is mandatory because a WIT world has no
     /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
-    fn metadata() -> RuleMetadata {
+    fn metadata(rule: u32) -> RuleMetadata {
+        only(rule);
         RuleMetadata {
             id: "fixture/reduce".to_owned(),
             languages: vec!["rust".to_owned()],
@@ -89,21 +95,25 @@ impl Guest for Component {
     ///
     /// Refuses unconditionally rather than accepting anything, so a caller that reached this
     /// export on this fixture fails loudly instead of passing on a vacuous success.
-    fn configure(_options_json: String) -> Result<(), String> {
+    fn configure(rule: u32, _options_json: String) -> Result<(), String> {
+        only(rule);
         Err("fixture/reduce does not implement configure".to_owned())
     }
 
-    fn has_check() -> bool {
+    fn has_check(rule: u32) -> bool {
+        only(rule);
         true
     }
 
     /// True, unlike every other fixture here: this one has a cross-file pass and it is the
     /// whole subject.
-    fn has_reduce() -> bool {
+    fn has_reduce(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn check(ctx: &CheckContext, m: Match) {
+    fn check(rule: u32, ctx: &CheckContext, m: Match) -> Result<(), RuleError> {
+        only(rule);
         match m.first().map_or("", |entry| entry.name.as_str()) {
             // A real per-file call that does nothing but succeed. It exists so a host can put
             // one *before* a forgery from the other phase — the adversarial ordering, where the
@@ -113,9 +123,11 @@ impl Guest for Component {
             "forge-reduce" => forge_reduce(ctx),
             other => report(ctx, &format!("unknown probe `{other}`")),
         }
+        Ok(())
     }
 
-    fn reduce(ctx: &ReduceContext) {
+    fn reduce(rule: u32, ctx: &ReduceContext) -> Result<(), RuleError> {
+        only(rule);
         let files = ctx.files();
         let args: Vec<&str> = files.iter().skip(1).map(String::as_str).collect();
 
@@ -132,6 +144,7 @@ impl Guest for Component {
             "forge-check" => forge_check(ctx),
             other => say(ctx, &format!("unknown probe `{other}`")),
         }
+        Ok(())
     }
 }
 
@@ -270,6 +283,16 @@ fn forge_check(ctx: &ReduceContext) {
     let _ = forged.emit_fact("forged", "{}");
 
     say(ctx, "the forged check-context handle was accepted");
+}
+
+/// The one rule this component hosts.
+///
+/// A component hosts a *list* of rules and every export but `rules` takes an index into it.
+/// This one hosts a single rule, so zero is the only index that answers — and a host asking
+/// for another has disagreed with what `rules` reported, which is worth trapping on rather
+/// than answering with the one rule's data under another rule's name.
+fn only(rule: u32) {
+    assert_eq!(rule, 0, "this component hosts one rule");
 }
 
 bindings::export!(Component with_types_in bindings);

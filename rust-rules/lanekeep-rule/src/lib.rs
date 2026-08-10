@@ -30,6 +30,181 @@
 //! this is not an orphan-rule violation, and it costs one `impl` block rather than a
 //! conversion at every `check`.
 
+/// Declare the rules a component hosts.
+///
+/// The index a rule answers to is its position here, and a rule crate never spells one:
+/// an index that has to be kept in step with a list by hand is a mismatch waiting to
+/// happen, and the mismatch is silent — a rule would simply answer to the wrong config.
+///
+/// ```ignore
+/// lanekeep_rule::ruleset! {
+///     "lanekeep/no-unwrap" => NoUnwrap,
+/// }
+/// ```
+///
+/// # What it expands to, and what it expects
+///
+/// A `trait Rule`, a `const RULE_IDS`, a `struct Component`, and the `impl Guest for Component`
+/// that dispatches every export of `crates/lanekeep-wasm/wit/world.wit`'s `rule` world to one of
+/// the types named above. The crate keeps its own `bindings::export!(Component ...)`, because
+/// that macro reaches into the generated bindings' internal shims and the `unsafe` it needs is
+/// allowed at that one site rather than wherever this is written.
+///
+/// Each `$rule` type is a plain unit struct implementing that trait, whose methods are the
+/// world's minus the index:
+///
+/// ```text
+/// impl Rule for NoUnwrap {
+///     fn metadata() -> RuleMetadata { … }
+///     fn configure(options_json: String) -> Result<(), String> { … }
+///     fn has_check() -> bool { … }
+///     fn has_reduce() -> bool { … }
+///     fn check(ctx: &CheckContext, m: Match) -> Result<(), RuleError> { … }
+///     fn reduce(ctx: &ReduceContext) -> Result<(), RuleError> { … }
+/// }
+/// ```
+///
+/// **The trait is generated rather than declared in this crate, and it has to be.** Every type in
+/// those signatures — `RuleMetadata`, `CheckContext`, `Match`, `RuleError` — belongs to the *rule
+/// crate's* own generated `bindings` module, which is private to it, so this crate cannot name
+/// one. A `macro_rules!` expansion resolves free identifiers at the call site, which is why the
+/// expansion can name them and this crate's source cannot. It is the same constraint [`Capture`]
+/// exists for, one layer up.
+///
+/// **A trait rather than inherent associated functions, which was the first shape and did not
+/// survive clippy.** The world dictates these signatures: `check` takes its `Match` by value
+/// because the canonical ABI hands one over, and both handlers return a `Result` because the
+/// world gives them an error channel a Rust rule has no use for. As *inherent* functions that
+/// reads as a mistake and `needless_pass_by_value` and `unnecessary_wraps` say so, five errors per
+/// rule crate. Clippy exempts a trait implementation from both, because there the signature is
+/// not the author's to choose — which is exactly the situation. The alternative was an `#[expect]`
+/// per rule for a lint that is right about every other function in the crate.
+///
+/// # Dispatch goes through the id rather than through a counted index
+///
+/// `macro_rules!` has no way to count its repetitions, and the arrangements that fake one —
+/// a mutable counter incremented per arm, a recursive helper threading an accumulator — put the
+/// index and the rule in two places that have to agree. Matching on `RULE_IDS[index]` instead
+/// makes the list itself the mapping: `rules` reports `RULE_IDS`, and every other export looks
+/// the index back up in it, so the enumeration a host reads and the dispatch it then drives
+/// cannot disagree.
+#[macro_export]
+macro_rules! ruleset {
+    ($($id:literal => $rule:ty),+ $(,)?) => {
+        /// One rule, as its author writes it: the world's exports minus the index the
+        /// component dispatches on.
+        trait Rule {
+            /// What this rule is. Read once, at prepare time, after it has been configured.
+            fn metadata() -> RuleMetadata;
+            /// This rule's options as JSON, or `null` when it was named with none.
+            fn configure(options_json: String) -> Result<(), String>;
+            /// Whether this rule has a per-file pass.
+            fn has_check() -> bool;
+            /// Whether this rule has a cross-file pass.
+            fn has_reduce() -> bool;
+            /// The per-file pass, for one query match.
+            fn check(ctx: &CheckContext, m: Match) -> Result<(), RuleError>;
+            /// The cross-file pass, once per run.
+            fn reduce(ctx: &ReduceContext) -> Result<(), RuleError>;
+        }
+
+        /// Every rule this component hosts, by id, in the order `rules` reports them.
+        const RULE_IDS: &[&str] = &[$($id),+];
+
+        /// The component this crate builds.
+        struct Component;
+
+        impl Guest for Component {
+            fn rules() -> Vec<String> {
+                RULE_IDS.iter().map(|id| (*id).to_owned()).collect()
+            }
+
+            fn configure(rule: u32, options_json: String) -> Result<(), String> {
+                match $crate::rule_id(RULE_IDS, rule) {
+                    $(Some($id) => <$rule as Rule>::configure(options_json),)+
+                    _ => $crate::no_such_rule(rule),
+                }
+            }
+
+            fn metadata(rule: u32) -> RuleMetadata {
+                match $crate::rule_id(RULE_IDS, rule) {
+                    $(Some($id) => <$rule as Rule>::metadata(),)+
+                    _ => $crate::no_such_rule(rule),
+                }
+            }
+
+            fn has_check(rule: u32) -> bool {
+                match $crate::rule_id(RULE_IDS, rule) {
+                    $(Some($id) => <$rule as Rule>::has_check(),)+
+                    _ => $crate::no_such_rule(rule),
+                }
+            }
+
+            fn has_reduce(rule: u32) -> bool {
+                match $crate::rule_id(RULE_IDS, rule) {
+                    $(Some($id) => <$rule as Rule>::has_reduce(),)+
+                    _ => $crate::no_such_rule(rule),
+                }
+            }
+
+            fn check(rule: u32, ctx: &CheckContext, m: Match) -> Result<(), RuleError> {
+                match $crate::rule_id(RULE_IDS, rule) {
+                    $(Some($id) => <$rule as Rule>::check(ctx, m),)+
+                    _ => $crate::no_such_rule(rule),
+                }
+            }
+
+            fn reduce(rule: u32, ctx: &ReduceContext) -> Result<(), RuleError> {
+                match $crate::rule_id(RULE_IDS, rule) {
+                    $(Some($id) => <$rule as Rule>::reduce(ctx),)+
+                    _ => $crate::no_such_rule(rule),
+                }
+            }
+        }
+    };
+}
+
+/// The id at `index`, or `None` when the component hosts no such rule.
+///
+/// Called by [`ruleset!`]'s expansion and by nothing a rule author writes. It is a function
+/// rather than an indexing expression inside the macro because indexing panics and this
+/// answers instead — the refusal belongs to [`no_such_rule`], where it says what went wrong.
+#[must_use]
+pub fn rule_id<'a>(ids: &[&'a str], index: u32) -> Option<&'a str> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| ids.get(index))
+        .copied()
+}
+
+/// Refuse an index that names no rule this component hosts.
+///
+/// **It traps, which is the honest answer and not a shortcut.** Three of the world's exports —
+/// `metadata`, `has-check`, `has-reduce` — have no error channel, so there is nowhere to put a
+/// refusal, and the alternatives are to invent one rule's answer for another rule's index or to
+/// return a plausible-looking blank. Both would be a host and a component silently disagreeing
+/// about which rule is running, which is the failure the whole `rules`-then-index arrangement
+/// exists to make impossible.
+///
+/// It is not reachable from a host that enumerates first: `rules` reports exactly the indices
+/// that answer. Reaching it means the host asked about a rule this component never listed.
+///
+/// # Panics
+///
+/// Always. In a component a panic is a trap, which is how a guest with no channel says no.
+#[cold]
+#[expect(
+    clippy::panic,
+    reason = "three of the world's exports have no error channel, and a wrong index must not \
+              be answered with another rule's data"
+)]
+pub fn no_such_rule(index: u32) -> ! {
+    panic!(
+        "no rule at index {index}: this component's `rules` export lists every index that \
+         answers, and this is not one of them"
+    );
+}
+
 /// An opaque reference into the arena of the check-context that produced it.
 ///
 /// Mirrors the WIT `node` alias (`crates/lanekeep-wasm/wit/world.wit`), which is itself a

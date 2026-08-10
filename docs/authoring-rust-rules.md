@@ -50,10 +50,33 @@ ignored = ["wit-bindgen-rt"]              # only `src/bindings.rs` uses it, and 
 
 ## What the crate exports
 
-The `rule` world's exports. `metadata`, `configure`, `has-check`, `has-reduce` and `check` are
-all mandatory — a WIT world has no optional exports — and `reduce` too if the rule has a
-cross-file phase. [`world.wit`](../crates/lanekeep-wasm/wit/world.wit) is the authority on every
-signature; §6.9 of the architecture says why each of the first four exists.
+The `rule` world's exports. `rules`, `metadata`, `configure`, `has-check`, `has-reduce` and
+`check` are all mandatory — a WIT world has no optional exports — and `reduce` too if the rule
+has a cross-file phase. [`world.wit`](../crates/lanekeep-wasm/wit/world.wit) is the authority on
+every signature; §6.9 of the architecture says why each of the first five exists.
+
+**A component hosts a list of rules, and you do not write the dispatch.** Every export but
+`rules` takes a `rule: u32` index into that list, and keeping an index in step with a list by
+hand is a mismatch waiting to happen — silently, since a rule would simply answer to another
+rule's configuration. The SDK's `ruleset!` macro is the whole of it:
+
+```rust
+lanekeep_rule::ruleset! {
+    "lanekeep/no-unwrap" => NoUnwrap,
+}
+```
+
+That declares the ids `rules` reports, generates a `trait Rule`, and generates the
+`impl Guest for Component` that looks each index back up in the same list. A rule is then a unit
+struct implementing that trait, whose methods are the world's minus the index:
+`metadata`, `configure`, `has_check`, `has_reduce`, `check(ctx, m)` and `reduce(ctx)`. Most
+crates name one rule and are a ruleset of one; a crate shipping a family names several, in the
+order they should be enumerated.
+
+`check` and `reduce` return `Result<(), RuleError>`. A Rust rule has no use for it — it has no
+stack to hand back, and a panic in a guest is a trap either way — so return `Ok(())` and report
+through `ctx`. It exists for guests whose language can catch its own failure, and it is the
+difference between a diagnostic that names a line and `wasm trap: unreachable`.
 
 `metadata` is where the rule's id, languages, severity, card, query, gates and timeout live. It
 is the component's answer to what a `defineRule` call carries, it is read once at config load,
@@ -67,9 +90,14 @@ carrying the message, which is what tells a user their configuration is wrong ra
 the rule is broken.
 
 [`rust-rules/lanekeep-rule`](../rust-rules/lanekeep-rule) is the SDK, and it is deliberately
-tiny: `Node`, the `Capture` trait with `capture(&m, "name")`, and `glob_matches`. Implement
-`Capture` for your crate's own generated `bindings::MatchEntry` once, at the top of the crate,
-and then read captures by name.
+tiny: the `ruleset!` macro above, `Node`, the `Capture` trait with `capture(&m, "name")`, and
+`glob_matches`. Implement `Capture` for your crate's own generated `bindings::MatchEntry` once,
+at the top of the crate, and then read captures by name.
+
+Everything in those signatures — `RuleMetadata`, `CheckContext`, `Match`, `RuleError` — comes
+from your crate's own generated `bindings` module, which is why `ruleset!` is a macro rather than
+a trait the SDK declares: the SDK cannot name a type that is private to your crate, and a
+`macro_rules!` expansion resolves those names where it is written.
 
 ## Two things that will bite
 

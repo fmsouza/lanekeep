@@ -15,6 +15,8 @@ use std::time::Duration;
 use lanekeep_core::limits::{RunClock, Trip};
 use thiserror::Error;
 
+use crate::bindings::types::{RuleError, StackFrame};
+
 /// A failure while running a rule component.
 ///
 /// Every variant here aborts the run. Skipping the offending rule and continuing is the
@@ -74,6 +76,37 @@ pub enum WasmError {
     Guest {
         /// The trap's root cause — for a host refusal, the host's own message.
         message: String,
+    },
+
+    /// The rule caught its own failure and handed it back, rather than trapping.
+    ///
+    /// **The graceful half of [`WasmError::Guest`], and the two are not interchangeable.** A
+    /// trap is what the host sees when a guest dies where it stands: measured 2026-08-10, an
+    /// uncaught JavaScript throw inside a component arrives as
+    /// `wasm trap: wasm 'unreachable' instruction executed`, with the thrown value's message,
+    /// its type and its whole stack gone — because there was nowhere for any of it to go. The
+    /// world's `check` and `reduce` return a `result` so that a guest whose language can catch
+    /// its own failure has somewhere to put what it caught, and this variant is where that
+    /// arrives.
+    ///
+    /// A Rust guest that panics still traps and is still [`WasmError::Guest`]. Nothing was
+    /// taken away; a second, better-informed way to fail was added beside it.
+    ///
+    /// Rendered as `lanekeep_js::SandboxError::Script` renders a thrown error — the same
+    /// wording and the same indented stack — because the two engines enforce one set of
+    /// limits and report into one set of diagnostics, and a user reading a failure should not
+    /// be able to tell which engine produced it from the shape of the sentence.
+    ///
+    /// `frames` is empty for a guest whose language has no stack to offer, which is every Rust
+    /// rule, and is innermost-first for one that does. The positions are in whatever space the
+    /// guest was compiled to; remapping them through a component's source map happens above
+    /// this type, not in it.
+    #[error("rule threw: {message}{}", indent_frames(.frames))]
+    RuleFailed {
+        /// The guest's own message.
+        message: String,
+        /// The guest's own stack, innermost first.
+        frames: Vec<StackFrame>,
     },
 
     /// A component refused the options it was configured with.
@@ -150,6 +183,42 @@ impl WasmError {
             Self::RuleTimeout { .. } | Self::RunTimeout { .. } | Self::MemoryExceeded { .. }
         )
     }
+}
+
+impl From<RuleError> for WasmError {
+    /// A guest's own account of why it failed, unchanged.
+    ///
+    /// A `From` rather than a constructor because there is nothing to decide: unlike
+    /// `classify` below, which weighs a recorded [`Trip`] and a memory breach against what the
+    /// engine said, this failure arrived as a value the guest built on purpose. Anything the
+    /// host added here would be the host's opinion of a rule's own report.
+    fn from(error: RuleError) -> Self {
+        Self::RuleFailed {
+            message: error.message,
+            frames: error.frames,
+        }
+    }
+}
+
+/// The guest's stack, one frame to a line, indented under the message.
+///
+/// The same arrangement `lanekeep_js::error::indent_stack` produces for a thrown JavaScript
+/// error, and spelled `function@file:line:column` because that is the form QuickJS already
+/// hands back — `boom@throw.js:13:25`. Two engines rendering one concept two ways is a
+/// difference a reader would have to learn for nothing.
+fn indent_frames(frames: &[StackFrame]) -> String {
+    use std::fmt::Write as _;
+
+    frames.iter().fold(String::new(), |mut out, frame| {
+        // Writing into a String cannot fail, and swallowing the Result here keeps this a
+        // plain fold rather than a loop with an unreachable error arm.
+        let _ = write!(
+            out,
+            "\n  {}@{}:{}:{}",
+            frame.function, frame.file, frame.line, frame.column
+        );
+        out
+    })
 }
 
 /// Turn a raw wasmtime failure into something that says what actually happened.

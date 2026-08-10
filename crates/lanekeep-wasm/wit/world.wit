@@ -256,6 +256,31 @@ interface types {
     invalid-json(string),
   }
 
+  /// One frame of a guest's own stack, innermost first.
+  ///
+  /// Positions are in whatever space the guest was compiled to — for a bundled JavaScript
+  /// rule that is the bundle, not the author's TypeScript. The host remaps them through the
+  /// component's source map before a user sees one.
+  record stack-frame {
+    function: string,
+    file: string,
+    line: u32,
+    column: u32,
+  }
+
+  /// Why a rule failed, when its language can say.
+  ///
+  /// A rule that fails *gracefully* returns one of these; a rule that traps still traps, and
+  /// the host handles both. This exists because a guest with no error channel loses
+  /// everything: measured 2026-08-10, an uncaught JavaScript throw inside a component
+  /// reaches the host as `wasm trap: unreachable` with the message, the type and the stack
+  /// all gone. A Rust guest that panics is that case and stays that case; `frames` is empty
+  /// for a language with no stack to offer.
+  record rule-error {
+    message: string,
+    frames: list<stack-frame>,
+  }
+
   /// The per-file phase's capabilities, and the parse tree it is reading.
   ///
   /// Held as a resource rather than passed as a record so that its method set *is* the
@@ -362,7 +387,16 @@ interface types {
   }
 }
 
-/// What a rule component is today: six exports over the host surface.
+/// What a rule component is today: seven exports over the host surface, for the one or more
+/// rules the component hosts.
+///
+/// **A component hosts a *list* of rules, and every export but `rules` takes an index into
+/// it.** That was forced rather than chosen. One embedded JavaScript engine is 12.34 MiB
+/// measured, and the rules on top of it are noise — three additional rules with real bodies
+/// cost 9,702 bytes — so one component per rule would ship four migrated built-ins as 49.37
+/// MiB where one shared component is 12.34 MiB. The shape also buys something for the target
+/// that did not need it: one Rust crate can ship a family of related rules in one 26 KB
+/// artifact. A rule authored alone is a ruleset of one, and pays a `u32` for it.
 ///
 /// **This list is still provisional, and the version number is where that shows.**
 /// `metadata` carries what a TypeScript rule's default export carries today (id, languages,
@@ -376,7 +410,8 @@ interface types {
 /// **Adding an export bumps `host_api_hash`, which is a cache-key input**, so every cached
 /// result in every checkout is invalidated by it — which is the right behavior, since a
 /// result computed against a world without the addition is not a valid result for a run that
-/// has it. `metadata` paid that cost once; `configure` pays it again here.
+/// has it. `metadata` paid that cost once, `configure` paid it again, and this change pays it
+/// a third time while also changing five signatures.
 world rule {
   import types;
 
@@ -392,20 +427,35 @@ world rule {
   ///
   /// This list is what a guest gets at the top level of its bindings; everything else in
   /// `types` is reached through the interface path. `check-context`, `reduce-context`,
-  /// `match` and `rule-metadata` are here because the exports below name them. `node` is not
+  /// `match`, `rule-metadata` and `rule-error` are here because the exports below name them.
+  /// `node` is not
   /// named below and is here anyway — for a Rust guest that buys nothing, measured:
   /// `wit-bindgen` 0.41.0 resolves `type node = u32` to `u32` and emits no alias, so the top
   /// of the generated bindings is the same four names with or without it, and the whole cost
   /// is 23 bytes of artifact metadata. It stays because languages that render an alias for a
   /// primitive typedef would put `node` where rule authors expect it, and 23 bytes is not a
   /// reason to find out the hard way which ones those are.
-  use types.{node, check-context, reduce-context, match, rule-metadata};
+  ///
+  /// `stack-frame` is deliberately absent: it appears only inside `rule-error` rather than in
+  /// an export signature, which is the same reason `reduce-location` is not here.
+  use types.{node, check-context, reduce-context, match, rule-metadata, rule-error};
 
-  /// What this rule is. Read once, at prepare time, before any file is checked.
-  export metadata: func() -> rule-metadata;
+  /// Every rule this component hosts, by id, in index order. The index is the `rule`
+  /// parameter every other export takes.
+  ///
+  /// Ids rather than full metadata, and the split is load-bearing. `configure` must run
+  /// before metadata is read, because a factory rule's card and query are produced by
+  /// applying the factory to its options. But to configure rule *i* you must know *i*
+  /// exists. A rule's id cannot depend on its options — the id is how a config names the
+  /// rule — so ids enumerate before configuration and everything else is read after it.
+  export rules: func() -> list<string>;
 
-  /// Hand this rule its configured options, once, after instantiation and before any
-  /// `check`.
+  /// What one of this component's rules is. Read once, at prepare time, before any file is
+  /// checked, and after that rule has been configured.
+  export metadata: func(rule: u32) -> rule-metadata;
+
+  /// Hand one of this component's rules its configured options, once, after instantiation
+  /// and before any `check`.
   ///
   /// JSON rather than a typed record, because a rule's options are its own design and this
   /// interface cannot know their shape. A component has no way to close over a host-supplied
@@ -417,7 +467,7 @@ world rule {
   /// two. The error is the guest's own message, and it fails the run rather than trapping —
   /// a rule that cannot use its configuration has not merely misbehaved, it has been
   /// misconfigured, and the user needs to be told which.
-  export configure: func(options-json: string) -> result<_, string>;
+  export configure: func(rule: u32, options-json: string) -> result<_, string>;
 
   /// Whether this rule has a per-file pass.
   ///
@@ -431,19 +481,27 @@ world rule {
   /// A component that answers `false` here fails config load outright, with the same message a
   /// TypeScript rule missing its handler gets: a rule that can never report is a misconfigured
   /// rule, not a quiet no-op.
-  export has-check: func() -> bool;
+  export has-check: func(rule: u32) -> bool;
   /// Whether this rule has a cross-file pass, on the same terms.
   ///
-  /// Every component exports all six functions regardless of which passes it uses, because
-  /// a WIT world has no optional exports. A check-only rule's `reduce` is a no-op its own
-  /// language's scaffolding supplies.
-  export has-reduce: func() -> bool;
+  /// Every component exports all seven functions regardless of which passes its rules use,
+  /// because a WIT world has no optional exports. A check-only rule's `reduce` is a no-op its
+  /// own language's scaffolding supplies.
+  export has-reduce: func(rule: u32) -> bool;
 
-  /// Run the per-file pass for one query match.
+  /// Run one rule's per-file pass for one query match.
   ///
   /// `borrow<check-context>`: the host owns the context and lends it for the call, so the
   /// handle is dead the moment `check` returns and cannot be stashed for a later one.
-  export check: func(ctx: borrow<check-context>, m: match);
-  /// Run the cross-file pass, once per run.
-  export reduce: func(ctx: borrow<reduce-context>);
+  ///
+  /// The `result` is the graceful-failure channel, and it is not a second way of spelling a
+  /// trap. A guest that traps loses everything it knew — measured 2026-08-10, an uncaught
+  /// JavaScript throw arrives as `wasm trap: unreachable` with no message, no type and no
+  /// stack — so a rule that can catch its own failure has to be able to hand one back, or the
+  /// host has nothing to remap through the component's source map and nothing to name in a
+  /// diagnostic. A Rust guest that panics still traps, and the host still handles it; this
+  /// adds a way to fail gracefully and removes nothing.
+  export check: func(rule: u32, ctx: borrow<check-context>, m: match) -> result<_, rule-error>;
+  /// Run one rule's cross-file pass, once per run, on the same terms as `check`.
+  export reduce: func(rule: u32, ctx: borrow<reduce-context>) -> result<_, rule-error>;
 }

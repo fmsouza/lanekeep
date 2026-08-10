@@ -2448,12 +2448,17 @@ fn load_components(
         // performed here instead would reach whichever store this thread happens to hold and
         // none of the others, which is a rule answering differently depending on how rayon
         // split the corpus.
-        let slot =
-            set.add(&name, &admitted, component.options)
-                .map_err(|e| RunError::Component {
-                    rule: name,
-                    detail: e.to_string(),
-                })?;
+        // Rule `0`, matching what `lanekeep_config::describe_components` described this
+        // component's rule as. The two have to agree: config read `metadata(0)` to build this
+        // rule's spec, so running any other index would execute a rule the config never saw.
+        // A component hosting a list of rules reaches neither of them yet — see the comment
+        // beside the `add` in `lanekeep-config`.
+        let slot = set
+            .add(&name, &admitted, 0, component.options)
+            .map_err(|e| RunError::Component {
+                rule: name,
+                detail: e.to_string(),
+            })?;
         rule.slot = Some(slot);
     }
 

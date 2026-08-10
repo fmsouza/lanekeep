@@ -166,14 +166,15 @@ impl Run {
     /// Run the per-file pass for a probe, under the runtime's default budget.
     fn check(&mut self, probe: &[&str]) -> Result<(), WasmError> {
         let captures = entries(probe);
-        self.runtime.call_check(&self.rule, &self.check, &captures)
+        self.runtime
+            .call_check(&self.rule, 0, &self.check, &captures)
     }
 
     /// Run the per-file pass for a probe under an explicit budget.
     fn check_within(&mut self, probe: &[&str], timeout: Duration) -> Result<(), WasmError> {
         let captures = entries(probe);
         self.runtime
-            .call_check_with_timeout(&self.rule, &self.check, &captures, timeout)
+            .call_check_with_timeout(&self.rule, 0, &self.check, &captures, timeout)
     }
 
     /// Run the cross-file pass, with the probe name as the first file.
@@ -184,7 +185,7 @@ impl Run {
             .host_mut()
             .push_reduce_context(context)
             .expect("the resource table accepts a context");
-        self.runtime.call_reduce(&self.rule, &handle)
+        self.runtime.call_reduce(&self.rule, 0, &handle)
     }
 
     /// Everything the per-file pass has reported since this was last called.
@@ -451,7 +452,7 @@ fn a_well_behaved_cross_file_pass_still_reports() {
         .push_reduce_context(context)
         .expect("the resource table accepts a context");
     run.runtime
-        .call_reduce(&run.rule, &handle)
+        .call_reduce(&run.rule, 0, &handle)
         .expect("an ordinary reduce runs");
 
     let owned = Resource::new_own(handle.rep());

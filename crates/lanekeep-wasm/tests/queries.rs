@@ -105,8 +105,14 @@ fn run(source: &str, name: &str) -> (Store<HostState>, Resource<CheckContext>) {
     // compile, a handle that resolves to nothing and an ancestor walk that finds nothing all
     // answer through the world's own channels, and a trap would crash a rule on a file it
     // could have skipped.
-    rule.call_check(&mut store, Resource::new_borrow(context.rep()), &captures)
-        .expect("check returns without trapping");
+    rule.call_check(
+        &mut store,
+        0,
+        Resource::new_borrow(context.rep()),
+        &captures,
+    )
+    .expect("check returns without trapping")
+    .expect("the rule does not report a failure");
 
     (store, context)
 }

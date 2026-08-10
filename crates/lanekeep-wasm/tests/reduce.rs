@@ -161,8 +161,10 @@ impl Harness {
 
     /// Run the cross-file pass. `Err` is a trap.
     fn reduce(&mut self) -> wasmtime::Result<()> {
-        self.rule
-            .call_reduce(&mut self.store, Resource::new_borrow(self.reduce.rep()))
+        let outcome =
+            self.rule
+                .call_reduce(&mut self.store, 0, Resource::new_borrow(self.reduce.rep()))?;
+        Self::trap_on_returned_failure(outcome)
     }
 
     /// Run the per-file pass with one capture naming the probe. `Err` is a trap.
@@ -171,11 +173,25 @@ impl Harness {
             name: probe.to_owned(),
             node: NodeArena::ROOT,
         }];
-        self.rule.call_check(
+        let outcome = self.rule.call_check(
             &mut self.store,
+            0,
             Resource::new_borrow(self.check.rep()),
             &captures,
-        )
+        )?;
+        Self::trap_on_returned_failure(outcome)
+    }
+
+    /// A Rust guest has no stack to hand back and reports a failure by trapping, so this
+    /// fixture never takes the world's graceful channel. Folding one into an error rather than
+    /// ignoring it keeps "`Err` is a trap" true of the two signatures above without silently
+    /// passing a failure off as a success.
+    fn trap_on_returned_failure(outcome: Result<(), types::RuleError>) -> wasmtime::Result<()> {
+        outcome.map_err(|failure| {
+            wasmtime::Error::msg(format!(
+                "the guest returned a failure rather than trapping: {failure:?}"
+            ))
+        })
     }
 
     /// What the cross-file context would hand the engine, emptying it as the engine's call does.
@@ -238,13 +254,13 @@ fn both_passes_are_declared() {
     assert!(
         harness
             .rule
-            .call_has_check(&mut harness.store)
+            .call_has_check(&mut harness.store, 0)
             .expect("has-check returns")
     );
     assert!(
         harness
             .rule
-            .call_has_reduce(&mut harness.store)
+            .call_has_reduce(&mut harness.store, 0)
             .expect("has-reduce returns")
     );
 }

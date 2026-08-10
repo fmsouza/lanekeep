@@ -302,11 +302,12 @@ fn a_component_targeting_the_world_instantiates_and_answers_both_probes() {
     let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
 
     assert!(
-        rule.call_has_check(&mut store).expect("has-check returns"),
+        rule.call_has_check(&mut store, 0)
+            .expect("has-check returns"),
         "the fixture declares a per-file pass"
     );
     assert!(
-        rule.call_has_reduce(&mut store)
+        rule.call_has_reduce(&mut store, 0)
             .expect("has-reduce returns"),
         "the fixture declares a cross-file pass"
     );
@@ -349,8 +350,9 @@ fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
         },
     ];
 
-    rule.call_check(&mut store, Resource::new_borrow(ctx.rep()), &captures)
-        .expect("check returns");
+    rule.call_check(&mut store, 0, Resource::new_borrow(ctx.rep()), &captures)
+        .expect("check returns")
+        .expect("the guest does not report a failure");
 
     assert_eq!(
         store.data().reported,
@@ -396,8 +398,9 @@ fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
         .push(ReduceContext::new(Vec::new(), Vec::new()))
         .expect("the resource table accepts a context");
 
-    rule.call_reduce(&mut store, Resource::new_borrow(ctx.rep()))
-        .expect("reduce returns");
+    rule.call_reduce(&mut store, 0, Resource::new_borrow(ctx.rep()))
+        .expect("reduce returns")
+        .expect("the guest does not report a failure");
 
     assert_eq!(
         store.data().reported,
