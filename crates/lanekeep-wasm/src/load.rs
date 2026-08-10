@@ -286,9 +286,29 @@ pub enum LoadSource {
 pub struct Loaded {
     component: Component,
     source: LoadSource,
+    identity: ComponentIdentity,
 }
 
+/// What makes two loads of one component the same component.
+///
+/// A blake3 of the bytes it was compiled from, and **content rather than object identity,
+/// which is the whole reason it exists.** `lanekeep-config` calls
+/// [`ComponentLoader::load`] once per rule *reference*, so four built-ins sharing one embedded
+/// artifact arrive as four separate [`Loaded`] values over identical bytes — and pointer
+/// identity would call those four different components and instantiate the engine inside them
+/// four times per worker. Comparing what they were compiled from is what lets
+/// [`crate::runtime::RuleSet`] recognize them as one.
+///
+/// Two byte strings that differ but compile to equivalent components are treated as different,
+/// which costs an instance and is the conservative direction.
+pub(crate) type ComponentIdentity = [u8; 32];
+
 impl Loaded {
+    /// What these bytes are, for recognizing a second load of the same component.
+    pub(crate) const fn identity(&self) -> &ComponentIdentity {
+        &self.identity
+    }
+
     /// The compiled component, ready to be resolved against the host world.
     #[must_use]
     pub const fn component(&self) -> &Component {
@@ -416,9 +436,19 @@ impl ComponentLoader {
     /// rather than on the counters alone.
     #[must_use]
     pub fn artifact_path(&self, name: &str, bytes: &[u8]) -> Option<PathBuf> {
+        self.artifact_path_for(name, &blake3::hash(bytes))
+    }
+
+    /// The same, for a caller that has already hashed the bytes.
+    ///
+    /// `load` hashes once and uses the digest for both the artifact name and
+    /// [`Loaded::identity`]. Hashing twice would be a second pass over the whole component,
+    /// which for the 12.34 MiB JavaScript engine is milliseconds paid per rule reference at
+    /// config load.
+    fn artifact_path_for(&self, name: &str, digest: &blake3::Hash) -> Option<PathBuf> {
         self.cache_dir
             .as_ref()
-            .map(|dir| dir.join(artifact_name(name, bytes)))
+            .map(|dir| dir.join(artifact_name(name, digest)))
     }
 
     /// Load a rule component, preferring a mapped precompiled artifact.
@@ -451,11 +481,17 @@ impl ComponentLoader {
     /// can compile. A cache directory that cannot be written is **not** an error: it is what
     /// [`LoadSource::Embedded`] is for.
     pub fn load(&self, engine: &WasmEngine, name: &str, bytes: &[u8]) -> Result<Loaded, WasmError> {
-        if let Some(path) = self.artifact_path(name, bytes) {
+        // Hashed once, here, and used for two things: the artifact's content-addressed name,
+        // and the [`Loaded::identity`] that lets `RuleSet::add` recognize a second load of the
+        // same component and give both loads one instance.
+        let digest = blake3::hash(bytes);
+        let identity = *digest.as_bytes();
+
+        if let Some(path) = self.artifact_path_for(name, &digest) {
             if path.is_file() {
                 if let Some(component) = map(engine.engine(), &path) {
                     self.mapped.fetch_add(1, Ordering::Relaxed);
-                    return self.admit(engine, name, component, LoadSource::Mapped);
+                    return self.admit(engine, name, component, LoadSource::Mapped, identity);
                 }
                 // A stale or truncated artifact. Removing it is not required — the write
                 // below replaces it — but leaving one that cannot be loaded means paying the
@@ -471,7 +507,7 @@ impl ComponentLoader {
             // Checked *before* it is written, so a component the sandbox refuses leaves nothing
             // on disk. Writing an artifact for something that will never run is wasted work
             // and a file a reader would have to explain.
-            let checked = self.admit(engine, name, compiled, LoadSource::Embedded)?;
+            let checked = self.admit(engine, name, compiled, LoadSource::Embedded, identity)?;
 
             if self.persist(checked.component(), &path)
                 && let Some(component) = map(engine.engine(), &path)
@@ -481,7 +517,7 @@ impl ComponentLoader {
                 // bytes off a different path — the same ones a *later* run will take at step 1
                 // — and "the compilation it came from was fine" is exactly the kind of
                 // reasoning that leaves a check reachable rather than unavoidable.
-                return self.admit(engine, name, component, LoadSource::Mapped);
+                return self.admit(engine, name, component, LoadSource::Mapped, identity);
             }
 
             // The directory is not writable, or what was written could not be read back.
@@ -494,7 +530,7 @@ impl ComponentLoader {
         let compiled = engine.compile(bytes)?;
         self.compilations.fetch_add(1, Ordering::Relaxed);
         self.embedded.fetch_add(1, Ordering::Relaxed);
-        self.admit(engine, name, compiled, LoadSource::Embedded)
+        self.admit(engine, name, compiled, LoadSource::Embedded, identity)
     }
 
     /// Check what a component reaches for, and hand it back if the answer is acceptable.
@@ -504,9 +540,14 @@ impl ComponentLoader {
         name: &str,
         component: Component,
         source: LoadSource,
+        identity: ComponentIdentity,
     ) -> Result<Loaded, WasmError> {
         check_imports(engine.engine(), name, &component, &self.permitted)?;
-        Ok(Loaded { component, source })
+        Ok(Loaded {
+            component,
+            source,
+            identity,
+        })
     }
 
     /// Write a compiled component's serialized form to `path`, atomically.
@@ -606,8 +647,8 @@ fn map(engine: &Engine, path: &Path) -> Option<Component> {
 /// there is no invalidation step to get wrong, and two checkouts of different revisions
 /// sharing a cache directory do not fight. The rule's name is a prefix purely so a human
 /// looking at the directory can tell what is in it.
-fn artifact_name(name: &str, bytes: &[u8]) -> String {
-    let digest = blake3::hash(bytes).to_hex();
+fn artifact_name(name: &str, digest: &blake3::Hash) -> String {
+    let digest = digest.to_hex();
     let digest: String = digest.chars().take(DIGEST_CHARS).collect();
     format!("{}-{digest}.{ARTIFACT_EXTENSION}", sanitize(name))
 }
@@ -675,7 +716,7 @@ mod tests {
     #[test]
     fn a_rule_id_cannot_decide_where_its_artifact_is_written() {
         // Namespaced ids carry separators, and a hostile one carries more than that.
-        let name = artifact_name("../../etc/passwd", b"bytes");
+        let name = artifact_name("../../etc/passwd", &blake3::hash(b"bytes"));
         assert!(
             !name.contains('/') && !name.contains(".."),
             "the name must be one path component: {name}"
@@ -689,29 +730,32 @@ mod tests {
 
     #[test]
     fn the_artifact_name_changes_when_the_component_does() {
-        let one = artifact_name("rule", b"first");
-        let two = artifact_name("rule", b"second");
+        let one = artifact_name("rule", &blake3::hash(b"first"));
+        let two = artifact_name("rule", &blake3::hash(b"second"));
         assert_ne!(
             one, two,
             "content-addressing is the whole invalidation strategy"
         );
         assert_eq!(
             one,
-            artifact_name("rule", b"first"),
+            artifact_name("rule", &blake3::hash(b"first")),
             "and the same bytes have to give the same name, or nothing is ever reused"
         );
     }
 
     #[test]
     fn two_rules_with_the_same_bytes_still_get_their_own_artifacts() {
-        assert_ne!(artifact_name("a", b"same"), artifact_name("b", b"same"));
+        assert_ne!(
+            artifact_name("a", &blake3::hash(b"same")),
+            artifact_name("b", &blake3::hash(b"same"))
+        );
     }
 
     #[test]
     fn a_name_that_sanitizes_away_entirely_still_produces_a_filename() {
-        let name = artifact_name("///", b"bytes");
+        let name = artifact_name("///", &blake3::hash(b"bytes"));
         assert!(name.starts_with("___-"), "{name}");
-        assert!(!artifact_name("", b"bytes").starts_with('-'));
+        assert!(!artifact_name("", &blake3::hash(b"bytes")).starts_with('-'));
     }
 
     #[test]

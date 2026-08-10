@@ -6150,7 +6150,7 @@ export default defineRule({
 
         #[test]
         fn a_worker_instantiates_a_component_rule_once_however_many_files_it_handles() {
-            // The bound `MEMORY_RESERVATION` is chosen on: one instance per (worker, rule).
+            // The bound `MEMORY_RESERVATION` is chosen on: one instance per (worker, component).
             // Driven through one `Worker` directly rather than through `run`, because rayon
             // decides how many workers exist and the claim is about one of them.
             let project = Project::new(

@@ -65,15 +65,25 @@
 //! this comment used to give, and an implementer would have gone looking for a feature that does
 //! not exist.
 //!
-//! # Instantiation happens once per (worker, rule), and a worker is not a thread
+//! # Instantiation happens once per (worker, component), and a worker is not a thread
 //!
-//! This module bounds instantiation to one per (worker, rule): [`RuleSet`] resolves each
+//! This module bounds instantiation to one per (worker, component): [`RuleSet`] resolves each
 //! component's imports once for the whole run (`RulePre`, from `Linker::instantiate_pre`), and
-//! each worker's [`WasmRuntime`] holds **one `Option` per rule** —
-//! [`WasmRuntime::instantiations`] counts what it built — filled the first time that rule is
-//! actually asked to run. It used to be a paragraph asking callers to behave; it is now the
-//! shape of the API, and `tests/instantiation.rs` fails the two eager designs it is written
-//! against.
+//! each worker's [`WasmRuntime`] holds **one `Option` per component** —
+//! [`WasmRuntime::instantiations`] counts what it built — filled the first time any rule that
+//! component hosts is actually asked to run. It used to be a paragraph asking callers to
+//! behave; it is now the shape of the API, and `tests/instantiation.rs` fails the three designs
+//! it is written against.
+//!
+//! **Per component and not per rule, and the difference is the reason the world's exports take
+//! a rule index.** A component is a compiled program and the rules on top of it are noise:
+//! measured 2026-08-10, a JavaScript engine compiled to a component is 12.34 MiB and three
+//! further rules with real bodies add 9,702 bytes. A per-rule instance cache would build that
+//! engine once per rule in every worker's store — giving back at run time exactly what the
+//! shared artifact saves on disk, and breaching the shipped 64 MiB per-worker ceiling, which
+//! `MemoryCeiling` sums across every memory in a store. The one exception is two slots naming
+//! the *same* rule of one component, which hold different configurations of one guest slot and
+//! cannot share; [`RuleSet::add`] splits those.
 //!
 //! **What that bound is worth depended on a number that was wrong, and it is corrected here.**
 //! An earlier version of this paragraph said "roughly three hundred and fifty instantiations
@@ -95,8 +105,10 @@
 //! going — so this is a distribution rather than a bound.
 //!
 //! **The design is not falsified; the arithmetic behind [`MEMORY_RESERVATION`] is.** The
-//! per-worker cache still works, and it is what keeps the count at workers × rules instead of
-//! at files × rules, which would be one hundred thousand for the last row. What is gone is "the
+//! per-worker cache still works, and it is what keeps the count at workers × components instead
+//! of at files × rules, which would be one hundred thousand for the last row. The table was
+//! measured when a component hosted one rule, so its rows read the same either way; a ruleset
+//! whose ten rules share one component now costs a tenth of them. What is gone is "the
 //! penalty does not grow with the corpus", and with it the claim that instantiation is a
 //! constant a large run can ignore. [`MEMORY_RESERVATION`] carries the re-derivation.
 //!
@@ -195,7 +207,7 @@ use crate::bindings::{Rule, RulePre, types};
 use crate::error::{WasmError, classify};
 use crate::host::{CheckContext, HostState, ReduceContext};
 use crate::key::ExternalBinding;
-use crate::load::Loaded;
+use crate::load::{ComponentIdentity, Loaded};
 
 /// Address space reserved ahead of time for each linear memory, in bytes.
 ///
@@ -342,11 +354,11 @@ use crate::load::Loaded;
 /// half. A rule that walks a subtree and compares a few strings will keep answering "fine"
 /// however many of them ship.
 ///
-/// **The argument depends on an instance per (worker, rule) rather than per file, and on every
-/// path a run takes that is now enforced rather than assumed.** [`RuleSet`] resolves each
-/// component once for the run and each worker's [`WasmRuntime`] holds one `Option` per rule,
-/// filled by [`WasmRuntime::rule`] and by nothing else — so a cache sized to the ruleset is the
-/// ceiling, and there is nowhere to put a second instance of a rule.
+/// **The argument depends on an instance per (worker, component) rather than per file, and on
+/// every path a run takes that is now enforced rather than assumed.** [`RuleSet`] resolves each
+/// component once for the run and each worker's [`WasmRuntime`] holds one `Option` per
+/// component, filled by [`WasmRuntime::rule`] and by nothing else — so a cache sized to the
+/// components is the ceiling, and there is nowhere to put a second instance of one.
 /// `tests/instantiation.rs` asserts it, and the two eager designs it is written against fail it.
 ///
 /// **One unbounded path remains, and it is named here rather than left to be discovered.**
@@ -666,11 +678,47 @@ impl RuleSlot {
     }
 }
 
-/// One rule, resolved against the host world once for the whole run.
+/// One component instance's worth of rules, resolved against the host world once for the run.
+///
+/// **The unit a store instantiates, which is not the same as a rule.** A component hosts a list
+/// of rules and every export but `rules` takes an index into it, so one instance serves every
+/// rule its component hosts — which is the whole reason the index parameter exists. Measured
+/// 2026-08-10, a JavaScript engine compiled to a component is 12.34 MiB and three further rules
+/// with real bodies add 9,702 bytes; instantiating per rule would hand every worker one copy of
+/// that engine per rule and give back at run time exactly what the shared artifact saved on
+/// disk.
+///
+/// # Why this is not simply "one per component"
+///
+/// A guest holds one configuration per rule index: `configure(rule, options)` writes it and
+/// every later `check` reads it. So an instance can serve at most one slot per index, and two
+/// slots naming the *same* rule of one component need an instance each — otherwise the second
+/// `configure` overwrites the first, and which one won would depend on which slot that worker
+/// reached first, which is a determinism failure rather than an inefficiency.
+///
+/// That case is a real config rather than a hypothetical: `lanekeep-config`'s `hash_ruleset`
+/// records that `["./r.wasm", {"rule": "./r.wasm", "options": {…}}]` "is how a rule is used bare
+/// and configured in the same run", and nothing deduplicates it.
+///
+/// So [`RuleSet::add`] shares an instance across rules of one component and splits on a
+/// collision, and [`PreparedInstance::taken`] is what it splits on.
+struct PreparedInstance {
+    /// Which component this is, so a second load of the same bytes is recognized as one.
+    identity: ComponentIdentity,
+    pre: RulePre<RuntimeState>,
+    /// The rule indices already served by this instance.
+    ///
+    /// A `Vec` and a linear scan, because it holds one entry per rule of one component — a
+    /// handful, searched once per `add` and never on the hot path.
+    taken: Vec<u32>,
+}
+
+/// One rule, and which instance serves it.
 struct Prepared {
     /// Whatever identifies the rule to a reader — a rule id. Diagnostics only.
     id: String,
-    pre: RulePre<RuntimeState>,
+    /// Which entry in [`RuleSet::instances`] this rule's component instance is built from.
+    instance: usize,
     /// Which of the component's rules this slot names.
     ///
     /// A component hosts a *list* of rules and every export but `rules` takes an index into
@@ -701,6 +749,8 @@ struct Prepared {
 /// instantiated: an instance belongs to a store, and a store belongs to a worker.
 pub struct RuleSet {
     linker: Linker<RuntimeState>,
+    /// What a store instantiates, one entry per (component, colliding-index) group.
+    instances: Vec<PreparedInstance>,
     rules: Vec<Prepared>,
     /// What was bound beside the declared world, as declared at the call site.
     ///
@@ -736,6 +786,7 @@ impl RuleSet {
         .map_err(|e| WasmError::Engine(e.to_string()))?;
         Ok(Self {
             linker,
+            instances: Vec::new(),
             rules: Vec::new(),
             external: Vec::new(),
         })
@@ -791,9 +842,22 @@ impl RuleSet {
     /// whole run and leaves instantiation to whichever worker needs it.
     /// [`WasmRuntime::call_rules`] is the enumeration, and a caller asks it once.
     ///
-    /// Two slots naming the same component at different indices is the ordinary case for a
-    /// multi-rule component and is not a duplicate: each gets its own pre-instantiation and,
-    /// per worker, its own instance.
+    /// # Rules of one component share an instance, and this is where that is decided
+    ///
+    /// Two slots naming the same component at *different* indices are the ordinary case for a
+    /// multi-rule component, and they resolve against it once and share one instance per store.
+    /// That is the whole reason the world's exports take an index: a component is a compiled
+    /// program, the rules on top of it are noise, and instantiating per rule would give back at
+    /// run time exactly what a shared artifact saves on disk.
+    ///
+    /// Two slots naming the same component at the *same* index are split onto separate
+    /// instances, because a guest holds one configuration per rule index. See
+    /// `PreparedInstance` for why that case is a real config rather than a hypothetical.
+    ///
+    /// **Sameness is the bytes a component was compiled from, not the [`Loaded`] value.**
+    /// `lanekeep-config` loads once per rule *reference*, so several rules of one shared
+    /// component arrive as several `Loaded`s over identical bytes, and object identity would
+    /// call them different components.
     ///
     /// # Errors
     ///
@@ -806,19 +870,57 @@ impl RuleSet {
         index: u32,
         options_json: impl Into<String>,
     ) -> Result<RuleSlot, WasmError> {
-        let pre = self
-            .linker
-            .instantiate_pre(loaded.component())
-            .and_then(RulePre::new)
-            .map_err(|e| WasmError::Engine(e.to_string()))?;
+        let instance = if let Some(existing) = self.sharing(loaded.identity(), index) {
+            existing
+        } else {
+            // Resolved before anything is pushed, so a component that does not satisfy the
+            // world leaves this set exactly as it found it.
+            let pre = self
+                .linker
+                .instantiate_pre(loaded.component())
+                .and_then(RulePre::new)
+                .map_err(|e| WasmError::Engine(e.to_string()))?;
+            self.instances.push(PreparedInstance {
+                identity: *loaded.identity(),
+                pre,
+                taken: Vec::new(),
+            });
+            self.instances.len().saturating_sub(1)
+        };
+
+        if let Some(entry) = self.instances.get_mut(instance) {
+            entry.taken.push(index);
+        }
+
         let slot = RuleSlot(self.rules.len());
         self.rules.push(Prepared {
             id: id.into(),
-            pre,
+            instance,
             index,
             options: options_json.into(),
         });
         Ok(slot)
+    }
+
+    /// The instance a rule of this component at this index may share, if there is one.
+    ///
+    /// The first entry for the component that has not already taken the index. "First" rather
+    /// than "any" only matters when a component is named three or more times for one rule, and
+    /// then only for which instance each lands on — every arrangement holds one configuration
+    /// per instance either way.
+    fn sharing(&self, identity: &ComponentIdentity, index: u32) -> Option<usize> {
+        self.instances
+            .iter()
+            .position(|entry| entry.identity == *identity && !entry.taken.contains(&index))
+    }
+
+    /// How many component instances a store built from this set will hold.
+    ///
+    /// One per entry in [`RuleSet::instances`], which is at most one per rule and is fewer
+    /// whenever a component hosts more than one of them. [`WasmRuntime`] sizes its instance
+    /// cache from this rather than from [`RuleSet::len`].
+    pub(crate) fn instance_count(&self) -> usize {
+        self.instances.len()
     }
 
     /// The linker, for a host that must bind more than the declared world.
@@ -906,7 +1008,7 @@ impl RuleSet {
         self.rules.get(slot.0).map(|rule| rule.index)
     }
 
-    /// The pre-instantiation a slot names.
+    /// The rule a slot names.
     fn rule(&self, slot: RuleSlot) -> Result<&Prepared, WasmError> {
         self.rules.get(slot.0).ok_or_else(|| {
             WasmError::Engine(format!(
@@ -916,6 +1018,19 @@ impl RuleSet {
                 self.rules.len()
             ))
         })
+    }
+
+    /// The pre-instantiation one of this set's instances is built from.
+    fn pre(&self, instance: usize) -> Result<&RulePre<RuntimeState>, WasmError> {
+        self.instances
+            .get(instance)
+            .map(|entry| &entry.pre)
+            .ok_or_else(|| {
+                WasmError::Engine(format!(
+                    "component instance {instance} is not in this rule set, which holds {}",
+                    self.instances.len()
+                ))
+            })
     }
 }
 
@@ -1047,18 +1162,30 @@ impl std::fmt::Debug for RuntimeState {
 pub struct WasmRuntime {
     engine: Arc<WasmEngine>,
     rules: Arc<RuleSet>,
-    /// One `Option` per rule in [`Self::rules`], filled on that rule's first use in this
-    /// store.
+    /// One `Option` per *component instance* the set will build, filled on first use.
     ///
-    /// **Per rule and not per worker, and that is the whole of condition 1.** A single flag
-    /// covering the ruleset recovers only the all-cache-hits case and pays for every rule the
-    /// moment one file misses; this pays for exactly the rules that ran. Sized once at
-    /// construction, so a slot lookup is an index and the hot path allocates nothing.
+    /// **Per rule was wrong and this is the correction.** A single flag covering the ruleset
+    /// recovers only the all-cache-hits case and pays for every rule the moment one file
+    /// misses, which is why this is not that; but a slot-indexed cache is the opposite mistake,
+    /// because several rules of one component share one instance and a per-slot cache builds
+    /// the component once per rule. For the 12.34 MiB JavaScript engine that is one copy of the
+    /// engine per rule in every worker's store, which the shipped 64 MiB per-worker ceiling
+    /// would refuse. Indexed by `Prepared::instance`, sized from
+    /// [`RuleSet::instance_count`].
     ///
     /// Nothing ever clears an entry. A `Store` does not reclaim an instance — instantiating
     /// repeatedly into one stops at 3,333 — so an entry that could be dropped and rebuilt
     /// would consume a slot without releasing one.
     instances: Vec<Option<Rule>>,
+    /// Whether each *rule* has had `configure` called in this store yet.
+    ///
+    /// Per slot where [`Self::instances`] is per component, because the two are lazy about
+    /// different things. An instance is shared; a configuration is not — the guest holds one
+    /// per rule index — so a component whose rule 0 has run must still configure rule 1 before
+    /// rule 1 checks anything. Keeping the flag here rather than inferring it from the instance
+    /// is what makes "no `check` reaches an unconfigured rule" true per rule rather than per
+    /// component.
+    configured: Vec<bool>,
     /// How many instances this store has built, as evidence.
     ///
     /// Nothing in execution reads it. It exists because "instantiation is lazy" and
@@ -1118,7 +1245,8 @@ impl WasmRuntime {
         limits: Limits,
         clock: Arc<RunClock>,
     ) -> Self {
-        let instances = (0..rules.len()).map(|_| None).collect();
+        let instances = (0..rules.instance_count()).map(|_| None).collect();
+        let configured = vec![false; rules.len()];
 
         let mut store = Store::new(
             engine.engine(),
@@ -1153,6 +1281,7 @@ impl WasmRuntime {
             engine,
             rules,
             instances,
+            configured,
             instantiations: 0,
             store,
             limits,
@@ -1239,8 +1368,8 @@ impl WasmRuntime {
     /// # How often this may be called is a load-bearing assumption, and this is the raw form
     ///
     /// [`MEMORY_RESERVATION`] is chosen on the basis that instantiation happens **per (worker,
-    /// rule)**. What makes that true is [`RuleSet`] plus the per-rule `Option` behind
-    /// [`WasmRuntime::rule`], which instantiates at most once per slot per store. This method
+    /// component)**. What makes that true is [`RuleSet`] plus the per-component `Option` behind
+    /// [`WasmRuntime::rule`], which instantiates at most once per component per store. This method
     /// is underneath that: it takes a component rather than a slot, so it resolves the
     /// component's imports on every call and keeps no instance, and calling it per file is
     /// exactly the shape the bound rules out.
@@ -1291,30 +1420,50 @@ impl WasmRuntime {
 
     /// How many instances this store has built since it was created.
     ///
-    /// Evidence, exactly as [`WasmRuntime::epoch_fired`] is. Two claims depend on it and
-    /// neither can be made about anything else: that a worker whose files all hit the cache
-    /// instantiates *nothing*, and that a worker handling three files that match the same rule
-    /// instantiates that rule *once*. A counter kept by a test harness would prove a property
-    /// of the harness.
+    /// Evidence, exactly as [`WasmRuntime::epoch_fired`] is. Three claims depend on it and
+    /// none can be made about anything else: that a worker whose files all hit the cache
+    /// instantiates *nothing*, that a worker handling three files that match the same rule
+    /// instantiates *once*, and that a component hosting several rules is instantiated once
+    /// however many of them run. A counter kept by a test harness would prove a property of the
+    /// harness.
     #[must_use]
     pub const fn instantiations(&self) -> usize {
         self.instantiations
     }
 
-    /// Whether a slot's rule has been instantiated in this store yet.
+    /// Whether the instance a slot's rule runs in has been built in this store yet.
+    ///
+    /// **The component's, not the rule's.** Several rules of one component share one instance,
+    /// so this answers `true` for a rule that has never run once a sibling rule of the same
+    /// component has. [`WasmRuntime::is_configured`] is the per-rule question.
     #[must_use]
     pub fn is_instantiated(&self, slot: RuleSlot) -> bool {
-        self.instances
-            .get(slot.index())
-            .is_some_and(Option::is_some)
+        self.rules.rule(slot).is_ok_and(|rule| {
+            self.instances
+                .get(rule.instance)
+                .is_some_and(Option::is_some)
+        })
     }
 
-    /// This store's instance of a rule, building it on first use.
+    /// Whether a slot's rule has been handed its options in this store yet.
     ///
-    /// **The lazy per-rule instance cache, and condition 1 in one method.** The first call for
-    /// a slot instantiates; every later call for the same slot returns what that one built.
-    /// A rule whose query never matches anything this worker saw is never instantiated at all,
-    /// which is the case eager instantiation pays 82 to 96× for.
+    /// Evidence, on the same terms as [`WasmRuntime::instantiations`]. A shared instance makes
+    /// "was this rule reached" a different question from "was its component built", and this is
+    /// the half that stayed per rule.
+    #[must_use]
+    pub fn is_configured(&self, slot: RuleSlot) -> bool {
+        self.configured.get(slot.index()).copied().unwrap_or(false)
+    }
+
+    /// This store's instance for a rule, building it and configuring the rule on first use.
+    ///
+    /// **Two lazinesses, and they are lazy about different things.** The *instance* is built the
+    /// first time any rule of its component is reached, and shared by the rest — a component is
+    /// a compiled program and its rules are what run inside it. The *configuration* is applied
+    /// the first time each rule is reached, because a guest holds one per rule index. So a
+    /// worker that runs rule 3 of a four-rule component builds one instance and configures one
+    /// rule, and a worker whose queries matched nothing does neither. That second case is what
+    /// eager instantiation pays 82 to 96× for.
     ///
     /// A failure is not remembered. `Worker::sandbox` in `lanekeep-engine` caches its build
     /// failure so it is reported once per worker rather than retried per file, and the
@@ -1332,13 +1481,17 @@ impl WasmRuntime {
     ///
     /// So the call sits between the instantiation and the instance being handed out, reading
     /// the options [`RuleSet::add`] recorded. Both halves of "once" follow from where it is:
-    /// once per (worker, rule) because the surrounding branch runs once, and before any
+    /// once per (worker, rule) because the `configured` flag is set beside it, and before any
     /// `check` because every entry point goes through here first.
     ///
-    /// **A refusal leaves no instance behind.** The instance is stored only after the guest
-    /// has accepted its options, so a run that ends here never had a live-but-unconfigured
-    /// instance to reach. The store keeps the memory either way — nothing reclaims an instance
-    /// — but that costs a run which is already over.
+    /// **An unconfigured rule is unreachable, which is what a shared instance leaves of "a
+    /// refusal leaves no instance behind".** That sentence used to be true literally: the
+    /// instance was stored only after its one rule accepted its options. It cannot stay literal
+    /// once an instance serves several rules — rule 0 configuring successfully is exactly why
+    /// the instance is kept when rule 1 then refuses — and the property that mattered survives
+    /// in a stronger form. Nothing reaches a `check` except through here, and this returns
+    /// before handing anything back unless *this rule* has been configured. Per rule, where it
+    /// used to be per instance.
     ///
     /// # Errors
     ///
@@ -1347,44 +1500,56 @@ impl WasmRuntime {
     /// when the guest declines the options it was handed, or [`WasmError::Engine`] for a slot
     /// this runtime's rule set never issued.
     pub fn rule(&mut self, slot: RuleSlot) -> Result<&Rule, WasmError> {
-        if !self.is_instantiated(slot) {
-            let rules = Arc::clone(&self.rules);
-            let prepared = rules.rule(slot)?;
+        let rules = Arc::clone(&self.rules);
+        let prepared = rules.rule(slot)?;
+        let at = prepared.instance;
+        let timeout = self.limits.rule_timeout;
 
-            let timeout = self.limits.rule_timeout;
+        if !self.instances.get(at).is_some_and(Option::is_some) {
             self.arm(timeout);
-            let outcome = prepared.pre.instantiate(&mut self.store);
+            let outcome = rules.pre(at)?.instantiate(&mut self.store);
             self.disarm();
             let instance = outcome.map_err(|error| self.classify(&error, timeout))?;
 
             self.instantiations += 1;
 
+            // Stored before `configure` runs, and that is the shared-instance shape rather than
+            // a relaxation: the same instance is about to serve every other rule its component
+            // hosts, so it does not belong to whichever rule happened to reach it first. What
+            // stops an unconfigured rule being *used* is the flag below, not the absence of an
+            // instance.
+            //
+            // `rules.rule(slot)` above already refused an out-of-range slot and `instances` is
+            // sized from the same set, so this index is in range. `get_mut` rather than `[]`
+            // regardless: the workspace denies panicking outside tests, and an engine that
+            // panics on a malformed input has failed at its job.
+            if let Some(entry) = self.instances.get_mut(at) {
+                *entry = Some(instance);
+            }
+        }
+
+        if !self.is_configured(slot) {
             self.arm(timeout);
-            let configured =
-                instance.call_configure(&mut self.store, prepared.index, &prepared.options);
+            let configured = self.with_instance(slot, |rule, store| {
+                rule.call_configure(store, prepared.index, &prepared.options)
+            });
             self.disarm();
             match configured {
                 Ok(Ok(())) => {}
                 Ok(Err(message)) => return Err(WasmError::Misconfigured { message }),
                 Err(error) => return Err(self.classify(&error, timeout)),
             }
-
-            // `rules.rule(slot)` above already refused an out-of-range slot, and `instances`
-            // is sized from the same set, so this index is in range. `get_mut` rather than
-            // `[]` regardless: the workspace denies panicking outside tests, and an engine
-            // that panics on a malformed input has failed at its job.
-            if let Some(entry) = self.instances.get_mut(slot.index()) {
-                *entry = Some(instance);
+            if let Some(entry) = self.configured.get_mut(slot.index()) {
+                *entry = true;
             }
         }
 
         self.instances
-            .get(slot.index())
+            .get(at)
             .and_then(Option::as_ref)
             .ok_or_else(|| {
                 WasmError::Engine(format!(
-                    "rule slot {} was instantiated and then could not be found",
-                    slot.index()
+                    "component instance {at} was built and then could not be found"
                 ))
             })
     }
@@ -1462,7 +1627,7 @@ impl WasmRuntime {
     /// Run a slot's per-file pass for one query match, under the default budget.
     ///
     /// **This is the call the bound is about.** It is reached once per (rule, match) and
-    /// instantiates at most once per (worker, rule), because the instance it needs is the one
+    /// instantiates at most once per (worker, component), because the instance it needs is the one
     /// [`WasmRuntime::rule`] cached.
     ///
     /// # Errors
@@ -1549,7 +1714,12 @@ impl WasmRuntime {
         slot: RuleSlot,
         call: impl FnOnce(&Rule, &mut Store<RuntimeState>) -> wasmtime::Result<T>,
     ) -> wasmtime::Result<T> {
-        let Some(rule) = self.instances.get(slot.index()).and_then(Option::as_ref) else {
+        let at = self
+            .rules
+            .rule(slot)
+            .map(|rule| rule.instance)
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let Some(rule) = self.instances.get(at).and_then(Option::as_ref) else {
             return Err(wasmtime::Error::msg(format!(
                 "rule slot {} has no instance in this store",
                 slot.index()
