@@ -38,11 +38,29 @@ tree-sitter = { workspace = true }
 
 [dev-dependencies]
 lanekeep-lang-js = { workspace = true }
+# `benches/crossings.rs` only. The Rust grammar, because its subject is a rule that checks Rust;
+# the arena, because the crossing count is taken by replaying the rule against the same
+# `NodeArena` both engines call.
+#
+# Deliberately *not* `lanekeep-rules`, whose component this bench also needs. That crate
+# dev-depends on `lanekeep-testkit`, which depends on this one, so a dev-dependency here would
+# close a cycle in the publication order — and `cargo publish` resolves a cycle by refusing.
+# `crossings.rs` reads the component's bytes from its path instead.
+lanekeep-lang-rust = { workspace = true }
+lanekeep-languages = { workspace = true }
+lanekeep-nodes = { workspace = true }
 
 [[bench]]
 name = "corpus"
 # No harness: this is a budget gate, not a statistical comparison against a stored
 # baseline. See the bench's own documentation for why criterion is the wrong shape here.
+harness = false
+
+[[bench]]
+name = "crossings"
+# No harness, for the same reason `corpus` has none: this measures a difference between two
+# matched corpora rather than a distribution, and criterion would time the setup it exists to
+# subtract.
 harness = false
 
 [lints]

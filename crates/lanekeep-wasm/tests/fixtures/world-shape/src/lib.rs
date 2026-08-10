@@ -19,12 +19,60 @@ mod bindings;
 // appear in an export signature and the world does not name it. That is the whole rule for
 // what a guest gets flat and what it reaches through the interface path, and it is worth
 // knowing before sub-project 3 writes an authoring crate around it.
-use bindings::lanekeep::host::types::ReduceLocation;
+use bindings::lanekeep::host::types::{
+    ReduceLocation, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
 
 impl Guest for Component {
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
+    fn metadata() -> RuleMetadata {
+        RuleMetadata {
+            id: "fixture/world-shape".to_owned(),
+            languages: vec!["rust".to_owned()],
+            severity: "error".to_owned(),
+            card: RuleCard {
+                message: String::new(),
+                remediation: String::new(),
+                examples: RuleExamples {
+                    bad: String::new(),
+                    good: String::new(),
+                },
+            },
+            query: String::new(),
+            gates: RuleGates {
+                path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
+                file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
+    /// Accepts the no-options shape and refuses everything else.
+    ///
+    /// It used to refuse unconditionally, on the reasoning that reaching an unimplemented
+    /// export should fail loudly rather than pass vacuously. That reasoning is now wrong for
+    /// this fixture and stays right for every sibling whose `configure` still answers `does not
+    /// implement configure` — stated as a property rather than a count, because the count was
+    /// wrong within two commits of being written: `WasmRuntime::rule` configures
+    /// every instance it builds, so `null` is reached on the ordinary path — by
+    /// `tests/instantiation.rs` and `tests/load.rs`, which drive this guest through a
+    /// `RuleSet` — and refusing it would mean this fixture could not be instantiated at all.
+    ///
+    /// Refusing anything else keeps the loud half: a caller that hands this fixture real
+    /// options is still told that it has no idea what to do with them.
+    fn configure(options_json: String) -> Result<(), String> {
+        if options_json == "null" {
+            return Ok(());
+        }
+        Err("fixture/world-shape takes no options".to_owned())
+    }
+
     fn has_check() -> bool {
         true
     }

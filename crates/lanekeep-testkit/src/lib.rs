@@ -71,7 +71,25 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 pub struct RuleTester {
     dir: PathBuf,
     extension: String,
+    /// The config file the project was written with, relative to [`RuleTester::dir`].
+    ///
+    /// A field rather than a constant because a component tester writes a `lanekeep.json` and a
+    /// source tester writes a `lanekeep.config.ts` — see [`RuleTester::for_component`] for why
+    /// that is forced rather than chosen.
+    config: &'static str,
 }
+
+/// What a source rule's project is configured by.
+const TS_CONFIG: &str = "lanekeep.config.ts";
+
+/// What a component rule's project is configured by.
+const JSON_CONFIG: &str = "lanekeep.json";
+
+/// Where a component tester puts the rule, relative to the project root.
+///
+/// Inside the rules root, which is the project root here, because `lanekeep-config` confines a
+/// component reference to it — a `.wasm` outside is refused before it is read.
+const COMPONENT_PATH: &str = "rules/rule.wasm";
 
 impl RuleTester {
     /// Build a tester for a rule's source.
@@ -152,6 +170,60 @@ impl RuleTester {
         Self::build(name, rule_source, extension, &format!("rule({options})"))
     }
 
+    /// Build a tester for a rule compiled to a WebAssembly component.
+    ///
+    /// `bytes` are the component itself — `lanekeep_rules::component("no-unwrap")`, or whatever
+    /// a project's own build produced. They are written to `rules/rule.wasm` inside the
+    /// throwaway project, because a component reference is confined to the rules root.
+    ///
+    /// # It generates a `lanekeep.json`, and it has to
+    ///
+    /// Every other constructor writes a `lanekeep.config.ts` that imports the rule. A `.wasm` is
+    /// not a value a TypeScript module can import: a component is resolved in Rust, by path, and
+    /// answers `metadata` for itself. So the component path is the JSON config path, and that is
+    /// forced by what a component is rather than chosen for convenience.
+    ///
+    /// # `extension` is required rather than defaulted
+    ///
+    /// [`RuleTester::new`] defaults to `ts` and [`RuleTester::with_extension`] varies it, which
+    /// is right when TypeScript is the overwhelmingly common case. It is not the common case
+    /// here — a rule authored as a component is one written in the language it inspects, and the
+    /// two that exist target Rust — so a default would be wrong more often than not, and the
+    /// pair of `*_with_extension` variants it would need doubles the constructor count for
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`RuleTester::new`].
+    pub fn for_component(name: &str, bytes: &[u8], extension: &str) -> Result<Self, TestError> {
+        Self::build_component(name, bytes, extension, None)
+    }
+
+    /// Build a tester for a component rule configured with options.
+    ///
+    /// `options` is **JSON**, and the difference from [`RuleTester::configured`] is the whole
+    /// point rather than an inconvenience. That one splices JavaScript source into a config, so
+    /// a factory rule can be handed a function or a regular expression. A component cannot close
+    /// over a host-supplied value at all: its options cross the boundary as data, through the
+    /// world's `configure(options-json)`. Accepting source here would suggest otherwise, and
+    /// would test a shape no real config can produce.
+    ///
+    /// # Errors
+    ///
+    /// As [`RuleTester::new`], plus [`TestError::Setup`] if `options` is not valid JSON — which
+    /// is caught here rather than left to surface as a config parse error naming a generated
+    /// file the caller never wrote.
+    pub fn for_component_configured(
+        name: &str,
+        bytes: &[u8],
+        extension: &str,
+        options: &str,
+    ) -> Result<Self, TestError> {
+        let options: serde_json::Value = serde_json::from_str(options)
+            .map_err(|e| TestError::Setup(format!("`options` is not valid JSON: {e}")))?;
+        Self::build_component(name, bytes, extension, Some(options))
+    }
+
     /// Write the throwaway project.
     ///
     /// `rule_expr` is what goes in the config's `rules` array — the imported module for a
@@ -162,22 +234,10 @@ impl RuleTester {
         extension: &str,
         rule_expr: &str,
     ) -> Result<Self, TestError> {
-        // Unique per tester: the counter separates testers in one process, the process id
-        // separates the processes nextest spawns per test.
-        let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "lanekeep-ruletest-{name}-{}-{seq}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let tester = Self {
-            dir,
-            extension: extension.to_owned(),
-        };
+        let tester = Self::empty(name, extension, TS_CONFIG);
         tester.write("rule.ts", rule_source)?;
         tester.write(
-            "lanekeep.config.ts",
+            TS_CONFIG,
             &format!(
                 "import {{ defineConfig }} from 'lanekeep';\n\
                  import rule from './rule';\n\
@@ -187,7 +247,59 @@ impl RuleTester {
         Ok(tester)
     }
 
+    /// Write the throwaway project for a component rule.
+    ///
+    /// `options` is `None` for the bare form and `Some` for the object form, and the two are not
+    /// the same config: `lanekeep-config` reads a bare string as a rule used as it comes and
+    /// `{ "rule", "options" }` as one configured, which is the distinction a rule author already
+    /// makes between a rule and a rule factory. `Some(Value::Null)` is therefore a third thing
+    /// again — a rule explicitly configured with nothing — and is reachable from here on
+    /// purpose.
+    fn build_component(
+        name: &str,
+        bytes: &[u8],
+        extension: &str,
+        options: Option<serde_json::Value>,
+    ) -> Result<Self, TestError> {
+        let tester = Self::empty(name, extension, JSON_CONFIG);
+        tester.write_bytes(COMPONENT_PATH, bytes)?;
+
+        let reference = format!("./{COMPONENT_PATH}");
+        let rule = match options {
+            None => serde_json::Value::String(reference),
+            Some(options) => serde_json::json!({ "rule": reference, "options": options }),
+        };
+        let config = serde_json::json!({ "include": ["subject/**"], "rules": [rule] });
+
+        // `to_string` rather than `to_string_pretty`: nothing reads this by eye except when a
+        // test fails, and a failure prints the error rather than the config.
+        tester.write(JSON_CONFIG, &config.to_string())?;
+        Ok(tester)
+    }
+
+    /// A tester with its own directory and nothing in it yet.
+    fn empty(name: &str, extension: &str, config: &'static str) -> Self {
+        // Unique per tester: the counter separates testers in one process, the process id
+        // separates the processes nextest spawns per test.
+        let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "lanekeep-ruletest-{name}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        Self {
+            dir,
+            extension: extension.to_owned(),
+            config,
+        }
+    }
+
     fn write(&self, path: &str, contents: &str) -> Result<(), TestError> {
+        self.write_bytes(path, contents.as_bytes())
+    }
+
+    fn write_bytes(&self, path: &str, contents: &[u8]) -> Result<(), TestError> {
         let full = self.dir.join(path);
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(|e| TestError::Setup(e.to_string()))?;
@@ -207,7 +319,7 @@ impl RuleTester {
         self.write(&format!("subject/input.{}", self.extension), source)?;
 
         let root = RuleRoot::new(&self.dir).map_err(|e| TestError::Setup(e.to_string()))?;
-        let config_path = self.dir.join("lanekeep.config.ts");
+        let config_path = self.dir.join(self.config);
 
         let sandbox =
             lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
@@ -486,6 +598,102 @@ mod tests {
             .expect("builds")
             .reports_at("const a = <div>hi</div>;\n", &[(1, 11)])
             .expect("should report the element");
+    }
+
+    /// Not a component. These cases assert what the harness *writes*, which is the whole of what
+    /// the component constructors do; running one is `crates/lanekeep-rules/tests/no_unwrap.rs`'s
+    /// job, and it has real components to do it with. Four bytes of magic keep the fixture from
+    /// looking like something that could be loaded.
+    const NOT_A_COMPONENT: &[u8] = b"\0asm not really";
+
+    /// The generated config, parsed back.
+    fn written_config(tester: &RuleTester) -> serde_json::Value {
+        let text = std::fs::read_to_string(tester.dir.join(JSON_CONFIG)).expect("config written");
+        serde_json::from_str(&text).expect("the generated config is JSON")
+    }
+
+    #[test]
+    fn a_component_tester_writes_the_bytes_and_points_a_json_config_at_them() {
+        let tester = RuleTester::for_component("component", NOT_A_COMPONENT, "rs").expect("builds");
+
+        assert_eq!(
+            std::fs::read(tester.dir.join(COMPONENT_PATH)).expect("component written"),
+            NOT_A_COMPONENT,
+            "the bytes must reach disk unchanged — a component is identified by them"
+        );
+        assert_eq!(
+            written_config(&tester)["rules"][0],
+            serde_json::json!("./rules/rule.wasm"),
+            "the bare form is a string, which is what `lanekeep-config` reads as a rule used \
+             as it comes"
+        );
+        assert!(
+            !tester.dir.join(TS_CONFIG).exists(),
+            "a component project must not also carry a TypeScript config"
+        );
+    }
+
+    #[test]
+    fn a_configured_component_tester_embeds_its_options_as_data() {
+        // The distinction `configured` cannot make: those options are spliced into JavaScript
+        // source, and these have to survive as a value, because `configure(options-json)` is
+        // where they arrive. A harness that stringified them would hand the rule `"{...}"`.
+        let tester = RuleTester::for_component_configured(
+            "configured",
+            NOT_A_COMPONENT,
+            "rs",
+            r#"{"allow": ["subject/input.rs"]}"#,
+        )
+        .expect("builds");
+
+        assert_eq!(
+            written_config(&tester)["rules"][0],
+            serde_json::json!({
+                "rule": "./rules/rule.wasm",
+                "options": { "allow": ["subject/input.rs"] },
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_null_options_are_a_different_config_from_the_bare_form() {
+        // Three states, not two. `lanekeep-config` reads a bare string as a rule used as it
+        // comes and the object form as one configured, so a rule named with `null` options is
+        // not the same config as a rule named with none — and a harness collapsing them would
+        // make the bare case untestable.
+        let configured =
+            RuleTester::for_component_configured("null-options", NOT_A_COMPONENT, "rs", "null")
+                .expect("builds");
+        let bare = RuleTester::for_component("bare", NOT_A_COMPONENT, "rs").expect("builds");
+
+        assert_eq!(
+            written_config(&configured)["rules"][0],
+            serde_json::json!({ "rule": "./rules/rule.wasm", "options": null })
+        );
+        assert_ne!(
+            written_config(&configured)["rules"][0],
+            written_config(&bare)["rules"][0]
+        );
+    }
+
+    #[test]
+    fn options_that_are_not_json_are_refused_naming_the_options() {
+        // The failure mode this branch exists to prevent: spliced into the config unchecked, a
+        // malformed value becomes a parse error against a generated file the caller never wrote,
+        // pointing at a line number that means nothing to them.
+        let err = RuleTester::for_component_configured(
+            "bad-options",
+            NOT_A_COMPONENT,
+            "rs",
+            "{ allow: ['subject/input.rs'] }",
+        )
+        .expect_err("JavaScript object syntax is not JSON");
+
+        assert!(matches!(err, TestError::Setup(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("`options` is not valid JSON"),
+            "{err}"
+        );
     }
 
     #[test]

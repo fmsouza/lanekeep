@@ -114,11 +114,14 @@ crates/
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
   lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring
-  lanekeep-rules     built-in rules, authored in TypeScript
+  lanekeep-rules     built-in rules: TypeScript sources, plus the committed components
   lanekeep-report    human, json, sarif, agent reporters
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
   lanekeep-testkit   RuleTester
   lanekeep-cli       the binary
+rust-rules/          a second Cargo workspace: rule crates authored in Rust
+  lanekeep-rule      the SDK they share: a capture lookup and a glob matcher
+                     see docs/authoring-rust-rules.md before adding one
 cmd/lanekeep/        the Go launcher, so `go tool lanekeep` works
 docs/                architecture, playbooks
 scripts/             repository tooling, with its own tests
@@ -180,6 +183,33 @@ nothing. Only `cargo +<version>` overrides the pin. This is why `just msrv` exis
 **Most interesting rustfmt options are nightly-only.** `imports_granularity`,
 `group_imports`, `wrap_comments` and friends emit a warning per file on stable and change
 nothing. `rustfmt.toml` is stable-only on purpose; do not add them back.
+
+**And an unstable rustfmt option applies from `--config` while being ignored from
+`rustfmt.toml`, which is why `just fmt` reaches the rule crates at all.** `skip_children` is
+nightly-only like the rest, but the two ways of setting it do not behave the same on stable.
+Measured on rustfmt 1.9.0-stable, against `rust-rules/no-unwrap/src/lib.rs`:
+
+| how it is set | what stable rustfmt does |
+| --- | --- |
+| `skip_children = true` in `rustfmt.toml` | `Warning: can't set skip_children = true, unstable features are only available in nightly channel`, and the setting is **dropped** — 578 lines of diff come back, 39 of them inside the generated `bindings.rs` |
+| `--config skip_children=true` on the command line | **applied**, silently, no warning, no diff |
+
+`just fmt` and `just fmt-check` depend on that asymmetry: passing it lets rustfmt check a rule
+crate's own source without descending into the `src/bindings.rs` that `cargo component build`
+generates — a file that is gitignored, that rustfmt would otherwise want to rewrite, and that
+does not exist at all on a checkout which has never run `cargo component`, where rustfmt fails
+outright with `failed to resolve mod`.
+
+**So moving that flag into a `rust-rules/rustfmt.toml` breaks it without failing.** That move
+reads like tidying — a repeated command-line argument consolidated into the config file next to
+it — and its result is a silent no-op: `just fmt` starts rewriting a generated file, and
+`just fmt-check` starts failing on a fresh checkout. The flag stays on the command line.
+
+Do not try to establish that an option is stable by observing that rustfmt accepted it. It
+rejects an option it does not *know* — `invalid key=val pair` — and accepts every option it
+knows, stable or not: `--config wrap_comments=true`, named nightly-only two paragraphs above,
+is accepted exactly as `skip_children` is. The test tells known from unknown, not stable from
+unstable, so it returns the wrong verdict on the example already written down here.
 
 **`typos` runs with `locale = "en-us"`.** Write `behavior`, `analyze`, `capitalize` — the
 American forms — in prose and comments alike. British variants fail the gate. This is
@@ -267,6 +297,38 @@ control characters as escapes (`\u0000`), never literally.
 macOS and fail on Windows.** `/etc/passwd` is absolute on Unix and merely *rooted* on
 Windows; `C:\...` is the reverse. Build an absolute path from `std::env::temp_dir()` rather
 than writing a literal, or the same input takes a different code branch on each platform.
+
+**And the sequel to that one, which the fix for it walks straight into: a Windows path
+interpolated into a JSON string is invalid JSON.** Having built an absolute path from
+`temp_dir()` to dodge the trap above, the natural next line writes it into a fixture config with
+`format!(r#"{{"rules": ["{}"]}}"#, path.display())`. On Unix that is fine. On Windows the path is
+`C:\Users\RUNNER~1\AppData\...`, a backslash opens an escape inside a JSON string, and `\U` is not
+one — so the config fails to **parse**, with `invalid escape at line 1 column 43`.
+
+The failure is worse than a wrong answer. A test whose fixture does not parse never reaches the
+thing it was written to assert, and it fails with a message about JSON rather than about the
+property — so the property is simply unasserted on that platform, and the test reads as though it
+covers it. `a_component_reference_may_not_be_an_absolute_path` was the absolute-path half of the
+component confinement check, and it asserted nothing on the one platform where an absolute path
+has the unusual shape. Its symlink sibling is `#[cfg(unix)]`, so Windows had neither.
+
+Build the string with `serde_json::to_string`, which escapes the separators, rather than
+interpolating. This applies to any fixture that puts a real path in JSON, which is most of the
+ones that name a file outside the project root.
+
+**And that fix uncovers a third layer, which is the one that matters: `validate_specifier`
+rejects any rule specifier containing a backslash**, so on Windows a native absolute path can
+never reach the confinement check at all. The guard predates components and is right — a
+specifier is interpolated into generated JavaScript, where a backslash or a quote could break
+out — but it means a test aiming at `confine` is answered by a message about quoting instead.
+Spell the path with forward slashes: `C:/Users/...` is still absolute, because Rust accepts
+either separator on Windows, and it carries nothing the specifier guard refuses. On Unix the
+replacement is a no-op.
+
+The general shape is worth more than the three instances: **a fixture that is refused by an
+earlier gate than the one under test passes for the wrong reason, or fails with a message that
+sends you to the wrong place.** All three of these produced a red test that named JSON, or
+quoting, while the property they were written for went unasserted.
 
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
@@ -376,7 +438,8 @@ therefore reject every real rule. The comparable thing is the set of imported in
 **A rustup toolchain's *name* reaches a component's bytes, so "same compiler" is not the same as
 "same artifact".** Component builds are otherwise reproducible here — measured 2026-08-06, the nine
 `wasm32-unknown-unknown` fixtures in `crates/lanekeep-wasm/tests/fixtures/` that existed then
-(`engine-rule` arrived after, making ten) built twice from clean with `cargo component` 0.21.1
+(`engine-rule` arrived after, making ten, and `metadata` after that, making eleven) built twice
+from clean with `cargo component` 0.21.1
 produced nine pairs of byte-identical artifacts, each matching what is committed, and the
 checkout's absolute path does not appear in any of them. What does appear is a standard-library source path in a panic location, which carries the
 *toolchain directory*: `.../toolchains/stable-aarch64-apple-darwin/...` against
@@ -401,6 +464,43 @@ on it compiles — so nothing can be pushed into a `ResourceTable` and no export
 when something tries to run. The `with` key is `package/interface@version.resource`, with a *dot*
 before the resource name; a slash there fails with "interfaces were specified in the `with` config
 option but are not referenced in the target world", which reads like the interface name is wrong.
+
+**A WIT world has no optional exports, so widening it breaks every existing guest that already
+targets it, not only guests written afterward.** Adding `export metadata: func() -> rule-metadata;`
+to `world rule` made `cargo component build` refuse every one of the ten committed fixtures that
+already had an `impl Guest for Component` block, all with the same message: ``error[E0046]: not
+all trait items implemented, missing: `metadata` ``. `wit-bindgen` generates a new export as a
+required trait method with no default body, so the fix is a stub `metadata()` in each fixture —
+mechanical, but not visible from the world change alone, only from actually building a fixture
+against it. `spike` is the one committed fixture this does not reach, because it targets its own
+`wit/spike.wit` rather than the shared world. Budget for the identical fan-out the next time an
+export is added — `configure` hit every one of the same fixtures for the same reason, and by then
+the set was one fixture larger. That is the pattern: each export added to the shared world costs a
+stub in every fixture targeting it, and the bill grows as fixtures do.
+
+**A reference's own `Clone` impl is reached only when the pointee has none — this reads backwards
+on first sight, and it is worth stating the right way round rather than the intuitive-sounding
+wrong one.** `&T: Clone` holds unconditionally (`impl<T: ?Sized> Clone for &T`), but when `T`
+itself is also `Clone`, method resolution still reaches through the reference and calls `T`'s own
+impl — that is the ordinary case, relied on everywhere `x.clone()` is written on a `&T` to get an
+owned `T`. It is only when `T` has *no* `Clone` of its own that resolution falls back to the
+reference's, silently handing back the same reference. Confirmed with a two-line probe: `(&NoClone
+{}).clone()` compiles to a no-op with `#[warn(noop_method_call)]` naming the exact cause ("the type
+`NoClone` does not implement `Clone`, so calling `clone` on `&NoClone` copies the reference"); the
+identical call on `&YesClone` where `YesClone: Clone` returns an owned value with no warning at
+all. `self.rule(slot)?.clone()`, where `rule` returns `Result<&Rule, WasmError>`, hit the silent
+case — `Rule` (`bindgen!`'s generated struct) implements neither `Clone` nor `Copy`.
+
+**And chaining it into a second use is what turns a silent no-op into a diagnostic that names the
+wrong cause.** `let n = self.get()?.clone(); self.use_it(&n)` — reproduced standalone, same shape —
+fails with `E0499: cannot borrow *self as mutable more than once at a time` and prints no
+`noop_method_call` warning at all, even though the identical `.clone()` on its own does. So the one
+diagnostic that appears blames a lifetime, and the lint that would have named the real cause never
+fires in this shape. `(*self.rule(slot)?).clone()` or `Clone::clone(self.rule(slot)?)` would have
+at least traded `E0499` for `E0599: no method named `clone` found for struct `Rule``, a diagnostic
+that points at the actual problem — not a working clone, since `Rule` has none to reach. The fix
+that was actually right here was to not clone at all and reuse the `with_instance` pattern
+`has_check`/`has_reduce` already established.
 
 **A wasm trap's rendered error already contains the method name, so asserting on it proves
 nothing.** wasmtime prefixes a host function's error with a backtrace whose top frame is spelled
@@ -435,15 +535,15 @@ rest of that worker's share.
 that produces identical bytes is not one of them.** So "the source commit is newer than the
 artifact commit" is not evidence that the artifact is stale — it is equally the signature of a
 rebuild that changed nothing, and the two are indistinguishable from history alone. Three of the
-eleven committed WebAssembly fixtures read as stale that way — `bindings`, `spike` and
+eleven committed WebAssembly fixtures then read as stale that way — `bindings`, `spike` and
 `world-shape` — and all eleven turned out to be current, which only a rebuild could establish:
 `cargo component build --release` on the pinned toolchain is byte-reproducible, so
 `just wasm-fixtures` on a consistent tree leaves `git status` clean and on an inconsistent one
 does not. That is now the check rather than the investigation —
 `crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
 `tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
-there too, because ten of the eleven name it as their component target and a world edit with no
-rebuild leaves every fixture satisfying an ABI that no longer exists.
+there too, because eleven of the twelve committed today name it as their component target and a
+world edit with no rebuild leaves every fixture satisfying an ABI that no longer exists.
 
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
@@ -489,6 +589,28 @@ of them. Nothing fails: the rule loads, the query never runs, and the output rea
 a codebase with none of the thing in it. There is no *or* form, so a rule with no single
 covering substring omits the gate rather than writing one that is wrong.
 
+**QuickJS truncates a thrown error at 255 bytes, and a module-resolution failure spends most of
+that on the user's own path before your message begins.** rquickjs renders one as
+`Error resolving module '<specifier>' from '<absolute path of the importing module>': <the
+`ResolveError`>`, so the budget is `35 + specifier + path + message <= 255` — the framing is 35
+bytes and the specifier is spent *twice* when the message names it too. Nothing fails, and the
+loss is at the end.
+
+**A `ResolveError` therefore gets one line, carrying the fact and the remedy together.** Not a
+front-loaded first line with the remedy under it: that arrangement shipped here and was measured
+wrong. `\`lanekeep/x\` is a rule component` on line one with `name it in a \`lanekeep.json\`` on
+line two survived whole only to a config path of 47 characters — and
+`/Users/alice/projects/acme/packages/checkout/lanekeep.config.ts` is 63, so every user deep
+enough in a monorepo to hit the error was told they had a problem and not what to do about it.
+The one-line form clears 120.
+
+The trap inside the trap is the assertion that guarded it: "the first line is at most 80 bytes"
+is a quantity nothing depends on, and it was green for the whole life of the bug.
+`the_refusal_survives_quickjs_beside_a_long_path` in `crates/lanekeep-js/src/loader.rs` asserts
+the real inequality instead, against a stated path budget and the longest rule name that ships —
+and a test driving the binary is where the *whole* message should be asserted, because that is
+the only place a realistic path is in front of it.
+
 **A rule that declares `check(ctx, m, options)` and exports a plain object silently ignores every
 option it documents.** A handler is invoked with two arguments — `...rules[i].check(ctx, {...})` —
 so a third parameter is always `undefined`. Options reach a rule only by being closed over, which
@@ -505,14 +627,20 @@ a superset covering both shapes deliberately, because the specifier cannot say w
 — so TypeScript accepts the call that throws `not a function` at run time.
 
 Both shapes have to keep working, which is why the fix is neither "make it a factory" nor "leave
-it an object": `lanekeep init` writes a bare `"lanekeep/no-unwrap"` into a Rust project's config
-and `lanekeep-config` renders that as the imported binding itself, while the documented usage
-calls it. The rule is now a factory whose properties are copied onto the function
-(`for...in`, not `Object.assign` — the sandbox's intrinsics are an allowlist and `Object` is not
-on it), which is what `builtin.d.ts` claimed all along. **The three genuine factories —
-`no-restricted-imports`, `no-circular-imports`, `no-unused-exports` — are the mirror image and are
-not fixed: referenced bare from a JSON config they render as a function where a rule object is
-expected.** No scaffold emits one, so nothing trips it today.
+it an object": a config naming a built-in bare — `"lanekeep/no-default-export"` — has
+`lanekeep-config` render it as the imported binding itself, while the documented usage calls it.
+Such a rule is a factory whose properties are copied onto the function (`for...in`, not
+`Object.assign` — the sandbox's intrinsics are an allowlist and `Object` is not on it), which is
+what `builtin.d.ts` claimed all along. **The three genuine factories — `no-restricted-imports`,
+`no-circular-imports`, `no-unused-exports` — are the mirror image and are not fixed: referenced
+bare from a JSON config they render as a function where a rule object is expected.** No scaffold
+emits one, so nothing trips it today.
+
+The two rules this was found on, `no-unwrap` and `no-glob-import`, are components now, so neither
+is an example of it any more — a bare reference to one renders as `null`, the placeholder holding
+a component's place in the entry module's array, and its options reach it through `configure` as
+data. The trap is unchanged for the eight built-ins that are still TypeScript modules, which is
+why the example above was repointed at one of them rather than deleted.
 
 **`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
 `ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a
@@ -623,6 +751,36 @@ exit code could fail all of its cases there and still be reported as tolerating 
 pipefail` in the stub is the fix. Worth remembering generally: a stub is test code, and test
 code that always passes is worse than none.
 
+**`just mutants -- --file <path>` does not narrow anything, and does not fail in a way that says
+so.** `just` keeps the `--` inside a recipe's variadic arguments rather than consuming it, so the
+recipe expands to `cargo mutants --workspace -- --file <path>` — and `--` is cargo-mutants' own
+passthrough to `cargo test`. The filter never reaches cargo-mutants. Measured here: the intended
+form finds **1** mutant in `crates/lanekeep-wasm/src/facts.rs`, and the `--` form announces
+`Found 1765 mutants to test` — the whole workspace — then fails the unmutated baseline, because
+`cargo test` rejects the `--file` it was handed. So the run tests zero mutants after paying the
+full build, and the number it printed first was never the number it was going to test.
+
+The working form is `just mutants --file <path>`, with no `--`. Use `just --dry-run mutants ...`
+to see the expansion before committing to a long run. `--list` hides the whole thing: it does not
+invoke `cargo test`, so the broken form lists all 1765 without erroring at all.
+
+**A rule crate cannot be mutation-tested, because cargo-mutants works in a copy of the workspace
+and the crate reaches outside it.** Each rule under `rust-rules/` names the engine's world with
+`[package.metadata.component.target] path = "../../crates/lanekeep-wasm/wit"` — deliberately, so
+there is no second copy of the world to drift. cargo-mutants tests every mutant in a scratch copy
+of the workspace root, and in that copy the path resolves to nothing: `failed to parse local
+target`, then `No such file or directory`. So the component cannot be rebuilt there, and the
+custom test command the obvious wiring needs — rebuild the component, then run the cross-workspace
+expectations in `crates/lanekeep-rules/tests/` — cannot run either.
+
+What makes this worth writing down is that the *scoped* invocation looks like it works.
+`cd rust-rules && cargo mutants -p no-glob-import` finds eight mutants and reports seven MISSED,
+which reads as a rule with no test coverage. It is the opposite: that workspace has no tests at
+all, because every assertion about these rules lives in the other one. A wall of false MISSED
+results is the expected output of pointing mutation testing at the wrong workspace, not a finding.
+`--in-place` avoids the copy and mutates the real tree, which for a build that rewrites committed
+artifacts is not something to put near a gate.
+
 **A stacked pull request conflicts as soon as its parent is squash-merged.** Squashing
 replaces the parent's commits with one new commit that has a different SHA, so git sees the
 child branch and `main` as having added the same files independently. Every file conflicts
@@ -635,6 +793,37 @@ git push --force-with-lease
 ```
 
 That replays only the child's own commits onto the new `main` and drops the duplicate.
+
+**When an encoding changes, a test pinned to it needs its data re-derived, not merely re-run.**
+`two_components_cannot_run_together_into_one` (`lanekeep-config`) proved two components could
+not concatenate into one cache key by constructing a real collision under the *old* encoding:
+`hash_ruleset` used to write a `\x01` presence marker before each component's bytes, with no
+length prefix, so `a.wasm = "AA"`, `b.wasm = "BB\x01CC"` and `a.wasm = "AA\x01BB"`, `b.wasm =
+"CC"` produced the identical nine bytes `\x01AA\x01BB\x01CC` either way — the marker embedded in
+the content played the real marker's own role at the split point. Removing the marker
+(`hash_ruleset` now only length-prefixes) left that data proving nothing: with no marker to
+fake, the same two rows differ even with the length prefix hypothetically gone, so
+`length_prefixed` could be deleted from the component fold and this test stayed green — the
+code under test never changed, only what the data meant. The change that invalidated it sat
+three hundred lines away in the same commit. The fix rederived the data — `"AA" + "BBCC"`
+against `"AABB" + "CC"`, which really do collide once concatenated without a length — rather
+than trusting "still passes" to mean "still tests," and shipped in `e85521d`: a reader who goes
+looking for the corresponding change in whichever commit this paragraph sits in will not find
+it there.
+
+**"A mutation of the code under test cannot reveal a stale fixture" is not the lesson, and is
+not even true.** Two mutation-testing runs against `hash_ruleset` missed this gap, but not
+because mutating the code under test categorically cannot expose stale data under it —
+`cargo-mutants` mutates by replacing a *whole function body*, so `length_prefixed with ()` guts
+every caller at once, and `hash_config` calls `length_prefixed` too and has several tests of its
+own. That mutant dies there regardless of what `two_components_cannot_run_together_into_one`
+does. The real mechanism is narrower and more worth knowing: a mutation run reporting a shared
+helper as "caught" does not say *which* caller's test caught it, so `hash_config`'s coverage
+stood in for `hash_ruleset`'s missing coverage without either number saying so — masking
+exactly the gap it looked like it was closing. A fixture is a claim about the encoding it was
+built against, and it goes stale exactly like documentation does: silently, and without whatever
+broke it saying so. Checking whether a mutation run actually exercises the code path you think
+it does means checking which test failed, not only that one did.
 
 ## What not to do
 

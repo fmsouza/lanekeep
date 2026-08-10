@@ -30,7 +30,9 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::lanekeep::host::types::BindingKind;
+use bindings::lanekeep::host::types::{
+    BindingKind, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 /// A handle no arena in these tests will have issued.
@@ -44,6 +46,41 @@ const UNRESOLVABLE: u32 = 9999;
 struct Component;
 
 impl Guest for Component {
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
+    fn metadata() -> RuleMetadata {
+        RuleMetadata {
+            id: "fixture/bindings".to_owned(),
+            languages: vec!["rust".to_owned()],
+            severity: "error".to_owned(),
+            card: RuleCard {
+                message: String::new(),
+                remediation: String::new(),
+                examples: RuleExamples {
+                    bad: String::new(),
+                    good: String::new(),
+                },
+            },
+            query: String::new(),
+            gates: RuleGates {
+                path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
+                file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `configure` itself is tested.
+    ///
+    /// Refuses unconditionally rather than accepting anything, so a caller that reached this
+    /// export on this fixture fails loudly instead of passing on a vacuous success.
+    fn configure(_options_json: String) -> Result<(), String> {
+        Err("fixture/bindings does not implement configure".to_owned())
+    }
+
     fn has_check() -> bool {
         true
     }
@@ -70,7 +107,10 @@ impl Guest for Component {
             ("kind", Some(node)) => kind(ctx, node),
             ("all", Some(node)) => all(ctx, node),
             ("unresolvable", _) => all(ctx, UNRESOLVABLE),
-            (other, None) => say(ctx, &format!("shape: probe `{other}` has no target capture")),
+            (other, None) => say(
+                ctx,
+                &format!("shape: probe `{other}` has no target capture"),
+            ),
             (other, Some(_)) => say(ctx, &format!("unknown probe `{other}`")),
         }
     }

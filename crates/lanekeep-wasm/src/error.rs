@@ -76,6 +76,31 @@ pub enum WasmError {
         message: String,
     },
 
+    /// A component refused the options it was configured with.
+    ///
+    /// **Distinct from [`WasmError::Guest`] on purpose, and not a second spelling of it.**
+    /// Both carry a string the guest wrote, which is what makes them easy to conflate — but a
+    /// trap means `configure` could not finish (it crashed, or a host call inside it was
+    /// refused), while this means `configure` finished and declined on purpose. `configure`'s
+    /// own doc in `wit/world.wit` says why the difference is worth a caller's attention: "a
+    /// rule that cannot use its configuration has not merely misbehaved, it has been
+    /// misconfigured, and the user needs to be told which." Reusing [`WasmError::Guest`] would
+    /// erase exactly that distinction.
+    ///
+    /// **The message alone cannot prove the two are distinguished, and asserting on it alone
+    /// so nearly did.** [`WasmError::Guest`]'s own `Display` is `"rule failed: {message}"`,
+    /// which contains any guest-written text this variant's does too — so a test asserting
+    /// only `format!("{error}").contains(...)` passes whichever variant `configure` maps a
+    /// refusal onto, and proves nothing about the mapping.
+    /// `tests/metadata.rs::a_guest_that_refuses_its_options_fails_the_call_with_its_own_message`
+    /// asserts `matches!(error, WasmError::Misconfigured { .. })` for exactly this reason, kept
+    /// beside the message assertion rather than instead of it.
+    #[error("rule refused its configured options: {message}")]
+    Misconfigured {
+        /// The guest's own refusal message.
+        message: String,
+    },
+
     /// A component reaches for capability the sandbox does not grant.
     ///
     /// Read off the artifact's import list before it is instantiated, and a variant of its
@@ -220,6 +245,13 @@ mod tests {
             }
             .is_limit_breach()
         );
+        assert!(
+            !WasmError::Misconfigured {
+                message: "expected an object".to_owned()
+            }
+            .is_limit_breach(),
+            "a refusal is a configuration problem, not a budget problem"
+        );
     }
 
     #[test]
@@ -260,6 +292,19 @@ mod tests {
         }
         .to_string();
         assert!(rendered.contains("permitted: nothing"), "{rendered}");
+    }
+
+    #[test]
+    fn a_misconfigured_rules_own_message_survives_into_the_rendering() {
+        // The whole value of this variant over `Guest` is that a reader can tell "the guest
+        // declined" from "the guest crashed" without parsing prose — but both carry a string
+        // the guest wrote, so the rendering has to carry it through rather than replace it
+        // with a generic word for the case.
+        let rendered = WasmError::Misconfigured {
+            message: "expected an object".to_owned(),
+        }
+        .to_string();
+        assert!(rendered.contains("expected an object"), "{rendered}");
     }
 
     #[test]

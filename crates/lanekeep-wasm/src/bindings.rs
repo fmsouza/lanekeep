@@ -3,7 +3,7 @@
 //! Almost nothing here is hand-written. [`wasmtime::component::bindgen!`] expands the `rule`
 //! world into the Rust the rest of this crate implements against: a `Host*` trait per
 //! resource with one method per WIT function, the record, variant and enum types, and a
-//! [`Rule`] struct whose `call_*` methods invoke the four exports.
+//! [`Rule`] struct whose `call_*` methods invoke the six exports.
 //!
 //! **The generated shape is the authority, not any description of it.** If a later change
 //! expects a name the macro does not produce, the change adapts.

@@ -1,10 +1,19 @@
 # Built-in rules
 
-The rules lanekeep ships with. They are authored in TypeScript against the same host API
-project rules use, and embedded in the binary — nothing is installed, and there is no
-`node_modules` to resolve.
+The rules lanekeep ships with. They are authored against the same host API project rules use,
+and embedded in the binary — nothing is installed, and there is no `node_modules` to resolve.
 
-Import one by specifier and put it in your `rules` array:
+Name one by specifier and put it in your `rules` array. In a `lanekeep.json`, which is what
+`lanekeep init` writes:
+
+```json
+{
+  "include": ["src/**"],
+  "rules": ["lanekeep/no-default-export"]
+}
+```
+
+Or in a `lanekeep.config.ts`:
 
 ```ts
 import { defineConfig } from 'lanekeep'
@@ -19,6 +28,16 @@ export default defineConfig({
 Built-ins resolve before the filesystem is consulted, so a file at
 `lanekeep/no-default-export.ts` in your project does not shadow one. A rule whose behavior
 depended on whether a same-named file happened to exist would be unreasonable to debug.
+
+**Two are compiled rules rather than TypeScript modules**, and a `lanekeep.config.ts` cannot
+import one. `lanekeep/no-glob-import` and `lanekeep/no-unwrap` — the two Rust rules — are
+WebAssembly components: they have no JavaScript to import, and they describe themselves rather
+than being read out of a `defineRule` call. Name them from a `lanekeep.json` and everything
+below works the same, options included. Importing one from a TypeScript config fails at load
+saying so.
+
+Which form a rule takes is not part of its interface. The specifier, the id, the options and
+the output are the same either way, and a rule that changes form does not change your config.
 
 Built-in ids are namespaced `lanekeep/`. Project rules use `local/`, or a namespace the
 project declares in its config — `namespaces: ['acme']` allows `acme/no-numeric-sizes`.
@@ -383,6 +402,16 @@ objects to.
 Both Rust rules are about *legibility of dependencies and failure*: where a name came from, and
 what happens when something goes wrong.
 
+**Both are components rather than TypeScript modules**, so name them from a `lanekeep.json`:
+
+```json
+{ "rules": ["lanekeep/no-unwrap", { "rule": "lanekeep/no-glob-import", "options": { "allow": ["*prelude*"] } }] }
+```
+
+They are written in the language they check, in [`rust-rules/`](../rust-rules), and compiled to
+WebAssembly — see [`authoring-rust-rules.md`](authoring-rust-rules.md). Nothing else about them
+differs: same ids, same options, same output.
+
 ## `lanekeep/no-glob-import`
 
 ```rust
@@ -458,6 +487,10 @@ needed something a project rule cannot have would be evidence the host API is wr
    engine over a throwaway project — real config loading, real gates, real sandbox. A
    cross-file rule needs more than one file, so those live in
    `crates/lanekeep-cli/tests/<name>.rs` and drive the built binary over a real corpus.
+
+For a rule in Rust, steps 1 and 2 become `rust-rules/<name>/` and `BUILT_IN_COMPONENTS`;
+[`authoring-rust-rules.md`](authoring-rust-rules.md) has the whole of it. Step 3 is the same
+file with the same `RuleTester`, through `RuleTester::for_component`.
 
 Cover the forms that do not look like the obvious one. Every gap found while writing these
 two rules was a form that read differently in source but meant the same thing.

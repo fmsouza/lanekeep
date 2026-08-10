@@ -129,5 +129,5 @@ pub use wasmtime::component::Resource;
 
 pub use error::WasmError;
 pub use key::{EXTERNAL_BINDINGS, ExternalBinding, compile_env_hash, host_api_hash};
-pub use load::{ComponentLoader, LoadSource, Loaded, PermittedImports};
+pub use load::{COMPONENT_CACHE_PATH, ComponentLoader, LoadSource, Loaded, PermittedImports};
 pub use runtime::{RuleSet, RuleSlot, WasmEngine, WasmRuntime, engine};

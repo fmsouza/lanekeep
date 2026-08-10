@@ -27,6 +27,7 @@
 #[allow(warnings)]
 mod bindings;
 
+use bindings::lanekeep::host::types::{RuleCard, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 /// A handle no arena in these tests will have issued.
@@ -41,6 +42,41 @@ const MALFORMED: &str = "(((";
 struct Component;
 
 impl Guest for Component {
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
+    fn metadata() -> RuleMetadata {
+        RuleMetadata {
+            id: "fixture/queries".to_owned(),
+            languages: vec!["rust".to_owned()],
+            severity: "error".to_owned(),
+            card: RuleCard {
+                message: String::new(),
+                remediation: String::new(),
+                examples: RuleExamples {
+                    bad: String::new(),
+                    good: String::new(),
+                },
+            },
+            query: String::new(),
+            gates: RuleGates {
+                path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
+                file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `configure` itself is tested.
+    ///
+    /// Refuses unconditionally rather than accepting anything, so a caller that reached this
+    /// export on this fixture fails loudly instead of passing on a vacuous success.
+    fn configure(_options_json: String) -> Result<(), String> {
+        Err("fixture/queries does not implement configure".to_owned())
+    }
+
     fn has_check() -> bool {
         true
     }
@@ -212,13 +248,11 @@ fn nearest(ctx: &CheckContext) {
         return say(ctx, "shape: no declarator to start from");
     };
 
-    let found = match ctx.closest_ancestor(
-        start,
-        "(function_declaration name: (identifier) @name) @fn",
-    ) {
-        Ok(found) => found,
-        Err(problem) => return say(ctx, &format!("unexpected error: {problem}")),
-    };
+    let found =
+        match ctx.closest_ancestor(start, "(function_declaration name: (identifier) @name) @fn") {
+            Ok(found) => found,
+            Err(problem) => return say(ctx, &format!("unexpected error: {problem}")),
+        };
 
     let Some(m) = found else {
         return say(ctx, "nothing matched");

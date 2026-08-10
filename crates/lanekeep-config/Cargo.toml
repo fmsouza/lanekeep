@@ -15,6 +15,13 @@ categories.workspace = true
 blake3 = { workspace = true }
 lanekeep-core = { workspace = true }
 lanekeep-js = { workspace = true }
+
+# `lanekeep-wasm` because a component describes itself: a `.wasm` rule reference is resolved by
+# instantiating the component and reading its `metadata` export, which is the only place its
+# id, query, card and gates exist. Config loading therefore runs guest code — once, here, for
+# each component named — and a rule that refuses its options is refused with its own message.
+lanekeep-wasm = { workspace = true }
+
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

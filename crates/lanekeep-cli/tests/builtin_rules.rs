@@ -209,6 +209,126 @@ fn a_project_file_cannot_shadow_a_built_in() {
     );
 }
 
+// --- built-ins that ship as components -----------------------------------------------
+
+/// A built-in component, named exactly as `lanekeep init` scaffolds it.
+///
+/// **This is the only test that walks the whole chain in one process**: a `lanekeep.json` on
+/// disk, parsed and resolved in Rust, its component bytes taken from the embedded table, asked
+/// what it is, folded into `ruleset_hash`, compiled and executed over a real file. Every leg of
+/// that has its own unit test and until this one nothing traversed it — the engine's component
+/// tests hand it a `RuleSpec` built by hand, and the config crate's stop at a byte comparison.
+#[test]
+fn a_built_in_component_can_be_named_by_specifier() {
+    let project = Project::new(
+        "builtin-component",
+        &[
+            (
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "rules": ["lanekeep/no-unwrap"]}"#,
+            ),
+            ("src/a.rs", "fn f() {\n    let c = load().unwrap();\n}\n"),
+        ],
+    );
+
+    let output = project.check(&[]);
+    let combined = describe(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected violations to be found:\n{combined}"
+    );
+    assert!(
+        combined.contains("lanekeep/no-unwrap"),
+        "the built-in component did not report:\n{combined}"
+    );
+}
+
+/// And it is configurable, through the same specifier.
+///
+/// A component cannot close over a host-supplied value, so its options cross the boundary as
+/// data — read from the JSON here, serialized once by `lanekeep-config`, handed to `configure`
+/// on every instance. Asserting the *absence* of a violation is what makes this discriminating:
+/// a rule whose options never arrived reports, and reporting is what the test above asserts.
+#[test]
+fn a_built_in_component_can_be_configured() {
+    let project = Project::new(
+        "builtin-component-configured",
+        &[
+            (
+                "lanekeep.json",
+                r#"{"include": ["src/**"],
+                    "rules": [{"rule": "lanekeep/no-unwrap", "options": {"allow": ["src/a.rs"]}}]}"#,
+            ),
+            ("src/a.rs", "fn f() {\n    let c = load().unwrap();\n}\n"),
+        ],
+    );
+
+    let output = project.check(&[]);
+    let combined = describe(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the allow option did not reach the component:\n{combined}"
+    );
+}
+
+/// A TypeScript config cannot import one, and is told why.
+///
+/// The one capability the swap costs, pinned so it stays a stated limit rather than a surprise.
+/// A component has no JavaScript to evaluate and its identity comes from its own `metadata`
+/// export, so there is nothing for an `import` to bind. What must not happen is the message
+/// this would otherwise get — "no built-in rule by that name" — which is what a typo looks like
+/// and would send its author hunting for a misspelling that is not there.
+///
+/// **The remedy is asserted here, and it is the half worth asserting.** QuickJS truncates a
+/// thrown error at 255 bytes and rquickjs spends the front of that on the importing module's
+/// absolute path — here a temporary directory over a hundred characters long, which is what
+/// makes this the realistic test rather than the unit one. An earlier two-line version of the
+/// message lost "name it in a `lanekeep.json`" to exactly this path, and this test passed,
+/// because it only checked the first line. Telling a user their config is wrong without telling
+/// them the one thing that fixes it is barely better than the "no built-in rule by that name"
+/// this replaced.
+#[test]
+fn a_typescript_config_cannot_import_a_built_in_component() {
+    let project = Project::new(
+        "builtin-component-imported",
+        &[
+            (
+                "lanekeep.config.ts",
+                "import { defineConfig } from 'lanekeep';\n\
+                 import noUnwrap from 'lanekeep/no-unwrap';\n\
+                 export default defineConfig({ include: ['src/**'], rules: [noUnwrap] });\n",
+            ),
+            ("src/a.rs", "fn f() {\n    let c = load().unwrap();\n}\n"),
+        ],
+    );
+
+    let output = project.check(&[]);
+    let combined = describe(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a config that cannot load is a runtime error, not a clean run:\n{combined}"
+    );
+    assert!(
+        combined.contains("lanekeep/no-unwrap"),
+        "the error does not name the specifier:\n{combined}"
+    );
+    assert!(
+        combined.contains("is a rule component"),
+        "the error must say what the rule is, not that it is missing:\n{combined}"
+    );
+    assert!(
+        combined.contains("name it in a `lanekeep.json`"),
+        "the remedy has to survive the truncation, or the error is not actionable:\n{combined}"
+    );
+    assert!(
+        !combined.contains("no built-in rule by that name"),
+        "a component-backed built-in is not a typo, and must not be reported as one:\n{combined}"
+    );
+}
+
 #[test]
 fn the_rules_command_lists_a_built_in() {
     let project = Project::new(

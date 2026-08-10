@@ -69,10 +69,12 @@ Three things follow from who reads the output:
 - **It runs in the inner loop.** Agents and developers invoke it after every edit, so a warm run
   is measured in tens of milliseconds.
 
-**Rules are authored in TypeScript whatever language they check.** One embedded language keeps the
-sandbox, the cache and the host API single-implementation, and it is the one most teams already
-have someone who writes. **Configuration is not** — `lanekeep.json` is plain data, so a Go, Python
-or Rust team never writes a `.ts` file except when authoring an actual rule.
+**Rules are authored in TypeScript whatever language they check** — that is the form to start
+from, and it is the one most teams already have someone who writes. A rule may also be a
+WebAssembly component, which is how the two Rust-checking built-ins ship; both forms reach the
+same host API and are held to the same limits, and a config names a rule rather than its
+implementation. **Configuration is neither** — `lanekeep.json` is plain data, so a Go, Python or
+Rust team never writes a `.ts` file except when authoring an actual rule.
 
 ## Using it
 
@@ -142,9 +144,10 @@ launcher and the Homebrew formula say so rather than failing obscurely.
 lanekeep is meant to run as a pre-commit hook and inside CI, which makes it a supply-chain target.
 Rules are executable code, so the posture is about confinement rather than absence:
 
-- **No ambient authority.** Rules run in an embedded QuickJS sandbox and reach exactly the host
-  functions lanekeep exposes. `fs`, `process`, `child_process`, network and dynamic import are not
-  restricted — they do not exist in the context.
+- **No ambient authority.** A TypeScript rule runs in an embedded QuickJS sandbox and a
+  WebAssembly rule under wasmtime; both reach exactly the host functions lanekeep exposes. `fs`,
+  `process`, `child_process`, network and dynamic import are not restricted — they do not exist in
+  the context. A component imports one interface and is refused at load if it imports another.
 - **No network access.** Ever, in any mode, with no configuration that enables it.
 - **Filesystem confinement.** Reads go through a tracked host call, confined to the project root.
   Writes happen only under `--fix`, only to matched files, only within reported ranges.

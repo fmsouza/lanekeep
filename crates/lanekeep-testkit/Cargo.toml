@@ -18,6 +18,10 @@ lanekeep-engine = { workspace = true }
 lanekeep-js = { workspace = true }
 lanekeep-lang-js = { workspace = true }
 lanekeep-languages = { workspace = true }
+# For the component testers, which generate a `lanekeep.json`. Building it with `format!` would
+# work and would turn a caller's malformed `options` into a config parse error somewhere
+# downstream, which is exactly the confusion `TestError`'s variants exist to prevent.
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

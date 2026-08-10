@@ -1,0 +1,5 @@
+# Anchored literal paths only. `crates/lanekeep-wasm/tests/fixture_currency.rs` parses
+# .gitignore files under that directory's fixtures and asserts every line starts_with('/')
+# and contains no glob metacharacter — this file is not read by that parser, but it follows
+# the same convention on purpose rather than by accident.
+/target

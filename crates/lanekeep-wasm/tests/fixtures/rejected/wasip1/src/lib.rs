@@ -15,11 +15,47 @@
 #[allow(warnings)]
 mod bindings;
 
+use bindings::lanekeep::host::types::{RuleCard, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
 
 impl Guest for Component {
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
+    fn metadata() -> RuleMetadata {
+        RuleMetadata {
+            id: "fixture/wasip1".to_owned(),
+            languages: vec!["rust".to_owned()],
+            severity: "error".to_owned(),
+            card: RuleCard {
+                message: String::new(),
+                remediation: String::new(),
+                examples: RuleExamples {
+                    bad: String::new(),
+                    good: String::new(),
+                },
+            },
+            query: String::new(),
+            gates: RuleGates {
+                path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
+                file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `configure` itself is tested.
+    ///
+    /// Refuses unconditionally rather than accepting anything, so a caller that reached this
+    /// export on this fixture fails loudly instead of passing on a vacuous success.
+    fn configure(_options_json: String) -> Result<(), String> {
+        Err("fixture/wasip1 does not implement configure".to_owned())
+    }
+
     fn has_check() -> bool {
         true
     }
@@ -33,7 +69,11 @@ impl Guest for Component {
         // the target rather than of how little this guest does.
         let path = ctx.file_path();
         let names: Vec<&str> = m.iter().map(|entry| entry.name.as_str()).collect();
-        ctx.report(ctx.root(), Some(&format!("{path}: {}", names.join(","))), None);
+        ctx.report(
+            ctx.root(),
+            Some(&format!("{path}: {}", names.join(","))),
+            None,
+        );
     }
 
     fn reduce(_: &ReduceContext) {}

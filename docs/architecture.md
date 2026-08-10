@@ -11,8 +11,8 @@ Not a linter in the ESLint sense. ESLint enforces language-level correctness; la
 ### v1 goals
 
 - TypeScript / JavaScript (incl. TSX/JSX).
-- **Rules are programs, authored in TypeScript** — the same language as the code they inspect. Turing-complete, with no expressiveness ceiling to hit.
-- **Rules run sandboxed inside the binary.** An embedded JavaScript engine, reaching only host functions lanekeep chooses to expose.
+- **Rules are programs, authored in TypeScript** — the same language as the code they inspect. Turing-complete, with no expressiveness ceiling to hit. A rule may also be a WebAssembly component, which is how the two Rust-checking built-ins ship (§4); TypeScript is the form a project starts from and the one this document is written in.
+- **Rules run sandboxed inside the binary.** An embedded JavaScript engine, or wasmtime for a component, reaching only host functions lanekeep chooses to expose.
 - **The hot path stays in Rust.** A rule declares a tree-sitter query; Rust matches it at native speed and calls into TypeScript only on matches.
 - Built-in rules ship with the tool and are authored against the same API user rules use.
 - One-shot CLI as the default execution model.
@@ -25,7 +25,7 @@ An earlier draft of this design made rules declarative data — a query plus a f
 
 That trade was wrong for this tool. The rules that matter are the ones specific enough that nobody else would ever write them, which is exactly the population a fixed vocabulary fails. And rule authors are TypeScript developers; asking them to learn a bespoke YAML predicate dialect to describe TypeScript is friction with nothing on the other side of it.
 
-So rules are TypeScript programs. Everything below follows from holding that alongside the performance and determinism goals, rather than trading them away for it. See §6 for the boundary that makes it safe, and §7 for the shape that makes it fast.
+So rules are programs rather than declarative patterns, and TypeScript is the form a project starts from. Everything below follows from holding that alongside the performance and determinism goals, rather than trading them away for it. See §6 for the boundary that makes it safe, and §7 for the shape that makes it fast. §4 covers the second authoring form, a WebAssembly component, which changes the language and the engine and none of the reasoning here.
 
 ### Explicit non-goals for v1
 
@@ -36,7 +36,7 @@ So rules are TypeScript programs. Everything below follows from holding that alo
 
 ### Distribution
 
-Single static Rust binary with the JavaScript engine compiled in — no Node.js required to run lanekeep, even though rules are written in TypeScript. Shipped via npm (platform packages + thin wrapper, the esbuild/swc/Biome pattern), PyPI (one platform wheel per target, no wrapper — a wheel names its own platform and pip picks by that tag), cargo, and Homebrew — the last from a tap rather than homebrew-core, whose notability requirements a new project does not meet.
+Single static Rust binary with the JavaScript engine and wasmtime compiled in — no Node.js required to run lanekeep, even where rules are written in TypeScript, and no toolchain required for a component, which ships as bytes. Shipped via npm (platform packages + thin wrapper, the esbuild/swc/Biome pattern), PyPI (one platform wheel per target, no wrapper — a wheel names its own platform and pip picks by that tag), cargo, and Homebrew — the last from a tap rather than homebrew-core, whose notability requirements a new project does not meet.
 
 A checker that reads Python should be installable by a Python project on its own terms; the alternative was telling a `pip`/`uv` team to install Node. The Linux binaries are built against glibc 2.17 so the `manylinux_2_17` tag those wheels carry is true, and that floor is asserted against the binary rather than assumed — see [`docs/releasing.md`](releasing.md).
 
@@ -89,6 +89,7 @@ lanekeep/
     lanekeep-engine/     # the walker: discovery, gates, parsing, handler invocation
     lanekeep-js/         # embedded engine, sandbox, host API, module loader
     lanekeep-query/      # query parsing + compilation
+    lanekeep-nodes/      # the node arena: handles shared by every rule-execution engine
     lanekeep-lang/       # Language trait + registry
     lanekeep-lang-js/    # TS/TSX/JS/JSX grammars + binding resolution
     lanekeep-lang-python/ # Python grammar + binding resolution
@@ -97,11 +98,15 @@ lanekeep/
     lanekeep-languages/  # the set of supported languages, assembled in one place
     lanekeep-config/     # schema, config loading, canonicalization + hashing
     lanekeep-cache/      # content-addressed store with dependency tracking
-    lanekeep-rules/      # built-in rules (authored in TypeScript, embedded at build time)
+    lanekeep-wasm/       # component execution: the WIT host API, wasmtime wiring
+    lanekeep-rules/      # built-in rules, embedded at build time (TypeScript, and
+                         #   the two components built from rust-rules/)
     lanekeep-report/     # human, json, sarif, agent reporters
     lanekeep-cli/        # binary
     lanekeep-server/     # LSP + MCP over stdio
     lanekeep-testkit/    # RuleTester: fixture-based snapshot harness
+  rust-rules/            # a second Cargo workspace: rule crates authored in Rust
+    lanekeep-rule/       #   the SDK they share
   cmd/lanekeep/          # the Go launcher, so `go tool lanekeep` works
   npm/                   # platform packages + wrapper
   benches/
@@ -141,7 +146,11 @@ Implement this on day one even though only `lanekeep-lang-js` exists. It is chea
 
 ## 4. Rule definition format
 
-A rule is a TypeScript module with a default export: metadata, a tree-sitter query that gates execution, and a handler invoked once per match.
+A rule declares metadata, a tree-sitter query that gates execution, and a handler invoked once per match. There are two ways to author one, and the rest of the engine treats them alike: **a TypeScript module with a default export**, evaluated in the sandbox of §5, or **a WebAssembly component** exporting the `rule` world of §6.9, executed by wasmtime. `RuleSpec::component` is the single field that decides which engine a rule goes to, and it is set where a rule is described rather than guessed at anywhere downstream.
+
+Neither is privileged. A component is held to the same validation a TypeScript rule is — namespace, card, query, `has-check` — by the same code, and both engines run in one pass over one corpus. Which form a rule takes is invisible to a config: `lanekeep/no-unwrap` names the rule, not its implementation, so a rule migrating from one to the other requires no config change. Two of the built-ins are components today, both of them the ones that check Rust; `docs/authoring-rust-rules.md` is how one is written.
+
+The TypeScript form is the one everything below is written in, because it is the one a project starts from.
 
 ```ts
 import { defineRule } from 'lanekeep'
@@ -238,6 +247,8 @@ A rule sees only its own facts. Reading another rule's would turn a private payl
 
 ## 5. The JavaScript host
 
+One of the two rule-execution engines, and the one every project starts from. It runs the TypeScript form of §4; §6.9 is the other. Everything in this section is about that engine specifically — a component reaches none of it, and neither the stripper nor the module loader nor QuickJS is on its path at all.
+
 ### 5.1 Engine
 
 QuickJS, embedded via `rquickjs`. Chosen over V8 and Boa for a combination of reasons: it compiles into a static binary at roughly a megabyte rather than tens, it starts in microseconds rather than milliseconds — which matters when the warm-run budget is 25 ms — and its runtime is straightforwardly one-per-thread, which is what rayon wants.
@@ -282,6 +293,8 @@ Rule modules are compiled to QuickJS bytecode once per run, then instantiated in
 The previous design's security posture was "rules are data, so there is nothing to execute." That is gone. What replaces it is narrower but still strong: **rules are code, but the only things they can reach are the functions lanekeep hands them.** There is no ambient `fs`, no `process`, no network, no dynamic import. Those globals are not restricted — they are absent.
 
 This is a stronger position than a conventional plugin system offers, where a plugin inherits the full authority of the host process.
+
+**It is one API with two spellings.** The tables below give the JavaScript one, which is what a TypeScript rule calls. A component reaches the same functions as methods on `check-context` and `reduce-context`, declared in `crates/lanekeep-wasm/wit/world.wit` — `ctx.report(node)` is `ctx.report(node)` there too, in kebab-case. §6.9 covers what a component has that a TypeScript rule does not, and it is only what the difference in form forces. The two are not generated from one source and that gap is recorded in the world's own header; the *absence* claims below are structural in both, because a component reaches exactly what its world declares.
 
 ### 6.1 Reporting
 
@@ -369,10 +382,16 @@ Turing-complete rules can fail to terminate. Three limits, all mandatory, all on
 | Limit | Default | Scope |
 |---|---|---|
 | `timeouts.rule` | 1 s | One handler invocation — a single `check` call, or a single `reduce` call |
-| `timeouts.global` | 15 s | Wall clock for the entire run, across all rules and files |
+| `timeouts.global` | 15 s | Wall clock for one phase of guest execution — see below |
 | `limits.memory` | 64 MiB | Per JavaScript runtime, so per rayon worker |
 
 Both timeouts are configurable in `lanekeep.config.ts`, and `timeouts.global` also via `--timeout`. An individual rule may raise its own invocation budget with a `timeout` field in `defineRule` — the escape valve for a `reduce` that legitimately processes a large corpus, without loosening the default for every rule.
+
+**`timeouts.global` bounds a phase, not the process, and there are two phases that run guest code.** Config load starts a clock of its own for the `metadata`, `configure` and probe calls a component answers at load time, and the run starts a second one. A configured 15 s therefore permits up to 30 s of wall clock across a single invocation, and a third phase would make it 45. This is not a break of the limits invariant — each clock still cancels the run outright rather than degrading it, and the pattern predates components, since a `lanekeep.config.ts` has always evaluated guest code before any run clock existed. It is stated here because the number reads as a bound on the process and is not one.
+
+**One number reaches both phases, and getting that wrong was the interesting failure.** `--timeout` is resolved before the config is loaded and handed in, so the config-load clock and the run clock are built from the same value. They were not always: the flag used to be applied to the loaded `Config`, one statement after config load had already instantiated, configured and read `metadata` from every component under whatever the config file said. A component whose `configure` overran therefore failed with a message ending "raise it with `--timeout`" — and raising it changed nothing, because the phase that breached had finished before the flag was read. That is the same shape as the original `--timeout` bug recorded in `AGENTS.md`, recurring in a phase that did not exist when it was first found, which is why a test for it has to **assert the raise**: a test that only lowers a budget passes against a budget nothing applies.
+
+What is still per phase is the *clock*, not the number. Anyone wanting a true process bound should thread one clock from the caller rather than starting one per phase; the reason that is not done already is that config load is reached from callers that never start a run at all.
 
 The two levels do different jobs. The per-invocation limit fires fast and **names the culprit**: which rule, which file, which phase. The global limit is the backstop for the case no single invocation is pathological but the aggregate is — a thousand rules each taking 20 ms. Keeping the per-rule default well under the global one means the diagnostic almost always comes from the level that can identify the cause.
 
@@ -387,6 +406,25 @@ Mechanically: the per-invocation limit uses QuickJS's interrupt handler for a Ty
 **Cache entries for files that fully completed are still committed.** Each entry is independently valid — it records the result of running every rule against that file to completion — and discarding them would mean a corpus that times out on a cold run times out identically on every retry, with no way to make progress. Files that were in flight when the run aborted are not written. An aborted run also **merges rather than prunes**: pruning is what ages a deleted file out and is sound only for a run that saw the whole corpus, so a run that stopped early would otherwise age out every file it never reached and leave the next run colder than the one that failed.
 
 Both halves became true in the same release and neither had been true before it, which is worth stating because this section has a history of describing behavior nothing implemented. The *commit* half this section always required and nothing did: `run_files` returned on the first error before it reached the save, so an aborted run wrote no entry at all, and a corpus that overran its budget would have been stranded cold forever the moment that budget started being enforced. The *no-prune* half is doctrine added alongside that fix, and it could not have been stated earlier — there was no save whose pruning behavior anyone had to decide. `lanekeep-engine`'s `an_aborted_run_still_commits_the_files_that_finished`, `an_aborted_run_does_not_prune_what_it_never_reached` and `a_full_run_still_prunes` are what hold the three claims above, and a claim added here without one is a claim in the position these were.
+
+### 6.9 The component surface
+
+A component rule is a WebAssembly component exporting the `rule` world. It reaches the same host API as §6.1–6.5 and is subject to the same limits as §6.7 — enforced by wasmtime's epoch interruption where a TypeScript rule is enforced by QuickJS's interrupt handler — and its absences are §6.6's, structurally: it imports exactly one interface, `lanekeep:host/types`, so there is no wall clock, no filesystem and no entropy to remove, because none was ever bound. A component built for `wasm32-wasip1` imports eleven instances rather than one — the host interface plus ten WASI ones — and is refused at load. Two of those three categories are among them, a wall clock and a filesystem; `wasi:random` is not imported, so the entropy an unconstrained build *could* reach is one this particular artifact does not.
+
+It has four exports a TypeScript rule has no need of, and each exists because a component cannot do what a module does:
+
+| Export | Why it exists |
+|---|---|
+| `metadata() -> rule-metadata` | A TypeScript rule's id, languages, severity, card, query, gates and timeout live in its `defineRule` call, and evaluating the module is how they are read. Nothing can evaluate a component to read a literal, so it answers for itself — once, at config load. |
+| `configure(options-json) -> result<_, string>` | A JavaScript factory closes over its options. A component cannot close over a host-supplied value, so options cross as JSON data, once per instance, before any handler runs. A component that refuses its options fails config load with its own message, which is a refusal rather than a trap. |
+| `has-check() -> bool` | Extraction records whether a TypeScript rule's `check` is callable, because a misspelled handler would otherwise load cleanly and never fire. A component is asked the same question rather than taken at its config's word. |
+| `has-reduce() -> bool` | The same, for the cross-file phase. |
+
+`configure` is a permanent expressiveness difference and not an implementation gap: a factory can be handed a function or a regular expression, and JSON cannot carry either. That is the cost of a boundary that serializes, and it is paid deliberately.
+
+The world's bytes are a cache-key input (§8.1, `host_api_hash`), so widening this surface invalidates every cached result — the same property `HOST_API_VERSION` gives the JavaScript half, except that this one needs nobody to remember.
+
+`docs/authoring-rust-rules.md` is the playbook for writing one.
 
 ---
 
@@ -457,7 +495,11 @@ Three things people get wrong here, all of which are silent-staleness bugs:
 
   It hashes module **source bytes**, not a canonicalized form. An earlier draft required canonicalization so that reformatting would not invalidate while editing a regex would — which was achievable when rules were declarative data and canonicalizing meant normalizing a parsed value. Canonicalizing arbitrary TypeScript would mean shipping a formatter and committing to its output forever. So reformatting a rule *does* invalidate its cached results. That is over-invalidation, costing a recompute; the opposite error — serving results computed by code that no longer exists — is the one this section exists to prevent, and the two are not symmetric.
 
-  It also covers **every rule component's bytes**, path-sorted, alongside the modules — a component is the code a rule is made of exactly as a module is. Its bytes and not its resolved path, which is absolute: hashing the path would throw a cache away for moving a checkout, and which component a rule *names* is `config_hash`'s through the specifier. A component that cannot be read folds in a marker rather than nothing, for the reason §8.2 gives about absent files.
+  It also covers **every rule component's bytes**, path-sorted, alongside the modules — a component is the code a rule is made of exactly as a module is. Its bytes and not its resolved path, which is absolute: hashing the path would throw a cache away for moving a checkout, and which component a rule *names* is `config_hash`'s through the specifier. Each component's bytes are length-prefixed, and the length is the whole of the delimiting: a `.wasm` is arbitrary binary, so any byte used as a separator could appear inside one, and without the length two different rulesets can concatenate into the same byte sequence.
+
+  **It folds bytes that were already read, rather than reading the paths itself**, which is the property the module half has for free — the loader records what it consumed. A component is read exactly once per run, when the configuration is loaded: those bytes answer `metadata`, those bytes are folded here, and those bytes are what executes. Reading at each of the three points would let a file that changed in between describe one rule, key a second and run a third, with every check passing.
+
+  This is why **absence is not encoded here**. An earlier version folded a present/absent marker per component, so that a missing component and a present one could not share a key, on §8.2's rule about absent files. Carried bytes cannot represent absence — and do not need to: a component that cannot be read fails configuration loading, so the run whose key would have been wrong never happens. The case is deleted rather than given a wrong encoding, which is stronger than the marker was.
 
 - **`config_hash` is canonicalized properly**, because configuration values genuinely are structured data. The severity map is ordered, so writing the same entries in a different order hashes the same, and `include`/`exclude` are sorted, since reordering globs changes nothing about which files are selected.
 - **Relative path belongs in the key.** Path gates make results path-sensitive; a moved file with identical bytes is not a cache hit.
@@ -648,10 +690,11 @@ One-shot is the default and CI runs it unchanged. `--watch` is a foreground loop
 
 Rules are executable code. The posture is therefore about **confinement**, not absence:
 
-- **No ambient authority.** Rule code reaches exactly the host functions in §6 and nothing else. `fs`, `process`, `child_process`, network and dynamic import are not restricted — they do not exist in the context.
+- **No ambient authority, in either engine.** Rule code reaches exactly the host functions in §6 and nothing else. For a TypeScript rule that is QuickJS with `fs`, `process`, `child_process`, network and dynamic import absent from the context rather than restricted within it. For a WebAssembly component (§6.9) it is structural: the component imports exactly one interface, `lanekeep:host/types`, so a clock, a filesystem and an entropy source were never bound and there is nothing to remove. A component importing anything else is refused at load rather than sandboxed at run time: the `wasm32-wasip1` build kept as a fixture imports **eleven** instances — the host interface plus ten WASI ones, among them `wasi:clocks/wall-clock`, `wasi:filesystem/types`, `wasi:filesystem/preopens` and the five `wasi:cli` interfaces — which is the ambient authority this check exists to keep out.
 - **No network.** Ever, in any mode, with no configuration that enables it.
+- **Config load executes guest code, including WebAssembly.** A component answers `metadata`, `configure`, `has-check` and `has-reduce` when a config naming it is read, so `lanekeep rules` and `lanekeep explain` — which check no files — run guest code where they previously ran none. The confinement is the same one; the surface is that reading a config is enough to reach it. A `lanekeep.config.ts` has always had this property, and a `lanekeep.json` naming a component now has it too.
 - **Filesystem confinement.** Reads happen only through `ctx.readFile`, only within the project root, with traversal rejected. Writes happen only under `--fix`, only to files a rule reported on, and only within the byte range of a node that rule matched.
-- **Bounded execution.** A per-invocation timeout, a 15-second global run budget, and a per-runtime memory ceiling (§6.7). None disableable, and breaching any of them cancels the run rather than degrading to a partial result (§6.8).
+- **Bounded execution.** A per-invocation timeout, a 15-second budget per phase of guest execution, and a per-runtime memory ceiling (§6.7). None disableable, and breaching any of them cancels the run rather than degrading to a partial result (§6.8). Note the per-phase scope: config load and the run each get the budget, so the process bound is a multiple of the configured number.
 - **Determinism by construction.** No clock, no randomness (§6.6).
 - Every built-in rule is reviewed by a maintainer.
 - Supply chain: npm provenance / sigstore attestations, CI pinned to SHAs, `cargo-deny` + `cargo-audit` in CI, minimal dependency surface. This is a pre-commit-hook-adjacent tool and therefore a target.
@@ -670,7 +713,9 @@ Cheap now, breaking changes later. Lock all five before writing much code.
 2. **The host API is in the cache key** (§8.1), so adding a `ctx` function invalidates correctly rather than silently serving results computed without it. The component half is a *hash* of `wit/world.wit` rather than a version, because the version had to be bumped by hand and nothing detects a missed bump; QuickJS's half is still a hand-maintained number and leaves with the last JavaScript rule.
 3. **Tracked effects from the start.** Retrofitting dependency tracking onto a cache that assumed purity means every existing entry is unsound. `deps` ships with the first cache.
 4. **Nodes cross the boundary as handles, never as objects.** Materializing an AST for JavaScript is a decision that cannot be walked back once rules depend on the object shape.
-5. **A clean internal `Rule` boundary.** Built-in rules are authored in TypeScript against the same host API as user rules — the strongest available evidence that the API is sufficient. Should a built-in ever need to be reimplemented in Rust for speed, it does so behind the same ID and the same trait.
+5. **A clean internal `Rule` boundary.** Built-in rules are authored against the same host API as user rules — the strongest available evidence that the API is sufficient. A built-in needing to be reimplemented in another language does so behind the same ID and the same trait.
+
+    **This one has been walked through, which is the only way a door gets tested.** The two Rust-checking built-ins were TypeScript modules and are WebAssembly components now (§4), and no config naming them changed: `lanekeep/no-unwrap` named the rule rather than its implementation before the port and still does. What the door bought is visible in what the port did *not* touch — rule IDs, suppression comments, output shape, the cache key's structure. Had the boundary been anything less than a trait both forms implement, that migration would have been a breaking change to every consumer instead of an internal one.
 
 ---
 
@@ -783,6 +828,10 @@ And one thing it has ruled out, which is worth as much:
 
 The remaining warm cost is reading and hashing every file to discover what changed, plus loading and rewriting a whole-corpus cache file. Beating it needs either a cheaper staleness check than content hashing, or a cache format that can be written in part.
 
+**A component must be compiled once per project, not once per config load.** Config load asks each component what it is (§6.9), which means compiling it, and compiling one is tens of milliseconds — so a config load with nowhere to cache the result pays that on every invocation, and pays it again at prepare time through the engine's own loader. Measured on the release binary before this was closed: `lanekeep rules` on a one-component project took 67.6 ms against 8.6 ms for a TypeScript-only one, and 124.3 ms with two components — a command that checks no files, exceeding the 25 ms warm budget on config load alone. It compounds because config load is not once per session: it runs per LSP request, per MCP tool call and per `--watch` iteration, and `lanekeep init` scaffolds a component-backed rule into every Rust project.
+
+The fix is that config load and the engine share one artifact cache, `.lanekeep/components`, so the first run in a project compiles once and every later run maps what it wrote. After: 8.6 ms and 9.3 ms for one and two components, against 10.8 ms for TypeScript only — components no longer measurably cost anything at config load. The first run in a project still pays the compile, ~70 ms per component, and that is the number to expect after a rule's bytes change. `lanekeep_config::load` keeps the uncached behavior, because a caller that has not named a project root has not asked for a directory to be written.
+
 **The report is absolute; the gate is relative.** Absolute numbers cannot be gated on a hosted runner: this suite's first CI run measured a cold pass at 10.9 s against 1.5 s on a developer machine, seven times slower, on hardware that varies between runs. Any absolute threshold loose enough not to flake there is too loose to catch anything.
 
 So the two jobs are separated. The report prints every scenario against its budget, exactly, on every run — that is what shows a 20% regression to someone reading the log, and it is why the budgets stay in the table even though none is met. The gate asserts only machine-independent ratios, chosen to be the claims the design rests on:
@@ -800,6 +849,35 @@ Instrumentation behind `--profile` only, reporting per-rule time split between q
 It goes to stderr, so `--profile --format json` still pipes a clean document, and it is sorted by total cost with the rule id breaking ties, so the table does not reorder between runs for reasons nobody can see. A rule that matched nothing still appears: its query ran on every file, and the rule whose query is expensive *and* matches nothing is the worst case there is.
 
 Off by default, because measuring costs a clock read per handler invocation and the warm path is the one place that matters most.
+
+### 15.1 What a host-API crossing costs, in each engine
+
+§4's invariant is that JavaScript executes proportional to matches and that any change increasing boundary crossings per file needs a benchmark rather than an argument. Putting a rule in a WebAssembly component was expected to leave the number of crossings alone and change what one costs, because the canonical ABI copies strings and lists through linear memory where `rquickjs` handed QuickJS a value. That was the one unmeasured quantity that could have inverted the case for components, and the decision record made measuring it a condition of acceptance. `benches/crossings.rs` is the measurement.
+
+**The subject is `lanekeep/no-unwrap`, run as both.** It exists in two forms — the TypeScript module that was the shipped rule until `1fb5d06`, and the component that replaced it — and it is the heavier of the two ported built-ins by a wide margin. The two corpora are byte-identical except for a six-character method name: `unwrap`, which sends the rule up the ancestor chain looking for a `#[test]`, against `mapmap`, which it drops after one call. Everything that is not a crossing — reading, hashing, parsing, query matching, the invocation itself — is identical on both sides and subtracts out.
+
+Measured 2026-08-10, Apple M3 Max (14 cores), macOS 26.5.2, rustc 1.95.0, wasmtime 47.0.3, rquickjs 0.12, tree-sitter 0.26. **Both arms in one session on one machine**, single-threaded so that a figure printed as nanoseconds per call is nanoseconds per call and not a throughput divided by the width of the machine.
+
+| Arm | Cold corpus | Hot corpus | Difference | Host calls | Per call |
+|---|---|---|---|---|---|
+| TypeScript, QuickJS | 115 ms | 294 ms | 179 ms | 593,280 | ~302 ns |
+| component, wasmtime | 78 ms | 216 ms | 138 ms | 414,720 | ~332 ns |
+
+**"Host calls" is the *marginal* count, `hot − cold`, which is what "Difference" is divided by.** The cold corpus makes 3,840 calls in either arm — one per subject, before the method name sends the rule up the ancestor chain — so the marginal counts are 3,840 below the hot totals of 597,120 and 418,560 that the prose below cites and the bench prints in its own block. Both quantities are right and they are not the same one: a per-call figure has to divide a marginal time by a marginal count, or it is a rate between two different populations. This has been "corrected" once, in the direction of making the table agree with the prose and stop agreeing with the measurement. Run `cargo bench -p lanekeep-engine --bench crossings` before changing it; its `calls` column is this one.
+
+**A host call costs about 1.1× through a component.** More than a dozen runs on a settled machine gave 1.06 to 1.12 — QuickJS 298–308 ns, component 322–335 ns — which is the whole of the spread. (A run started immediately after a rebuild reads outside it, up to 1.15; the QuickJS side is the steady one and the component side is where the noise lives.) The performance argument is not inverted, and it is not close to inverted.
+
+**The denominators are different on purpose, and that is half the result.** The port hoisted `line(ancestor)` and `column(ancestor)` out of the sibling loop, so the component saves two calls per sibling it scans; against that it pays one more per match, because `filePath` is a property under QuickJS and a method on `check-context`. Over this corpus the component makes 30% fewer host calls than the rule it replaced. A benchmark that divided both times by one crossing count would have reported the two rules' relative efficiency and called it the cost of the boundary — and would have concluded, wrongly, that a component crossing is *cheaper*.
+
+So the end-to-end direction and the per-call direction disagree, and both are true: the component arm is **faster** on this corpus, by 27% on the hot one, while each of its host calls is dearer.
+
+Three things this does not say.
+
+- **It is not the cost of the boundary alone, and the split beneath it is indicative rather than measured.** Between two crossings a rule also executes, and that execution is interpreted bytecode in one arm and compiled code in the other. The bench separates the arena work — the same call sequence replayed against the same `NodeArena` with no engine in the way — and what remains is the crossing *plus* the in-guest execution, which nothing here splits further. Over seven runs the arena figures are steady, 200.8–203.1 ns and 233.2–237.2 ns; the residues are 100.6–106.8 ns and 86.6–101.2 ns. **Those two ranges nearly touch.** The residue is a difference of two separately timed quantities, so it carries the whole of the engine measurement's absolute noise on a third of the magnitude — 15% against the 4% of the figure it came from. The direction held in every run observed, and the gap is not established at the precision the numbers are printed to. So: about two-thirds of a QuickJS call and about three-quarters of a component call is shared arena work, and the honest reading of a residue that favors the component is not that the canonical ABI is cheaper than `rquickjs` — it is that whatever the ABI costs extra, compiled guest code appears to more than pay back. **The headline ratio is the result; this split is the scale it sits on.**
+- **They are two call mixes, not one.** Both are dominated by scalar and short-string returns plus one `named-children` per match returning a list as long as the file's top-level items — but they are not the same mix, and for the same reason the denominators differ: the hoist above removes two cheap position lookups per sibling from the component's sequence, so a larger share of what is left is string-returning. That asymmetry, and the violation construction and cache write that sit inside the timed region on the hot corpus only, both bias **against** the component. 1.1× is a ceiling rather than a midpoint. A rule that moves large lists will meet the copy cost more directly than this one does.
+- **The call counts are replayed, not counted by the engine.** Neither engine exposes a host-call counter and neither grew one for this: an increment on the trust boundary's hot path is a poor trade for a benchmark. The bench instead follows the rule's decision procedure statement for statement over the same trees, counting what it would have called. Two things hold that honest, and the weaker one is the one that looks convincing. The bench's assertion holds *each arm* to *its own branch* of the replay and then the branches to each other — per arm, because holding both engines to one branch leaves the other validated by nothing, which is what an earlier version did and what breaking the TypeScript branch alone now demonstrates. But the assertion cannot see a call omitted on a path all three take. What pins the numbers is arithmetic: the corpus is regular enough that both denominators are derivable in closed form — 40 files of 96 functions, an ancestor chain of four, a call in the *k*-th function scanning *k* siblings, giving `13 + 3k` calls per subject under QuickJS and `14 + 2k` under the component — and the sums are exactly the 597,120 and 418,560 the bench prints. Two independent derivations of one number, not one transcription trusted twice. **Changing the corpus shape or the rule means redoing that sum**; the assertion alone would not notice.
+
+**No budget moved.** This measures one thing and writes it down; the table above is re-baselined once the remaining authoring paths land.
 
 ---
 

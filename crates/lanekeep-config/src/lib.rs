@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use lanekeep_core::{Examples, Gates, Namespace, RuleCard, RuleId, Severity};
-use lanekeep_js::{Limits, RuleRoot, RunClock, Sandbox};
+use lanekeep_js::{Limits, ResolveError, RuleRoot, RunClock, Sandbox};
+use lanekeep_wasm::{RuleSet, WasmEngine, WasmRuntime};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -59,6 +60,13 @@ pub struct RuleSpec {
     /// This is how the engine reaches the handler: the rule object lives in the loaded
     /// config, and indexing into it is what lets a function cross the boundary without
     /// ever being extracted as a value.
+    ///
+    /// **It is the position in the config and the position in the entry module's array, and
+    /// those have to stay one number.** A component-backed rule has no entry in that array —
+    /// its handlers are not JavaScript — so `json::rules_module` emits a `null` placeholder to
+    /// hold its place rather than closing the gap. Numbering the array separately would leave
+    /// every rule after a component pointing at its neighbor's handler: the call succeeds, and
+    /// the violations are attributed to the wrong rule.
     pub index: usize,
     /// Namespaced identifier.
     pub id: RuleId,
@@ -88,33 +96,131 @@ pub struct RuleSpec {
     /// same run over the same corpus — the decision is a property of the rule and is made here,
     /// where a rule is described, rather than by the engine guessing from anything else.
     ///
-    /// # It is `None` for every rule a config can express today, and the reason is not this crate
+    /// Every other field of a component-backed rule is the component's own answer to
+    /// `metadata`, read once here at config load. There is no config syntax carrying an `id`, a
+    /// `query` or a card beside a `.wasm` reference, and there deliberately never was: a second
+    /// description of a rule is drift that has to be kept in step with the first.
+    pub component: Option<ComponentRule>,
+}
+
+/// Where a component-backed rule's code is, and what it is configured with.
+///
+/// **One value rather than two fields, because the two cannot be independently true.** A rule
+/// backed by a component is always configured — with `null` when the config named it with no
+/// options, which is the shape `crates/lanekeep-wasm/wit/world.wit` declares so that a guest
+/// has one code path rather than two — and a rule that is not backed by a component has no
+/// `configure` to reach. Splitting them would make "a component with nothing to configure it
+/// with" and "options belonging to no component" representable, and both are states nothing
+/// downstream knows what to do with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentRule {
+    /// Where the bytes came from: a path confined to the rules root, or `lanekeep/<name>` for
+    /// a built-in embedded in the binary.
     ///
-    /// [`RuleReference::Component`] resolves a `.wasm` specifier to a path, and `rules_module`
-    /// then refuses it. That refusal stays, because the fields above it have nowhere to come
-    /// from: `crates/lanekeep-wasm/wit/world.wit` declares four exports and **none of them is
-    /// `metadata`**, so a component cannot supply its own `id`, `query`, `card`, `gates`,
-    /// `languages`, `severity` or `timeout`.
+    /// Kept for diagnostics and for the order [`ComponentBytes`] are folded into
+    /// `ruleset_hash` in. Nothing reads the file again — see [`ComponentRule::bytes`].
     ///
-    /// [`RuleSpec::has_reduce`] is the exception and is worth naming rather than leaving out of
-    /// the list, because it is the one field a second source of truth already exists for. The
-    /// world *does* declare `has-check` and `has-reduce`, and a component answers both — but
-    /// nothing asks: the engine reads that field, which this crate fills in by inspecting the
-    /// TypeScript module or from JSON, and `lanekeep_wasm::WasmRuntime::has_reduce` has test
-    /// callers only. So a component-backed rule is taken at its config's word about a question
-    /// it can answer itself, and the two can disagree with nothing to notice. Closing that is
-    /// the same sub-project as `metadata`, and it should close both at once.
+    /// **A built-in's is a specifier rather than a path, and cannot collide with one.** A
+    /// confined path is absolute, because `RuleRoot::confine` canonicalizes; `lanekeep/no-unwrap`
+    /// is relative. So a project that happens to have `lanekeep/no-unwrap.wasm` inside its rules
+    /// root sorts and dedups separately, as two different rules should.
+    pub path: PathBuf,
+    /// What `configure` is called with, as JSON — `"null"` for a rule named with no options.
     ///
-    /// The only alternatives are to add that export —
-    /// which is the Rust-authoring sub-project's ABI to design, and bumps a cache-key input —
-    /// or to invent config syntax carrying the metadata beside the reference, which that same
-    /// sub-project would then have to un-invent. Both were declined, as they were when the
-    /// options question reached the same wall.
+    /// A string rather than a `serde_json::Value` because that is what crosses the boundary:
+    /// a component cannot close over a host-supplied value the way a JavaScript factory does,
+    /// so its options arrive as data. Serializing once here also fixes the bytes, which
+    /// matters because they are what every worker's `configure` is handed.
+    pub options: String,
+    /// The component itself, read exactly once.
     ///
-    /// So the field is the seam and not yet the door: a caller holding a `Config` — a test, an
-    /// embedder, and the sub-project that adds `metadata` — can set it and get component
-    /// dispatch, and `lanekeep-config` sets it the day a component can describe itself.
-    pub component: Option<PathBuf>,
+    /// **The rule that was described has to be the rule that runs.** The bytes used to be read
+    /// three times in a run — once to ask the component what it is, once to hash it, once to
+    /// execute it — and a file that changed between those reads would give metadata from one,
+    /// a cache key from a second and handlers from a third, with nothing to notice. That is
+    /// the same property the TypeScript path already has for free: `hash_ruleset` folds what
+    /// `RuleLoader` actually consumed, not a second read of the same paths.
+    ///
+    /// So they are read once, here, and carried: `metadata` is read from them, `ruleset_hash`
+    /// folds them, and `lanekeep-engine` loads the component from them rather than from the
+    /// path beside them.
+    ///
+    /// Behind an [`std::sync::Arc`], because a `RuleSpec` is cloned per rule when the engine
+    /// prepares and a per-rule copy of a megabyte is a cost with nothing to buy it.
+    pub bytes: ComponentBytes,
+    /// Whether these exact bytes were folded into the `ruleset_hash` of the `Config` this
+    /// rule sits in.
+    ///
+    /// `true` for every `ComponentRule` `describe_components` builds — the only constructor
+    /// in this crate, and its output is exactly what `build` folds into `ruleset_hash` a few
+    /// lines later, over the very `rules` this value ends up attached to. Private, so nothing
+    /// outside this crate can construct one that claims coverage it does not have: the only
+    /// other way to get a `ComponentRule` is [`ComponentRule::uncounted`], which is honest
+    /// about the alternative.
+    ///
+    /// This is `Engine::caching`'s one input for the question its field doc calls "asking
+    /// where the field came from" — a `RuleSpec` an embedder or a test attaches after
+    /// `lanekeep_config::load` returns carries a component whose bytes reached no hash, and
+    /// `lanekeep-engine` reads this flag to refuse the cache for exactly that run.
+    counted_in_ruleset_hash: bool,
+}
+
+impl ComponentRule {
+    /// Whether these bytes are folded into the `ruleset_hash` of the `Config` they arrived
+    /// with — see the field.
+    #[must_use]
+    pub const fn counted_in_ruleset_hash(&self) -> bool {
+        self.counted_in_ruleset_hash
+    }
+
+    /// Build a `ComponentRule` outside `lanekeep_config::load`.
+    ///
+    /// **Whatever this produces is not folded into any `Config`'s `ruleset_hash`,** because
+    /// nothing here computes one — that happens exactly once, inside `load`, over whichever
+    /// rules were in `Config.rules` at the moment it returned. This is for an embedder, or a
+    /// test, that attaches a component to a `RuleSpec` afterward: `lanekeep-engine`'s own
+    /// component tests are exactly that, which is why `Engine::caching` refuses the cache for
+    /// a run carrying one of these.
+    #[must_use]
+    pub fn uncounted(path: PathBuf, options: String, bytes: impl Into<ComponentBytes>) -> Self {
+        Self {
+            path,
+            options,
+            bytes: bytes.into(),
+            counted_in_ruleset_hash: false,
+        }
+    }
+}
+
+/// A component's bytes, shared rather than copied.
+///
+/// A newtype for one reason: [`RuleSpec`] derives `Debug`, and a bare byte slice renders every
+/// byte of a forty-kilobyte artifact into any assertion message that prints a rule. This
+/// prints what a reader can act on — how many bytes there are — and the equality that
+/// `Config`'s own `PartialEq` needs is still over the content.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ComponentBytes(std::sync::Arc<[u8]>);
+
+impl ComponentBytes {
+    /// The bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for ComponentBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes.into())
+    }
+}
+
+impl std::fmt::Debug for ComponentBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComponentBytes")
+            .field("len", &self.0.len())
+            .finish()
+    }
 }
 
 /// A loaded, validated configuration.
@@ -351,8 +457,8 @@ fn entry_source(
     display: &str,
 ) -> Result<(String, Option<json::Parsed>), ConfigError> {
     if json::is_json(config_path) {
-        let parsed = json::parse(config_path, root.path())?;
-        let source = json::rules_module(&parsed.rules, display)?;
+        let parsed = json::parse(config_path, root.path(), root.builtin_components())?;
+        let source = json::rules_module(&parsed.rules);
         return Ok((source, Some(parsed)));
     }
 
@@ -401,6 +507,68 @@ pub fn evaluate_into(
 /// Returns [`ConfigError`] when the file cannot be read, the module fails to evaluate, or
 /// the result is not shaped like a config.
 pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Config, ConfigError> {
+    load_with(sandbox, root, config_path, LoadOptions::default())
+}
+
+/// What a load needs beyond the config file, for a caller that has more to say than [`load`]
+/// can carry.
+///
+/// A struct rather than two more parameters, for the reason `lanekeep-cli`'s `CheckOptions`
+/// gives: `artifacts` and the config path are both `&Path`, and adjacent parameters of one
+/// type are the shape that gets silently transposed at a call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions<'a> {
+    /// A project root under which compiled components may be cached, or `None` for a load with
+    /// nowhere to write.
+    ///
+    /// **This is the difference between a component costing tens of milliseconds per config load
+    /// and costing nothing.** With `None`, `describe_components` compiles every component from
+    /// scratch to ask it what it is, throws the compilation away, and the engine compiles the
+    /// same bytes again at prepare time. Measured on the release binary, one component added
+    /// ~58 ms to a `lanekeep rules` that checks no files at all, and two added ~116 ms — against
+    /// a §15 warm-run budget of 25 ms for the whole invocation. Config load runs per LSP request,
+    /// per MCP tool call and per `--watch` iteration, so this is paid on every one of them.
+    ///
+    /// Given a root, both loads write and map artifacts under the same [`COMPONENT_CACHE_PATH`],
+    /// keyed on the specifier and the bytes — so the first run compiles once instead of twice and
+    /// every later run maps what that run wrote. The two loaders agree because both build their
+    /// `wasmtime::Engine` with `WasmEngine::new`; an artifact a different build wrote fails to
+    /// deserialize and is discarded rather than trusted.
+    ///
+    /// Named by the caller rather than inferred, because a rules root is the project root only by
+    /// the CLI's choice — `lanekeep-testkit` anchors one at a temporary fixture directory — and
+    /// guessing would make loading a config write somewhere nobody asked for.
+    ///
+    /// [`COMPONENT_CACHE_PATH`]: lanekeep_wasm::COMPONENT_CACHE_PATH
+    pub artifacts: Option<&'a Path>,
+
+    /// Overrides `timeouts.global` from the config file, for a caller holding a more specific
+    /// statement — `--timeout`, which a user typed on this run.
+    ///
+    /// **It has to arrive here rather than be applied to the returned [`Config`], because config
+    /// load is itself a phase that runs guest code.** `describe_components` instantiates,
+    /// `configure`s and calls `metadata` on every component under a clock of its own, and that
+    /// clock is built before this function returns. A caller that loaded first and assigned to
+    /// `Config::limits` afterwards would leave that phase governed by the config file's number
+    /// while the message a breach prints tells the user to raise it with `--timeout` — advice
+    /// that could not work. `AGENTS.md` records the original instance of exactly this shape.
+    pub global_timeout: Option<Duration>,
+}
+
+/// [`load`], with everything a caller knows that the config file does not.
+///
+/// See [`LoadOptions`] for what each field buys and why it has to be known before the load
+/// rather than applied to the [`Config`] it returns.
+///
+/// # Errors
+///
+/// As [`load`].
+pub fn load_with(
+    sandbox: &Sandbox,
+    root: &RuleRoot,
+    config_path: &Path,
+    options: LoadOptions<'_>,
+) -> Result<Config, ConfigError> {
     let display = config_path.display().to_string();
 
     let entry = root.path().join(ENTRY);
@@ -441,14 +609,16 @@ pub fn load(sandbox: &Sandbox, root: &RuleRoot, config_path: &Path) -> Result<Co
         None => (extracted, Vec::new()),
     };
 
-    build(sandbox, raw, &display, &resolved)
+    build(sandbox, root, raw, &display, &resolved, options)
 }
 
 fn build(
     sandbox: &Sandbox,
+    root: &RuleRoot,
     raw: RawConfig,
     display: &str,
     resolved: &[ResolvedRule],
+    options: LoadOptions<'_>,
 ) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
@@ -472,11 +642,17 @@ fn build(
         declared.insert(namespace.clone());
     }
 
-    let mut rules = Vec::with_capacity(raw.rules.len());
-    for (index, rule) in raw.rules.into_iter().enumerate() {
-        rules.push(build_rule(rule, index + 1, display, &overrides, &declared)?);
-    }
-
+    // The budgets, worked out before anything runs under them. `describe_components` executes
+    // guest code — instantiation, `configure`, `metadata` — and a component asked what it is
+    // under a budget the config did not set is a limit that was parsed and then dropped, which
+    // `AGENTS.md` records as the shape of the `--timeout` bug: accepted, validated, ignored.
+    //
+    // **The caller's override is folded in *here*, not applied to the `Config` this returns.**
+    // That is the same bug in a new phase, and it was live for the length of this branch: the CLI
+    // loaded the config, then assigned `--timeout` to `loaded.limits`, one statement after the
+    // phase it was meant to govern had already finished. A component whose `configure` overran
+    // failed with a message ending "raise it with `--timeout`", and raising it changed nothing.
+    // Resolving it before `describe_components` is what makes one number govern both phases.
     let mut limits = Limits::default();
     if let Some(ms) = raw.timeouts.rule {
         limits = limits.with_rule_timeout(Duration::from_millis(ms));
@@ -484,8 +660,58 @@ fn build(
     if let Some(ms) = raw.timeouts.global {
         limits = limits.with_global_timeout(Duration::from_millis(ms));
     }
+    if let Some(global) = options.global_timeout {
+        limits = limits.with_global_timeout(global);
+    }
 
-    let ruleset_hash = hash_ruleset(sandbox, resolved);
+    // Every component in the config, asked what it is. Once, here, before a `RuleSpec` exists
+    // — not per worker: instantiation is 82 to 96 times the cost of not instantiating, which
+    // is why `lanekeep_wasm::WasmRuntime::rule` defers it, and reading metadata through a
+    // worker's runtime would undo that for every rule in the set.
+    let mut described = describe_components(root, resolved, display, limits, options.artifacts)?;
+
+    let mut rules = Vec::with_capacity(raw.rules.len());
+    for (index, rule) in raw.rules.into_iter().enumerate() {
+        // A component's entry in `raw.rules` is the placeholder `rules_module` emitted for it,
+        // carrying nothing; what describes it is its own `metadata`. The two lists are indexed
+        // alike by construction, which is the whole reason the placeholder is there.
+        let described = described.get_mut(index).and_then(Option::take);
+        rules.push(build_rule(
+            rule,
+            index + 1,
+            display,
+            &overrides,
+            &declared,
+            described,
+        )?);
+    }
+
+    // Every description has to have been claimed by a rule. One left over means the entry
+    // module's array and the config's rule list came out different lengths, and the loop above
+    // would then have dropped a component rule without saying so — a configured rule that
+    // silently checks nothing is the failure this tool exists not to produce. Unreachable while
+    // `rules_module` emits one array entry per reference, which is exactly why it is asserted
+    // rather than assumed: the placeholder is what makes it true, and a future edit that
+    // removed it would find this instead of a wrong answer.
+    if let Some(position) = described.iter().position(Option::is_some) {
+        return Err(ConfigError::Rule {
+            position: position + 1,
+            path: display.to_owned(),
+            detail: "this component reached no rule — the entry module's rule array and the \
+                     config's rule list are not the same length"
+                .to_owned(),
+        });
+    }
+
+    // The components, in the order the config listed them, taken back off the rules that were
+    // just built — so what is hashed is what was described and what will run, rather than a
+    // fresh look at the same paths.
+    let components: Vec<&ComponentRule> = rules
+        .iter()
+        .filter_map(|rule| rule.component.as_ref())
+        .collect();
+
+    let ruleset_hash = hash_ruleset(sandbox, &components);
     let config_hash = hash_config(&raw.include, &raw.exclude, &overrides, &limits, resolved);
 
     Ok(Config {
@@ -519,13 +745,323 @@ fn parse_severity_overrides(
         .collect()
 }
 
+/// Ask every component the config names what it is.
+///
+/// One entry per resolved reference, `Some` for a component and `None` for anything else, so
+/// the answer is indexed by the config's own rule position — the same numbering
+/// `json::rules_module`'s placeholder preserves.
+///
+/// # Once for the run, and deliberately not through a worker's runtime
+///
+/// Every component is compiled, instantiated, configured and asked three questions here. That
+/// is the cost `lanekeep_wasm::WasmRuntime::rule` exists to avoid paying per worker — #96's
+/// spike measured eager instantiation at 82 to 96 times the lazy arrangement — and it is paid
+/// exactly once, before any worker exists, because a rule that cannot describe itself cannot
+/// be run at all. Nothing built here outlives this function: the engine, the rule set and the
+/// runtime are dropped on the way out, and what survives is the metadata and the path.
+///
+/// # What each answer is for
+///
+/// `metadata` fills every field of the `RuleSpec` a TypeScript rule fills from its own
+/// `defineRule` call, and it goes through `build_rule` exactly as an extracted TypeScript rule
+/// does — so a component's id, namespace, card, query and severity are validated by the same
+/// code, and a component cannot smuggle past a check a TypeScript rule has to satisfy.
+///
+/// `has-check` and `has-reduce` are asked rather than assumed, which closes the one place a
+/// component used to be taken at its config's word about a question it can answer itself.
+///
+/// `configure` is not called here and is not skipped: `RuleSet::add` records the options and
+/// `WasmRuntime::rule` hands them over on the way to the instance `metadata` is read from. So a
+/// component that refuses its options fails at config load, naming the rule and carrying the
+/// guest's own message, and the same call happens again on every worker that later builds an
+/// instance of its own.
+///
+/// # Confinement, before a byte is read — and a built-in has nothing to confine
+///
+/// A built-in component is embedded in this binary. There is no path in the config, no file on
+/// disk and nothing to canonicalize, so the paragraphs below are about a `.wasm` *path*
+/// reference and only about that. That is not a weaker check for built-ins; it is the absence
+/// of the thing the check exists to constrain, and it is the same reason a built-in module
+/// cannot be shadowed by a project file.
+///
+/// A rule reference is a string in a config file and a component is *executed*, so where it is
+/// allowed to point is a trust boundary rather than a convenience. `json::classify` joins the
+/// specifier against the rules root and normalizes it, which is purely lexical and does not
+/// confine anything: `Path::join` lets an absolute specifier replace the root outright, and no
+/// lexical rule can see through a symlink.
+///
+/// [`RuleRoot::confine`] is the check, and it is the containment half of the one a module
+/// import goes through rather than a second set written here: the lexical test that refuses
+/// `../../evil.wasm` whatever is on disk, then the canonicalization that refuses a symlink
+/// pointing out of the root. It runs before [`std::fs::read`], so a reference that escapes is
+/// refused without its bytes ever being loaded, let alone compiled or instantiated.
+///
+/// **Containment is all of it, and a module import is held to more.** `RuleRoot::resolve`
+/// additionally refuses *any* absolute specifier a rule writes, as a bare specifier, before
+/// containment is considered at all — so `import '/etc/passwd'` and
+/// `import '/inside/the/root/x'` are both refused, and only the first would be refused here.
+/// An absolute `.wasm` path that lands inside the rules root is therefore accepted. That is not
+/// an escape and nothing about the trust boundary turns on it; it is written down because the
+/// two paths are otherwise easy to read as identical, and the next person to compare them
+/// should find the difference recorded rather than discover it.
+///
+/// # One read
+///
+/// The bytes are read here and carried on [`ComponentRule`]. `metadata` is read from them,
+/// `hash_ruleset` folds them and `lanekeep-engine` executes them, so the rule that was
+/// described is the rule that runs. Reading three times would let a file that changed in
+/// between describe one rule, key another and run a third.
+fn describe_components(
+    root: &RuleRoot,
+    resolved: &[ResolvedRule],
+    display: &str,
+    limits: Limits,
+    artifacts: Option<&Path>,
+) -> Result<Vec<Option<Described>>, ConfigError> {
+    let mut described: Vec<Option<Described>> = resolved.iter().map(|_| None).collect();
+    if !resolved.iter().any(|rule| rule.reference.is_component()) {
+        return Ok(described);
+    }
+
+    let fail = |position: usize, detail: String| ConfigError::Rule {
+        position: position + 1,
+        path: display.to_owned(),
+        detail,
+    };
+    let broken = |detail: String| ConfigError::Shape {
+        path: display.to_owned(),
+        detail,
+    };
+
+    let engine = WasmEngine::new().map_err(|e| broken(e.to_string()))?;
+    let mut set = RuleSet::new(&engine).map_err(|e| broken(e.to_string()))?;
+    // With the on-disk artifact cache when the caller named a project root, and without one
+    // otherwise. A rules root is not a project root — `lanekeep-testkit` anchors one at a
+    // temporary fixture directory — so guessing a location to write `.lanekeep/components` into
+    // would make loading a config write somewhere nobody asked for. Naming it is
+    // `LoadOptions::artifacts`, passed through `load_with`, and the CLI names it.
+    //
+    // It matters because without one this compiles every component only to throw the
+    // compilation away, and the engine compiles the same bytes again at prepare time: ~58 ms per
+    // component, on every config load, and config load runs per LSP request, per MCP tool call
+    // and per `--watch` iteration. With one, both loads map the same artifact.
+    let loader = artifacts.map_or_else(
+        lanekeep_wasm::ComponentLoader::without_cache,
+        lanekeep_wasm::ComponentLoader::for_project_root,
+    );
+
+    let mut added = Vec::new();
+    for (position, rule) in resolved.iter().enumerate() {
+        // Whether this reference is a component at all comes first, so a config of TypeScript
+        // rules with one component in it does no work per rule that is thrown away. Extracting
+        // the two byte sources into `component_bytes` put the serialization above this test for
+        // a while, which was a small silent regression on the common shape.
+        let Some((origin, bytes)) =
+            component_bytes(root, rule).map_err(|detail| fail(position, detail))?
+        else {
+            continue;
+        };
+
+        // `null` for a rule named with no options, which is the world's own shape for it —
+        // serialized once here so that every worker's `configure` is handed the same bytes.
+        let options = rule
+            .options
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), json::literal);
+
+        let admitted = loader
+            .load(&engine, &rule.specifier, bytes.as_slice())
+            .map_err(|e| fail(position, e.to_string()))?;
+        let slot = set
+            .add(&rule.specifier, &admitted, options.clone())
+            .map_err(|e| fail(position, e.to_string()))?;
+
+        added.push((
+            position,
+            slot,
+            ComponentRule {
+                path: origin,
+                options,
+                bytes,
+                // The one constructor whose output `build` folds into `ruleset_hash` —
+                // see the field.
+                counted_in_ruleset_hash: true,
+            },
+        ));
+    }
+
+    let clock = RunClock::start(limits.global_timeout);
+    let mut runtime = WasmRuntime::for_rules(engine, std::sync::Arc::new(set), limits, clock);
+
+    for (position, slot, component) in added {
+        let metadata = runtime
+            .metadata(slot)
+            .map_err(|e| fail(position, e.to_string()))?;
+        let has_check = runtime
+            .has_check(slot)
+            .map_err(|e| fail(position, e.to_string()))?;
+        let has_reduce = runtime
+            .has_reduce(slot)
+            .map_err(|e| fail(position, e.to_string()))?;
+
+        if let Some(entry) = described.get_mut(position) {
+            *entry = Some(Described {
+                raw: raw_rule_from(metadata, has_check, has_reduce),
+                component,
+            });
+        }
+    }
+
+    Ok(described)
+}
+
+/// Where one reference's component bytes come from, or `None` if it names no component.
+///
+/// **The two sources of a component, in one place.** A built-in is embedded in this binary and a
+/// project rule is a file inside the rules root, and everything downstream — admission, the rule
+/// set, `metadata`, `ruleset_hash`, execution — treats them identically from here on. Keeping the
+/// two arms together is what makes that reading true rather than approximately true: a difference
+/// between them has to be written in this function, where it can be seen.
+///
+/// The first element is provenance for [`ComponentRule::path`] — a canonical path for a file, and
+/// the `lanekeep/<name>` specifier for a built-in, which is relative and so can never collide
+/// with one.
+///
+/// # A loose `.wasm` is reachable and is not a supported interface
+///
+/// The file arm below means a `lanekeep.json` naming `./rules/mine.wasm` loads and runs it, and
+/// the containment tests beside it are real. It is nonetheless **not** a documented feature:
+/// `schema/lanekeep.schema.json` describes built-ins and `./path.ts` only, and
+/// `docs/authoring-rust-rules.md` is about the built-ins in this repository rather than about a
+/// project shipping its own component.
+///
+/// That is a decision rather than an oversight, taken because supporting it means promising
+/// something not yet true. A third-party component binds against `crates/lanekeep-wasm/wit`,
+/// whose bytes are a *cache key* and not a stability promise — it changes without ceremony, and
+/// this branch changed it twice — so a rule built against one lanekeep would silently target a
+/// world the next one does not have. Advertising the path before there is a versioned world and
+/// a published authoring story would be committing to an ABI nothing currently keeps.
+///
+/// The arm stays because built-ins and fixtures reach it by the same route, and narrowing it to
+/// built-ins would put a difference between the two sources back into a function whose whole
+/// purpose is that there is not one. Anyone deciding to support it should add the schema entry
+/// and the authoring documentation in that change, and say what the world's stability is.
+///
+/// # Errors
+///
+/// Returns the diagnostic detail, without a position: the caller knows which rule this was and
+/// wraps it. A built-in that the lookup does not know is *unreachable* while `json::classify`
+/// asks the very lookup this reads — the reference is only that variant because the name
+/// answered. It is refused rather than assumed away because the two calls are in different
+/// crates, and a rules root rebuilt between them without its components would otherwise produce
+/// a rule with no `check` rather than an explanation.
+fn component_bytes(
+    root: &RuleRoot,
+    rule: &ResolvedRule,
+) -> Result<Option<(PathBuf, ComponentBytes)>, String> {
+    match &rule.reference {
+        // Embedded in this binary, so there is no path to confine and no file to read — and
+        // nothing a project file could shadow, which is the guarantee a built-in module has too.
+        RuleReference::BuiltinComponent(name) => {
+            let bytes = root.builtin_component(name).ok_or_else(|| {
+                format!(
+                    "`lanekeep/{name}` was resolved as a built-in component and this build has \
+                     no component by that name"
+                )
+            })?;
+            Ok(Some((
+                PathBuf::from(format!("lanekeep/{name}")),
+                bytes.to_vec().into(),
+            )))
+        }
+
+        RuleReference::Component(path) => {
+            // Confinement before the read, and before anything is compiled or run.
+            //
+            // The message is this crate's rather than the resolver's, because the resolver's is
+            // written for an `import` and says so — "rule modules may only import from within
+            // it" names nothing a user who wrote a `.wasm` path would recognize. The *check* is
+            // the resolver's, which is the half that must not be duplicated.
+            let confined = root.confine(&rule.specifier, path).map_err(|e| match e {
+                ResolveError::EscapesRoot { .. } => format!(
+                    "`{}` resolves outside the rules root, and a rule component must sit \
+                     inside it",
+                    rule.specifier
+                ),
+                ResolveError::Unreadable { detail, .. } => {
+                    format!("cannot read `{}`: {detail}", path.display())
+                }
+                other => other.to_string(),
+            })?;
+
+            let bytes: ComponentBytes = std::fs::read(&confined)
+                .map_err(|e| format!("cannot read `{}`: {e}", confined.display()))?
+                .into();
+            Ok(Some((confined, bytes)))
+        }
+
+        RuleReference::Builtin(_) | RuleReference::Module(_) => Ok(None),
+    }
+}
+
+/// A component's own account of itself, in the shape [`build_rule`] validates.
+struct Described {
+    raw: RawRule,
+    component: ComponentRule,
+}
+
+/// What a component answered, as the rule declaration the rest of this file already knows how
+/// to check.
+///
+/// Deliberately a [`RawRule`] rather than a `RuleSpec`: converging on the same validation is
+/// the point. A component that named an undeclared namespace, an empty query or an unusable
+/// card is refused by the code that refuses a TypeScript rule for the same reasons, in the
+/// same words.
+fn raw_rule_from(
+    metadata: lanekeep_wasm::bindings::types::RuleMetadata,
+    has_check: bool,
+    has_reduce: bool,
+) -> RawRule {
+    RawRule {
+        id: Some(metadata.id),
+        language: Some(RawLanguages::Many(metadata.languages)),
+        severity: Some(metadata.severity),
+        card: Some(RawCard {
+            message: Some(metadata.card.message),
+            remediation: Some(metadata.card.remediation),
+            examples: Some(RawExamples {
+                bad: Some(metadata.card.examples.bad),
+                good: Some(metadata.card.examples.good),
+            }),
+        }),
+        query: Some(metadata.query),
+        gates: Gates {
+            path_matches: metadata.gates.path_matches,
+            path_not_matches: metadata.gates.path_not_matches,
+            file_contains: metadata.gates.file_contains,
+            file_not_contains: metadata.gates.file_not_contains,
+        },
+        timeout: metadata.timeout,
+        has_check,
+        has_reduce,
+    }
+}
+
 fn build_rule(
     raw: RawRule,
     position: usize,
     display: &str,
     overrides: &BTreeMap<RuleId, Severity>,
     declared: &BTreeSet<String>,
+    described: Option<Described>,
 ) -> Result<RuleSpec, ConfigError> {
+    // A component's own answers replace the placeholder the entry module carried for it. The
+    // placeholder is what keeps the two lists indexed alike; it describes nothing.
+    let (raw, component) = match described {
+        Some(described) => (described.raw, Some(described.component)),
+        None => (raw, None),
+    };
+
     let fail = |detail: String| ConfigError::Rule {
         position,
         path: display.to_owned(),
@@ -596,27 +1132,37 @@ fn build_rule(
         .map_err(|e| fail(format!("`{id}`: {e}")))?
         .unwrap_or(Severity::Error);
 
+    // Both TypeScript dialects by default, because a rule written for TypeScript is meant for
+    // the TypeScript in the project — and in any React codebase most of that lives in `.tsx`,
+    // which the TypeScript grammar cannot parse.
+    let languages = raw.language.map_or_else(
+        || vec!["typescript".to_owned(), "tsx".to_owned()],
+        RawLanguages::into_vec,
+    );
+    // An empty list is not "every language", it is *no file at all* — a rule runs only on a
+    // file whose own language it names — and it is silent: the rule loads, matches nothing and
+    // reports nothing, which is indistinguishable from the code being clean. The world declares
+    // that the host refuses one at load (`crates/lanekeep-wasm/wit/world.wit`); this is that
+    // refusal, and it covers a TypeScript rule writing `language: []` for the same reason.
+    if languages.is_empty() {
+        return Err(fail(format!(
+            "`{id}` names no language — a rule runs only on files whose language it names, so \
+             an empty list means it can never run"
+        )));
+    }
+
     Ok(RuleSpec {
         index: position - 1,
         // Config severity wins over what the rule declares, per §9.
         severity: overrides.get(&id).copied().unwrap_or(declared),
         id,
-        // Both TypeScript dialects by default, because a rule written for TypeScript is
-        // meant for the TypeScript in the project — and in any React codebase most of that
-        // lives in `.tsx`, which the TypeScript grammar cannot parse.
-        languages: raw.language.map_or_else(
-            || vec!["typescript".to_owned(), "tsx".to_owned()],
-            RawLanguages::into_vec,
-        ),
+        languages,
         card,
         query,
         gates: raw.gates,
         timeout: raw.timeout.map(Duration::from_millis),
         has_reduce: raw.has_reduce,
-        // Every rule that reaches here was read out of an evaluated TypeScript module, so its
-        // handlers are in that module. See [`RuleSpec::component`] for what has to exist before
-        // this can be anything else.
-        component: None,
+        component,
     })
 }
 
@@ -641,9 +1187,9 @@ fn build_rule(
 /// A component's bytes are the same input as a module's source: the code that decided the
 /// answer. The plan for this change described the component fold as replacing the module walk,
 /// which would be correct in a world where every rule is a component and is a silent
-/// under-invalidation in this one — every rule in this tree is TypeScript, and dropping the
-/// walk would take the whole ruleset out of the cache key. So both are folded, and the module
-/// walk leaves when the last module does.
+/// under-invalidation in this one — two built-ins are components and every other rule in this
+/// tree is a module, so dropping the walk would take almost the whole ruleset out of the cache
+/// key. So both are folded, and the module walk leaves when the last module does.
 ///
 /// A component is hashed by its **bytes and not its path**, sorted by path so the order is
 /// fixed. A resolved component path is absolute, and putting it in would make the key depend
@@ -652,23 +1198,39 @@ fn build_rule(
 /// about the code. Duplicates collapse for the same reason: listing one component twice is a
 /// configuration difference, not a different program.
 ///
-/// **A component that cannot be read folds in a marker rather than nothing.** Skipping it
-/// would make "the component is missing" and "the component is there" hash alike, which is the
-/// shape §8.2 already rules out for tracked reads: absence is an input, because a run that
-/// could not read a rule and one that could must not share a key. The marker is not a
-/// separator — a `.wasm` is arbitrary binary and can contain whichever byte it is — so the
-/// bytes are length-prefixed as well, and `two_components_cannot_run_together_into_one` is
-/// what says so.
+/// # It folds bytes it is handed, and does not go and read them
 ///
-/// # `resolved` is empty for a TypeScript config, so this half is JSON-only today
+/// **This is the same property the module half has, and it used to be the one thing the
+/// component half did not.** `sandbox.loaded_modules()` is what the loader actually consumed,
+/// so a module that changed after it was read still hashes as the source that produced the
+/// answer. The component half used to take the *paths* and read them again — a second read,
+/// several milliseconds after `describe_components` read the same files to ask them what they
+/// are, and before `lanekeep-engine` read them a third time to run them. A file that changed
+/// in between would describe one rule, key another and execute a third, and nothing would
+/// notice. So the bytes arrive on [`ComponentRule`], read once, and this folds those.
 ///
-/// `load` passes `Vec::new()` on the TypeScript path, because only a `lanekeep.json` produces
-/// a [`RuleReference::Component`]. That is consistent rather than a hole *while that stays
-/// true*: a TypeScript config cannot name a component at all, so there are no component bytes
-/// to miss. **The day it can, this is the branch that silently stops covering them** — a
-/// component named from `lanekeep.config.ts` would reach no hash, and nothing here would fail.
-/// Whoever adds that path owes this function the reference list, not just the loader.
-fn hash_ruleset(sandbox: &Sandbox, resolved: &[ResolvedRule]) -> Hash {
+/// **Absence is therefore no longer representable here, and that is stronger than the marker
+/// it replaces rather than weaker.** This used to fold a present/absent byte, so that "the
+/// component is missing" and "the component is there" could not hash alike — §8.2's rule that
+/// a run which could not read a rule and one that could must not share a key. A component that
+/// cannot be read now fails config load outright: there is no `Config`, so there is no key and
+/// no run, which is what that rule was protecting against in the first place.
+/// `a_component_that_is_not_there_is_refused_by_position` is where that lives now.
+///
+/// The bytes are still length-prefixed, and that is unrelated to the marker: a `.wasm` is
+/// arbitrary binary and can contain whichever byte a separator would be, so without the length
+/// two components could concatenate into one byte sequence.
+/// `two_components_cannot_run_together_into_one` is what says so.
+///
+/// # `components` is empty for a TypeScript config, so this half is JSON-only today
+///
+/// Only a `lanekeep.json` produces a [`RuleReference::Component`], so a TypeScript config
+/// builds no [`ComponentRule`] and there are no component bytes to miss. **The day it can name
+/// one, this is the branch that silently stops covering them** — and the shape above is what
+/// makes that harder to get wrong than it was: the bytes come from the rules that were built,
+/// so whoever teaches the TypeScript path to name a component gets the fold for free rather
+/// than having to remember a second list.
+fn hash_ruleset(sandbox: &Sandbox, components: &[&ComponentRule]) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-ruleset-v2");
 
@@ -683,28 +1245,38 @@ fn hash_ruleset(sandbox: &Sandbox, resolved: &[ResolvedRule]) -> Hash {
         }
     }
 
-    let mut components: Vec<&Path> = resolved
-        .iter()
-        .filter_map(|rule| match &rule.reference {
-            RuleReference::Component(path) => Some(path.as_path()),
-            RuleReference::Builtin(_) | RuleReference::Module(_) => None,
-        })
-        .collect();
-    components.sort_unstable();
-    components.dedup();
+    // Sorted and deduplicated by path *and bytes*, so that reordering a config's rules or naming
+    // one component twice is not a different ruleset. The path itself is deliberately not
+    // hashed: it is absolute, so it would throw a cache away for moving a checkout, and which
+    // component a rule *names* is `hash_config`'s through the specifier.
+    //
+    // **The bytes are in the key because "read once" is per reference, not per path.**
+    // `component_bytes` reads once per `ResolvedRule`, and nothing deduplicates `rules`, so a
+    // config may legitimately name one file twice — `["./r.wasm", {"rule": "./r.wasm", "options":
+    // {…}}]` is how a rule is used bare and configured in the same run. If the file is rewritten
+    // between those two reads, two `ComponentRule`s carry one path and different bytes, and both
+    // execute what they carry. Deduplicating on the path alone would then keep one of them
+    // arbitrarily — `sort_unstable` does not order equal keys — and hash a ruleset that is not
+    // the one running, which is the single claim this whole function exists to make.
+    //
+    // Keying rather than preventing, deliberately. Caching the first read and reusing it would
+    // close the window by changing which bytes the second rule *runs*, which is a semantic change
+    // to fix a hashing bug — and it cannot make the read atomic either, since there is no
+    // snapshot of a live filesystem to take. Hashing what actually ran is the property that was
+    // claimed, and it is the one restored here. In the ordinary case both entries have identical
+    // bytes and this deduplicates exactly as it did before.
+    let mut components: Vec<&&ComponentRule> = components.iter().collect();
+    components.sort_unstable_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.bytes.as_slice().cmp(b.bytes.as_slice()))
+    });
+    components.dedup_by(|a, b| a.path == b.path && a.bytes.as_slice() == b.bytes.as_slice());
 
     hasher.update(b"components");
     length_prefixed(&mut hasher, &(components.len() as u64).to_le_bytes());
-    for path in components {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                hasher.update(&[1]);
-                length_prefixed(&mut hasher, &bytes);
-            }
-            Err(_) => {
-                hasher.update(&[0]);
-            }
-        }
+    for component in components {
+        length_prefixed(&mut hasher, component.bytes.as_slice());
     }
 
     *hasher.finalize().as_bytes()
@@ -896,29 +1468,61 @@ mod tests {
         }
 
         fn load_named(&self, name: &str) -> Result<Config, ConfigError> {
-            let root = RuleRoot::new(&self.dir).expect("canonicalizes");
-            let sandbox =
-                sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
-            load(&sandbox, &root, &self.dir.join(name))
+            load_from(&self.dir, name)
         }
 
         /// A sandbox over this fixture, with nothing loaded into it.
         ///
-        /// For the component half of `ruleset_hash`, which cannot be reached through `load`:
-        /// a `.wasm` reference is refused before a `Config` is built, because this build runs
-        /// no components yet. The hash is still where a component's bytes have to be by the
-        /// time one runs, and a cache-key input nothing exercises is how one goes missing.
+        /// For the component half of `ruleset_hash`, whose tests want a fold over bytes rather
+        /// than over rules: the files they name are a few bytes long and are not components at
+        /// all, which is what lets them assert on separators, ordering and absence without
+        /// building a real artifact apiece. Going through `load` would refuse every one of them
+        /// long before the hash was reached.
         fn empty_sandbox(&self) -> Sandbox {
             let root = RuleRoot::new(&self.dir).expect("canonicalizes");
             sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox")
         }
 
-        /// A resolved reference to a component inside this fixture.
-        fn component(&self, name: &str) -> ResolvedRule {
-            ResolvedRule {
-                specifier: format!("./{name}"),
-                reference: RuleReference::Component(self.dir.join(name)),
-                options: None,
+        /// Copy one of `lanekeep-wasm`'s committed fixture components into this fixture.
+        ///
+        /// By path at run time rather than `include_bytes!`, because `lanekeep-wasm` excludes
+        /// its whole `tests/` tree from the published package — a compile-time include would
+        /// make this crate fail to build for anyone who vendored it, where a copy that is only
+        /// reached by a test fails nowhere else.
+        fn write_component(&self, at: &str, fixture: &str) {
+            let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../lanekeep-wasm/tests/fixtures")
+                .join(format!("{fixture}.wasm"));
+            let full = self.dir.join(at);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("creates parent");
+            }
+            fs::copy(&from, &full).expect("the fixture ships");
+        }
+
+        /// A component-backed rule over a file inside this fixture.
+        ///
+        /// **The bytes are read when this is called, not when the hash is taken**, which is
+        /// the property `hash_ruleset` now has and is why every test below that edits a file
+        /// calls this again afterwards. Reading at hash time is exactly the bug that shape
+        /// removes: the hash would then be over a read nobody else made.
+        fn component(&self, name: &str) -> ComponentRule {
+            let path = self.dir.join(name);
+            // `expect`, not `unwrap_or_default`: a mistyped name would otherwise become empty
+            // bytes, and two tests here compare hashes that would then be equal for the wrong
+            // reason — `the_ruleset_hash_ignores_where_a_component_sits` and
+            // `..._ignores_the_order_and_the_repetition_of_a_component` both assert *equality*,
+            // so they pass vacuously against two empty files. The engine's `backed_by` says the
+            // same thing for the same reason.
+            let bytes = fs::read(&path).expect("the component file is where the test put it");
+            ComponentRule {
+                path,
+                options: "null".to_owned(),
+                bytes: bytes.into(),
+                // Irrelevant to what is under test here — these tests drive `hash_ruleset`
+                // directly rather than through `Engine::caching` — but `true` is the honest
+                // answer: a real `load` is what every one of these fixtures simulates.
+                counted_in_ruleset_hash: true,
             }
         }
     }
@@ -926,6 +1530,63 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Load a config with the rules root at a chosen directory.
+    ///
+    /// Separate from [`Fixture::load_named`] because the confinement tests need a root that is
+    /// *inside* the fixture, so that something the fixture wrote is genuinely outside it.
+    fn load_from(dir: &Path, name: &str) -> Result<Config, ConfigError> {
+        let root = RuleRoot::new(dir).expect("canonicalizes");
+        let sandbox =
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+        load(&sandbox, &root, &dir.join(name))
+    }
+
+    /// The same, with a built-in component table installed.
+    ///
+    /// Separate rather than a parameter on every caller, because "no built-in ships as a
+    /// component" is what the rest of this suite means and should keep saying.
+    fn load_with_components(
+        dir: &Path,
+        name: &str,
+        components: lanekeep_js::BuiltinComponent,
+    ) -> Result<Config, ConfigError> {
+        let root = RuleRoot::new(dir)
+            .expect("canonicalizes")
+            .with_builtin_components(components);
+        let sandbox =
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+        load(&sandbox, &root, &dir.join(name))
+    }
+
+    /// The `metadata` fixture's bytes, served as though they were embedded in the binary.
+    ///
+    /// Read at run time rather than `include_bytes!`, for the reason [`Fixture::write_component`]
+    /// records: `lanekeep-wasm` excludes its whole `tests/` tree from the published package, and
+    /// a compile-time include would put a path that does not exist for a vendored checkout into
+    /// this crate's source. A `OnceLock` is what turns a run-time read into the `&'static [u8]`
+    /// a [`lanekeep_js::BuiltinComponent`] has to return.
+    fn built_in_component_bytes() -> &'static [u8] {
+        static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        BYTES.get_or_init(|| {
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures/metadata.wasm"),
+            )
+            .expect("the fixture ships")
+        })
+    }
+
+    /// A built-in table with exactly one component in it, standing in for `lanekeep_rules`.
+    ///
+    /// A stub rather than the real table: which rules have migrated is not what these tests are
+    /// about, and naming one would make the next migration edit assertions unrelated to it.
+    fn built_in_components(name: &str) -> Option<&'static [u8]> {
+        match name {
+            "metadata" => Some(built_in_component_bytes()),
+            _ => None,
         }
     }
 
@@ -1254,6 +1915,685 @@ mod tests {
         assert_eq!(config.limits.global_timeout, Duration::from_secs(30));
     }
 
+    // --- components -----------------------------------------------------------------
+
+    #[test]
+    fn a_component_reference_resolves_to_a_spec_carrying_its_own_metadata() {
+        // Every field below comes from the component's own `metadata` export and from
+        // nowhere else — there is no config syntax carrying any of it, which is the whole
+        // reason the export exists.
+        let fixture = Fixture::new("component-metadata", &[]);
+        fixture.write_component("rules/metadata.wasm", "metadata");
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["./rules/metadata.wasm"]}"#,
+        )]);
+
+        let config = fixture
+            .load_json()
+            .expect("a component reference is resolvable");
+
+        let rule = &config.rules[0];
+        assert_eq!(rule.id.to_string(), "fixture/metadata");
+        assert_eq!(rule.query, "(call_expression) @call");
+        assert_eq!(rule.languages, ["rust"]);
+        assert_eq!(rule.card.message, "a fixture");
+        assert_eq!(rule.card.remediation, "do the other thing");
+        // All four, and the fixture sets all four to different values on purpose. `raw_rule_from`
+        // assigns them from a plain struct literal, so a dropped or swapped field is not a type
+        // error — asserting two of the four leaves the other two mapped by nothing, and both
+        // mutations pass. This is the shape of the Task 1 finding recurring one layer up.
+        assert_eq!(rule.gates.path_matches, ["src/**/*.rs"]);
+        assert_eq!(rule.gates.path_not_matches, ["**/generated/**"]);
+        assert_eq!(rule.gates.file_contains, ["call"]);
+        assert_eq!(rule.gates.file_not_contains, ["skip"]);
+        assert_eq!(rule.timeout, Some(Duration::from_millis(1500)));
+        assert!(
+            !rule.has_reduce,
+            "the fixture answers `has-reduce` with false, and the config must take that \
+             answer rather than assuming one"
+        );
+        let component = rule
+            .component
+            .as_ref()
+            .expect("the bytes travel with the rule");
+        assert_eq!(
+            component.bytes.as_slice(),
+            fs::read(fixture.dir.join("rules/metadata.wasm"))
+                .expect("the fixture is there")
+                .as_slice(),
+            "the rule carries the component it was described from"
+        );
+        // This crate is the only one that can truthfully answer this: `describe_components`'s
+        // output is exactly what `build` folds into `ruleset_hash`, a few lines below where the
+        // rule this test just built came from. `Engine::caching` (`lanekeep-engine`) trusts this
+        // flag rather than re-deriving it, so a `false` here would silently take every
+        // component-backed run's cache off — and nothing outside this crate can tell, because a
+        // hand-built `ComponentRule` looks identical otherwise. Paired with
+        // `an_uncounted_component_is_not_counted_in_ruleset_hash` below, this closes both
+        // mutants of `ComponentRule::counted_in_ruleset_hash` inside this crate's own suite: this
+        // one alone only kills `replace ... with false`, since nothing here is `false` for a
+        // mutant hardcoding `true` to disagree with.
+        assert!(
+            component.counted_in_ruleset_hash(),
+            "a component `load` resolved must be counted in `ruleset_hash`"
+        );
+    }
+
+    /// The two entry points differ in exactly one observable way, and it is worth tens of
+    /// milliseconds per config load.
+    ///
+    /// `load` has nowhere to write, so it compiles each component only to discard the
+    /// compilation, and the engine compiles the same bytes again at prepare time.
+    /// [`load_with`] given a [`LoadOptions::artifacts`] root leaves a `.cwasm` under
+    /// `COMPONENT_CACHE_PATH` that both this load and the engine's own loader map — measured at
+    /// ~58 ms per component per load before, and at TypeScript parity after.
+    ///
+    /// Asserted on the artifact rather than on a duration: a timing assertion on a loaded machine
+    /// is a flake, and the file either exists or it does not. Both directions are asserted,
+    /// because a change making *every* load write would pass a one-sided test while putting a
+    /// cache directory inside every `lanekeep-testkit` fixture — which is the reason `load` does
+    /// not do it.
+    #[test]
+    fn only_a_load_given_a_project_root_caches_what_it_compiled() {
+        let files = &[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["./rules/metadata.wasm"]}"#,
+        )];
+
+        let plain = Fixture::new("artifact-cache-absent", files);
+        plain.write_component("rules/metadata.wasm", "metadata");
+        plain.load_json().expect("the component resolves");
+        assert!(
+            !plain.dir.join(lanekeep_wasm::COMPONENT_CACHE_PATH).exists(),
+            "`load` names no project root, so it must not write a cache directory into one"
+        );
+
+        let cached = Fixture::new("artifact-cache-present", files);
+        cached.write_component("rules/metadata.wasm", "metadata");
+        let root = RuleRoot::new(&cached.dir).expect("canonicalizes");
+        let sandbox =
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+        load_with(
+            &sandbox,
+            &root,
+            &cached.dir.join("lanekeep.json"),
+            LoadOptions {
+                artifacts: Some(&cached.dir),
+                ..LoadOptions::default()
+            },
+        )
+        .expect("the component resolves");
+
+        let artifacts = cached.dir.join(lanekeep_wasm::COMPONENT_CACHE_PATH);
+        let written: Vec<_> = fs::read_dir(&artifacts)
+            .expect("the cache directory is there")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "cwasm"))
+            .collect();
+        assert_eq!(
+            written.len(),
+            1,
+            "one component was described, so one artifact should be cached; found {written:?}"
+        );
+    }
+
+    /// A caller's `--timeout` has to govern config load, because config load runs guest code.
+    ///
+    /// **Asserts the raise, which is the direction that can fail.** `AGENTS.md` records why: a
+    /// test that only *lowers* a budget passes against a budget that is ignored, because the run
+    /// completes either way and completion is what such a test asserts. Raising is different —
+    /// the un-overridden load must fail first, so the override is the only thing that can make
+    /// the second one succeed.
+    ///
+    /// This is the `--timeout` trap recurring in a phase that did not exist when it was first
+    /// found. The flag used to be applied to the `Config` *after* `load` returned, one statement
+    /// below a config load that had already instantiated, configured and read `metadata` from
+    /// every component under the config file's number. A component whose `configure` overran
+    /// failed with a message ending "raise it with `--timeout`", and raising it changed nothing.
+    ///
+    /// The 50 ms against a burn of roughly a third of a second is a ratio, not a deadline: a
+    /// slower machine only makes the breach breach harder, and the raised case has seconds of
+    /// room. Both halves go through `load_with` rather than the CLI, because the CLI is where the
+    /// bug was and a test that reproduced its structure would inherit it.
+    #[test]
+    fn a_raised_global_timeout_governs_config_load_and_not_only_the_run() {
+        let files: &[(&str, &str)] = &[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "timeouts": {"global": 50},
+                "rules": [{"rule": "./rules/metadata.wasm", "options": {"burn": true}}]}"#,
+        )];
+        let fixture = Fixture::new("config-load-budget", files);
+        fixture.write_component("rules/metadata.wasm", "metadata");
+        let root = RuleRoot::new(&fixture.dir).expect("canonicalizes");
+        let sandbox =
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+        let config_path = fixture.dir.join("lanekeep.json");
+
+        // The config's own budget is far below what the fixture spends in `configure`, so the
+        // phase breaches. Asserted on the message as well as on the failure, because a fixture
+        // that failed to load for some unrelated reason would satisfy `is_err` and would make
+        // the raise below prove nothing.
+        let breached = load_with(&sandbox, &root, &config_path, LoadOptions::default())
+            .expect_err("50 ms is far below what the fixture's `configure` spends");
+        let text = breached.to_string();
+        assert!(
+            text.contains("budget"),
+            "the breach must be the budget rather than something incidental, got: {text}"
+        );
+
+        // And raising it is what that message tells the user to do.
+        load_with(
+            &sandbox,
+            &root,
+            &config_path,
+            LoadOptions {
+                global_timeout: Some(Duration::from_secs(30)),
+                ..LoadOptions::default()
+            },
+        )
+        .expect("a raised budget must reach the phase that breached under the lower one");
+    }
+
+    #[test]
+    fn a_built_in_that_ships_as_a_component_resolves_without_a_path() {
+        // The same claim as the test above, for the reference a *user* writes. `lanekeep init`
+        // scaffolds `"lanekeep/<name>"`, and two of the rules that spelling names are compiled
+        // components — so this is the shape every real config takes, where a `.wasm` path is
+        // the shape a project rule takes.
+        let fixture = Fixture::new("builtin-component-load", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/metadata"]}"#,
+        )]);
+
+        let config = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
+            .expect("a built-in component is resolvable by specifier");
+
+        let rule = &config.rules[0];
+        // Everything about the rule is the component's own answer, exactly as for a path
+        // reference. Nothing in the config said any of it.
+        assert_eq!(rule.id.to_string(), "fixture/metadata");
+        assert_eq!(rule.query, "(call_expression) @call");
+        assert_eq!(rule.languages, ["rust"]);
+
+        let component = rule
+            .component
+            .as_ref()
+            .expect("a built-in component reaches the engine as a component");
+        assert_eq!(
+            component.bytes.as_slice(),
+            built_in_component_bytes(),
+            "the rule carries the embedded bytes it was described from"
+        );
+        // A specifier, not a path: there is no file, so there is nothing to canonicalize. It is
+        // relative, which is what keeps it from ever colliding with a confined path — those are
+        // absolute.
+        assert_eq!(component.path, PathBuf::from("lanekeep/metadata"));
+        assert!(
+            !component.path.is_absolute(),
+            "a built-in's provenance must not look like a resolved path"
+        );
+        assert!(
+            component.counted_in_ruleset_hash(),
+            "a built-in component `load` resolved must be counted in `ruleset_hash`"
+        );
+    }
+
+    #[test]
+    fn the_same_specifier_is_a_module_in_a_build_where_no_component_ships() {
+        // The pair, and it is the assertion that makes the one above mean something. With no
+        // component table installed, `lanekeep/metadata` is an ordinary built-in module
+        // specifier — and no such module ships, so it is refused as a missing rule rather than
+        // silently becoming something else. A `classify` that ignored the lookup would pass the
+        // test above and fail here.
+        let fixture = Fixture::new("builtin-component-absent", &[]);
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"include": ["**/*.rs"], "namespaces": ["fixture"],
+                "rules": ["lanekeep/metadata"]}"#,
+        )]);
+
+        let error = fixture
+            .load_json()
+            .expect_err("nothing ships under that name in this build");
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("lanekeep/metadata"),
+            "the refusal has to name the specifier: {rendered}"
+        );
+    }
+
+    /// The other half of the pair above. `load` is not the only way to build a
+    /// `ComponentRule` — `ComponentRule::uncounted` is the door this crate hands an embedder or
+    /// a test that attaches a component outside `load` — and it has to answer honestly too, or
+    /// a mutant hardcoding `counted_in_ruleset_hash` to `true` would pass every test in this
+    /// crate: nothing above ever exercises a value that is genuinely `false`.
+    #[test]
+    fn an_uncounted_component_is_not_counted_in_ruleset_hash() {
+        let component = ComponentRule::uncounted(
+            PathBuf::from("rules/mine.wasm"),
+            "null".to_owned(),
+            b"\0asm".to_vec(),
+        );
+        assert!(
+            !component.counted_in_ruleset_hash(),
+            "bytes nobody hashed must not claim to be counted"
+        );
+    }
+
+    // --- an empty language list ---------------------------------------------------------
+    //
+    // A rule runs only on a file whose language it names, so an empty list is not "every
+    // language", it is *no file at all* — and silently: the rule loads, matches nothing and
+    // reports nothing, which is what a clean codebase looks like. `wit/world.wit` declares
+    // that the host refuses one at load; both ways a rule can arrive have to be held to it,
+    // and the check is one piece of code in `build_rule` precisely so that they are.
+
+    #[test]
+    fn a_typescript_rule_naming_no_language_is_refused() {
+        let fixture = Fixture::new(
+            "empty-languages-ts",
+            &[
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     export default defineRule({\n\
+                       id: 'local/silent',\n\
+                       language: [],\n\
+                       query: '(identifier) @id',\n\
+                       card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+                       check(ctx, m) { ctx.report(m.id); },\n\
+                     });\n",
+                ),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("a rule that can never run must not load");
+        let rendered = error.to_string();
+        assert!(rendered.contains("local/silent"), "{rendered}");
+        assert!(rendered.contains("names no language"), "{rendered}");
+    }
+
+    #[test]
+    fn a_component_naming_no_language_is_refused() {
+        // The same refusal on the other path, driven through the two functions the wasm path
+        // uses — `raw_rule_from` turns what a guest answered into a rule declaration, and
+        // `build_rule` validates it. It stops short of a real guest for one reason: no
+        // committed fixture answers an empty list, and adding a `.wasm` artifact whose only
+        // purpose is to be rejected before it ever runs buys nothing this does not.
+        let described = Described {
+            raw: raw_rule_from(
+                lanekeep_wasm::bindings::types::RuleMetadata {
+                    id: "fixture/silent".to_owned(),
+                    languages: Vec::new(),
+                    severity: "error".to_owned(),
+                    card: lanekeep_wasm::bindings::types::RuleCard {
+                        message: "m".to_owned(),
+                        remediation: "r".to_owned(),
+                        examples: lanekeep_wasm::bindings::types::RuleExamples {
+                            bad: "a".to_owned(),
+                            good: "b".to_owned(),
+                        },
+                    },
+                    query: "(call_expression) @call".to_owned(),
+                    gates: lanekeep_wasm::bindings::types::RuleGates {
+                        path_matches: Vec::new(),
+                        path_not_matches: Vec::new(),
+                        file_contains: Vec::new(),
+                        file_not_contains: Vec::new(),
+                    },
+                    timeout: None,
+                },
+                true,
+                false,
+            ),
+            component: ComponentRule {
+                path: PathBuf::from("silent.wasm"),
+                options: "null".to_owned(),
+                bytes: Vec::new().into(),
+                // This test drives `build_rule` directly, below `describe_components` and
+                // `hash_ruleset` both — irrelevant to either, so `true` for the same reason
+                // `Fixture::component` gives it.
+                counted_in_ruleset_hash: true,
+            },
+        };
+
+        let declared = BTreeSet::from(["fixture".to_owned()]);
+        let error = build_rule(
+            RawRule {
+                id: None,
+                language: None,
+                severity: None,
+                card: None,
+                query: None,
+                gates: Gates::default(),
+                timeout: None,
+                has_check: false,
+                has_reduce: false,
+            },
+            1,
+            "lanekeep.json",
+            &BTreeMap::new(),
+            &declared,
+            Some(described),
+        )
+        .expect_err("a component that can never run must not load");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("fixture/silent"), "{rendered}");
+        assert!(rendered.contains("names no language"), "{rendered}");
+    }
+
+    #[test]
+    fn a_component_is_held_to_the_same_card_and_query_a_typescript_rule_is() {
+        // End to end, through a real guest: `world-shape.wasm` answers `metadata` with an empty
+        // card and an empty query, because it is a probe rather than a rule. A component's
+        // answers go through `build_rule` exactly as an extracted TypeScript rule's do, so it
+        // is refused for the reasons a TypeScript rule would be.
+        let fixture = Fixture::new("component-validated", &[]);
+        fixture.write_component("rules/probe.wasm", "world-shape");
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"namespaces": ["fixture"], "rules": ["./rules/probe.wasm"]}"#,
+        )]);
+
+        let error = fixture
+            .load_json()
+            .expect_err("a probe is not a usable rule");
+        assert!(
+            matches!(error, ConfigError::Rule { position: 1, .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("fixture/world-shape"),
+            "the component's own id should name it: {error}"
+        );
+    }
+
+    // --- confinement ------------------------------------------------------------------
+    //
+    // A rule reference is a string in a config file and a component is *executed*, so where
+    // one may point is a trust boundary. The cases below are the sibling's: `crates/
+    // lanekeep-js/src/loader.rs` refuses traversal, an absolute path and a symlink out of the
+    // root for a module import, and a `.wasm` reference has to be refused for the same reasons
+    // — through `RuleRoot::confine`, which is that same check rather than a second one.
+
+    #[test]
+    fn a_component_reference_may_not_traverse_out_of_the_rules_root() {
+        // Refused whatever is on disk: `secret.wasm` is real and is one directory up. An error
+        // that depended on whether the target existed would tell a reader about the filesystem
+        // rather than about their config.
+        let fixture = Fixture::new("component-traversal", &[]);
+        fixture.write_component("secret.wasm", "metadata");
+        fs::create_dir_all(fixture.dir.join("project")).expect("creates the inner root");
+
+        for specifier in ["../secret.wasm", "../../secret.wasm", "./../secret.wasm"] {
+            fs::write(
+                fixture.dir.join("project/lanekeep.json"),
+                format!(r#"{{"namespaces": ["fixture"], "rules": ["{specifier}"]}}"#),
+            )
+            .expect("writes");
+
+            let error = load_from(&fixture.dir.join("project"), "lanekeep.json")
+                .expect_err("traversal must not resolve");
+            assert!(
+                matches!(error, ConfigError::Rule { position: 1, .. }),
+                "{specifier} gave {error:?}"
+            );
+            assert!(
+                error.to_string().contains("outside the rules root"),
+                "{specifier} gave {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_component_reference_may_not_be_an_absolute_path() {
+        // Built from `temp_dir` rather than written literally: `Path::is_absolute` is
+        // platform-specific, so a literal would take a different branch on each platform. What
+        // makes this reachable at all is that `Path::join` lets an absolute path replace the
+        // base outright, so joining it against the rules root does not confine it.
+        let fixture = Fixture::new("component-absolute", &[]);
+        fixture.write_component("outside.wasm", "metadata");
+
+        let outside = fixture.dir.join("outside.wasm");
+        let inner = fixture.dir.join("project");
+        fs::create_dir_all(&inner).expect("creates the inner root");
+        // Two platform hazards sit between this path and the check it is here to reach, and
+        // both refuse it for a reason that is not confinement.
+        //
+        // Forward slashes, because `validate_specifier` rejects any specifier containing a
+        // backslash — a guard that predates components and exists because a specifier is
+        // interpolated into generated JavaScript. A Windows path spelled `C:\Users\...` is
+        // therefore refused one layer above `confine`, with a message about quoting. Spelled
+        // `C:/Users/...` it is still absolute — Rust accepts either separator on Windows — and
+        // it reaches the confinement check this test names. On Unix the replacement is a no-op.
+        //
+        // Then `serde_json` rather than `format!`, because a backslash also begins an escape
+        // inside a JSON string, so an interpolated Windows path makes the config fail to
+        // *parse*. Belt and braces: the replacement above already removes them, and encoding
+        // properly keeps this true if the path ever carries something else JSON reserves.
+        let forward = outside.display().to_string().replace('\\', "/");
+        let specifier = serde_json::to_string(&forward).expect("a path is a JSON string");
+        fs::write(
+            inner.join("lanekeep.json"),
+            format!(r#"{{"namespaces": ["fixture"], "rules": [{specifier}]}}"#),
+        )
+        .expect("writes");
+
+        let error = load_from(&inner, "lanekeep.json").expect_err("an absolute path is refused");
+        assert!(
+            error.to_string().contains("outside the rules root"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_component_reference_may_not_be_a_symlink_out_of_the_rules_root() {
+        // The case a lexical check cannot see, and the reason `confine` canonicalizes rather
+        // than only normalizing. `./link.wasm` sits inside the root and looks entirely
+        // innocent.
+        let fixture = Fixture::new("component-symlink", &[]);
+        fixture.write_component("outside.wasm", "metadata");
+        let inner = fixture.dir.join("project");
+        fs::create_dir_all(&inner).expect("creates the inner root");
+        std::os::unix::fs::symlink(fixture.dir.join("outside.wasm"), inner.join("link.wasm"))
+            .expect("creates symlink");
+        fs::write(
+            inner.join("lanekeep.json"),
+            r#"{"namespaces": ["fixture"], "rules": ["./link.wasm"]}"#,
+        )
+        .expect("writes");
+
+        let error = load_from(&inner, "lanekeep.json").expect_err("a symlink out is refused");
+        assert!(
+            error.to_string().contains("outside the rules root"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_escaping_component_is_refused_before_its_bytes_are_read() {
+        // Confinement that happened after the read would already have loaded, compiled and
+        // instantiated whatever the reference pointed at — the check would be a report rather
+        // than a guard. Pointing at a path that is *unreadable* rather than absent separates
+        // the two: read-then-check reports the permission error, check-then-read reports the
+        // escape.
+        let fixture = Fixture::new("component-escape-before-read", &[]);
+        fixture.write_component("outside.wasm", "metadata");
+        let outside = fixture.dir.join("outside.wasm");
+        fs::set_permissions(
+            &outside,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("makes it unreadable");
+
+        let inner = fixture.dir.join("project");
+        fs::create_dir_all(&inner).expect("creates the inner root");
+        fs::write(
+            inner.join("lanekeep.json"),
+            r#"{"namespaces": ["fixture"], "rules": ["../outside.wasm"]}"#,
+        )
+        .expect("writes");
+
+        let error = load_from(&inner, "lanekeep.json").expect_err("refused");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("outside the rules root"),
+            "the escape must be what stopped it, not the read: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Permission denied"),
+            "nothing may be read before the reference is confined: {rendered}"
+        );
+
+        // Left readable, or the fixture's own cleanup cannot remove it.
+        fs::set_permissions(
+            &outside,
+            std::os::unix::fs::PermissionsExt::from_mode(0o644),
+        )
+        .expect("restores");
+    }
+
+    /// A TypeScript rule sitting after a component still reaches its own handler.
+    ///
+    /// **The silent failure this is written against.** `RuleSpec::index` is how the engine
+    /// reaches a TypeScript handler — it is spelled `__lanekeepConfig.rules[index].check(...)`
+    /// — and a component contributes nothing to that array. Numbering the array separately
+    /// from the config would leave rule 2 of a mixed config at array position 1: the call
+    /// succeeds, the wrong rule's handler runs, and every violation is reported under a
+    /// neighbor's id. Nothing errors and nothing looks wrong.
+    ///
+    /// So the two numberings are one numbering, and this is what says so end to end: the
+    /// TypeScript rule's `index` is its position in the config, and the entry module has that
+    /// rule at that position.
+    #[test]
+    fn a_typescript_rule_after_a_component_keeps_its_own_index() {
+        let fixture = Fixture::new(
+            "component-mixed-order",
+            &[("second.ts", &rule("local/second"))],
+        );
+        fixture.write_component("rules/metadata.wasm", "metadata");
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"namespaces": ["fixture"],
+                "rules": ["./rules/metadata.wasm", "./second"]}"#,
+        )]);
+
+        let config = fixture.load_json().expect("loads");
+
+        assert_eq!(config.rules[0].id.to_string(), "fixture/metadata");
+        assert_eq!(config.rules[0].index, 0);
+        assert_eq!(config.rules[1].id.to_string(), "local/second");
+        assert_eq!(
+            config.rules[1].index, 1,
+            "the TypeScript rule's index is its position in the array the engine indexes"
+        );
+        assert!(config.rules[1].component.is_none());
+    }
+
+    #[test]
+    fn a_component_carries_the_options_it_was_configured_with() {
+        // A component cannot close over a host-supplied value, so its options travel with it
+        // as data — all the way to every worker's `configure`. A rule named with no options is
+        // still configured, with `null`, which is the world's own shape for it.
+        let fixture = Fixture::new("component-options", &[]);
+        fixture.write_component("rules/metadata.wasm", "metadata");
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"namespaces": ["fixture"],
+                "rules": [{"rule": "./rules/metadata.wasm", "options": {"allow": ["a.rs"]}}]}"#,
+        )]);
+
+        let config = fixture.load_json().expect("loads");
+        let component = config.rules[0]
+            .component
+            .as_ref()
+            .expect("a component-backed rule");
+        assert_eq!(component.options, r#"{"allow":["a.rs"]}"#);
+
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"namespaces": ["fixture"], "rules": ["./rules/metadata.wasm"]}"#,
+        )]);
+        let bare = fixture.load_json().expect("loads");
+        assert_eq!(
+            bare.rules[0]
+                .component
+                .as_ref()
+                .expect("a component-backed rule")
+                .options,
+            "null"
+        );
+    }
+
+    #[test]
+    fn a_component_that_refuses_its_options_is_refused_at_load() {
+        // A misconfigured rule is not a rule that misbehaved, and the difference is what the
+        // user can do about it. The guest's own message has to survive to the diagnostic,
+        // because it is the only part that names what was wrong with the configuration.
+        let fixture = Fixture::new("component-bad-options", &[]);
+        fixture.write_component("rules/metadata.wasm", "metadata");
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"namespaces": ["fixture"],
+                "rules": [{"rule": "./rules/metadata.wasm", "options": [1, 2]}]}"#,
+        )]);
+
+        let error = fixture
+            .load_json()
+            .expect_err("the fixture refuses an array");
+
+        assert!(
+            matches!(error, ConfigError::Rule { position: 1, .. }),
+            "the diagnostic should name which entry: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("expected an object"),
+            "the guest's own message should survive: {error}"
+        );
+    }
+
+    /// A component that cannot be read fails the load, so it never reaches a hash.
+    ///
+    /// **This is where §8.2's "absence is a dependency" went, and it is stronger here.**
+    /// `ruleset_hash` used to fold a present/absent marker per component, so that a missing
+    /// one and a present one could not share a cache key; it folds bytes that were already
+    /// read now, and cannot see absence at all. It does not need to: the run whose key would
+    /// have been wrong does not happen. A missing component is refused before a `Config`
+    /// exists, naming which entry, so there is nothing to serve a stale answer to.
+    #[test]
+    fn a_component_that_is_not_there_is_refused_by_position() {
+        let fixture = Fixture::new(
+            "component-missing",
+            &[
+                ("first.ts", &rule("local/first")),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./first", "./rules/gone.wasm"]}"#,
+                ),
+            ],
+        );
+
+        let error = fixture.load_json().expect_err("there are no bytes to run");
+        assert!(
+            matches!(error, ConfigError::Rule { position: 2, .. }),
+            "the diagnostic should name which entry: {error:?}"
+        );
+        assert!(error.to_string().contains("gone.wasm"), "{error}");
+    }
+
     // --- hashing --------------------------------------------------------------------
 
     #[test]
@@ -1311,11 +2651,10 @@ mod tests {
         // asserts for modules: editing the code a rule is made of must invalidate.
         let fixture = Fixture::new("component-bytes", &[("mine.wasm", "\u{0}asm-one")]);
         let sandbox = fixture.empty_sandbox();
-        let resolved = [fixture.component("mine.wasm")];
 
-        let before = hash_ruleset(&sandbox, &resolved);
+        let before = hash_ruleset(&sandbox, &[&fixture.component("mine.wasm")]);
         fixture.write_all(&[("mine.wasm", "\u{0}asm-two")]);
-        let after = hash_ruleset(&sandbox, &resolved);
+        let after = hash_ruleset(&sandbox, &[&fixture.component("mine.wasm")]);
 
         assert_ne!(
             hex(&before),
@@ -1326,36 +2665,48 @@ mod tests {
 
     #[test]
     fn two_components_cannot_run_together_into_one() {
-        // The reason a component's bytes are length-prefixed, and the reason a test for it has
-        // to use bytes that carry the marker.
+        // The reason a component's bytes are length-prefixed, and now the only thing that says
+        // so — the length is the whole of the delimiting.
         //
         // A module's source is text and its separator is a NUL. A component is arbitrary
-        // binary, so **any** byte used as a separator can appear inside it — including the
-        // `0x01` present-marker, which is what would be doing the delimiting if the length
-        // prefix were dropped. These two rulesets are genuinely different and fold to the
-        // identical byte sequence without it, under an identical component count:
+        // binary, so there is no byte available to separate one from the next: whichever were
+        // chosen could appear inside a component. Without the length, these two rulesets are
+        // genuinely different and fold to the identical byte sequence, under an identical
+        // component count:
         //
-        //   A:  01 'A' 'A' | 01 'B' 'B' 01 'C' 'C'      a = "AA",       b = "BB\x01CC"
-        //   B:  01 'A' 'A' 01 'B' 'B' | 01 'C' 'C'      a = "AA\x01BB", b = "CC"
+        //   A:  'A' 'A' | 'B' 'B' 'C' 'C'      a = "AA",   b = "BBCC"
+        //   B:  'A' 'A' 'B' 'B' | 'C' 'C'      a = "AABB", b = "CC"
+        //
+        // **The data used to carry a `\x01` and stopped discriminating when it was no longer
+        // needed.** The bytes were built around the old present/absent marker acting as the
+        // delimiter, so removing the marker made the two rows genuinely different sequences and
+        // this test passed with `length_prefixed` deleted. Concatenation is the property; the
+        // data has to be a real collision under it.
         //
         // Two different rulesets sharing a cache key is the one failure `docs/architecture.md`
         // §8.1 exists to prevent, so it is asserted here rather than left to the fact that
         // nothing writes a `.wasm` by hand.
         let fixture = Fixture::new("component-run-together", &[("a.wasm", ""), ("b.wasm", "")]);
         let sandbox = fixture.empty_sandbox();
-        let resolved = [fixture.component("a.wasm"), fixture.component("b.wasm")];
 
-        fixture.write_all(&[("a.wasm", "AA"), ("b.wasm", "BB\u{1}CC")]);
-        let split_early = hash_ruleset(&sandbox, &resolved);
+        fixture.write_all(&[("a.wasm", "AA"), ("b.wasm", "BBCC")]);
+        let split_early = hash_ruleset(
+            &sandbox,
+            &[&fixture.component("a.wasm"), &fixture.component("b.wasm")],
+        );
 
-        fixture.write_all(&[("a.wasm", "AA\u{1}BB"), ("b.wasm", "CC")]);
-        let split_late = hash_ruleset(&sandbox, &resolved);
+        fixture.write_all(&[("a.wasm", "AABB"), ("b.wasm", "CC")]);
+        let split_late = hash_ruleset(
+            &sandbox,
+            &[&fixture.component("a.wasm"), &fixture.component("b.wasm")],
+        );
 
         assert_ne!(
             hex(&split_early),
             hex(&split_late),
             "two components must not be able to concatenate into one byte sequence — the \
-             present-marker is not a separator, because a component can contain it"
+             length is the only thing delimiting them, because any separator byte can appear \
+             inside a component"
         );
     }
 
@@ -1372,54 +2723,12 @@ mod tests {
         let sandbox = fixture.empty_sandbox();
 
         assert_eq!(
-            hex(&hash_ruleset(&sandbox, &[fixture.component("a.wasm")])),
+            hex(&hash_ruleset(&sandbox, &[&fixture.component("a.wasm")])),
             hex(&hash_ruleset(
                 &sandbox,
-                &[fixture.component("nested/b.wasm")]
+                &[&fixture.component("nested/b.wasm")]
             )),
             "the same component bytes are the same ruleset wherever they sit"
-        );
-    }
-
-    #[test]
-    fn a_component_that_cannot_be_read_is_not_one_that_can() {
-        // §8.2's "absence is a dependency", one level up. A component that is missing and one
-        // that is present must not share a key, or adding the file changes nothing until
-        // something unrelated invalidates the entry.
-        let fixture = Fixture::new("component-absent", &[("a-present.wasm", "")]);
-        let sandbox = fixture.empty_sandbox();
-
-        assert_ne!(
-            hex(&hash_ruleset(
-                &sandbox,
-                &[fixture.component("a-present.wasm")]
-            )),
-            hex(&hash_ruleset(&sandbox, &[fixture.component("b-gone.wasm")])),
-            "an unreadable component must not hash as an empty one"
-        );
-
-        // And *which* one is missing has to be distinguishable, which is what the marker buys
-        // over simply skipping the entry. Two references, one file present at each: skip the
-        // absent one and both runs fold the identical bytes, so a ruleset with one rule broken
-        // shares a key with the ruleset that has the other one broken. The count is hashed
-        // already, so nothing else would notice.
-        fixture.write_all(&[("b-present.wasm", "")]);
-        assert_ne!(
-            hex(&hash_ruleset(
-                &sandbox,
-                &[
-                    fixture.component("a-present.wasm"),
-                    fixture.component("b-gone.wasm"),
-                ]
-            )),
-            hex(&hash_ruleset(
-                &sandbox,
-                &[
-                    fixture.component("a-gone.wasm"),
-                    fixture.component("b-present.wasm"),
-                ]
-            )),
-            "which component is missing must be part of the hash, not only how many are"
         );
     }
 
@@ -1437,24 +2746,71 @@ mod tests {
         let one = fixture.component("one.wasm");
         let two = fixture.component("two.wasm");
 
-        let canonical = hex(&hash_ruleset(&sandbox, &[one.clone(), two.clone()]));
+        let canonical = hex(&hash_ruleset(&sandbox, &[&one, &two]));
         assert_eq!(
             canonical,
-            hex(&hash_ruleset(&sandbox, &[two.clone(), one.clone()])),
+            hex(&hash_ruleset(&sandbox, &[&two, &one])),
             "reordering two components is not a different ruleset"
         );
         assert_eq!(
             canonical,
-            hex(&hash_ruleset(&sandbox, &[one.clone(), two, one])),
+            hex(&hash_ruleset(&sandbox, &[&one, &two, &one])),
             "naming one component twice is not a different ruleset"
+        );
+    }
+
+    /// One path can carry two byte sequences, and both have to reach the key.
+    ///
+    /// `component_bytes` reads once per `ResolvedRule` and nothing deduplicates `rules`, so a
+    /// config naming one file twice — bare in one entry and with options in another — reads it
+    /// twice. A rewrite between those reads produces exactly the pair below, and both rules go on
+    /// to execute the bytes they carry. Deduplicating on the path alone kept one of them
+    /// arbitrarily, so the key described a ruleset that was not running.
+    ///
+    /// The window is microseconds and the trigger is exotic. It is asserted anyway because the
+    /// claim it falsifies — the bytes hashed are the bytes that run — is the one the component
+    /// half of `ruleset_hash` exists to make, and a claim with one shape that breaks it is not
+    /// quite the claim.
+    #[test]
+    fn one_path_with_two_byte_sequences_reaches_the_ruleset_hash_as_both() {
+        let fixture = Fixture::new("component-torn-read", &[("r.wasm", "\u{0}asm-before")]);
+        let sandbox = fixture.empty_sandbox();
+
+        // The first reference's read.
+        let before = fixture.component("r.wasm");
+        // The file is rewritten, and the second reference reads what is there now. Both carry
+        // the same path, because it is the same file.
+        fixture.write_all(&[("r.wasm", "\u{0}asm-after")]);
+        let after = fixture.component("r.wasm");
+        assert_eq!(
+            before.path, after.path,
+            "the fixture is one file, read twice"
+        );
+        assert_ne!(
+            before.bytes.as_slice(),
+            after.bytes.as_slice(),
+            "the rewrite is what makes this pair interesting"
+        );
+
+        assert_ne!(
+            hex(&hash_ruleset(&sandbox, &[&before, &after])),
+            hex(&hash_ruleset(&sandbox, &[&before, &before])),
+            "a run executing two different components must not key as one executing the first \
+             twice — deduplicating on the path alone made these equal"
+        );
+        assert_ne!(
+            hex(&hash_ruleset(&sandbox, &[&before, &after])),
+            hex(&hash_ruleset(&sandbox, &[&after, &after])),
+            "nor as one executing the second twice"
         );
     }
 
     #[test]
     fn the_ruleset_hash_still_covers_modules_when_a_component_is_present() {
         // The deviation this change makes from its own plan, asserted rather than described.
-        // The plan said the component fold *replaces* the module walk; every rule in this tree
-        // is TypeScript, so that would have taken the whole ruleset out of the cache key.
+        // The plan said the component fold *replaces* the module walk; two built-ins are
+        // components and every other rule in this tree is a module, so that would have taken
+        // almost the whole ruleset out of the cache key.
         let files: &[(&str, &str)] = &[
             ("rule.ts", &rule("local/example")),
             ("lanekeep.config.ts", ""),
@@ -1463,7 +2819,7 @@ mod tests {
         fixture.write_all(&[("lanekeep.config.ts", &config_with("rules: [rule]"))]);
         fixture.write_all(&[("mine.wasm", "\u{0}asm")]);
 
-        let resolved = [fixture.component("mine.wasm")];
+        let mine = fixture.component("mine.wasm");
         let root = RuleRoot::new(&fixture.dir).expect("canonicalizes");
         let hash_after_loading = |source: &str| {
             fixture.write_all(&[("rule.ts", source)]);
@@ -1471,7 +2827,7 @@ mod tests {
                 sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
             evaluate_into(&sandbox, &root, &fixture.dir.join("lanekeep.config.ts"))
                 .expect("evaluates");
-            hash_ruleset(&sandbox, &resolved)
+            hash_ruleset(&sandbox, &[&mine])
         };
 
         assert_ne!(

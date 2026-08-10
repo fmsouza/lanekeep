@@ -37,7 +37,9 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::lanekeep::host::types::{FactError, ReduceLocation};
+use bindings::lanekeep::host::types::{
+    FactError, ReduceLocation, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 /// The capture this rule reports at.
@@ -82,6 +84,56 @@ static SINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 struct Component;
 
 impl Guest for Component {
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
+    fn metadata() -> RuleMetadata {
+        RuleMetadata {
+            id: "fixture/engine-rule".to_owned(),
+            // Not `"rust"`: `crates/lanekeep-engine/src/lib.rs`'s `component_rule` is the only
+            // place this fixture is actually driven, and it builds the real `RuleSpec` by hand
+            // with `languages: vec!["typescript".to_owned()]` and the same query this guest
+            // matches against. `metadata()` here is unexercised by any test, but this is the one
+            // field with a real answer sitting elsewhere in the tree, so it agrees rather than
+            // inventing a second one.
+            languages: vec!["typescript".to_owned()],
+            severity: "error".to_owned(),
+            card: RuleCard {
+                message: String::new(),
+                remediation: String::new(),
+                examples: RuleExamples {
+                    bad: String::new(),
+                    good: String::new(),
+                },
+            },
+            query: String::new(),
+            gates: RuleGates {
+                path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
+                file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
+    /// Accepts `null` and an object, and refuses anything else.
+    ///
+    /// It used to refuse unconditionally, which was right while nothing called it and is not
+    /// now: `WasmRuntime::rule` configures every instance it builds, and this is the fixture
+    /// `lanekeep-engine`'s component-dispatch tests actually run — so an unconditional refusal
+    /// would fail every one of them, from inside instantiation, with a message about an export
+    /// none of those tests mention.
+    ///
+    /// An object is accepted as well as `null` so that a test configuring this rule with real
+    /// options is testing the engine's plumbing rather than this guest's opinion of it. What
+    /// stays refused is the shape that is not options at all.
+    fn configure(options_json: String) -> Result<(), String> {
+        if options_json == "null" || options_json.starts_with('{') {
+            return Ok(());
+        }
+        Err("fixture/engine-rule expects an object or null".to_owned())
+    }
+
     fn has_check() -> bool {
         true
     }

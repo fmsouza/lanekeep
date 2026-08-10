@@ -835,6 +835,7 @@ dependencies = [
  "lanekeep-core",
  "lanekeep-js",
  "lanekeep-lang-js",
+ "lanekeep-wasm",
  "serde",
  "serde_json",
  "thiserror",
@@ -864,6 +865,9 @@ dependencies = [
  "lanekeep-js",
  "lanekeep-lang",
  "lanekeep-lang-js",
+ "lanekeep-lang-rust",
+ "lanekeep-languages",
+ "lanekeep-nodes",
  "lanekeep-query",
  "lanekeep-wasm",
  "memchr",
@@ -978,6 +982,8 @@ dependencies = [
 name = "lanekeep-rules"
 version = "0.6.1"
 dependencies = [
+ "lanekeep-core",
+ "lanekeep-js",
  "lanekeep-testkit",
 ]
 
@@ -1000,6 +1006,7 @@ dependencies = [
  "lanekeep-js",
  "lanekeep-lang-js",
  "lanekeep-languages",
+ "serde_json",
  "thiserror",
 ]
 

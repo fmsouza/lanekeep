@@ -27,12 +27,47 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::lanekeep::host::types::ReadError;
+use bindings::lanekeep::host::types::{ReadError, RuleCard, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
 
 impl Guest for Component {
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
+    fn metadata() -> RuleMetadata {
+        RuleMetadata {
+            id: "fixture/reads".to_owned(),
+            languages: vec!["rust".to_owned()],
+            severity: "error".to_owned(),
+            card: RuleCard {
+                message: String::new(),
+                remediation: String::new(),
+                examples: RuleExamples {
+                    bad: String::new(),
+                    good: String::new(),
+                },
+            },
+            query: String::new(),
+            gates: RuleGates {
+                path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
+                file_contains: Vec::new(),
+                file_not_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
+    /// Not exercised by any test — every export is mandatory because a WIT world has no
+    /// optional ones. `tests/fixtures/metadata/` is where `configure` itself is tested.
+    ///
+    /// Refuses unconditionally rather than accepting anything, so a caller that reached this
+    /// export on this fixture fails loudly instead of passing on a vacuous success.
+    fn configure(_options_json: String) -> Result<(), String> {
+        Err("fixture/reads does not implement configure".to_owned())
+    }
+
     fn has_check() -> bool {
         true
     }
@@ -108,10 +143,7 @@ fn read(ctx: &CheckContext, args: &[&str]) {
     let Some(path) = args.first() else {
         return say(ctx, "shape: no path argument");
     };
-    say(
-        ctx,
-        &format!("read={}", read_outcome(ctx.read_file(path))),
-    );
+    say(ctx, &format!("read={}", read_outcome(ctx.read_file(path))));
 }
 
 /// One `file-exists`, reported.

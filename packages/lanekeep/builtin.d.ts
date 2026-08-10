@@ -12,9 +12,22 @@
  * ignores it and the import stays unresolved. That failed silently until a compile test
  * caught it.
  *
- * The default covers both shapes a built-in can take, because which one it is cannot be known
- * from the specifier: a rule taking options is a factory — `noRestrictedImports({ ... })` —
- * and one taking none is the rule itself.
+ * The default covers the two shapes an *importable* built-in can take, because which one it is
+ * cannot be known from the specifier: a rule taking options is a factory —
+ * `noRestrictedImports({ ... })` — and one taking none is the rule itself.
+ *
+ * **There is a third shape, and this file types it wrongly.** A built-in may ship as a
+ * WebAssembly component, which has no module to import at all: `lanekeep/no-unwrap` and
+ * `lanekeep/no-glob-import` are components today. The `typesVersions` mapping points every
+ * specifier here, so importing one type-checks and then fails at run time with a resolution
+ * error naming the reason. Name it in `lanekeep.json` instead — `"rules": ["lanekeep/no-unwrap"]`
+ * — which is the spelling `lanekeep init` scaffolds and which works whichever form the rule
+ * takes.
+ *
+ * Typing that honestly needs the mapping to distinguish specifiers, which means either
+ * enumerating built-ins in `package.json` — a list that goes stale on the next migration — or
+ * generating it. Left as follow-up; this comment exists so the gap is not mistaken for a
+ * complete enumeration. There is no `tsc` gate over this package, so nothing here is red.
  */
 export * from './index'
 
