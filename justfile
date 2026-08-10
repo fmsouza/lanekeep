@@ -155,9 +155,10 @@ test-doc:
 # eight of `wasi:cli` — which is a filesystem, a clock, randomness, network and stdio in a
 # component whose whole purpose is to have none of them. `crates/lanekeep-wasm/src/load.rs`
 # refuses such an artifact at load, naming all eighteen. The flag costs 42,584 bytes
-# (13,070,681 without against 13,028,097 with) — to a few dozen bytes, since neither side is
-# reproducible — so the capabilities are nearly free to carry and would be very expensive to
-# have.
+# (13,070,681 without against 13,028,097 with) — a matched pair from one sitting, exact only to a
+# few dozen bytes since neither side is reproducible, and neither number is the committed
+# artifact's, which is a later build. The capabilities are nearly free to carry and would be very
+# expensive to have.
 #
 # **A missing Node is an error here and not a skip**, unlike in `test-js`. Both of this
 # recipe's callers end by recording digests of every source they were built from, and a build
@@ -175,6 +176,21 @@ test-doc:
 # that nothing moved" check does not reach these two artifacts — restore one with
 # `git checkout` when its digest is the only line that moved.
 #
+# **`--no-install` is a supply-chain flag, not a speed one.** `--prefix` decides which directory
+# npx looks in; it does not stop npx fetching what it fails to find there. `node_modules/` is
+# gitignored, so on a clone that has never run `npm ci` the invocation below resolves nothing
+# locally and npx offers to install **`jco@1.0.0`** — an unrelated package on the public registry,
+# not `@bytecodealliance/jco@1.27.0` — which in a terminal is one Enter away from executing
+# against this repository. `_require node` and `_require npx` cannot see it: both binaries are
+# there. With the flag, npx refuses and exits 1 instead.
+#
+# The check above it exists because npx's refusal names the package it would have fetched rather
+# than the prefix it looked in, so `jco@1.0.0` is the last thing a reader sees when the actual
+# problem is an empty `node_modules`. It does *not* cover the other way this goes wrong — an
+# install that succeeded on too old a Node and silently skipped a native binding, which
+# `AGENTS.md` records — because in that case the binary below is present and the failure is
+# inside it.
+#
 # `{{ ARGS }}` is unquoted on purpose, so that `--bundle-config <path>` arrives as two words.
 # Every value is written in this file; none comes from a caller outside it.
 _componentize source out *ARGS:
@@ -182,8 +198,14 @@ _componentize source out *ARGS:
     set -euo pipefail
     just _require node
     just _require npx
+    if [ ! -x packages/lanekeep/node_modules/.bin/jco ]; then
+        echo "error: 'packages/lanekeep' has no installed jco." >&2
+        echo "       run 'npm --prefix packages/lanekeep ci' first — componentizing needs the" >&2
+        echo "       pinned toolchain, and nothing here may fetch one." >&2
+        exit 1
+    fi
     echo "componentizing {{ source }}"
-    npx --prefix packages/lanekeep jco componentize "{{ source }}" \
+    npx --no-install --prefix packages/lanekeep jco componentize "{{ source }}" \
         --wit crates/lanekeep-wasm/wit --world-name rule --disable all --bundle \
         {{ ARGS }} -o "{{ out }}"
 
@@ -371,10 +393,10 @@ rust-rules:
 # `just check` passes on a machine with no Node at all.
 #
 # **One component for every TypeScript rule, and not one each.** Measured on this entry,
-# 2026-08-10: hosting `no-default-export` alone gives 13,021,569 bytes and hosting all four
-# gives 13,028,097 — **6,528 bytes for three more rules**, against a per-rule cost of 13 MiB if
-# each got its own component. What is being paid for is a StarlingMonkey build, and the rules
-# are rounding error on it. `crates/lanekeep-rules/typescript/entry.ts` is where they are
+# 2026-08-10, a matched pair from one sitting: hosting `no-default-export` alone gives 13,021,569
+# bytes and hosting all four gives 13,028,097 — **6,528 bytes for three more rules**, against a
+# per-rule cost of 13 MiB if each got its own component. What is being paid for is a
+# StarlingMonkey build, and the rules are rounding error on it. `crates/lanekeep-rules/typescript/entry.ts` is where they are
 # listed, and the index a rule sits at there is what `lanekeep_rules` dispatches on.
 #
 # `--bundle-config` is what makes lanekeep's own resolution rules apply to a bundler that would

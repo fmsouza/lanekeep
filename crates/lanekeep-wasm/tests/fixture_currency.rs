@@ -206,6 +206,13 @@ const TYPESCRIPT_ARTIFACTS: &[&str] =
 ///   A version bump changes the bytes, the bytes are a `ruleset_hash` input, so a bump that
 ///   nobody rebuilt against is exactly the staleness this file is about. It also carries the
 ///   `exports` map and the package's module type, which decide what a specifier means.
+/// - **`packages/lanekeep/package-lock.json`**, which is the sharper of the two and not a
+///   duplicate of it. What decides these bytes is the whole locked tree — rolldown, the
+///   StarlingMonkey build, `wizer`, `binaryen` — and every one of those can move while the two
+///   versions in `package.json` stay exactly as they were. A lock refresh is then an artifact
+///   nobody rebuilt sitting behind a green manifest, which is the class of failure this file
+///   exists for rather than an exception to it. The cost is that `npm install` churn demands a
+///   rebuild, and that is the right trade: the churn really did change the toolchain.
 /// - **The four runtime files**, not the directory: `runtime/` also holds two `.test.js` files
 ///   that nothing is built from, and covering it would demand a componentize after editing a
 ///   JavaScript test. `resolve.js` is in here because the bundle's resolver *is* it —
@@ -223,6 +230,7 @@ const TYPESCRIPT_SOURCES: &[&str] = &[
     "crates/lanekeep-rules/typescript",
     "crates/lanekeep-wasm/wit",
     "packages/lanekeep/index.js",
+    "packages/lanekeep/package-lock.json",
     "packages/lanekeep/package.json",
     "packages/lanekeep/runtime/entry.js",
     "packages/lanekeep/runtime/host.js",
@@ -270,6 +278,7 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
         HEADER,
         "the committed WebAssembly fixtures",
         "just wasm-fixtures",
+        None,
     );
 }
 
@@ -341,6 +350,12 @@ fn every_committed_rule_component_is_the_one_its_sources_build() {
         RULE_HEADER,
         "the committed rule components",
         "just rust-rules",
+        Some(
+            ". And if it is a component some other recipe builds, it belongs in \
+             `TYPESCRIPT_ARTIFACTS` — recording it here makes `just rust-rules` bless an \
+             artifact it cannot rebuild, and every rebuild by the recipe that can will then \
+             leave this manifest red",
+        ),
     );
 }
 
@@ -397,6 +412,7 @@ fn every_committed_typescript_component_is_the_one_its_sources_build() {
         TYPESCRIPT_HEADER,
         "the committed TypeScript built-ins component",
         "just typescript-builtins",
+        None,
     );
 }
 
@@ -442,6 +458,16 @@ fn counted(computed: &BTreeMap<String, String>, prefix: &str, extension: &str) -
 ///
 /// `what` and `recipe` are the two halves of the failure message that differ between the
 /// manifests: what went stale, and which recipe makes it current again.
+///
+/// `stray` is a third, and only one manifest needs it. Every complaint here ends by naming
+/// `recipe` as the repair, which is right for a stale digest and **wrong for a file that was
+/// never recorded at all** when the walk covers a directory another recipe also builds into:
+/// `crates/lanekeep-rules/components/` holds artifacts from two recipes, so a new JavaScript
+/// component appearing there would be reported by the *Rust* manifest, and running the repair it
+/// named would bless it into a manifest that cannot rebuild it — the ownership drift this file's
+/// own documentation says must not happen. An error message that sends a reader to the wrong fix
+/// is worse than one that says less, so the manifest with that exposure passes the sentence that
+/// names the partition.
 fn reconcile(
     computed: &BTreeMap<String, String>,
     manifest: &Path,
@@ -449,6 +475,7 @@ fn reconcile(
     header: &str,
     what: &str,
     recipe: &str,
+    stray: Option<&str>,
 ) {
     if std::env::var_os(bless).is_some() {
         std::fs::write(manifest, render(header, computed)).expect("the manifest is writable");
@@ -467,7 +494,8 @@ fn reconcile(
             Some(_) => wrong.push(format!("  {path} changed since it was last recorded")),
             None => wrong.push(format!(
                 "  {path} is present but was never recorded — if it is not a source, it does \
-                 not belong in the tree"
+                 not belong in the tree{}",
+                stray.unwrap_or_default()
             )),
         }
     }

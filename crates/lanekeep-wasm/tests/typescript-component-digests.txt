@@ -8,7 +8,7 @@
 # A line that moves when the artifact did not means a rule's source, the runtime it is bundled
 # with, the world it is built against or the toolchain it is pinned to was changed without
 # rebuilding — run `just typescript-builtins`.
-crates/lanekeep-rules/components/typescript-builtins.wasm cd07ae4aa59c73165529980c98a2260706ddb88b2a16e06d48a256a37144dbe0
+crates/lanekeep-rules/components/typescript-builtins.wasm 301ee6cbf9531f36e468382a71b193da12c98731752fa441fcc42de700d847d7
 crates/lanekeep-rules/modules/paths.ts 92e6793d4d5640229a938b38514863691a63f9bd245a015d6bb581bb49cae65c
 crates/lanekeep-rules/rules/no-circular-imports.ts 3ba0f2ba906a2b900740865d67cdb0f9c307d179916f8da6d2755f1aea532c1a
 crates/lanekeep-rules/rules/no-default-export.ts ecbf4b4c78b1a6142a44121d435a4aeefc841685692c50673ac64b9a741c8b54
@@ -18,6 +18,7 @@ crates/lanekeep-rules/typescript/entry.ts 70f2270524af06c5ac70faf47d02fd3e014527
 crates/lanekeep-rules/typescript/rolldown.config.mjs 245df7be088eaae759c3528cd25c65ca899e9802875cd839f4e3972b1f75e0d9
 crates/lanekeep-wasm/wit/world.wit 958f83214815afef4827fe26d3d027b1730a674769c941a85da373397c58c994
 packages/lanekeep/index.js fddaee95f4573966190d85bdcedd5f9a7e3c3d53b25f531e96a4842e035b870e
+packages/lanekeep/package-lock.json bbc5fbe06ccd8ade9ac4b5b08f38a6532256e068413fd761321fefe148a7475d
 packages/lanekeep/package.json 0ec76fba0468f40c36671ea0e27c54ca469651b164f989006f68d8a83d4ef9f6
 packages/lanekeep/runtime/entry.js be03c32087b2ad46755bf223c06c28d653f1ce90cb9f4574694a18c6d3491976
 packages/lanekeep/runtime/host.js 013bfdc9c8913ba474aa4784a4a97a888706bd9ff4f9d39666accbfe69d1264f
