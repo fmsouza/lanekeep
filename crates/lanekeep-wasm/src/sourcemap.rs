@@ -195,13 +195,17 @@ impl SourceMap {
             .get(usize::try_from(line.checked_sub(1)?).ok()?)?;
         let zero_based = column.saturating_sub(1);
 
-        // The last segment at or before the column, and the first on the line when the column
-        // precedes all of them. `partition_point` is the binary search: it answers how many
-        // segments start at or before `zero_based`.
+        // How many segments start at or before the column. `partition_point` is the binary
+        // search; the segment wanted is the one before that boundary.
         let at = segments.partition_point(|segment| segment.generated_column <= zero_based);
-        let segment = segments
-            .get(at.saturating_sub(1))
-            .or_else(|| segments.first())?;
+        let segment = match at.checked_sub(1) {
+            Some(index) => segments.get(index)?,
+            // The documented departure, spelled as its own arm rather than folded into a
+            // `saturating_sub` — which is what it was, and which made the policy indistinguishable
+            // from the ordinary path and therefore untestable. Nothing starts at or before the
+            // column, so the line's first segment is the answer.
+            None => segments.first()?,
+        };
 
         Some(Position {
             file: self.sources.get(usize::try_from(segment.source).ok()?)?,
@@ -212,17 +216,33 @@ impl SourceMap {
 
     /// A guest's stack, in the space its author wrote rather than the one it was compiled to.
     ///
-    /// # Two rules, and the second is what keeps a build machine's paths out of a diagnostic
+    /// # Three cases, and the second and third are not one case
     ///
-    /// A frame naming this map's generated file is remapped. A frame naming anything else is
-    /// **dropped**, provided at least one frame was remapped — for the shipped component those
-    /// are the three outermost frames, `componentize-js`'s own generated glue, which name
-    /// `/var/folders/…/T/…/sources/initializer.js`: a path in a temporary directory on whichever
+    /// **A frame in a file this map does not describe is dropped.** For the shipped component
+    /// those are the outermost three, `componentize-js`'s own generated glue, which name
+    /// `/var/folders/…/T/…/sources/initializer.js` — a path in a temporary directory on whichever
     /// machine built the artifact, which exists nowhere else and means nothing to a reader.
     ///
-    /// The proviso is the whole of the safety. If the map explained no frame at all — a stack
-    /// entirely from somewhere this map does not describe — dropping would leave a failure with
-    /// no stack, which is strictly less than it arrived with. In that case nothing is touched.
+    /// **A frame in the mapped file that the map can place is rewritten**, which is the point.
+    ///
+    /// **A frame in the mapped file that the map cannot place is kept exactly as it arrived.**
+    /// 531 of the shipped map's 1,138 generated lines carry no segments, spread evenly, so this
+    /// is an ordinary case rather than a corruption — and dropping such a frame would take a real
+    /// call out of the middle of a stack with nothing to say it had been there. Bundle
+    /// coordinates are worse than source coordinates and far better than a hole.
+    ///
+    /// These were one case until a reviewer separated them, and the difference was load-bearing
+    /// in a way that is not obvious: with unplaceable frames dropped, a stack whose every frame
+    /// was on an unmapped line remapped to nothing, and the "hand back what arrived" fallback
+    /// then returned the `/var/folders` frames after all. Keeping them makes the fallback
+    /// unreachable whenever the guest's own file is on the stack at all.
+    ///
+    /// # The fallback that is left, and what it now keys on
+    ///
+    /// A stack with *no* frame in the mapped file is handed back untouched. That is a map which
+    /// does not describe this stack — a mispaired map, or a throw entirely inside the engine —
+    /// and emptying the stack on the strength of a map that recognized none of it would be acting
+    /// on an authority it has not demonstrated.
     pub(crate) fn remap(&self, frames: Vec<StackFrame>) -> Vec<StackFrame> {
         let mut remapped = Vec::with_capacity(frames.len());
 
@@ -230,15 +250,15 @@ impl SourceMap {
             if frame.file != self.file {
                 continue;
             }
-            let Some(position) = self.lookup(frame.line, frame.column) else {
-                continue;
-            };
-            remapped.push(StackFrame {
-                function: frame.function.clone(),
-                file: position.file.to_owned(),
-                line: position.line,
-                column: position.column,
-            });
+            match self.lookup(frame.line, frame.column) {
+                Some(position) => remapped.push(StackFrame {
+                    function: frame.function.clone(),
+                    file: position.file.to_owned(),
+                    line: position.line,
+                    column: position.column,
+                }),
+                None => remapped.push(frame.clone()),
+            }
         }
 
         if remapped.is_empty() {
@@ -371,14 +391,36 @@ mod tests {
 
     /// The map the tests below decode: two sources, a handful of segments, encoded by hand.
     ///
-    /// `AAAA` is four zero deltas — generated column 0, source 0, line 0, column 0 — and `C` is
-    /// 1, `E` is 2, `D` is -1. So `AAAA,IACA` on one line is (0 → 0:0:0) and (4 → 0:1:0), and the
-    /// second group `AACA` continues the accumulation from there rather than restarting.
-    const MAPPINGS: &str = "AAAA,IACA;AACA";
+    /// `A` is 0, `C` is 1, `E` is 2, `I` is 4, `D` is -1 — the low bit is the sign, so an odd
+    /// base64 digit is a negative delta. Each segment is four deltas: generated column, source,
+    /// source line, source column.
+    ///
+    /// **The first segment starts at generated column 1, not 0, and that is the whole reason this
+    /// constant is written the way it is.** It was `AAAA,IACA` — a first segment at column 0 —
+    /// and under that fixture no lookup could ever ask for a column *before* every segment on a
+    /// line: column 0 was an exact hit on segment 0. So
+    /// [`a_column_before_every_segment_still_answers_with_the_line`] was named for a policy it
+    /// never reached, and inverting that policy to return nothing left all eleven tests green. A
+    /// reviewer's mutation found it. One base64 digit is the difference.
+    ///
+    /// So: line 1 holds (col 1 → a.ts 0:0) and (col 5 → a.ts 1:0); line 2 holds (col 0 → a.ts
+    /// 2:0), which is where the source line goes on accumulating across a line boundary while the
+    /// generated column resets.
+    const MAPPINGS: &str = "CAAA,IACA;AACA";
 
     fn map() -> SourceMap {
-        let json = br#"{"version":3,"file":"out.js","sources":["a.ts","b.ts"],"mappings":"AAAA,IACA;AACA"}"#;
+        let json = br#"{"version":3,"file":"out.js","sources":["a.ts","b.ts"],"mappings":"CAAA,IACA;AACA"}"#;
         SourceMap::parse("fixture", json).expect("the fixture decodes")
+    }
+
+    /// A frame in the fixture's generated file, at a position the caller chooses.
+    fn frame(function: &str, file: &str, line: u32, column: u32) -> StackFrame {
+        StackFrame {
+            function: function.to_owned(),
+            file: file.to_owned(),
+            line,
+            column,
+        }
     }
 
     #[test]
@@ -389,13 +431,13 @@ mod tests {
             vec![
                 vec![
                     Segment {
-                        generated_column: 0,
+                        generated_column: 1,
                         source: 0,
                         line: 0,
                         column: 0
                     },
                     Segment {
-                        generated_column: 4,
+                        generated_column: 5,
                         source: 0,
                         line: 1,
                         column: 0
@@ -415,26 +457,31 @@ mod tests {
 
     #[test]
     fn a_lookup_answers_in_one_based_coordinates() {
-        // Generated line 1, column 5 is inside the second segment, which starts at zero-based
-        // column 4. Its source position is zero-based line 1, column 0 — one-based 2:1.
+        // Generated line 1, one-based column 6 is zero-based 5, which is exactly where the second
+        // segment starts. Its source position is zero-based line 1, column 0 — one-based 2:1.
         let map = map();
         assert_eq!(
-            map.lookup(1, 5),
+            map.lookup(1, 6),
             Some(Position {
                 file: "a.ts",
                 line: 2,
                 column: 1
             })
         );
+        // And a column inside that segment rather than at its start answers the same, which is
+        // what "the last segment at or before the column" means.
+        assert_eq!(map.lookup(1, 9), map.lookup(1, 6));
     }
 
     #[test]
     fn a_column_before_every_segment_still_answers_with_the_line() {
-        // The documented departure from the usual convention. Column 0 precedes the first
-        // segment's one-based column 1, and the line is still what the reader needs.
+        // The documented departure from the usual convention, and now actually reached: the
+        // fixture's first segment is at zero-based column 1, so a one-based column of 1 — zero
+        // based 0 — precedes every segment on the line. Returning nothing here is the mutation
+        // this test exists to kill.
         let map = map();
         assert_eq!(
-            map.lookup(1, 0),
+            map.lookup(1, 1),
             Some(Position {
                 file: "a.ts",
                 line: 1,
@@ -522,24 +569,18 @@ mod tests {
     }
 
     #[test]
-    fn only_the_frames_the_map_explains_survive_when_any_of_them_do() {
+    fn a_frame_in_a_file_the_map_does_not_describe_is_dropped() {
         let map = map();
-        let frames = vec![
-            StackFrame {
-                function: "inner".to_owned(),
-                file: "out.js".to_owned(),
-                line: 1,
-                column: 5,
-            },
-            StackFrame {
-                function: "glue".to_owned(),
-                file: "/var/folders/x/T/y/sources/initializer.js".to_owned(),
-                line: 5588,
-                column: 22,
-            },
-        ];
+        let remapped = map.remap(vec![
+            frame("inner", "out.js", 1, 6),
+            frame(
+                "glue",
+                "/var/folders/x/T/y/sources/initializer.js",
+                5588,
+                22,
+            ),
+        ]);
 
-        let remapped = map.remap(frames);
         assert_eq!(remapped.len(), 1, "{remapped:?}");
         assert_eq!(remapped[0].function, "inner", "the name is the guest's");
         assert_eq!(remapped[0].file, "a.ts");
@@ -547,17 +588,141 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_the_map_explains_nothing_of_is_handed_back_whole() {
-        // Dropping here would turn a failure that arrived with a stack into one with none, which
-        // is less than it came with. The proviso is the whole of the safety in `remap`.
+    fn a_frame_on_a_line_the_map_cannot_place_is_kept_as_it_arrived() {
+        // The case that used to be folded in with the one above. Generated line 3 has no
+        // segments — the fixture has two lines — so the frame cannot be placed, and dropping it
+        // would take a real call out of the middle of a stack with nothing to say it was there.
         let map = map();
-        let frames = vec![StackFrame {
-            function: "glue".to_owned(),
-            file: "elsewhere.js".to_owned(),
-            line: 3,
-            column: 1,
-        }];
+        let unplaceable = frame("middle", "out.js", 3, 1);
+        let remapped = map.remap(vec![
+            frame("inner", "out.js", 1, 6),
+            unplaceable.clone(),
+            frame(
+                "glue",
+                "/var/folders/x/T/y/sources/initializer.js",
+                5588,
+                22,
+            ),
+        ]);
+
+        assert_eq!(remapped.len(), 2, "{remapped:?}");
+        assert_eq!(remapped[0].file, "a.ts", "the placeable one is remapped");
+        assert_eq!(
+            remapped[1], unplaceable,
+            "the unplaceable one survives in the coordinates it arrived in"
+        );
+    }
+
+    #[test]
+    fn an_unplaceable_stack_in_the_mapped_file_does_not_let_a_foreign_frame_back_in() {
+        // The consequence of the two rules together, and the reason they have to be two. With
+        // unplaceable frames dropped, this stack remapped to nothing, the "hand back what
+        // arrived" fallback fired, and the build machine's temporary directory reappeared in a
+        // diagnostic — after `remap`'s own documentation had promised it would not.
+        let map = map();
+        let remapped = map.remap(vec![
+            frame("middle", "out.js", 3, 1),
+            frame(
+                "glue",
+                "/var/folders/x/T/y/sources/initializer.js",
+                5588,
+                22,
+            ),
+        ]);
+
+        assert_eq!(remapped, vec![frame("middle", "out.js", 3, 1)]);
+    }
+
+    #[test]
+    fn a_stack_with_no_frame_in_the_mapped_file_is_handed_back_whole() {
+        // The fallback that is left. This map describes `out.js` and this stack mentions no such
+        // file, so it recognized nothing here — and emptying a stack on the strength of a map
+        // that recognized none of it would be acting on authority it has not shown. A failure
+        // that arrived with a stack must not leave with none.
+        let map = map();
+        let frames = vec![frame("glue", "elsewhere.js", 3, 1)];
 
         assert_eq!(map.remap(frames.clone()), frames);
+    }
+
+    /// Every segment of the shipped map lands inside the file it names.
+    ///
+    /// **The per-rule evidence, and the only form of it available.** The migrated rules are four
+    /// programs in one bundle behind one map, and a map that is right about one rule and forty
+    /// lines out about another satisfies every assertion made anywhere else: the CLI test drives
+    /// one rule, and `the_map_covers_every_rule_the_component_hosts` in
+    /// `crates/lanekeep-rules/tests/source_maps.rs` only checks that the four paths appear in
+    /// `sources`. This decodes the committed map in full and holds all 2,500-odd segments to the
+    /// files they name.
+    ///
+    /// A unit test rather than one under `tests/`, because the decoder is private to this crate
+    /// and the whole point is to run the real one rather than a second copy of it. Reaching
+    /// across the repository at run time is the pattern `tests/fixture_currency.rs` already uses
+    /// for the same artifact.
+    #[test]
+    fn every_segment_of_the_shipped_map_lands_inside_the_source_it_names() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let json = std::fs::read(
+            root.join("crates/lanekeep-rules/components/typescript-builtins.wasm.map"),
+        )
+        .expect("the sidecar map ships beside the component");
+        let map = SourceMap::parse("typescript-builtins", &json).expect("the shipped map decodes");
+
+        // Read once per source rather than once per segment: there are nine sources and a few
+        // thousand segments.
+        let lengths: Vec<usize> = map
+            .sources
+            .iter()
+            .map(|source| {
+                std::fs::read_to_string(root.join(source))
+                    .unwrap_or_else(|e| panic!("`{source}` is not readable: {e}"))
+                    .lines()
+                    .count()
+            })
+            .collect();
+
+        let mut referenced = vec![0_usize; map.sources.len()];
+        let mut segments = 0_usize;
+        for line in &map.lines {
+            for segment in line {
+                segments += 1;
+                let at = usize::try_from(segment.source).expect("a source index is small");
+                referenced[at] += 1;
+                assert!(
+                    (segment.line as usize) < lengths[at],
+                    "a segment names line {} of `{}`, which has {} lines",
+                    segment.line + 1,
+                    map.sources[at],
+                    lengths[at]
+                );
+            }
+        }
+
+        // A map that decoded to nothing would satisfy the loop above without asserting anything,
+        // which is the one way this could be green while covering no rule at all.
+        assert!(segments > 1000, "the map decoded to {segments} segments");
+        for (at, count) in referenced.iter().enumerate() {
+            assert!(
+                *count > 0,
+                "`{}` is in `sources` and no segment points at it",
+                map.sources[at]
+            );
+        }
+
+        // And the four rules by name, so that a bundle which quietly stopped including one is a
+        // failure here rather than a rule reporting in bundle coordinates in the field.
+        for rule in [
+            "no-circular-imports",
+            "no-default-export",
+            "no-restricted-imports",
+            "no-unused-exports",
+        ] {
+            let expected = format!("crates/lanekeep-rules/rules/{rule}.ts");
+            assert!(
+                map.sources.contains(&expected),
+                "the map does not cover `{rule}`: {:?}",
+                map.sources
+            );
+        }
     }
 }
