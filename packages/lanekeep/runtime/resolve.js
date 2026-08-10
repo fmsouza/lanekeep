@@ -57,9 +57,19 @@ const SEPARATORS = sep === '\\' ? /[\\/]+/ : /\/+/
 /**
  * Resolve a specifier written in `importer`.
  *
- * `importer` is the canonical absolute path of the importing module, `'lanekeep'` for the
- * host module, or `''` for an entry module that nothing imported. It has to be canonical for
- * the same reason the root is: the containment check compares them.
+ * `importer` is the absolute path of the importing module, `'lanekeep'` for the host module,
+ * or `''` for an entry module that nothing imported.
+ *
+ * **`importer` and `rulesRoot` may be spelled canonically or as the caller configured them,
+ * and the two need not agree.** `RuleRoot` requires a canonical base because it canonicalized
+ * its root once at construction and every caller inside this repository holds that root; here
+ * every call takes a raw string, and the two spellings differ constantly and invisibly —
+ * `os.tmpdir()` is `/var/…` on macOS and `/private/var/…` canonically, so a caller who builds
+ * an entry path from their own configured root would be told it escaped a directory it is
+ * plainly inside. That refusal is fail-closed and so not dangerous, but it looks exactly like
+ * a confinement violation and would send somebody hunting for one. Only the *lexical* gate is
+ * widened; see `canonicalWithin`, which is the actual boundary and compares against the
+ * canonical root alone.
  *
  * `builtins` names what `lanekeep/<name>` may mean — `{ modules, components }`, each an array
  * or a `Set`, each optional. Both resolve under the one prefix, because which table a
@@ -100,6 +110,7 @@ export function resolve(specifier, importer, options = {}) {
 
   const root = canonicalize(rulesRoot)
   if (root.error !== undefined) return { error: unreadable(rulesRoot, root.error) }
+  const spellings = spellingsOf(rulesRoot, root.path)
 
   const base = importer ?? ''
 
@@ -112,13 +123,25 @@ export function resolve(specifier, importer, options = {}) {
   // checked either way.
   if (isAbsolute(specifier)) {
     if (base !== '') return { error: bareSpecifier(specifier) }
-    return within(root.path, specifier, normalize(specifier))
+    return within(root.path, spellings, specifier, normalize(specifier))
   }
 
   if (!specifier.startsWith('.')) return { error: bareSpecifier(specifier) }
 
   const directory = base === HOST_MODULE || base === '' ? root.path : parentOf(base, root.path)
-  return within(root.path, specifier, normalize(concat(directory, specifier)))
+  return within(root.path, spellings, specifier, normalize(concat(directory, specifier)))
+}
+
+/**
+ * The prefixes a path may lexically sit under: the canonical root, and the root as written.
+ *
+ * One entry when they agree, which is the common case. This is the *only* place the caller's
+ * spelling is honored — everything downstream of `realpath` is compared against the canonical
+ * root and nothing else.
+ */
+function spellingsOf(rulesRoot, canonical) {
+  const given = normalize(rulesRoot)
+  return given === canonical ? [canonical] : [canonical, given]
 }
 
 /**
@@ -139,34 +162,39 @@ export function resolve(specifier, importer, options = {}) {
  *
  * Returns `{ path }` or `{ error }`, on the same terms as `resolve`.
  *
- * Two things here are deliberately not what `RuleRoot::confine` does, both because that method
- * is reached from inside a `RuleRoot` that already holds a canonical root and this function is
- * reached by a caller who holds a string.
+ * **The argument is canonicalized as written, and only the lexical gate sees a normalized
+ * copy.** Those are two different questions and running them the other way round is a real
+ * bug, not a nicety: with `<root>/link` a symlink to somewhere outside,
+ * `confine('<root>/link/../secret.ts')` canonicalized-after-normalizing hands back
+ * `<root>/secret.ts` — a *different file from the one the path names*, since `realpath` of
+ * that argument is `<outside>/secret.ts`. Resolving `..` lexically across a symlink is the one
+ * thing canonicalizing exists to prevent, so `RuleRoot::confine`'s order is kept.
  *
- * It **normalizes** its argument, which `RuleRoot::confine` leaves to its callers because all
- * of them already have. A lexical prefix test cannot be trusted on a path still carrying `..`:
- * `<root>/../secret.ts` does start with `<root>/`. Canonicalizing catches that one anyway, but
- * only for a path that exists, so without this a traversal to somewhere that is not there
- * comes back `unreadable` — a fact about the filesystem rather than about the mistake.
+ * The normalized copy is still what the lexical gate reads, which `RuleRoot::confine` leaves
+ * to its callers because all of them have already done it. Without it, `<root>/../secret.ts`
+ * passes the gate — it does start with `<root>/` — and for a path that is not there,
+ * canonicalizing then fails, so the answer is `unreadable`: a fact about the filesystem where
+ * the documented behavior is that a traversal is refused as a traversal whatever is on disk.
  *
- * And its lexical gate accepts the root **as the caller spelled it** as well as canonically,
- * because those differ constantly and invisibly: `/var/…` against `/private/var/…` is every
- * path under `os.tmpdir()` on macOS. Refusing a legitimate file for that reason is fail-closed
- * and so not dangerous, but it looks exactly like a confinement violation and would send
- * somebody hunting for one. **Nothing is loosened by it**: the canonical gate below is the
- * actual boundary and is untouched, and a traversal escapes both spellings alike.
+ * **That leaves one deliberate difference from `RuleRoot::confine`, in the closed direction.**
+ * A path whose `..` only lands back inside the root by going through a symlink first —
+ * `<root>/link/../../x` where `link` points two levels deep inside — normalizes to somewhere
+ * outside and is refused here, where `RuleRoot::confine` would canonicalize it back in and
+ * accept. Refusing is the answer worth having: a path that reaches inside only via symlink
+ * indirection is not one to hand a reader without comment. It is pinned by
+ * `confine refuses a traversal that only lands inside by way of a symlink`.
+ *
+ * The lexical gate also accepts the root **as the caller spelled it**, for the reason
+ * `resolve` documents.
  */
 export function confine(path, options = {}) {
   const root = canonicalize(options.rulesRoot)
   if (root.error !== undefined) return { error: unreadable(options.rulesRoot, root.error) }
 
-  const normalized = normalize(path)
-  const spellings = [root.path, normalize(options.rulesRoot)]
-  if (!spellings.some((spelling) => isWithin(spelling, normalized))) {
-    return { error: escapesRoot(path) }
-  }
+  const spellings = spellingsOf(options.rulesRoot, root.path)
+  if (!isWithinAny(spellings, normalize(path))) return { error: escapesRoot(path) }
 
-  return canonicalWithin(root.path, path, normalized)
+  return canonicalWithin(root.path, path, path)
 }
 
 /**
@@ -175,14 +203,14 @@ export function confine(path, options = {}) {
  * The lexical check is repeated here as well as inside `confineTo`, because a traversal that
  * matches no file at all must still be reported as an escape rather than as "nothing found".
  */
-function within(root, specifier, joined) {
-  if (!isWithin(root, joined)) return { error: escapesRoot(specifier) }
+function within(root, spellings, specifier, joined) {
+  if (!isWithinAny(spellings, joined)) return { error: escapesRoot(specifier) }
 
   const tried = []
   for (const candidate of candidates(joined)) {
     tried.push(candidate)
     if (!isFile(candidate)) continue
-    return confineTo(root, specifier, candidate)
+    return confineTo(root, spellings, specifier, candidate)
   }
 
   return { error: notFound(specifier, tried) }
@@ -195,8 +223,8 @@ function within(root, specifier, joined) {
  * disk, so `../../secrets` is refused identically whether or not it is there. The canonical
  * one is what sees through a symlink, and it can only be made once the file is known to exist.
  */
-function confineTo(root, specifier, joined) {
-  if (!isWithin(root, joined)) return { error: escapesRoot(specifier) }
+function confineTo(root, spellings, specifier, joined) {
+  if (!isWithinAny(spellings, joined)) return { error: escapesRoot(specifier) }
   return canonicalWithin(root, specifier, joined)
 }
 
@@ -286,6 +314,11 @@ function normalize(path) {
 function isWithin(root, path) {
   if (path === root) return true
   return path.startsWith(root.endsWith(sep) ? root : root + sep)
+}
+
+/** Whether any of these spellings of the root contains `path`. */
+function isWithinAny(roots, path) {
+  return roots.some((root) => isWithin(root, path))
 }
 
 /** The parent of `path`, or `fallback` for a path that has none. `Path::parent`'s rule. */

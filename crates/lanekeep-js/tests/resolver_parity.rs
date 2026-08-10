@@ -101,14 +101,42 @@ fn every_refusal() -> Vec<(&'static str, ResolveError)> {
     ]
 }
 
+/// Refusal codes carried by the bundler's resolver, however the quote is spelled.
+///
+/// `code: '…'` is what this repository writes, and nothing enforces it — there is no
+/// prettier, eslint or biome configuration here, so a `code: "policy-refusal"` added later
+/// would be perfectly ordinary and would slip past a count of the single-quoted form.
+fn refusal_codes() -> usize {
+    RESOLVER
+        .match_indices("code:")
+        .filter(|(index, key)| {
+            let rest = &RESOLVER[index + key.len()..];
+            rest.trim_start().starts_with(['\'', '"'])
+        })
+        .count()
+}
+
 #[test]
 fn every_refusal_reads_the_same_from_a_bundler() {
     let mut asserted = 0_usize;
-    let mut fragments = 0_usize;
 
     for (variant, error) in every_refusal() {
-        for fragment in prose(&error.to_string()) {
-            fragments += 1;
+        let prose = prose(&error.to_string());
+
+        // Per variant rather than over the total, because the total has no margin to spend:
+        // every message today has its holes in the interior, so each contributes exactly two
+        // fragments, and a future message merely *beginning* with a hole would drop the sum to
+        // nine and trip a guard whose text blames a broken extraction. What is actually being
+        // guarded is that each variant contributed something worth looking for.
+        let characters: usize = prose.iter().map(String::len).sum();
+        assert!(
+            !prose.is_empty() && characters >= 20,
+            "`ResolveError::{variant}` yielded {} fragments and {characters} characters — the \
+             split is broken, so nothing is being asserted about this variant",
+            prose.len(),
+        );
+
+        for fragment in prose {
             asserted += fragment.len();
             assert!(
                 RESOLVER.contains(&fragment),
@@ -124,13 +152,13 @@ fn every_refusal_reads_the_same_from_a_bundler() {
         }
     }
 
-    // A parse that quietly matched nothing would leave this green forever while checking
-    // nothing. Five variants with one hole each contribute two fragments apiece, and the
-    // shortest message is well over a hundred characters.
+    // And a floor over the whole run, which the per-variant check does not give: five variants
+    // clearing twenty characters each would satisfy that and still be a broken split. A sum is
+    // safe to put a number on because no rewording moves it much.
     assert!(
-        fragments >= 10 && asserted >= 400,
-        "only {fragments} fragments, {asserted} characters in all, were extracted — the \
-         split is broken, so this test is asserting nothing"
+        asserted >= 400,
+        "{asserted} characters in all were extracted from five messages — the split is broken, \
+         so this test is asserting almost nothing"
     );
 }
 
@@ -142,7 +170,7 @@ fn the_bundler_refuses_for_no_reason_this_crate_lacks() {
     //
     // Codes rather than messages, because reading them exactly would mean parsing JavaScript.
     let declared = every_refusal().len();
-    let carried = RESOLVER.matches("code: '").count();
+    let carried = refusal_codes();
 
     assert_eq!(
         carried, declared,

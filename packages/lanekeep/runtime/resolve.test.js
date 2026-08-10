@@ -318,6 +318,46 @@ test('a rule may not import an absolute path', (t) => {
   assert.ok(path?.endsWith(`${sep}rule.ts`), path)
 })
 
+// No `loader.rs` counterpart, and there could not usefully be one: Rust gets this from
+// `Path::starts_with`, which compares components. In JavaScript it is code, and code regresses
+// — a plain `path.startsWith(root)` passes every other test in this file while resolving
+// `../root-evil/secret` from a root named `root` to a file outside it.
+test('a sibling directory whose name extends the root is outside it', (t) => {
+  const f = fixture(t, 'sibling-prefix', {
+    'root/main.ts': '',
+    'root-evil/secret.ts': 'export const s = 1;',
+  })
+  const root = join(f.dir, 'root')
+
+  const resolved = resolve('../root-evil/secret', f.entry('root/main.ts'), { rulesRoot: root })
+  assert.equal(resolved.error?.code, 'escapes-root', JSON.stringify(resolved))
+
+  // The same trap through the other entry point, whose lexical gate is its own.
+  const confined = confine(join(f.dir, 'root-evil', 'secret.ts'), { rulesRoot: root })
+  assert.equal(confined.error?.code, 'escapes-root', JSON.stringify(confined))
+})
+
+// No `loader.rs` counterpart: `RuleRoot` canonicalizes its root once at construction, so a
+// base and a root spelled differently cannot arise there. Here every call takes a string.
+test('the root and the importer may be spelled either way', (t) => {
+  const f = fixture(t, 'spelling', { 'entry.ts': '', 'helper.ts': 'export const h = 1;' })
+
+  // `f.dir` is `/var/…` on macOS and canonically `/private/var/…`. A caller who configured
+  // the first and built an entry path from it must not be told it escapes.
+  assert.notEqual(f.dir, realpathSync.native(f.dir), 'this fixture needs the two to differ')
+
+  const entry = resolve(join(f.dir, 'entry.ts'), '', { rulesRoot: f.dir })
+  assert.equal(entry.path, f.entry('entry.ts'), JSON.stringify(entry))
+
+  // And an importer spelled the same way the caller spelled the root.
+  const sibling = resolve('./helper', join(f.dir, 'entry.ts'), { rulesRoot: f.dir })
+  assert.equal(sibling.path, f.entry('helper.ts'), JSON.stringify(sibling))
+
+  // Whatever the spelling, a traversal out is still refused.
+  const out = resolve('../elsewhere', join(f.dir, 'entry.ts'), { rulesRoot: f.dir })
+  assert.equal(out.error?.code, 'escapes-root', JSON.stringify(out))
+})
+
 // from `reports_what_it_tried_when_nothing_matches`
 test('reports what it tried when nothing matches', (t) => {
   const f = fixture(t, 'missing', { 'main.ts': '' })
@@ -391,4 +431,47 @@ test('confine reports a missing file inside the root as unreadable', (t) => {
   const f = fixture(t, 'confine-missing', { 'a.ts': '' })
   const { error } = confine(join(f.dir, 'nope.ts'), { rulesRoot: f.dir })
   assert.equal(error?.code, 'unreadable', JSON.stringify(error))
+})
+
+// No `loader.rs` counterpart: `RuleRoot::confine` canonicalizes the path it was given, so this
+// cannot arise there. It arises here only because this function normalizes, and it is why the
+// normalized copy goes to the lexical gate and nowhere else.
+test('confine canonicalizes the path as written, not a lexically resolved copy', {
+  skip: process.platform === 'win32',
+}, (t) => {
+  // Both files exist and they are different files. Resolving `..` lexically picks the one
+  // inside the root and returns it; resolving it through `realpath` picks the one outside and
+  // refuses. Handing back the wrong file quietly is worse than either.
+  const f = fixture(t, 'confine-symlink-traversal', {
+    'root/secret.ts': "export const from = 'inside';",
+    'outside/dir/placeholder.ts': '',
+    'outside/secret.ts': "export const from = 'outside';",
+  })
+  const root = join(f.dir, 'root')
+  symlinkSync(join(f.dir, 'outside', 'dir'), join(root, 'link'))
+
+  const answer = confine(`${root}${sep}link${sep}..${sep}secret.ts`, { rulesRoot: root })
+  assert.equal(
+    answer.error?.code,
+    'escapes-root',
+    `resolving .. across a symlink must not hand back the file inside: ${JSON.stringify(answer)}`,
+  )
+})
+
+// The deliberate difference from `RuleRoot::confine`, pinned so it is a decision rather than
+// an accident. See the note at `confine`'s definition.
+test('confine refuses a traversal that only lands inside by way of a symlink', {
+  skip: process.platform === 'win32',
+}, (t) => {
+  const f = fixture(t, 'confine-symlink-inward', {
+    'root/a/b/placeholder.ts': '',
+    'root/x.ts': "export const from = 'inside';",
+  })
+  const root = join(f.dir, 'root')
+  symlinkSync(join(root, 'a', 'b'), join(root, 'link'))
+
+  // `realpath` lands on `<root>/x.ts`, which is inside, so `RuleRoot::confine` would accept.
+  // Normalizing lexically lands outside, and this refuses. Fail-closed, and on purpose.
+  const answer = confine(`${root}${sep}link${sep}..${sep}..${sep}x.ts`, { rulesRoot: root })
+  assert.equal(answer.error?.code, 'escapes-root', JSON.stringify(answer))
 })

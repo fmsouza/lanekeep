@@ -35,10 +35,10 @@ _require tool:
 # ---------------------------------------------------------------------------
 
 # Pre-commit gate. Fast enough to run on every commit without being resented.
-check-fast: fmt-check lint test test-rust-rules test-scripts test-go
+check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-rust-rules test-scripts test-go docs deny machete typos-check msrv
+check: fmt-check lint test test-rust-rules test-scripts test-go test-js docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -359,6 +359,75 @@ test-go:
     fi
     go vet ./...
     go test ./...
+
+# The authoring package's JavaScript tests.
+#
+# `packages/lanekeep/runtime/resolve.js` enforces the module-resolution rules a second time —
+# `crates/lanekeep-js/src/loader.rs` enforces them at run time inside the sandbox, and that one
+# enforces them at build time for a rule compiled ahead of time into a component. Its tests are
+# ported from that file's one for one and *are* the port's specification. Not running them
+# leaves the whole port resting on `resolver_parity.rs`, which only compares refusal messages.
+#
+# Skipped where Node is absent rather than failing, on `test-go`'s terms and for its reasons:
+# componentizing is a maintainer's job, and making the Rust gate need a JavaScript toolchain
+# would cost every contributor for something most of them never touch. The `gate` job runs on
+# a runner that has Node, so it is a real check there.
+#
+# A Node too old to have `node --test` is an error rather than a skip. Absence is somebody's
+# machine; a version that cannot run the suite is a misconfiguration, and a gate that quietly
+# checks nothing because of one is the failure this recipe exists to prevent.
+#
+# **The file list is a glob, and `node --test <directory>` is not an option.** Since Node 23 a
+# directory argument is executed as a module rather than searched, and it fails in the quiet
+# direction one level up: `node --test packages/lanekeep/` exits 0 reporting one passing test,
+# having loaded `index.js`, which declares none.
+#
+# An empty expansion is refused for the reason `_fmt-rust-rules` refuses one, and the list is
+# NUL-separated through a file rather than a bash array for the reason that recipe explains —
+# macOS ships bash 3.2, where `${#array[@]}` on an empty array is an error under `set -u`.
+test-js:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v node >/dev/null 2>&1; then
+        echo "note: no node here, so the authoring package's tests are skipped (CI covers them)"
+        exit 0
+    fi
+
+    # Truncated at the first whitespace, so a carriage return cannot reach the comparison.
+    major="$(node --version | sed -E 's/^v([0-9][0-9]*).*/\1/')"
+    major="${major%%[![:digit:]]*}"
+    if [ -z "${major}" ] || [ "${major}" -lt 18 ]; then
+        echo "error: node $(node --version) has no built-in test runner." >&2
+        echo "       lanekeep's authoring package needs node 18 or newer." >&2
+        exit 1
+    fi
+
+    list="$(mktemp)"
+    output="$(mktemp)"
+    trap 'rm -f "${list}" "${output}"' EXIT
+
+    find packages/lanekeep/runtime -maxdepth 1 -name '*.test.js' -print0 > "${list}"
+    count="$(tr -cd '\0' < "${list}" | wc -c | tr -d ' ')"
+    if [ "${count}" -eq 0 ]; then
+        echo "error: no test files under packages/lanekeep/runtime/." >&2
+        echo "       nothing ran, so nothing was checked." >&2
+        exit 1
+    fi
+
+    if ! xargs -0 node --test --test-reporter=tap < "${list}" > "${output}"; then
+        cat "${output}"
+        exit 1
+    fi
+
+    # A file declaring no tests is counted by node as one passing test, so a green run is not
+    # by itself evidence that anything executed.
+    ran="$(sed -n 's/^# tests \([0-9][0-9]*\).*/\1/p' "${output}" | tail -1)"
+    if [ -z "${ran}" ] || [ "${ran}" -eq 0 ]; then
+        cat "${output}"
+        echo "error: node reported no tests from ${count} file(s)." >&2
+        exit 1
+    fi
+    echo "${ran} passed, 0 failed"
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 #
