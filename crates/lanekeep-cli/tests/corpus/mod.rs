@@ -81,7 +81,7 @@ impl Corpus {
             .arg(&self.dir)
             .arg("--format")
             .arg("json")
-            // Milliseconds, and far above what the work needs.
+            // Ten minutes, in milliseconds, and far above what the work needs.
             //
             // The rules these tests drive live in a 12.4 MiB component, and every corpus is a
             // fresh directory, so the first `check` in each one compiles that component from
@@ -91,8 +91,17 @@ impl Corpus {
             // load as a rule's misbehavior, which is the failure `AGENTS.md`'s limits invariant
             // exists to keep out of the output.
             //
-            // Raised rather than removed: a rule that genuinely hangs still fails, in under a
-            // minute, rather than wedging the suite.
+            // **Nothing here stops a hung rule, and that is deliberate rather than an
+            // oversight.** This was 45 s with a comment claiming a hang would still fail inside
+            // a minute; the number was then raised for CI hardware and the claim was left
+            // standing beside it, false. The backstop is nextest's own `slow-timeout` —
+            // `.config/nextest.toml` sets 30 s with `terminate-after = 4` — which kills the
+            // test after two minutes and reports it as terminated. That is the better layer for
+            // it: a harness saying "this test was killed" is the truth, where a budget breach
+            // says a rule misbehaved when what happened was the machine.
+            //
+            // The config this helper writes carries the same two budgets, because `--timeout`
+            // sets only the global one.
             .arg("--timeout")
             .arg("600000")
             .output()

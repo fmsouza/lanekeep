@@ -936,8 +936,14 @@ fn describe_components(
     // message ends "narrow what is being checked", which is advice that cannot work against a
     // fixed compile cost.
 
-    let compiled = compile_components(root, resolved, &engine, &loader)
-        .map_err(|(position, detail)| fail(position, detail))?;
+    let compiled = compile_components(
+        root,
+        resolved,
+        &engine,
+        &loader,
+        COMPILE_BUDGET_PER_COMPONENT,
+    )
+    .map_err(|(position, detail)| fail(position, detail))?;
 
     // The one clock, started before any guest code runs and shared by the enumeration and the
     // description. Two clocks would give each phase the whole global budget, so a config load
@@ -1075,11 +1081,15 @@ fn describe_components(
 /// is above everything observed and still far below the point at which a user would conclude
 /// the process had crashed.
 ///
-/// **Nothing exercises it**, and that is stated rather than papered over: no component in this
-/// repository takes ten minutes to compile, and a fixture that did would cost ten minutes to
-/// run. What is tested is the *phase separation* it belongs to —
-/// `compiling_a_component_is_not_charged_to_the_run_budget` — and this constant is the bound on
-/// what that separation would otherwise leave unbounded.
+/// **The comparison and the message are tested; the wall-clock value is not, and cannot be.**
+/// [`compile_overrun`] is a pure function over an elapsed `Duration` and a count, so a test
+/// drives the arithmetic and the wording with synthetic microseconds — which is what makes this
+/// branch reachable without a fixture that spends ten minutes getting there. "No fixture can
+/// afford it, so none of it can be tested" was the reasoning this constant shipped with for one
+/// round, and it was a false dichotomy: only an *end-to-end* test needs a real slow compile.
+///
+/// What no test asserts is that ten minutes is the right number of minutes — that is a judgment
+/// against measurements, recorded above.
 ///
 /// **It cannot preempt a single compilation**, and nothing here pretends otherwise: wasmtime's
 /// compile is synchronous with no interrupt, so this is checked between components. A config
@@ -1122,6 +1132,7 @@ fn compile_components(
     resolved: &[ResolvedRule],
     engine: &std::sync::Arc<WasmEngine>,
     loader: &lanekeep_wasm::ComponentLoader,
+    budget: Duration,
 ) -> Result<Vec<Compiled>, (usize, String)> {
     let started = std::time::Instant::now();
     let mut compiled = Vec::new();
@@ -1158,28 +1169,42 @@ fn compile_components(
         });
 
         // Checked after each component rather than before, because a compilation cannot be
-        // interrupted once it has started. The budget scales with how many were asked for, so a
-        // config with twenty components is not held to one component's allowance.
-        let elapsed = started.elapsed();
-        let allowed = COMPILE_BUDGET_PER_COMPONENT
-            .saturating_mul(u32::try_from(compiled.len()).unwrap_or(u32::MAX));
-        if elapsed > allowed {
-            return Err((
-                position,
-                format!(
-                    "compiling the rule components took {elapsed:.1?}, past the {allowed:.1?} \
-                     allowed for {} of them\n  \
-                     this is the cost of turning WebAssembly into machine code and not of \
-                     running any rule, so narrowing what is checked will not help\n  \
-                     a warm `.lanekeep/components` skips it entirely — if this recurs on every \
-                     run, that directory is not writable",
-                    compiled.len()
-                ),
-            ));
+        // interrupted once it has started.
+        if let Some(detail) = compile_overrun(started.elapsed(), compiled.len(), budget) {
+            return Err((position, detail));
         }
     }
 
     Ok(compiled)
+}
+
+/// Whether the compilation pass has overrun its budget, and what to say if it has.
+///
+/// **A pure function so the budget can be tested at all.** Everything else about the pass needs a
+/// real component and a real compiler; this is the arithmetic and the wording, and separating it
+/// is what lets a test drive the comparison with synthetic microsecond `Duration`s instead of a
+/// fixture that would have to spend ten minutes to reach the branch. The alternative on offer was
+/// an end-to-end test costing exactly the budget, which is why the branch went untested for a
+/// round — the dichotomy was false and this is the third thing this change has had to learn it
+/// about.
+///
+/// The budget scales with how many components were asked for, so a config with twenty of them is
+/// not held to one component's allowance. `saturating_mul` rather than `*`: `Duration`
+/// multiplication panics on overflow, and the count comes from a config.
+fn compile_overrun(elapsed: Duration, compiled: usize, budget: Duration) -> Option<String> {
+    let allowed = budget.saturating_mul(u32::try_from(compiled).unwrap_or(u32::MAX));
+    if elapsed <= allowed {
+        return None;
+    }
+
+    Some(format!(
+        "compiling the rule components took {elapsed:.1?}, past the {allowed:.1?} allowed for \
+         {compiled} of them\n  \
+         this is the cost of turning WebAssembly into machine code and not of running any rule, \
+         so narrowing what is checked will not help\n  \
+         a warm `.lanekeep/components` skips it entirely — if this recurs on every run, that \
+         directory is not writable"
+    ))
 }
 
 /// Which of a component's rules one config entry stands for, as `(index, id)`.
@@ -2565,6 +2590,136 @@ mod tests {
             "the component's rule has to have been described, or nothing was clocked at all"
         );
         assert_eq!(config.rules[0].id.to_string(), "probe/context");
+    }
+
+    /// The compilation budget's arithmetic, driven with synthetic durations.
+    ///
+    /// **The branch this covers went a whole round untested**, on the reasoning that a fixture
+    /// slow enough to trip a ten-minute budget would cost ten minutes to run. That is true of an
+    /// end-to-end test and false of the comparison, which is why the comparison is a pure
+    /// function now: everything below runs in microseconds and would have failed against
+    /// `if false && elapsed > allowed`, the mutation that produced no failures at all.
+    ///
+    /// The budget is a parameter here rather than the shipped constant, deliberately: what is
+    /// under test is the comparison, and a test that took its expectations from
+    /// `COMPILE_BUDGET_PER_COMPONENT` would agree with itself if that constant became zero. The
+    /// shipped value is a judgment against measurements and is documented where it is declared.
+    #[test]
+    fn the_compile_budget_is_a_comparison_against_a_scaling_allowance() {
+        /// A budget with no relationship to the shipped one, so nothing below can be satisfied
+        /// by arithmetic that ignores its argument.
+        const BUDGET: Duration = Duration::from_micros(250);
+
+        // Under, at, and over — the boundary included, because `>` and `>=` are the two
+        // plausible spellings and only one of them is written.
+        assert_eq!(compile_overrun(Duration::ZERO, 1, BUDGET), None);
+        assert_eq!(compile_overrun(BUDGET, 1, BUDGET), None);
+        assert!(
+            compile_overrun(BUDGET + Duration::from_micros(1), 1, BUDGET).is_some(),
+            "a microsecond past the allowance is past it"
+        );
+
+        // And it scales, which is the whole reason the count is a parameter: a config with three
+        // components is not held to one component's allowance.
+        let three = BUDGET * 3;
+        assert_eq!(compile_overrun(three, 3, BUDGET), None);
+        assert!(compile_overrun(three, 2, BUDGET).is_some());
+        assert!(
+            compile_overrun(three + Duration::from_micros(1), 3, BUDGET).is_some(),
+            "three components get three allowances and not a fourth"
+        );
+
+        // A count of zero has no allowance at all. Unreachable — the check runs after a
+        // component was pushed — and asserted because "scales with the count" has to mean
+        // something at the bottom of the range too.
+        assert!(compile_overrun(Duration::from_micros(1), 0, BUDGET).is_some());
+    }
+
+    #[test]
+    fn the_compile_budget_message_says_what_it_is_and_what_will_not_help() {
+        const BUDGET: Duration = Duration::from_micros(250);
+
+        let detail = compile_overrun(BUDGET * 9, 2, BUDGET)
+            .expect("nine allowances against two components is an overrun");
+
+        // The numbers a reader needs to tell "this machine is slow" from "this is a hang".
+        assert!(
+            detail.contains("compiling the rule components took"),
+            "{detail}"
+        );
+        assert!(detail.contains("2 of them"), "{detail}");
+
+        // And the two things that distinguish this diagnostic from the global budget's, which
+        // is the reason it exists rather than being folded into that one: the global message
+        // ends "narrow what is being checked", which cannot help against a fixed compile cost.
+        assert!(
+            detail.contains("not of running any rule"),
+            "the message has to say this is not a rule's fault: {detail}"
+        );
+        assert!(
+            detail.contains("narrowing what is checked will not help"),
+            "and that the other budget's advice does not apply: {detail}"
+        );
+        assert!(
+            detail.contains(".lanekeep/components"),
+            "and where the remedy actually is: {detail}"
+        );
+    }
+
+    /// And the pass *calls* it, which the two tests above cannot say.
+    ///
+    /// **The gap they leave is the one the reviewer's mutation actually sat in.** Disabling the
+    /// comparison inside `compile_overrun` now fails them both; deleting the `if let` that calls
+    /// it would not, because a pure function tested in isolation says nothing about whether
+    /// anything reached it. The budget is a parameter for exactly this reason — a zero budget
+    /// makes the first component an overrun, so the call site is reachable in milliseconds
+    /// rather than in the ten minutes the shipped value would need.
+    ///
+    /// `world-shape.wasm` rather than the 12.4 MiB one: what is under test is that the check
+    /// runs, and the smallest component that compiles at all is the fastest way to find out.
+    #[test]
+    fn the_compilation_pass_checks_its_budget() {
+        let fixture = Fixture::new("config-compile-budget-call", &[]);
+        fixture.write_component("rules/probe.wasm", "world-shape");
+
+        let root = RuleRoot::new(&fixture.dir).expect("canonicalizes");
+        let engine = WasmEngine::new().expect("the shipped configuration builds an engine");
+        let loader = lanekeep_wasm::ComponentLoader::without_cache();
+        let resolved = vec![ResolvedRule {
+            specifier: "./rules/probe.wasm".to_owned(),
+            // From the *canonical* root, which is what `json::classify` builds and what
+            // `RuleRoot::confine` compares against — the fixture's own `dir` is not canonical on
+            // macOS, where `/var` is a symlink to `/private/var`.
+            reference: RuleReference::Component(root.path().join("rules/probe.wasm")),
+            options: None,
+        }];
+
+        // A budget of zero: any elapsed time at all is past it, so the first component overruns.
+        // `Compiled` holds a `wasmtime::Component` and so is not `Debug`, which `expect_err`
+        // needs; matched rather than unwrapped.
+        let Err((position, detail)) =
+            compile_components(&root, &resolved, &engine, &loader, Duration::ZERO)
+        else {
+            panic!("no compilation finishes in zero time");
+        };
+        assert_eq!(position, 0, "the diagnostic names the entry that overran");
+        assert!(
+            detail.contains("compiling the rule components took"),
+            "and it is the compilation diagnostic rather than a load failure: {detail}"
+        );
+
+        // The same pass under the shipped budget completes, so the failure above is the budget
+        // and not the fixture — without this, a component that simply failed to load would
+        // satisfy every assertion above.
+        let compiled = compile_components(
+            &root,
+            &resolved,
+            &engine,
+            &loader,
+            COMPILE_BUDGET_PER_COMPONENT,
+        )
+        .expect("the same component compiles fine under the shipped budget");
+        assert_eq!(compiled.len(), 1);
     }
 
     /// A caller's `--timeout` has to govern config load, because config load runs guest code.
