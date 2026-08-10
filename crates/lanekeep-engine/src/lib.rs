@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
-use lanekeep_config::{Config, ConfigError, RuleSpec};
+use lanekeep_config::{ComponentBytes, Config, ConfigError, RuleSpec};
 use lanekeep_core::suppression::{self, Date, Suppressions};
 use lanekeep_core::{
     CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, RuleId, Severity,
@@ -2439,7 +2439,15 @@ fn load_components(
         // so executing a second read would let a file that changed in between describe one
         // rule, key another and run a third — with every check passing and nothing to notice.
         let admitted = loader
-            .load(&engine, &name, component.bytes.as_slice())
+            .load_mapped(
+                &engine,
+                &name,
+                component.bytes.as_slice(),
+                // The map the config carried, not one looked up here. It is only correct for
+                // the bundle beside it, and this crate has no way to check that pairing —
+                // `lanekeep-config` read both out of one table.
+                component.source_map.as_ref().map(ComponentBytes::as_slice),
+            )
             .map_err(|e: WasmError| RunError::Component {
                 rule: name.clone(),
                 detail: e.to_string(),

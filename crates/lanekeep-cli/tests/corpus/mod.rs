@@ -17,6 +17,15 @@
 //! them still run in QuickJS. Those files would then have been green before the change and green
 //! after it, while asserting nothing about the thing that changed.
 
+// Each `tests/*.rs` is its own crate and uses the reading it needs — `run` for the two
+// cross-file rules, `run_failing` for the one that is about a rule refusing to finish — so an
+// unused method here is code another crate uses. `allow` rather than `expect`, because `expect`
+// would be unfulfilled in whichever crate happens to use all of it.
+#![allow(
+    dead_code,
+    reason = "one module shared by several test crates, each using the part it needs"
+)]
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,13 +79,68 @@ impl Corpus {
         std::fs::write(full, contents).expect("writes file");
     }
 
+    /// What the tool said when the run could not finish.
+    ///
+    /// The other half of [`Corpus::run`], for the case that one refuses: a rule that throws
+    /// cancels the run and exits `2`, which [`Corpus::run`] treats — correctly, for its own
+    /// callers — as the test having gone wrong. Here it is the subject.
+    ///
+    /// Both streams, joined, because where a failure is written is a reporter's decision and
+    /// not what any caller of this is asserting.
+    pub(crate) fn run_failing(&self) -> String {
+        let output = self.invoke();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "the run was supposed to be cancelled by a failing rule:\n{stderr}\n{stdout}"
+        );
+        format!("{stderr}{stdout}")
+    }
+
     /// Violations as `file:line:column message`, in the order the tool reported them.
     ///
     /// Rendered rather than structured, because the ordering *is* part of what these tests
     /// assert — a cross-file rule that reports the same set in a different order every run
     /// has failed the determinism invariant even though the set is right.
     pub(crate) fn run(&self) -> Vec<String> {
-        let output = Command::new(env!("CARGO_BIN_EXE_lanekeep"))
+        let output = self.invoke();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.code() != Some(2),
+            "the run failed:\n{stderr}\n{stdout}"
+        );
+
+        let document: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("bad json ({e}): {stdout}"));
+
+        document["violations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no violations array in: {stdout}"))
+            .iter()
+            .map(|v| {
+                let at = &v["location"];
+                format!(
+                    "{}:{}:{} {}",
+                    at["file"].as_str().unwrap_or("?"),
+                    at["position"]["line"].as_u64().unwrap_or(0),
+                    at["position"]["column"].as_u64().unwrap_or(0),
+                    v["message"].as_str().unwrap_or("?"),
+                )
+            })
+            .collect()
+    }
+
+    /// One `lanekeep check` over this project, however it turns out.
+    ///
+    /// Shared by both readings above so that neither can drift into checking a different run
+    /// from the other — the budgets in particular, which are what keep a loaded machine from
+    /// being reported as a misbehaving rule.
+    fn invoke(&self) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_lanekeep"))
             .arg("check")
             .arg(&self.dir)
             .arg("--format")
@@ -105,33 +169,7 @@ impl Corpus {
             .arg("--timeout")
             .arg("600000")
             .output()
-            .expect("runs the binary");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.code() != Some(2),
-            "the run failed:\n{stderr}\n{stdout}"
-        );
-
-        let document: serde_json::Value =
-            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("bad json ({e}): {stdout}"));
-
-        document["violations"]
-            .as_array()
-            .unwrap_or_else(|| panic!("no violations array in: {stdout}"))
-            .iter()
-            .map(|v| {
-                let at = &v["location"];
-                format!(
-                    "{}:{}:{} {}",
-                    at["file"].as_str().unwrap_or("?"),
-                    at["position"]["line"].as_u64().unwrap_or(0),
-                    at["position"]["column"].as_u64().unwrap_or(0),
-                    v["message"].as_str().unwrap_or("?"),
-                )
-            })
-            .collect()
+            .expect("runs the binary")
     }
 }
 

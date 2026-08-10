@@ -85,6 +85,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use wasmtime::Engine;
@@ -93,6 +94,7 @@ use wasmtime::component::types::ComponentItem;
 
 use crate::error::WasmError;
 use crate::runtime::WasmEngine;
+use crate::sourcemap::SourceMap;
 
 /// The one instance import `wit/world.wit` declares.
 ///
@@ -280,6 +282,18 @@ pub struct Loaded {
     component: Component,
     source: LoadSource,
     identity: ComponentIdentity,
+    /// The component's sidecar source map, decoded, or `None` for a component that ships
+    /// without one.
+    ///
+    /// Decoded here rather than where a failure is rendered, because a map is a property of the
+    /// component and a rendering happens per thrown error. Behind an [`Arc`] because
+    /// [`crate::runtime::RuleSet`] is shared by every worker and a 3,400-segment table copied per
+    /// worker would buy nothing.
+    ///
+    /// **A component with no map is the ordinary case and not a degraded one.** Every Rust rule
+    /// is one — a panic traps and carries no stack at all, so there would be nothing to remap —
+    /// and so is any component whose author did not ship a map beside it.
+    source_map: Option<Arc<SourceMap>>,
 }
 
 /// What makes two loads of one component the same component.
@@ -312,6 +326,24 @@ impl Loaded {
     #[must_use]
     pub const fn source(&self) -> LoadSource {
         self.source
+    }
+
+    /// Whether a source map came with the component.
+    ///
+    /// Public because it is the one thing about a map that anything outside this crate has a
+    /// reason to ask, and because the question a caller actually has is a wiring question: a
+    /// built-in reaches this through four crates, and every one of them could quietly hand on
+    /// `None`. What a missing map costs is a diagnostic in `entry.js` coordinates, which nothing
+    /// else goes red about, so the wiring is asserted rather than assumed —
+    /// `crates/lanekeep-rules/tests/source_maps.rs`.
+    #[must_use]
+    pub const fn has_source_map(&self) -> bool {
+        self.source_map.is_some()
+    }
+
+    /// The decoded map, for the runtime that will remap this component's failures.
+    pub(crate) fn source_map(&self) -> Option<&Arc<SourceMap>> {
+        self.source_map.as_ref()
     }
 }
 
@@ -478,6 +510,46 @@ impl ComponentLoader {
     /// can compile. A cache directory that cannot be written is **not** an error: it is what
     /// [`LoadSource::Embedded`] is for.
     pub fn load(&self, engine: &WasmEngine, name: &str, bytes: &[u8]) -> Result<Loaded, WasmError> {
+        self.load_mapped(engine, name, bytes, None)
+    }
+
+    /// The same, for a component that ships a sidecar source map beside it.
+    ///
+    /// **What the map buys is a diagnostic and nothing else.** A rule compiled ahead of time from
+    /// TypeScript throws from a position in the bundle it was flattened into — `entry.js:957:16`
+    /// — and the map is what turns that back into a line in the file its author edited. It cannot
+    /// move a violation: a violation's position comes from the Rust arena by way of a node handle,
+    /// never from JavaScript.
+    ///
+    /// That is also why a map is not a cache-key input. It affects only the rendering of
+    /// [`WasmError::RuleFailed`], and every variant of that error cancels the run — so no cached
+    /// entry is ever written by a run whose output the map touched, and a run that changed only
+    /// its map produces byte-identical output for every file that completes.
+    ///
+    /// **Decoded once per load, which is once per rule reference and not once per error.** The
+    /// same component named by four rules is loaded four times and decoded four times, at roughly
+    /// 14 KB and a few thousand segments each; the loader is deliberately lock-free — `&self`
+    /// throughout, so rules load in parallel with no contention — and a cache keyed by identity
+    /// would have to be behind a lock to be one. What the caching claim is actually about is the
+    /// rendering path, and that reads a decoded map rather than JSON.
+    ///
+    /// # Errors
+    ///
+    /// As [`ComponentLoader::load`], plus [`WasmError::Engine`] when the map does not decode.
+    /// A malformed map fails the load rather than being dropped: a map that silently explains
+    /// nothing leaves every failure of that component reporting a position in a file that does
+    /// not exist, and nothing anywhere goes red.
+    pub fn load_mapped(
+        &self,
+        engine: &WasmEngine,
+        name: &str,
+        bytes: &[u8],
+        source_map: Option<&[u8]>,
+    ) -> Result<Loaded, WasmError> {
+        let source_map = source_map
+            .map(|json| SourceMap::parse(name, json).map(Arc::new))
+            .transpose()?;
+
         // Hashed once, here, and used for two things: the artifact's content-addressed name,
         // and the [`Loaded::identity`] that lets `RuleSet::add` recognize a second load of the
         // same component and give both loads one instance.
@@ -488,7 +560,14 @@ impl ComponentLoader {
             if path.is_file() {
                 if let Some(component) = map(engine.engine(), &path) {
                     self.mapped.fetch_add(1, Ordering::Relaxed);
-                    return self.admit(engine, name, component, LoadSource::Mapped, identity);
+                    return self.admit(
+                        engine,
+                        name,
+                        component,
+                        LoadSource::Mapped,
+                        identity,
+                        source_map,
+                    );
                 }
                 // A stale or truncated artifact. Removing it is not required — the write
                 // below replaces it — but leaving one that cannot be loaded means paying the
@@ -504,7 +583,14 @@ impl ComponentLoader {
             // Checked *before* it is written, so a component the sandbox refuses leaves nothing
             // on disk. Writing an artifact for something that will never run is wasted work
             // and a file a reader would have to explain.
-            let checked = self.admit(engine, name, compiled, LoadSource::Embedded, identity)?;
+            let checked = self.admit(
+                engine,
+                name,
+                compiled,
+                LoadSource::Embedded,
+                identity,
+                source_map.clone(),
+            )?;
 
             if self.persist(checked.component(), &path)
                 && let Some(component) = map(engine.engine(), &path)
@@ -514,7 +600,14 @@ impl ComponentLoader {
                 // bytes off a different path — the same ones a *later* run will take at step 1
                 // — and "the compilation it came from was fine" is exactly the kind of
                 // reasoning that leaves a check reachable rather than unavoidable.
-                return self.admit(engine, name, component, LoadSource::Mapped, identity);
+                return self.admit(
+                    engine,
+                    name,
+                    component,
+                    LoadSource::Mapped,
+                    identity,
+                    source_map,
+                );
             }
 
             // The directory is not writable, or what was written could not be read back.
@@ -527,7 +620,14 @@ impl ComponentLoader {
         let compiled = engine.compile(bytes)?;
         self.compilations.fetch_add(1, Ordering::Relaxed);
         self.embedded.fetch_add(1, Ordering::Relaxed);
-        self.admit(engine, name, compiled, LoadSource::Embedded, identity)
+        self.admit(
+            engine,
+            name,
+            compiled,
+            LoadSource::Embedded,
+            identity,
+            source_map,
+        )
     }
 
     /// Check what a component reaches for, and hand it back if the answer is acceptable.
@@ -538,12 +638,14 @@ impl ComponentLoader {
         component: Component,
         source: LoadSource,
         identity: ComponentIdentity,
+        source_map: Option<Arc<SourceMap>>,
     ) -> Result<Loaded, WasmError> {
         check_imports(engine.engine(), name, &component, &self.permitted)?;
         Ok(Loaded {
             component,
             source,
             identity,
+            source_map,
         })
     }
 

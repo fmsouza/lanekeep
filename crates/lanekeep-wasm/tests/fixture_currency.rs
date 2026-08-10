@@ -174,8 +174,7 @@ const TYPESCRIPT_HEADER: &str = "\
 # rebuilding — run `just typescript-builtins`.
 ";
 
-/// The components under `crates/lanekeep-rules/components/` that `just rust-rules` does not
-/// build.
+/// The files under `crates/lanekeep-rules/components/` that `just rust-rules` does not build.
 ///
 /// Read twice, with opposite signs: as the artifact list of
 /// [`every_committed_typescript_component_is_the_one_its_sources_build`], and as what
@@ -183,10 +182,19 @@ const TYPESCRIPT_HEADER: &str = "\
 /// One list rather than two, so the partition cannot drift into either an artifact in both
 /// manifests or an artifact in neither.
 ///
+/// **Two files rather than one, and the second is not a by-product.** The sidecar map is what
+/// turns a thrown rule's `entry.js:957:16` back into a line in the author's TypeScript, and it is
+/// only correct for the bundle it was generated from — the two are one build's output, produced
+/// by one invocation of `jco componentize`, and a map paired with any other component points at
+/// arbitrary lines of real files. Recording it here is what makes "rebuilt one without the other"
+/// impossible rather than merely unlikely.
+///
 /// This crate's own directory is the base, so the paths are the repository-relative ones both
 /// manifests are keyed on.
-const TYPESCRIPT_ARTIFACTS: &[&str] =
-    &["crates/lanekeep-rules/components/typescript-builtins.wasm"];
+const TYPESCRIPT_ARTIFACTS: &[&str] = &[
+    "crates/lanekeep-rules/components/typescript-builtins.wasm",
+    "crates/lanekeep-rules/components/typescript-builtins.wasm.map",
+];
 
 /// Everything the TypeScript built-ins component is built from, other than its own artifact.
 ///
@@ -388,7 +396,14 @@ fn every_committed_typescript_component_is_the_one_its_sources_build() {
     // the two that are directories — either could come back empty and agree with an empty
     // manifest. Named rather than counted: these are the two files the component is bundled
     // from and the one it is built against, and none of the three is optional.
-    let artifacts = counted(&computed, "crates/lanekeep-rules/components/", "wasm");
+    //
+    // The artifacts are counted through their own list rather than by file extension, because
+    // they no longer share one: the component is a `.wasm` and its map is a `.map`, and a count
+    // keyed on either would silently stop covering the other.
+    let artifacts = TYPESCRIPT_ARTIFACTS
+        .iter()
+        .filter(|artifact| computed.contains_key(**artifact))
+        .count();
     assert!(
         artifacts == TYPESCRIPT_ARTIFACTS.len()
             && computed.contains_key("crates/lanekeep-rules/typescript/entry.ts")

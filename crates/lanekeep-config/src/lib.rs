@@ -168,6 +168,20 @@ pub struct ComponentRule {
     /// Behind an [`std::sync::Arc`], because a `RuleSpec` is cloned per rule when the engine
     /// prepares and a per-rule copy of a megabyte is a cost with nothing to buy it.
     pub bytes: ComponentBytes,
+    /// The component's sidecar source map, or `None` for one that ships without one.
+    ///
+    /// **Carried beside the bytes for the same reason they are carried at all**: the component
+    /// that was described has to be the component that runs, and the map is only correct for the
+    /// bundle it was generated from. Reading it a second time later, from a path, would let a
+    /// file that changed in between explain the positions of a program it does not describe.
+    ///
+    /// **Not a `ruleset_hash` input, and that is a decision rather than an omission.** A map
+    /// changes exactly one thing: where a *thrown* rule error is reported. It cannot move a
+    /// violation — a violation's position comes from the parse tree by way of a node handle — and
+    /// every failure it touches cancels the run, so no cache entry is ever written by a run whose
+    /// output it affected. Two runs differing only in their maps produce byte-identical output for
+    /// every file that completes.
+    pub source_map: Option<ComponentBytes>,
     /// Whether these exact bytes were folded into the `ruleset_hash` of the `Config` this
     /// rule sits in.
     ///
@@ -213,6 +227,12 @@ impl ComponentRule {
             index,
             options,
             bytes: bytes.into(),
+            // No map, because there is no honest way to take one here: a caller attaching a
+            // component after `load` has returned has no component-to-map pairing this crate
+            // could check, and a mispaired map reports arbitrary lines of real files. The cost
+            // is a stack in the space the guest was compiled to, which is what an embedder
+            // driving a component directly already gets.
+            source_map: None,
             counted_in_ruleset_hash: false,
         }
     }
@@ -1002,6 +1022,9 @@ fn describe_components(
                     // An `Arc` clone: the rules of one component share the read, which is what
                     // makes "read once" per reference rather than per rule.
                     bytes: entry.bytes.clone(),
+                    // And the map beside them, so `lanekeep-engine` loads this component with
+                    // the map this description was made against rather than looking for one.
+                    source_map: entry.source_map.clone(),
                     // The one constructor whose output `build` folds into `ruleset_hash` —
                     // see the field.
                     counted_in_ruleset_hash: true,
@@ -1109,6 +1132,8 @@ struct Compiled {
     origin: PathBuf,
     /// The bytes this was compiled from, folded into `ruleset_hash`.
     bytes: ComponentBytes,
+    /// The component's source map, carried to `ComponentRule` so the engine loads with it too.
+    source_map: Option<ComponentBytes>,
     /// Which rule of the component this entry names, or every one of them.
     only: Option<u32>,
     /// The entry's options as JSON, serialized once so every worker gets the same bytes.
@@ -1142,8 +1167,12 @@ fn compile_components(
         // rules with one component in it does no work per rule that is thrown away. Extracting
         // the two byte sources into `component_bytes` put the serialization above this test for
         // a while, which was a small silent regression on the common shape.
-        let Some((origin, bytes, only)) =
-            component_bytes(root, rule).map_err(|detail| (position, detail))?
+        let Some(ComponentSource {
+            origin,
+            bytes,
+            only,
+            source_map,
+        }) = component_bytes(root, rule).map_err(|detail| (position, detail))?
         else {
             continue;
         };
@@ -1156,13 +1185,19 @@ fn compile_components(
             .map_or_else(|| "null".to_owned(), json::literal);
 
         let admitted = loader
-            .load(engine, &rule.specifier, bytes.as_slice())
+            .load_mapped(
+                engine,
+                &rule.specifier,
+                bytes.as_slice(),
+                source_map.as_ref().map(ComponentBytes::as_slice),
+            )
             .map_err(|e| (position, e.to_string()))?;
 
         compiled.push(Compiled {
             position,
             origin,
             bytes,
+            source_map,
             only,
             options,
             admitted,
@@ -1343,10 +1378,26 @@ fn hosted_rules(
 /// answered. It is refused rather than assumed away because the two calls are in different
 /// crates, and a rules root rebuilt between them without its components would otherwise produce
 /// a rule with no `check` rather than an explanation.
+/// What a config entry's component reference resolved to, before anything is compiled.
+///
+/// A struct rather than a tuple because it grew a fourth member whose meaning is not readable
+/// from its position — three of these are `Option`s or paths and the reader has to be told which
+/// is which.
+struct ComponentSource {
+    /// Provenance for [`ComponentRule::path`]: a confined path, or `lanekeep/<name>`.
+    origin: PathBuf,
+    /// The component itself, read exactly once.
+    bytes: ComponentBytes,
+    /// Which of the component's rules this entry names, or every one of them.
+    only: Option<u32>,
+    /// The component's source map, if it ships one.
+    source_map: Option<ComponentBytes>,
+}
+
 fn component_bytes(
     root: &RuleRoot,
     rule: &ResolvedRule,
-) -> Result<Option<(PathBuf, ComponentBytes, Option<u32>)>, String> {
+) -> Result<Option<ComponentSource>, String> {
     match &rule.reference {
         // Embedded in this binary, so there is no path to confine and no file to read — and
         // nothing a project file could shadow, which is the guarantee a built-in module has too.
@@ -1357,11 +1408,16 @@ fn component_bytes(
                      no component by that name"
                 )
             })?;
-            Ok(Some((
-                PathBuf::from(format!("lanekeep/{name}")),
-                bytes.to_vec().into(),
-                Some(index),
-            )))
+            Ok(Some(ComponentSource {
+                origin: PathBuf::from(format!("lanekeep/{name}")),
+                bytes: bytes.to_vec().into(),
+                only: Some(index),
+                // Asked with the same name and from the same table, so the map a component
+                // gets is its own or none.
+                source_map: root
+                    .builtin_component_map(name)
+                    .map(|map| map.to_vec().into()),
+            }))
         }
 
         RuleReference::Component(path) => {
@@ -1386,7 +1442,18 @@ fn component_bytes(
             let bytes: ComponentBytes = std::fs::read(&confined)
                 .map_err(|e| format!("cannot read `{}`: {e}", confined.display()))?
                 .into();
-            Ok(Some((confined, bytes, None)))
+            // No sidecar is read for a project component, deliberately. `<name>.wasm.map` is the
+            // obvious convention and it would be a second file whose freshness against the first
+            // nothing checks: a map left behind by a previous build reports positions in real
+            // files that have nothing to do with the failure, and the two cannot be paired
+            // without a digest neither of them carries. A built-in's map is embedded in this
+            // binary beside its component, which is what makes that pairing hold there.
+            Ok(Some(ComponentSource {
+                origin: confined,
+                bytes,
+                only: None,
+                source_map: None,
+            }))
         }
 
         RuleReference::Builtin(_) | RuleReference::Module(_) => Ok(None),
@@ -1973,6 +2040,10 @@ mod tests {
                 index,
                 options: "null".to_owned(),
                 bytes: bytes.into(),
+                // No map: these fixtures are hand-written `.wasm` bytes with nothing beside
+                // them, and a map is not a `ruleset_hash` input, so it is outside every claim
+                // these tests make.
+                source_map: None,
                 // Irrelevant to what is under test here — these tests drive `hash_ruleset`
                 // directly rather than through `Engine::caching` — but `true` is the honest
                 // answer: a real `load` is what every one of these fixtures simulates.
@@ -3145,6 +3216,7 @@ mod tests {
                 index: 0,
                 options: "null".to_owned(),
                 bytes: Vec::new().into(),
+                source_map: None,
                 // This test drives `build_rule` directly, below `describe_components` and
                 // `hash_ruleset` both — irrelevant to either, so `true` for the same reason
                 // `Fixture::component` gives it.

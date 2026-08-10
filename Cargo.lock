@@ -985,8 +985,13 @@ dependencies = [
  "blake3",
  "lanekeep-core",
  "lanekeep-js",
+ "lanekeep-lang",
+ "lanekeep-lang-js",
+ "lanekeep-nodes",
  "lanekeep-testkit",
  "lanekeep-wasm",
+ "serde_json",
+ "tree-sitter",
 ]
 
 [[package]]

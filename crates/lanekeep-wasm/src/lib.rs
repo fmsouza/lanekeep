@@ -114,6 +114,12 @@ pub mod key;
 pub mod load;
 pub mod runtime;
 
+// Private for the reason `facts` is, and the claim is the same one: nothing outside this
+// crate decodes a source map, because nothing outside it receives a guest's stack. A map
+// arrives as bytes — `ComponentLoader::load_mapped` — and leaves as a remapped
+// `WasmError::RuleFailed`, so the decoded form has no reason to be nameable.
+mod sourcemap;
+
 // Private, and the visibility is the claim: nothing outside this crate validates a fact,
 // because nothing outside it receives one from a guest. The module exists so the three
 // answers can be pinned down without a store, a component and a parsed file, not so callers

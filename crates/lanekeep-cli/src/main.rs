@@ -849,7 +849,14 @@ fn prepare(
         // how it happens to be authored in this build, and a config writes `lanekeep/<name>`
         // either way — so both lookups have to be installed together, or a rule that migrated
         // stops resolving for everyone who never changed anything.
-        .with_builtin_components(lanekeep_rules::component);
+        .with_builtin_components(lanekeep_rules::component)
+        // And the third: the source maps of the components that have one, so a built-in that
+        // throws is reported at a line in the TypeScript it was authored in rather than at one
+        // in the bundle it was compiled into. Only a diagnostic depends on this — a rule that
+        // resolves without it works identically and reports the same violations — which is why
+        // it is asserted end to end in `crates/lanekeep-rules/tests/source_maps.rs` rather than
+        // left to whoever notices.
+        .with_builtin_component_maps(lanekeep_rules::component_source_map);
     let config_path = config_path(project_root, config)?;
 
     let sandbox = lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))

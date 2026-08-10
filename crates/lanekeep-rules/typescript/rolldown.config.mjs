@@ -2,7 +2,18 @@
  * How `jco componentize` is allowed to resolve and read the modules it bundles.
  *
  * Merged into jco's own rolldown invocation by `--bundle-config`; jco owns `input`, `cwd`,
- * `format` and `platform`, so what this file contributes is a plugin and nothing else.
+ * `format` and `platform`, so what this file contributes is two plugins and one output option.
+ *
+ * # The second plugin writes the source map, and the option is what produces one
+ *
+ * A rule compiled ahead of time throws from a position in the flattened bundle —
+ * `matches@entry.js:957:16` — and `entry.js` is not a file anybody can open. The sidecar map
+ * beside the component is what turns that back into a line in the author's TypeScript, and it is
+ * written here because this is the only place the mapping exists: jco returns the bundled *code*
+ * and discards everything else rolldown produced.
+ *
+ * That makes this configuration single-purpose, which it already was — `resolveId` below refuses
+ * any entry but `entry.ts` — so the output path is written out rather than passed in.
  *
  * # Why a bundler needs a resolver of lanekeep's own
  *
@@ -43,8 +54,8 @@
  * any other unknown built-in, which is what the sandbox does with the same specifier.
  */
 
-import { readFileSync } from 'node:fs'
-import { dirname, join, resolve as resolvePath, sep } from 'node:path'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { confine, resolve } from '../../../packages/lanekeep/runtime/resolve.js'
@@ -62,6 +73,25 @@ const rulesRoot = resolvePath(here, '..')
 
 /** lanekeep's own authoring package, which is not rule code. */
 const packageRoot = resolvePath(here, '../../../packages/lanekeep')
+
+/**
+ * The repository root, which every path in the written map is relative to.
+ *
+ * Not rolldown's own choice, which is the output directory — `crates/lanekeep-rules/typescript`,
+ * giving `../../rules/no-restricted-imports.ts`. A frame shown to a user has to name a path that
+ * means the same thing to them, to a `git grep` and to an editor, and the only such spelling is
+ * relative to the repository. Rewritten at the build rather than at the read, so the shipped map
+ * says what it means and nothing in Rust has to know where this directory sits.
+ */
+const repositoryRoot = resolvePath(here, '../../..')
+
+/**
+ * Where the sidecar map is written.
+ *
+ * Beside the component, named after it, which is the convention `lanekeep-wasm` reads and the one
+ * every bundler already uses. `just typescript-builtins` records both files' digests.
+ */
+const sourceMapOut = join(rulesRoot, 'components/typescript-builtins.wasm.map')
 
 /** The entry module, which is the only module allowed to import the runtime. */
 const entry = join(here, 'entry.ts')
@@ -167,4 +197,74 @@ const lanekeepRules = {
   },
 }
 
-export default { plugins: [lanekeepRules] }
+/**
+ * One source path, as the shipped map spells it: relative to the repository root, with `/`.
+ *
+ * Rolldown's own spelling is relative to the output directory, which for a `generate()` with no
+ * `dir` is `<cwd>/dist` — a directory that does not exist, two levels from anything real, and not
+ * something to derive by counting. `sourcemapPathTransform` is handed the map's own path, so the
+ * base is read rather than guessed.
+ *
+ * @param {string} relativeSourcePath As rolldown wrote it.
+ * @param {string} sourcemapPath The absolute path rolldown would have written the map to.
+ */
+function repositoryRelative(relativeSourcePath, sourcemapPath) {
+  const absolute = resolvePath(dirname(sourcemapPath), relativeSourcePath)
+  const fromRoot = relative(repositoryRoot, absolute)
+  if (fromRoot.startsWith('..')) {
+    throw new Error(
+      `the source map names ${absolute}, which is outside this repository — a frame pointing ` +
+        'there would name a path the reader does not have',
+    )
+  }
+  return fromRoot.split(sep).join('/')
+}
+
+/**
+ * The map rolldown produced, written beside the component and taken out of the bundle.
+ *
+ * Two things, and the second is not optional. jco refuses an output containing any asset —
+ * "Component bundling produced unsupported assets" — and enabling a source map produces exactly
+ * one, `entry.js.map`. So the asset is deleted here rather than emitted: the map leaves through
+ * this plugin's own write or it does not leave at all.
+ *
+ * `sourcesContent` is dropped. The sources are files in this repository, so embedding a second
+ * copy of 56 KB of them would put a rule's text somewhere it can go stale against the file the
+ * frame names — and the frame naming a real path is the whole point.
+ */
+const lanekeepSourceMap = {
+  name: 'lanekeep-source-map',
+
+  generateBundle(_options, bundle) {
+    let written = false
+
+    for (const [fileName, item] of Object.entries(bundle)) {
+      if (fileName.endsWith('.map')) {
+        delete bundle[fileName]
+        continue
+      }
+      if (item.type !== 'chunk' || !item.isEntry || !item.map) continue
+
+      const map =
+        typeof item.map.toString === 'function' ? JSON.parse(item.map.toString()) : item.map
+      delete map.sourcesContent
+
+      writeFileSync(sourceMapOut, `${JSON.stringify(map)}\n`)
+      written = true
+    }
+
+    // A silent absence here is a component whose failures report positions in `entry.js` for
+    // the rest of its life, with nothing red — the build is the only place that can notice.
+    if (!written) {
+      throw new Error(
+        `no entry chunk carried a source map, so ${sourceMapOut} was not written. ` +
+          'The `output.sourcemap` below is what produces one.',
+      )
+    }
+  },
+}
+
+export default {
+  plugins: [lanekeepRules, lanekeepSourceMap],
+  output: { sourcemap: 'hidden', sourcemapPathTransform: repositoryRelative },
+}

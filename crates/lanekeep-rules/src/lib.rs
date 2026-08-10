@@ -140,16 +140,46 @@ const COMPONENT_SOURCES: &[(&str, &str)] = &[
 /// artifacts here. The bytes are committed, so the gate needs neither `cargo component`, a wasm
 /// target, nor Node.
 ///
+/// One shipped component: its name, its bytes, and its source map if it has one.
+///
+/// Named so the two tables below and the lookup behind them read as rows rather than as tuples
+/// — and because a three-element tuple of two slices and an optional slice is a shape clippy is
+/// right to object to.
+type BuiltInComponent = (&'static str, &'static [u8], Option<&'static [u8]>);
+
+/// # The third column is the component's source map, and it is optional
+///
+/// A component compiled from TypeScript throws from a position in the bundle several files were
+/// flattened into — `matches@entry.js:957:16` — and `entry.js` is a file nobody can open. The
+/// sidecar map beside the artifact is what turns that back into a line in the source a reader can
+/// go and look at, and it is embedded here for the reason the bytes are: a built-in is in the
+/// binary, so nothing is read from disk and nothing in a project can shadow it.
+///
+/// `None` for the two components built from Rust, and it is not an omission: a Rust rule that
+/// fails does so by panicking, which traps, and a trap arrives at the host with no stack at all.
+/// There would be nothing to remap.
+///
+/// **In this table rather than beside it**, so that a component and its map cannot be wired
+/// separately. They are one build's output — `just typescript-builtins` writes both — and a map
+/// paired with any other component reports arbitrary lines of real files, which is worse than
+/// reporting none.
+///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
-const BUILT_IN_COMPONENTS: &[(&str, &[u8])] = &[
+const BUILT_IN_COMPONENTS: &[BuiltInComponent] = &[
     (
         "no-glob-import",
         include_bytes!("../components/no-glob-import.wasm"),
+        None,
     ),
-    ("no-unwrap", include_bytes!("../components/no-unwrap.wasm")),
+    (
+        "no-unwrap",
+        include_bytes!("../components/no-unwrap.wasm"),
+        None,
+    ),
     (
         "typescript-builtins",
         include_bytes!("../components/typescript-builtins.wasm"),
+        Some(include_bytes!("../components/typescript-builtins.wasm.map")),
     ),
 ];
 
@@ -215,13 +245,36 @@ pub fn source(name: &str) -> Option<&'static str> {
 /// TypeScript built-ins that is a different rule than the one the config named.
 #[must_use]
 pub fn component(name: &str) -> Option<(&'static [u8], u32)> {
+    let ((_, bytes, _), index) = hosted(name)?;
+    Some((bytes, index))
+}
+
+/// The source map of the component behind a built-in rule's name, or `None`.
+///
+/// Keyed by the *rule* rather than by the component, so a caller asks it with the same name it
+/// asks [`component`] with — a config names a rule, and which artifact hosts it is not something
+/// a config knows.
+///
+/// **What a missing map costs is a diagnostic and nothing else.** A rule that throws is reported
+/// at a position in the program that actually ran; with the map, that position is translated back
+/// into the file its author edited. A violation's position never passes through here — the host
+/// reads it from the parse tree — so nothing about what a rule *finds* depends on this answer.
+#[must_use]
+pub fn component_source_map(name: &str) -> Option<&'static [u8]> {
+    hosted(name)?.0.2
+}
+
+/// The row of [`BUILT_IN_COMPONENTS`] that hosts a rule, and the index it sits at.
+///
+/// One lookup behind both accessors, so a rule cannot be found by one and missed by the other.
+fn hosted(name: &str) -> Option<(&'static BuiltInComponent, u32)> {
     let (_, host, index) = COMPONENT_RULES
         .iter()
         .find(|(candidate, _, _)| *candidate == name)?;
-    let (_, bytes) = BUILT_IN_COMPONENTS
+    let component = BUILT_IN_COMPONENTS
         .iter()
-        .find(|(candidate, _)| candidate == host)?;
-    Some((*bytes, *index))
+        .find(|(candidate, _, _)| candidate == host)?;
+    Some((component, *index))
 }
 
 /// Every built-in rule's name, in a stable order.
@@ -389,7 +442,7 @@ mod tests {
         // nobody can. A component no rule names is 13 MiB embedded in the binary and never
         // executed; a rule naming a component this build does not have is a config entry that
         // resolves to nothing.
-        for (component_name, _) in BUILT_IN_COMPONENTS {
+        for (component_name, _, _) in BUILT_IN_COMPONENTS {
             assert!(
                 COMPONENT_RULES
                     .iter()
@@ -400,7 +453,7 @@ mod tests {
 
         for (name, host, _) in COMPONENT_RULES {
             assert!(
-                BUILT_IN_COMPONENTS.iter().any(|(n, _)| n == host),
+                BUILT_IN_COMPONENTS.iter().any(|(n, _, _)| n == host),
                 "`{name}` names the component `{host}`, which this build does not ship"
             );
             assert!(
@@ -439,7 +492,7 @@ mod tests {
     fn a_component_is_webassembly_rather_than_a_placeholder() {
         // `include_bytes!` of a stub or a half-written file compiles, and the failure would be a
         // load error inside whichever test ran first. Four bytes are enough to tell them apart.
-        for (name, bytes) in BUILT_IN_COMPONENTS {
+        for (name, bytes, _) in BUILT_IN_COMPONENTS {
             assert_eq!(
                 bytes.get(..4),
                 Some(b"\0asm".as_slice()),
@@ -492,7 +545,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             BUILT_IN_COMPONENTS
                 .iter()
-                .map(|(n, _)| *n)
+                .map(|(n, _, _)| *n)
                 .collect::<Vec<_>>(),
             COMPONENT_RULES
                 .iter()

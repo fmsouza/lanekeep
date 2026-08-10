@@ -69,6 +69,23 @@ pub type BuiltinSource = fn(&str) -> Option<&'static str>;
 /// a wrong rule reporting is indistinguishable from a right one reporting.
 pub type BuiltinComponent = fn(&str) -> Option<(&'static [u8], u32)>;
 
+/// Resolves a built-in rule name to its component's embedded source map.
+///
+/// A third hook rather than a third element of [`BuiltinComponent`], because it answers a
+/// different kind of question and almost every caller has no use for it: what a map buys is where
+/// a *thrown* rule error is reported, and nothing else. A violation's position never passes
+/// through JavaScript at all, so a build that wired this to nothing would produce identical
+/// violations and a worse stack.
+///
+/// That is also its risk, and the reason `crates/lanekeep-rules/tests/source_maps.rs` asserts the
+/// wiring end to end rather than trusting it: a caller that sets [`RuleRoot::with_builtin_components`]
+/// and forgets this one gets rules that work and diagnostics that name `entry.js`, with nothing
+/// anywhere going red.
+///
+/// `None` is the ordinary answer. Every component built from Rust is one — a panicking rule traps,
+/// and a trap reaches the host with no stack to remap.
+pub type BuiltinComponentMap = fn(&str) -> Option<&'static [u8]>;
+
 /// The longest a component-hosted built-in's name may be before refusing it stops being
 /// actionable.
 ///
@@ -110,6 +127,11 @@ fn no_builtins(_name: &str) -> Option<&'static str> {
 
 /// The default: no built-in components.
 fn no_builtin_components(_name: &str) -> Option<(&'static [u8], u32)> {
+    None
+}
+
+/// The default: no source maps, which is also the answer for every component that has none.
+fn no_builtin_component_maps(_name: &str) -> Option<&'static [u8]> {
     None
 }
 
@@ -205,6 +227,7 @@ pub struct RuleRoot {
     root: PathBuf,
     builtins: BuiltinSource,
     builtin_components: BuiltinComponent,
+    builtin_component_maps: BuiltinComponentMap,
 }
 
 impl RuleRoot {
@@ -223,6 +246,7 @@ impl RuleRoot {
             root: canonical,
             builtins: no_builtins,
             builtin_components: no_builtin_components,
+            builtin_component_maps: no_builtin_component_maps,
         })
     }
 
@@ -246,6 +270,25 @@ impl RuleRoot {
     pub const fn with_builtin_components(mut self, components: BuiltinComponent) -> Self {
         self.builtin_components = components;
         self
+    }
+
+    /// Serve the source maps of the built-ins that ship as components.
+    ///
+    /// Separate from [`RuleRoot::with_builtin_components`] on the terms [`BuiltinComponentMap`]
+    /// gives: a map answers a diagnostics question, most components have none, and a caller that
+    /// wires one hook and not the other loses a stack rather than a rule.
+    #[must_use]
+    pub const fn with_builtin_component_maps(mut self, maps: BuiltinComponentMap) -> Self {
+        self.builtin_component_maps = maps;
+        self
+    }
+
+    /// The source map of the component behind a built-in's name, or `None`.
+    ///
+    /// Asked by `lanekeep-config` beside [`RuleRoot::builtin_component`], with the same name.
+    #[must_use]
+    pub fn builtin_component_map(&self, name: &str) -> Option<&'static [u8]> {
+        (self.builtin_component_maps)(name)
     }
 
     /// The component behind a built-in's name and the index it sits at, or `None`.

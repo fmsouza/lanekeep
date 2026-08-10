@@ -208,6 +208,7 @@ use crate::error::{WasmError, classify};
 use crate::host::{CheckContext, HostState, ReduceContext};
 use crate::key::ExternalBinding;
 use crate::load::{ComponentIdentity, Loaded};
+use crate::sourcemap::SourceMap;
 
 /// Address space reserved ahead of time for each linear memory, in bytes.
 ///
@@ -706,6 +707,13 @@ struct PreparedInstance {
     /// Which component this is, so a second load of the same bytes is recognized as one.
     identity: ComponentIdentity,
     pre: RulePre<RuntimeState>,
+    /// The component's source map, or `None` for one that shipped without one.
+    ///
+    /// Held per instance rather than per rule because a map describes the *component*: the four
+    /// TypeScript built-ins are one bundle and one map, and a copy per rule would be four
+    /// references to the same table for no reason. It is read once per thrown error, which is
+    /// once per run — every variant of `WasmError` cancels it.
+    source_map: Option<Arc<SourceMap>>,
     /// The rule indices already served by this instance.
     ///
     /// A `Vec` and a linear scan, because it holds one entry per rule of one component — a
@@ -883,6 +891,7 @@ impl RuleSet {
             self.instances.push(PreparedInstance {
                 identity: *loaded.identity(),
                 pre,
+                source_map: loaded.source_map().map(Arc::clone),
                 taken: Vec::new(),
             });
             self.instances.len().saturating_sub(1)
@@ -1018,6 +1027,16 @@ impl RuleSet {
                 self.rules.len()
             ))
         })
+    }
+
+    /// The source map of the component a slot's rule lives in, if it ships with one.
+    ///
+    /// `None` for a slot this set never issued, on the same terms as [`RuleSet::rule_index`]:
+    /// a missing map and an unknown slot are both "nothing to remap with", and a caller reaching
+    /// here is rendering a failure rather than deciding whether one happened.
+    fn source_map(&self, slot: RuleSlot) -> Option<&Arc<SourceMap>> {
+        let at = self.rules.get(slot.0)?.instance;
+        self.instances.get(at)?.source_map.as_ref()
     }
 
     /// The pre-instantiation one of this set's instances is built from.
@@ -1661,12 +1680,16 @@ impl WasmRuntime {
         self.rule(slot)?;
         let index = self.rule_index(slot)?;
         let borrow = Resource::new_borrow(context.rep());
+        // Taken before the call rather than after it, and cloned rather than borrowed, because
+        // `settle` needs `&mut self` and the map lives in the set behind `self.rules`. An `Arc`
+        // clone is a refcount bump on a table that is shared by every worker anyway.
+        let source_map = self.rules.source_map(slot).map(Arc::clone);
         self.arm(timeout);
         let outcome = self.with_instance(slot, |rule, store| {
             rule.call_check(store, index, borrow, captures)
         });
         self.disarm();
-        self.settle(outcome, timeout)
+        self.settle(outcome, timeout, source_map.as_deref())
     }
 
     /// Run a slot's cross-file pass, under the default budget.
@@ -1696,11 +1719,12 @@ impl WasmRuntime {
         self.rule(slot)?;
         let index = self.rule_index(slot)?;
         let borrow = Resource::new_borrow(context.rep());
+        let source_map = self.rules.source_map(slot).map(Arc::clone);
         self.arm(timeout);
         let outcome =
             self.with_instance(slot, |rule, store| rule.call_reduce(store, index, borrow));
         self.disarm();
-        self.settle(outcome, timeout)
+        self.settle(outcome, timeout, source_map.as_deref())
     }
 
     /// Call into a slot's already-built instance.
@@ -1826,7 +1850,12 @@ impl WasmRuntime {
         self.arm(timeout);
         let outcome = rule.call_check(&mut self.store, index, borrow, captures);
         self.disarm();
-        self.settle(outcome, timeout)
+        // No source map, and it is the parameter list that says why: an instance is not a slot.
+        // A map belongs to a component, and what identifies a component here is the slot it was
+        // added under — this entry point takes a bare `Rule`, which carries nothing to look one
+        // up by. Every failure through here therefore reports in the space the guest was
+        // compiled to. Nothing in a run reaches it: `lanekeep-engine` drives slots.
+        self.settle(outcome, timeout, None)
     }
 
     /// Run one of an instance's rules' cross-file pass, under the default budget.
@@ -1859,7 +1888,8 @@ impl WasmRuntime {
         self.arm(timeout);
         let outcome = rule.call_reduce(&mut self.store, index, borrow);
         self.disarm();
-        self.settle(outcome, timeout)
+        // Unmapped, for the reason `call_check_with_timeout` gives.
+        self.settle(outcome, timeout, None)
     }
 
     /// Start the clock on one invocation.
@@ -1897,10 +1927,21 @@ impl WasmRuntime {
         &mut self,
         outcome: wasmtime::Result<Result<(), types::RuleError>>,
         timeout: Duration,
+        source_map: Option<&SourceMap>,
     ) -> Result<(), WasmError> {
         match outcome {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(failure)) => Err(WasmError::from(failure)),
+            Ok(Err(mut failure)) => {
+                // The one place a guest's own positions are touched. They arrive in the space
+                // the guest was compiled to — for a bundled TypeScript rule that is the flattened
+                // entry module — and the component's own map is what turns them back into the
+                // file its author edited. Untouched when there is no map, which is every Rust
+                // rule and every component whose author shipped none.
+                if let Some(map) = source_map {
+                    failure.frames = map.remap(failure.frames);
+                }
+                Err(WasmError::from(failure))
+            }
             Err(error) => Err(self.classify(&error, timeout)),
         }
     }
