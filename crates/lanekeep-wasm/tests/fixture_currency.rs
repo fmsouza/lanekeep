@@ -127,7 +127,19 @@ const RULE_HEADER: &str = "\
 #[test]
 fn every_committed_artifact_is_the_one_its_sources_build() {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let computed = digests(&crate_dir, &["wit", "tests/fixtures"]);
+    let computed = digests(
+        &crate_dir,
+        &[
+            "wit",
+            "tests/fixtures",
+            // The JavaScript fixture is bundled from these two and from its own `rule.js`,
+            // which the walk above already covers. They are outside this crate, so their lines
+            // are the only ones in the manifest spelled with a `../../` — the alternative was
+            // re-keying every other line against the repository root for the sake of two.
+            "../../packages/lanekeep/runtime/host.js",
+            "../../packages/lanekeep/runtime/entry.js",
+        ],
+    );
 
     // A walk that found nothing would agree with an empty manifest and assert precisely
     // nothing, which is the one way this test could be green while checking no fixture at all.
@@ -292,16 +304,25 @@ fn reconcile(
 /// Every file the committed artifacts are built from, and the artifacts themselves.
 ///
 /// `roots` are relative to `base`, and `base` is what the recorded paths are relative to. For
-/// the fixtures that is this crate, whose two roots are `wit/` — eleven of the twelve fixtures name
+/// the fixtures that is this crate, whose roots are `wit/` — eleven of the thirteen fixtures name
 /// it as their component target — and `tests/fixtures/`, which holds both the guest crates and
 /// their build output. The `.wasm` files need no separate pass; they sit in a root as ordinary
 /// files.
+/// A root may also name a single file, which is how the JavaScript fixture's two build inputs
+/// are covered without dragging their directory in: `packages/lanekeep/runtime/` also holds
+/// `resolve.js` and two `.test.js` files, none of which that artifact is built from, and
+/// recording the directory would demand a `just wasm-fixtures` — `cargo component` and Node
+/// both — after editing a JavaScript test.
 fn digests(base: &Path, roots: &[&str]) -> BTreeMap<String, String> {
     let mut found = BTreeMap::new();
     for root in roots {
-        let dir = base.join(root);
-        assert!(dir.is_dir(), "{} is not there", dir.display());
-        walk(&dir, base, &[], &mut found);
+        let path = base.join(root);
+        if path.is_file() {
+            found.insert(slashed(&path, base), digest(&path));
+            continue;
+        }
+        assert!(path.is_dir(), "{} is not there", path.display());
+        walk(&path, base, &[], &mut found);
     }
     found
 }

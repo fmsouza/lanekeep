@@ -202,6 +202,42 @@ wasm-fixtures:
     cp "${dir}target/wasm32-wasip1/release/wasip1.wasm" \
        "${root}/crates/lanekeep-wasm/tests/fixtures/rejected/wasip1.wasm"
 
+    # And the one fixture that is not a Rust crate: a JavaScript rule component, which is the
+    # only way to test what a rule can still reach once `componentize-js` has put it inside
+    # StarlingMonkey. `crates/lanekeep-wasm/tests/js_globals.rs` says what that is and why it
+    # matters.
+    #
+    # **Its build belongs here rather than being left to whoever remembers**, because the step
+    # below re-records every source under `tests/fixtures/` whether this recipe built the
+    # artifact beside it or not. A JS fixture this recipe skipped would therefore have its
+    # sources blessed against a binary nobody rebuilt — turning "a determined hand can bless
+    # without building" into the ordinary result of running the recipe, which is the one thing
+    # `fixture_currency.rs` says it must never do.
+    #
+    # So a missing Node is an error and not a skip, for the same reason. Nothing in any gate
+    # needs Node — the artifact is committed and read with `include_bytes!`-shaped code — and
+    # this recipe is outside every gate exactly as `cargo component` is.
+    #
+    # `--disable all` is load-bearing and is not tidiness: without it the artifact imports
+    # `wasi:filesystem`, `wasi:clocks/wall-clock`, `wasi:random` and `wasi:http`, and
+    # `crates/lanekeep-wasm/src/load.rs`'s import check refuses it at load. Measured cost of
+    # the flag on 2026-08-10: 42,552 bytes against a 12.4 MiB component.
+    #
+    # **And unlike every artifact above it, this one is not byte-reproducible.** Measured
+    # 2026-08-10 with jco 1.27.0: two builds from an unchanged tree differ in 2,861,081 bytes
+    # and in length. The `wizer` snapshot is a heap image, and SpiderMonkey's layout of it is
+    # not stable between processes. So `git status` is dirty after every run of this recipe,
+    # and the "rebuild and see that nothing moved" check `fixture_currency.rs` documents does
+    # not reach this fixture — restore it with `git checkout` when its digest is the only line
+    # that moved.
+    just _require node
+    just _require npx
+    echo "building js-globals (componentize-js)"
+    npx --prefix packages/lanekeep jco componentize \
+        crates/lanekeep-wasm/tests/fixtures/js-globals/rule.js \
+        --wit crates/lanekeep-wasm/wit --world-name rule --disable all --bundle \
+        -o "${root}/crates/lanekeep-wasm/tests/fixtures/js-globals.wasm"
+
     # Record what all of that was built from, so the gate can tell a stale artifact from a
     # current one without needing `cargo component` to find out.
     #

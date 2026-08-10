@@ -11,6 +11,8 @@ msrv = "1.94"
 # list rather than replacing it.
 doc-valid-idents = [
     "QuickJS",
+    "StarlingMonkey",
+    "SpiderMonkey",
     "GritQL",
     "WebAssembly",
     "WIT",
