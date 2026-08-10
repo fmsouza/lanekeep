@@ -107,9 +107,10 @@ When it ships:
 npm install --save-dev lanekeep    # or: cargo install lanekeep-cli
 ```
 
-A single static binary with the JavaScript engine compiled in. **Node.js is not required to
-run lanekeep**, even though rules are written in TypeScript — it is required only to install
-it from npm, where it picks which binary to fetch.
+A single static binary with the JavaScript engine and wasmtime compiled in. **Node.js is not
+required to run lanekeep**, even where rules are written in TypeScript — it is required only to
+install it from npm, where it picks which binary to fetch. A rule may also ship as a WebAssembly
+component, which needs no toolchain at all.
 
 See [`docs/releasing.md`](docs/releasing.md) for how a release is cut.
 
