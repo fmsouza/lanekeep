@@ -640,6 +640,29 @@ msrv:
 bench *ARGS:
     cargo bench --workspace {{ ARGS }}
 
+# Build the JavaScript component `benches/crossings.rs` measures its third arm against.
+#
+# `lanekeep/no-unwrap` compiled from the same TypeScript the QuickJS arm runs, through the flags
+# `_componentize` gives the shipped built-ins — the point of the arm is the engine underneath the
+# rule, so a component built any other way would answer about a component nothing ships.
+#
+# **The artifact is not committed, and that is a size decision rather than a taste one.** It is
+# 13 MB; every crate in this workspace is published, and crates.io refuses a package over 10 MiB,
+# so committing it under `crates/lanekeep-engine/benches/` would make that crate unpublishable to
+# hold a benchmark input. `target/` is gitignored, `just bench` runs without it, and
+# `crossings.rs` prints two arms and names this recipe when it is absent.
+#
+# Outside every gate for the reason `typescript-builtins` is: it needs Node and jco, which
+# `just check` deliberately does not.
+bench-js-component:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p target/bench
+    just _componentize \
+        crates/lanekeep-engine/benches/no-unwrap-entry.ts \
+        target/bench/no-unwrap-js.wasm \
+        --bundle-config crates/lanekeep-engine/benches/no-unwrap.rolldown.mjs
+
 # Review pending insta snapshots interactively.
 snapshot:
     @just _require cargo-insta
