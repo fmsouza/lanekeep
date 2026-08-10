@@ -1428,7 +1428,7 @@ mod tests {
         /// For the component half of `ruleset_hash`, whose tests want a fold over bytes rather
         /// than over rules: the files they name are a few bytes long and are not components at
         /// all, which is what lets them assert on separators, ordering and absence without
-        /// building eleven real artifacts. Going through `load` would refuse every one of them
+        /// building a real artifact apiece. Going through `load` would refuse every one of them
         /// long before the hash was reached.
         fn empty_sandbox(&self) -> Sandbox {
             let root = RuleRoot::new(&self.dir).expect("canonicalizes");
@@ -2640,8 +2640,9 @@ mod tests {
     #[test]
     fn the_ruleset_hash_still_covers_modules_when_a_component_is_present() {
         // The deviation this change makes from its own plan, asserted rather than described.
-        // The plan said the component fold *replaces* the module walk; every rule in this tree
-        // is TypeScript, so that would have taken the whole ruleset out of the cache key.
+        // The plan said the component fold *replaces* the module walk; two built-ins are
+        // components and every other rule in this tree is a module, so that would have taken
+        // almost the whole ruleset out of the cache key.
         let files: &[(&str, &str)] = &[
             ("rule.ts", &rule("local/example")),
             ("lanekeep.config.ts", ""),
