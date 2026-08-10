@@ -54,8 +54,8 @@ pub enum WasmError {
     /// The store hit its memory ceiling.
     ///
     /// Summed across every linear memory in one store rather than measured per memory: a
-    /// store holds one instance per rule, so a per-memory ceiling would let a worker running
-    /// twenty rules use twenty times the budget it was given. See
+    /// store holds one instance per component, so a per-memory ceiling would let a worker
+    /// running twenty components use twenty times the budget it was given. See
     /// `crate::runtime::MemoryCeiling`.
     #[error(
         "rule execution exceeded its {limit_bytes} byte memory ceiling\n  \

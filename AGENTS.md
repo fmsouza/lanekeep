@@ -276,8 +276,11 @@ corpus and disagree, because rayon splits on how the work is going, so this is a
 rather than a bound. `lanekeep-wasm`'s `MEMORY_RESERVATION` was justified on "roughly three
 hundred and fifty instantiations for a run, and it does not grow with the corpus", from workers ×
 rules at fourteen workers; the real figure at ten thousand files times ten rules is 10,380. The
-design was right — one instance per (worker, rule) is what keeps it off files × rules, which would
-be 100,000 — and the *number* it was defended with was thirty times too small. If a cost is per
+design was right — one instance per (worker, component) is what keeps it off files × rules, which
+would be 100,000 — and the *number* it was defended with was thirty times too small. (It was
+written as per (worker, rule) when a component hosted exactly one rule; a component hosting
+several now shares one instance across them, which lowers the figure and leaves the reasoning
+intact.) If a cost is per
 initializer, measure the initializers; `with_min_len` is the lever that makes the count something
 you chose.
 

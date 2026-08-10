@@ -486,14 +486,128 @@ fn one_component_named_twice_for_the_same_rule_is_not_shared() {
     assert_eq!(worker.reports.len(), 2, "and both of them ran");
 }
 
+/// Two *loads* of one component are still one component.
+///
+/// **The assertion that holds `Loaded::identity` to being content rather than object identity**,
+/// and without it the most consequential line of this design is asserted by nothing. Every other
+/// test here builds its slots from a single `Loaded`, so replacing the blake3 of the bytes with a
+/// per-`load` counter leaves all of them green.
+///
+/// The case is not hypothetical and it is not an edge: `lanekeep-config` calls
+/// `ComponentLoader::load` once per rule *reference*, so four built-ins sharing one embedded
+/// component arrive as four separate `Loaded` values over identical bytes. Under object identity
+/// those are four components, and every worker instantiates a 12.34 MiB JavaScript engine four
+/// times — which is exactly the defect this sharing exists to remove, reappearing on precisely
+/// the case it was built for.
+///
+/// One loader rather than two, because that is what config does: the two loads are distinct
+/// because `load` is called twice, not because anything else about them differs.
+#[test]
+fn two_loads_of_one_component_are_one_instance() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+    let loader = ComponentLoader::without_cache();
+    let first = loader
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the fixture loads");
+    let second = loader
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the same bytes, loaded again");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    let one = rules
+        .add("fixture/first", &first, 0, "null")
+        .expect("rule 0, through the first load");
+    let two = rules
+        .add("fixture/second", &second, 1, "null")
+        .expect("rule 1, through the second");
+
+    let mut worker = worker_over(engine, rules);
+    worker
+        .checked("src/a.ts", &[(one, "callee"), (two, "callee")])
+        .expect("checking a file returns");
+
+    assert_eq!(
+        worker.instantiations(),
+        1,
+        "two loads of one artifact are one component; recognizing them takes the bytes, and \
+         object identity would make this two"
+    );
+    assert_eq!(
+        worker.reports,
+        vec![
+            "fixture/first: callee".to_owned(),
+            "fixture/second: callee".to_owned(),
+        ],
+        "and both rules ran, so the count is not one-because-nothing-happened"
+    );
+}
+
+/// Two configurations of one rule each read their own options.
+///
+/// **The property behind the count**, and the reason the split above is keyed on the rule index
+/// rather than on the component alone. `one_component_named_twice_for_the_same_rule_is_not_shared`
+/// asserts that two such slots cost two instances, which does fail against per-component sharing
+/// — but through a proxy. This asserts the fault itself: a guest holds one configuration per rule
+/// index, so two slots sharing an instance would have the second `configure` overwrite the first,
+/// and both would answer with whichever ran last.
+///
+/// **Both rules are configured before either is read, and that ordering is the whole test.**
+/// Reading each one immediately after configuring it passes against the bug — the clobbering has
+/// not happened yet — which is the shape a test of this would take if written the obvious way.
+///
+/// What makes it a determinism failure rather than a wrong answer is that "whichever ran last" is
+/// decided by which slot that worker reached first, and rayon's work-stealing makes that
+/// run-dependent. Two runs over identical input would disagree.
+#[test]
+fn two_configurations_of_one_rule_each_read_their_own_options() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+    let loaded = ComponentLoader::without_cache()
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the fixture loads");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    let alpha = rules
+        .add("fixture/first", &loaded, 0, r#"{"tag":"alpha"}"#)
+        .expect("rule 0, configured one way");
+    let omega = rules
+        .add("fixture/first", &loaded, 0, r#"{"tag":"omega"}"#)
+        .expect("rule 0, configured the other");
+
+    let mut runtime = runtime_over(engine, rules);
+    // Both configured first. `rule` is where `configure` happens, so this is the moment a shared
+    // instance would lose the first rule's options.
+    runtime.rule(alpha).expect("alpha is configured");
+    runtime.rule(omega).expect("omega is configured");
+
+    let first = runtime.metadata(alpha).expect("alpha describes itself");
+    let second = runtime.metadata(omega).expect("omega describes itself");
+
+    assert!(
+        first.card.message.contains("alpha"),
+        "the first rule answered with the second's configuration, so one instance is holding \
+         both — which rule wins would depend on which slot a worker reached first: {}",
+        first.card.message
+    );
+    assert!(
+        second.card.message.contains("omega"),
+        "the second rule lost its own configuration: {}",
+        second.card.message
+    );
+}
+
 /// One worker over a rule set, for the tests above that assemble their own.
 fn worker_over(engine: Arc<WasmEngine>, rules: RuleSet) -> Worker {
-    let limits = Limits::default();
-    let clock = RunClock::start(limits.global_timeout);
     Worker {
-        runtime: WasmRuntime::for_rules(engine, Arc::new(rules), limits, clock),
+        runtime: runtime_over(engine, rules),
         reports: Vec::new(),
     }
+}
+
+/// One runtime over a rule set, for a test that reads a rule rather than running one.
+fn runtime_over(engine: Arc<WasmEngine>, rules: RuleSet) -> WasmRuntime {
+    let limits = Limits::default();
+    let clock = RunClock::start(limits.global_timeout);
+    WasmRuntime::for_rules(engine, Arc::new(rules), limits, clock)
 }
 
 // --- the bound ----------------------------------------------------------------------------

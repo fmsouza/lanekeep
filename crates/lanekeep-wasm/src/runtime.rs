@@ -1039,8 +1039,11 @@ impl RuleSet {
 /// **Hand-written rather than `StoreLimitsBuilder::memory_size`, and the difference is the
 /// point.** wasmtime's own helper applies its ceiling to each linear memory independently: it
 /// compares `desired` against the limit and knows nothing about the other memories in the
-/// store. A store holds one instance per rule, so under that helper a worker running twenty
-/// rules could reach twenty times the budget it was given, and nothing would say so.
+/// store. A store holds one instance per component, so under that helper a worker running
+/// twenty components could reach twenty times the budget it was given, and nothing would say so.
+/// Sharing an instance across a component's rules lowers the count and does not change the
+/// argument: what a per-memory ceiling multiplies by is the number of instances, whatever
+/// decides it.
 ///
 /// What this tracks instead is the running total of every growth this store has been asked
 /// for. Linear memories never shrink and a store never releases an instance, so the total is
@@ -1233,7 +1236,8 @@ impl WasmRuntime {
     /// **The per-worker constructor, and it instantiates nothing.** That is deliberate rather
     /// than incidental: `rayon`'s `map_init` runs its initializer per chunk rather than per
     /// thread, so any instantiation done here would multiply by chunks instead of by workers.
-    /// What it allocates is one `None` per rule.
+    /// What it allocates is one `None` per component instance the set needs, and one
+    /// `configure`-yet flag per rule.
     ///
     /// Infallible, and that is a consequence rather than a convenience: the one thing that
     /// could fail — linking the host world — happens once in [`RuleSet::new`] for the whole

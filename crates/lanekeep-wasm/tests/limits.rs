@@ -498,8 +498,9 @@ fn the_ceiling_applies_at_instantiation_before_a_rule_has_run_a_line() {
 /// **The reason `MemoryCeiling` is hand-written instead of `StoreLimitsBuilder::memory_size`.**
 ///
 /// wasmtime's helper compares each linear memory against the ceiling on its own and knows
-/// nothing about the others in the store. A store holds one instance per rule, so under it a
-/// worker running twenty rules could reach twenty times the budget it was given, silently.
+/// nothing about the others in the store. A store holds one instance per component, so under it
+/// a worker running twenty components could reach twenty times the budget it was given,
+/// silently.
 ///
 /// Three instances of a 1,114,112-byte fixture against a ceiling of two of them plus a page:
 /// the first two fit and the third does not. Under a per-memory ceiling all three would fit,

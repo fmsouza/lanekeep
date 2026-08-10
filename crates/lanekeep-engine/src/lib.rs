@@ -2110,11 +2110,13 @@ struct Worker<'a> {
     failed: Option<RunError>,
     /// This worker's component store, built on first use exactly as the sandbox is.
     ///
-    /// **One store per worker holding one instance per rule — and rayon decides how many workers
-    /// there are.** `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it allocates
-    /// one `None` per rule), which is what makes it safe to build from rayon's initializer,
-    /// since `map_init` runs that per *chunk* rather than per thread. Instantiation then happens
-    /// in `WasmRuntime::rule`, at most once per slot per store.
+    /// **One store per worker holding one instance per component — and rayon decides how many
+    /// workers there are.** `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it
+    /// allocates one `None` per component instance the ruleset needs), which is what makes it
+    /// safe to build from rayon's initializer, since `map_init` runs that per *chunk* rather than
+    /// per thread. Instantiation then happens in `WasmRuntime::rule`, at most once per component
+    /// instance per store — several rules of one component share one, which is the point of the
+    /// rule index the world's exports take.
     ///
     /// That is a bound per `Worker`, not per thread, and the difference is not small: measured
     /// through this engine at ten thousand files times ten rules, **1,038 stores and 10,380
