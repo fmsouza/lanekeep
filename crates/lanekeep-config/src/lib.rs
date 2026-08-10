@@ -899,6 +899,26 @@ fn describe_components(
 /// the `lanekeep/<name>` specifier for a built-in, which is relative and so can never collide
 /// with one.
 ///
+/// # A loose `.wasm` is reachable and is not a supported interface
+///
+/// The file arm below means a `lanekeep.json` naming `./rules/mine.wasm` loads and runs it, and
+/// the containment tests beside it are real. It is nonetheless **not** a documented feature:
+/// `schema/lanekeep.schema.json` describes built-ins and `./path.ts` only, and
+/// `docs/authoring-rust-rules.md` is about the built-ins in this repository rather than about a
+/// project shipping its own component.
+///
+/// That is a decision rather than an oversight, taken because supporting it means promising
+/// something not yet true. A third-party component binds against `crates/lanekeep-wasm/wit`,
+/// whose bytes are a *cache key* and not a stability promise — it changes without ceremony, and
+/// this branch changed it twice — so a rule built against one lanekeep would silently target a
+/// world the next one does not have. Advertising the path before there is a versioned world and
+/// a published authoring story would be committing to an ABI nothing currently keeps.
+///
+/// The arm stays because built-ins and fixtures reach it by the same route, and narrowing it to
+/// built-ins would put a difference between the two sources back into a function whose whole
+/// purpose is that there is not one. Anyone deciding to support it should add the schema entry
+/// and the authoring documentation in that change, and say what the world's stability is.
+///
 /// # Errors
 ///
 /// Returns the diagnostic detail, without a position: the caller knows which rule this was and
@@ -1872,7 +1892,13 @@ mod tests {
         assert_eq!(rule.languages, ["rust"]);
         assert_eq!(rule.card.message, "a fixture");
         assert_eq!(rule.card.remediation, "do the other thing");
+        // All four, and the fixture sets all four to different values on purpose. `raw_rule_from`
+        // assigns them from a plain struct literal, so a dropped or swapped field is not a type
+        // error — asserting two of the four leaves the other two mapped by nothing, and both
+        // mutations pass. This is the shape of the Task 1 finding recurring one layer up.
         assert_eq!(rule.gates.path_matches, ["src/**/*.rs"]);
+        assert_eq!(rule.gates.path_not_matches, ["**/generated/**"]);
+        assert_eq!(rule.gates.file_contains, ["call"]);
         assert_eq!(rule.gates.file_not_contains, ["skip"]);
         assert_eq!(rule.timeout, Some(Duration::from_millis(1500)));
         assert!(
