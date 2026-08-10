@@ -1,9 +1,26 @@
 {
   "name": "lanekeep",
+  "private": true,
   "types": "index.d.ts",
   "typesVersions": {
     "*": {
       "*": ["builtin.d.ts"]
     }
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./paths": "./modules/paths.ts",
+    "./runtime/resolve": "./runtime/resolve.js",
+    "./package.json": "./package.json",
+    "./*": {
+      "types": "./builtin.d.ts"
+    }
+  },
+  "devDependencies": {
+    "@bytecodealliance/componentize-js": "0.22.0",
+    "@bytecodealliance/jco": "1.27.0"
   }
 }

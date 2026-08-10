@@ -385,6 +385,46 @@ mod tests {
         );
     }
 
+    /// The two copies of `paths.ts` are one file, and this is what keeps them that way.
+    ///
+    /// `crates/lanekeep-rules/modules/paths.ts` is what the sandbox serves for a rule that
+    /// writes `import { resolveImport } from 'lanekeep/paths'`.
+    /// `packages/lanekeep/modules/paths.ts` is what a bundler reaches for that same specifier
+    /// when a rule is compiled ahead of time into a component. Both have to exist — the
+    /// sandbox has no bundler and the bundler has no `include_str!` — and both have to be the
+    /// same bytes.
+    ///
+    /// **The drift would not announce itself.** Nothing fails to build, no rule errors: a rule
+    /// would simply resolve `./a` one way under one engine and another way under the other,
+    /// and each answer would be individually plausible. That is the failure the whole module
+    /// exists to prevent, arriving through the back door.
+    ///
+    /// `include_bytes!` rather than a read at run time, so the dependency is a build-time one:
+    /// deleting the copy fails to compile, naming this test, rather than failing inside
+    /// whichever test happened to run first.
+    #[test]
+    fn paths_ships_byte_for_byte_to_the_authoring_package() {
+        const PACKAGED: &[u8] = include_bytes!("../../../packages/lanekeep/modules/paths.ts");
+
+        let embedded = source("paths").unwrap_or_default().as_bytes();
+        assert!(!embedded.is_empty(), "the shared path helpers must resolve");
+
+        let at = embedded
+            .iter()
+            .zip(PACKAGED)
+            .position(|(left, right)| left != right)
+            .unwrap_or_else(|| embedded.len().min(PACKAGED.len()));
+        assert!(
+            embedded == PACKAGED,
+            "crates/lanekeep-rules/modules/paths.ts and packages/lanekeep/modules/paths.ts \
+             have diverged: {} bytes against {}, first differing at byte {at}\n  \
+             they are one file served by two engines — carry the change across, rather than \
+             leaving a rule to resolve its imports differently depending on which one ran it",
+            embedded.len(),
+            PACKAGED.len(),
+        );
+    }
+
     #[test]
     fn listing_rules_does_not_list_modules() {
         // `lanekeep rules` renders an id, a severity and a card for everything it lists.
