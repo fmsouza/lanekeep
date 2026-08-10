@@ -8,7 +8,7 @@
 # against, was changed without rebuilding — run `just rust-rules`.
 crates/lanekeep-rules/components/no-glob-import.wasm 97de6e6b3b54f809a48434c98d17fe608f187d357f21b4f5cd2de1b543d6305d
 crates/lanekeep-rules/components/no-unwrap.wasm 982ebae3748c72ac1aec4a15743848bcc986a331af8a64ded7ee8656d6356631
-crates/lanekeep-wasm/wit/world.wit 1313efba6c7b401ecdb4d0747acd0e71009bf1a34dc2fee19f9409d000cbc1f9
+crates/lanekeep-wasm/wit/world.wit 671ff1d8f01d12a8048eaeb49559e8fe79196c5e76342953d7838ee00fb96e17
 rust-rules/.gitignore 084ea2569f638ccc64f50f72b805897bd927cfa3cee75e81f3081dd598ab0773
 rust-rules/Cargo.lock ccd218c190ce88c0c7e61f2f17cb588d7f50834e196a1a842a94019c1061a3a8
 rust-rules/Cargo.toml 2d23b04aa238ab247ca622adc428ad36619063ef893b714657493b73c6b748c7

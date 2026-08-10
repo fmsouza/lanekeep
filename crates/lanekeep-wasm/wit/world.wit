@@ -108,8 +108,13 @@ interface types {
   ///
   /// Declaring them `u32` would make that structural rather than enforced, and is the stronger
   /// shape. It is not taken here because it would put this record out of step with the
-  /// published type it mirrors, and because it is an ABI change — cheap only while no
-  /// authoring crate binds against this world, which is true today and will not stay true.
+  /// published type it mirrors, and because it is an ABI change. That second reason used to
+  /// carry a window with it — cheap only while no authoring crate binds against this world —
+  /// and the window has closed: `rust-rules/no-unwrap` and `rust-rules/no-glob-import` both
+  /// point `[package.metadata.component.target]` at this directory, and their artifacts are
+  /// committed and hashed. Changing the record now invalidates every one of them and any
+  /// component built outside this repository besides, which inverts what this paragraph used
+  /// to recommend: the option stays, and the host keeps enforcing what the type will not.
   record reduce-location {
     file: string,
     line: option<u32>,
@@ -416,14 +421,16 @@ world rule {
 
   /// Whether this rule has a per-file pass.
   ///
-  /// **Declared and implemented, and not yet probed by anything.** The intent is one probe at
-  /// prepare time, mirroring how the presence of `check` is discovered today by inspecting the
-  /// evaluated module rather than by trusting hand-written config. What the engine does today
-  /// is read `rule.spec.has_reduce`, which `lanekeep-config` fills in from the TypeScript
-  /// module or from JSON — so `WasmRuntime::has_check` and `WasmRuntime::has_reduce` have test
-  /// callers only, and a component is still taken at its config's word. Closing that is the
-  /// same sub-project that gives a component a `metadata` export to describe itself with;
-  /// until then this is a surface that exists rather than a mechanism that runs.
+  /// **Probed once per rule at config load, and the answer is what the engine dispatches on.**
+  /// `lanekeep-config` calls this and `has-reduce` immediately after `metadata`, and folds all
+  /// three into the rule's spec — so a component describes its own passes and is no longer
+  /// taken at its config's word. This mirrors how the presence of `check` is discovered for a
+  /// TypeScript rule, by inspecting the evaluated module rather than by trusting hand-written
+  /// config.
+  ///
+  /// A component that answers `false` here fails config load outright, with the same message a
+  /// TypeScript rule missing its handler gets: a rule that can never report is a misconfigured
+  /// rule, not a quiet no-op.
   export has-check: func() -> bool;
   /// Whether this rule has a cross-file pass, on the same terms.
   ///
