@@ -92,6 +92,20 @@
 //! the whole of the check here rather than a convenience on top of reproducibility, and they
 //! catch staleness in one direction only: blessing re-records without building, so an edited
 //! source blessed without a rebuild leaves a stale binary behind a green gate.
+//!
+//! # And a fourth, for the component built from Go
+//!
+//! `crates/lanekeep-rules/components/go-builtins.wasm` is built by `just go-rules` from
+//! `go-rules/` with TinyGo. A fourth recipe rebuilding a disjoint artifact gets a fourth
+//! manifest and a fourth variable, for the reason the second and third exist — and it makes the
+//! partition of that one components directory a three-way one, which [`GO_ARTIFACTS`] and
+//! [`TYPESCRIPT_ARTIFACTS`] together describe.
+//!
+//! Unlike `componentize-js`, TinyGo's output *is* byte-reproducible here — measured 2026-08-11
+//! on 0.41.1, two builds from an unchanged tree gave one digest — so `AGENTS.md`'s
+//! rebuild-and-diff protocol works on it and these digests are a second opinion rather than the
+//! only one. That holds only with `-no-debug`: without it the artifact carries the build
+//! directory in DWARF, and no two checkouts agree.
 
 // `clippy.toml`'s `allow-expect-in-tests` reaches `#[test]` functions and `#[cfg(test)]`
 // modules and nothing else, so the helpers below — which are neither — need the grant
@@ -174,6 +188,41 @@ const TYPESCRIPT_HEADER: &str = "\
 # rebuilding — run `just typescript-builtins`.
 ";
 
+/// Rewrite the Go built-ins' manifest instead of asserting against it.
+///
+/// Set by `just go-rules` and by nothing else, on the same terms as the three above.
+const GO_BLESS: &str = "LANEKEEP_BLESS_GO_RULES";
+
+/// Where the Go built-ins' digests live, relative to this crate.
+const GO_MANIFEST: &str = "tests/go-component-digests.txt";
+
+/// The header written above the Go built-ins' digests.
+const GO_HEADER: &str = "\
+# What the committed Go built-ins component was built from.
+#
+# Written by `just go-rules`, asserted by `crates/lanekeep-wasm/tests/fixture_currency.rs`, and
+# not to be edited by hand: a value here that no build produced is exactly the claim this file
+# exists to deny. `<path> <blake3>`, sorted, paths relative to the repository root.
+#
+# A line that moves when the artifact did not means a rule's source, the SDK it is built on, the
+# generated bindings or the world it is built against was changed without rebuilding — run
+# `just go-rules`.
+";
+
+/// The artifact `just go-rules` builds, and nothing else builds.
+///
+/// Read with opposite signs by two tests, exactly as [`TYPESCRIPT_ARTIFACTS`] is — its own
+/// manifest's artifact list, and what
+/// [`every_committed_rule_component_is_the_one_its_sources_build`] must leave out of its walk.
+///
+/// **A list of its own rather than an entry in [`TYPESCRIPT_ARTIFACTS`]**, which would compile
+/// and would be wrong in the direction this file is about: that constant is what
+/// [`every_committed_typescript_component_is_the_one_its_sources_build`] records, so filing the
+/// Go artifact there would put it in a manifest `just typescript-builtins` re-blesses — a recipe
+/// that needs Node, knows nothing about TinyGo, and cannot rebuild it. Ownership is per recipe,
+/// and a lane gets a list because it has a recipe.
+const GO_ARTIFACTS: &[&str] = &["crates/lanekeep-rules/components/go-builtins.wasm"];
+
 /// The files under `crates/lanekeep-rules/components/` that `just rust-rules` does not build.
 ///
 /// Read twice, with opposite signs: as the artifact list of
@@ -181,6 +230,11 @@ const TYPESCRIPT_HEADER: &str = "\
 /// [`every_committed_rule_component_is_the_one_its_sources_build`] must leave out of its walk.
 /// One list rather than two, so the partition cannot drift into either an artifact in both
 /// manifests or an artifact in neither.
+///
+/// It is one part of a three-way partition now: [`GO_ARTIFACTS`] is the other subtraction, and
+/// what survives both is what `just rust-rules` builds. A lane added later needs a list here and
+/// a subtraction there, and forgetting the second is caught rather than silent — [`reconcile`]
+/// reports the artifact as "present but was never recorded" against the Rust manifest.
 ///
 /// **Two files rather than one, and the second is not a by-product.** The sidecar map is what
 /// turns a thrown rule's `entry.js:957:16` back into a line in the author's TypeScript, and it is
@@ -307,12 +361,12 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
 /// The generated `src/bindings.rs` stays out without being named, exactly as `target/` does:
 /// each rule crate's own `.gitignore` is read on the way in, and it excludes both.
 ///
-/// [`TYPESCRIPT_ARTIFACTS`] is dropped from the walk, and it is the only thing in any of these
-/// three walks that is named rather than derived. `just rust-rules` does not build it, so
-/// recording it here would put a rebuild of the *TypeScript* component behind a run of the
-/// *Rust* one — see this file's own documentation for why an artifact belongs to exactly one
-/// manifest while an input may be in every one of them. A stray artifact nobody owns is still
-/// caught, by [`reconcile`]'s "present but was never recorded".
+/// [`TYPESCRIPT_ARTIFACTS`] and [`GO_ARTIFACTS`] are dropped from the walk, and they are the
+/// only thing in any of these four walks that is named rather than derived. `just rust-rules`
+/// does not build either, so recording them here would put a rebuild of the *TypeScript* or the
+/// *Go* component behind a run of the *Rust* one — see this file's own documentation for why an
+/// artifact belongs to exactly one manifest while an input may be in every one of them. A stray
+/// artifact nobody owns is still caught, by [`reconcile`]'s "present but was never recorded".
 #[test]
 fn every_committed_rule_component_is_the_one_its_sources_build() {
     let root = repository_root();
@@ -324,7 +378,7 @@ fn every_committed_rule_component_is_the_one_its_sources_build() {
             "crates/lanekeep-rules/components",
         ],
     );
-    for artifact in TYPESCRIPT_ARTIFACTS {
+    for artifact in TYPESCRIPT_ARTIFACTS.iter().chain(GO_ARTIFACTS) {
         assert!(
             computed.remove(*artifact).is_some(),
             "`{artifact}` is not there. It is a shipped component that `just rust-rules` does \
@@ -359,10 +413,10 @@ fn every_committed_rule_component_is_the_one_its_sources_build() {
         "the committed rule components",
         "just rust-rules",
         Some(
-            ". And if it is a component some other recipe builds, it belongs in \
-             `TYPESCRIPT_ARTIFACTS` — recording it here makes `just rust-rules` bless an \
-             artifact it cannot rebuild, and every rebuild by the recipe that can will then \
-             leave this manifest red",
+            ". And if it is a component some other recipe builds, it belongs in that lane's \
+             artifact list — `TYPESCRIPT_ARTIFACTS` or `GO_ARTIFACTS` — rather than here: \
+             recording it here makes `just rust-rules` bless an artifact it cannot rebuild, and \
+             every rebuild by the recipe that can will then leave this manifest red",
         ),
     );
 }
@@ -427,6 +481,64 @@ fn every_committed_typescript_component_is_the_one_its_sources_build() {
         TYPESCRIPT_HEADER,
         "the committed TypeScript built-ins component",
         "just typescript-builtins",
+        None,
+    );
+}
+
+/// The same claim once more, for the shipped component built from Go.
+///
+/// Three roots. `go-rules/` holds everything the component is compiled from — the rules, the SDK
+/// they share, the committed `wit-bindgen-go` bindings, and the module files that pin
+/// `go.bytecodealliance.org/cm` — so it is a directory rather than a list of files, on
+/// `rust-rules/`'s terms and for its reason: everything in it is a build input by construction.
+/// `crates/lanekeep-wasm/wit/` is here because the component is built against it with TinyGo's
+/// `-wit-package`, so a world edit with no rebuild leaves the artifact satisfying an ABI that no
+/// longer exists. And the artifact itself, named through [`GO_ARTIFACTS`] so the one list decides
+/// which manifest owns it.
+///
+/// **The `go-rules/` walk covers its tests too, which over-invalidates a little and is the right
+/// trade.** Editing `go-rules/lanekeep/glob_test.go` demands a `just go-rules`, and that rebuild
+/// is cheap and byte-reproducible — where the alternative, naming the non-test files, is a list
+/// that silently stops covering a new one.
+///
+/// It costs nothing that this walk and the rule components' walk both cover
+/// `crates/lanekeep-wasm/wit/`: an input may be in every manifest, and a change to the world has
+/// to send you to every recipe. It is the *artifact* that belongs to exactly one.
+#[test]
+fn every_committed_go_component_is_the_one_its_sources_build() {
+    let root = repository_root();
+    let mut roots: Vec<&str> = vec!["crates/lanekeep-wasm/wit", "go-rules"];
+    roots.extend_from_slice(GO_ARTIFACTS);
+    let computed = digests(&root, &roots);
+
+    // A named root that is missing already panics inside `digests`, so what is left to check is
+    // the two directories — either could come back empty and agree with an empty manifest.
+    // Properties rather than counts, on the other tests' terms: a rule added or removed is a
+    // change to make deliberately and not a reason for the gate to go red.
+    let artifacts = GO_ARTIFACTS
+        .iter()
+        .filter(|artifact| computed.contains_key(**artifact))
+        .count();
+    let sources = counted(&computed, "go-rules/", "go");
+    assert!(
+        artifacts == GO_ARTIFACTS.len()
+            && sources > 0
+            && computed.contains_key("go-rules/main.go")
+            && computed.contains_key("crates/lanekeep-wasm/wit/world.wit"),
+        "the walk found {artifacts} components and {sources} Go sources, and {} the component \
+         entry and {} the world: it is no longer looking where this component is built from, and \
+         has been asserting nothing",
+        found(&computed, "go-rules/main.go"),
+        found(&computed, "crates/lanekeep-wasm/wit/world.wit"),
+    );
+
+    reconcile(
+        &computed,
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join(GO_MANIFEST),
+        GO_BLESS,
+        GO_HEADER,
+        "the committed Go built-ins component",
+        "just go-rules",
         None,
     );
 }
@@ -559,12 +671,18 @@ fn digests(base: &Path, roots: &[&str]) -> BTreeMap<String, String> {
 
 /// Descend a directory, recording each file that survives the exclusions in force.
 ///
-/// A cargo package contributes its own `.gitignore` on the way in and those apply for its whole
+/// A package contributes its own `.gitignore` on the way in and those apply for its whole
 /// subtree, which is how `target/` and the generated `src/bindings.rs` stay out without this
 /// function naming either of them.
+///
+/// A package is anything with a manifest at its root — `Cargo.toml` or `go.mod`. The second is
+/// not symmetry for its own sake: `go-rules/.gitignore` names the artifacts a person produces by
+/// running `tinygo build -o` at the module root by hand, and a walk that hashed one of those
+/// would report it as "present but was never recorded" — a red gate, on a machine that happens
+/// to have a stray file, naming a manifest that is perfectly current.
 fn walk(dir: &Path, base: &Path, excluded: &[PathBuf], found: &mut BTreeMap<String, String>) {
     let mut excluded = excluded.to_vec();
-    if dir.join("Cargo.toml").is_file() {
+    if dir.join("Cargo.toml").is_file() || dir.join("go.mod").is_file() {
         excluded.extend(exclusions(dir));
     }
 
@@ -582,7 +700,7 @@ fn walk(dir: &Path, base: &Path, excluded: &[PathBuf], found: &mut BTreeMap<Stri
     }
 }
 
-/// What a package's `.gitignore` keeps out, as absolute paths.
+/// What a package's `.gitignore` keeps out, as absolute paths — for either kind of manifest.
 ///
 /// Read rather than hard-coded so the skip list cannot drift from git's. The parser understands
 /// anchored literal paths and nothing else, and says so loudly when it meets anything else: a

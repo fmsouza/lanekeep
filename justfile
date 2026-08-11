@@ -422,6 +422,89 @@ typescript-builtins:
     LANEKEEP_BLESS_TYPESCRIPT_BUILTINS=1 cargo test --quiet -p lanekeep-wasm \
         --test fixture_currency -- --exact every_committed_typescript_component_is_the_one_its_sources_build
 
+# Rebuild the committed Go built-ins component from go-rules/.
+#
+# The fourth recipe that rewrites a committed artifact, and outside every gate for the reason the
+# other three are: it needs a toolchain the gate deliberately does not — TinyGo here — and the
+# artifact it produces is committed and read with `include_bytes!`. `just check` passes on a
+# machine with neither TinyGo nor Go.
+#
+# **One component for every Go rule, and not one each**, which `go-rules/main.go` explains: the
+# rules are listed there, and the index a rule sits at in that slice is what `lanekeep_rules`
+# dispatches on.
+#
+# # The build flags, and which of them are not preferences
+#
+# `-target=wasm-unknown` is the requirement `rust-rules` states as `--target
+# wasm32-unknown-unknown`, for the same reason: it is the only TinyGo target whose components
+# import nothing but the declared world. `wasip2` imports a clock, a filesystem and randomness —
+# the capabilities the sandbox exists to withhold — and `crates/lanekeep-wasm/tests/world_shape.rs`
+# is what would catch a rebuild on it.
+#
+# **`-no-debug` is a correctness requirement rather than a size lever.** Without it TinyGo writes
+# the build directory into the artifact's DWARF, so every checkout produces different bytes for
+# identical source — and a component's bytes are a `ruleset_hash` input, so two people on one
+# commit would compute two cache keys. Measured here on TinyGo 0.41.1: with the flag, 9,291 bytes
+# and no absolute path anywhere in them; without it, 307,655 bytes carrying this worktree's path
+# eleven times.
+#
+# No `-opt` flag, which is also deliberate: `-opt=z` is this target's default, and `-opt=2` and
+# `-opt=1` both produce a *larger* artifact.
+go-rules:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _require tinygo
+    just _require go
+    root="$(pwd)"
+
+    # `gofmt` and `go vet` before the build, on the reasoning the `rust-rules` recipe sets out at
+    # length: this recipe is the only path a Go artifact reaches a commit by, and the digest
+    # manifest is what forces the recipe to be run, so checks placed ahead of the recording sit
+    # on the only route to a green tree. Recording first would make them skippable by ignoring
+    # one exit code.
+    #
+    # `go test` as well, and it is the only place these run. `just test-go` operates in the
+    # *root* module, which excludes a nested one by construction — `go list ./...` there reports
+    # only the launcher — so `go-rules/lanekeep`'s own tests are reachable from nowhere else
+    # today.
+    #
+    # `go build ./...` is deliberately not here: `main.go` is a `package main` whose imports are
+    # `//go:wasmimport` declarations with no body, so it type-checks everywhere and *links* only
+    # on a wasm target. On the host it fails with `relocation target ... not defined`, which is
+    # the toolchain working correctly and would read like a broken build. `go vet` and `go test`
+    # compile every package here without linking that one, which is the coverage there is.
+    echo "checking go-rules/"
+    unformatted="$(cd go-rules && gofmt -l .)"
+    if [ -n "${unformatted}" ]; then
+        echo "error: not gofmt'd:" >&2
+        echo "${unformatted}" >&2
+        exit 1
+    fi
+    (cd go-rules && go vet ./...)
+    (cd go-rules && go test ./...)
+
+    echo "building go-builtins"
+    (cd go-rules && tinygo build \
+        -target=wasm-unknown \
+        -wit-package "${root}/crates/lanekeep-wasm/wit" \
+        -wit-world rule \
+        -panic=trap \
+        -no-debug \
+        -o "${root}/crates/lanekeep-rules/components/go-builtins.wasm" \
+        .)
+
+    # Record what it was built from, so the gate can tell a stale component from a current one
+    # without needing TinyGo to find out. A manifest and a variable of its own rather than any of
+    # the three that already exist — sharing one would mean this recipe re-recording artifacts it
+    # did not build, and the recipe that did build them re-recording this one, which is how a
+    # stale artifact gets blessed by somebody doing the right thing elsewhere.
+    #
+    # `cargo test` rather than `cargo nextest run`, for the reason the other three give: what is
+    # wanted is the side effect and not the verdict. `--exact` keeps this to the one test.
+    echo "recording Go component digests"
+    LANEKEEP_BLESS_GO_RULES=1 cargo test --quiet -p lanekeep-wasm \
+        --test fixture_currency -- --exact every_committed_go_component_is_the_one_its_sources_build
+
 # Test rust-rules/: its own workspace, so `cargo test --workspace` at the root does not reach
 # it.
 #
