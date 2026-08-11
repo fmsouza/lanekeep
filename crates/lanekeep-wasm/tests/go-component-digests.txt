@@ -7,7 +7,7 @@
 # A line that moves when the artifact did not means a rule's source, the SDK it is built on, the
 # generated bindings or the world it is built against was changed without rebuilding — run
 # `just go-rules`.
-crates/lanekeep-rules/components/go-builtins.wasm eae5c62e3e0edfed2ec0e56e9fa6bf998fcab1bd1c1cf385d2fe15da0a902c2e
+crates/lanekeep-rules/components/go-builtins.wasm 47fb82991709289309192ba338ea96402d153e04a3275b5d2a9618a9ea2d9e68
 crates/lanekeep-wasm/wit/world.wit 290f483be47beb5e9df599e78e2d04572af8d4586459d361bb0741714ec975ae
 go-rules/.gitignore 02af855e1226375a64521b31bd8994a45c665fbe93ea55dfdb4b38f062d98c36
 go-rules/go.mod 25d0033f110d1e59cc9e59ecc9b2bda4102adaa59f0414844df1d8e17c889e4c
@@ -30,5 +30,6 @@ go-rules/lanekeep/handlers_test.go 7bb3a3befa2c602f49decbd3c6926122e9c11839cdaf7
 go-rules/lanekeep/rand.go 037a03353e2fb753d79e385db39aea4d81c3117792480602fc05fa333e2bc067
 go-rules/lanekeep/rand_host.go 26e98c49f8c461e3bd96546bdd8ceb727007b700bf7e7eb5c35f98bae8bb4221
 go-rules/lanekeep/realloc.go fdca8a8bb650063e8b5b946af4b4dc677e9f149ceac508dc359327dcaf0e017a
-go-rules/main.go 211b36ab19a686660c874794d612eca917bc362985b7758a0a6bfd05807cce91
+go-rules/main.go 1de18cdedbd56998774201271382ce33f157a534285395c8cbf062d4cdff1f40
+go-rules/rules/nocontextinstruct/rule.go d3e1bd321d94f601b7e1994fe5d4fbdb14211f4cb5079870bb6456c90a15e4a0
 go-rules/rules/nopackageinit/rule.go 0d068cdae21e56e85eefc389ac028e56bd37852ccffb5f87fad8e26fde2ff7b0

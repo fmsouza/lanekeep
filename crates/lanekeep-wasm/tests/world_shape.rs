@@ -65,14 +65,56 @@ const FILE: &str = "src/lib.ts";
 /// nothing else.
 const INIT_TEXT: &str = "init";
 
-/// The text the stub reports for every node but 0.
+/// The text the stub reports for every node the table below does not name.
 ///
-/// **Two constants rather than one, and the second is what makes the first mean something.** A
+/// **Several constants rather than one, and the others are what make this one mean something.** A
 /// stub answering `init` for every node cannot tell a rule that fires on `func init()` from a
 /// rule that fires on every function declaration it is handed — both report, and reporting is
-/// what a working rule looks like. Keyed on the handle, the same test can drive the rule twice
-/// and watch it decline once.
+/// what a working rule looks like. Keyed on the handle, one test can drive a rule several times
+/// and watch it decline all but once.
 const OTHER_TEXT: &str = "Register";
+
+/// The handles the stub answers specially, and what each one stands for.
+///
+/// A handle is meaningless on its own — the arena the real host reads is not here — so these are
+/// simply the addresses at which this stub keeps its answers. What each one is *for* is the
+/// branch of a guest it lets a test reach:
+///
+/// | handle | `text` | `binding-kind` | the branch it exercises |
+/// | --- | --- | --- | --- |
+/// | 0 | `init` | const | `no-package-init` reports |
+/// | 2 | `Context` | const | `no-context-in-struct`'s type name matches |
+/// | 3 | `context` | **import** | its qualifier is an imported package: reports |
+/// | 4 | `context` | const | a local name that reads `context`: declines |
+/// | 5 | `context` | **none** | a qualifier that resolves to nothing: declines |
+/// | any other | `Register` | const | neither rule fires |
+///
+/// Handle 5 is not symmetry. `binding-kind` is an `option<binding-kind>`, and `import` is the
+/// **first** case of that enum — so a guest reading the option's value without first asking
+/// whether it has one gets `import` for a name that resolves to no binding at all, and reports a
+/// type that merely reads like the standard library's. That is the same shape as the `if (!node)`
+/// bug that cost `no-unwrap` its `#[test]` exemption, and it is invisible without a `none` here.
+const NODE_INIT: u32 = 0;
+const NODE_CONTEXT_TYPE: u32 = 2;
+const NODE_IMPORTED_PKG: u32 = 3;
+const NODE_LOCAL_PKG: u32 = 4;
+const NODE_UNRESOLVED_PKG: u32 = 5;
+
+/// The text a `context.Context` field's type name carries.
+const CONTEXT_TYPE_TEXT: &str = "Context";
+
+/// The text its qualifier carries, whatever the qualifier turns out to resolve to.
+const CONTEXT_PKG_TEXT: &str = "context";
+
+/// Where each Go built-in sits in `go-rules/main.go`'s table.
+///
+/// **Alphabetical, and that is a constraint rather than a habit.** `crates/lanekeep-rules`'
+/// `COMPONENT_RULES` is sorted by rule name, and the index in each of its rows is what this
+/// component is then dispatched on — so a table in a different order here means a config naming
+/// one rule running the other, with both answering perfectly well and nothing to notice. Adding a
+/// third Go rule renumbers whichever of these it sorts before.
+const NO_CONTEXT_IN_STRUCT: u32 = 0;
+const NO_PACKAGE_INIT: u32 = 1;
 
 /// The store's data: the table the contexts live in, and what the guest reported through
 /// them.
@@ -102,17 +144,23 @@ impl HostCheckContext for StubHost {
         Ok(Some("program".to_owned()))
     }
 
-    /// [`INIT_TEXT`] at node 0 and [`OTHER_TEXT`] everywhere else — still constants, and still
-    /// nothing read out of the context, but two of them, so a guest that branches on the text can
-    /// be watched taking each branch. See [`OTHER_TEXT`] for why one would not do.
+    /// A constant per handle — still constants, and still nothing read out of the context, but
+    /// several of them, so a guest that branches on the text can be watched taking each branch.
+    /// The table is in [`NODE_INIT`]'s doc comment.
     ///
     /// The fixture this file was written for never calls `text` at all — see
     /// [`the_imported_instance_declares_only_what_the_guest_calls`], which names the three
-    /// `check-context` methods it does call — so nothing but
-    /// [`the_go_builtins_component_answers_the_world_it_targets`] can observe either.
+    /// `check-context` methods it does call — so nothing but the two tests over the shipped Go
+    /// component can observe any of them.
     fn text(&mut self, _: Resource<CheckContext>, node: u32) -> wasmtime::Result<Option<String>> {
         Ok(Some(
-            if node == 0 { INIT_TEXT } else { OTHER_TEXT }.to_owned(),
+            match node {
+                NODE_INIT => INIT_TEXT,
+                NODE_CONTEXT_TYPE => CONTEXT_TYPE_TEXT,
+                NODE_IMPORTED_PKG | NODE_LOCAL_PKG | NODE_UNRESOLVED_PKG => CONTEXT_PKG_TEXT,
+                _ => OTHER_TEXT,
+            }
+            .to_owned(),
         ))
     }
 
@@ -163,12 +211,21 @@ impl HostCheckContext for StubHost {
         Ok(false)
     }
 
+    /// One handle resolves to an import, one to nothing at all, and everything else to a `const`.
+    ///
+    /// The `None` arm is the one worth having: it is the answer for a name that resolves to no
+    /// binding, and it is what tells a guest that reads this option's *value* from one that asks
+    /// whether it has one. See [`NODE_INIT`]'s table.
     fn binding_kind(
         &mut self,
         _: Resource<CheckContext>,
-        _: u32,
+        node: u32,
     ) -> wasmtime::Result<Option<BindingKind>> {
-        Ok(Some(BindingKind::Const))
+        Ok(match node {
+            NODE_IMPORTED_PKG => Some(BindingKind::Import),
+            NODE_UNRESOLVED_PKG => None,
+            _ => Some(BindingKind::Const),
+        })
     }
 
     fn is_shadowed(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<bool> {
@@ -779,18 +836,22 @@ fn the_go_builtins_component_answers_the_world_it_targets() {
 
     assert_eq!(
         rule.call_rules(&mut store).expect("rules returns"),
-        vec!["lanekeep/no-package-init".to_owned()],
+        vec![
+            "lanekeep/no-context-in-struct".to_owned(),
+            "lanekeep/no-package-init".to_owned(),
+        ],
         "the ids `go-rules/main.go`'s table declares, in the order it declares them — which is \
-         the order every other export's index is read against"
+         the order every other export's index is read against, and which is alphabetical because \
+         `crates/lanekeep-rules`' own tables are"
     );
     assert!(
-        rule.call_has_check(&mut store, 0)
+        rule.call_has_check(&mut store, NO_PACKAGE_INIT)
             .expect("has-check returns"),
-        "the rule at index 0 has a per-file pass"
+        "the rule at this index has a per-file pass"
     );
     assert!(
         !rule
-            .call_has_reduce(&mut store, 0)
+            .call_has_reduce(&mut store, NO_PACKAGE_INIT)
             .expect("has-reduce returns"),
         "and no cross-file one: every export is mandatory because a WIT world has no optional \
          ones, which is not the same as every pass being present"
@@ -802,7 +863,9 @@ fn the_go_builtins_component_answers_the_world_it_targets() {
     // Go guest is a null data pointer with a zero length, and it crosses the canonical ABI at
     // every one of these fields — so if that lifted wrong, it would do so in `metadata`, once,
     // before any file is read, and take the whole run with it.
-    let metadata = rule.call_metadata(&mut store, 0).expect("metadata returns");
+    let metadata = rule
+        .call_metadata(&mut store, NO_PACKAGE_INIT)
+        .expect("metadata returns");
     assert_eq!(metadata.id, "lanekeep/no-package-init");
     assert_eq!(metadata.languages, vec!["go".to_owned()]);
     assert_eq!(metadata.gates.file_contains, vec!["init".to_owned()]);
@@ -817,7 +880,7 @@ fn the_go_builtins_component_answers_the_world_it_targets() {
 
     // `null` is what the world sends a rule named with no options, and every rule is configured
     // once before any check. This one has none and accepts anyway; see `takesNoOptions`.
-    rule.call_configure(&mut store, 0, "null")
+    rule.call_configure(&mut store, NO_PACKAGE_INIT, "null")
         .expect("configure returns")
         .expect("a rule with no options accepts the world's `null`");
 
@@ -836,7 +899,7 @@ fn the_go_builtins_component_answers_the_world_it_targets() {
         .push(context())
         .expect("the resource table accepts a check context");
     let borrow = Resource::new_borrow(check_ctx.rep());
-    rule.call_check(&mut store, 0, borrow, &captures(0))
+    rule.call_check(&mut store, NO_PACKAGE_INIT, borrow, &captures(NODE_INIT))
         .expect("check returns")
         .expect("the guest does not report a failure");
 
@@ -858,7 +921,7 @@ fn the_go_builtins_component_answers_the_world_it_targets() {
     // The only thing that differs between the two calls is which node the `name` capture binds,
     // and so which of the stub's two texts the guest reads.
     let borrow = Resource::new_borrow(check_ctx.rep());
-    rule.call_check(&mut store, 0, borrow, &captures(1))
+    rule.call_check(&mut store, NO_PACKAGE_INIT, borrow, &captures(1))
         .expect("check returns")
         .expect("the guest does not report a failure");
 
@@ -877,7 +940,11 @@ fn the_go_builtins_component_answers_the_world_it_targets() {
         .push(ReduceContext::new(Vec::new(), Vec::new()))
         .expect("the resource table accepts a reduce context");
     let refused = rule
-        .call_reduce(&mut store, 0, Resource::new_borrow(reduce_ctx.rep()))
+        .call_reduce(
+            &mut store,
+            NO_PACKAGE_INIT,
+            Resource::new_borrow(reduce_ctx.rep()),
+        )
         .expect("reduce returns")
         .expect_err("this rule has no cross-file pass");
     assert!(
@@ -900,6 +967,142 @@ fn captures(node: u32) -> Vec<types::MatchEntry> {
         types::MatchEntry {
             name: "func".to_owned(),
             node: 7,
+        },
+    ]
+}
+
+/// And the second rule the same component hosts, driven the same way.
+///
+/// A test of its own rather than more assertions in the one above, because what makes the pair
+/// worth having is that **both are reached through the same instance by index**: the rule that
+/// answers is decided by a number, and a component whose table drifted out of alphabetical order
+/// would answer every call perfectly while answering for the wrong rule. `rules` is asserted
+/// there; this is the other end of the same claim, that index 0 is the rule `rules` named at
+/// position 0.
+///
+/// What the guest reads here is three host answers per match — the type name's text, the
+/// qualifier's text, and the qualifier's binding kind — so the four calls below walk the rule's
+/// four outcomes. The `none` binding kind is the one that would be missed by eye; see
+/// [`NODE_INIT`]'s table for why an option whose first enum case is `import` is a trap rather
+/// than a formality.
+///
+/// **This is not the fidelity suite.** Every value here is a constant and no Go file is parsed;
+/// `crates/lanekeep-rules/tests/no_context_in_struct.rs` is where the rule meets the real grammar
+/// and the real resolver. What this can say, and that file cannot until the built-in is swapped
+/// over, is that the shipped artifact hosts a working second rule at all.
+#[test]
+fn the_go_builtins_component_runs_its_second_rule_by_index() {
+    let (engine, component, linker) = linked_to(GO_BUILTINS);
+    let mut store = Store::new(&engine, StubHost::default());
+    store.set_epoch_deadline(u64::MAX / 2);
+    let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
+
+    let metadata = rule
+        .call_metadata(&mut store, NO_CONTEXT_IN_STRUCT)
+        .expect("metadata returns");
+    assert_eq!(metadata.id, "lanekeep/no-context-in-struct");
+    assert_eq!(metadata.languages, vec!["go".to_owned()]);
+    assert_eq!(metadata.gates.file_contains, vec!["context".to_owned()]);
+    assert!(
+        rule.call_has_check(&mut store, NO_CONTEXT_IN_STRUCT)
+            .expect("has-check returns")
+            && !rule
+                .call_has_reduce(&mut store, NO_CONTEXT_IN_STRUCT)
+                .expect("has-reduce returns"),
+        "a per-file rule, like its neighbor"
+    );
+
+    let check_ctx = store
+        .data_mut()
+        .table
+        .push(context())
+        .expect("the resource table accepts a check context");
+
+    // A `context.Context` field whose qualifier is an imported package: the one case that reports.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(
+        &mut store,
+        NO_CONTEXT_IN_STRUCT,
+        borrow,
+        &field(NODE_IMPORTED_PKG, NODE_CONTEXT_TYPE),
+    )
+    .expect("check returns")
+    .expect("the guest does not report a failure");
+
+    assert_eq!(
+        store.data().reported,
+        vec![
+            "check node=9 message=a context.Context stored in a struct outlives the call it was \
+             scoped to, so cancelling one request can cancel unrelated work fix=none"
+                .to_owned()
+        ],
+        "reported at the node the `field` capture bound, not at either of the two it read"
+    );
+
+    // The same field, with a qualifier that is a local `const` rather than an import. A rule that
+    // skipped the binding kind reports here, and the report would look exactly like the one above.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(
+        &mut store,
+        NO_CONTEXT_IN_STRUCT,
+        borrow,
+        &field(NODE_LOCAL_PKG, NODE_CONTEXT_TYPE),
+    )
+    .expect("check returns")
+    .expect("the guest does not report a failure");
+
+    // And with a qualifier that resolves to nothing at all. `import` is the first case of
+    // `binding-kind`, so a guest reading the option's value without asking whether it has one
+    // gets `import` here and reports — silently, and only ever by adding violations.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(
+        &mut store,
+        NO_CONTEXT_IN_STRUCT,
+        borrow,
+        &field(NODE_UNRESOLVED_PKG, NODE_CONTEXT_TYPE),
+    )
+    .expect("check returns")
+    .expect("the guest does not report a failure");
+
+    // And an imported qualifier carrying some other type entirely.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(
+        &mut store,
+        NO_CONTEXT_IN_STRUCT,
+        borrow,
+        &field(NODE_IMPORTED_PKG, 6),
+    )
+    .expect("check returns")
+    .expect("the guest does not report a failure");
+
+    assert_eq!(
+        store.data().reported.len(),
+        1,
+        "only the imported `context.Context` is a violation: {:?}",
+        store.data().reported
+    );
+}
+
+/// One match of this rule's query, with the qualifier at `pkg` and the type name at `name`.
+///
+/// The field declaration is always node 9, so what varies between calls is only which of the
+/// stub's answers the guest reads for the two nodes it inspects.
+///
+/// Both of the rule's query patterns bind exactly these three captures — that is what lets the
+/// bare and pointer forms share one handler — so one shape here covers both.
+fn field(pkg: u32, name: u32) -> Vec<types::MatchEntry> {
+    vec![
+        types::MatchEntry {
+            name: "pkg".to_owned(),
+            node: pkg,
+        },
+        types::MatchEntry {
+            name: "name".to_owned(),
+            node: name,
+        },
+        types::MatchEntry {
+            name: "field".to_owned(),
+            node: 9,
         },
     ]
 }

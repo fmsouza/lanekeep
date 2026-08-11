@@ -31,6 +31,7 @@ import (
 	"github.com/fmsouza/lanekeep/go-rules/internal/lanekeep/host/rule"
 	"github.com/fmsouza/lanekeep/go-rules/internal/lanekeep/host/types"
 	"github.com/fmsouza/lanekeep/go-rules/lanekeep"
+	"github.com/fmsouza/lanekeep/go-rules/rules/nocontextinstruct"
 	"github.com/fmsouza/lanekeep/go-rules/rules/nopackageinit"
 	"go.bytecodealliance.org/cm"
 )
@@ -70,9 +71,21 @@ type hosted struct {
 
 // ruleset is every rule this component hosts, in the order `rules` reports them.
 //
-// Appending is the safe edit; inserting renumbers every rule after the insertion point, and the
-// index is what `crates/lanekeep-rules`' `COMPONENT_RULES` dispatches on.
+// **Ordered by id, and that is a constraint rather than a tidy habit.**
+// `crates/lanekeep-rules`' `COMPONENT_RULES` is sorted by rule name, and the index in each of its
+// rows is what this component is dispatched on — so a table in any other order means a config
+// naming one rule running the other, with both components answering perfectly well and nothing
+// anywhere to notice. `crates/lanekeep-wasm/tests/world_shape.rs` asserts the order this reports.
+//
+// A rule that sorts into the middle therefore renumbers every rule after it, and the rows in
+// `COMPONENT_RULES` have to move with it in the same change.
 var ruleset = []hosted{
+	{
+		id:        nocontextinstruct.ID,
+		metadata:  nocontextinstruct.Metadata,
+		configure: takesNoOptions,
+		Handlers:  nocontextinstruct.Handlers(),
+	},
 	{
 		id:        nopackageinit.ID,
 		metadata:  nopackageinit.Metadata,
