@@ -715,10 +715,10 @@ fn reconcile(
 /// Every file the committed artifacts are built from, and the artifacts themselves.
 ///
 /// `roots` are relative to `base`, and `base` is what the recorded paths are relative to. For
-/// the fixtures that is this crate, whose roots are `wit/` — fourteen of the fifteen fixtures
-/// name it as their component target — and `tests/fixtures/`, which holds both the guest crates and
-/// their build output. The `.wasm` files need no separate pass; they sit in a root as ordinary
-/// files.
+/// the fixtures that is this crate, whose roots are `wit/` — every committed fixture but `spike`
+/// names it as their component target, `spike` having a `wit/spike.wit` of its own — and
+/// `tests/fixtures/`, which holds both the guest crates and their build output. The `.wasm` files
+/// need no separate pass; they sit in a root as ordinary files.
 /// A root may also name a single file, which is how the JavaScript fixture's two build inputs
 /// are covered without dragging their directory in: `packages/lanekeep/runtime/` also holds
 /// `resolve.js` and two `.test.js` files, none of which that artifact is built from, and

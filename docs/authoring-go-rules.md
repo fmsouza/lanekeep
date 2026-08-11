@@ -188,10 +188,12 @@ validates a TypeScript rule's. `configure` is handed the rule's options as a JSO
 *refuse* a configuration rather than to fail. `check` and `reduce` return a plain Go `error`,
 which the entry converts into the world's `result<_, rule-error>`.
 
-[`go-rules/lanekeep`](../go-rules/lanekeep) is the SDK, and it is four things:
-`Capture(m, "name") (Node, bool)`, `GlobMatches(pattern, value)`, `ResetRand()`, and the
-`cabi_realloc` export. The first two mirror `rust-rules/lanekeep-rule`; the last two are
-TinyGo's tax and exist so no rule author meets either as an error message.
+[`go-rules/lanekeep`](../go-rules/lanekeep) is the SDK, and it is small: `NewHandlers` and the
+`Handlers` it returns, which is how a rule declares itself; `Capture(m, "name") (Node, bool)`
+with the `Match` and `Node` aliases its signature needs; `GlobMatches(pattern, value)`;
+`ResetRand()`; and the `cabi_realloc` export no rule ever names. `Capture` and `GlobMatches`
+mirror `rust-rules/lanekeep-rule`, which is the whole of that SDK; the rest is TinyGo's tax and
+exists so no rule author meets any of it as an error message.
 
 ## Four more things that will bite
 
@@ -258,12 +260,24 @@ in for enforcement of a hazard whose failure mode is a rule passing every test a
 and misbehaving only under a real corpus. `ResetRand` stays exported only because the fixture
 that proves the reset works has to drive it directly.
 
-`crates/lanekeep-wasm/tests/go_map_order.rs` is that proof: it drives
-`go-rules/fixtures/maporder/` — a component that is not a rule and ships to nobody — six times
-through one production `WasmRuntime` instance, asserting one distinct message and
-`instantiations() == 1`. Its sibling test asserts the fixture's order *moves* with the generator
-position, because a fixture whose observable is constant would make the first test green over a
+`crates/lanekeep-wasm/tests/go_map_order.rs` is that proof. It drives
+`go-rules/fixtures/maporder/` — a component that is not a rule and ships to nobody — through one
+production `WasmRuntime` instance, and there is a test per host-called path: each of `metadata`,
+`configure`, `check` and `reduce` reports the order it visited a map in, and each is asserted to
+hold still however much ran before it. Deleting `ResetRand()` from any one of `Handlers`' four
+methods fails exactly one of them, which is measured rather than asserted — that file's header
+has the table. A fifth test asserts the fixture's order *moves* with the generator position,
+because a fixture whose observable is constant would make the other four green over a
 `ResetRand` that does nothing.
+
+Two shapes in there are worth knowing before writing a probe of your own. `configure` runs once
+per (rule, instance), so on a component hosting one rule it is always the first call on a fresh
+instance and its reset cannot be observed — the fixture hosts two rules so that the second can be
+configured after the first has worked the shared instance, which is what a real run does. And all
+four paths reset and then spend the same number of draws, so *any* observation taken behind
+another one of them sits at that call's position rather than at its own: the probes for `metadata`
+and `reduce` take their readings back-to-back, and the versions that put a `check` in between were
+green over the mutation they were written for.
 
 ## Building, testing, committing
 
