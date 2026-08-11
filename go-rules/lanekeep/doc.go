@@ -50,10 +50,15 @@
 //
 // # The reset is structural, not a rule an author follows
 //
-// Nothing here asks an author to remember anything. A rule declares its passes through
-// [NewHandlers], whose [Handlers.Check] and [Handlers.Reduce] reset before delegating, and the
-// declared handler is unreachable except through them — the fields are unexported and there is
-// no other constructor. So the reset happens on every invocation by construction.
+// Nothing here asks an author to remember anything. A rule declares everything the host calls on
+// it through [NewHandlers], whose four methods reset before delegating, and the declared funcs
+// are unreachable except through them — the fields are unexported and there is no other
+// constructor. So the reset happens on every invocation by construction.
+//
+// All four, not only the two passes: `metadata` and `configure` were bare funcs on the component
+// entry until a review asked why, and the answer — "because neither of the rules that ship
+// iterates a map" — was a property of those rules rather than of the dispatch. A `configure` that
+// decodes options into a `map[string]any` and ranges it is the ordinary way to write one.
 //
 // An earlier version of this package did ask, in a section here headed "what a rule author has
 // to remember". That was documentation standing in for enforcement of exactly the hazard the
@@ -66,7 +71,10 @@
 //		...
 //	}
 //
-//	var rule = lanekeep.NewHandlers(check, nil)  // the reset comes with it
+//	// the reset comes with it, on every one of the four
+//	var rule = lanekeep.NewHandlers[types.RuleMetadata, types.CheckContext, types.ReduceContext](
+//		Metadata, nil, check, nil,
+//	)
 //
 // [ResetRand] stays exported because the fixtures that prove it need to drive it directly, not
 // because a rule should call it.

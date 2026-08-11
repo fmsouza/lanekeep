@@ -46,27 +46,28 @@ type (
 	configureResult = cm.Result[string, struct{}, string]
 )
 
-// hosted is one rule as this component holds it: what it says it is, how it takes options, and
-// its two passes.
+// hosted is one rule as this component holds it: the id a config names it by, and everything the
+// host calls on it.
 //
-// **The passes are embedded rather than stored as funcs**, so that `ruleset[i].Check(...)` is a
-// call on [lanekeep.Handlers] and there is no second, reset-free way to reach the handler
-// underneath. That wrapper resets TinyGo's map-iteration generators before delegating; a
-// dispatch that called a rule's own function directly would reopen a determinism hole that no
-// test in this repository would catch, because nothing about a rule's output looks wrong when
-// map order varies. See the `lanekeep` package documentation.
+// **Every callable is embedded rather than stored as a func**, so that `ruleset[i].Metadata()`,
+// `.Configure(...)`, `.Check(...)` and `.Reduce(...)` are all calls on [lanekeep.Handlers] and
+// there is no second, reset-free way to reach the rule's own function underneath. That wrapper
+// resets TinyGo's map-iteration generators before delegating; a dispatch that called a rule's
+// function directly would reopen a determinism hole that no test in this repository would catch,
+// because nothing about a rule's output looks wrong when map order varies. See the `lanekeep`
+// package documentation.
+//
+// It held `metadata` and `configure` as bare funcs until a review asked why they were exempt.
+// Nothing was wrong with either rule that ships — both build their metadata from package-level
+// constants — but the answer was "because these two do not iterate a map *today*", which is a
+// property of the current rules rather than of the dispatch. `id` stays a plain field because it
+// is data rather than a call: `rules` reads the slice built from it once, at initialization.
 type hosted struct {
 	// id is what a config names and what `rules` enumerates. Its position in [ruleset] is the
 	// index every other export takes.
 	id string
 
-	// metadata is what this rule is, read once at prepare time and after `configure`.
-	metadata func() types.RuleMetadata
-
-	// configure hands the rule its options as JSON, or `null` when it was named with none.
-	configure func(optionsJSON string) error
-
-	lanekeep.Handlers[types.CheckContext, types.ReduceContext]
+	lanekeep.Handlers[types.RuleMetadata, types.CheckContext, types.ReduceContext]
 }
 
 // ruleset is every rule this component hosts, in the order `rules` reports them.
@@ -80,18 +81,8 @@ type hosted struct {
 // A rule that sorts into the middle therefore renumbers every rule after it, and the rows in
 // `COMPONENT_RULES` have to move with it in the same change.
 var ruleset = []hosted{
-	{
-		id:        nocontextinstruct.ID,
-		metadata:  nocontextinstruct.Metadata,
-		configure: takesNoOptions,
-		Handlers:  nocontextinstruct.Handlers(),
-	},
-	{
-		id:        nopackageinit.ID,
-		metadata:  nopackageinit.Metadata,
-		configure: takesNoOptions,
-		Handlers:  nopackageinit.Handlers(),
-	},
+	{id: nocontextinstruct.ID, Handlers: nocontextinstruct.Handlers()},
+	{id: nopackageinit.ID, Handlers: nopackageinit.Handlers()},
 }
 
 // ruleIDs is [ruleset]'s ids, in its order, built once.
@@ -146,7 +137,7 @@ func metadata(index uint32) types.RuleMetadata {
 	if !ok {
 		panic(noSuchRule(index))
 	}
-	return hosted.metadata()
+	return hosted.Metadata()
 }
 
 // configure hands one rule its options.
@@ -158,7 +149,7 @@ func configure(index uint32, optionsJSON string) configureResult {
 	if !ok {
 		return cm.Err[configureResult](noSuchRule(index))
 	}
-	if err := hosted.configure(optionsJSON); err != nil {
+	if err := hosted.Configure(optionsJSON); err != nil {
 		return cm.Err[configureResult](err.Error())
 	}
 	return cm.OK[configureResult](struct{}{})
@@ -243,15 +234,6 @@ func reduce(index uint32, ctx cm.Rep) passResult {
 	}
 	return cm.OK[passResult](struct{}{})
 }
-
-// takesNoOptions is the `configure` of a rule that has none.
-//
-// It accepts rather than refuses, and that is deliberate. The TypeScript rules these components
-// replace export a plain object, so a config that names one with options today is accepted and
-// the options are ignored; a component that refused would turn a working config into a failed
-// run at the moment the built-in is swapped over, which is not a change that belongs inside a
-// migration.
-func takesNoOptions(string) error { return nil }
 
 // at is the rule at an index, or `false` when this component hosts no such rule.
 //

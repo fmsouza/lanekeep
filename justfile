@@ -444,9 +444,29 @@ typescript-builtins:
 # **`-no-debug` is a correctness requirement rather than a size lever.** Without it TinyGo writes
 # the build directory into the artifact's DWARF, so every checkout produces different bytes for
 # identical source — and a component's bytes are a `ruleset_hash` input, so two people on one
-# commit would compute two cache keys. Measured here on TinyGo 0.41.1: with the flag, 9,291 bytes
-# and no absolute path anywhere in them; without it, 307,655 bytes carrying this worktree's path
-# eleven times.
+# commit would compute two cache keys.
+#
+# Measured on TinyGo 0.41.1 against the artifact **this recipe builds today** — `go-builtins.wasm`
+# hosting two rules, at the commit that added `no-context-in-struct`. Both halves are one command
+# apart, so a later reader can re-run them rather than trusting the numbers:
+#
+#     ls -l <the artifact>
+#     strings <the artifact> | grep -cE '/Users|/opt/homebrew'
+#
+# | build | bytes | lines naming an absolute path |
+# | --- | --- | --- |
+# | with `-no-debug` | 13,187 | **0** |
+# | without | 322,301 | **85**, twelve of them this worktree's own |
+#
+# The 85 is `grep -c`, so it counts *lines* rather than occurrences, and most of them are the
+# TinyGo cache and the Go module cache rather than the checkout. Twelve name the worktree, which
+# is the half that makes the bytes differ per machine.
+#
+# **Every one of those figures moves when a rule is added**, which is the whole reason they are
+# dated to an artifact here. An earlier version of this comment quoted the one-rule build's
+# numbers and kept them through a rebuild that changed all three; a figure with no artifact named
+# beside it is reproducible by nobody. Re-measure when you change what this recipe builds, or
+# delete the table rather than leave it stale.
 #
 # No `-opt` flag, which is also deliberate: `-opt=z` is this target's default, and `-opt=2` and
 # `-opt=1` both produce a *larger* artifact.

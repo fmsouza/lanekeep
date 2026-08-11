@@ -11,7 +11,7 @@ package lanekeep
 //
 // This file exists so that `go test`, `go vet` and an editor's language server work on an
 // ordinary host toolchain over this module and the rule packages above it — every rule reaches
-// [ResetRand] through [WithResetRand], and without a host-side declaration none of them would
+// [ResetRand] through [Handlers], and without a host-side declaration none of them would
 // compile outside a TinyGo build.
 //
 // # The tag is `!tinygo`, and `!wasm_unknown` is the version of it that is quietly wrong

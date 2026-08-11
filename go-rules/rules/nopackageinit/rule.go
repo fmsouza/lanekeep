@@ -99,13 +99,16 @@ func Metadata() types.RuleMetadata {
 	}
 }
 
-// Handlers is this rule's passes: a per-file one, and no cross-file one.
+// Handlers is everything the host calls on this rule: its metadata, and a per-file pass. No
+// options, and no cross-file pass.
 //
 // Constructed through [lanekeep.NewHandlers] rather than handed over as bare functions, which is
 // what puts the map-iteration reset ahead of every invocation without this file mentioning it.
-// The type parameters are named because an untyped `nil` reduce carries nothing to infer from.
-func Handlers() lanekeep.Handlers[types.CheckContext, types.ReduceContext] {
-	return lanekeep.NewHandlers[types.CheckContext, types.ReduceContext](check, nil)
+// The type parameters are named because an untyped `nil` carries nothing to infer from.
+func Handlers() lanekeep.Handlers[types.RuleMetadata, types.CheckContext, types.ReduceContext] {
+	return lanekeep.NewHandlers[types.RuleMetadata, types.CheckContext, types.ReduceContext](
+		Metadata, nil, check, nil,
+	)
 }
 
 // check reports one `func init()`.
