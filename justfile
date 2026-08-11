@@ -446,12 +446,14 @@ typescript-builtins:
 # identical source — and a component's bytes are a `ruleset_hash` input, so two people on one
 # commit would compute two cache keys.
 #
-# Measured on TinyGo 0.41.1 against the artifact **this recipe builds today** — `go-builtins.wasm`
-# hosting two rules, at the commit that added `no-context-in-struct`. Both halves are one command
-# apart, so a later reader can re-run them rather than trusting the numbers:
+# Measured on TinyGo 0.41.1 against the artifact **this recipe builds today**:
+# `crates/lanekeep-rules/components/go-builtins.wasm`, hosting the two Go built-ins. Both halves
+# are reproducible from a checkout, so a later reader can re-run them rather than trusting the
+# numbers — run this recipe for the first row, and the same `tinygo build` with `-no-debug`
+# removed for the second:
 #
-#     ls -l <the artifact>
-#     strings <the artifact> | grep -cE '/Users|/opt/homebrew'
+#     wc -c < crates/lanekeep-rules/components/go-builtins.wasm
+#     strings crates/lanekeep-rules/components/go-builtins.wasm | grep -cE '/Users|/opt/homebrew'
 #
 # | build | bytes | lines naming an absolute path |
 # | --- | --- | --- |
@@ -462,10 +464,13 @@ typescript-builtins:
 # TinyGo cache and the Go module cache rather than the checkout. Twelve name the worktree, which
 # is the half that makes the bytes differ per machine.
 #
-# **Every one of those figures moves when a rule is added**, which is the whole reason they are
-# dated to an artifact here. An earlier version of this comment quoted the one-rule build's
-# numbers and kept them through a rebuild that changed all three; a figure with no artifact named
-# beside it is reproducible by nobody. Re-measure when you change what this recipe builds, or
+# **Every one of those figures moves when a rule is added**, which is the whole reason the
+# artifact is named rather than a commit. An earlier version of this comment quoted the one-rule
+# build's numbers and kept them through a rebuild that changed all three; the version after that
+# quoted the two-rule numbers against "the commit that added `no-context-in-struct`", which is
+# 13,207 rather than 13,187 — 13,187 is what the artifact came out at one commit later, when the
+# SDK changed under it. Neither mistake is reachable from a figure keyed to what the recipe
+# builds and a command that rebuilds it. Re-measure when you change what this recipe builds, or
 # delete the table rather than leave it stale.
 #
 # No `-opt` flag, which is also deliberate: `-opt=z` is this target's default, and `-opt=2` and
@@ -635,11 +640,12 @@ test-scripts:
 #
 # `cmd/lanekeep` is the launcher and lives in the root module. `go-rules/` is a module of its
 # own, and a nested module is excluded from `./...` by construction — `go list ./...` at the
-# root reports only the launcher, whatever is underneath `go-rules/`. So for three commits the
-# Go SDK's tests ran in no gate at all: reachable only through `just go-rules`, a recipe that
-# requires TinyGo and that neither gate invokes. Green, and asserting nothing.
+# root reports only the launcher, whatever is underneath `go-rules/`. So for the whole of the
+# branch that introduced that module, the Go SDK's tests ran in no gate at all: reachable only
+# through `just go-rules`, a recipe that requires TinyGo and that neither gate invokes. Green,
+# and asserting nothing.
 #
-# None of the three commands below needs TinyGo, which is what puts the second module here on
+# None of the four commands below needs TinyGo, which is what puts the second module here on
 # exactly the launcher's terms. `just go-rules` runs the same three ahead of its build and
 # keeps doing so — that recipe is the only path an artifact reaches a commit by, so its checks
 # have to sit on that path whether or not they also run here.

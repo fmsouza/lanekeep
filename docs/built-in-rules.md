@@ -48,7 +48,9 @@ about them changed but the engine that runs them. The Rust and Go ones are writt
 language they check and have no TypeScript at all. Which form a rule takes is not part of its
 interface: the specifier, the id, the options and the output are the same either way, and a rule
 that changes form does not change your config — the two Go rules were TypeScript modules until
-`fec6cfc` and every case in their test suites passed unchanged across the move.
+this release, and every case in their test suites passed unchanged across the move. Their
+`.ts` sources are recoverable with `git log --diff-filter=D -- crates/lanekeep-rules/rules/`,
+which is where a reader who wants to compare the two implementations should start.
 
 Built-in ids are namespaced `lanekeep/`. Project rules use `local/`, or a namespace the
 project declares in its config — `namespaces: ['acme']` allows `acme/no-numeric-sizes`.
@@ -533,8 +535,9 @@ For a rule in Go, step 1 becomes `go-rules/rules/<name>/` plus a row in `go-rule
 `ruleset`, and step 2 becomes a `COMPONENT_RULES` row naming `go-builtins` and the index that
 row sits at — every Go rule shares one component, so `BUILT_IN_COMPONENTS` already has its
 entry. [`authoring-go-rules.md`](authoring-go-rules.md) has the whole of it, including the six
-things about TinyGo that fail silently. Step 3 uses `RuleTester::for_built_in` rather than
-`for_component`, for the reason the note below gives about a shared artifact.
+things about TinyGo that are not preferences — four of which fail silently, and two of which
+stop the build and say so. Step 3 uses `RuleTester::for_built_in` rather than `for_component`,
+for the reason the note below gives about a shared artifact.
 
 To ship a TypeScript rule as a component instead of a module, step 1 is unchanged — it is the
 same file, importing only from `lanekeep` — and steps 2 and 3 gain a build. List it in

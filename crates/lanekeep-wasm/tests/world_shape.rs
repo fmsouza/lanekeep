@@ -635,10 +635,12 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// so a fixture on the wrong target passes every shape assertion right up until a real rule
 /// formats a string.
 ///
-/// The two tests above check one artifact; this directory holds fourteen of them, and it held
+/// The two tests above check one artifact; this directory holds fifteen of them, and it held
 /// eleven when that sentence was first written. Each new fixture widened the gap silently, which
 /// is why this one is written the way it is — and why the count above is the only number here,
-/// stated as something that moves rather than as a fact about the tree.
+/// stated as something that moves rather than as a fact about the tree. Take it from `ls
+/// crates/lanekeep-wasm/tests/fixtures/*.wasm` rather than from this sentence; the test itself
+/// never reads it.
 ///
 /// # Globbed, and that is the whole point
 ///
@@ -814,14 +816,18 @@ fn the_go_builtins_component_imports_no_ambient_authority() {
 /// export that settles it: it is what a host enumerates before anything else, and what
 /// `crates/lanekeep-rules`' own dispatch table is checked against once this component ships.
 ///
-/// **Here rather than in `crates/lanekeep-rules/tests/component_rules.rs`**, which is where the
+/// **Here as well as in `crates/lanekeep-rules/tests/component_rules.rs`**, which is where the
 /// equivalent claim about the other three components lives. That file reads its components out of
-/// `lanekeep_rules::component`, which resolves a *rule name*, and no rule name resolves to this
-/// artifact yet — the swap that moves `lanekeep/no-package-init` off its TypeScript module is a
-/// later change. Until then this is the only place the component can be reached at all, and
-/// leaving it unasserted until then is exactly what that file's own documentation records
-/// regretting about `typescript-builtins`: "until now nothing but a digest said what was inside
-/// it".
+/// `lanekeep_rules::component`, which resolves a *rule name*, and it now names both Go rules — so
+/// the two tests overlap, deliberately. This one is the lower of the pair: it links the component
+/// against the world in `crates/lanekeep-wasm/wit/` directly, so it fails on a component that no
+/// longer answers the world it was built for, where the other fails on a *table* that disagrees
+/// with what the component enumerates. A rebuild against a moved world reddens this file first,
+/// and it says so in terms of the ABI rather than in terms of a rule name.
+///
+/// It was written when the swap had not happened and no rule name resolved here at all, which is
+/// the state that made it the only place this component could be reached. That is no longer the
+/// reason it exists; the paragraph above is.
 #[test]
 fn the_go_builtins_component_answers_the_world_it_targets() {
     let (engine, component, linker) = linked_to(GO_BUILTINS);

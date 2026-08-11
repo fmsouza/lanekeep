@@ -12,7 +12,7 @@ same process plus the invariants and the traps.
 
 ## Setup
 
-You need [rustup](https://rustup.rs). Everything else is installed for you.
+You need [rustup](https://rustup.rs). Everything else the gate needs is installed for you.
 
 ```bash
 git clone https://github.com/fmsouza/lanekeep
@@ -24,6 +24,13 @@ That installs the pinned toolchain and the development tools, activates the git 
 and verifies the result by running the fast gate. Installing
 [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) first makes it much
 quicker — the script uses it when present and falls back to compiling from source.
+
+**Two toolchains are outside that and stay outside it deliberately**, because neither gate
+needs them: the artifacts they build are committed. Go and TinyGo, for the rule SDK in
+[`go-rules/`](go-rules) — `just test-go` skips its checks where `go` is absent, and
+`just go-rules` is a maintainer's recipe that requires TinyGo, which cannot be installed
+from cargo. Node, for the JavaScript component and the authoring package's own tests. See
+[`docs/authoring-go-rules.md`](docs/authoring-go-rules.md) if you are changing a Go rule.
 
 ## Commands
 

@@ -31,7 +31,8 @@ component's bytes are a `ruleset_hash` input (architecture §8.1), so identical 
 two checkouts gives two cache keys — which is the rustup-toolchain-name trap AGENTS.md already
 records, and strictly worse: a toolchain name differs between two people who reached one compiler
 by different routes, and a checkout path differs for everybody. Measured on TinyGo 0.41.1 against
-`go-builtins.wasm` at `2ce7aef`: **13,187 bytes** with the flag and **322,301** without, and
+the committed `crates/lanekeep-rules/components/go-builtins.wasm`, which `just go-rules`
+rebuilds: **13,187 bytes** with the flag and **322,301** without, and
 `strings … | grep -cE '/Users|/opt/homebrew'` finds **0** lines against **85**, twelve of which
 name the worktree it was built in. Do not drop it while debugging. `just go-rules` passes it;
 do not build these by hand.
@@ -104,8 +105,8 @@ of any Cargo workspace or of the repository's root Go module. That last part has
 worth knowing before you add a package here: `./...` is scoped to a module rather than to a
 directory, so a wildcard run from the repository root reaches `cmd/lanekeep` and nothing under
 `go-rules/`. `just test-go` therefore runs `gofmt -l`, `go vet` and `go test` in **both** modules
-— it did not always, and for three commits the SDK's tests ran in `just go-rules` and nowhere
-else, which is to say in no gate at all.
+— it did not always, and for the whole of the branch that introduced this module the SDK's tests
+ran in `just go-rules` and nowhere else, which is to say in no gate at all.
 
 ```
 go-rules/

@@ -571,13 +571,14 @@ eleven committed WebAssembly fixtures then read as stale that way — `bindings`
 does not. That is now the check rather than the investigation —
 `crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
 `tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
-there too, because fourteen of the fifteen committed today name it as their component target —
+there too, because fifteen of the sixteen committed today name it as their component target —
 every one but `spike`, which targets its own `wit/spike.wit` — and a world edit with no rebuild
 leaves every fixture satisfying an ABI that no longer exists. Count them with `ls
 crates/lanekeep-wasm/tests/fixtures/*.wasm` plus the one in `rejected/`, not from this sentence:
-it has been wrong twice, and a stale count here is the same failure the paragraph above is about.
+it has been wrong three times, and a stale count here is the same failure the paragraph above is
+about.
 
-**And one of the fifteen breaks that protocol, because `componentize-js` output is not reproducible
+**And one of the sixteen breaks that protocol, because `componentize-js` output is not reproducible
 at all.** `js-globals.wasm` is built by `jco componentize` rather than by `cargo component`, and
 three builds over one unchanged tree — jco 1.27.0, measured 2026-08-10 — gave 13,023,574,
 13,023,571 and 13,023,630 bytes, three distinct sha256s, with 2,968,012 bytes differing between
@@ -597,19 +598,25 @@ behavioral rather than byte-wise: `tests/js_globals.rs` derives its probes from 
 an artifact that no longer satisfies the contract fails the moment the contract moves. That is
 weaker — it catches a stale artifact only where the two disagree — and it is what there is.
 
-**There are three digest manifests now, one per recipe that rewrites a committed artifact, and
+**There are four digest manifests now, one per recipe that rewrites a committed artifact, and
 what may be shared between them is an input rather than an artifact.** `just wasm-fixtures`
-writes `fixture-digests.txt`, `just rust-rules` writes `rule-component-digests.txt`, and
-`just typescript-builtins` writes `typescript-component-digests.txt`. All three record
-`wit/world.wit`, deliberately: it is a build input to every component in the tree, and a change
-to it has to send you to every recipe. An *artifact* is the opposite case, because exactly one
-recipe can produce it — and `typescript-builtins.wasm` sits in
-`crates/lanekeep-rules/components/`, beside two artifacts a different recipe builds. Recording
-it in that recipe's manifest as well would mean a rebuild of the TypeScript component, whose
-bytes change every time, leaves the *Rust* manifest red until somebody runs `just rust-rules`: a
-recipe about other artifacts, needing `cargo component` and a wasm target, to fix a build it had
-no part in. `fixture_currency.rs`'s `TYPESCRIPT_ARTIFACTS` is the one list that partitions them,
-read by the manifest that owns them and by the manifest that must subtract them.
+writes `fixture-digests.txt`, `just rust-rules` writes `rule-component-digests.txt`,
+`just typescript-builtins` writes `typescript-component-digests.txt`, and `just go-rules` writes
+`go-component-digests.txt`. All four record `wit/world.wit`, deliberately: it is a build input to
+every component in the tree, and a change to it has to send you to every recipe. An *artifact* is
+the opposite case, because exactly one recipe can produce it — and `typescript-builtins.wasm`
+sits in `crates/lanekeep-rules/components/`, beside artifacts two different recipes build.
+Recording it in another recipe's manifest as well would mean a rebuild of the TypeScript
+component, whose bytes change every time, leaves the *Rust* manifest red until somebody runs
+`just rust-rules`: a recipe about other artifacts, needing `cargo component` and a wasm target,
+to fix a build it had no part in. `fixture_currency.rs` partitions them three ways rather than
+two — the Go component's artifacts are the third set, subtracted by the same mechanism and for
+the same reason: `just wasm-fixtures` cannot rebuild `go-maporder.wasm`, which needs TinyGo.
+
+Count the manifests with `ls crates/lanekeep-wasm/tests/*digests*.txt`. This sentence said
+"three" for a while after the fourth landed, which is the entry below about grepping a formula
+arriving in the file that warns about it: the sweep that added the Go recipe matched recipe names
+and artifact paths, and "three" is neither.
 
 **And `jco componentize` needs a far newer Node than `just test-js` does, which is discovered at
 *install* time and reported at build time, by neither.** `test-js` requires Node 18, the floor
@@ -1055,12 +1062,14 @@ Without it TinyGo writes the build directory into the artifact's DWARF, so ident
 checkouts produces different bytes — and a component's bytes are a cache-key input, so every
 developer computes a different key for one commit. This is the rustup-toolchain-name trap above
 and strictly worse: a toolchain name differs between two people who reached one compiler by
-different routes, and a checkout path differs for everybody. Measured on TinyGo 0.41.1 against
-`go-builtins.wasm` at `2ce7aef`: **13,187 bytes** with the flag and **322,301** without, with
+different routes, and a checkout path differs for everybody. Measured on TinyGo 0.41.1 against the
+committed `crates/lanekeep-rules/components/go-builtins.wasm`, which `just go-rules` rebuilds:
+**13,187 bytes** with the flag and **322,301** without, with
 `strings … | grep -cE '/Users|/opt/homebrew'` finding **0** lines against **85**, twelve of which
 name the worktree. Nothing turns red — the artifact is valid and the rule works — so the flag has
 to survive every future edit of that recipe, and the `justfile` says so where the command is
-written.
+written, along with what each figure is keyed to and why it is keyed to the artifact rather than
+to a commit.
 
 **`-target=wasip2` fails at *encode* time rather than at load, which is the good news.** The
 expected failure mode was a component with too many imports, argued about at load. Instead
@@ -1083,9 +1092,16 @@ target or that flag lands; not worth a second look before then.
 
 **`-opt=2` and `-opt=1` produce a *larger* TinyGo artifact than the default.** `-opt=z` is already
 `wasm-unknown`'s default (it is in `targets/wasm-unknown.json`, along with `gc=leaking` and
-`scheduler=none`), so naming it buys nothing and reaching for a "higher" level costs size:
-measured on the spike's rule, 804,006 bytes at the default against 1,145,410 at `-opt=2` and
-1,150,350 at `-opt=1`. Pass no `-opt` flag at all.
+`scheduler=none`), so naming it buys nothing and reaching for a "higher" level costs size.
+Measured on TinyGo 0.41.1 against `crates/lanekeep-rules/components/go-builtins.wasm`, by running
+`just go-rules`'s own `tinygo build` with each flag added: **13,187** bytes with no `-opt` at all,
+**13,187** at `-opt=z` — the same artifact, since that is the default — **13,245** at `-opt=2` and
+**13,841** at `-opt=1`. Pass no `-opt` flag at all.
+
+An earlier version of this entry gave 804,006 / 1,145,410 / 1,150,350, which are the same three
+comparisons on a throwaway design spike that is not in this tree and cannot be rebuilt from any
+commit in it. The ordering was right and the numbers were unreproducible, which is the trap
+further down about a figure measured against a working tree.
 
 **`//go:linkname` on a *variable* emits a definition under TinyGo and links silently to nothing
 under host Go, so `go test` passes against a dead write.** The SDK has to reach TinyGo's runtime
@@ -1170,11 +1186,11 @@ in the repository. Put a `go.mod` in any scratch directory containing Go files, 
 it a nested module and invisible; that is the same construction that keeps `go-rules/` out of the
 root module's `./...`.
 
-**And the same construction cost the Go SDK's tests every gate for three commits, which is the
-half of it that mattered.** `just test-go` ran `go vet ./...` and `go test ./...` in the root
-module, so it reported on `cmd/lanekeep` and on nothing else; `go-rules/lanekeep`'s eleven test
-functions were reachable only through `just go-rules`, a recipe that requires TinyGo and that
-neither gate invokes. Nothing said so — `just check` was green, and a recipe called `test-go`
+**And the same construction cost the Go SDK's tests every gate for the whole of the branch that
+introduced them, which is the half of it that mattered.** `just test-go` ran `go vet ./...` and
+`go test ./...` in the root module, so it reported on `cmd/lanekeep` and on nothing else;
+`go-rules/lanekeep`'s test functions were reachable only through `just go-rules`, a recipe that
+requires TinyGo and that neither gate invokes. Nothing said so — `just check` was green, and a recipe called `test-go`
 reads like it covers the Go code. `test-go` now runs `gofmt -l`, `go vet` and `go test` in both
 modules behind one `command -v go` guard, since none of the three needs TinyGo. Carry the general
 form: **`./...` is scoped to a module, not to a directory**, so adding a nested module silently
