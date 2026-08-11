@@ -95,7 +95,10 @@
 //! left for a rule's own allocations from 54.9 MiB to 27.8 MiB, because linear memories never
 //! shrink and every grant counts against the same ceiling. What does not survive a per-rule
 //! bound is the next component: eight rules in one artifact would be refused outright, and the
-//! shared TypeScript one already hosts four.
+//! shared TypeScript one already hosts four. The same claim is still live in `wit/world.wit`'s
+//! own doc comment, left uncorrected there on purpose: its bytes are folded into
+//! `host_api_hash`, so fixing even a comment invalidates every cached result in every checkout.
+//! It rides the next change that moves that hash instead of paying the cost alone.
 //!
 //! **What that bound is worth depended on a number that was wrong, and it is corrected here.**
 //! An earlier version of this paragraph said "roughly three hundred and fifty instantiations
