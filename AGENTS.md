@@ -1180,6 +1180,27 @@ modules behind one `command -v go` guard, since none of the three needs TinyGo. 
 form: **`./...` is scoped to a module, not to a directory**, so adding a nested module silently
 subtracts it from every wildcard the parent runs.
 
+**A TinyGo build's bytes depend on two tools its command never names, and one of them travels
+with the TinyGo you installed.** `tinygo build` shells out to `wasm-opt` for the `-Oz` pass and to
+`wasm-tools` for `component embed` and `component new`, so an artifact is a function of four
+versions — Go, whose `GOROOT` supplies the standard library it compiles; TinyGo; binaryen;
+wasm-tools — of which the recipe names two. `wasm-tools` at least fails loudly when absent
+(`exec: "wasm-tools": executable file not found in $PATH`, after a minute in LLVM, which is why
+`just go-rules` now `_require`s it). `wasm-opt` is the quiet one: TinyGo prefers
+`$TINYGOROOT/bin/wasm-opt` over `PATH` and honors `$WASMOPT` ahead of both, and **the official
+Linux tarball ships binaryen 116 inside its own root while Homebrew's TinyGo ships none at all**
+— so one command, one TinyGo version and two machines can run two different optimizers. Measured
+2026-08-11 with everything else held equal: `go-builtins.wasm` is **13,187 bytes through binaryen
+131 and 13,274 through 116**, with different digests.
+
+Two things to carry with it. The reassuring one: with all four matched the artifact does **not**
+depend on the operating system or the architecture — linux/amd64 reproduces the darwin/arm64
+bytes exactly, which is what `.github/workflows/ci.yml`'s rebuild-and-diff job rests on and why
+that job pins four versions rather than one. And the warning: `go-maporder.wasm`, the small
+fixture built by the same recipe, is byte-identical through 116 and 131, so **a fixture cannot
+stand in for this check** — only the real artifact is large enough for two optimizers to disagree
+about.
+
 ## What not to do
 
 - Do not add a dependency without checking `deny.toml`. Network crates are banned

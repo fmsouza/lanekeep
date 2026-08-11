@@ -138,10 +138,114 @@ jobs:
 
       - run: just bench
 
+  # The Go component, rebuilt from source and compared byte for byte against what is committed.
+  #
+  # This check is possible here and impossible for the TypeScript component beside it.
+  # `componentize-js` output is a SpiderMonkey heap image and is not reproducible between two
+  # builds of one unchanged tree, so for that artifact a digest manifest is the whole staleness
+  # check; it catches a source edited without a rebuild and cannot catch an artifact that no
+  # source in the tree produces. A TinyGo build *is* reproducible, so this job closes the second
+  # half — and it is the only thing that can, since `LANEKEEP_BLESS_GO_RULES=1` will happily
+  # re-record whatever bytes are already in the tree.
+  #
+  # **Four versions are pinned because all four are inputs to the artifact's bytes.** `tinygo
+  # build` shells out to `wasm-opt` and to `wasm-tools`, and compiles the standard library out of
+  # the Go toolchain's `GOROOT`; `just go-rules` documents the measurement. Installed by hand
+  # rather than through actions, so that the four sit in one table a reader can compare against
+  # the machine that produced the committed bytes. A floating version anywhere here is a red diff
+  # nobody introduced.
+  go-rules:
+    name: go-rules (rebuild and diff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.5"
+          # The root module has no `go.sum`, and the cache step errors rather than shrugging
+          # when it cannot find the file it keys on.
+          cache: false
+
+      - name: Install TinyGo
+        env:
+          TINYGO_VERSION: "0.41.1"
+          TINYGO_SHA256: "e156d1d93a376eef639a4143d13be07e8c463fb6cf2d7d447698ed4474d23e91"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/tinygo.tar.gz" \
+            "https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo${TINYGO_VERSION}.linux-amd64.tar.gz"
+          echo "${TINYGO_SHA256}  ${RUNNER_TEMP}/tinygo.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/tinygo.tar.gz"
+          echo "${RUNNER_TEMP}/tinygo/bin" >> "${GITHUB_PATH}"
+
+      # Not the one TinyGo brings. Its Linux tarball bundles binaryen 116 at
+      # `$TINYGOROOT/bin/wasm-opt`, and the committed artifacts were built through 131 — 87 bytes
+      # apart on `go-builtins.wasm`, with `go-maporder.wasm` identical through both, so nothing
+      # smaller than the real artifact would notice. `WASMOPT` is the one override TinyGo honors
+      # ahead of the copy in its own root.
+      - name: Install binaryen (wasm-opt)
+        env:
+          BINARYEN_VERSION: "131"
+          BINARYEN_SHA256: "b5bf1f0eaf17c63ee588ff7a5954dc8f6ce2c26989051c66f24dfe9ece3e46db"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/binaryen.tar.gz" \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          echo "${BINARYEN_SHA256}  ${RUNNER_TEMP}/binaryen.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/binaryen.tar.gz"
+          echo "WASMOPT=${RUNNER_TEMP}/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" >> "${GITHUB_ENV}"
+
+      # TinyGo shells out to this for `component embed` and `component new`. It ships with
+      # neither TinyGo nor the runner image, so without it the build dies at the encoding step
+      # after a minute in LLVM.
+      - name: Install wasm-tools
+        env:
+          WASM_TOOLS_VERSION: "1.255.0"
+          WASM_TOOLS_SHA256: "a62237f4731c45f665f1115cad39acaeec02963cbc848c9473ab033eed837072"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/wasm-tools.tar.gz" \
+            "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz"
+          echo "${WASM_TOOLS_SHA256}  ${RUNNER_TEMP}/wasm-tools.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/wasm-tools.tar.gz"
+          echo "${RUNNER_TEMP}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux" >> "${GITHUB_PATH}"
+
+      # `just go-rules` records the digest manifest through `cargo test`, so this job needs the
+      # Rust toolchain as well as the Go one.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: go-rules
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just
+
+      # Which also runs `gofmt -l`, `go vet` and `go test` over `go-rules/`, and re-records the
+      # digest manifest — so a stale manifest lands in the diff below exactly as a stale artifact
+      # does. That is the intent and not a side effect.
+      - run: just go-rules
+
+      - name: The committed artifacts must be the ones these sources build
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "the committed Go artifacts are exactly what their sources build"
+            exit 0
+          fi
+          echo "::error::the rebuilt Go artifacts differ from the committed ones — run 'just go-rules' and commit the result"
+          echo "if you did run it and this is still red, compare the toolchain versions printed"
+          echo "above against the four this job pins: they are all inputs to the artifact's bytes."
+          git status --porcelain
+          git --no-pager diff --stat
+          exit 1
+
   ci-ok:
     name: ci
     if: always()
-    needs: [gate, test, msrv, bench]
+    needs: [gate, test, msrv, bench, go-rules]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every job succeeded

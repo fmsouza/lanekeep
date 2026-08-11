@@ -94,8 +94,8 @@ the ids, the options and the output are identical, and there is no capability a 
 that a TypeScript rule lacks.
 
 What Go costs beyond that: a build step no gate runs (the artifact is committed), options that
-must survive JSON, and a toolchain — TinyGo and Go — that `just check` deliberately does not
-require and `just setup` does not install.
+must survive JSON, and a four-tool toolchain — Go, TinyGo, binaryen and wasm-tools — that
+`just check` deliberately does not require and that `just setup` installs only the last of.
 
 ## The shape of the module
 
@@ -275,11 +275,32 @@ That runs `gofmt -l`, `go vet ./...` and `go test ./...` inside `go-rules/`, bui
 `crates/lanekeep-wasm/tests/fixtures/`, and records what each was built from in
 [`crates/lanekeep-wasm/tests/go-component-digests.txt`](../crates/lanekeep-wasm/tests/go-component-digests.txt).
 
-It needs TinyGo and Go; `just setup` installs neither, so `just _require tinygo` will tell you to
-run a recipe that does not help. Install TinyGo yourself. **The gate needs neither** — the
-artifacts are committed, and `fixture_currency.rs` reddens when a source under `go-rules/` moves
-and the artifact does not. That test is what makes running this recipe non-optional rather than a
+It needs **four** tools, and the build command names only two of them. `tinygo build` shells out
+to `wasm-opt` for the `-Oz` pass and to `wasm-tools` for `component embed` and `component new`,
+so Go, TinyGo, binaryen and wasm-tools are all inputs to the artifact's bytes. `just setup`
+installs wasm-tools and not TinyGo — install TinyGo yourself; `just _require tinygo` will tell
+you to run a recipe that does not help. **The gate needs none of the four** — the artifacts are
+committed, and `fixture_currency.rs` reddens when a source under `go-rules/` moves and the
+artifact does not. That test is what makes running this recipe non-optional rather than a
 convention.
+
+The versions the committed artifacts were built through, which the recipe echoes on every run
+so that a byte diff has its own cause in the log beside it:
+
+| tool | version | how it gets in |
+| --- | --- | --- |
+| Go | 1.26.5 | the standard library TinyGo compiles from `GOROOT` |
+| TinyGo | 0.41.1 | the compiler |
+| binaryen (`wasm-opt`) | 131 | `$WASMOPT`, else `$TINYGOROOT/bin/wasm-opt`, else `PATH` |
+| wasm-tools | 1.255.0 | `PATH` |
+
+**`wasm-opt` is the one that has actually moved, and how you installed TinyGo decides it.** The
+official Linux tarball ships binaryen **116** inside `$TINYGOROOT/bin/`, which TinyGo prefers
+over anything on `PATH`; Homebrew's TinyGo ships none, so a Mac uses whatever `wasm-opt` is
+installed — 131 here. Measured 2026-08-11 with everything else held equal: `go-builtins.wasm` is
+13,187 bytes through 131 and 13,274 through 116, with different digests. `go-maporder.wasm` is
+byte-identical through both, so a small fixture cannot stand in for that check. Set `WASMOPT` if
+your TinyGo brings its own and you need to match.
 
 The digest manifest records `go-rules/` **wholesale**, tests included, and
 `crates/lanekeep-wasm/wit/` as a directory. So editing `glob_test.go` demands a rebuild. That is
@@ -291,6 +312,14 @@ rebuild-and-see-`git status`-clean protocol works here: two builds from an uncha
 through the recipe and one through its `tinygo` line by hand, both gave sha256
 `881bc3cc47da05a6e76e59067a97581762bb53a1461f40d807f167b67d7d4a3c` on TinyGo 0.41.1. The digest
 manifest is a second opinion rather than the only check.
+
+**And it reproduces across machines, not only across runs of one machine** — which is what
+`.github/workflows/ci.yml`'s `go-rules` job rests on. Measured 2026-08-11: linux/amd64 with the
+four versions in the table above produces exactly the digest quoted in the previous paragraph,
+built on darwin/arm64. That job rebuilds both artifacts on every pull request and fails on a
+non-empty `git status`, which is the check the TypeScript component can never have: a digest
+manifest catches a source edited without a rebuild, and only a rebuild catches an artifact that
+no source in the tree produces.
 
 `go build ./...` is deliberately not in the recipe and will fail if you run it. `main.go` is a
 `package main` whose imports are `//go:wasmimport` declarations with no body, so it type-checks

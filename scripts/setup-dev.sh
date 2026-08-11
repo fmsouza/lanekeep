@@ -66,6 +66,12 @@ TOOLS=(
     # Builds the WebAssembly rule components. Not needed by any gate — the built
     # fixtures are committed — but needed by `just wasm-fixtures` to rebuild one.
     "cargo-component:cargo-component"
+    # `tinygo build` shells out to this for `component embed` and `component new`, so
+    # `just go-rules` needs it and nothing else here does. Installed rather than merely
+    # required, because `_require`'s message tells you to run this script — a promise that
+    # was false for wasm-tools until this line existed. TinyGo itself cannot be installed
+    # from cargo; docs/authoring-go-rules.md says so and says what to do instead.
+    "wasm-tools:wasm-tools"
 )
 
 missing=()

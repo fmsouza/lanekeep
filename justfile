@@ -470,12 +470,49 @@ typescript-builtins:
 #
 # No `-opt` flag, which is also deliberate: `-opt=z` is this target's default, and `-opt=2` and
 # `-opt=1` both produce a *larger* artifact.
+#
+# # The four versions that decide the bytes, one of which the build command never names
+#
+# `tinygo build` shells out twice: to **`wasm-opt`** for the `-Oz` pass, and to **`wasm-tools`**
+# for `component embed` and `component new`. Neither appears in the command below, neither is
+# bundled on every platform, and both are as much an input to the artifact as the Go standard
+# library the compiler reads out of `GOROOT`. So the bytes are a function of four versions: Go,
+# TinyGo, binaryen and wasm-tools.
+#
+# **`wasm-opt` is the one that has actually moved.** TinyGo looks for it at `$TINYGOROOT/bin/`
+# first and honors `$WASMOPT` ahead of even that. The official Linux tarball ships **binaryen
+# 116** in its own root; Homebrew's TinyGo ships none at all, so a Mac uses whatever is on
+# `PATH` — **131** on the machine these artifacts were built on. Measured 2026-08-11 against
+# `go-builtins.wasm`, everything else held equal: **13,187 bytes through 131 and 13,274 through
+# 116**, different sha256s. `go-maporder.wasm` comes out byte-identical through both, so the
+# fixture cannot stand in for that check.
+#
+# The reassuring half of the same measurement, and what `.github/workflows/ci.yml`'s `go-rules`
+# job rests on: with all four matched, the artifact does **not** depend on the operating system
+# or the architecture. darwin/arm64 and linux/amd64 both produce
+# `881bc3cc47da05a6e76e59067a97581762bb53a1461f40d807f167b67d7d4a3c`.
+#
+# The versions are echoed below rather than checked. A mismatch surfaces as a byte diff whose
+# cause is in the log beside it, which is as much as a recipe can do without pinning a toolchain
+# it has no way to install.
 go-rules:
     #!/usr/bin/env bash
     set -euo pipefail
     just _require tinygo
     just _require go
+    # Not optional, and not obvious: `tinygo build` invokes it for the component encoding, and
+    # nothing else in this repository needs it. Without this line the failure is `exec:
+    # "wasm-tools": executable file not found in $PATH`, from inside a build that has already
+    # spent a minute in LLVM.
+    just _require wasm-tools
     root="$(pwd)"
+
+    # What the artifacts below will have been built through, in the log next to them.
+    echo "toolchain:"
+    echo "  $(go version)"
+    echo "  $(tinygo version)"
+    echo "  wasm-opt $(${WASMOPT:-wasm-opt} --version | sed -E 's/^wasm-opt version //')"
+    echo "  $(wasm-tools --version)"
 
     # `gofmt` and `go vet` before the build, on the reasoning the `rust-rules` recipe sets out at
     # length: this recipe is the only path a Go artifact reaches a commit by, and the digest
