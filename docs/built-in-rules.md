@@ -13,8 +13,8 @@ Name one by specifier and put it in your `rules` array. In a `lanekeep.json`, wh
 }
 ```
 
-Or in a `lanekeep.config.ts`, for a rule that is a TypeScript module — which today means the
-Python ones:
+Or in a `lanekeep.config.ts`, for a rule that is a TypeScript module — which today means the two
+Python rules and the two Go ones:
 
 ```ts
 import { defineConfig } from 'lanekeep'
@@ -45,10 +45,8 @@ whichever format the rule it documents accepts.
 
 The four TypeScript rules are compiled from *exactly* the sources they were written in; nothing
 about them changed but the engine that runs them. Which form a rule takes is not part of its
-interface, and a rule that changes form does not change its id, its options or its output.
-
-Which form a rule takes is not part of its interface. The specifier, the id, the options and
-the output are the same either way, and a rule that changes form does not change your config.
+interface: the specifier, the id, the options and the output are the same either way, and a rule
+that changes form does not change your config.
 
 Built-in ids are namespaced `lanekeep/`. Project rules use `local/`, or a namespace the
 project declares in its config — `namespaces: ['acme']` allows `acme/no-numeric-sizes`.

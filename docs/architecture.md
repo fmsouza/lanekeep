@@ -906,7 +906,23 @@ The remaining warm cost is reading and hashing every file to discover what chang
 
 **A component must be compiled once per project, not once per config load.** Config load asks each component what it is (§6.9), which means compiling it, and compiling one is tens of milliseconds — so a config load with nowhere to cache the result pays that on every invocation, and pays it again at prepare time through the engine's own loader. Measured on the release binary before this was closed: `lanekeep rules` on a one-component project took 67.6 ms against 8.6 ms for a TypeScript-only one, and 124.3 ms with two components — a command that checks no files, exceeding the 25 ms warm budget on config load alone. It compounds because config load is not once per session: it runs per LSP request, per MCP tool call and per `--watch` iteration, and `lanekeep init` scaffolds a component-backed rule into every Rust project.
 
-The fix is that config load and the engine share one artifact cache, `.lanekeep/components`, so the first run in a project compiles once and every later run maps what it wrote. After: 8.6 ms and 9.3 ms for one and two components, against 10.8 ms for TypeScript only — components no longer measurably cost anything at config load. The first run in a project still pays the compile, ~70 ms per component, and that is the number to expect after a rule's bytes change. `lanekeep_config::load` keeps the uncached behavior, because a caller that has not named a project root has not asked for a directory to be written.
+The fix is that config load and the engine share one artifact cache, `.lanekeep/components`, so the first run in a project compiles once and every later run maps what it wrote. After: 8.6 ms and 9.3 ms for one and two components, against 10.8 ms for TypeScript only — components no longer measurably cost anything at config load. The first run in a project still pays the compile, ~70 ms per component. `lanekeep_config::load` keeps the uncached behavior, because a caller that has not named a project root has not asked for a directory to be written.
+
+**Every number in the two paragraphs above was measured against components of about 26 KB, and a JavaScript one is 12.4 MiB. It does not generalize, and the gap is three orders of magnitude.** Measured 2026-08-11 on the release binary, Apple M3 Max, over a one-file project — so essentially all of this is config load and prepare rather than checking:
+
+| Config | Cold | Warm |
+|---|---|---|
+| one TypeScript **module** rule | 32 ms | ~30 ms |
+| one rule of the shared JavaScript component | 6,115 ms | ~213 ms |
+| two rules of it | 6,680 ms | ~747 ms |
+| three | 7,451 ms | ~1,492 ms |
+| **four — the migrated set** | **8,312 ms** | **~2,398 ms** |
+
+So "compiling one is tens of milliseconds" is ~6 s for this artifact, "~70 ms per component" is ~6 s, and "components no longer measurably cost anything at config load" is 213 ms for one rule against a 25 ms warm budget. The precompiled `.cwasm` is 34 MB.
+
+**The warm column grows faster than the rule count, and that is a defect rather than a property.** The increments are +534 ms, +745 ms, +906 ms: `lanekeep-config` loads once per rule *reference*, so four rules of one component deserialize the same 34 MB artifact repeatedly and instantiate it more than once, where the whole point of sharing the component is to pay for the engine once. The fix is a memo keyed on the content identity `Loaded` already carries — the same identity `lanekeep-wasm` keys instance sharing on (§6.9) — rather than anything structural. It is not done, and until it is, **naming a fifth rule of that component costs about another second of warm time**.
+
+None of this is on the path of a project that uses no components, and none of it changes a result. It is the cost of the form, and §15.1 has the other half — what a component costs per `check` invocation once it is loaded.
 
 **The report is absolute; the gate is relative.** Absolute numbers cannot be gated on a hosted runner: this suite's first CI run measured a cold pass at 10.9 s against 1.5 s on a developer machine, seven times slower, on hardware that varies between runs. Any absolute threshold loose enough not to flake there is too loose to catch anything.
 
@@ -967,6 +983,8 @@ Measured 2026-08-11 on the same machine — Apple M3 Max (14 cores), macOS 26.5.
 | Rust component, wasmtime | 82 ms | 229 ms | 147 ms | 414,720 | ~355 ns | 1.10× |
 | TypeScript component, wasmtime | 621 ms | 22.1 s | 21.5 s | 597,120 | ~35,900 ns | **111×** |
 
+"Host calls" is the marginal count here too, for the reason the note above gives — and **597,120 now appears in this document as two different quantities**, which is worth flagging rather than leaving for a reader to trip over. It is QuickJS's *hot total* in the paragraph above and the JavaScript arm's *marginal* count in this table. Both are right and the coincidence is arithmetic: the JavaScript arm makes one more call per engaged match than QuickJS does, and there are exactly as many engaged matches as there are cold-corpus calls. The three hot totals are 597,120, 418,560 and 600,960.
+
 **A host call costs about 110× through a JavaScript component.** Three runs in that session gave 109.3, 111.0 and 112.6 — 34.3 µs to 35.9 µs against QuickJS's 313–324 ns. End to end on this corpus, which is built to make crossings as visible as possible and is not a real one, the hot run is 21.5 s against 313 ms.
 
 That is stated first and without softening because it is the direction the decision record was afraid of. The condition attached to accepting components was that the per-crossing cost be measured before the self-check rules moved, precisely so a number like this could arrive before it was expensive to act on. For a Rust component it came back at 1.1× and the case held. For a JavaScript one it is two orders of magnitude, and the case for that form has to rest on something other than speed.
@@ -978,7 +996,31 @@ Four things pin it, and the fourth is the one that keeps it from being read as a
 - **It is not the canonical ABI.** The Rust component pays the same ABI on the same host code and comes out at 1.10×. The bench's `arena` column — the identical call sequence replayed against the same `NodeArena` with no engine in the way — is about two-thirds of the QuickJS figure and **0.6%** of the JavaScript one (≈209 ns of ≈35,000). Practically all of the difference is engine.
 - **What that engine is doing is interpreting, and it cannot do otherwise.** A JavaScript engine compiled to WebAssembly has no JIT to fall back on: there is no way to emit and enter machine code from inside the sandbox, so SpiderMonkey runs the rule in its interpreter — inside a guest that is itself compiled code being called through the component model. Every host call additionally traverses `host.js`'s `ctx` shim and `componentize-js`'s generated bindings. §5.1 accepted interpretation as affordable "precisely because of the query gate", and that argument still holds in shape; what changed is the constant, by two orders.
 
-**What it does and does not say about the four migrated built-ins.** `no-unwrap` was chosen as the subject for being the heaviest crosser that ships — it calls seven distinct host functions where `no-glob-import` calls two, and on this corpus it averages about 155 crossings per engaged match because the sibling scan grows with the file — so it is a near-worst case rather than a typical one, and a rule that crosses twice per match pays this 110× on a number that is small to begin with. What is not in doubt is the direction. The four TypeScript built-ins now sharing one component do not run faster than they did as modules, and nothing here should be read as claiming they do; the case for compiling them is the authoring path and eventually one engine rather than two, not throughput. §15's budget table has **not** been re-baselined against them, and the levers that matter for this form are the ones that reduce crossings rather than the ones that speed a crossing up — the Rust port's hoist of `line`/`column` out of a loop took 30% of this rule's calls away, and that lever is available to a TypeScript rule unchanged.
+#### The larger cost, which the measurement above subtracts away
+
+Everything above is *per crossing*, and it is a difference between two corpora with the same match count — so whatever a `check` invocation costs **before** the rule crosses anything cancels out of it exactly. That is the right thing to remove when comparing QuickJS against a Rust component, because there it is small. For a JavaScript component it is the bigger number, and it is the one that decides the outcome for a rule that does not cross much — which is all four of the rules that actually migrated.
+
+The bench measures it by running the cold corpus at two sizes, 10 files and 40, and taking the **slope**. Every fixed cost of a run — config load, discovery, engine and component instantiation, the cache write — falls out of a slope, and on the cold corpus one match is exactly one `check` invocation and exactly one crossing. Same session, same machine:
+
+| Arm | Per file | Per match | Intercept | Per invocation, against QuickJS |
+|---|---|---|---|---|
+| TypeScript, QuickJS | 2.89 ms | 30.1 µs | +8.2 ms | — |
+| Rust component | 2.03 ms | 21.1 µs | +2.0 ms | **−9 µs** |
+| TypeScript component | 15.5 ms | 161 µs | **−31 ms** | **+98 µs** |
+
+The per-match column carries the shared per-file work — reading, hashing, parsing, query matching — which is identical over identical bytes and cancels only when two arms are differenced; the last column is that difference with the one crossing taken out. Three runs gave +107.4, +100.3 and +97.7 µs, and an independent reviewer's own extraction from a separate pair of corpus sizes gave ≈107 µs.
+
+**The intercept is the part to read before believing the slope.** It is everything that does not scale with the corpus, which is exactly where instantiating a 13 MB component would appear. For the JavaScript arm it is *negative* — −29 to −31 ms across three runs — so there is no fixed cost hiding in this figure at all. The ~100 µs is charged per invocation, not once per run.
+
+Two consequences, and the second is the one worth planning against.
+
+A Rust component's invocation is about 9 µs **cheaper** than a QuickJS one, which is a small result in the opposite direction and is why the Rust arm's cold column is lower than QuickJS's throughout. And the added cost of the JavaScript form is roughly `matches × 130 µs` before a rule crosses anything at all: about 100 µs of invocation plus the one crossing every match makes. Ten thousand matches is **1.3 seconds**, against §15's 800 ms cold budget for a whole 2,000-file run.
+
+**What this says about the four migrated built-ins, and it is not what the per-crossing figure says.** `no-unwrap` was chosen as the subject for being the heaviest crosser that ships — seven distinct host functions where `no-glob-import` calls two, and about 155 crossings per engaged match on this corpus. **The four rules that migrated are the opposite.** They are low-crossing rules, so driving their crossings to *zero* would still leave ~100 µs per invocation, and the 110× headline is nearly irrelevant to them.
+
+So the lever is **fewer matches, not fewer crossings**: the query gate of §7.2, a `fileContains` gate that keeps a file from being parsed at all, and a query that binds the site the rule actually cares about instead of a broad shape it then filters in JavaScript. Reducing crossings per match is the right lever for a *heavy* rule such as `no-unwrap` — the Rust port's hoist of `line`/`column` out of a loop took 30% of its calls away, and that lever is available to a TypeScript rule unchanged — and it is the wrong one here.
+
+The four TypeScript built-ins now sharing one component do not run faster than they did as modules, and nothing in this document should be read as claiming they do. The case for compiling them is the authoring path and eventually one engine rather than two, not throughput. §15's budget table has **not** been re-baselined against them, and §15's config-load figures are the other half of the bill.
 
 **A TypeScript rule that is not compiled is unaffected.** This is the cost of the component form, not of authoring in TypeScript: a rule loaded as a module still runs in QuickJS at the first row's price. The coexistence window (§6) is what makes that a choice rather than a migration everyone pays for.
 

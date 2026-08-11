@@ -634,6 +634,22 @@ and `--no-install` is satisfied — and the failure is still `MODULE_NOT_FOUND` 
 dependency. Two different faults with one symptom shape; `_componentize` carries a check for
 `packages/lanekeep/node_modules/.bin/jco` for the first and nothing but this note for the second.
 
+**A rule's marginal cost inside a JavaScript component is about 3 KB against a 12.4 MiB engine,
+so the arithmetic that decides component *count* is nothing like the arithmetic for Rust.**
+Measured 2026-08-10 with jco 1.27.0, matched pairs from one sitting: hosting `no-default-export`
+alone gives 13,021,569 bytes and hosting all four gives 13,028,097 — **6,528 bytes for three more
+rules**, about 2.2 KB each; on an earlier pair with different bundling the three cost 9,702 bytes.
+What is being paid for is a StarlingMonkey build, and the rules are rounding error on it.
+
+Two consequences that do not follow from the Rust experience, where a rule crate is a 26 KB
+artifact and one per rule is perfectly reasonable. **One component must host every TypeScript
+rule that ships**, or four rules cost 49.37 MiB instead of 12.34 MiB — which is why `world rule`
+takes a rule index on every export at all. And **a second JavaScript component is close to
+unaffordable for a different reason**: `lanekeep-rules` packages at 4.1 MiB compressed with one,
+against crates.io's 10 MiB limit, so a second one leaves almost no room. If Go or Python
+authoring later wants its own component, that ceiling is the thing to check first rather than
+after.
+
 **`componentize-js` leaves `Date.now()` and `Math.random()` present and *frozen*, and
 `--disable all` does not touch them.** Measured 2026-08-10, jco 1.27.0 with componentize-js
 0.22.0: a component built with `--disable all` imports exactly one interface — checked at the
@@ -763,21 +779,36 @@ wrong. And `packages/lanekeep/builtin.d.ts` declares a built-in as `Rule & ((opt
 a superset covering both shapes deliberately, because the specifier cannot say which one a rule is
 — so TypeScript accepts the call that throws `not a function` at run time.
 
-Both shapes have to keep working, which is why the fix is neither "make it a factory" nor "leave
-it an object": a config naming a built-in bare — `"lanekeep/no-default-export"` — has
-`lanekeep-config` render it as the imported binding itself, while the documented usage calls it.
-Such a rule is a factory whose properties are copied onto the function (`for...in`, not
-`Object.assign` — the sandbox's intrinsics are an allowlist and `Object` is not on it), which is
-what `builtin.d.ts` claimed all along. **The three genuine factories — `no-restricted-imports`,
-`no-circular-imports`, `no-unused-exports` — are the mirror image and are not fixed: referenced
-bare from a JSON config they render as a function where a rule object is expected.** No scaffold
-emits one, so nothing trips it today.
+Both shapes had to keep working, which is why the fix was neither "make it a factory" nor "leave
+it an object": a config naming a built-in bare has `lanekeep-config` render it as the imported
+binding itself, while the documented usage calls it. Such a rule became a factory whose
+properties are copied onto the function (`for...in`, not `Object.assign` — the sandbox's
+intrinsics are an allowlist and `Object` is not on it), which is what `builtin.d.ts` claimed all
+along. The mirror image is a genuine factory referenced *bare* from a JSON config, which renders
+as a function where a rule object is expected.
 
-The two rules this was found on, `no-unwrap` and `no-glob-import`, are components now, so neither
-is an example of it any more — a bare reference to one renders as `null`, the placeholder holding
-a component's place in the entry module's array, and its options reach it through `configure` as
-data. The trap is unchanged for the eight built-ins that are still TypeScript modules, which is
-why the example above was repointed at one of them rather than deleted.
+**No shipped built-in is in either shape today, and the mechanism is unchanged.** Six of the ten
+are components now: the two Rust rules first, then `no-default-export`,
+`no-restricted-imports`, `no-circular-imports` and `no-unused-exports` — which is all three of
+the genuine factories and both rules the dual shape was written for. A bare reference to a
+component renders as `null`, the placeholder holding its place in the entry module's array, and
+its options arrive through `configure` as JSON data rather than through a call. The four still
+shipped as modules — two Python, two Go — each `export default defineRule({…})` and take no
+options at all, so none of them can exhibit either half. Verified rather than assumed: no file
+under `crates/lanekeep-rules/rules/` still carries the `for (const key in …)` copy, and the only
+surviving instance of the dual shape in this repository is
+`crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy that ships to nobody.
+
+So the live surface is **project** rules, which is where it always mattered most: a rule
+declaring `check(ctx, m, options)` and exporting a plain object ignores every option it
+documents, in a repository where no built-in demonstrates the mistake any more.
+
+**This paragraph was itself stale for a while, in the file that exists to stop that**, and how it
+happened is the useful part: the migration swept for the rule *names* it was changing, and this
+text describes them by *shape* — "the three genuine factories", "the eight built-ins that are
+still TypeScript modules". That is the entry below about grepping a formula rather than a claim,
+arriving once more. A count written out in prose is the spelling no pattern matches and no test
+covers.
 
 **`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
 `ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a

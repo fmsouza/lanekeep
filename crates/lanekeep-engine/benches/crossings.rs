@@ -138,6 +138,29 @@
 //! different number, and a rule that moves lists will see the canonical ABI's copy cost more
 //! than this one does.
 //!
+//! # The other cost, which the subtraction above deliberately removes
+//!
+//! Everything above is *per crossing*, and it is a difference between two corpora with the same
+//! number of matches — so whatever a `check` invocation costs **before** the rule crosses
+//! anything cancels out of it exactly. For the two arms this file was written for that was the
+//! right thing to remove, because it is small. For a JavaScript component it is the larger of
+//! the two numbers, and it is the one that decides whether a *low-crossing* rule came out ahead
+//! or behind, which is the question the migration actually poses.
+//!
+//! So the cold corpus is measured at two sizes, [`FILES`] and [`SMALL_FILES`], and the **slope**
+//! between them is the per-file cost with every fixed cost of a run removed — config load,
+//! discovery, engine and component instantiation, the cache write. Divided by [`FUNCTIONS`] it
+//! is the cost of one match, and on the cold corpus a match is exactly one `check` invocation
+//! and exactly one crossing. Differencing two arms then cancels the reading, hashing, parsing
+//! and query matching, which are identical work over identical bytes; taking one crossing out
+//! with the figure above leaves the invocation.
+//!
+//! **The intercept is printed beside it and has to be read before the slope is believed.** It is
+//! everything a run costs that does not scale with the corpus, which is exactly where a 13 MB
+//! component's instantiation would show up. If the per-match figure were really an instantiation
+//! cost divided by a match count, the intercept is where that would be visible, and it is not
+//! there.
+//!
 //! # Not a gate on time
 //!
 //! `benches/corpus.rs` explains at length why absolute times cannot be asserted on a hosted
@@ -182,6 +205,13 @@ type Violation = (String, u32, u32);
 /// carries `corpus.rs`. Forty files is about five seconds here, and the difference it produces
 /// is still more than an order of magnitude larger than the run-to-run spread.
 const FILES: usize = 40;
+
+/// Files in the second cold corpus, which exists to give the first one a slope.
+///
+/// A quarter, so the two points are far enough apart that the difference between them is not
+/// noise, and small enough that the extra measurement is cheap. See "The other cost" above for
+/// what the slope and the intercept are each for.
+const SMALL_FILES: usize = 10;
 
 /// Top-level functions per file, each holding one method call.
 ///
@@ -297,6 +327,8 @@ impl Arm {
 enum Corpus {
     /// The method the rule ignores: one crossing per match.
     Cold,
+    /// The same again over a quarter of the files, so the two have a slope between them.
+    ColdSmall,
     /// The method the rule is about: the full ancestor walk.
     Hot,
 }
@@ -304,10 +336,28 @@ enum Corpus {
 impl Corpus {
     const fn method(self) -> &'static str {
         match self {
-            Self::Cold => COLD_METHOD,
+            Self::Cold | Self::ColdSmall => COLD_METHOD,
             Self::Hot => HOT_METHOD,
         }
     }
+
+    const fn files(self) -> usize {
+        match self {
+            Self::Cold | Self::Hot => FILES,
+            Self::ColdSmall => SMALL_FILES,
+        }
+    }
+}
+
+/// One arm's three measurements.
+struct Measured {
+    arm: Arm,
+    /// The cold corpus over [`SMALL_FILES`] files.
+    small: Duration,
+    /// The cold corpus over [`FILES`] files.
+    cold: Duration,
+    /// The hot corpus over [`FILES`] files.
+    hot: Duration,
 }
 
 fn main() {
@@ -321,18 +371,26 @@ fn main() {
         .filter(|arm| *arm != Arm::JavaScript || javascript.is_some())
         .collect();
 
+    let small = Project::build(Corpus::ColdSmall, javascript.as_deref());
     let cold = Project::build(Corpus::Cold, javascript.as_deref());
     let hot = Project::build(Corpus::Hot, javascript.as_deref());
 
     let mut measured = Vec::new();
     let mut reported = Vec::new();
     for arm in arms.iter().copied() {
-        // The violations come back from the measured runs themselves rather than from four
+        // The violations come back from the measured runs themselves rather than from six
         // more runs made to collect them. They are the same runs either way, and a bench that
         // runs in CI should not pay twice for one answer.
+        let (small_time, small_violations) = small.measure(arm);
         let (cold_time, cold_violations) = cold.measure(arm);
         let (hot_time, hot_violations) = hot.measure(arm);
-        measured.push((arm, cold_time, hot_time));
+        measured.push(Measured {
+            arm,
+            small: small_time,
+            cold: cold_time,
+            hot: hot_time,
+        });
+        reported.push((Corpus::ColdSmall, arm, small_violations));
         reported.push((Corpus::Cold, arm, cold_violations));
         reported.push((Corpus::Hot, arm, hot_violations));
     }
@@ -340,11 +398,12 @@ fn main() {
     // After the engine runs, not before them. The replay is single-threaded work over the same
     // corpora, so putting it first would leave the page cache and the allocator in a state the
     // measured runs did not choose for themselves.
+    let small_calls = Crossings::of(&small);
     let cold_calls = Crossings::of(&cold);
     let hot_calls = Crossings::of(&hot);
 
-    report(&measured, &cold_calls, &hot_calls);
-    gate(&reported, &cold_calls, &hot_calls);
+    report(&measured, &cold_calls, &hot_calls, &small_calls);
+    gate(&reported, &cold_calls, &hot_calls, &small_calls);
 }
 
 /// Confine the whole run to one thread.
@@ -373,7 +432,7 @@ fn single_threaded() {
 /// Whichever way is the point. This is the one quantity that could have inverted the argument
 /// for putting rules in components, and a benchmark reported only when it is favorable is not a
 /// benchmark.
-fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossings) {
+fn report(measured: &[Measured], cold: &Crossings, hot: &Crossings, small: &Crossings) {
     println!(
         "\nlanekeep host-API crossings — {FILES} files, {FUNCTIONS} functions each, \
          `lanekeep/no-unwrap`, one thread\n"
@@ -384,8 +443,9 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
     );
 
     let mut per_call = Vec::new();
-    for &(arm, cold_time, hot_time) in measured {
-        let delta = hot_time.saturating_sub(cold_time);
+    for m in measured {
+        let arm = m.arm;
+        let delta = m.hot.saturating_sub(m.cold);
         let calls = hot.total(arm) - cold.total(arm);
         let arena = hot.arena_time(arm).saturating_sub(cold.arena_time(arm));
 
@@ -401,8 +461,8 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
         println!(
             "  {:<22} {:>8.1?} {:>8.1?} {:>8.1?} {calls:>12} {ns:>8.1} {arena_ns:>8.1} {:>8.1}",
             arm.label(),
-            cold_time,
-            hot_time,
+            m.cold,
+            m.hot,
             delta,
             ns - arena_ns,
         );
@@ -432,10 +492,11 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
     println!("\n  calls counted by replay — the three rules do not make the same ones:");
     for &(arm, _) in &per_call {
         println!(
-            "    {:<22} cold {:>10}  hot {:>10}",
+            "    {:<22} cold {:>10}  hot {:>10}  small {:>10}",
             arm.label(),
             cold.total(arm),
-            hot.total(arm)
+            hot.total(arm),
+            small.total(arm),
         );
     }
 
@@ -458,6 +519,8 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
         );
     }
 
+    invocations(measured, &per_call);
+
     if per_call.len() < Arm::ALL.len() {
         println!(
             "\n  the JavaScript component arm did not run: {} is not there.\n  \
@@ -467,6 +530,98 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
         );
     }
     println!();
+}
+
+/// What one `check` invocation costs, which the headline above subtracts away.
+///
+/// See "The other cost" in this module's documentation for why it is a separate measurement
+/// rather than a column: the per-crossing figure is a difference between two corpora with equal
+/// match counts, so the invocation cancels out of it by construction. For a low-crossing rule —
+/// which is all four of the migrated built-ins — this is the number that decides the outcome,
+/// and the one above says almost nothing.
+///
+/// Everything here comes off the **cold** corpus at two sizes, where one match is exactly one
+/// invocation and exactly one crossing.
+fn invocations(measured: &[Measured], per_call: &[(Arm, f64)]) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "File and function counts are three-digit constants."
+    )]
+    let per_file_matches = FUNCTIONS as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "File and function counts are three-digit constants."
+    )]
+    let spread = (FILES - SMALL_FILES) as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "File and function counts are three-digit constants."
+    )]
+    let files = FILES as f64;
+
+    println!(
+        "\n  what a `check` invocation costs, from the cold corpus at {SMALL_FILES} files and \
+         {FILES}.\n  The per-match column carries the shared per-file work — reading, hashing, \
+         parsing, matching —\n  which is identical over identical bytes and cancels only when \
+         two arms are differenced.\n"
+    );
+    println!(
+        "  {:<22} {:>12} {:>12} {:>12}",
+        "arm", "per file", "per match", "intercept"
+    );
+
+    let mut per_match = Vec::new();
+    for m in measured {
+        let slope = (m.cold.as_secs_f64() - m.small.as_secs_f64()) * 1e9 / spread;
+        let intercept = m.cold.as_secs_f64() * 1e9 - files * slope;
+        per_match.push((m.arm, slope / per_file_matches));
+
+        println!(
+            "  {:<22} {:>10.2}ms {:>10.1}µs {:>10.2}ms",
+            m.arm.label(),
+            slope / 1e6,
+            slope / per_file_matches / 1e3,
+            intercept / 1e6,
+        );
+    }
+
+    // The intercept is not a curiosity. It is every fixed cost of a run — config load,
+    // discovery, engine build, component instantiation, the cache write — and it is where a
+    // 13 MB component's instantiation would appear if the per-match figure were really that
+    // cost divided by a match count. A value at or below zero says the slope is a slope.
+    let baseline = per_match
+        .iter()
+        .find(|(arm, _)| *arm == Arm::TypeScript)
+        .map(|&(_, ns)| ns);
+    let crossing = per_call
+        .iter()
+        .find(|(arm, _)| *arm == Arm::TypeScript)
+        .map(|&(_, ns)| ns);
+
+    println!("\n  against QuickJS, with the one crossing a cold match makes taken out:");
+    for &(arm, ns) in &per_match {
+        let (Some(baseline), Some(crossing)) = (baseline, crossing) else {
+            continue;
+        };
+        if arm == Arm::TypeScript {
+            continue;
+        }
+        let this_crossing = per_call
+            .iter()
+            .find(|(other, _)| *other == arm)
+            .map_or(crossing, |&(_, ns)| ns);
+        let invocation = ns - baseline - (this_crossing - crossing);
+        println!(
+            "    {:<22} {:>+10.1}µs per invocation, before it crosses anything",
+            arm.label(),
+            invocation / 1e3,
+        );
+    }
+    println!(
+        "\n  So the end-to-end cost of an arm is roughly `matches x invocation + crossings x \
+         ns/call`,\n  and for a rule that crosses a handful of times per match the first term \
+         is the whole answer."
+    );
 }
 
 /// The machine-independent assertions: each branch of the replay agrees with its own engine.
@@ -492,10 +647,16 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
 /// branches are pure functions of the corpus, so a missing artifact removes an engine from the
 /// first loop and nothing from the second — which is what keeps the JavaScript branch from
 /// drifting on a machine that never builds its component.
-fn gate(reported: &[(Corpus, Arm, Vec<Violation>)], cold: &Crossings, hot: &Crossings) {
+fn gate(
+    reported: &[(Corpus, Arm, Vec<Violation>)],
+    cold: &Crossings,
+    hot: &Crossings,
+    small: &Crossings,
+) {
     for (corpus, arm, violations) in reported {
         let replayed = match corpus {
             Corpus::Cold => cold,
+            Corpus::ColdSmall => small,
             Corpus::Hot => hot,
         };
         if let Some(detail) = disagreement(violations, replayed.reports(*arm)) {
@@ -507,7 +668,11 @@ fn gate(reported: &[(Corpus, Arm, Vec<Violation>)], cold: &Crossings, hot: &Cros
         }
     }
 
-    for (corpus, replayed) in [(Corpus::Cold, cold), (Corpus::Hot, hot)] {
+    for (corpus, replayed) in [
+        (Corpus::Cold, cold),
+        (Corpus::ColdSmall, small),
+        (Corpus::Hot, hot),
+    ] {
         for arm in Arm::ALL {
             if let Some(detail) =
                 disagreement(replayed.reports(Arm::TypeScript), replayed.reports(arm))
@@ -559,6 +724,9 @@ struct Project {
     /// was never crossed. It read 3.8 ns against 5.7 ns before this was noticed, both of which
     /// are far too small for a host call and neither of which meant anything.
     cache: PathBuf,
+    /// How many files this corpus has. Two of the three have [`FILES`]; the third is what gives
+    /// the cold measurement a slope.
+    files: usize,
 }
 
 impl Project {
@@ -576,6 +744,7 @@ impl Project {
         let project = Self {
             cache: lanekeep_cache::Store::path_for(&dir),
             dir,
+            files: corpus.files(),
         };
         project.write("no-unwrap.ts", TYPESCRIPT_RULE.as_bytes());
         project.write("no-unwrap.wasm", &component_bytes());
@@ -585,7 +754,7 @@ impl Project {
         for arm in Arm::ALL {
             project.write(arm.config(), config_source(arm.rule()).as_bytes());
         }
-        for index in 0..FILES {
+        for index in 0..project.files {
             project.write(
                 &format!("src/m{index:04}.rs"),
                 file_source(corpus.method()).as_bytes(),
@@ -799,7 +968,7 @@ impl Crossings {
         let mut calls = [0; Arm::ALL.len()];
         let mut arena = [Duration::MAX; Arm::ALL.len()];
 
-        let sources: Vec<(String, String)> = (0..FILES)
+        let sources: Vec<(String, String)> = (0..project.files)
             .map(|index| {
                 let relative = format!("src/m{index:04}.rs");
                 let source = std::fs::read_to_string(project.dir.join(&relative))
