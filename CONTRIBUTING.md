@@ -37,7 +37,7 @@ Every check is defined once, in the `justfile`. CI runs the same recipes, so a g
 | `just check` | The full gate — runs on push and in CI |
 | `just test` | Rust tests only |
 | `just test-scripts` | The repository's own shell tooling |
-| `just test-go` | The Go launcher, skipped where Go is absent |
+| `just test-go` | The Go launcher and the Go rule SDK, skipped where Go is absent |
 | `just fmt` | Apply formatting |
 | `just snapshot` | Review pending snapshot changes |
 

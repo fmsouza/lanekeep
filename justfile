@@ -483,10 +483,10 @@ go-rules:
     # on the only route to a green tree. Recording first would make them skippable by ignoring
     # one exit code.
     #
-    # `go test` as well, and it is the only place these run. `just test-go` operates in the
-    # *root* module, which excludes a nested one by construction — `go list ./...` there reports
-    # only the launcher — so `go-rules/lanekeep`'s own tests are reachable from nowhere else
-    # today.
+    # `go test` as well. `just test-go` runs the same three now, so this is no longer the only
+    # place they execute — and it stays here regardless, because the two answer different
+    # questions: the gate asks whether the source is sound, and this asks it *before* an
+    # artifact built from that source is copied over a committed one.
     #
     # `go build ./...` is deliberately not here: `main.go` is a `package main` whose imports are
     # `//go:wasmimport` declarations with no body, so it type-checks everywhere and *links* only
@@ -593,27 +593,58 @@ test-scripts:
     @./scripts/test-workflows.sh
     @./scripts/test-release-config.sh
 
-# The Go launcher: formatting, vet, and its own tests.
+# The Go code: formatting, vet, and tests. **Two modules, and the second one is the reason
+# this recipe is not one command.**
 #
-# Skipped where Go is absent rather than failing. It is one distribution lane, and making
-# the Rust gate require a Go toolchain would cost every contributor for something most of
-# them never touch — the same trade `test-shell-portability.sh` makes for bash 3.2. CI has
-# Go on every runner, so it is a real check there.
+# `cmd/lanekeep` is the launcher and lives in the root module. `go-rules/` is a module of its
+# own, and a nested module is excluded from `./...` by construction — `go list ./...` at the
+# root reports only the launcher, whatever is underneath `go-rules/`. So for three commits the
+# Go SDK's tests ran in no gate at all: reachable only through `just go-rules`, a recipe that
+# requires TinyGo and that neither gate invokes. Green, and asserting nothing.
+#
+# None of the three commands below needs TinyGo, which is what puts the second module here on
+# exactly the launcher's terms. `just go-rules` runs the same three ahead of its build and
+# keeps doing so — that recipe is the only path an artifact reaches a commit by, so its checks
+# have to sit on that path whether or not they also run here.
+#
+# **`go build ./...` is deliberately absent, and would fail if it were here.** `go-rules`'s
+# `main.go` is a `package main` whose host functions are `//go:wasmimport` declarations with no
+# body: it type-checks everywhere and *links* only on a wasm target. On the host it fails with
+# `relocation target ... not defined`, which is the toolchain working correctly and reads like
+# a broken build. `go vet` and `go test` compile every package without linking that one.
+#
+# Skipped where Go is absent rather than failing — one guard for both modules, so a machine
+# without Go skips the same set it would have run. It is one distribution lane plus one
+# authoring lane, and making the Rust gate require a Go toolchain would cost every contributor
+# for something most of them never touch: the same trade `test-shell-portability.sh` makes for
+# bash 3.2. CI has Go on every runner, so it is a real check there.
+#
+# `go-rules/` has one dependency, so the first run here populates a module cache. Offline with
+# an empty one it fails, exactly as a cold `cargo` would — that is not new to this recipe.
 test-go:
     #!/usr/bin/env bash
     set -euo pipefail
     if ! command -v go >/dev/null 2>&1; then
-        echo "note: no go toolchain here, so the launcher tests are skipped (CI covers them)"
+        echo "note: no go toolchain here, so the launcher and rule-SDK tests are skipped (CI covers them)"
         exit 0
     fi
-    unformatted="$(gofmt -l ./cmd)"
+
+    # One `gofmt` over both, and from the repository root so the paths it prints can be opened
+    # from where the reader is standing. `gofmt` walks directories and knows nothing about
+    # module boundaries, which is the one place that fact helps rather than hurts.
+    unformatted="$(gofmt -l ./cmd ./go-rules)"
     if [ -n "${unformatted}" ]; then
         echo "error: not gofmt'd:" >&2
         echo "${unformatted}" >&2
         exit 1
     fi
+
     go vet ./...
     go test ./...
+
+    # And the nested module, which the two lines above cannot see.
+    (cd go-rules && go vet ./...)
+    (cd go-rules && go test ./...)
 
 # The authoring package's JavaScript tests.
 #

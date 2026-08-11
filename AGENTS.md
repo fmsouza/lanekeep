@@ -27,7 +27,7 @@ passes here it passes there.
 | `just check-fast` | Format, clippy, tests. What pre-commit runs. |
 | `just check` | The full gate. What pre-push and CI run. |
 | `just test` | Rust tests via nextest |
-| `just test-go` | The Go launcher's tests, skipped where Go is absent |
+| `just test-go` | Both Go modules — the launcher and the rule SDK — skipped where Go is absent |
 | `just test -- <filter>` | A subset — `just test -- cache::` |
 | `just fmt` | Apply formatting |
 | `just snapshot` | Review pending insta snapshots |
@@ -1169,6 +1169,16 @@ nothing else. A scratch copy under `/target/` — never near a commit — redden
 in the repository. Put a `go.mod` in any scratch directory containing Go files, which is what makes
 it a nested module and invisible; that is the same construction that keeps `go-rules/` out of the
 root module's `./...`.
+
+**And the same construction cost the Go SDK's tests every gate for three commits, which is the
+half of it that mattered.** `just test-go` ran `go vet ./...` and `go test ./...` in the root
+module, so it reported on `cmd/lanekeep` and on nothing else; `go-rules/lanekeep`'s eleven test
+functions were reachable only through `just go-rules`, a recipe that requires TinyGo and that
+neither gate invokes. Nothing said so — `just check` was green, and a recipe called `test-go`
+reads like it covers the Go code. `test-go` now runs `gofmt -l`, `go vet` and `go test` in both
+modules behind one `command -v go` guard, since none of the three needs TinyGo. Carry the general
+form: **`./...` is scoped to a module, not to a directory**, so adding a nested module silently
+subtracts it from every wildcard the parent runs.
 
 ## What not to do
 

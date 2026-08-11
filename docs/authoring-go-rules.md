@@ -100,10 +100,12 @@ require and `just setup` does not install.
 ## The shape of the module
 
 `go-rules/` is one Go module, `github.com/fmsouza/lanekeep/go-rules`, and it is **not** a member
-of any Cargo workspace or of the repository's root Go module. That last part is load-bearing:
-`just test-go` runs `go vet ./...` and `go test ./...` in the *root* module, which excludes a
-nested one by construction, so nothing in `go-rules/` is reachable from a gate. It is also why
-`go-rules/`'s own tests run in `just go-rules` and nowhere else.
+of any Cargo workspace or of the repository's root Go module. That last part has a consequence
+worth knowing before you add a package here: `./...` is scoped to a module rather than to a
+directory, so a wildcard run from the repository root reaches `cmd/lanekeep` and nothing under
+`go-rules/`. `just test-go` therefore runs `gofmt -l`, `go vet` and `go test` in **both** modules
+— it did not always, and for three commits the SDK's tests ran in `just go-rules` and nowhere
+else, which is to say in no gate at all.
 
 ```
 go-rules/
