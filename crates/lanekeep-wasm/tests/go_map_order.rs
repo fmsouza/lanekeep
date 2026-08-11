@@ -75,10 +75,10 @@
 //!
 //! | reset deleted from | what moves | which test fails |
 //! | --- | --- | --- |
-//! | `Metadata` | three back-to-back reads: `bdfhaceg\|acegbdfh\|acegbdfh`, `acegbdfh\|gbdfhace\|cegbdfha`, `hacegbdf\|gbdfhace\|egbdfhac` | `metadata_reports_one_map_order_…` |
+//! | `Metadata` | the first three of the six calls: `bdfhaceg\|acegbdfh\|acegbdfh`, `acegbdfh\|gbdfhace\|cegbdfha`, `hacegbdf\|gbdfhace\|egbdfhac` | `metadata_reports_one_map_order_…` |
 //! | `Configure` | rule 0's `dfhacegb\|acegbdfh\|acegbdfh` against rule 1's `bdfhaceg\|acegbdfh\|acegbdfh` | `a_late_configure_sees_what_an_early_one_saw` |
 //! | `Check` | six calls give six messages, from `bdfhaceg\|acegbdfh\|acegbdfh` through `bdfhaceg\|dfhacegb\|acegbdfh` | `a_go_rules_map_order_does_not_depend_…` |
-//! | `Reduce` | three back-to-back calls, the same three the `Metadata` row lists | `reduce_reports_one_map_order_…` |
+//! | `Reduce` | the first three of six, the same three the `Metadata` row lists | `reduce_reports_one_map_order_…` |
 //!
 //! **The two identical middle columns are the mechanism showing through**, not a copy-paste: a
 //! neutered `metadata` and a neutered `reduce` both walk three maps per call and both start from
