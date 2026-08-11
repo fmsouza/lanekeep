@@ -35,10 +35,10 @@ _require tool:
 # ---------------------------------------------------------------------------
 
 # Pre-commit gate. Fast enough to run on every commit without being resented.
-check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js
+check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-rust-rules test-scripts test-go test-js docs deny machete typos-check msrv
+check: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -768,6 +768,81 @@ test-js:
         exit 1
     fi
     echo "${ran} passed, 0 failed"
+
+# The Python rule-authoring SDK's tests.
+#
+# Skipped where Python is absent rather than failing, on `test-go`'s terms and for its
+# reasons: the SDK is one authoring lane, and making the Rust gate require a Python
+# toolchain would cost every contributor for something most of them never touch. CI has
+# Python on every runner, so it is a real check there.
+#
+# The SDK is type-agnostic — it never imports the generated `wit_world` bindings — so
+# these tests run on the host with plain Python and no `componentize-py`. The example
+# rules are not tested here; they are tested through the real engine by `just py-rules`.
+test-py:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "note: no python3 here, so the Python rule-SDK tests are skipped (CI covers them)"
+        exit 0
+    fi
+    (cd py-rules && PYTHONPATH=. python3 -m unittest discover -s tests -v)
+
+# Build the Python component and prove it through the real engine.
+#
+# The only path a Python artifact is built by, and outside every gate for the reason the
+# other artifact-building recipes are: it needs `componentize-py`, which the gates
+# deliberately do not require. The artifact is **not committed** — `componentize-py`
+# output is not byte-reproducible (CPython's hash seed is drawn from `wasi:random`
+# during pre-init and frozen into the heap image), so a committed artifact would leave a
+# permanently dirty digest line. This recipe builds it, runs the SDK's own tests, and
+# runs the Rust integration tests that drive it through the real engine.
+#
+# **`--stub-wasi` is a requirement, not a preference.** A default build imports 26
+# instances (wall clock, environment, filesystem, sockets); a `--stub-wasi` build
+# imports exactly the declared world. `crates/lanekeep-wasm/tests/world_shape.rs` is what
+# would catch a rebuild without it.
+#
+# Three artifacts, because the determinism test needs two builds of one source: the main
+# `python-builtins.wasm` (hosting the two example rules) and a determinism probe built
+# twice (`py-determinism-a.wasm` and `py-determinism-b.wasm`). The probe reports
+# `hash('lanekeep')`, a set's iteration order, and the same set's `sorted()` order; the
+# two builds differ in the first two and agree on the third, which is the set-iteration
+# hazard and its mitigation.
+py-rules:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _require python3
+    root="$(pwd)"
+
+    # The venv, created once. `componentize-py` is the one tool the gates deliberately do
+    # not require; this recipe is the only path a Python artifact is built by.
+    if [ ! -x py-rules/.venv/bin/componentize-py ]; then
+        python3 -m venv py-rules/.venv
+        py-rules/.venv/bin/pip install --quiet --disable-pip-version-check "componentize-py==0.25.0"
+    fi
+
+    echo "building python-builtins"
+    (cd py-rules && .venv/bin/componentize-py -q -d "${root}/crates/lanekeep-wasm/wit" \
+        -w rule componentize main --stub-wasi -o target/python-builtins.wasm)
+
+    echo "building the determinism probe twice"
+    (cd py-rules && .venv/bin/componentize-py -q -d "${root}/crates/lanekeep-wasm/wit" \
+        -w rule componentize determinism_probe --stub-wasi -o target/py-determinism-a.wasm)
+    (cd py-rules && .venv/bin/componentize-py -q -d "${root}/crates/lanekeep-wasm/wit" \
+        -w rule componentize determinism_probe --stub-wasi -o target/py-determinism-b.wasm)
+
+    echo "running the Python SDK tests"
+    (cd py-rules && PYTHONPATH=. python3 -m unittest discover -s tests -v)
+
+    echo "running the fidelity and determinism tests"
+    LANEKEEP_PY_RULES_WASM="${root}/py-rules/target/python-builtins.wasm" \
+    LANEKEEP_PY_DETERMINISM_A="${root}/py-rules/target/py-determinism-a.wasm" \
+    LANEKEEP_PY_DETERMINISM_B="${root}/py-rules/target/py-determinism-b.wasm" \
+    cargo nextest run -p lanekeep-rules --test python_rules
+    LANEKEEP_PY_DETERMINISM_A="${root}/py-rules/target/py-determinism-a.wasm" \
+    LANEKEEP_PY_DETERMINISM_B="${root}/py-rules/target/py-determinism-b.wasm" \
+    cargo nextest run -p lanekeep-wasm --test python_determinism
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 #
