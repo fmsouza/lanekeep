@@ -683,6 +683,17 @@ test-go:
     (cd go-rules && go vet ./...)
     (cd go-rules && go test ./...)
 
+    # A second vet of the same module under the build tag TinyGo's `wasm-unknown` target sets.
+    # `go-rules/lanekeep` is two files split on that tag — `rand.go` for the real reset,
+    # `rand_host.go` for the host no-op — and the two tags have to partition every build
+    # between them or the package declares `ResetRand` twice. They did not: `rand.go` was
+    # tagged `wasm_unknown` alone, which an ordinary `-tags wasm_unknown` on a host toolchain
+    # also satisfies, so both files were selected and the package stopped compiling. Nothing
+    # here noticed, because the plain vet above passes without the tag and TinyGo's own build
+    # is a recipe no gate runs. `go vet` is enough — this is a type-check, and it costs a
+    # second.
+    (cd go-rules && go vet -tags wasm_unknown ./...)
+
 # The authoring package's JavaScript tests.
 #
 # `packages/lanekeep/runtime/resolve.js` enforces the module-resolution rules a second time —

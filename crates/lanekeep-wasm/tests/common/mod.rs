@@ -156,7 +156,13 @@ impl Ruleset {
     }
 
     /// The runtime for the options recorded so far, building it if the options have moved.
-    fn runtime(&mut self) -> Result<&mut WasmRuntime, WasmError> {
+    ///
+    /// Reachable by a test, because a fixture whose observation is the *report* rather than the
+    /// verdict has to take it off the runtime's host state, and `check_capture` above hands back
+    /// only whether the call succeeded. Every slot this hands out belongs to the set this built,
+    /// so a caller holding it across a `configure` — which discards the runtime — gets a fresh
+    /// one on the next call rather than a stale borrow.
+    pub(crate) fn runtime(&mut self) -> Result<&mut WasmRuntime, WasmError> {
         if self.runtime.is_none() {
             let mut set = RuleSet::new(&self.engine)?;
             for (index, (id, options)) in self.ids.iter().zip(&self.options).enumerate() {

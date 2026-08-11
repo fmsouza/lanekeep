@@ -230,8 +230,17 @@ jobs:
       - run: just go-rules
 
       - name: The committed artifacts must be the ones these sources build
+        # **The assignment is a statement of its own, and that is the whole point.** `bash -e`
+        # does not abort on a command substitution that fails inside `[ ... ]` — the exit
+        # status the shell sees is the test's, not git's. Written as
+        # `if [ -z "$(git status --porcelain)" ]`, a git that dies for any reason at all
+        # substitutes the empty string, the branch is taken, and this step prints "exactly what
+        # their sources build" and exits 0: the rebuild-and-diff would assert nothing while
+        # going green. Reproduced with a `git` stub that exits 128 — the inline form printed the
+        # success message, the form below propagates 128.
         run: |
-          if [ -z "$(git status --porcelain)" ]; then
+          dirty="$(git status --porcelain)"
+          if [ -z "$dirty" ]; then
             echo "the committed Go artifacts are exactly what their sources build"
             exit 0
           fi

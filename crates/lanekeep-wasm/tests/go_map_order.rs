@@ -21,7 +21,34 @@
 //! of every host-called path. Nothing about a rule's source shows whether that happened, so the
 //! evidence here is behavioral: drive one instance repeatedly and watch the order hold still.
 //!
-//! # Why there are two tests and why the second one is not optional
+//! # All four host-called paths, not only `check`
+//!
+//! `Handlers` resets on `metadata`, `configure`, `check` and `reduce` alike, and the argument for
+//! covering the two that are not passes is written out in `go-rules/lanekeep/handlers.go`: a
+//! `configure` that decodes options into a `map[string]any` and ranges it is the ordinary way to
+//! write one.
+//!
+//! This file probed `check` and nothing else for a while, against a fixture that declared its
+//! metadata from constants, no `configure` and no `reduce` — so deleting the reset from any of
+//! the other three was caught by nothing at all, while the comment in `handlers_test.go` said a
+//! wasm probe caught all four. Each of the four reports an order of its own now, through
+//! whichever channel that export has, and there is a test per path:
+//!
+//! | path | what carries the observation | test |
+//! | --- | --- | --- |
+//! | `check` | the violation message | [`a_go_rules_map_order_does_not_depend_on_the_work_that_preceded_it`] |
+//! | `configure` | stored, and carried out by the next `check` | [`a_late_configure_sees_what_an_early_one_saw`] |
+//! | `metadata` | the rule card's message | [`metadata_reports_one_map_order_however_much_ran_before_it`] |
+//! | `reduce` | the cross-file violation message | [`reduce_reports_one_map_order_however_much_ran_before_it`] |
+//!
+//! `configure` is the one that needs more than a repeat call, because it runs once per (rule,
+//! instance) on the way to that rule's first use. On a component hosting one rule it is therefore
+//! always the first thing called on a fresh instance, where the generator is at its initial
+//! position whether or not anything reset it. The fixture hosts two rules for that reason: rule
+//! 1's `configure` can then be reached after rule 0 has worked the shared instance, which is
+//! exactly the arrangement `crates/lanekeep-wasm/src/runtime.rs` produces under a real run.
+//!
+//! # Why the sensitivity test is not optional
 //!
 //! [`a_go_rules_map_order_does_not_depend_on_the_work_that_preceded_it`] is the property.
 //! [`the_order_this_fixture_reports_moves_with_the_generator_position`] is what stops it passing
@@ -34,27 +61,34 @@
 //! So the fixture builds and walks its map three times per call and reports all three orders, and
 //! the second test asserts they *disagree*. Those three walks stand at three different positions
 //! in one call's own cycle, so their disagreeing is exactly the statement "this observable moves
-//! with the generator position" — which is the premise the first test's assertion needs in order
-//! to mean anything.
+//! with the generator position" — which is the premise every assertion here needs in order to
+//! mean anything. It is stated once, of `check`'s three passes, and the other three paths report
+//! the same observable through the same helper.
 //!
-//! Measured rather than argued, on TinyGo 0.41.1 against the fixture this commit builds. With
-//! `ResetRand` intact, six calls on one instance report `dfhacegb|acegbdfh|acegbdfh` every time.
-//! With its two assignments replaced by reads of the same globals, the same six calls report six
-//! different messages:
+//! # Measured rather than argued
 //!
-//! ```text
-//! dfhacegb|acegbdfh|acegbdfh    bdfhaceg|acegbdfh|acegbdfh    acegbdfh|gbdfhace|cegbdfha
-//! hacegbdf|gbdfhace|egbdfhac    egbdfhac|bdfhaceg|bdfhaceg    acegbdfh|dfhacegb|acegbdfh
-//! ```
+//! On TinyGo 0.41.1 against the fixture this recipe builds, with `go-rules/lanekeep`'s
+//! `handlers.go` mutated one method at a time — `ResetRand()` deleted from exactly one of the
+//! four, everything else left alone. Intact, every path on every call reports
+//! `dfhacegb|acegbdfh|acegbdfh`, which is the order a freshly instantiated guest walks that map
+//! in. Each mutant is caught by exactly one test:
 //!
-//! The first of the six is the one the working build reports, which is the reset doing exactly
-//! what it claims: pinning each call to the position a freshly instantiated guest starts from.
+//! | reset deleted from | what moves | which test fails |
+//! | --- | --- | --- |
+//! | `Metadata` | three back-to-back reads: `bdfhaceg\|acegbdfh\|acegbdfh`, `acegbdfh\|gbdfhace\|cegbdfha`, `hacegbdf\|gbdfhace\|egbdfhac` | `metadata_reports_one_map_order_…` |
+//! | `Configure` | rule 0's `dfhacegb\|acegbdfh\|acegbdfh` against rule 1's `bdfhaceg\|acegbdfh\|acegbdfh` | `a_late_configure_sees_what_an_early_one_saw` |
+//! | `Check` | six calls give six messages, from `bdfhaceg\|acegbdfh\|acegbdfh` through `bdfhaceg\|dfhacegb\|acegbdfh` | `a_go_rules_map_order_does_not_depend_…` |
+//! | `Reduce` | three back-to-back calls, the same three the `Metadata` row lists | `reduce_reports_one_map_order_…` |
+//!
+//! **The two identical middle columns are the mechanism showing through**, not a copy-paste: a
+//! neutered `metadata` and a neutered `reduce` both walk three maps per call and both start from
+//! wherever the last resetting call left off, so they read the same three positions of one cycle.
 //!
 //! And the vacuous case was built too, because a guard nobody has watched fire is a guard nobody
-//! has checked. With the reset still neutered *and* `visit` walking the key slice rather than the
-//! map — an observable that cannot move — the property test above goes **green** over a broken
-//! SDK, and this file's second test is the only thing that objects:
-//! `abcdefgh|abcdefgh|abcdefgh`.
+//! has checked. With a reset neutered *and* `visit` walking the key slice rather than the map —
+//! an observable that cannot move — the property tests go **green** over a broken SDK, and
+//! [`the_order_this_fixture_reports_moves_with_the_generator_position`] is the only thing that
+//! objects: `abcdefgh|abcdefgh|abcdefgh`.
 
 // `clippy.toml`'s `allow-expect-in-tests` reaches `#[test]` functions and `#[cfg(test)]` modules
 // and nothing else, so the helpers below — which are neither — need the grant restating. Only
@@ -72,7 +106,7 @@ use lanekeep_lang::Language;
 use lanekeep_lang_js::TypeScript;
 use lanekeep_nodes::NodeArena;
 use lanekeep_wasm::bindings::types::MatchEntry;
-use lanekeep_wasm::host::CheckContext;
+use lanekeep_wasm::host::{CheckContext, ReduceContext};
 use lanekeep_wasm::{Resource, RuleSlot, WasmRuntime};
 
 mod common;
@@ -99,7 +133,11 @@ const CALLS: usize = 6;
 /// the pair.
 const SEPARATOR: char = '|';
 
-/// How many visit orders one call reports. `passes` in the fixture.
+/// What a `check` message puts between the whole of `configure`'s observation and the whole of
+/// its own. The fixture's `section`.
+const SECTION: char = '#';
+
+/// How many visit orders one observation reports. `passes` in the fixture.
 const PASSES: usize = 3;
 
 /// One instance, called [`CALLS`] times, reports one order every time.
@@ -161,7 +199,13 @@ fn the_order_this_fixture_reports_moves_with_the_generator_position() {
     let context = check_context(&mut runtime);
 
     let reported = order(&mut runtime, slot, &context);
-    let passes: Vec<&str> = reported.split(SEPARATOR).collect();
+    // The half before the section marker is `configure`'s observation, which stands at a
+    // different point in the cycle from any of this call's own passes and so says nothing about
+    // whether *these* three move together.
+    let (_, own) = reported
+        .split_once(SECTION)
+        .expect("the message leads with what `configure` saw");
+    let passes: Vec<&str> = own.split(SEPARATOR).collect();
     assert_eq!(
         passes.len(),
         PASSES,
@@ -191,6 +235,194 @@ fn the_order_this_fixture_reports_moves_with_the_generator_position() {
              {pass}"
         );
     }
+}
+
+/// A rule configured *late*, on an instance another rule has already worked, sees what a rule
+/// configured on a fresh one sees.
+///
+/// This is the reset in `Handlers.Configure`, and nothing else here reaches it. `configure` runs
+/// once per (rule, instance) on the way to that rule's first use, so with one rule it is always
+/// the first call on a fresh instance and its observation is the initial position whether or not
+/// anything reset it — a single-rule probe is green over a `Configure` with no reset at all.
+///
+/// The fixture hosts two rules, both the same rule, so the sequence below can put one
+/// `configure` where the hazard actually puts it:
+///
+/// 1. reach rule 0, which configures it on a fresh instance and reports what its `configure` saw;
+/// 2. run [`CALLS`] more checks on rule 0, every one of them advancing the shared generator;
+/// 3. reach rule 1 for the first time, which is where *its* `configure` runs — on that same
+///    instance, after all of the above.
+///
+/// The two observations have to agree. Under a real run the order of those steps is rayon's, so
+/// disagreement is output that depends on the schedule with every cache-key input identical.
+///
+/// The module documentation's table has what each side reports with `ResetRand()` deleted from
+/// `Handlers.Configure` alone, which is the mutation this test exists to fail on.
+#[test]
+fn a_late_configure_sees_what_an_early_one_saw() {
+    let (mut harness, slots) = common::runtime_for_all(FIXTURE);
+    let (early_rule, late_rule) = (slots[0], slots[1]);
+
+    let early = configure_order(&mut harness, early_rule);
+    for _ in 0..CALLS {
+        let _ = configure_order(&mut harness, early_rule);
+    }
+    let late = configure_order(&mut harness, late_rule);
+
+    assert_eq!(
+        harness
+            .runtime()
+            .expect("the runtime is built")
+            .instantiations(),
+        1,
+        "both rules have to share one instance, or the late `configure` runs on a fresh generator \
+         and this test asserts nothing"
+    );
+    assert_eq!(
+        early, late,
+        "a rule configured after {CALLS} checks on the shared instance saw a different map order \
+         than one configured on a fresh one"
+    );
+}
+
+/// `metadata` reports one map order however much ran before it.
+///
+/// The rule card's message is the observation — the only string on that export a host reads back
+/// verbatim. `metadata` is also the export with no error channel, so a wrong answer here is not
+/// a failure: it is a rule describing itself differently on two workers.
+///
+/// **The calls are consecutive, and putting a `check` between them is what makes this test
+/// assert nothing.** All four paths reset and then spend the same nine draws, so *every* call
+/// that resets leaves the generator at the same place — which means an observation taken after
+/// one is at that same place whether or not the export under test reset anything itself. The
+/// first version of this test read `metadata`, ran [`CALLS`] checks, and read `metadata` again,
+/// and it was green against a `Handlers.Metadata` with the reset deleted: both reads stood
+/// behind a `check`'s reset and agreed for that reason. Back-to-back calls are the only
+/// arrangement where a missing reset has anywhere to show, since the second then starts where
+/// the first stopped.
+///
+/// The run after [`CALLS`] checks is kept as well, because it is the position a real run puts
+/// this call at — it just cannot be the only one.
+#[test]
+fn metadata_reports_one_map_order_however_much_ran_before_it() {
+    let (mut runtime, slot) = common::runtime_for(FIXTURE);
+    let context = check_context(&mut runtime);
+
+    let mut observed: Vec<String> = (0..CALLS)
+        .map(|_| declared_order(&mut runtime, slot))
+        .collect();
+    for _ in 0..CALLS {
+        order(&mut runtime, slot, &context);
+    }
+    observed.push(declared_order(&mut runtime, slot));
+
+    assert_eq!(
+        runtime.instantiations(),
+        1,
+        "every call has to land on one instance, or the generator is reset by accident"
+    );
+    let distinct: BTreeSet<&String> = observed.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "a rule described itself differently depending on how many draws preceded the question. \
+         Reported {observed:#?}"
+    );
+}
+
+/// `reduce` reports one map order however much ran before it.
+///
+/// The cross-file pass runs on the instance that has just checked every file that worker was
+/// handed, which is the largest amount of prior work any of the four paths meets. It is also the
+/// pass whose output is most obviously order-sensitive: a rule reducing over facts it grouped in
+/// a map reports a different violation, not the same one somewhere else.
+///
+/// Back-to-back calls, for the reason
+/// [`metadata_reports_one_map_order_however_much_ran_before_it`] sets out: an observation taken
+/// behind another resetting call is at that call's position rather than at its own, so a probe
+/// with a `check` between its two reads is green over a `Handlers.Reduce` that resets nothing.
+#[test]
+fn reduce_reports_one_map_order_however_much_ran_before_it() {
+    let (mut runtime, slot) = common::runtime_for(FIXTURE);
+    let context = check_context(&mut runtime);
+    let across = reduce_context(&mut runtime);
+
+    let mut observed: Vec<String> = (0..CALLS)
+        .map(|_| reduced_order(&mut runtime, slot, &across))
+        .collect();
+    for _ in 0..CALLS {
+        order(&mut runtime, slot, &context);
+    }
+    observed.push(reduced_order(&mut runtime, slot, &across));
+
+    assert_eq!(
+        runtime.instantiations(),
+        1,
+        "every call has to land on one instance, or the generator is reset by accident"
+    );
+    let distinct: BTreeSet<&String> = observed.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "a cross-file pass reported a different map order depending on how many draws preceded \
+         it. Reported {observed:#?}"
+    );
+}
+
+/// Run one rule's `check` and take the field of its message that `configure` filled in.
+///
+/// Reaching the rule is what configures it — `WasmRuntime::rule` is the only place `configure`
+/// happens — so the first call for a given slot is both the configuration and the read of it.
+fn configure_order(harness: &mut common::Ruleset, slot: RuleSlot) -> String {
+    let runtime = harness.runtime().expect("the runtime is built");
+    let context = check_context(runtime);
+    let reported = order(runtime, slot, &context);
+    let (configured, _) = reported
+        .split_once(SECTION)
+        .expect("the message leads with what `configure` saw");
+    configured.to_owned()
+}
+
+/// Ask one rule what it is, and take the order its `metadata` visited a map in.
+fn declared_order(runtime: &mut WasmRuntime, slot: RuleSlot) -> String {
+    runtime
+        .metadata(slot)
+        .expect("the fixture describes itself without trapping")
+        .card
+        .message
+}
+
+/// Run one rule's cross-file pass and take the order it reported.
+fn reduced_order(
+    runtime: &mut WasmRuntime,
+    slot: RuleSlot,
+    context: &Resource<ReduceContext>,
+) -> String {
+    runtime
+        .reduce(slot, context)
+        .expect("the fixture's reduce returns without trapping");
+
+    let mut reports = runtime
+        .host_mut()
+        .reduce_context_mut(context)
+        .expect("the context outlives the call that borrowed it")
+        .take_reports();
+    assert_eq!(reports.len(), 1, "one report per call: {reports:?}");
+    reports
+        .pop()
+        .and_then(|report| report.message)
+        .expect("the fixture reports the visit order as the message")
+}
+
+/// A cross-file context over nothing, pushed once and lent to every call.
+///
+/// No files and no facts: the fixture reads neither, and a list it does not look at would be one
+/// more thing for a reader to wonder about.
+fn reduce_context(runtime: &mut WasmRuntime) -> Resource<ReduceContext> {
+    runtime
+        .host_mut()
+        .push_reduce_context(ReduceContext::new(Vec::new(), Vec::new()))
+        .expect("the resource table accepts a context")
 }
 
 /// Run the fixture once and take the message it reported.

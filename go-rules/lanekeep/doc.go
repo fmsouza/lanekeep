@@ -1,10 +1,19 @@
 // Package lanekeep is the SDK every Go-authored rule in this module shares.
 //
-// Four things, deliberately, and nothing else: a name lookup over a query match ([Capture]),
-// a glob matcher ([GlobMatches]), a reset for TinyGo's map-iteration randomness
-// ([ResetRand]), and the `cabi_realloc` export the component model requires and TinyGo does
-// not supply on this target. The first two mirror `rust-rules/lanekeep-rule`; the last two
-// are TinyGo's tax, and they are here so that no rule author meets either of them as an error
+// Small, deliberately. What it holds is:
+//
+//   - the wrapper a rule declares itself through, [NewHandlers] and the [Handlers] it returns,
+//     which is what makes the reset below structural rather than a convention;
+//   - a name lookup over a query match, [Capture], with the two aliases its signature needs —
+//     [Match] for a match and [Node] for a handle;
+//   - a glob matcher, [GlobMatches];
+//   - a reset for TinyGo's map-iteration randomness, [ResetRand], exported only because the
+//     fixtures that prove it drive it directly;
+//   - the `cabi_realloc` export the component model requires and TinyGo does not supply on
+//     this target, which no rule names and every component needs.
+//
+// [Capture] and [GlobMatches] mirror `rust-rules/lanekeep-rule`, which is the whole of that
+// SDK. The rest is TinyGo's tax, here so that no rule author meets any of it as an error
 // message.
 //
 // This package is not itself a WebAssembly component. It has no world of its own and exports

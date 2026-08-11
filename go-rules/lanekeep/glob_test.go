@@ -63,6 +63,18 @@ func TestGlobMatches(t *testing.T) {
 		{"middle segment absent", "a*b*", "ax", false},
 		{"middle segment absent", "a*b*", "axb", true},
 
+		// Three `*`s, which is the smallest pattern that can tell `strings.LastIndex` from
+		// `strings.Index` in the loop's setup. One `*` never reaches that line, and with two
+		// the remainder after the first is peeled off holds exactly one — so the two functions
+		// agree, and every row above survives `Index` in place of `LastIndex`. With three, the
+		// remainder holds two: `LastIndex` splits `b*c` from the trailing literal `d` and walks
+		// both middle segments, where `Index` splits `b` from `c*d` and then demands a literal
+		// `c*d` suffix, which no value produced by expanding the wildcards can have. Reachable
+		// rather than contrived — `no-restricted-imports` patterns like `@app/*/internal/*`
+		// carry three the moment a leading or trailing one is added.
+		{"three stars", "a*b*c*d", "aXbYcZd", true},
+		{"three stars", "a*b*c*d", "aXbYcZ", false},
+
 		// a_regex_metacharacter_in_a_pattern_is_a_literal. The TypeScript original escapes
 		// these before building a RegExp. An implementation that forgot would make `a.rs`
 		// match `axrs`.

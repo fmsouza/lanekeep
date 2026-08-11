@@ -1,10 +1,21 @@
-//go:build wasm_unknown
+//go:build wasm_unknown && tinygo
 
 package lanekeep
 
 // TinyGo's map iteration is randomized from a pair of package-level pseudo-random generators
 // in its runtime, and this file writes to both of them. See the package documentation for why
 // that is a determinism requirement rather than a tuning knob.
+//
+// # The tag names both halves, because `wasm_unknown` is not the negation of `!tinygo`
+//
+// `rand_host.go` is tagged `!tinygo` for the reasons it sets out at length, and the two tags
+// have to partition the builds between them or the package has two [ResetRand]s. They did not:
+// `wasm_unknown` is an ordinary tag anyone can pass, so `go build -tags wasm_unknown` on a host
+// toolchain selected *both* files and failed with `ResetRand redeclared in this block` — a
+// message about a duplicate symbol, in a package whose two halves are each documented as
+// mutually exclusive. Nothing in either file's prose was wrong; the tags simply overlapped in a
+// configuration neither had in mind. `wasm_unknown && tinygo` is satisfied by exactly the
+// builds this file is for, since `tinygo` is set by every TinyGo target and by nothing else.
 //
 // # Which global, and why the obvious one is the wrong one
 //

@@ -2,6 +2,7 @@ package lanekeep
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/fmsouza/lanekeep/go-rules/internal/lanekeep/host/types"
@@ -16,8 +17,16 @@ import (
 // The structural half is carried by the type rather than by an assertion: `Handlers`' fields
 // are unexported and [NewHandlers] is the only constructor, so a component entry outside this
 // package cannot reach any of a rule's four funcs without going through [Handlers.Metadata],
-// [Handlers.Configure], [Handlers.Check] or [Handlers.Reduce]. Deleting the reset from any of
-// them is what a wasm probe catches; what these tests catch is a method that stopped delegating.
+// [Handlers.Configure], [Handlers.Check] or [Handlers.Reduce]. What these tests catch is a
+// method that stopped delegating.
+//
+// Deleting the reset from any one of the four is caught by
+// `crates/lanekeep-wasm/tests/go_map_order.rs`, which has a test per path and a table of what
+// each mutation makes the fixture report. That was a claim before it was true: this comment read
+// "deleting the reset from any of them is what a wasm probe catches" while the probe drove
+// `check` and nothing else, against a fixture that built its metadata from constants and
+// declared neither `configure` nor `reduce` — so three of the four were unguarded, and this
+// sentence is the only thing that said otherwise.
 
 func TestHandlersCheckDelegatesWithItsArguments(t *testing.T) {
 	want := errors.New("from the rule")
@@ -143,6 +152,40 @@ func TestHandlersReportWhichPassesExist(t *testing.T) {
 			t.Errorf("%s: HasReduce() = %v, want %v", c.name, got, c.wantRed)
 		}
 	}
+}
+
+// And `metadata` is the one export that must **not** answer, because it has no channel to
+// answer through.
+//
+// [Handlers.Metadata] returns `M` and nothing else, so a rule that declared none has two
+// possible behaviors and only one of them is honest: panic — a trap on this target, which the
+// host reports — or hand back a zero `M`, which is a rule with no id and no query that the host
+// loads and then never fires. `NewHandlers` takes the metadata func first precisely because it
+// is not optional, and this is the assertion that keeps the refusal from being softened into a
+// zero value by somebody reading the nil checks in `Check` and `Configure` and making the four
+// methods look alike.
+//
+// Written as a test rather than left to the doc comment because `var zero M; return zero` in
+// place of the panic passed every other test in this file: the four other methods' nil arms are
+// each asserted above, and nothing called `Metadata` without one.
+func TestHandlersMetadataRefusesWhenTheRuleDeclaredNone(t *testing.T) {
+	h := NewHandlers[types.RuleMetadata, types.CheckContext, types.ReduceContext](nil, nil, nil, nil)
+
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("Metadata() on a rule that declared none returned rather than panicking: " +
+				"a zero RuleMetadata is a rule the host loads and never fires")
+		}
+		// The message names what is missing, since a bare panic on this target reaches the host
+		// as `wasm trap: unreachable` with nothing in it — the message is what a maintainer
+		// reading the guest's source has instead.
+		if message, ok := recovered.(string); !ok || !strings.Contains(message, "no metadata") {
+			t.Errorf("panicked with %v, want a message naming the missing metadata", recovered)
+		}
+	}()
+
+	_ = h.Metadata()
 }
 
 // A host that dispatches without consulting `has-check` first must be told which of the two
