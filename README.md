@@ -76,8 +76,9 @@ Three things follow from who reads the output:
 
 **Rules are authored in TypeScript whatever language they check** — that is the form to start
 from, and it is the one most teams already have someone who writes. A rule may also be a
-WebAssembly component, which is how six of the ten built-ins ship — two written in Rust, and
-four compiled ahead of time from the same TypeScript they were already written in. Every form
+WebAssembly component, which is how eight of the ten built-ins ship — two written in Rust, two
+written in Go, and four compiled ahead of time from the same TypeScript they were already
+written in. Every form
 reaches the same host API and is held to the same limits, and a config names a rule rather than
 its implementation. **Configuration is neither** — `lanekeep.json` is plain data, so a Go, Python or
 Rust team never writes a `.ts` file except when authoring an actual rule.
