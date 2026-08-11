@@ -35,10 +35,10 @@ _require tool:
 # ---------------------------------------------------------------------------
 
 # Pre-commit gate. Fast enough to run on every commit without being resented.
-check-fast: fmt-check lint test test-rust-rules test-scripts test-go
+check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-rust-rules test-scripts test-go docs deny machete typos-check msrv
+check: fmt-check lint test test-rust-rules test-scripts test-go test-js docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -140,6 +140,75 @@ test *ARGS:
 test-doc:
     cargo test --workspace --doc
 
+# Build one WebAssembly component from a JavaScript or TypeScript entry module.
+#
+# Shared by `wasm-fixtures` and `typescript-builtins`, which are the only two recipes that
+# produce a component this way and which must not differ in a single flag: the JavaScript
+# fixture exists to establish what a rule can still reach once `componentize-js` has put it
+# inside StarlingMonkey, and a fixture built differently from the thing it stands in for
+# establishes nothing. Both are outside every gate, and both rewrite a committed artifact.
+#
+# **`--disable all` is load-bearing and is not tidiness.** Measured on the built-ins entry,
+# 2026-08-10, jco 1.27.0: without it the artifact imports **eighteen** WASI interfaces beside
+# the host one — `wasi:filesystem/{types,preopens}`, `wasi:clocks/{wall-clock,monotonic-clock}`,
+# `wasi:random/random`, `wasi:http/{types,outgoing-handler}`, `wasi:io/{error,poll,streams}` and
+# eight of `wasi:cli` — which is a filesystem, a clock, randomness, network and stdio in a
+# component whose whole purpose is to have none of them. `crates/lanekeep-wasm/src/load.rs`
+# refuses such an artifact at load, naming all eighteen. The flag costs 42,584 bytes
+# (13,070,681 without against 13,028,097 with) — a matched pair from one sitting, exact only to a
+# few dozen bytes since neither side is reproducible, and neither number is the committed
+# artifact's, which is a later build. The capabilities are nearly free to carry and would be very
+# expensive to have.
+#
+# **A missing Node is an error here and not a skip**, unlike in `test-js`. Both of this
+# recipe's callers end by recording digests of every source they were built from, and a build
+# that was skipped would have its sources recorded against a binary nobody rebuilt — turning
+# "a determined hand can bless without building" into the ordinary result of running the
+# recipe, which is the one thing `crates/lanekeep-wasm/tests/fixture_currency.rs` says must
+# never happen. Nothing in any gate needs Node: every artifact is committed and read with
+# `include_bytes!`.
+#
+# **And unlike every component built from Rust, these are not byte-reproducible.** Measured
+# 2026-08-10 with jco 1.27.0: three builds from an unchanged tree gave 13,023,574 / 13,023,571
+# / 13,023,630 bytes and three distinct sha256s, differing in 2,968,012 bytes. The `wizer`
+# snapshot is a heap image and SpiderMonkey's layout of it is not stable between processes. So
+# `git status` is dirty after every run of either caller, and `AGENTS.md`'s "rebuild and see
+# that nothing moved" check does not reach these two artifacts — restore one with
+# `git checkout` when its digest is the only line that moved.
+#
+# **`--no-install` is a supply-chain flag, not a speed one.** `--prefix` decides which directory
+# npx looks in; it does not stop npx fetching what it fails to find there. `node_modules/` is
+# gitignored, so on a clone that has never run `npm ci` the invocation below resolves nothing
+# locally and npx offers to install **`jco@1.0.0`** — an unrelated package on the public registry,
+# not `@bytecodealliance/jco@1.27.0` — which in a terminal is one Enter away from executing
+# against this repository. `_require node` and `_require npx` cannot see it: both binaries are
+# there. With the flag, npx refuses and exits 1 instead.
+#
+# The check above it exists because npx's refusal names the package it would have fetched rather
+# than the prefix it looked in, so `jco@1.0.0` is the last thing a reader sees when the actual
+# problem is an empty `node_modules`. It does *not* cover the other way this goes wrong — an
+# install that succeeded on too old a Node and silently skipped a native binding, which
+# `AGENTS.md` records — because in that case the binary below is present and the failure is
+# inside it.
+#
+# `{{ ARGS }}` is unquoted on purpose, so that `--bundle-config <path>` arrives as two words.
+# Every value is written in this file; none comes from a caller outside it.
+_componentize source out *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _require node
+    just _require npx
+    if [ ! -x packages/lanekeep/node_modules/.bin/jco ]; then
+        echo "error: 'packages/lanekeep' has no installed jco." >&2
+        echo "       run 'npm --prefix packages/lanekeep ci' first — componentizing needs the" >&2
+        echo "       pinned toolchain, and nothing here may fetch one." >&2
+        exit 1
+    fi
+    echo "componentizing {{ source }}"
+    npx --no-install --prefix packages/lanekeep jco componentize "{{ source }}" \
+        --wit crates/lanekeep-wasm/wit --world-name rule --disable all --bundle \
+        {{ ARGS }} -o "{{ out }}"
+
 # Rebuild the committed WebAssembly test fixtures from their sources.
 #
 # Deliberately not part of any gate. The built components are committed, so the gate does
@@ -201,6 +270,27 @@ wasm-fixtures:
     (cd "${dir}" && cargo component build --release --target wasm32-wasip1)
     cp "${dir}target/wasm32-wasip1/release/wasip1.wasm" \
        "${root}/crates/lanekeep-wasm/tests/fixtures/rejected/wasip1.wasm"
+
+    # And the one fixture that is not a Rust crate: a JavaScript rule component, which is the
+    # only way to test what a rule can still reach once `componentize-js` has put it inside
+    # StarlingMonkey. `crates/lanekeep-wasm/tests/js_globals.rs` says what that is and why it
+    # matters.
+    #
+    # **Its build belongs here rather than being left to whoever remembers**, because the step
+    # below re-records every source under `tests/fixtures/` whether this recipe built the
+    # artifact beside it or not. A JS fixture this recipe skipped would therefore have its
+    # sources blessed against a binary nobody rebuilt — turning "a determined hand can bless
+    # without building" into the ordinary result of running the recipe, which is the one thing
+    # `fixture_currency.rs` says it must never do.
+    #
+    # Everything else about the build — the flags, why a missing Node is an error rather than a
+    # skip, and why the result is not byte-reproducible — is in `_componentize`, which the
+    # shipped built-ins component shares. That sharing is not tidiness either: this fixture
+    # stands in for that component, and a fixture built with different flags stands in for
+    # nothing.
+    just _componentize \
+        crates/lanekeep-wasm/tests/fixtures/js-globals/rule.js \
+        crates/lanekeep-wasm/tests/fixtures/js-globals.wasm
 
     # Record what all of that was built from, so the gate can tell a stale artifact from a
     # current one without needing `cargo component` to find out.
@@ -295,6 +385,43 @@ rust-rules:
     LANEKEEP_BLESS_RULE_COMPONENTS=1 cargo test --quiet -p lanekeep-wasm \
         --test fixture_currency -- --exact every_committed_rule_component_is_the_one_its_sources_build
 
+# Rebuild the committed TypeScript built-ins component.
+#
+# The third recipe that rewrites a committed artifact, and outside every gate for the reason the
+# other two are: it needs a toolchain the gate deliberately does not — Node here, rather than
+# `cargo component` — and the artifact it produces is committed and read with `include_bytes!`.
+# `just check` passes on a machine with no Node at all.
+#
+# **One component for every TypeScript rule, and not one each.** Measured on this entry,
+# 2026-08-10, a matched pair from one sitting: hosting `no-default-export` alone gives 13,021,569
+# bytes and hosting all four gives 13,028,097 — **6,528 bytes for three more rules**, against a
+# per-rule cost of 13 MiB if each got its own component. What is being paid for is a
+# StarlingMonkey build, and the rules are rounding error on it. `crates/lanekeep-rules/typescript/entry.ts` is where they are
+# listed, and the index a rule sits at there is what `lanekeep_rules` dispatches on.
+#
+# `--bundle-config` is what makes lanekeep's own resolution rules apply to a bundler that would
+# otherwise resolve imports the way npm does — see `typescript/rolldown.config.mjs`, which wires
+# `packages/lanekeep/runtime/resolve.js` into rolldown rather than restating it. Everything else
+# about the build is in `_componentize`, which the JavaScript fixture shares.
+#
+# The last step records what the artifact was built from, and it is the whole of the staleness
+# check rather than half of it: `componentize-js` is not byte-reproducible, so there is no
+# rebuild-and-diff to fall back on. See `crates/lanekeep-wasm/tests/fixture_currency.rs`.
+typescript-builtins:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _componentize \
+        crates/lanekeep-rules/typescript/entry.ts \
+        crates/lanekeep-rules/components/typescript-builtins.wasm \
+        --bundle-config crates/lanekeep-rules/typescript/rolldown.config.mjs
+
+    # `cargo test` rather than `cargo nextest run`, for the reason `wasm-fixtures` gives: what
+    # is wanted here is the side effect and not the verdict, and nextest has no way to say
+    # "this one writes a file". The same test asserts under `just test` with the variable unset.
+    echo "recording TypeScript component digests"
+    LANEKEEP_BLESS_TYPESCRIPT_BUILTINS=1 cargo test --quiet -p lanekeep-wasm \
+        --test fixture_currency -- --exact every_committed_typescript_component_is_the_one_its_sources_build
+
 # Test rust-rules/: its own workspace, so `cargo test --workspace` at the root does not reach
 # it.
 #
@@ -359,6 +486,75 @@ test-go:
     fi
     go vet ./...
     go test ./...
+
+# The authoring package's JavaScript tests.
+#
+# `packages/lanekeep/runtime/resolve.js` enforces the module-resolution rules a second time —
+# `crates/lanekeep-js/src/loader.rs` enforces them at run time inside the sandbox, and that one
+# enforces them at build time for a rule compiled ahead of time into a component. Its tests are
+# ported from that file's one for one and *are* the port's specification. Not running them
+# leaves the whole port resting on `resolver_parity.rs`, which only compares refusal messages.
+#
+# Skipped where Node is absent rather than failing, on `test-go`'s terms and for its reasons:
+# componentizing is a maintainer's job, and making the Rust gate need a JavaScript toolchain
+# would cost every contributor for something most of them never touch. The `gate` job runs on
+# a runner that has Node, so it is a real check there.
+#
+# A Node too old to have `node --test` is an error rather than a skip. Absence is somebody's
+# machine; a version that cannot run the suite is a misconfiguration, and a gate that quietly
+# checks nothing because of one is the failure this recipe exists to prevent.
+#
+# **The file list is a glob, and `node --test <directory>` is not an option.** Since Node 23 a
+# directory argument is executed as a module rather than searched, and it fails in the quiet
+# direction one level up: `node --test packages/lanekeep/` exits 0 reporting one passing test,
+# having loaded `index.js`, which declares none.
+#
+# An empty expansion is refused for the reason `_fmt-rust-rules` refuses one, and the list is
+# NUL-separated through a file rather than a bash array for the reason that recipe explains —
+# macOS ships bash 3.2, where `${#array[@]}` on an empty array is an error under `set -u`.
+test-js:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v node >/dev/null 2>&1; then
+        echo "note: no node here, so the authoring package's tests are skipped (CI covers them)"
+        exit 0
+    fi
+
+    # Truncated at the first whitespace, so a carriage return cannot reach the comparison.
+    major="$(node --version | sed -E 's/^v([0-9][0-9]*).*/\1/')"
+    major="${major%%[![:digit:]]*}"
+    if [ -z "${major}" ] || [ "${major}" -lt 18 ]; then
+        echo "error: node $(node --version) has no built-in test runner." >&2
+        echo "       lanekeep's authoring package needs node 18 or newer." >&2
+        exit 1
+    fi
+
+    list="$(mktemp)"
+    output="$(mktemp)"
+    trap 'rm -f "${list}" "${output}"' EXIT
+
+    find packages/lanekeep/runtime -maxdepth 1 -name '*.test.js' -print0 > "${list}"
+    count="$(tr -cd '\0' < "${list}" | wc -c | tr -d ' ')"
+    if [ "${count}" -eq 0 ]; then
+        echo "error: no test files under packages/lanekeep/runtime/." >&2
+        echo "       nothing ran, so nothing was checked." >&2
+        exit 1
+    fi
+
+    if ! xargs -0 node --test --test-reporter=tap < "${list}" > "${output}"; then
+        cat "${output}"
+        exit 1
+    fi
+
+    # A file declaring no tests is counted by node as one passing test, so a green run is not
+    # by itself evidence that anything executed.
+    ran="$(sed -n 's/^# tests \([0-9][0-9]*\).*/\1/p' "${output}" | tail -1)"
+    if [ -z "${ran}" ] || [ "${ran}" -eq 0 ]; then
+        cat "${output}"
+        echo "error: node reported no tests from ${count} file(s)." >&2
+        exit 1
+    fi
+    echo "${ran} passed, 0 failed"
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 #
@@ -443,6 +639,35 @@ msrv:
 # not.
 bench *ARGS:
     cargo bench --workspace {{ ARGS }}
+
+# Build the JavaScript component `benches/crossings.rs` measures its third arm against.
+#
+# `lanekeep/no-unwrap` compiled from the same TypeScript the QuickJS arm runs, through the flags
+# `_componentize` gives the shipped built-ins — the point of the arm is the engine underneath the
+# rule, so a component built any other way would answer about a component nothing ships.
+#
+# **The artifact is not committed.** `target/` is gitignored, `just bench` runs without it, and
+# `crossings.rs` prints two arms and names this recipe when it is absent.
+#
+# This comment used to say committing it would make `lanekeep-engine` unpublishable, because
+# crates.io refuses a package over 10 MiB. That is not true and it points a reader at the wrong
+# thing: the cap is on the *compressed* package, and `lanekeep-rules` already commits a 13,029,888
+# byte `typescript-builtins.wasm` inside a package that measures 4,336,984 bytes. Anyone who
+# believed the old sentence would go looking for a committed artifact to delete. The real reasons
+# are that this is a benchmark input rather than something a crate ships, that `componentize-js` is
+# not byte-reproducible so no currency check could tell a stale committed copy from a current one,
+# and that the room left under the cap is worth keeping for artifacts users run.
+#
+# Outside every gate for the reason `typescript-builtins` is: it needs Node and jco, which
+# `just check` deliberately does not.
+bench-js-component:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p target/bench
+    just _componentize \
+        crates/lanekeep-engine/benches/no-unwrap-entry.ts \
+        target/bench/no-unwrap-js.wasm \
+        --bundle-config crates/lanekeep-engine/benches/no-unwrap.rolldown.mjs
 
 # Review pending insta snapshots interactively.
 snapshot:

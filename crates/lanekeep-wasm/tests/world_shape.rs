@@ -38,6 +38,14 @@ use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
 /// precompiled and never shipped.
 const WORLD_SHAPE: &[u8] = include_bytes!("fixtures/world-shape.wasm");
 
+/// The TypeScript built-ins, as built by `just typescript-builtins`.
+///
+/// Named here rather than left to the glob below so that its *absence* is a compile error —
+/// see [`the_typescript_builtins_component_imports_no_ambient_authority`], which is the whole
+/// reason this constant exists.
+const TYPESCRIPT_BUILTINS: &[u8] =
+    include_bytes!("../../lanekeep-rules/components/typescript-builtins.wasm");
+
 /// The path the stub reports as the file under check.
 const FILE: &str = "src/lib.ts";
 
@@ -302,11 +310,12 @@ fn a_component_targeting_the_world_instantiates_and_answers_both_probes() {
     let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
 
     assert!(
-        rule.call_has_check(&mut store).expect("has-check returns"),
+        rule.call_has_check(&mut store, 0)
+            .expect("has-check returns"),
         "the fixture declares a per-file pass"
     );
     assert!(
-        rule.call_has_reduce(&mut store)
+        rule.call_has_reduce(&mut store, 0)
             .expect("has-reduce returns"),
         "the fixture declares a cross-file pass"
     );
@@ -349,8 +358,9 @@ fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
         },
     ];
 
-    rule.call_check(&mut store, Resource::new_borrow(ctx.rep()), &captures)
-        .expect("check returns");
+    rule.call_check(&mut store, 0, Resource::new_borrow(ctx.rep()), &captures)
+        .expect("check returns")
+        .expect("the guest does not report a failure");
 
     assert_eq!(
         store.data().reported,
@@ -396,8 +406,9 @@ fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
         .push(ReduceContext::new(Vec::new(), Vec::new()))
         .expect("the resource table accepts a context");
 
-    rule.call_reduce(&mut store, Resource::new_borrow(ctx.rep()))
-        .expect("reduce returns");
+    rule.call_reduce(&mut store, 0, Resource::new_borrow(ctx.rep()))
+        .expect("reduce returns")
+        .expect("the guest does not report a failure");
 
     assert_eq!(
         store.data().reported,
@@ -518,8 +529,10 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// so a fixture on the wrong target passes every shape assertion right up until a real rule
 /// formats a string.
 ///
-/// The two tests above check one artifact out of eleven. Each new fixture widened that gap
-/// silently, which is why this one is written the way it is.
+/// The two tests above check one artifact; this directory holds fourteen of them, and it held
+/// eleven when that sentence was first written. Each new fixture widened the gap silently, which
+/// is why this one is written the way it is — and why the count above is the only number here,
+/// stated as something that moves rather than as a fact about the tree.
 ///
 /// # Globbed, and that is the whole point
 ///
@@ -532,8 +545,9 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// # A property, not a snapshot
 ///
 /// What is asserted is that every *instance* import is the one host interface. Not a
-/// transcript of what the eleven artifacts import today: that would be a list again, and it
-/// would have to be edited by whoever adds a fixture, which is the failure mode being fixed.
+/// transcript of what the artifacts in this directory import today: that would be a list again,
+/// and it would have to be edited by whoever adds a fixture, which is the failure mode being
+/// fixed.
 /// Importing nothing at all passes — `spike.wasm` targets its own `wit/spike.wit` and reaches
 /// no part of `std` that touches the adapter — because importing nothing is strictly less
 /// authority, never more.
@@ -618,6 +632,43 @@ fn no_fixture_artifact_imports_ambient_authority() {
          it was built for the wrong target:\n  {}\n\nevery artifact:\n  {}",
         offenders.join("\n  "),
         observed.join("\n  ")
+    );
+}
+
+/// **The one shipped component that is built from JavaScript, named rather than globbed.**
+///
+/// [`no_shipped_rule_component_imports_ambient_authority`] below already makes this claim about
+/// every artifact in that directory, and it makes it the better way — a glob cannot go stale. So
+/// this test exists for the one thing a glob cannot do: **a directory listing is satisfied by a
+/// directory that does not contain the artifact at all.** `include_bytes!` is not. Delete
+/// `typescript-builtins.wasm`, or never build it, and this crate does not compile, naming the
+/// path; the glob goes green over the two Rust components beside it and says nothing.
+///
+/// That is not hypothetical here. This artifact is the only one in the tree produced by a recipe
+/// that needs Node, and `just typescript-builtins` is outside every gate for the reason
+/// `just rust-rules` is. A contributor who has never run it has a checkout where the glob is
+/// still green.
+///
+/// # Equality, not containment
+///
+/// `{"lanekeep:host/types@0.1.0"}` exactly. A component built without `--disable all` imports
+/// `wasi:filesystem/{types,preopens}`, `wasi:clocks/{wall-clock,monotonic-clock}`,
+/// `wasi:random/random` and `wasi:http/{types,outgoing-handler}` — filesystem, clock, randomness
+/// and network, in a component whose whole purpose is to have none of them — and a containment
+/// check would pass an artifact that imports the host interface *and* all seven. The other
+/// direction matters too: a component that imports nothing is a rule that cannot call `report`,
+/// and it is what a bundle that silently dropped the runtime looks like.
+#[test]
+fn the_typescript_builtins_component_imports_no_ambient_authority() {
+    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+    let component = Component::new(&engine, TYPESCRIPT_BUILTINS)
+        .expect("the shipped TypeScript built-ins are a valid component");
+
+    let imports = instance_imports(&engine, &component);
+    assert_eq!(
+        imports,
+        vec![HOST_INTERFACE.to_owned()],
+        "equality, not containment: a component importing nothing is also wrong"
     );
 }
 

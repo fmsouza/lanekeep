@@ -50,10 +50,33 @@ ignored = ["wit-bindgen-rt"]              # only `src/bindings.rs` uses it, and 
 
 ## What the crate exports
 
-The `rule` world's exports. `metadata`, `configure`, `has-check`, `has-reduce` and `check` are
-all mandatory — a WIT world has no optional exports — and `reduce` too if the rule has a
-cross-file phase. [`world.wit`](../crates/lanekeep-wasm/wit/world.wit) is the authority on every
-signature; §6.9 of the architecture says why each of the first four exists.
+The `rule` world's exports. `rules`, `metadata`, `configure`, `has-check`, `has-reduce` and
+`check` are all mandatory — a WIT world has no optional exports — and `reduce` too if the rule
+has a cross-file phase. [`world.wit`](../crates/lanekeep-wasm/wit/world.wit) is the authority on
+every signature; §6.9 of the architecture says why each of the first five exists.
+
+**A component hosts a list of rules, and you do not write the dispatch.** Every export but
+`rules` takes a `rule: u32` index into that list, and keeping an index in step with a list by
+hand is a mismatch waiting to happen — silently, since a rule would simply answer to another
+rule's configuration. The SDK's `ruleset!` macro is the whole of it:
+
+```rust
+lanekeep_rule::ruleset! {
+    "lanekeep/no-unwrap" => NoUnwrap,
+}
+```
+
+That declares the ids `rules` reports, generates a `trait Rule`, and generates the
+`impl Guest for Component` that looks each index back up in the same list. A rule is then a unit
+struct implementing that trait, whose methods are the world's minus the index:
+`metadata`, `configure`, `has_check`, `has_reduce`, `check(ctx, m)` and `reduce(ctx)`. Most
+crates name one rule and are a ruleset of one; a crate shipping a family names several, in the
+order they should be enumerated.
+
+`check` and `reduce` return `Result<(), RuleError>`. A Rust rule has no use for it — it has no
+stack to hand back, and a panic in a guest is a trap either way — so return `Ok(())` and report
+through `ctx`. It exists for guests whose language can catch its own failure, and it is the
+difference between a diagnostic that names a line and `wasm trap: unreachable`.
 
 `metadata` is where the rule's id, languages, severity, card, query, gates and timeout live. It
 is the component's answer to what a `defineRule` call carries, it is read once at config load,
@@ -67,11 +90,16 @@ carrying the message, which is what tells a user their configuration is wrong ra
 the rule is broken.
 
 [`rust-rules/lanekeep-rule`](../rust-rules/lanekeep-rule) is the SDK, and it is deliberately
-tiny: `Node`, the `Capture` trait with `capture(&m, "name")`, and `glob_matches`. Implement
-`Capture` for your crate's own generated `bindings::MatchEntry` once, at the top of the crate,
-and then read captures by name.
+tiny: the `ruleset!` macro above, `Node`, the `Capture` trait with `capture(&m, "name")`, and
+`glob_matches`. Implement `Capture` for your crate's own generated `bindings::MatchEntry` once,
+at the top of the crate, and then read captures by name.
 
-## Two things that will bite
+Everything in those signatures — `RuleMetadata`, `CheckContext`, `Match`, `RuleError` — comes
+from your crate's own generated `bindings` module, which is why `ruleset!` is a macro rather than
+a trait the SDK declares: the SDK cannot name a type that is private to your crate, and a
+`macro_rules!` expansion resolves those names where it is written.
+
+## Three things that will bite
 
 **A node handle is an integer and the root's is zero.** `parent` returns `Option<Node>`, and
 `Some(0)` is the root — distinct from `None`, which is what the TypeScript original's
@@ -83,6 +111,25 @@ components import a wall clock and two filesystem interfaces the moment the gues
 anything in `std` — exactly the capabilities the sandbox exists to withhold. The loader refuses
 them, and a small fixture will not warn you: a guest that allocates nothing has zero imports on
 *both* targets. `just rust-rules` passes the target; do not build these by hand.
+
+**A crate's globals are shared by every rule it hosts.** One crate can export several rules,
+and the host instantiates once per (worker, **component**) rather than once per rule — so a
+`static`, a `OnceLock`, a lazily built table is one thing that all of them see, and the order
+they see it in is whichever order rayon handed a worker its files. Only `configure`'s options
+are per rule index.
+
+That is not a reason to avoid state; it is a reason for one rule about it. **Anything outliving
+a `check` call must be derivable from that call's inputs.** A memo keyed on the file path
+qualifies — being handed a populated one is indistinguishable from being handed an empty one,
+so nothing observes the sharing. A counter of files seen does not, and neither does a value
+`check` stashes in a `static` for `reduce` to read: facts are the hand-off between the two
+phases, and they are per file by construction. Breaking this gives a rule whose violations
+depend on scheduling, which is exactly the nondeterminism the sandbox withholds `Math.random`
+and the clock to prevent — reached this time through a `static`.
+
+`crates/lanekeep-wasm/tests/fixtures/two-rules/` is the shape that stays correct: it keeps its
+per-rule state in an array indexed by the rule index it is handed, and writes nothing a later
+call reads back.
 
 ## Building, testing, committing
 
@@ -113,10 +160,22 @@ than a `lanekeep.config.ts`, because a component is not a value a TypeScript mod
 
 ## Shipping it as a built-in
 
-Add it to `BUILT_IN_COMPONENTS` in
-[`crates/lanekeep-rules/src/lib.rs`](../crates/lanekeep-rules/src/lib.rs), keeping the table in
-order. A name belongs to exactly one of the two tables; a rule in both would be two programs
-answering to one id.
+**Two tables, not one**, both in
+[`crates/lanekeep-rules/src/lib.rs`](../crates/lanekeep-rules/src/lib.rs), each kept in order:
+
+- `BUILT_IN_COMPONENTS`, keyed by the *component* — its name, its bytes, and its source map if
+  it has one. This is the artifact.
+- `COMPONENT_RULES`, keyed by the *rule* — `(rule name, component name, index)`. This is what a
+  config resolves through: `component()` and `hosted()` read it and nothing else, so a component
+  listed only in the first table is embedded in the binary and reachable by no specifier.
+
+A component built from `rust-rules/<name>/` hosts one rule and its two rows agree on the name,
+which is why this used to read as one step. It is one step only in that case. The gate catches
+the omission either way — `every_component_is_a_rule_that_ships` asserts both directions — but
+it catches it as a failing unit test rather than at the place you were editing.
+
+A rule name belongs to exactly one of `BUILT_IN_RULES` and `COMPONENT_RULES`; a rule in both
+would be two programs answering to one id.
 
 Nothing else changes. `lanekeep/<name>` resolves to the component wherever it resolved to a
 module, so a rule migrating from TypeScript needs no config edit anywhere — which is the

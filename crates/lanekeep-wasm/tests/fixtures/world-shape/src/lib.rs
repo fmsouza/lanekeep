@@ -20,16 +20,22 @@ mod bindings;
 // what a guest gets flat and what it reaches through the interface path, and it is worth
 // knowing before sub-project 3 writes an authoring crate around it.
 use bindings::lanekeep::host::types::{
-    ReduceLocation, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+    ReduceLocation, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
 
 impl Guest for Component {
+    /// The one rule this component hosts. Every other export takes its index.
+    fn rules() -> Vec<String> {
+        vec!["fixture/world-shape".to_owned()]
+    }
+
     /// Not exercised by any test — every export is mandatory because a WIT world has no
     /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
-    fn metadata() -> RuleMetadata {
+    fn metadata(rule: u32) -> RuleMetadata {
+        only(rule);
         RuleMetadata {
             id: "fixture/world-shape".to_owned(),
             languages: vec!["rust".to_owned()],
@@ -66,22 +72,26 @@ impl Guest for Component {
     ///
     /// Refusing anything else keeps the loud half: a caller that hands this fixture real
     /// options is still told that it has no idea what to do with them.
-    fn configure(options_json: String) -> Result<(), String> {
+    fn configure(rule: u32, options_json: String) -> Result<(), String> {
+        only(rule);
         if options_json == "null" {
             return Ok(());
         }
         Err("fixture/world-shape takes no options".to_owned())
     }
 
-    fn has_check() -> bool {
+    fn has_check(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn has_reduce() -> bool {
+    fn has_reduce(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn check(ctx: &CheckContext, m: Match) {
+    fn check(rule: u32, ctx: &CheckContext, m: Match) -> Result<(), RuleError> {
+        only(rule);
         // Reads through the borrowed handle, so the host observes that the borrow is live
         // for the length of the call, and allocates, so the artifact's import list is a
         // real measurement rather than an artifact of the guest being too small.
@@ -95,9 +105,11 @@ impl Guest for Component {
             // without the other is the shape that could not be expressed as a union.
             None,
         );
+        Ok(())
     }
 
-    fn reduce(ctx: &ReduceContext) {
+    fn reduce(rule: u32, ctx: &ReduceContext) -> Result<(), RuleError> {
+        only(rule);
         let files = ctx.files();
         let kinds: Vec<String> = ctx.facts(None).into_iter().map(|fact| fact.kind).collect();
         ctx.report(
@@ -119,7 +131,18 @@ impl Guest for Component {
             },
             Some(&format!("{} files, {} facts", files.len(), kinds.len())),
         );
+        Ok(())
     }
+}
+
+/// The one rule this component hosts.
+///
+/// A component hosts a *list* of rules and every export but `rules` takes an index into it.
+/// This one hosts a single rule, so zero is the only index that answers — and a host asking
+/// for another has disagreed with what `rules` reported, which is worth trapping on rather
+/// than answering with the one rule's data under another rule's name.
+fn only(rule: u32) {
+    assert_eq!(rule, 0, "this component hosts one rule");
 }
 
 bindings::export!(Component with_types_in bindings);

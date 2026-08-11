@@ -276,8 +276,11 @@ corpus and disagree, because rayon splits on how the work is going, so this is a
 rather than a bound. `lanekeep-wasm`'s `MEMORY_RESERVATION` was justified on "roughly three
 hundred and fifty instantiations for a run, and it does not grow with the corpus", from workers ×
 rules at fourteen workers; the real figure at ten thousand files times ten rules is 10,380. The
-design was right — one instance per (worker, rule) is what keeps it off files × rules, which would
-be 100,000 — and the *number* it was defended with was thirty times too small. If a cost is per
+design was right — one instance per (worker, component) is what keeps it off files × rules, which
+would be 100,000 — and the *number* it was defended with was thirty times too small. (It was
+written as per (worker, rule) when a component hosted exactly one rule; a component hosting
+several now shares one instance across them, which lowers the figure and leaves the reasoning
+intact.) If a cost is per
 initializer, measure the initializers; `with_min_len` is the lever that makes the count something
 you chose.
 
@@ -329,6 +332,29 @@ The general shape is worth more than the three instances: **a fixture that is re
 earlier gate than the one under test passes for the wrong reason, or fails with a message that
 sends you to the wrong place.** All three of these produced a red test that named JSON, or
 quoting, while the property they were written for went unasserted.
+
+**And a fourth wearing different clothes: a fixture built by a helper that performs the thing
+under test asserts nothing at all.** A test for a resolver's refusal of a `..` traversal built
+its input with `path.join(root, '..', 'secret.ts')` — and `path.join` normalizes, so the
+function under test was handed an already-resolved path and never saw a `..`. Deleting the
+normalizing step from the function left every test in the file green; only mutation testing
+found it. Build such a path by concatenation, and assert that it still carries the traversal
+before handing it over.
+
+This one hides better than the three above, because the offending call looks like ordinary path
+hygiene rather than like a gate. `path.join`, `path.resolve`, `URL`, `serde_json::to_string` and
+`canonicalize` all normalize or escape; any of them standing between a test's literal and its
+assertion is worth a second look, and the question to ask is whether the helper and the subject
+do the same job.
+
+**`node --test <dir>/` executes the directory as a module on Node ≥ 23, so a suite can pass
+while running nothing.** `node --test packages/lanekeep/` reports `pass 1`: it resolved the
+directory to `index.js`, a file that declares no tests at all, and counted it. Older Node walked
+a directory for test files, so a command copied from anywhere older is silently a no-op now. The
+working form names files — `node --test 'packages/lanekeep/runtime/*.test.js'`. `just test-js`
+carries three guards for the same reason: no directory argument, an empty glob is an error, and
+node's own reported test count is asserted nonzero. "It exited 0" is precisely what this failure
+looks like.
 
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
@@ -542,8 +568,138 @@ eleven committed WebAssembly fixtures then read as stale that way — `bindings`
 does not. That is now the check rather than the investigation —
 `crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
 `tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
-there too, because eleven of the twelve committed today name it as their component target and a
-world edit with no rebuild leaves every fixture satisfying an ABI that no longer exists.
+there too, because fourteen of the fifteen committed today name it as their component target —
+every one but `spike`, which targets its own `wit/spike.wit` — and a world edit with no rebuild
+leaves every fixture satisfying an ABI that no longer exists. Count them with `ls
+crates/lanekeep-wasm/tests/fixtures/*.wasm` plus the one in `rejected/`, not from this sentence:
+it has been wrong twice, and a stale count here is the same failure the paragraph above is about.
+
+**And one of the fifteen breaks that protocol, because `componentize-js` output is not reproducible
+at all.** `js-globals.wasm` is built by `jco componentize` rather than by `cargo component`, and
+three builds over one unchanged tree — jco 1.27.0, measured 2026-08-10 — gave 13,023,574,
+13,023,571 and 13,023,630 bytes, three distinct sha256s, with 2,968,012 bytes differing between
+the first two. The `wizer` snapshot is a heap image and SpiderMonkey does not lay one out the same
+way twice. So **`just wasm-fixtures` on a *consistent* tree now leaves that artifact and its
+digest line dirty**, which the paragraph above would have you read as a stale fixture. It is not.
+Restore it with `git checkout` when its digest is the only line that moved.
+
+What is lost with it is worth naming, because the digest manifest replaces only half of it.
+Reproducibility catches staleness in *both* directions: a source edited without a rebuild, and an
+artifact that no source in the tree produces. Digests catch the first. They cannot catch the
+second, because `LANEKEEP_BLESS_WASM_FIXTURES=1` re-records whatever is in the tree without
+building it — so editing `packages/lanekeep/runtime/host.js`, blessing, and committing leaves a
+stale binary behind a green gate, and no byte-wise check can notice. What stands in for it is
+behavioral rather than byte-wise: `tests/js_globals.rs` derives its probes from what
+`crates/lanekeep-js/src/sandbox.rs` withholds and runs them *inside* the committed component, so
+an artifact that no longer satisfies the contract fails the moment the contract moves. That is
+weaker — it catches a stale artifact only where the two disagree — and it is what there is.
+
+**There are three digest manifests now, one per recipe that rewrites a committed artifact, and
+what may be shared between them is an input rather than an artifact.** `just wasm-fixtures`
+writes `fixture-digests.txt`, `just rust-rules` writes `rule-component-digests.txt`, and
+`just typescript-builtins` writes `typescript-component-digests.txt`. All three record
+`wit/world.wit`, deliberately: it is a build input to every component in the tree, and a change
+to it has to send you to every recipe. An *artifact* is the opposite case, because exactly one
+recipe can produce it — and `typescript-builtins.wasm` sits in
+`crates/lanekeep-rules/components/`, beside two artifacts a different recipe builds. Recording
+it in that recipe's manifest as well would mean a rebuild of the TypeScript component, whose
+bytes change every time, leaves the *Rust* manifest red until somebody runs `just rust-rules`: a
+recipe about other artifacts, needing `cargo component` and a wasm target, to fix a build it had
+no part in. `fixture_currency.rs`'s `TYPESCRIPT_ARTIFACTS` is the one list that partitions them,
+read by the manifest that owns them and by the manifest that must subtract them.
+
+**And `jco componentize` needs a far newer Node than `just test-js` does, which is discovered at
+*install* time and reported at build time, by neither.** `test-js` requires Node 18, the floor
+for `node --test`. The componentize toolchain's floor is set by a transitive native dependency —
+`@napi-rs/lzma@1.5.1`, reached through jco 1.27.0, declares
+`engines.node = "^22.20 || ^24.12 || >=25"`. On Node 20, `npm ci` prints a single `EBADENGINE`
+warning and **skips the platform binding**, since it is an optional dependency; whoever next runs
+`just wasm-fixtures` or `just typescript-builtins` — possibly days later — gets
+`MODULE_NOT_FOUND` from inside `@napi-rs/lzma/index.js`, on a stack that names neither Node nor a
+version. Measured 2026-08-10 in `node:20-bookworm`, on arm64 and x86-64 alike. `node:24-bookworm`
+(v24.19.0) builds the same component from the same committed lock and says nothing. Deleting
+`package-lock.json` also makes it work, by resolving a different tree — which is worth knowing
+only so that nobody mistakes it for the fix. Neither recipe is in any gate, so this cannot redden
+CI; it costs a maintainer an afternoon instead.
+
+**And `npx --prefix` fixes the directory, not the install, so a fresh clone can still fetch a
+stranger's package.** `packages/lanekeep/node_modules` is gitignored. On a checkout where nobody
+has run `npm ci` there, `npx --prefix packages/lanekeep jco …` finds no local `jco`, falls
+through to the registry, and offers to fetch `jco@1.0.0` — an unrelated package that happens to
+hold that bare name. In CI that is loud. In an interactive terminal npx *prompts*, and Enter
+accepts, so the answer to "did it work?" is yes and what ran was not this repository's toolchain.
+`just _require node` and `just _require npx` cannot catch it, because both binaries exist.
+`--no-install` closes it, turning an empty `node_modules` into an error naming the prefix.
+
+It does **not** close the case above it, which is the correction worth carrying: on too old a
+Node, `npm ci` *succeeds* and skips only the optional native binding, so `.bin/jco` is present
+and `--no-install` is satisfied — and the failure is still `MODULE_NOT_FOUND` from inside a
+dependency. Two different faults with one symptom shape; `_componentize` carries a check for
+`packages/lanekeep/node_modules/.bin/jco` for the first and nothing but this note for the second.
+
+**A rule's marginal cost inside a JavaScript component is about 3 KB against a 12.4 MiB engine,
+so the arithmetic that decides component *count* is nothing like the arithmetic for Rust.**
+Measured 2026-08-10 with jco 1.27.0, matched pairs from one sitting: hosting `no-default-export`
+alone gives 13,021,569 bytes and hosting all four gives 13,028,097 — **6,528 bytes for three more
+rules**, about 2.2 KB each; on an earlier pair with different bundling the three cost 9,702 bytes.
+What is being paid for is a StarlingMonkey build, and the rules are rounding error on it.
+
+Two consequences that do not follow from the Rust experience, where a rule crate is a 26 KB
+artifact and one per rule is perfectly reasonable. **One component must host every TypeScript
+rule that ships**, or four rules cost 49.37 MiB instead of 12.34 MiB — which is why `world rule`
+takes a rule index on every export at all. And **a second JavaScript component is close to
+unaffordable for a different reason**: `lanekeep-rules` packages at 4.1 MiB compressed with one,
+against crates.io's 10 MiB limit, so a second one leaves almost no room. If Go or Python
+authoring later wants its own component, that ceiling is the thing to check first rather than
+after.
+
+**`componentize-js` leaves `Date.now()` and `Math.random()` present and *frozen*, and
+`--disable all` does not touch them.** Measured 2026-08-10, jco 1.27.0 with componentize-js
+0.22.0: a component built with `--disable all` imports exactly one interface — checked at the
+component's import list *and* at all 29 of its core-module imports — and rule code inside it
+still read `Date.now=1786352655014`, `Math.random=0.48401551228016615`, `fetch=function`,
+`setTimeout=function`. Byte-identical across two calls in one process and across two processes
+minutes apart, because `Date.now()` is the instant the component was **built**, snapshotted into
+the `wizer` heap image, and `Math.random()` is a constant.
+
+Nothing is nondeterministic, which is exactly why nothing catches it: the component's bytes are a
+`ruleset_hash` input, so even the frozen timestamp is part of the cache key. What breaks is the
+sandbox invariant above, and present-and-frozen is worse than either absence or failure — an
+author calling `Date.now()` gets a stale build timestamp with nothing anywhere to say so.
+
+**The general form outlives this toolchain: absence at the import level is not absence at the
+JavaScript level.** The component model withholds what an engine reaches through an *import*;
+whatever the engine implements internally is there regardless of what the import list says.
+`packages/lanekeep/runtime/host.js` deletes 37 such names, from the runtime module's top level,
+before any rule module is evaluated — the ordering is load-bearing, since ES modules evaluate
+depth-first in source order and a rule imported ahead of the runtime would have module scope in
+which to capture them.
+
+**The QuickJS backend's artifact is nearly eight times smaller and its WASI imports cannot be
+dropped, so it is unusable — structurally, not for want of a flag.** Measured 2026-08-11 on one
+rule: `jco componentize --backend qjs` produces 1,702,540 bytes against StarlingMonkey's
+13,062,599, and imports **19** instances rather than one, among them `wasi:clocks/wall-clock`,
+`wasi:filesystem/types`, `wasi:filesystem/preopens` and `wasi:random/insecure-seed`. Passing
+`--disable all` with it is refused: `The --disable option is only supported by the starlingmonkey
+backend.` That refusal is honest rather than an oversight — jco's own
+`dist/cmd/componentize.js` shows `componentizeQJS` forwarding `witPath`, `jsSource`, `jsPath`,
+`world` and `sync` and computing no feature set at all, where the StarlingMonkey path calls
+`calculateFeatureSet(opts)`. So the saving is real and out of reach until that backend grows a
+feature-set parameter of its own, and "try the smaller backend" is not a lever anyone should
+spend a day rediscovering.
+
+**An uncaught throw inside a component arrives at the host as a bare `wasm trap: unreachable`.**
+The message, the thrown value's type and the whole stack are gone, because a trap carries no
+payload and there is nowhere for any of them to go. A rule failing for a perfectly nameable
+reason — `undefined.message` on a missing `card` — is therefore indistinguishable from one that
+ran off the end of memory, and the diagnostic names neither the rule nor the field.
+
+There is nothing for the host to catch better, so the conversion belongs to the guest: `check`
+and `reduce` return `result<_, rule-error>`, and `packages/lanekeep/runtime/entry.js` wraps every
+handler so a throw becomes a message plus parsed stack frames. What runs *outside* that wrapper
+has no such channel — `metadata`, and the engine's own module evaluation — which is why
+`register` validates a rule's shape at build time. That is the only remaining place where "this
+rule is missing `card.examples.bad`" can still be said in words.
 
 **A file watcher over the project root sees lanekeep's own cache writes.** `.lanekeep/` lives
 inside the root, so a `--watch` loop that reacts to every event re-checks, writes the cache,
@@ -626,21 +782,36 @@ wrong. And `packages/lanekeep/builtin.d.ts` declares a built-in as `Rule & ((opt
 a superset covering both shapes deliberately, because the specifier cannot say which one a rule is
 — so TypeScript accepts the call that throws `not a function` at run time.
 
-Both shapes have to keep working, which is why the fix is neither "make it a factory" nor "leave
-it an object": a config naming a built-in bare — `"lanekeep/no-default-export"` — has
-`lanekeep-config` render it as the imported binding itself, while the documented usage calls it.
-Such a rule is a factory whose properties are copied onto the function (`for...in`, not
-`Object.assign` — the sandbox's intrinsics are an allowlist and `Object` is not on it), which is
-what `builtin.d.ts` claimed all along. **The three genuine factories — `no-restricted-imports`,
-`no-circular-imports`, `no-unused-exports` — are the mirror image and are not fixed: referenced
-bare from a JSON config they render as a function where a rule object is expected.** No scaffold
-emits one, so nothing trips it today.
+Both shapes had to keep working, which is why the fix was neither "make it a factory" nor "leave
+it an object": a config naming a built-in bare has `lanekeep-config` render it as the imported
+binding itself, while the documented usage calls it. Such a rule became a factory whose
+properties are copied onto the function (`for...in`, not `Object.assign` — the sandbox's
+intrinsics are an allowlist and `Object` is not on it), which is what `builtin.d.ts` claimed all
+along. The mirror image is a genuine factory referenced *bare* from a JSON config, which renders
+as a function where a rule object is expected.
 
-The two rules this was found on, `no-unwrap` and `no-glob-import`, are components now, so neither
-is an example of it any more — a bare reference to one renders as `null`, the placeholder holding
-a component's place in the entry module's array, and its options reach it through `configure` as
-data. The trap is unchanged for the eight built-ins that are still TypeScript modules, which is
-why the example above was repointed at one of them rather than deleted.
+**No shipped built-in is in either shape today, and the mechanism is unchanged.** Six of the ten
+are components now: the two Rust rules first, then `no-default-export`,
+`no-restricted-imports`, `no-circular-imports` and `no-unused-exports` — which is all three of
+the genuine factories and both rules the dual shape was written for. A bare reference to a
+component renders as `null`, the placeholder holding its place in the entry module's array, and
+its options arrive through `configure` as JSON data rather than through a call. The four still
+shipped as modules — two Python, two Go — each `export default defineRule({…})` and take no
+options at all, so none of them can exhibit either half. Verified rather than assumed: no file
+under `crates/lanekeep-rules/rules/` still carries the `for (const key in …)` copy, and the only
+surviving instance of the dual shape in this repository is
+`crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy that ships to nobody.
+
+So the live surface is **project** rules, which is where it always mattered most: a rule
+declaring `check(ctx, m, options)` and exporting a plain object ignores every option it
+documents, in a repository where no built-in demonstrates the mistake any more.
+
+**This paragraph was itself stale for a while, in the file that exists to stop that**, and how it
+happened is the useful part: the migration swept for the rule *names* it was changing, and this
+text describes them by *shape* — "the three genuine factories", "the eight built-ins that are
+still TypeScript modules". That is the entry below about grepping a formula rather than a claim,
+arriving once more. A count written out in prose is the spelling no pattern matches and no test
+covers.
 
 **`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
 `ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a
@@ -751,6 +922,22 @@ exit code could fail all of its cases there and still be reported as tolerating 
 pipefail` in the stub is the fix. Worth remembering generally: a stub is test code, and test
 code that always passes is worse than none.
 
+**A `[profile.dev.package.*]` stanza naming a crate that does not exist is a silent no-op, and
+cargo reports the wrong spelling only as a per-build warning at exit 0.** wasmtime 47 renamed its
+internals: the crate is `wasmtime-internal-cranelift`, and the obvious `wasmtime-cranelift`
+matches nothing at all. Measured here — `warning: profile package spec … did not match any
+packages`, exit code **0**, and the profile silently unapplied. With the right name, `just check`
+went from 92.90 s to 15.42 s: the workspace tests compile a 12.4 MiB JavaScript component, and
+Cranelift built at `opt-level = 0` is what makes that take a minute and a half. A 6× difference
+in the pre-commit gate, sitting behind a spelling that nothing turns red.
+
+**And `cargo remove` silently deletes `[profile.dev.package.*]` stanzas and
+`[workspace.dependencies]` entries it did not add.** Observed on the root `Cargo.toml`: removing
+one dependency took three profile stanzas and an unrelated workspace-dependency entry with it.
+Put beside the entry above, that is the 6× given back without a word — the stanza vanishes, the
+build stays green, and the only symptom is a gate that got slow again. Diff the root manifest
+after any `cargo add` or `cargo remove`, or make the edit by hand.
+
 **`just mutants -- --file <path>` does not narrow anything, and does not fail in a way that says
 so.** `just` keeps the `--` inside a recipe's variadic arguments rather than consuming it, so the
 recipe expands to `cargo mutants --workspace -- --file <path>` — and `--` is cargo-mutants' own
@@ -824,6 +1011,33 @@ exactly the gap it looked like it was closing. A fixture is a claim about the en
 built against, and it goes stale exactly like documentation does: silently, and without whatever
 broke it saying so. Checking whether a mutation run actually exercises the code path you think
 it does means checking which test failed, not only that one did.
+
+**A figure measured against a working tree is reproducible by nobody who lacks that tree.** A
+fidelity check reported "87 violations over 106 files", the number went into a pull request body,
+and from there into a plan as the expected result of a later change — which came out at 99 over
+107 and read as a regression. Neither figure was wrong. The 87/106 run was made on a branch
+*before* that same branch added a file the merged commit introduces, so **no commit in history
+produces it**: the delta closes to the unit, one added file and twelve more violations, all
+twelve inside that one file. Only a run against a pinned `git archive <sha>` could establish
+that, and only because someone went looking.
+
+So name the commit beside the number, measure against it rather than against a checkout, and
+read "measured on my tree at the time" as an anecdote. Two corollaries, both cheap. Compare two
+binaries over **one** unchanging corpus, never one binary over two trees — the second measures
+the trees. And when a count does not reproduce, report the difference rather than adjusting the
+expectation to match what you now see: it is either a regression or a moved corpus, and which of
+the two it is decides everything.
+
+**Grepping a formula finds the formula, not the claim.** A stated bound moved from
+"(worker, rule)" to "(worker, component)", and the sweep that found the places to fix matched the
+string `(worker, rule)`. It found five. There were nine — the other four said the same thing in
+prose, "one instance per rule", "one `None` per rule", "one lazily built instance per rule" —
+and not one of them contains the formula. They were found by a reviewer reading, which is not a
+process anybody should rely on twice.
+
+Search for the *claim* in the several ways someone would have written it, and expect the plainest
+spelling to be the one the pattern misses. Prose is where a fact goes stale most quietly, because
+nothing about it looks like code that could be wrong.
 
 ## What not to do
 

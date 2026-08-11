@@ -384,7 +384,10 @@ fn assert_every_case(build: impl Fn(&Case) -> RuleTester + Sync) {
 /// configures it. That is why the table carries cases of each kind rather than only the
 /// configured ones.
 fn component(case: &Case) -> RuleTester {
-    let bytes = lanekeep_rules::component("no-unwrap").expect("the component ships");
+    // The index is discarded, and only because this rule's component hosts exactly one rule:
+    // `RuleTester::for_component` writes the artifact to a path and a path reference contributes
+    // every rule in it. A rule of a shared component cannot be tested this way.
+    let (bytes, _) = lanekeep_rules::component("no-unwrap").expect("the component ships");
     match case.options {
         None => RuleTester::for_component("no-unwrap", bytes, "rs"),
         Some(options) => RuleTester::for_component_configured("no-unwrap", bytes, "rs", options),

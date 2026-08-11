@@ -12,6 +12,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dev-dependencies]
+# For the digest that freezes the five rule sources this migration was required not to touch.
+# The same hash `lanekeep-cache`, `lanekeep-config` and `lanekeep-wasm` key on, so a reader
+# meets one digest across the project rather than two.
+blake3 = { workspace = true }
 # For the fields of a `Violation` that the testkit's assertions do not pin — `rule_id`,
 # `severity` and `remediation`, which a rule can get wrong without moving a position or a message.
 lanekeep-core = { workspace = true }
@@ -21,7 +25,24 @@ lanekeep-core = { workspace = true }
 # what makes the two halves unable to drift. No cycle — `lanekeep-js` depends on nothing here —
 # and no new publication-order constraint, since `lanekeep-testkit` already reaches it.
 lanekeep-js = { workspace = true }
+# For `tests/source_maps.rs`, which has to hand a component rule a real `check-context` before
+# it can watch one throw: a context is a parsed tree, an arena over it and a language. The four
+# are the smallest set that builds one, and they are dev-dependencies for the same reason
+# `lanekeep-wasm` is — nothing in this crate's own code parses a file or runs a guest.
+lanekeep-lang = { workspace = true }
+lanekeep-lang-js = { workspace = true }
+lanekeep-nodes = { workspace = true }
 lanekeep-testkit = { workspace = true }
+# For reading the committed sidecar source map in `tests/source_maps.rs`. The decoder that reads
+# it in earnest is private to `lanekeep-wasm`, and what those two tests assert is the shipped
+# file's own shape rather than anything Rust does with it.
+serde_json = { workspace = true }
+tree-sitter = { workspace = true }
+# For `tests/component_rules.rs`, which is the only place the name → (component, index) table
+# can be checked against what the components actually host: this crate has no wasm runtime, and
+# `lanekeep-wasm` sits below it and cannot see which rules ship. A dev-dependency because
+# nothing in the crate's own code runs a guest — it is a table and four `include_bytes!`es.
+lanekeep-wasm = { workspace = true }
 
 [lints]
 workspace = true

@@ -136,6 +136,32 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# Optimize wasmtime's compiler even in a debug build, because the test suite runs it.
+#
+# Nothing here optimizes lanekeep — these three crates are Cranelift, and every test that
+# loads a WebAssembly component pays for them compiling it. Unoptimized they dominate:
+# measured 2026-08-10 on `cargo test -p lanekeep-wasm --test js_globals`, whose fixture is a
+# 12.4 MiB JavaScript component, **92.90 s becomes 15.42 s**. The one-time cost is about 35 s
+# to rebuild the three of them.
+#
+# It changes nothing a user ever runs. Release builds already optimize everything, and
+# wasmtime's own codegen settings — what it emits for a guest, and how fast that guest runs —
+# are untouched; this is only how fast the compiler itself executes while compiling.
+#
+# The third name is `wasmtime-internal-cranelift` and not `wasmtime-cranelift`, which is what
+# every other project's version of this stanza says: wasmtime 47 renamed its internals behind
+# that prefix. Cargo does say so — `profile package spec ... did not match any packages` — but
+# it says it as a warning on every build, so a stanza that silently does nothing is exactly
+# what you get by copying the usual spelling. Check for that warning if this is ever edited.
+[profile.dev.package.cranelift-codegen]
+opt-level = 2
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 2
+
+[profile.dev.package.regalloc2]
+opt-level = 2
+
 # Benchmarks need symbols to be interpretable in a profiler, so they inherit
 # release optimization without the stripping.
 [profile.bench]

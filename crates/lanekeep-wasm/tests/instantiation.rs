@@ -1,11 +1,17 @@
-//! Instantiation is lazy, it is reused, and it is bounded by (worker, rule).
+//! Instantiation is lazy, it is reused, and it is bounded by (worker, component).
 //!
 //! `runtime::MEMORY_RESERVATION`'s whole argument rests on that bound — about three hundred
 //! and fifty instantiations for a run, against a 1.6× on guest compute that grows with the
 //! corpus — and until this file existed the bound was a paragraph asking callers to behave.
 //! What is asserted here is that the API makes it true: a [`Worker`] below is the shape
-//! `lanekeep-engine` gives a rayon worker, and it cannot instantiate more than once per rule
-//! however many files it is handed.
+//! `lanekeep-engine` gives a rayon worker, and it cannot instantiate more than once per
+//! component however many files it is handed and however many of that component's rules run.
+//!
+//! **Per component and not per rule**, which is the correction this file's `--- what a
+//! component instance is shared by ---` section was added for. A component is a compiled
+//! program and its rules run inside it, so one instance serves all of them; the exception is
+//! two slots naming the same rule of one component, which hold different configurations of one
+//! guest slot and cannot share.
 //!
 //! # A laziness test is the easiest kind to write so that it cannot fail
 //!
@@ -57,6 +63,9 @@ use wasmtime::component::Resource;
 /// The guest, which reports `"{file}: {captures}"` for every match it is given.
 const WORLD_SHAPE: &[u8] = include_bytes!("fixtures/world-shape.wasm");
 
+/// One component hosting two rules, each reporting `"{id}: {captures}"`.
+const TWO_RULES: &[u8] = include_bytes!("fixtures/two-rules.wasm");
+
 /// A component targeting a world of its own, for the case where resolution has to fail.
 const SPIKE: &[u8] = include_bytes!("fixtures/spike.wasm");
 
@@ -78,11 +87,14 @@ struct Run {
 }
 
 impl Run {
-    /// A run with `count` rules in it, every one of them the same guest.
+    /// A run with `count` rules in it, every one of them the same guest at the same index.
     ///
-    /// The same component behind several slots is deliberate: what distinguishes two rules
-    /// here is which `Option` holds their instance, and using one component keeps the test
-    /// about that rather than about two guests behaving differently.
+    /// The same component behind several slots is deliberate, and **the same *index* is what
+    /// keeps these slots one instance each** — rules of one component share an instance, so a
+    /// harness that varied the index would give every test below a single instantiation and the
+    /// laziness assertions would hold whatever the engine did. At index 0 throughout, each slot
+    /// is a configuration of one rule and needs an instance to hold it, which is the shape these
+    /// tests were written against.
     fn with_rules(count: usize) -> Self {
         Self::with_limits(count, Limits::default())
     }
@@ -99,7 +111,7 @@ impl Run {
         let mut rules = RuleSet::new(&engine).expect("the world links");
         for n in 0..count {
             rules
-                .add(format!("acme/rule-{n}"), &loaded, "null")
+                .add(format!("acme/rule-{n}"), &loaded, 0, "null")
                 .expect("the fixture satisfies the world");
         }
         Self {
@@ -340,6 +352,264 @@ fn a_worker_instantiates_only_the_rules_that_actually_ran() {
     assert!(!worker.runtime.is_instantiated(run.slot(2)));
 }
 
+// --- what a component instance is shared by -------------------------------------------------
+
+/// Two rules hosted by one component are one instance, not two.
+///
+/// **This is the reason the world's exports take a rule index at all.** A component is a
+/// compiled program and the rules on top of it are noise — measured 2026-08-10, a JavaScript
+/// engine compiled to a component is 12.34 MiB and three further rules with real bodies add
+/// 9,702 bytes — so four built-ins share one artifact. An engine that then instantiated per
+/// *rule* would hand every worker four copies of that engine's linear memory and give back at
+/// run time exactly what the shared artifact saved on disk. Under the shipped 64 MiB per-worker
+/// ceiling, which `MemoryCeiling` sums across every memory in a store, that is a breach rather
+/// than merely waste.
+///
+/// **The two reports are load-bearing**, on this file's usual terms: without them an engine
+/// that instantiated once and ran nothing would satisfy the count. They are also what shows the
+/// two rules stayed distinct — one instance serving both must still answer as `fixture/first`
+/// and `fixture/second`.
+#[test]
+fn one_component_hosting_two_rules_is_instantiated_once() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+    let loaded = ComponentLoader::without_cache()
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the fixture loads and imports only the declared world");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    let first = rules
+        .add("fixture/first", &loaded, 0, "null")
+        .expect("rule 0 of the component");
+    let second = rules
+        .add("fixture/second", &loaded, 1, "null")
+        .expect("rule 1 of the same component");
+
+    let mut worker = worker_over(engine, rules);
+    worker
+        .checked("src/a.ts", &[(first, "callee"), (second, "callee")])
+        .expect("checking a file returns");
+
+    assert_eq!(
+        worker.instantiations(),
+        1,
+        "one component is one instance however many of its rules run"
+    );
+    assert_eq!(
+        worker.reports,
+        vec![
+            "fixture/first: callee".to_owned(),
+            "fixture/second: callee".to_owned(),
+        ],
+        "and both rules really ran, so the count is not one-because-nothing-happened"
+    );
+}
+
+/// Two rules from two *different* components are two instances.
+///
+/// The converse, and it is what stops the fix above degenerating into "reuse whatever instance
+/// is already there". Sharing is keyed on which component hosts a rule; two components have
+/// nothing to share.
+#[test]
+fn two_components_are_instantiated_once_each() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+    let loader = ComponentLoader::without_cache();
+    let shape = loader
+        .load(&engine, "world-shape", WORLD_SHAPE)
+        .expect("the fixture loads");
+    let two = loader
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the fixture loads");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    let from_shape = rules.add("acme/shape", &shape, 0, "null").expect("added");
+    let from_two = rules.add("fixture/first", &two, 0, "null").expect("added");
+
+    let mut worker = worker_over(engine, rules);
+    worker
+        .checked("src/a.ts", &[(from_shape, "callee"), (from_two, "callee")])
+        .expect("checking a file returns");
+
+    assert_eq!(
+        worker.instantiations(),
+        2,
+        "two components cannot share an instance"
+    );
+    assert_eq!(
+        worker.reports,
+        vec![
+            "src/a.ts: callee".to_owned(),
+            "fixture/first: callee".to_owned(),
+        ]
+    );
+}
+
+/// One component named twice for the *same* rule is two instances, not one.
+///
+/// **The case that stops sharing from being keyed on the component alone.** A guest holds one
+/// configuration per rule index — `configure(rule, options)` writes it and every later `check`
+/// reads it — so two slots naming rule 0 of one component with different options cannot share an
+/// instance without one silently overwriting the other. Worse than wrong: which one won would
+/// depend on which slot that worker happened to reach first, so the answer would vary between
+/// runs on identical input.
+///
+/// It is a real config rather than a hypothetical. `lanekeep-config`'s `hash_ruleset` records
+/// that `["./r.wasm", {"rule": "./r.wasm", "options": {…}}]` "is how a rule is used bare and
+/// configured in the same run", and nothing deduplicates it.
+///
+/// The options differ here so the assertion is about the mechanism rather than about two
+/// identical registrations happening to be indistinguishable.
+#[test]
+fn one_component_named_twice_for_the_same_rule_is_not_shared() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+    let loaded = ComponentLoader::without_cache()
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the fixture loads");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    let bare = rules
+        .add("fixture/first", &loaded, 0, "null")
+        .expect("the bare reference");
+    let configured = rules
+        .add("fixture/first", &loaded, 0, r#"{"tag":"alpha"}"#)
+        .expect("the same rule, configured");
+
+    let mut worker = worker_over(engine, rules);
+    worker
+        .checked("src/a.ts", &[(bare, "callee"), (configured, "callee")])
+        .expect("checking a file returns");
+
+    assert_eq!(
+        worker.instantiations(),
+        2,
+        "two configurations of one rule need two instances to hold them"
+    );
+    assert_eq!(worker.reports.len(), 2, "and both of them ran");
+}
+
+/// Two *loads* of one component are still one component.
+///
+/// **The assertion that holds `Loaded::identity` to being content rather than object identity**,
+/// and without it the most consequential line of this design is asserted by nothing. Every other
+/// test here builds its slots from a single `Loaded`, so replacing the blake3 of the bytes with a
+/// per-`load` counter leaves all of them green.
+///
+/// The case is not hypothetical and it is not an edge: `lanekeep-config` calls
+/// `ComponentLoader::load` once per rule *reference*, so four built-ins sharing one embedded
+/// component arrive as four separate `Loaded` values over identical bytes. Under object identity
+/// those are four components, and every worker instantiates a 12.34 MiB JavaScript engine four
+/// times — which is exactly the defect this sharing exists to remove, reappearing on precisely
+/// the case it was built for.
+///
+/// One loader rather than two, because that is what config does: the two loads are distinct
+/// because `load` is called twice, not because anything else about them differs.
+#[test]
+fn two_loads_of_one_component_are_one_instance() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+    let loader = ComponentLoader::without_cache();
+    let first = loader
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the fixture loads");
+    let second = loader
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the same bytes, loaded again");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    let one = rules
+        .add("fixture/first", &first, 0, "null")
+        .expect("rule 0, through the first load");
+    let two = rules
+        .add("fixture/second", &second, 1, "null")
+        .expect("rule 1, through the second");
+
+    let mut worker = worker_over(engine, rules);
+    worker
+        .checked("src/a.ts", &[(one, "callee"), (two, "callee")])
+        .expect("checking a file returns");
+
+    assert_eq!(
+        worker.instantiations(),
+        1,
+        "two loads of one artifact are one component; recognizing them takes the bytes, and \
+         object identity would make this two"
+    );
+    assert_eq!(
+        worker.reports,
+        vec![
+            "fixture/first: callee".to_owned(),
+            "fixture/second: callee".to_owned(),
+        ],
+        "and both rules ran, so the count is not one-because-nothing-happened"
+    );
+}
+
+/// Two configurations of one rule each read their own options.
+///
+/// **The property behind the count**, and the reason the split above is keyed on the rule index
+/// rather than on the component alone. `one_component_named_twice_for_the_same_rule_is_not_shared`
+/// asserts that two such slots cost two instances, which does fail against per-component sharing
+/// — but through a proxy. This asserts the fault itself: a guest holds one configuration per rule
+/// index, so two slots sharing an instance would have the second `configure` overwrite the first,
+/// and both would answer with whichever ran last.
+///
+/// **Both rules are configured before either is read, and that ordering is the whole test.**
+/// Reading each one immediately after configuring it passes against the bug — the clobbering has
+/// not happened yet — which is the shape a test of this would take if written the obvious way.
+///
+/// What makes it a determinism failure rather than a wrong answer is that "whichever ran last" is
+/// decided by which slot that worker reached first, and rayon's work-stealing makes that
+/// run-dependent. Two runs over identical input would disagree.
+#[test]
+fn two_configurations_of_one_rule_each_read_their_own_options() {
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+    let loaded = ComponentLoader::without_cache()
+        .load(&engine, "two-rules", TWO_RULES)
+        .expect("the fixture loads");
+
+    let mut rules = RuleSet::new(&engine).expect("the world links");
+    let alpha = rules
+        .add("fixture/first", &loaded, 0, r#"{"tag":"alpha"}"#)
+        .expect("rule 0, configured one way");
+    let omega = rules
+        .add("fixture/first", &loaded, 0, r#"{"tag":"omega"}"#)
+        .expect("rule 0, configured the other");
+
+    let mut runtime = runtime_over(engine, rules);
+    // Both configured first. `rule` is where `configure` happens, so this is the moment a shared
+    // instance would lose the first rule's options.
+    runtime.rule(alpha).expect("alpha is configured");
+    runtime.rule(omega).expect("omega is configured");
+
+    let first = runtime.metadata(alpha).expect("alpha describes itself");
+    let second = runtime.metadata(omega).expect("omega describes itself");
+
+    assert!(
+        first.card.message.contains("alpha"),
+        "the first rule answered with the second's configuration, so one instance is holding \
+         both — which rule wins would depend on which slot a worker reached first: {}",
+        first.card.message
+    );
+    assert!(
+        second.card.message.contains("omega"),
+        "the second rule lost its own configuration: {}",
+        second.card.message
+    );
+}
+
+/// One worker over a rule set, for the tests above that assemble their own.
+fn worker_over(engine: Arc<WasmEngine>, rules: RuleSet) -> Worker {
+    Worker {
+        runtime: runtime_over(engine, rules),
+        reports: Vec::new(),
+    }
+}
+
+/// One runtime over a rule set, for a test that reads a rule rather than running one.
+fn runtime_over(engine: Arc<WasmEngine>, rules: RuleSet) -> WasmRuntime {
+    let limits = Limits::default();
+    let clock = RunClock::start(limits.global_timeout);
+    WasmRuntime::for_rules(engine, Arc::new(rules), limits, clock)
+}
+
 // --- the bound ----------------------------------------------------------------------------
 
 /// Every worker instantiates for itself, and once each: the bound is a product, not a total.
@@ -390,7 +660,7 @@ fn a_component_that_does_not_satisfy_the_world_is_refused_when_it_is_added() {
     let mut rules = RuleSet::new(&engine).expect("the world links");
 
     let error = rules
-        .add("acme/spike", &spike, "null")
+        .add("acme/spike", &spike, 0, "null")
         .expect_err("a component targeting another world does not satisfy this one");
     assert!(matches!(error, WasmError::Engine(_)), "{error:?}");
     assert!(
@@ -430,7 +700,7 @@ fn permitting_an_interface_does_not_bind_it() {
 
     let mut rules = RuleSet::new(&engine).expect("the world links");
     let error = rules
-        .add("acme/wasip1", &loaded, "null")
+        .add("acme/wasip1", &loaded, 0, "null")
         .expect_err("nothing bound `wasi:clocks/wall-clock`, so it cannot be resolved");
     assert!(matches!(error, WasmError::Engine(_)), "{error:?}");
     assert!(
@@ -485,7 +755,7 @@ fn the_linker_accepts_bindings_beyond_the_declared_world() {
     );
 
     let slot = rules
-        .add("acme/rule", &loaded, "null")
+        .add("acme/rule", &loaded, 0, "null")
         .expect("the world still resolves with an extra instance bound beside it");
 
     let limits = Limits::default();

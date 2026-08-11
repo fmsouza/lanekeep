@@ -30,6 +30,10 @@
 # Assembled npm packages, written at release time from built binaries.
 /dist-npm/
 
+# The authoring package's build-time toolchain. Pinned in its package.json and installed by
+# whoever componentizes the built-ins; the Rust gate needs none of it.
+/packages/**/node_modules/
+
 # Insta snapshot review leftovers. Accepted snapshots are committed; pending ones are not.
 *.snap.new
 *.pending-snap

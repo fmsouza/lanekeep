@@ -32,7 +32,7 @@ impl Repo {
         repo.git(&["config", "user.name", "Test"]);
         repo.git(&["config", "commit.gpgsign", "false"]);
 
-        repo.write("lanekeep.config.ts", config);
+        repo.write("lanekeep.json", config);
         for (path, contents) in files {
             repo.write(path, contents);
         }
@@ -106,13 +106,14 @@ fn violation_count(output: &Output) -> usize {
         .unwrap_or(0)
 }
 
-const PER_FILE_CONFIG: &str = "import { defineConfig } from 'lanekeep';\n\
-     import rule from 'lanekeep/no-default-export';\n\
-     export default defineConfig({ include: ['src/**'], rules: [rule] });\n";
+// JSON rather than a `lanekeep.config.ts`: both of these rules are compiled into a component
+// now, and a component is not a value a module can import. What `--since` and `--staged` do
+// with a rule depends on whether it reads the whole corpus, which is the same either way.
+const PER_FILE_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+     "rules": ["lanekeep/no-default-export"]}"#;
 
-const CROSS_FILE_CONFIG: &str = "import { defineConfig } from 'lanekeep';\n\
-     import rule from 'lanekeep/no-unused-exports';\n\
-     export default defineConfig({ include: ['src/**'], rules: [rule({})] });\n";
+const CROSS_FILE_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+     "rules": [{"rule": "lanekeep/no-unused-exports", "options": {}}]}"#;
 
 #[test]
 fn staged_checks_only_what_is_staged() {

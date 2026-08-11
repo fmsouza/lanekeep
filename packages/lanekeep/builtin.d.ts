@@ -17,17 +17,25 @@
  * `noRestrictedImports({ ... })` — and one taking none is the rule itself.
  *
  * **There is a third shape, and this file types it wrongly.** A built-in may ship as a
- * WebAssembly component, which has no module to import at all: `lanekeep/no-unwrap` and
- * `lanekeep/no-glob-import` are components today. The `typesVersions` mapping points every
- * specifier here, so importing one type-checks and then fails at run time with a resolution
- * error naming the reason. Name it in `lanekeep.json` instead — `"rules": ["lanekeep/no-unwrap"]`
- * — which is the spelling `lanekeep init` scaffolds and which works whichever form the rule
- * takes.
+ * WebAssembly component, which has no module to import at all. Six of the ten do today:
+ * `lanekeep/no-circular-imports`, `lanekeep/no-default-export`, `lanekeep/no-glob-import`,
+ * `lanekeep/no-restricted-imports`, `lanekeep/no-unused-exports` and `lanekeep/no-unwrap`.
+ * The `typesVersions` mapping points every specifier here, so importing one type-checks and
+ * then fails at run time with a resolution error naming the reason. Name it in `lanekeep.json`
+ * instead — `"rules": ["lanekeep/no-unwrap"]` — which is the spelling `lanekeep init` scaffolds
+ * and which works whichever form the rule takes.
+ *
+ * **The list above is a copy, and `COMPONENT_RULES` in
+ * `crates/lanekeep-rules/src/lib.rs` is the original.** That table is what a config resolves
+ * through and what the gate asserts against every shipped component's own `rules()`; nothing
+ * checks it against this comment. It said two when four more had already migrated, which is the
+ * failure this sentence exists to make cheap to notice: read the table, not this file.
  *
  * Typing that honestly needs the mapping to distinguish specifiers, which means either
  * enumerating built-ins in `package.json` — a list that goes stale on the next migration — or
- * generating it. Left as follow-up; this comment exists so the gap is not mistaken for a
- * complete enumeration. There is no `tsc` gate over this package, so nothing here is red.
+ * generating it. Left as follow-up for the second sub-project running: the TypeScript authoring
+ * revision spec §4 promised it and did not deliver it, and this comment is what stands in for it
+ * meanwhile. There is no `tsc` gate over this package, so nothing here is red.
  */
 export * from './index'
 

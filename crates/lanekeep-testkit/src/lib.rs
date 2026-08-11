@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lanekeep_core::Violation;
 use lanekeep_engine::Engine;
-use lanekeep_js::RuleRoot;
+use lanekeep_js::{BuiltinComponent, BuiltinComponentMap, RuleRoot};
 use lanekeep_lang_js::{JavaScript, TypeScript};
 use thiserror::Error;
 
@@ -77,6 +77,25 @@ pub struct RuleTester {
     /// source tester writes a `lanekeep.config.ts` — see [`RuleTester::for_component`] for why
     /// that is forced rather than chosen.
     config: &'static str,
+    /// How `lanekeep/<name>` resolves to a component, for a tester built by
+    /// [`RuleTester::for_built_in`]. [`no_components`] for every other constructor, which is
+    /// what [`RuleRoot::new`] starts with anyway.
+    components: BuiltinComponent,
+    /// The matching source-map lookup, on the same terms.
+    component_maps: BuiltinComponentMap,
+}
+
+/// A build with no built-in components, which is what every tester but a built-in one wants.
+///
+/// Written here rather than reached for in `lanekeep-js` because that crate keeps its own
+/// equivalents private, and a `fn` item is cheaper than widening its API for one caller.
+const fn no_components(_: &str) -> Option<(&'static [u8], u32)> {
+    None
+}
+
+/// The source-map half of [`no_components`].
+const fn no_component_maps(_: &str) -> Option<&'static [u8]> {
+    None
 }
 
 /// What a source rule's project is configured by.
@@ -224,6 +243,96 @@ impl RuleTester {
         Self::build_component(name, bytes, extension, Some(options))
     }
 
+    /// Build a tester for a built-in rule, named the way a real config names it.
+    ///
+    /// `name` is the bare rule name — `"no-default-export"` — and the generated `lanekeep.json`
+    /// carries `"lanekeep/no-default-export"`. `components` is the lookup that answers it, which
+    /// for lanekeep's own rules is `lanekeep_rules::component`; it is a parameter rather than a
+    /// dependency because `lanekeep-rules` dev-depends on this crate, and an edge the other way
+    /// would put each crate ahead of the other in the publication order.
+    ///
+    /// # What this exists for, and what [`RuleTester::for_component`] cannot do
+    ///
+    /// `for_component` writes an artifact to a path, and **a path reference contributes every
+    /// rule the artifact hosts**. That is right for a component built from one `rust-rules/`
+    /// crate and wrong for a shared one: the four TypeScript built-ins live in a single
+    /// `typescript-builtins.wasm`, so pointing a tester at its bytes runs all four and there is
+    /// no way to say which one is under test. Naming the *specifier* is how a config says it —
+    /// resolution goes through the embedded table, which carries the rule's index, and the
+    /// engine is handed one rule. Until this constructor existed, a rule of a shared component
+    /// could not be tested through `RuleTester` at all.
+    ///
+    /// # It is slower than every other constructor, by a lot
+    ///
+    /// A built-in that ships as a component is compiled at load, and the shared TypeScript one
+    /// is 12.4 MiB. The first `run` on a tester pays that — seconds, not milliseconds — and
+    /// later runs on the same tester map what it wrote into the throwaway project. Prefer one
+    /// tester over a table of cases to a tester per case.
+    ///
+    /// # Errors
+    ///
+    /// As [`RuleTester::new`].
+    pub fn for_built_in(
+        name: &str,
+        extension: &str,
+        components: BuiltinComponent,
+    ) -> Result<Self, TestError> {
+        Self::build_built_in(name, extension, components, None)
+    }
+
+    /// Build a tester for a built-in rule configured with options.
+    ///
+    /// `options` is **JSON**, for the reason [`RuleTester::for_component_configured`] gives: a
+    /// built-in that ships as a component takes its options as data through `configure`, and one
+    /// that ships as a module is reached from a `lanekeep.json` here too, where JSON is all a
+    /// config can write. Neither form can close over a host-supplied value.
+    ///
+    /// # Errors
+    ///
+    /// As [`RuleTester::for_component_configured`].
+    pub fn for_built_in_configured(
+        name: &str,
+        extension: &str,
+        components: BuiltinComponent,
+        options: &str,
+    ) -> Result<Self, TestError> {
+        let options: serde_json::Value = serde_json::from_str(options)
+            .map_err(|e| TestError::Setup(format!("`options` is not valid JSON: {e}")))?;
+        Self::build_built_in(name, extension, components, Some(options))
+    }
+
+    /// Serve source maps for built-in components too.
+    ///
+    /// Diagnostics only, and separate from the constructor because of it: a map decides where a
+    /// *thrown* rule is reported and nothing about what a rule finds, so a test asserting
+    /// behavior needs none. `lanekeep_rules::component_source_map` is the lookup for lanekeep's
+    /// own rules.
+    #[must_use]
+    pub const fn with_component_maps(mut self, maps: BuiltinComponentMap) -> Self {
+        self.component_maps = maps;
+        self
+    }
+
+    /// Write the throwaway project for a built-in rule named by its specifier.
+    fn build_built_in(
+        name: &str,
+        extension: &str,
+        components: BuiltinComponent,
+        options: Option<serde_json::Value>,
+    ) -> Result<Self, TestError> {
+        let mut tester = Self::empty(name, extension, JSON_CONFIG);
+        tester.components = components;
+
+        let reference = format!("lanekeep/{name}");
+        let rule = match options {
+            None => serde_json::Value::String(reference),
+            Some(options) => serde_json::json!({ "rule": reference, "options": options }),
+        };
+        let config = serde_json::json!({ "include": ["subject/**"], "rules": [rule] });
+        tester.write(JSON_CONFIG, &config.to_string())?;
+        Ok(tester)
+    }
+
     /// Write the throwaway project.
     ///
     /// `rule_expr` is what goes in the config's `rules` array — the imported module for a
@@ -292,6 +401,8 @@ impl RuleTester {
             dir,
             extension: extension.to_owned(),
             config,
+            components: no_components,
+            component_maps: no_component_maps,
         }
     }
 
@@ -318,14 +429,32 @@ impl RuleTester {
         let _ = std::fs::remove_dir_all(self.dir.join("subject"));
         self.write(&format!("subject/input.{}", self.extension), source)?;
 
-        let root = RuleRoot::new(&self.dir).map_err(|e| TestError::Setup(e.to_string()))?;
+        let root = RuleRoot::new(&self.dir)
+            .map_err(|e| TestError::Setup(e.to_string()))?
+            .with_builtin_components(self.components)
+            .with_builtin_component_maps(self.component_maps);
         let config_path = self.dir.join(self.config);
 
         let sandbox =
             lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
                 .map_err(|e| TestError::Load(e.to_string()))?;
-        let config = lanekeep_config::load(&sandbox, &root, &config_path)
-            .map_err(|e| TestError::Load(e.to_string()))?;
+        // **The throwaway project is named as the artifact root, and this crate is the one
+        // caller entitled to do it.** `LoadOptions::artifacts` is `None` by default because a
+        // rules root is not generally a project root, and guessing one would make loading a
+        // config write into a directory nobody asked for. Here the two are the same directory,
+        // this crate created it, and `Drop` removes it. Without it every `run` compiles each
+        // component twice from scratch — tolerable for a 26 KB Rust rule and seconds per case
+        // for the 12.4 MiB shared TypeScript one, which is what `for_built_in` reaches.
+        let config = lanekeep_config::load_with(
+            &sandbox,
+            &root,
+            &config_path,
+            lanekeep_config::LoadOptions {
+                artifacts: Some(&self.dir),
+                ..lanekeep_config::LoadOptions::default()
+            },
+        )
+        .map_err(|e| TestError::Load(e.to_string()))?;
 
         let engine = Engine::prepare(
             &config,

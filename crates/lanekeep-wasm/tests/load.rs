@@ -135,7 +135,7 @@ fn violations(engine: &Arc<WasmEngine>, loaded: &Loaded) -> Vec<String> {
     let engine = Arc::clone(engine);
     let mut rules = RuleSet::new(&engine).expect("the world links");
     let slot = rules
-        .add("world-shape", loaded, "null")
+        .add("world-shape", loaded, 0, "null")
         .expect("the fixture satisfies the world");
 
     let limits = Limits::default();
@@ -435,6 +435,65 @@ fn a_second_run_maps_what_the_first_compiled() {
         1,
         "and it reused the file rather than writing a second"
     );
+}
+
+/// Several rules of one component compile it once and leave one artifact.
+///
+/// **The shape every config with a shared component has.** `lanekeep-config` loads once per
+/// rule *reference* — deliberately, because the two byte sources have to be read in one place —
+/// so a `lanekeep.json` naming four rules of `typescript-builtins.wasm` calls `load` four times
+/// with identical bytes and four different names. The whole reason those four rules share one
+/// component is that the 12.4 MiB engine underneath them is paid for once; compiling it per
+/// reference hands that saving back in the one place a user feels it.
+///
+/// Measured before this was fixed, on the four-rule config: 25.4 s cold against 6.2 s for one
+/// rule, and 133 MB of `.lanekeep/components` in four byte-identical files.
+///
+/// **The name is not in the artifact's filename, and this is what says so.** It used to be, as
+/// a readability affordance, which was harmless when a component hosted one rule and is not
+/// harmless now: it made a *warm* artifact invisible to the next reference. That the name is a
+/// readability affordance and the digest is the identity is what both `NAME_CHARS` and
+/// `sanitize` said all along.
+#[test]
+fn several_rules_of_one_component_compile_it_once() {
+    let cache = Cache::new("shared");
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+
+    let loader = cache.loader();
+    for name in [
+        "lanekeep/no-circular-imports",
+        "lanekeep/no-default-export",
+        "lanekeep/no-restricted-imports",
+        "lanekeep/no-unused-exports",
+    ] {
+        let reference = loader
+            .load(&engine, name, WORLD_SHAPE)
+            .expect("every reference to one component loads");
+        assert_eq!(
+            reference.source(),
+            LoadSource::Mapped,
+            "`{name}` must come off the artifact rather than the embedded slice"
+        );
+    }
+
+    assert_eq!(
+        loader.compilations(),
+        1,
+        "one component, one compilation — the other three references must find the artifact \
+         the first one wrote"
+    );
+    assert_eq!(
+        cache.artifacts().len(),
+        1,
+        "and one file: four byte-identical copies of a 33 MB artifact is what naming it after \
+         the rule produced"
+    );
+    assert_eq!(
+        loader.mapped_loads(),
+        4,
+        "every one of them came off the mapped artifact, including the reference that wrote it"
+    );
+    assert_eq!(loader.embedded_loads(), 0);
 }
 
 /// A component changes, so its artifact does. There is no invalidation step to get wrong.

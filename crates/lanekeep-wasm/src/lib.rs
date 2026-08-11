@@ -10,7 +10,8 @@
 //! to link — and where its compiled form comes from, which is a mapped `.cwasm` in lanekeep's
 //! own cache directory whenever there is one. [`runtime::RuleSet`] resolves each admitted
 //! component against the host world once for the run. [`runtime::WasmRuntime`] is one store
-//! per worker, holding one lazily built instance per rule.
+//! per worker, holding one lazily built instance per component — several rules of one component
+//! share it, which is what the rule index every export takes is for.
 //!
 //! A fourth module answers to a different owner. [`key`] holds the two values a run folds into
 //! its cache key before any of that happens: what a rule may reach, and what a component was
@@ -112,6 +113,12 @@ pub mod host;
 pub mod key;
 pub mod load;
 pub mod runtime;
+
+// Private for the reason `facts` is, and the claim is the same one: nothing outside this
+// crate decodes a source map, because nothing outside it receives a guest's stack. A map
+// arrives as bytes — `ComponentLoader::load_mapped` — and leaves as a remapped
+// `WasmError::RuleFailed`, so the decoded form has no reason to be nameable.
+mod sourcemap;
 
 // Private, and the visibility is the claim: nothing outside this crate validates a fact,
 // because nothing outside it receives one from a guest. The module exists so the three

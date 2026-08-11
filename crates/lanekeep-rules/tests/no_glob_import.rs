@@ -325,7 +325,14 @@ fn assert_every_case(build: impl Fn(&Case) -> RuleTester + Sync) {
 /// configures it. That is why the table carries cases of each kind rather than only the
 /// configured ones.
 fn component(case: &Case) -> RuleTester {
-    let bytes = lanekeep_rules::component("no-glob-import").expect("the component ships");
+    // The index is discarded, and only because this rule's component hosts exactly one rule:
+    // `RuleTester::for_component` writes the artifact to a path and a path reference contributes
+    // every rule in it. A rule of a shared component needs `RuleTester::for_built_in`, which
+    // names the specifier instead and resolves the index through the embedded table — see
+    // `typescript_builtins_as_components.rs`. This rule can use either; `for_component` is kept
+    // because it is also the constructor a project's own component build would reach for, and
+    // it costs a fraction of a second where the shared artifact costs six.
+    let (bytes, _) = lanekeep_rules::component("no-glob-import").expect("the component ships");
     match case.options {
         None => RuleTester::for_component("no-glob-import", bytes, "rs"),
         Some(options) => {

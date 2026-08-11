@@ -61,10 +61,19 @@ enum Command {
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Recompute everything, ignoring and not writing the cache.
+        /// Recheck every file, ignoring and not writing the result cache.
         ///
         /// For diagnosing a suspected stale result. If one is ever found this way, the
         /// cache key is missing an input — that is a bug, not a reason to keep the flag on.
+        ///
+        /// It governs the result cache and nothing else. A run still writes precompiled
+        /// components into `.lanekeep/components`, which for a project naming one of the
+        /// TypeScript built-ins is about 33 MiB — worth knowing before running this in a
+        /// container you expected to leave clean. That is deliberate: an artifact is named by
+        /// a hash of the component's own bytes, so there is no stale one to serve and nothing
+        /// this flag exists to diagnose can come from it, while suppressing it would add
+        /// several seconds of recompilation to every diagnostic run. `ComponentLoader`'s own
+        /// documentation records the same decision from the other side.
         #[arg(long)]
         no_cache: bool,
 
@@ -849,7 +858,14 @@ fn prepare(
         // how it happens to be authored in this build, and a config writes `lanekeep/<name>`
         // either way — so both lookups have to be installed together, or a rule that migrated
         // stops resolving for everyone who never changed anything.
-        .with_builtin_components(lanekeep_rules::component);
+        .with_builtin_components(lanekeep_rules::component)
+        // And the third: the source maps of the components that have one, so a built-in that
+        // throws is reported at a line in the TypeScript it was authored in rather than at one
+        // in the bundle it was compiled into. Only a diagnostic depends on this — a rule that
+        // resolves without it works identically and reports the same violations — which is why
+        // it is asserted end to end in `crates/lanekeep-rules/tests/source_maps.rs` rather than
+        // left to whoever notices.
+        .with_builtin_component_maps(lanekeep_rules::component_source_map);
     let config_path = config_path(project_root, config)?;
 
     let sandbox = lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
@@ -861,7 +877,10 @@ fn prepare(
     // `artifacts` hands config load the same `.lanekeep/components` the engine's own loader uses,
     // so a component is compiled once for the project instead of once per config load and again
     // per prepare. `prepare` runs per LSP request, per MCP tool call and per `--watch` iteration,
-    // and without it that was ~58 ms per component on each of them.
+    // and without it that was ~58 ms per component on each of them — for a 26 KB Rust component,
+    // which is what was measured. The shared TypeScript built-ins are one 12.4 MiB artifact and
+    // cost about six seconds to compile, so on a project naming any of those four this line is
+    // the difference between an interactive command and an unusable one.
     //
     // `global_timeout` is `--timeout`, which overrides whatever the config settled on because a
     // flag a user typed on this run is a more specific statement than a file that applies to every

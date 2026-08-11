@@ -181,7 +181,13 @@ fn what_init_writes_actually_runs() {
     );
     project.run(&["init"]);
 
-    let output = project.run(&["check"]);
+    // The budget is raised on the command line rather than in what `init` wrote, which is the
+    // whole file under test here. `lanekeep/no-default-export` is compiled into a 12.4 MiB
+    // component, so the first run in a fresh project compiles it — 6 s in a release build on an
+    // idle machine, and several times that in a debug build with two dozen of these running at
+    // once. That is not the starter config failing to check anything, which is what this test
+    // is for.
+    let output = project.run(&["check", "--timeout", "600000"]);
     let combined = describe(&output);
     assert_eq!(output.status.code(), Some(1), "{combined}");
     assert!(combined.contains("local/no-debugger"), "{combined}");
@@ -196,6 +202,23 @@ fn the_starter_rule_can_be_explained() {
     // The card is complete, which is what makes the starter a template rather than a stub.
     let project = Project::new("explain", &[]);
     project.run(&["init"]);
+
+    // `explain` has no `--timeout`, so the raise goes in the config. What is under test is the
+    // starter *rule file* rather than the starter config, and reading any rule's card means
+    // loading the whole config first — including the 12.4 MiB component behind
+    // `lanekeep/no-default-export`. See `what_init_writes_actually_runs`, which does assert on
+    // exactly what `init` wrote.
+    let config = project.dir.join("lanekeep.json");
+    let written = std::fs::read_to_string(&config).expect("init wrote a config");
+    std::fs::write(
+        &config,
+        written.replacen(
+            '{',
+            "{\n  \"timeouts\": { \"rule\": 600000, \"global\": 600000},",
+            1,
+        ),
+    )
+    .expect("writes config");
 
     let output = project.run(&["explain", "local/no-debugger"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -293,9 +316,12 @@ fn init_writes_no_gitignore_outside_a_repository() {
 
 // --- profile -------------------------------------------------------------------------------
 
-const CONFIG: &str = "import { defineConfig } from 'lanekeep';\n\
-     import rule from 'lanekeep/no-default-export';\n\
-     export default defineConfig({ include: ['src/**'], rules: [rule] });\n";
+// JSON rather than a `lanekeep.config.ts`: `no-default-export` is compiled into a component
+// now, and a component is not a value a module can import. `--profile` measures a rule's query
+// and handler time, which is the same either way — and for a component rule it is the first
+// thing in the tree that measures one at all.
+const CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+     "rules": ["lanekeep/no-default-export"]}"#;
 
 #[test]
 fn profile_reports_the_query_handler_split() {
@@ -304,7 +330,7 @@ fn profile_reports_the_query_handler_split() {
     let project = Project::new(
         "profile",
         &[
-            ("lanekeep.config.ts", CONFIG),
+            ("lanekeep.json", CONFIG),
             ("src/a.ts", "export default 1;\n"),
         ],
     );
@@ -322,7 +348,7 @@ fn profile_goes_to_stderr_so_json_still_pipes() {
     let project = Project::new(
         "profile-json",
         &[
-            ("lanekeep.config.ts", CONFIG),
+            ("lanekeep.json", CONFIG),
             ("src/a.ts", "export default 1;\n"),
         ],
     );
@@ -340,7 +366,7 @@ fn nothing_is_profiled_without_the_flag() {
     let project = Project::new(
         "profile-off",
         &[
-            ("lanekeep.config.ts", CONFIG),
+            ("lanekeep.json", CONFIG),
             ("src/a.ts", "export default 1;\n"),
         ],
     );
@@ -360,11 +386,10 @@ fn a_rule_that_never_matched_still_appears() {
         "profile-nomatch",
         &[
             (
-                "lanekeep.config.ts",
-                "import { defineConfig } from 'lanekeep';\n\
-                 import a from 'lanekeep/no-default-export';\n\
-                 import b from 'lanekeep/no-restricted-imports';\n\
-                 export default defineConfig({ include: ['src/**'], rules: [a, b({})] });\n",
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+                    "rules": ["lanekeep/no-default-export",
+                              {"rule": "lanekeep/no-restricted-imports", "options": {}}]}"#,
             ),
             ("src/a.ts", "export default 1;\n"),
         ],

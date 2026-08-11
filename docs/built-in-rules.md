@@ -13,31 +13,40 @@ Name one by specifier and put it in your `rules` array. In a `lanekeep.json`, wh
 }
 ```
 
-Or in a `lanekeep.config.ts`:
+Or in a `lanekeep.config.ts`, for a rule that is a TypeScript module — which today means the two
+Python rules and the two Go ones:
 
 ```ts
 import { defineConfig } from 'lanekeep'
-import noDefaultExport from 'lanekeep/no-default-export'
+import noBroadExcept from 'lanekeep/no-broad-except'
 
 export default defineConfig({
   include: ['src/**'],
-  rules: [noDefaultExport],
+  rules: [noBroadExcept],
 })
 ```
 
 Built-ins resolve before the filesystem is consulted, so a file at
-`lanekeep/no-default-export.ts` in your project does not shadow one. A rule whose behavior
+`lanekeep/no-broad-except.ts` in your project does not shadow one. A rule whose behavior
 depended on whether a same-named file happened to exist would be unreasonable to debug.
 
-**Two are compiled rules rather than TypeScript modules**, and a `lanekeep.config.ts` cannot
-import one. `lanekeep/no-glob-import` and `lanekeep/no-unwrap` — the two Rust rules — are
-WebAssembly components: they have no JavaScript to import, and they describe themselves rather
-than being read out of a `defineRule` call. Name them from a `lanekeep.json` and everything
-below works the same, options included. Importing one from a TypeScript config fails at load
-saying so.
+**Six of the ten are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
+cannot import one.** The two Rust rules — `lanekeep/no-glob-import` and `lanekeep/no-unwrap` —
+and the four TypeScript ones — `lanekeep/no-default-export`,
+`lanekeep/no-restricted-imports`, `lanekeep/no-circular-imports` and
+`lanekeep/no-unused-exports` — are WebAssembly components. They have no JavaScript left to
+import at run time, and they describe themselves rather than being read out of a `defineRule`
+call.
 
-Which form a rule takes is not part of its interface. The specifier, the id, the options and
-the output are the same either way, and a rule that changes form does not change your config.
+**Name them from a `lanekeep.json` and everything below works the same, options included.**
+Importing one from a TypeScript config fails at load with a message that says so and names the
+remedy — which is the whole of the difference a user sees. Every example in this document uses
+whichever format the rule it documents accepts.
+
+The four TypeScript rules are compiled from *exactly* the sources they were written in; nothing
+about them changed but the engine that runs them. Which form a rule takes is not part of its
+interface: the specifier, the id, the options and the output are the same either way, and a rule
+that changes form does not change your config.
 
 Built-in ids are namespaced `lanekeep/`. Project rules use `local/`, or a namespace the
 project declares in its config — `namespaces: ['acme']` allows `acme/no-numeric-sizes`.
@@ -51,7 +60,14 @@ A rule that names no language defaults to `['typescript', 'tsx']`.
 
 ---
 
-# TypeScript and JavaScript
+# TypeScript
+
+**These four run on `.ts` and `.tsx` and not on JavaScript.** None of them declares a `language`,
+so all four take the default above — `['typescript', 'tsx']` — and `javascript` is a separate
+language covering `.js`, `.mjs`, `.cjs` and `.jsx`. This section was headed "TypeScript and
+JavaScript" for a while and the rules underneath it never fired on a `.js` file, which is the
+quiet kind of wrong: a rule that does not run looks exactly like a codebase with nothing to
+report. Extending them is a rule change rather than a documentation one.
 
 ## `lanekeep/no-default-export`
 
@@ -64,10 +80,8 @@ a rule rather than a review comment.
 
 Takes no options.
 
-```ts
-import noDefaultExport from 'lanekeep/no-default-export'
-
-export default defineConfig({ rules: [noDefaultExport] })
+```json
+{ "rules": ["lanekeep/no-default-export"] }
 ```
 
 It reports all four forms, including the two that do not contain the words `export default`:
@@ -98,27 +112,27 @@ This is the workhorse architectural rule: "the UI layer must not reach into the 
 client", "nothing outside `payments/` may import the Stripe SDK". Those are exactly the
 conventions a language model cannot infer from the code it is shown.
 
-It is a **factory** — a function you call with options, which returns a rule. The
-restriction is the entire content of the rule, so there is nothing useful to import
-unconfigured.
+The restriction is the entire content of the rule, so naming it without options does nothing
+useful — give it `restrictions`:
 
-```ts
-import noRestrictedImports from 'lanekeep/no-restricted-imports'
-
-export default defineConfig({
-  rules: [
-    noRestrictedImports({
-      restrictions: [
-        {
-          module: 'stripe',
-          from: ['!packages/payments/**'],
-          reason: 'route payments through the payments package',
-        },
-        { module: 'lodash/*', reason: 'use the standard library' },
-      ],
-    }),
-  ],
-})
+```json
+{
+  "rules": [
+    {
+      "rule": "lanekeep/no-restricted-imports",
+      "options": {
+        "restrictions": [
+          {
+            "module": "stripe",
+            "from": ["!packages/payments/**"],
+            "reason": "route payments through the payments package"
+          },
+          { "module": "lodash/*", "reason": "use the standard library" }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 ### Options
@@ -160,12 +174,15 @@ reader has to assume something depends on it, and an agent will happily wire new
 it. Nothing in the exporting file reveals the problem — which is why this is a
 [cross-file rule](cross-file-rules.md) rather than a query.
 
-```ts
-import noUnusedExports from 'lanekeep/no-unused-exports'
-
-export default defineConfig({
-  rules: [noUnusedExports({ entryPoints: ['src/index.ts', 'src/cli.ts'] })],
-})
+```json
+{
+  "rules": [
+    {
+      "rule": "lanekeep/no-unused-exports",
+      "options": { "entryPoints": ["src/index.ts", "src/cli.ts"] }
+    }
+  ]
+}
 ```
 
 ### Options
@@ -210,12 +227,8 @@ copes, and then one module observes a half-initialized binding from another and 
 error miles from its cause — usually only under a particular import order, which is why it
 survives review and shows up in production.
 
-```ts
-import noCircularImports from 'lanekeep/no-circular-imports'
-
-export default defineConfig({
-  rules: [noCircularImports()],
-})
+```json
+{ "rules": ["lanekeep/no-circular-imports"] }
 ```
 
 ### Options
@@ -402,7 +415,8 @@ objects to.
 Both Rust rules are about *legibility of dependencies and failure*: where a name came from, and
 what happens when something goes wrong.
 
-**Both are components rather than TypeScript modules**, so name them from a `lanekeep.json`:
+**Both are components**, like the four TypeScript rules above, so name them from a
+`lanekeep.json`:
 
 ```json
 { "rules": ["lanekeep/no-unwrap", { "rule": "lanekeep/no-glob-import", "options": { "allow": ["*prelude*"] } }] }
@@ -491,6 +505,24 @@ needed something a project rule cannot have would be evidence the host API is wr
 For a rule in Rust, steps 1 and 2 become `rust-rules/<name>/` and `BUILT_IN_COMPONENTS`;
 [`authoring-rust-rules.md`](authoring-rust-rules.md) has the whole of it. Step 3 is the same
 file with the same `RuleTester`, through `RuleTester::for_component`.
+
+To ship a TypeScript rule as a component instead of a module, step 1 is unchanged — it is the
+same file, importing only from `lanekeep` — and steps 2 and 3 gain a build. List it in
+`crates/lanekeep-rules/typescript/entry.ts`, whose order *is* the index the component is
+dispatched on, record it in `COMPONENT_RULES` rather than `BUILT_IN_RULES`, and run
+`just typescript-builtins` to rebuild the shared artifact and re-record its source digests. The
+rule's own tests do not change, which is the point and was the acceptance test for the four that
+moved: same source, same expectations, different engine.
+
+**Add a test that runs the component, because "the tests do not change" does not mean they cover
+it.** A test built on `lanekeep_rules::source(name)` runs the TypeScript in QuickJS whatever form
+the rule ships in, so for two of the four the unchanged file went on testing the source and said
+nothing about the artifact. `RuleTester::for_built_in` names the rule by its specifier —
+`"lanekeep/no-default-export"` — which resolves through the embedded table to one rule of the
+shared component; `RuleTester::for_component` cannot do this, because it writes the artifact to a
+path and a path reference contributes every rule in it.
+`crates/lanekeep-rules/tests/typescript_builtins_as_components.rs` is the worked example, and its
+header explains why it is deliberately a subset: every case there compiles a 12.4 MiB artifact.
 
 Cover the forms that do not look like the obvious one. Every gap found while writing these
 two rules was a form that read differently in source but meant the same thing.

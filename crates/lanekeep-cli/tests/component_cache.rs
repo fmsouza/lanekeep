@@ -144,10 +144,16 @@ fn describe(output: &Output) -> String {
 /// A config naming one built-in TypeScript rule and one compiled component, in the one array a
 /// real `lanekeep.json` mixes them in — `lanekeep-config`'s `json::rules_module` doc calls this
 /// out as the case a placeholder index exists to keep sound.
+///
+/// **The TypeScript half is a Python-targeting rule, and that is what keeps the mix real.** It
+/// was `lanekeep/no-default-export` until that rule was compiled into a component; leaving it
+/// there would have made both entries components and quietly retired the case this fixture
+/// exists for, with every assertion below still passing. Every built-in that is still evaluated
+/// as a module targets Python, Go or Rust, so the subject file is Python.
 const CONFIG: &str = r#"{
     "include": ["src/**"],
     "namespaces": ["fixture"],
-    "rules": ["lanekeep/no-default-export", "./rules/probe.wasm"]
+    "rules": ["lanekeep/no-broad-except", "./rules/probe.wasm"]
 }"#;
 
 #[test]
@@ -158,10 +164,10 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
     let project = Project::new(
         "reuse",
         &[
-            // Violates `lanekeep/no-default-export` — a real, visible answer to compare across
+            // Violates `lanekeep/no-broad-except` — a real, visible answer to compare across
             // the two runs, so "reports identically" is not vacuously true of a rule that
             // never reports anything.
-            ("src/a.ts", "export default 1;\n"),
+            ("src/a.py", "try:\n    run()\nexcept Exception:\n    pass\n"),
             // `metadata.wasm`'s gates: `path_matches: ["src/**/*.rs"]`, `file_contains:
             // ["call"]`, `file_not_contains: ["skip"]`. Its `check` reports nothing — see
             // `crates/lanekeep-wasm/tests/fixtures/metadata/src/lib.rs` — so it contributes no
@@ -187,7 +193,7 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
     // is the only half that can.
     let cold_stderr = String::from_utf8_lossy(&cold.stderr).into_owned();
     assert_eq!(cold.status.code(), Some(1), "{combined}");
-    assert!(combined.contains("src/a.ts"), "{combined}");
+    assert!(combined.contains("src/a.py"), "{combined}");
 
     // The direct regression check: caching used to be off for *any* run that loaded a
     // component, configured or not, so this file would never exist. `metadata` is configured —
@@ -203,7 +209,7 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
     // the row exists at all, which `a_rule_that_never_matched_still_appears`
     // (`lanekeep-engine`) already establishes does not require a match, only that the query ran.
     assert!(
-        cold_stderr.contains("lanekeep/no-default-export"),
+        cold_stderr.contains("lanekeep/no-broad-except"),
         "the TypeScript rule's row is missing from a cold profile: {combined}"
     );
     assert!(
@@ -232,7 +238,7 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
         "the component rule ran again on a warm pass — the cache was not read: {combined}"
     );
     assert!(
-        !warm_stderr.contains("lanekeep/no-default-export"),
+        !warm_stderr.contains("lanekeep/no-broad-except"),
         "the TypeScript rule ran again on a warm pass — the cache was not read: {combined}"
     );
 }
@@ -259,7 +265,7 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     let project = Project::new(
         "recompute",
         &[
-            ("src/a.ts", "export default 1;\n"),
+            ("src/a.py", "try:\n    run()\nexcept Exception:\n    pass\n"),
             ("src/a.rs", "fn f() { call(); }\n"),
         ],
     );
@@ -271,7 +277,7 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     let cold_stderr = String::from_utf8_lossy(&cold.stderr).into_owned();
     assert!(
         cold_stderr.contains("fixture/metadata")
-            && cold_stderr.contains("lanekeep/no-default-export"),
+            && cold_stderr.contains("lanekeep/no-broad-except"),
         "both rules should have run cold: {}",
         describe(&cold)
     );
@@ -280,7 +286,7 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     let warm_stderr = String::from_utf8_lossy(&warm.stderr).into_owned();
     assert!(
         !warm_stderr.contains("fixture/metadata")
-            && !warm_stderr.contains("lanekeep/no-default-export"),
+            && !warm_stderr.contains("lanekeep/no-broad-except"),
         "the second run over unchanged input should have been a full cache hit: {}",
         describe(&warm)
     );
@@ -308,7 +314,7 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
         "the component did not run again after its own bytes changed: {combined}"
     );
     assert!(
-        recomputed_stderr.contains("lanekeep/no-default-export"),
+        recomputed_stderr.contains("lanekeep/no-broad-except"),
         "the TypeScript rule did not run again after the component's bytes changed — the \
          whole run's key should have moved, not just the changed rule's: {combined}"
     );
@@ -322,7 +328,7 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     let warm_again_stderr = String::from_utf8_lossy(&warm_again.stderr).into_owned();
     assert!(
         !warm_again_stderr.contains("fixture/metadata")
-            && !warm_again_stderr.contains("lanekeep/no-default-export"),
+            && !warm_again_stderr.contains("lanekeep/no-broad-except"),
         "the run after the recompute should have warmed on the new bytes: {combined}"
     );
 }

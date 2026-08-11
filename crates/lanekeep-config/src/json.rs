@@ -80,7 +80,7 @@ use crate::ConfigError;
 /// is not a sandbox and importing the alias would not make it one — but the check reads names
 /// rather than intent, deliberately, because the alternative is a check that has to be argued
 /// with every time it fires. This file does not need the import, so it does not take it.
-pub(crate) type BuiltinComponent = fn(&str) -> Option<&'static [u8]>;
+pub(crate) type BuiltinComponent = fn(&str) -> Option<(&'static [u8], u32)>;
 
 /// The prefix a built-in rule reference carries, as in `lanekeep/no-package-init`.
 const BUILTIN_PREFIX: &str = "lanekeep/";
@@ -475,7 +475,7 @@ mod tests {
     ///
     /// The default for these tests, so that the ones about imports and options say what they
     /// always said regardless of which real rules have migrated.
-    fn no_components(_name: &str) -> Option<&'static [u8]> {
+    fn no_components(_name: &str) -> Option<(&'static [u8], u32)> {
         None
     }
 
@@ -484,9 +484,9 @@ mod tests {
     /// A stub rather than `lanekeep_rules::component`, on the same terms as the loader's own
     /// stub: which rules ship is not what these tests are about, and pinning them to the real
     /// table would make a future migration edit assertions that have nothing to do with it.
-    fn one_component(name: &str) -> Option<&'static [u8]> {
+    fn one_component(name: &str) -> Option<(&'static [u8], u32)> {
         match name {
-            "compiled" => Some(b"\0asm\x01\x00\x00\x00"),
+            "compiled" => Some((b"\0asm\x01\x00\x00\x00", 0)),
             _ => None,
         }
     }

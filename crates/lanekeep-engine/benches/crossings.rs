@@ -17,9 +17,16 @@
 //! The count did not stay alone, as it happens: the port dropped about 30% of this rule's
 //! crossings by hoisting two calls out of a loop. That is why every figure below is per arm.
 //!
+//! The third arm answers a question the first two cannot. A Rust component and a TypeScript
+//! module differ in two things at once — the boundary they cross and the language they are
+//! written in — so a ratio between them cannot say which of the two moved. A component built
+//! from *the same TypeScript source* pays the canonical ABI **and** carries a JavaScript engine
+//! of its own, and comparing it against the same rule under QuickJS is the closest this can get
+//! to holding the rule still and changing only the engine underneath it.
+//!
 //! # The subject
 //!
-//! `lanekeep/no-unwrap`, which exists in both forms:
+//! `lanekeep/no-unwrap`, which exists in three forms:
 //!
 //! - `benches/no-unwrap.ts` is the TypeScript original, byte-identical to the file deleted in
 //!   `1fb5d06`. Check it rather than believe it —
@@ -27,6 +34,17 @@
 //!   is the whole verification, and it must stay empty.
 //! - `crates/lanekeep-rules/components/no-unwrap.wasm` is the component that replaced it, read
 //!   from where it ships rather than copied, so this bench cannot measure a stale one.
+//! - `target/bench/no-unwrap-js.wasm` is that same TypeScript source inside StarlingMonkey,
+//!   built by `just bench-js-component` from `benches/no-unwrap-entry.ts` with the flags the
+//!   shipped built-ins component is built with.
+//!
+//! **The third is not committed, and this bench runs without it.** It is 13 MB; every crate in
+//! this workspace is published and crates.io refuses a package over 10 MiB, so committing it
+//! would make `lanekeep-engine` unpublishable in order to hold a benchmark input. It is built
+//! into `target/` instead, which needs Node and `jco` — neither of which any gate may require —
+//! and when it is absent the report prints two arms and says which recipe produces the third.
+//! Every assertion below is per arm, so the missing arm removes a row rather than weakening a
+//! claim.
 //!
 //! It is the subject because it is the heavier of the two ported built-ins by a wide margin:
 //! seven distinct host calls including `ancestors`, `named-children` and a `line`/`column` pair
@@ -76,21 +94,24 @@
 //! take which the replay simply omits — the count would be low and every report identical.
 //!
 //! **The arithmetic, which is what actually pins the numbers.** The corpus is regular enough
-//! that both denominators are derivable by hand and were: `FILES` files of `FUNCTIONS`
+//! that all three denominators are derivable by hand and were: `FILES` files of `FUNCTIONS`
 //! functions, an ancestor chain of four, and a call in the *k*-th function scanning *k*
-//! siblings, gives `13 + 3k` calls per subject under QuickJS and `14 + 2k` under the component,
-//! which sums to exactly the 597,120 and 418,560 the replay prints. A count that agrees with
-//! closed-form arithmetic over the corpus geometry is not resting on the transcription being
-//! faithful; it is two independent derivations of one number. **Anyone changing the corpus
-//! shape or the rule should redo that sum rather than trust these two paragraphs**, because the
-//! assertion alone would not notice.
+//! siblings, gives `13 + 3k` calls per subject under QuickJS, `14 + 2k` under the Rust
+//! component and `14 + 3k` under the JavaScript one, which sums to exactly the 597,120, 418,560
+//! and 600,960 the replay prints. A count that agrees with closed-form arithmetic over the
+//! corpus geometry is not resting on the transcription being faithful; it is two independent
+//! derivations of one number. **Anyone changing the corpus shape or the rule should redo that
+//! sum rather than trust these two paragraphs**, because the assertion alone would not notice.
 //!
-//! **The two arms do not make the same number of calls, and that is the reason the denominator
-//! is per-engine.** The port hoisted `line(ancestor)` and `column(ancestor)` out of the sibling
-//! loop, so the component saves two crossings per sibling scanned; against that it pays one
-//! more, because `filePath` is a *property* under QuickJS and a *method* on `check-context`. A
-//! benchmark that divided both times by one crossing count would report the ratio of the two
-//! rules' efficiency and call it the cost of the boundary.
+//! **The three arms do not make the same number of calls, and that is the reason the
+//! denominator is per-engine.** The Rust port hoisted `line(ancestor)` and `column(ancestor)`
+//! out of the sibling loop, so it saves two crossings per sibling scanned; against that it pays
+//! one more, because `filePath` is a *property* under QuickJS and a *method* on
+//! `check-context`. The JavaScript component runs the unported source, so it keeps the loop and
+//! pays that same extra call — `host.js` memoizes `filePath` per `check`, and `check` is per
+//! match, so it is one crossing for every match the rule engages with. A benchmark that divided
+//! every time by one crossing count would report the ratio of the rules' efficiency and call it
+//! the cost of the boundary.
 //!
 //! # What is included in "a crossing", stated plainly
 //!
@@ -98,21 +119,47 @@
 //! a string handed back, and the figure covers all three, because all three are what a rule
 //! pays to ask the question.
 //!
-//! **It is not a measurement of the boundary alone, and the difference between the two arms is
-//! not one either.** Between two crossings a rule also *executes*, and that execution is
-//! interpreted bytecode in one arm and compiled code in the other. Those two effects run in
-//! opposite directions inside one number. The report separates out the arena work, which is
-//! shared code and can be timed by replaying the same calls with no engine in the way; what
-//! remains is the crossing **plus** the in-guest execution, and nothing here can split it
-//! further. So the honest reading of a `rest` column that favors the component is not "the
-//! canonical ABI is cheaper than `rquickjs`" — it is "whatever the canonical ABI costs extra,
-//! compiled guest code more than pays back".
+//! **It is not a measurement of the boundary alone, and the difference between two arms is not
+//! one either.** Between two crossings a rule also *executes*, and that execution is
+//! interpreted bytecode in one arm, compiled code in another and bytecode inside a compiled
+//! engine in the third. Those effects run in opposite directions inside one number. The report
+//! separates out the arena work, which is shared code and can be timed by replaying the same
+//! calls with no engine in the way; what remains is the crossing **plus** the in-guest
+//! execution, and nothing here can split it further. So the honest reading of a `rest` column
+//! that favors the Rust component is not "the canonical ABI is cheaper than `rquickjs`" — it is
+//! "whatever the canonical ABI costs extra, compiled guest code more than pays back". The
+//! JavaScript arm is where that cancellation is undone: it pays the same canonical ABI with no
+//! compiled rule body to pay it back with, and a host call from it also traverses `host.js`'s
+//! `ctx` shim, the generated bindings and StarlingMonkey's own call machinery.
 //!
 //! The mix is this rule's, not a universal one: mostly scalar and short-string returns
 //! (`kind`, `text`, `line`, `column`), plus one `named-children` per subject that returns a
 //! list as long as the file has top-level items. A rule with a different mix will see a
 //! different number, and a rule that moves lists will see the canonical ABI's copy cost more
 //! than this one does.
+//!
+//! # The other cost, which the subtraction above deliberately removes
+//!
+//! Everything above is *per crossing*, and it is a difference between two corpora with the same
+//! number of matches — so whatever a `check` invocation costs **before** the rule crosses
+//! anything cancels out of it exactly. For the two arms this file was written for that was the
+//! right thing to remove, because it is small. For a JavaScript component it is the larger of
+//! the two numbers, and it is the one that decides whether a *low-crossing* rule came out ahead
+//! or behind, which is the question the migration actually poses.
+//!
+//! So the cold corpus is measured at two sizes, [`FILES`] and [`SMALL_FILES`], and the **slope**
+//! between them is the per-file cost with every fixed cost of a run removed — config load,
+//! discovery, engine and component instantiation, the cache write. Divided by [`FUNCTIONS`] it
+//! is the cost of one match, and on the cold corpus a match is exactly one `check` invocation
+//! and exactly one crossing. Differencing two arms then cancels the reading, hashing, parsing
+//! and query matching, which are identical work over identical bytes; taking one crossing out
+//! with the figure above leaves the invocation.
+//!
+//! **The intercept is printed beside it and has to be read before the slope is believed.** It is
+//! everything a run costs that does not scale with the corpus, which is exactly where a 13 MB
+//! component's instantiation would show up. If the per-match figure were really an instantiation
+//! cost divided by a match count, the intercept is where that would be visible, and it is not
+//! there.
 //!
 //! # Not a gate on time
 //!
@@ -159,6 +206,13 @@ type Violation = (String, u32, u32);
 /// is still more than an order of magnitude larger than the run-to-run spread.
 const FILES: usize = 40;
 
+/// Files in the second cold corpus, which exists to give the first one a slope.
+///
+/// A quarter, so the two points are far enough apart that the difference between them is not
+/// noise, and small enough that the extra measurement is cheap. See "The other cost" above for
+/// what the slope and the intercept are each for.
+const SMALL_FILES: usize = 10;
+
 /// Top-level functions per file, each holding one method call.
 ///
 /// This is the number that sets the signal, because `no-unwrap` scans the parent's children
@@ -203,27 +257,68 @@ const BENCH_GLOBAL_TIMEOUT_MS: u64 = 600_000;
 enum Arm {
     /// `no-unwrap.ts`, executed by QuickJS.
     TypeScript,
-    /// `no-unwrap.wasm`, executed by wasmtime.
+    /// `no-unwrap.wasm`, the Rust port, executed by wasmtime.
     Component,
+    /// `no-unwrap-js.wasm`, the *same TypeScript source*, executed by StarlingMonkey inside
+    /// wasmtime.
+    JavaScript,
 }
 
 impl Arm {
-    const ALL: [Self; 2] = [Self::TypeScript, Self::Component];
+    const ALL: [Self; 3] = [Self::TypeScript, Self::Component, Self::JavaScript];
 
     const fn label(self) -> &'static str {
         match self {
             Self::TypeScript => "TypeScript (QuickJS)",
-            Self::Component => "component (wasmtime)",
+            Self::Component => "Rust component",
+            Self::JavaScript => "JS component",
         }
     }
 
-    /// The config naming this arm's rule. Both are `lanekeep.json`, so the two runs differ in
+    /// Where this arm's numbers go in the arrays [`Crossings`] keeps.
+    const fn index(self) -> usize {
+        match self {
+            Self::TypeScript => 0,
+            Self::Component => 1,
+            Self::JavaScript => 2,
+        }
+    }
+
+    /// The config naming this arm's rule. All three are `lanekeep.json`, so the runs differ in
     /// the rule they name and in nothing else — not even the format their config is read in.
     const fn config(self) -> &'static str {
         match self {
             Self::TypeScript => "typescript.json",
             Self::Component => "component.json",
+            Self::JavaScript => "javascript.json",
         }
+    }
+
+    /// The rule this arm's config names, as the config spells it.
+    const fn rule(self) -> &'static str {
+        match self {
+            Self::TypeScript => "./no-unwrap.ts",
+            Self::Component => "./no-unwrap.wasm",
+            Self::JavaScript => "./no-unwrap-js.wasm",
+        }
+    }
+
+    /// Whether a rule crosses the component boundary to read `ctx.filePath`.
+    ///
+    /// Both components do, once per engaged match: it is a `check-context` method, and
+    /// `host.js` memoizes it for the life of one `check` call. Under QuickJS it is an ordinary
+    /// value property on the context object (`lanekeep_js::host`'s `object.set("filePath", …)`)
+    /// and costs nothing.
+    const fn calls_file_path(self) -> bool {
+        !matches!(self, Self::TypeScript)
+    }
+
+    /// Whether this arm hoists the item's own line and column out of the sibling loop.
+    ///
+    /// The Rust port does; the two arms running `no-unwrap.ts` do not, because that is the
+    /// source they run.
+    const fn hoists_position(self) -> bool {
+        matches!(self, Self::Component)
     }
 }
 
@@ -232,6 +327,8 @@ impl Arm {
 enum Corpus {
     /// The method the rule ignores: one crossing per match.
     Cold,
+    /// The same again over a quarter of the files, so the two have a slope between them.
+    ColdSmall,
     /// The method the rule is about: the full ancestor walk.
     Hot,
 }
@@ -239,27 +336,61 @@ enum Corpus {
 impl Corpus {
     const fn method(self) -> &'static str {
         match self {
-            Self::Cold => COLD_METHOD,
+            Self::Cold | Self::ColdSmall => COLD_METHOD,
             Self::Hot => HOT_METHOD,
         }
     }
+
+    const fn files(self) -> usize {
+        match self {
+            Self::Cold | Self::Hot => FILES,
+            Self::ColdSmall => SMALL_FILES,
+        }
+    }
+}
+
+/// One arm's three measurements.
+struct Measured {
+    arm: Arm,
+    /// The cold corpus over [`SMALL_FILES`] files.
+    small: Duration,
+    /// The cold corpus over [`FILES`] files.
+    cold: Duration,
+    /// The hot corpus over [`FILES`] files.
+    hot: Duration,
 }
 
 fn main() {
     single_threaded();
 
-    let cold = Project::build(Corpus::Cold);
-    let hot = Project::build(Corpus::Hot);
+    // Read once and lent to both corpora: 13 MB, and a second read would only prove the file
+    // is still there.
+    let javascript = javascript_component_bytes();
+    let arms: Vec<Arm> = Arm::ALL
+        .into_iter()
+        .filter(|arm| *arm != Arm::JavaScript || javascript.is_some())
+        .collect();
+
+    let small = Project::build(Corpus::ColdSmall, javascript.as_deref());
+    let cold = Project::build(Corpus::Cold, javascript.as_deref());
+    let hot = Project::build(Corpus::Hot, javascript.as_deref());
 
     let mut measured = Vec::new();
     let mut reported = Vec::new();
-    for arm in Arm::ALL {
-        // The violations come back from the measured runs themselves rather than from four
+    for arm in arms.iter().copied() {
+        // The violations come back from the measured runs themselves rather than from six
         // more runs made to collect them. They are the same runs either way, and a bench that
         // runs in CI should not pay twice for one answer.
+        let (small_time, small_violations) = small.measure(arm);
         let (cold_time, cold_violations) = cold.measure(arm);
         let (hot_time, hot_violations) = hot.measure(arm);
-        measured.push((arm, cold_time, hot_time));
+        measured.push(Measured {
+            arm,
+            small: small_time,
+            cold: cold_time,
+            hot: hot_time,
+        });
+        reported.push((Corpus::ColdSmall, arm, small_violations));
         reported.push((Corpus::Cold, arm, cold_violations));
         reported.push((Corpus::Hot, arm, hot_violations));
     }
@@ -267,11 +398,12 @@ fn main() {
     // After the engine runs, not before them. The replay is single-threaded work over the same
     // corpora, so putting it first would leave the page cache and the allocator in a state the
     // measured runs did not choose for themselves.
+    let small_calls = Crossings::of(&small);
     let cold_calls = Crossings::of(&cold);
     let hot_calls = Crossings::of(&hot);
 
-    report(&measured, &cold_calls, &hot_calls);
-    gate(&reported, &cold_calls, &hot_calls);
+    report(&measured, &cold_calls, &hot_calls, &small_calls);
+    gate(&reported, &cold_calls, &hot_calls, &small_calls);
 }
 
 /// Confine the whole run to one thread.
@@ -300,7 +432,7 @@ fn single_threaded() {
 /// Whichever way is the point. This is the one quantity that could have inverted the argument
 /// for putting rules in components, and a benchmark reported only when it is favorable is not a
 /// benchmark.
-fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossings) {
+fn report(measured: &[Measured], cold: &Crossings, hot: &Crossings, small: &Crossings) {
     println!(
         "\nlanekeep host-API crossings — {FILES} files, {FUNCTIONS} functions each, \
          `lanekeep/no-unwrap`, one thread\n"
@@ -311,8 +443,9 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
     );
 
     let mut per_call = Vec::new();
-    for &(arm, cold_time, hot_time) in measured {
-        let delta = hot_time.saturating_sub(cold_time);
+    for m in measured {
+        let arm = m.arm;
+        let delta = m.hot.saturating_sub(m.cold);
         let calls = hot.total(arm) - cold.total(arm);
         let arena = hot.arena_time(arm).saturating_sub(cold.arena_time(arm));
 
@@ -323,13 +456,13 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
         let divisor = calls as f64;
         let ns = delta.as_secs_f64() * 1e9 / divisor;
         let arena_ns = arena.as_secs_f64() * 1e9 / divisor;
-        per_call.push(ns);
+        per_call.push((arm, ns));
 
         println!(
             "  {:<22} {:>8.1?} {:>8.1?} {:>8.1?} {calls:>12} {ns:>8.1} {arena_ns:>8.1} {:>8.1}",
             arm.label(),
-            cold_time,
-            hot_time,
+            m.cold,
+            m.hot,
             delta,
             ns - arena_ns,
         );
@@ -356,23 +489,139 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
          between runs where `ns/call` moves by ~4%: indicative, not measured."
     );
 
-    println!("\n  calls counted by replay — the two rules do not make the same ones:");
-    for arm in Arm::ALL {
+    println!("\n  calls counted by replay — the three rules do not make the same ones:");
+    for &(arm, _) in &per_call {
         println!(
-            "    {:<22} cold {:>10}  hot {:>10}",
+            "    {:<22} cold {:>10}  hot {:>10}  small {:>10}",
             arm.label(),
             cold.total(arm),
-            hot.total(arm)
+            hot.total(arm),
+            small.total(arm),
         );
     }
 
-    if let [typescript, component] = per_call.as_slice() {
+    // Every ratio against QuickJS, which is what the migration is a move away from. Printed per
+    // arm rather than as one line, so an absent JavaScript arm removes a row instead of
+    // silently changing what the surviving line means.
+    println!();
+    let baseline = per_call
+        .iter()
+        .find(|(arm, _)| *arm == Arm::TypeScript)
+        .map(|&(_, ns)| ns);
+    for &(arm, ns) in &per_call {
+        let Some(baseline) = baseline.filter(|_| arm != Arm::TypeScript) else {
+            continue;
+        };
         println!(
-            "\n  a host call costs {:.2}x through a component ({component:.0} ns against \
-             {typescript:.0} ns)\n",
-            component / typescript
+            "  a host call costs {:.2}x through the {} ({ns:.0} ns against {baseline:.0} ns)",
+            ns / baseline,
+            arm.label(),
         );
     }
+
+    invocations(measured, &per_call);
+
+    if per_call.len() < Arm::ALL.len() {
+        println!(
+            "\n  the JavaScript component arm did not run: {} is not there.\n  \
+             `just bench-js-component` builds it — it needs Node and jco, which no gate may \
+             require,\n  and it is 13 MB, which is why it is not committed.",
+            javascript_component_path().display()
+        );
+    }
+    println!();
+}
+
+/// What one `check` invocation costs, which the headline above subtracts away.
+///
+/// See "The other cost" in this module's documentation for why it is a separate measurement
+/// rather than a column: the per-crossing figure is a difference between two corpora with equal
+/// match counts, so the invocation cancels out of it by construction. For a low-crossing rule —
+/// which is all four of the migrated built-ins — this is the number that decides the outcome,
+/// and the one above says almost nothing.
+///
+/// Everything here comes off the **cold** corpus at two sizes, where one match is exactly one
+/// invocation and exactly one crossing.
+fn invocations(measured: &[Measured], per_call: &[(Arm, f64)]) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "File and function counts are three-digit constants."
+    )]
+    let per_file_matches = FUNCTIONS as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "File and function counts are three-digit constants."
+    )]
+    let spread = (FILES - SMALL_FILES) as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "File and function counts are three-digit constants."
+    )]
+    let files = FILES as f64;
+
+    println!(
+        "\n  what a `check` invocation costs, from the cold corpus at {SMALL_FILES} files and \
+         {FILES}.\n  The per-match column carries the shared per-file work — reading, hashing, \
+         parsing, matching —\n  which is identical over identical bytes and cancels only when \
+         two arms are differenced.\n"
+    );
+    println!(
+        "  {:<22} {:>12} {:>12} {:>12}",
+        "arm", "per file", "per match", "intercept"
+    );
+
+    let mut per_match = Vec::new();
+    for m in measured {
+        let slope = (m.cold.as_secs_f64() - m.small.as_secs_f64()) * 1e9 / spread;
+        let intercept = m.cold.as_secs_f64() * 1e9 - files * slope;
+        per_match.push((m.arm, slope / per_file_matches));
+
+        println!(
+            "  {:<22} {:>10.2}ms {:>10.1}µs {:>10.2}ms",
+            m.arm.label(),
+            slope / 1e6,
+            slope / per_file_matches / 1e3,
+            intercept / 1e6,
+        );
+    }
+
+    // The intercept is not a curiosity. It is every fixed cost of a run — config load,
+    // discovery, engine build, component instantiation, the cache write — and it is where a
+    // 13 MB component's instantiation would appear if the per-match figure were really that
+    // cost divided by a match count. A value at or below zero says the slope is a slope.
+    let baseline = per_match
+        .iter()
+        .find(|(arm, _)| *arm == Arm::TypeScript)
+        .map(|&(_, ns)| ns);
+    let crossing = per_call
+        .iter()
+        .find(|(arm, _)| *arm == Arm::TypeScript)
+        .map(|&(_, ns)| ns);
+
+    println!("\n  against QuickJS, with the one crossing a cold match makes taken out:");
+    for &(arm, ns) in &per_match {
+        let (Some(baseline), Some(crossing)) = (baseline, crossing) else {
+            continue;
+        };
+        if arm == Arm::TypeScript {
+            continue;
+        }
+        let this_crossing = per_call
+            .iter()
+            .find(|(other, _)| *other == arm)
+            .map_or(crossing, |&(_, ns)| ns);
+        let invocation = ns - baseline - (this_crossing - crossing);
+        println!(
+            "    {:<22} {:>+10.1}µs per invocation, before it crosses anything",
+            arm.label(),
+            invocation / 1e3,
+        );
+    }
+    println!(
+        "\n  So the end-to-end cost of an arm is roughly `matches x invocation + crossings x \
+         ns/call`,\n  and for a rule that crosses a handful of times per match the first term \
+         is the whole answer."
+    );
 }
 
 /// The machine-independent assertions: each branch of the replay agrees with its own engine.
@@ -381,22 +630,33 @@ fn report(measured: &[(Arm, Duration, Duration)], cold: &Crossings, hot: &Crossi
 /// the rule did, and the reported set is what a path produces.
 ///
 /// **Each arm against its own branch, which is a stronger claim than it looks.** The replay has
-/// two branches, one per arm, and they produce the two different denominators the report
-/// divides by. Holding both engines to *one* of those branches would leave the other validated
-/// by nothing — the engines would agree with each other and with whichever branch was collected,
-/// and the uncollected branch could count anything at all. So the comparison is per arm, and
-/// the two branches are then also compared against each other: they transcribe one rule and are
-/// held to the reporting parity the port itself was held to.
+/// a branch per arm, and they produce the different denominators the report divides by. Holding
+/// every engine to *one* of those branches would leave the others validated by nothing — the
+/// engines would agree with each other and with whichever branch was collected, and the
+/// uncollected branches could count anything at all. So the comparison is per arm, and the
+/// branches are then also compared against each other: they transcribe one rule and are held to
+/// the reporting parity the port itself was held to.
 ///
 /// That is not a theory about an earlier version, it is what the earlier version did. Measured
 /// by breaking the TypeScript branch alone — an extra `continue` before its `report`, leaving
 /// the component branch untouched — which this gate fails on and which the version that
 /// collected only from the component branch passed. An assertion that cannot fail on half the
 /// code it is supposed to cover is worth less than its wording suggests.
-fn gate(reported: &[(Corpus, Arm, Vec<Violation>)], cold: &Crossings, hot: &Crossings) {
+///
+/// **The cross-branch comparison covers every arm, including one that did not run.** The
+/// branches are pure functions of the corpus, so a missing artifact removes an engine from the
+/// first loop and nothing from the second — which is what keeps the JavaScript branch from
+/// drifting on a machine that never builds its component.
+fn gate(
+    reported: &[(Corpus, Arm, Vec<Violation>)],
+    cold: &Crossings,
+    hot: &Crossings,
+    small: &Crossings,
+) {
     for (corpus, arm, violations) in reported {
         let replayed = match corpus {
             Corpus::Cold => cold,
+            Corpus::ColdSmall => small,
             Corpus::Hot => hot,
         };
         if let Some(detail) = disagreement(violations, replayed.reports(*arm)) {
@@ -408,15 +668,21 @@ fn gate(reported: &[(Corpus, Arm, Vec<Violation>)], cold: &Crossings, hot: &Cros
         }
     }
 
-    for (corpus, replayed) in [(Corpus::Cold, cold), (Corpus::Hot, hot)] {
-        if let Some(detail) = disagreement(
-            replayed.reports(Arm::TypeScript),
-            replayed.reports(Arm::Component),
-        ) {
-            panic!(
-                "the two branches of the replay disagree about what {corpus:?} reports, so they \
-                 are not two transcriptions of one rule\n  {detail}"
-            );
+    for (corpus, replayed) in [
+        (Corpus::Cold, cold),
+        (Corpus::ColdSmall, small),
+        (Corpus::Hot, hot),
+    ] {
+        for arm in Arm::ALL {
+            if let Some(detail) =
+                disagreement(replayed.reports(Arm::TypeScript), replayed.reports(arm))
+            {
+                panic!(
+                    "the {} branch of the replay disagrees with the TypeScript branch about what \
+                     {corpus:?} reports, so they are not transcriptions of one rule\n  {detail}",
+                    arm.label(),
+                );
+            }
         }
     }
 
@@ -458,10 +724,16 @@ struct Project {
     /// was never crossed. It read 3.8 ns against 5.7 ns before this was noticed, both of which
     /// are far too small for a host call and neither of which meant anything.
     cache: PathBuf,
+    /// How many files this corpus has. Two of the three have [`FILES`]; the third is what gives
+    /// the cold measurement a slope.
+    files: usize,
 }
 
 impl Project {
-    fn build(corpus: Corpus) -> Self {
+    /// `javascript` is the JavaScript component's bytes when it has been built, and `None` when
+    /// it has not — in which case that arm's rule file is never written and its config is never
+    /// read, so an absent artifact costs a row in the report and nothing else.
+    fn build(corpus: Corpus, javascript: Option<&[u8]>) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "lanekeep-bench-crossings-{}-{:?}",
             std::process::id(),
@@ -472,17 +744,17 @@ impl Project {
         let project = Self {
             cache: lanekeep_cache::Store::path_for(&dir),
             dir,
+            files: corpus.files(),
         };
         project.write("no-unwrap.ts", TYPESCRIPT_RULE.as_bytes());
         project.write("no-unwrap.wasm", &component_bytes());
-        for arm in Arm::ALL {
-            let rule = match arm {
-                Arm::TypeScript => "./no-unwrap.ts",
-                Arm::Component => "./no-unwrap.wasm",
-            };
-            project.write(arm.config(), config_source(rule).as_bytes());
+        if let Some(bytes) = javascript {
+            project.write("no-unwrap-js.wasm", bytes);
         }
-        for index in 0..FILES {
+        for arm in Arm::ALL {
+            project.write(arm.config(), config_source(arm.rule()).as_bytes());
+        }
+        for index in 0..project.files {
             project.write(
                 &format!("src/m{index:04}.rs"),
                 file_source(corpus.method()).as_bytes(),
@@ -584,6 +856,29 @@ fn component_bytes() -> Vec<u8> {
         .unwrap_or_else(|e| panic!("reads the shipped component at {}: {e}", path.display()))
 }
 
+/// Where `just bench-js-component` writes the JavaScript component.
+///
+/// Under `target/`, which is gitignored, because the artifact is 13 MB and every crate here is
+/// published — see this module's documentation. The repository's own `target/`, spelled from
+/// this crate's manifest directory, because that is where the recipe writes it; a
+/// `CARGO_TARGET_DIR` pointing somewhere else moves cargo's output and not this file.
+fn javascript_component_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bench/no-unwrap-js.wasm")
+}
+
+/// The JavaScript component's bytes, or `None` when nobody has built it.
+///
+/// **Absence is the only failure treated as absence.** A path that is there but unreadable is a
+/// broken build rather than a missing one, and reporting two arms in that case would hide it.
+fn javascript_component_bytes() -> Option<Vec<u8>> {
+    let path = javascript_component_path();
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("reads the JavaScript component at {}: {e}", path.display()),
+    }
+}
+
 /// A `lanekeep.json` naming one rule.
 ///
 /// JSON for both arms, which matters: a `lanekeep.config.ts` cannot name a component at all, so
@@ -632,44 +927,33 @@ fn file_source(method: &str) -> String {
 /// the scale: whether "a call costs 1.1x" is a call that is mostly boundary or a call that is
 /// two-thirds shared arena work with the engines differing over the last third.
 struct Crossings {
-    typescript: u64,
-    component: u64,
+    /// Host calls per arm, indexed by [`Arm::index`].
+    calls: [u64; Arm::ALL.len()],
     /// Time in [`replay`] alone, per arm. Parsing and [`subjects`] are outside it.
-    typescript_arena: Duration,
-    component_arena: Duration,
+    arena: [Duration; Arm::ALL.len()],
     /// What each arm's branch of the replay would report, sorted.
     ///
     /// **Per arm, and it has to be.** An earlier version collected from the component branch
     /// only and held both engines to that one set, which establishes TypeScript engine ≡
     /// component engine ≡ component replay — and leaves the *TypeScript* branch of the replay,
-    /// the branch producing the larger denominator, compared against nothing at all. The two
-    /// branches differ in more than counters: the component's has an `else { continue }` on an
-    /// absent position that the TypeScript branch does not, which is inert on this corpus and
-    /// is exactly the kind of thing an unchecked branch accumulates.
-    typescript_reports: Vec<Violation>,
-    component_reports: Vec<Violation>,
+    /// the branch producing the larger denominator, compared against nothing at all. The
+    /// branches differ in more than counters: the Rust component's has an `else { continue }`
+    /// on an absent position that the other two do not, which is inert on this corpus and is
+    /// exactly the kind of thing an unchecked branch accumulates.
+    reports: [Vec<Violation>; Arm::ALL.len()],
 }
 
 impl Crossings {
     const fn total(&self, arm: Arm) -> u64 {
-        match arm {
-            Arm::TypeScript => self.typescript,
-            Arm::Component => self.component,
-        }
+        self.calls[arm.index()]
     }
 
     const fn arena_time(&self, arm: Arm) -> Duration {
-        match arm {
-            Arm::TypeScript => self.typescript_arena,
-            Arm::Component => self.component_arena,
-        }
+        self.arena[arm.index()]
     }
 
     const fn reports(&self, arm: Arm) -> &Vec<Violation> {
-        match arm {
-            Arm::TypeScript => &self.typescript_reports,
-            Arm::Component => &self.component_reports,
-        }
+        &self.reports[arm.index()]
     }
 
     /// Walk every file the run walked, and count.
@@ -681,12 +965,10 @@ impl Crossings {
     /// Reusing one arena would have made the replay look cheap and the boundary look expensive,
     /// in exactly the direction that flatters the conclusion.
     fn of(project: &Project) -> Self {
-        let mut typescript = 0;
-        let mut component = 0;
-        let mut typescript_arena = Duration::MAX;
-        let mut component_arena = Duration::MAX;
+        let mut calls = [0; Arm::ALL.len()];
+        let mut arena = [Duration::MAX; Arm::ALL.len()];
 
-        let sources: Vec<(String, String)> = (0..FILES)
+        let sources: Vec<(String, String)> = (0..project.files)
             .map(|index| {
                 let relative = format!("src/m{index:04}.rs");
                 let source = std::fs::read_to_string(project.dir.join(&relative))
@@ -697,43 +979,31 @@ impl Crossings {
 
         for _ in 0..ATTEMPTS {
             for arm in Arm::ALL {
-                let mut calls = 0;
+                let mut counted = 0;
                 let mut elapsed = Duration::ZERO;
 
                 for (relative, source) in &sources {
-                    let (mut arena, matches) = parsed(source);
+                    let (mut nodes, matches) = parsed(source);
                     let start = Instant::now();
-                    calls += replay(arm, &mut arena, relative, &matches, &mut None);
+                    counted += replay(arm, &mut nodes, relative, &matches, &mut None);
                     elapsed += start.elapsed();
                 }
 
-                match arm {
-                    Arm::TypeScript => {
-                        typescript = calls;
-                        typescript_arena = typescript_arena.min(elapsed);
-                    }
-                    Arm::Component => {
-                        component = calls;
-                        component_arena = component_arena.min(elapsed);
-                    }
-                }
+                calls[arm.index()] = counted;
+                arena[arm.index()] = arena[arm.index()].min(elapsed);
             }
         }
 
         // A pass of its own, per arm, with the clock off. The timed passes above collect
         // nothing at all: pushing a position happens *inside* `replay`, so a collecting pass is
         // a slower pass, and folding it into the attempts either biases whichever arm collects
-        // or forces both to pay a cost neither engine has.
-        let [typescript_reports, component_reports] =
-            Arm::ALL.map(|arm| Self::collect(arm, &sources));
+        // or forces every arm to pay a cost no engine has.
+        let reports = Arm::ALL.map(|arm| Self::collect(arm, &sources));
 
         Self {
-            typescript,
-            component,
-            typescript_arena,
-            component_arena,
-            typescript_reports,
-            component_reports,
+            calls,
+            arena,
+            reports,
         }
     }
 
@@ -840,10 +1110,12 @@ fn replay(
             continue;
         }
 
-        // `ctx.filePath`, and the first place the two arms diverge: a property installed on the
+        // `ctx.filePath`, and the first place the arms diverge: a property installed on the
         // context object under QuickJS, so no call at all, against `check-context.file-path`,
-        // which is one.
-        if arm == Arm::Component {
+        // which is one — for either component, the Rust one because it is a method and the
+        // JavaScript one because `host.js` fronts that method with a getter memoized for the
+        // life of one `check`.
+        if arm.calls_file_path() {
             calls += 1;
         }
 
@@ -886,11 +1158,12 @@ fn in_test_code(arm: Arm, arena: &mut NodeArena, node: Handle, calls: &mut u64) 
             continue;
         };
 
-        // The second divergence, and the larger one. The component reads the item's own line
+        // The second divergence, and the larger one. The Rust port reads the item's own line
         // and column *once*, here, with `line` and `column` being separate methods that each
         // resolve the node. The TypeScript original asks for both again on every sibling it
-        // compares against, which is what the two branches in the loop below are.
-        let hoisted = if arm == Arm::Component {
+        // compares against, which is what the two branches in the loop below are — and the
+        // JavaScript component runs that original, so it takes the unhoisted branch too.
+        let hoisted = if arm.hoists_position() {
             *calls += 2;
             let (Some(line), Some(column)) = (
                 arena.position(ancestor).map(|p| p.0),

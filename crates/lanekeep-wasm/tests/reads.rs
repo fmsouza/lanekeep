@@ -179,11 +179,21 @@ impl Harness {
             })
             .collect();
 
-        self.rule.call_check(
+        match self.rule.call_check(
             &mut self.store,
+            0,
             Resource::new_borrow(self.context.rep()),
             &captures,
-        )
+        )? {
+            Ok(()) => Ok(()),
+            // A Rust guest has no stack to hand back and reports a failure by trapping, so
+            // this probe never takes the world's graceful channel. Folding one into an error
+            // rather than ignoring it keeps "an `Err` here is a trap" true of the signature
+            // without silently passing a failure off as a success.
+            Err(failure) => Err(wasmtime::Error::msg(format!(
+                "the guest returned a failure rather than trapping: {failure:?}"
+            ))),
+        }
     }
 
     /// Invoke one probe and collect the messages it reported.

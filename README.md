@@ -67,13 +67,19 @@ Three things follow from who reads the output:
   the sandbox withholds the clock and randomness, so two runs over identical input produce
   byte-identical output. An agent reading it twice must not see reordering as change.
 - **It runs in the inner loop.** Agents and developers invoke it after every edit, so a warm run
-  is measured in tens of milliseconds.
+  is measured in tens of milliseconds — for a config whose rules are all TypeScript modules. A
+  rule that ships as a compiled component has to be loaded first, and the four TypeScript
+  built-ins share a 12.4 MiB one: naming any of them costs **about 6.5 seconds on a project's
+  first run** and **about 0.2 seconds on every run after it**, and leaves 33 MiB in `.lanekeep`.
+  `lanekeep init` scaffolds one of those four, so that is what a new TypeScript project meets
+  first. [`docs/architecture.md`](docs/architecture.md) §15 has the table and what is owed.
 
 **Rules are authored in TypeScript whatever language they check** — that is the form to start
 from, and it is the one most teams already have someone who writes. A rule may also be a
-WebAssembly component, which is how the two Rust-checking built-ins ship; both forms reach the
-same host API and are held to the same limits, and a config names a rule rather than its
-implementation. **Configuration is neither** — `lanekeep.json` is plain data, so a Go, Python or
+WebAssembly component, which is how six of the ten built-ins ship — two written in Rust, and
+four compiled ahead of time from the same TypeScript they were already written in. Every form
+reaches the same host API and is held to the same limits, and a config names a rule rather than
+its implementation. **Configuration is neither** — `lanekeep.json` is plain data, so a Go, Python or
 Rust team never writes a `.ts` file except when authoring an actual rule.
 
 ## Using it

@@ -38,7 +38,7 @@
 mod bindings;
 
 use bindings::lanekeep::host::types::{
-    FactError, ReduceLocation, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+    FactError, ReduceLocation, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
@@ -84,9 +84,15 @@ static SINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 struct Component;
 
 impl Guest for Component {
+    /// The one rule this component hosts. Every other export takes its index.
+    fn rules() -> Vec<String> {
+        vec!["fixture/engine-rule".to_owned()]
+    }
+
     /// Not exercised by any test — every export is mandatory because a WIT world has no
     /// optional ones. `tests/fixtures/metadata/` is where `metadata` itself is tested.
-    fn metadata() -> RuleMetadata {
+    fn metadata(rule: u32) -> RuleMetadata {
+        only(rule);
         RuleMetadata {
             id: "fixture/engine-rule".to_owned(),
             // Not `"rust"`: `crates/lanekeep-engine/src/lib.rs`'s `component_rule` is the only
@@ -127,22 +133,26 @@ impl Guest for Component {
     /// An object is accepted as well as `null` so that a test configuring this rule with real
     /// options is testing the engine's plumbing rather than this guest's opinion of it. What
     /// stays refused is the shape that is not options at all.
-    fn configure(options_json: String) -> Result<(), String> {
+    fn configure(rule: u32, options_json: String) -> Result<(), String> {
+        only(rule);
         if options_json == "null" || options_json.starts_with('{') {
             return Ok(());
         }
         Err("fixture/engine-rule expects an object or null".to_owned())
     }
 
-    fn has_check() -> bool {
+    fn has_check(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn has_reduce() -> bool {
+    fn has_reduce(rule: u32) -> bool {
+        only(rule);
         true
     }
 
-    fn check(ctx: &CheckContext, m: Match) {
+    fn check(rule: u32, ctx: &CheckContext, m: Match) -> Result<(), RuleError> {
+        only(rule);
         if m.iter().any(|entry| entry.name == BURN) {
             burn();
         }
@@ -161,7 +171,7 @@ impl Guest for Component {
                 )),
                 None,
             );
-            return;
+            return Ok(());
         };
 
         // `text` rather than `kind`: a kind is the same for every match of one query, so an
@@ -184,9 +194,11 @@ impl Guest for Component {
         if let Err(error) = ctx.emit_fact(KIND, &format!("{{\"text\":\"{text}\"}}")) {
             ctx.report(target, Some(&format!("emit: {}", named(&error))), None);
         }
+        Ok(())
     }
 
-    fn reduce(ctx: &ReduceContext) {
+    fn reduce(rule: u32, ctx: &ReduceContext) -> Result<(), RuleError> {
+        only(rule);
         for fact in ctx.facts(None) {
             // Reported *at the file the fact came from*, which is the only site a cross-file
             // rule has: the reduce phase never touches parse trees, so a position has to have
@@ -200,6 +212,7 @@ impl Guest for Component {
                 Some(&format!("{}|{}|{}", fact.kind, fact.file, fact.data)),
             );
         }
+        Ok(())
     }
 }
 
@@ -233,6 +246,16 @@ fn named(error: &FactError) -> String {
         FactError::NotAnObject => "not-an-object".to_owned(),
         FactError::InvalidJson(message) => format!("invalid-json({message})"),
     }
+}
+
+/// The one rule this component hosts.
+///
+/// A component hosts a *list* of rules and every export but `rules` takes an index into it.
+/// This one hosts a single rule, so zero is the only index that answers — and a host asking
+/// for another has disagreed with what `rules` reported, which is worth trapping on rather
+/// than answering with the one rule's data under another rule's name.
+fn only(rule: u32) {
+    assert_eq!(rule, 0, "this component hosts one rule");
 }
 
 bindings::export!(Component with_types_in bindings);

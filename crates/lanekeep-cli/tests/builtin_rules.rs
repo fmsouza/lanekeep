@@ -73,6 +73,13 @@ fn describe(output: &Output) -> String {
     )
 }
 
+/// A built-in that still ships as a TypeScript module, imported the way a `.config.ts` does.
+///
+/// Python rather than TypeScript, and that is not arbitrary: after the four flagship TypeScript
+/// rules were compiled into a component, every built-in that is still a *module* targets Python,
+/// Go or Rust. The import path is what is under test, so the rule has to be one that can still
+/// be imported — and a test that quietly switched to a `lanekeep.json` to keep passing would
+/// have stopped covering this path at all while looking exactly as green.
 #[test]
 fn a_built_in_rule_can_be_imported_by_specifier() {
     let project = Project::new(
@@ -81,10 +88,10 @@ fn a_built_in_rule_can_be_imported_by_specifier() {
             (
                 "lanekeep.config.ts",
                 "import { defineConfig } from 'lanekeep';\n\
-                 import noDefaultExport from 'lanekeep/no-default-export';\n\
-                 export default defineConfig({ include: ['src/**'], rules: [noDefaultExport] });\n",
+                 import noBroadExcept from 'lanekeep/no-broad-except';\n\
+                 export default defineConfig({ include: ['src/**'], rules: [noBroadExcept] });\n",
             ),
-            ("src/a.ts", "export default function parse() {}\n"),
+            ("src/a.py", "try:\n    run()\nexcept Exception:\n    pass\n"),
         ],
     );
 
@@ -96,24 +103,35 @@ fn a_built_in_rule_can_be_imported_by_specifier() {
         "expected violations to be found:\n{combined}"
     );
     assert!(
-        combined.contains("lanekeep/no-default-export"),
+        combined.contains("lanekeep/no-broad-except"),
         "the built-in did not report:\n{combined}"
     );
 }
 
+/// A built-in **factory**, configured — through the format that can now reach one.
+///
+/// `no-restricted-imports` exports a function over its options rather than a rule object, and
+/// both shapes have to keep working now that they live in one component: `configure` applies a
+/// factory to its options and uses a rule object as it comes. This is the factory half, end to
+/// end, from JSON on disk to a message carrying the configured reason.
+///
+/// It was a `lanekeep.config.ts` calling `noRestrictedImports({...})` until this rule became a
+/// component, and there is no remaining built-in factory that a `.config.ts` can import — the
+/// four modules that are left all export a rule object. So the capability being covered here is
+/// "a built-in factory can be configured", and the format it is covered through moved because
+/// the rule did.
 #[test]
 fn a_built_in_factory_rule_can_be_configured() {
     let project = Project::new(
         "builtin-factory",
         &[
             (
-                "lanekeep.config.ts",
-                "import { defineConfig } from 'lanekeep';\n\
-                 import noRestrictedImports from 'lanekeep/no-restricted-imports';\n\
-                 export default defineConfig({\n\
-                 \x20 include: ['src/**'],\n\
-                 \x20 rules: [noRestrictedImports({ restrictions: [{ module: 'lodash', reason: 'use the standard library' }] })],\n\
-                 });\n",
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+                    "rules": [{"rule": "lanekeep/no-restricted-imports",
+                               "options": {"restrictions": [
+                                   {"module": "lodash",
+                                    "reason": "use the standard library"}]}}]}"#,
             ),
             (
                 "src/a.ts",
@@ -132,6 +150,48 @@ fn a_built_in_factory_rule_can_be_configured() {
     assert!(
         combined.contains("use the standard library"),
         "the configured reason did not reach the output:\n{combined}"
+    );
+}
+
+/// And a built-in that is **not** a factory refuses options rather than ignoring them.
+///
+/// `no-default-export` exports a rule object, which has nowhere to put options: they reach a
+/// rule by being closed over, and only a factory closes over anything. Silently discarding them
+/// is the failure `AGENTS.md` records against `no-unwrap` and `no-glob-import`, whose documented
+/// `allow` option was dead code from the day each shipped — invisible because an ignored option
+/// only ever *adds* violations, so a user seeing one assumes their pattern is wrong.
+///
+/// Exit 2 and the rule's id in the message. A run that merely reported more than it should have
+/// is the shape this is written to prevent.
+#[test]
+fn a_built_in_that_is_not_a_factory_refuses_options() {
+    let project = Project::new(
+        "builtin-not-a-factory",
+        &[
+            (
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+                    "rules": [{"rule": "lanekeep/no-default-export",
+                               "options": {"allow": ["src/a.ts"]}}]}"#,
+            ),
+            ("src/a.ts", "export default function parse() {}\n"),
+        ],
+    );
+
+    let output = project.check(&[]);
+    let combined = describe(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "options a rule cannot use are a misconfiguration, not a violation:\n{combined}"
+    );
+    assert!(
+        combined.contains("lanekeep/no-default-export"),
+        "the refusal has to name the rule that was misconfigured:\n{combined}"
+    );
+    assert!(
+        combined.contains("takes no options"),
+        "the refusal has to say what is wrong with the config:\n{combined}"
     );
 }
 
@@ -169,14 +229,17 @@ fn a_project_file_cannot_shadow_a_built_in() {
         "builtin-shadow",
         &[
             (
-                "lanekeep.config.ts",
-                "import { defineConfig } from 'lanekeep';\n\
-                 import noDefaultExport from 'lanekeep/no-default-export';\n\
-                 export default defineConfig({ include: ['src/**'], rules: [noDefaultExport] });\n",
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+                    "rules": ["lanekeep/no-default-export"]}"#,
             ),
             // A rule that reports nothing, sitting exactly where naive path resolution
             // would look. If it won, the check below would pass with zero violations and
             // the tool would be silently disarmed.
+            //
+            // A component-backed built-in is the sharper version of this: the impostor is a
+            // module and the real rule is not, so a resolver that fell back to the filesystem
+            // would find something that loads.
             (
                 "lanekeep/no-default-export.ts",
                 "import { defineRule } from 'lanekeep';\n\
@@ -225,7 +288,8 @@ fn a_built_in_component_can_be_named_by_specifier() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"], "rules": ["lanekeep/no-unwrap"]}"#,
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+                    "rules": ["lanekeep/no-unwrap"]}"#,
             ),
             ("src/a.rs", "fn f() {\n    let c = load().unwrap();\n}\n"),
         ],
@@ -257,7 +321,7 @@ fn a_built_in_component_can_be_configured() {
         &[
             (
                 "lanekeep.json",
-                r#"{"include": ["src/**"],
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
                     "rules": [{"rule": "lanekeep/no-unwrap", "options": {"allow": ["src/a.rs"]}}]}"#,
             ),
             ("src/a.rs", "fn f() {\n    let c = load().unwrap();\n}\n"),
@@ -283,50 +347,90 @@ fn a_built_in_component_can_be_configured() {
 ///
 /// **The remedy is asserted here, and it is the half worth asserting.** QuickJS truncates a
 /// thrown error at 255 bytes and rquickjs spends the front of that on the importing module's
-/// absolute path — here a temporary directory over a hundred characters long, which is what
-/// makes this the realistic test rather than the unit one. An earlier two-line version of the
-/// message lost "name it in a `lanekeep.json`" to exactly this path, and this test passed,
-/// because it only checked the first line. Telling a user their config is wrong without telling
-/// them the one thing that fixes it is barely better than the "no built-in rule by that name"
-/// this replaced.
+/// absolute path, which is what makes this the realistic test rather than the unit one. An
+/// earlier two-line version of the message lost "name it in a `lanekeep.json`" to exactly this
+/// path, and this test passed, because it only checked the first line. Telling a user their
+/// config is wrong without telling them the one thing that fixes it is barely better than the
+/// "no built-in rule by that name" this replaced.
+///
+/// # Both ends of the name-length budget, and why the fixture names are as short as they are
+///
+/// The rule's name is spent twice inside those 255 bytes — once in rquickjs's framing, once in
+/// the message — so the *longest* name that ships is the case that can fail, and `no-unwrap` at
+/// nine characters would pass with headroom `no-restricted-imports` does not have. Both are
+/// covered.
+///
+/// What is left for the path is `150 - 2 * name`, which
+/// `lanekeep_js::MAX_COMPONENT_NAME` derives and states as 108 bytes at the current longest
+/// name. **A temporary directory is not a project path**: macOS's is 56 bytes of
+/// `/private/var/folders/…/T/` before this fixture writes anything, so a descriptive directory
+/// name here spends the user's budget on the harness and asserts something no config path has
+/// to satisfy. The name is one character for that reason, and the failure below prints the
+/// length it actually had, so a machine with an unusually long `TMPDIR` says so rather than
+/// reading as a regression in the message.
 #[test]
 fn a_typescript_config_cannot_import_a_built_in_component() {
-    let project = Project::new(
-        "builtin-component-imported",
-        &[
-            (
-                "lanekeep.config.ts",
-                "import { defineConfig } from 'lanekeep';\n\
-                 import noUnwrap from 'lanekeep/no-unwrap';\n\
-                 export default defineConfig({ include: ['src/**'], rules: [noUnwrap] });\n",
-            ),
-            ("src/a.rs", "fn f() {\n    let c = load().unwrap();\n}\n"),
-        ],
-    );
+    for (name, subject, source) in [
+        (
+            "no-unwrap",
+            "src/a.rs",
+            "fn f() {\n    let c = load().unwrap();\n}\n",
+        ),
+        (
+            "no-restricted-imports",
+            "src/a.ts",
+            "import merge from 'lodash';\nexport { merge };\n",
+        ),
+    ] {
+        let project = Project::new(
+            "c",
+            &[
+                (
+                    "lanekeep.config.ts",
+                    &format!(
+                        "import {{ defineConfig }} from 'lanekeep';\n\
+                         import rule from 'lanekeep/{name}';\n\
+                         export default defineConfig({{ include: ['src/**'], rules: [rule] }});\n"
+                    ),
+                ),
+                (subject, source),
+            ],
+        );
 
-    let output = project.check(&[]);
-    let combined = describe(&output);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "a config that cannot load is a runtime error, not a clean run:\n{combined}"
-    );
-    assert!(
-        combined.contains("lanekeep/no-unwrap"),
-        "the error does not name the specifier:\n{combined}"
-    );
-    assert!(
-        combined.contains("is a rule component"),
-        "the error must say what the rule is, not that it is missing:\n{combined}"
-    );
-    assert!(
-        combined.contains("name it in a `lanekeep.json`"),
-        "the remedy has to survive the truncation, or the error is not actionable:\n{combined}"
-    );
-    assert!(
-        !combined.contains("no built-in rule by that name"),
-        "a component-backed built-in is not a typo, and must not be reported as one:\n{combined}"
-    );
+        // What rquickjs will actually put in front of the message: the *canonical* path, which
+        // on macOS is eight bytes longer than the one the fixture built.
+        let config_path = std::fs::canonicalize(&project.dir)
+            .unwrap_or_else(|_| project.dir.clone())
+            .join("lanekeep.config.ts");
+        let path_bytes = config_path.as_os_str().len();
+
+        let output = project.check(&[]);
+        let combined = describe(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "a config that cannot load is a runtime error, not a clean run:\n{combined}"
+        );
+        assert!(
+            combined.contains(&format!("lanekeep/{name}")),
+            "the error does not name the specifier:\n{combined}"
+        );
+        assert!(
+            combined.contains("is a rule component"),
+            "the error must say what the rule is, not that it is missing:\n{combined}"
+        );
+        assert!(
+            combined.contains("name it in a `lanekeep.json`"),
+            "the remedy has to survive the truncation, or the error is not actionable\n  \
+             the config path was {path_bytes} bytes and the budget for `{name}` is \
+             {} — a path over that is this machine's `TMPDIR`, not a regression here\n{combined}",
+            150 - 2 * name.len(),
+        );
+        assert!(
+            !combined.contains("no built-in rule by that name"),
+            "a component-backed built-in is not a typo, and must not be reported as one:\n{combined}"
+        );
+    }
 }
 
 #[test]
@@ -334,10 +438,9 @@ fn the_rules_command_lists_a_built_in() {
     let project = Project::new(
         "builtin-listed",
         &[(
-            "lanekeep.config.ts",
-            "import { defineConfig } from 'lanekeep';\n\
-             import noDefaultExport from 'lanekeep/no-default-export';\n\
-             export default defineConfig({ include: ['src/**'], rules: [noDefaultExport] });\n",
+            "lanekeep.json",
+            r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+                    "rules": ["lanekeep/no-default-export"]}"#,
         )],
     );
 
@@ -361,10 +464,9 @@ fn a_clean_project_using_built_ins_exits_zero() {
         "builtin-clean",
         &[
             (
-                "lanekeep.config.ts",
-                "import { defineConfig } from 'lanekeep';\n\
-                 import noDefaultExport from 'lanekeep/no-default-export';\n\
-                 export default defineConfig({ include: ['src/**'], rules: [noDefaultExport] });\n",
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+                    "rules": ["lanekeep/no-default-export"]}"#,
             ),
             ("src/a.ts", "export function parse() {}\n"),
         ],
@@ -382,10 +484,9 @@ fn built_ins_are_reachable_without_a_lanekeep_directory() {
         "builtin-no-dir",
         &[
             (
-                "lanekeep.config.ts",
-                "import { defineConfig } from 'lanekeep';\n\
-                 import noDefaultExport from 'lanekeep/no-default-export';\n\
-                 export default defineConfig({ include: ['src/**'], rules: [noDefaultExport] });\n",
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+                    "rules": ["lanekeep/no-default-export"]}"#,
             ),
             ("src/a.ts", "export default 1;\n"),
         ],

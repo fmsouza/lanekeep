@@ -57,7 +57,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -122,9 +122,9 @@ impl Capture for MatchEntry {
     }
 }
 
-struct Component;
+struct NoUnwrap;
 
-impl Guest for Component {
+impl Rule for NoUnwrap {
     fn metadata() -> RuleMetadata {
         RuleMetadata {
             id: "lanekeep/no-unwrap".to_owned(),
@@ -183,17 +183,17 @@ impl Guest for Component {
         false
     }
 
-    fn check(ctx: &CheckContext, m: Match) {
+    fn check(ctx: &CheckContext, m: Match) -> Result<(), RuleError> {
         let (Some(method), Some(call)) = (capture(&m, METHOD), capture(&m, CALL)) else {
             // The query below binds both on every match, so this is unreachable — and it is a
             // `return` rather than an assertion because the alternative in a guest is a trap,
             // which the host cannot tell apart from a rule that found nothing.
-            return;
+            return Ok(());
         };
 
         let method = ctx.text(method).unwrap_or_default();
         if method != UNWRAP && method != EXPECT {
-            return;
+            return Ok(());
         }
 
         let path = ctx.file_path();
@@ -201,14 +201,14 @@ impl Guest for Component {
         // An integration test directory, and the conventional unit-test module name. Panicking
         // is the failure mechanism there, which is the whole point of a test.
         if path.contains("/tests/") || path.starts_with("tests/") {
-            return;
+            return Ok(());
         }
         if in_test_code(ctx, call) {
-            return;
+            return Ok(());
         }
 
         if ALLOW.with_borrow(|allow| allow.iter().any(|pattern| glob_matches(pattern, &path))) {
-            return;
+            return Ok(());
         }
 
         ctx.report(
@@ -218,10 +218,13 @@ impl Guest for Component {
             )),
             None,
         );
+        Ok(())
     }
 
-    /// Nothing. This rule has no cross-file pass; see [`Guest::has_reduce`].
-    fn reduce(_ctx: &ReduceContext) {}
+    /// Nothing. This rule has no cross-file pass; see [`NoUnwrap::has_reduce`].
+    fn reduce(_ctx: &ReduceContext) -> Result<(), RuleError> {
+        Ok(())
+    }
 }
 
 /// Whether this node sits inside `#[test]` or `#[cfg(test)]`.
@@ -302,7 +305,19 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// The canonical-ABI shims that make the six exports reachable from the host.
+// The rules this component hosts, and the dispatch the world's rule index drives.
+//
+// One rule, so this component is a ruleset of one and answers to index zero. The macro is what
+// keeps that true without this file spelling a number: `rules` reports the list and every other
+// export looks its index back up in the same list, so an id and a type cannot drift apart.
+//
+// A plain comment rather than `///`: a doc comment on a macro invocation documents nothing, and
+// `unused_doc_comments` is an error under this workspace's lints.
+lanekeep_rule::ruleset! {
+    "lanekeep/no-unwrap" => NoUnwrap,
+}
+
+/// The canonical-ABI shims that make the seven exports reachable from the host.
 ///
 /// In a module of its own so the `unsafe_code` the expansion needs is allowed *here* and not
 /// across the rule's own code, which the workspace still denies it in. The macro takes bare
@@ -310,7 +325,7 @@ fn is_word_byte(byte: u8) -> bool {
 /// spelled out.
 ///
 /// `warnings` alongside `unsafe_code`, on the same terms as `mod bindings` above: the expansion
-/// calls `bindings`' own underscore-prefixed shims, which is six `clippy::used_underscore_items`
+/// calls `bindings`' own underscore-prefixed shims, which is seven `clippy::used_underscore_items`
 /// under this workspace's `pedantic`. The `engine-rule` fixture this crate is modeled on has no
 /// `[lints]` table of its own, so the template never had to answer for the expansion's lints and
 /// dropping `warnings` here looks harmless right up until `cargo clippy` runs.

@@ -1,0 +1,47 @@
+# The two-faced guest: a component whose `rules()` and `metadata()` disagree about a rule's id.
+#
+# Every other fixture here answers its own id the same way twice, which is what makes them
+# useless for the check that the two answers agree — a host that never compared them passes
+# against all of them. This one enumerates `fixture/enumerated` and describes that rule as
+# `fixture/described`, and nothing else about it is unusual.
+#
+# Its own workspace, deliberately, exactly as tests/fixtures/two-rules/ is. It is built for
+# wasm32-unknown-unknown by `cargo component`, not by the parent workspace's toolchain, and
+# `members = ["crates/*"]` does not reach it. An empty `[workspace]` table is what detaches
+# it; without one, cargo refuses to build it at all.
+[package]
+name = "two-faced"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# The world is read from the engine's own wit/ directory rather than from a copy under this
+# crate, for the reason tests/fixtures/world-shape/Cargo.toml gives at length: a copy would
+# prove that a file which was once the world is targetable, and nothing would catch the two
+# drifting apart.
+[package.metadata.component.target]
+path = "../../../wit"
+world = "rule"
+
+[package.metadata.component.dependencies]
+
+# The artifact is committed, so it is worth not committing debug information nobody reads.
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build`
+# generates and `.gitignore` deliberately excludes. cargo-machete reads source, so on a
+# fresh checkout it sees a dependency nothing references and fails the gate — while a
+# machine that has built the fixture once sees it used and passes. That split is the
+# whole bug: it passed locally and failed on CI's first Linux run.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]

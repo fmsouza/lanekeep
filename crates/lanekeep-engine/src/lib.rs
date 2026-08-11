@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
-use lanekeep_config::{Config, ConfigError, RuleSpec};
+use lanekeep_config::{ComponentBytes, Config, ConfigError, RuleSpec};
 use lanekeep_core::suppression::{self, Date, Suppressions};
 use lanekeep_core::{
     CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, RuleId, Severity,
@@ -2110,11 +2110,13 @@ struct Worker<'a> {
     failed: Option<RunError>,
     /// This worker's component store, built on first use exactly as the sandbox is.
     ///
-    /// **One store per worker holding one instance per rule — and rayon decides how many workers
-    /// there are.** `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it allocates
-    /// one `None` per rule), which is what makes it safe to build from rayon's initializer,
-    /// since `map_init` runs that per *chunk* rather than per thread. Instantiation then happens
-    /// in `WasmRuntime::rule`, at most once per slot per store.
+    /// **One store per worker holding one instance per component — and rayon decides how many
+    /// workers there are.** `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it
+    /// allocates one `None` per component instance the ruleset needs), which is what makes it
+    /// safe to build from rayon's initializer, since `map_init` runs that per *chunk* rather than
+    /// per thread. Instantiation then happens in `WasmRuntime::rule`, at most once per component
+    /// instance per store — several rules of one component share one, which is the point of the
+    /// rule index the world's exports take.
     ///
     /// That is a bound per `Worker`, not per thread, and the difference is not small: measured
     /// through this engine at ten thousand files times ten rules, **1,038 stores and 10,380
@@ -2437,7 +2439,15 @@ fn load_components(
         // so executing a second read would let a file that changed in between describe one
         // rule, key another and run a third — with every check passing and nothing to notice.
         let admitted = loader
-            .load(&engine, &name, component.bytes.as_slice())
+            .load_mapped(
+                &engine,
+                &name,
+                component.bytes.as_slice(),
+                // The map the config carried, not one looked up here. It is only correct for
+                // the bundle beside it, and this crate has no way to check that pairing —
+                // `lanekeep-config` read both out of one table.
+                component.source_map.as_ref().map(ComponentBytes::as_slice),
+            )
             .map_err(|e: WasmError| RunError::Component {
                 rule: name.clone(),
                 detail: e.to_string(),
@@ -2448,12 +2458,20 @@ fn load_components(
         // performed here instead would reach whichever store this thread happens to hold and
         // none of the others, which is a rule answering differently depending on how rayon
         // split the corpus.
-        let slot =
-            set.add(&name, &admitted, component.options)
-                .map_err(|e| RunError::Component {
-                    rule: name,
-                    detail: e.to_string(),
-                })?;
+        //
+        // **The index is the rule, and the component is only where it lives.** A component
+        // hosts a list, so `lanekeep_config::describe_components` produces one `RuleSpec` per
+        // rule, each carrying the `ComponentRule::index` its description was read at. Every
+        // export the world declares takes that index, so it is the whole of what distinguishes
+        // the programs two rules of one component run — their code is byte-identical. Naming a
+        // constant here instead would run the same rule under each of its neighbors' ids, with
+        // the id, the query and the card all correct and only the handler wrong.
+        let slot = set
+            .add(&name, &admitted, component.index, component.options)
+            .map_err(|e| RunError::Component {
+                rule: name,
+                detail: e.to_string(),
+            })?;
         rule.slot = Some(slot);
     }
 
@@ -5265,7 +5283,12 @@ export default defineRule({
 
         /// The same, with the bytes chosen — for the cases about a component that cannot run.
         fn with_bytes(path: PathBuf, bytes: Vec<u8>) -> ComponentRule {
-            ComponentRule::uncounted(path, "null".to_owned(), bytes)
+            // Rule `0`: every component these hand-built specs reach hosts exactly one rule, so
+            // it is the only index there is to name. The engine dispatches on whatever is here
+            // — `each_rule_of_one_component_runs_the_code_its_own_index_names` is what says so,
+            // and it goes through a real `lanekeep.json` rather than this helper, because a
+            // component hosting a list is described rather than hand-built.
+            ComponentRule::uncounted(path, 0, "null".to_owned(), bytes)
         }
 
         /// A `RuleSpec` backed by the fixture component.
@@ -5329,6 +5352,54 @@ export default defineRule({
             /// Load the project's config, add component-backed rules to it, and run cold.
             fn run_with(&self, extra: Vec<RuleSpec>) -> Result<Outcome, RunError> {
                 self.prepared(extra)?.without_cache().run()
+            }
+
+            /// Copy a `.wasm` fixture into this project, under a path a config can name.
+            ///
+            /// A binary copy rather than [`Project::write`], and inside the project rather than
+            /// referenced where it is built, because `RuleRoot::confine` refuses a rule
+            /// specifier that leaves the rules root.
+            fn write_component(&self, at: &str, fixture: &str) {
+                let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../lanekeep-wasm/tests/fixtures")
+                    .join(format!("{fixture}.wasm"));
+                let full = self.dir.join(at);
+                if let Some(parent) = full.parent() {
+                    fs::create_dir_all(parent).expect("creates parent");
+                }
+                fs::copy(&from, &full).expect("the fixture ships");
+            }
+
+            /// Load this project's `lanekeep.json` and run it cold, over every language.
+            ///
+            /// Two things separate it from [`Project::prepared`], and both are the point rather
+            /// than convenience. The config is a `lanekeep.json`, because that is the only
+            /// format that can name a component — so a rule reaching the engine through it was
+            /// described by `lanekeep_config::describe_components` rather than hand-built here,
+            /// which is what makes a multi-rule component expressible at all. And the registry
+            /// is every supported language rather than the JavaScript family, because a
+            /// component's rules declare whichever language they were written against and the
+            /// engine refuses a rule naming one it does not know.
+            fn run_json(&self) -> Result<Outcome, RunError> {
+                let root = RuleRoot::new(&self.dir).expect("canonicalizes");
+                let config_path = self.dir.join("lanekeep.json");
+                let sandbox =
+                    lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
+                        .expect("sandbox");
+                let config = lanekeep_config::load(&sandbox, &root, &config_path)
+                    .unwrap_or_else(|e| panic!("config failed to load: {e}"));
+
+                Engine::prepare(
+                    &config,
+                    &self.dir,
+                    root,
+                    &config_path,
+                    &lanekeep_languages::registry(),
+                    Arc::new(TypeScript),
+                    Arc::new(JavaScript),
+                )?
+                .without_cache()
+                .run()
             }
         }
 
@@ -5451,6 +5522,75 @@ export default defineRule({
                     "local/zeta|src/b.ts|1:1|debugger statement".to_owned(),
                 ],
                 "the two engines' violations must interleave by id, not group by engine"
+            );
+        }
+
+        #[test]
+        fn each_rule_of_one_component_runs_the_code_its_own_index_names() {
+            // **The dispatch, and the one arrangement that can see it.** Every other component
+            // test here names a fixture hosting a single rule, so rule 0 is the only rule there
+            // is and an engine that dispatched on the index is indistinguishable from one that
+            // wrote `0` at the call site. `two-rules` hosts two, whose ids, queries and card
+            // messages all differ, so running the wrong one is visible rather than plausible.
+            //
+            // What each half of a violation comes from is what makes the failure legible. The
+            // `rule_id` is the *spec's* — the host attributes a report to the rule it invoked
+            // for — so it is right either way. The message is the *guest's*: `two-rules` writes
+            // its own id into it, and the capture name it saw. So an engine dispatching on `0`
+            // reports `fixture/second|…|fixture/first: 1` — rule 1's query, rule 0's code, under
+            // rule 1's name — which says "the engine ran the wrong rule" and not merely "this
+            // did not match".
+            //
+            // The corpus is mixed and so is the ruleset: the component's rules are Rust and the
+            // QuickJS rule is TypeScript, and the QuickJS rule is declared *last* while sorting
+            // *between* the two component rules. So the single sorted output covers all three.
+            let project = Project::new(
+                "component-by-index",
+                &[
+                    ("middle.ts", &debugger_rule("fixture/middle")),
+                    (
+                        "lanekeep.json",
+                        r#"{"include": ["src/**/*.rs", "src/**/*.ts"],
+                            "namespaces": ["fixture"],
+                            "rules": [{"rule": "./rules/two-rules.wasm",
+                                       "options": {"tag": "alpha"}},
+                                      "./middle"]}"#,
+                    ),
+                    ("src/a.rs", "fn main() {\n    helper();\n}\n"),
+                    ("src/b.ts", "debugger;\n"),
+                ],
+            );
+            project.write_component("rules/two-rules.wasm", "two-rules");
+
+            let outcome = project.run_json().expect("runs");
+
+            assert_eq!(
+                rendered(&outcome),
+                vec![
+                    "fixture/first|src/a.rs|1:1|fixture/first: 0".to_owned(),
+                    "fixture/middle|src/b.ts|1:1|debugger statement".to_owned(),
+                    "fixture/second|src/a.rs|1:1|fixture/second: 1".to_owned(),
+                ],
+                "each rule of a component must run the code its own index names, and all three \
+                 must land in one order"
+            );
+
+            // And the config described each of them as itself. The remediation is the spec's
+            // side of the same claim the message makes from the guest's side — it comes from
+            // the card `metadata(index)` returned, so two rules collapsing into one description
+            // would show here even if dispatch were right.
+            let remediations: Vec<&str> = outcome
+                .violations
+                .iter()
+                .map(|v| v.remediation.as_str())
+                .collect();
+            assert_eq!(
+                remediations,
+                [
+                    "fixture/first remediation",
+                    "remove it",
+                    "fixture/second remediation"
+                ]
             );
         }
 
@@ -6145,7 +6285,7 @@ export default defineRule({
 
         #[test]
         fn a_worker_instantiates_a_component_rule_once_however_many_files_it_handles() {
-            // The bound `MEMORY_RESERVATION` is chosen on: one instance per (worker, rule).
+            // The bound `MEMORY_RESERVATION` is chosen on: one instance per (worker, component).
             // Driven through one `Worker` directly rather than through `run`, because rayon
             // decides how many workers exist and the claim is about one of them.
             let project = Project::new(

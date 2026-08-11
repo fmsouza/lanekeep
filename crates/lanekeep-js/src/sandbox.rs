@@ -506,6 +506,10 @@ mod tests {
 
     #[test]
     fn there_is_no_network_access() {
+        // `fetch` is the capability; `Request`, `Response` and `Headers` are the fetch API's
+        // own constructors and go with it. The general data types it happens to use — `Blob`,
+        // `File`, `FormData`, `URL` — are deliberately not named: they carry no authority once
+        // `fetch` is gone, and this list is not an inventory of everything QuickJS lacks.
         let s = sandbox();
         for global in [
             "fetch",
@@ -514,6 +518,7 @@ mod tests {
             "navigator",
             "Request",
             "Response",
+            "Headers",
         ] {
             assert_eq!(type_of(&s, global), "undefined", "{global} must not exist");
         }
@@ -523,13 +528,36 @@ mod tests {
     fn there_are_no_timers() {
         // Timers have no meaning in a synchronous single-pass engine, and `setTimeout`
         // would be a scheduling primitive a rule could use to observe wall-clock time.
+        //
+        // The `clear*` half is inert once the `set*` half is gone, and is named anyway: half a
+        // pair reads as an oversight, and this list is what the component engine's own
+        // withholding is derived from.
         let s = sandbox();
         for global in [
             "setTimeout",
             "setInterval",
             "setImmediate",
             "requestAnimationFrame",
+            "clearTimeout",
+            "clearInterval",
         ] {
+            assert_eq!(type_of(&s, global), "undefined", "{global} must not exist");
+        }
+    }
+
+    #[test]
+    fn there_is_no_ambient_output_or_environment() {
+        // None of these has ever been in this engine, and the assertion is here because it is
+        // read: `crates/lanekeep-wasm/tests/js_globals.rs` derives what a WebAssembly rule
+        // component must delete from what this module says is absent, and StarlingMonkey ships
+        // all four.
+        //
+        // `console` is an output channel that goes nowhere — the component build disables
+        // stdio — and a rule that logs should fail the same way in both engines rather than in
+        // one. `location` and its `self`/`WorkerLocation` spellings describe a host
+        // environment a rule has no business observing.
+        let s = sandbox();
+        for global in ["console", "location", "self", "WorkerLocation"] {
             assert_eq!(type_of(&s, global), "undefined", "{global} must not exist");
         }
     }
@@ -540,6 +568,11 @@ mod tests {
     fn there_is_no_clock() {
         // Both of these, not just Date. `performance.now()` is the one that survives a
         // reviewer thinking "we removed Date, so there is no clock".
+        //
+        // And `Performance` beside `performance`, one level further in: the instance is not
+        // the only way to a clock, since `Performance.prototype.now` is the method it fronts.
+        // Omitting `intrinsic::Performance` takes both away here; an engine that deleted only
+        // the lowercase one would have left the trap this comment is about.
         let s = sandbox();
         assert_eq!(type_of(&s, "Date"), "undefined", "Date must not exist");
         assert_eq!(
@@ -547,17 +580,35 @@ mod tests {
             "undefined",
             "performance must not exist"
         );
+        assert_eq!(
+            type_of(&s, "Performance"),
+            "undefined",
+            "Performance must not exist"
+        );
     }
 
     #[test]
     fn there_is_no_randomness() {
+        // `type_of` and not a bare `eval`, though the two say the same thing here. This module's
+        // absence assertions are *read* — `crates/lanekeep-wasm/tests/js_globals.rs` extracts
+        // them and holds the component engine to the same set — and that extraction recognizes
+        // three shapes. An `assert_eq!(s.eval::<String>(...), "undefined", ...)` is a fourth,
+        // and a name added in it would be withheld here and reachable in a component with
+        // nothing going red. `type_of` evaluates `typeof (Math.random)`, so the dotted form
+        // needs nothing special.
         let s = sandbox();
         assert_eq!(
-            s.eval::<String>("typeof Math.random").expect("evaluates"),
+            type_of(&s, "Math.random"),
             "undefined",
             "Math.random must be gone"
         );
         assert_eq!(type_of(&s, "crypto"), "undefined", "crypto must not exist");
+        // The constructor forms, on the same footing as `Performance` above: `crypto` is an
+        // instance of `Crypto`, and `Crypto.prototype.getRandomValues` is the entropy source
+        // it fronts.
+        for global in ["Crypto", "SubtleCrypto", "CryptoKey"] {
+            assert_eq!(type_of(&s, global), "undefined", "{global} must not exist");
+        }
     }
 
     #[test]

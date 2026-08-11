@@ -3,7 +3,7 @@
 //! Almost nothing here is hand-written. [`wasmtime::component::bindgen!`] expands the `rule`
 //! world into the Rust the rest of this crate implements against: a `Host*` trait per
 //! resource with one method per WIT function, the record, variant and enum types, and a
-//! [`Rule`] struct whose `call_*` methods invoke the six exports.
+//! [`Rule`] struct whose `call_*` methods invoke the seven exports.
 //!
 //! **The generated shape is the authority, not any description of it.** If a later change
 //! expects a name the macro does not produce, the change adapts.
@@ -71,6 +71,20 @@ mod generated {
         // malformed input has failed at its job. With it, the host returns `Err`, the call
         // traps, and the run reports rather than dies.
         imports: { default: trappable },
+
+        // `bindgen!` derives `Clone` and writes a `Debug` impl and stops there. `WasmError`
+        // is `PartialEq + Eq` — every other variant is comparable and its tests compare
+        // them — and `WasmError::RuleFailed` carries the guest's own `stack-frame` list, so
+        // that record has to be comparable too.
+        //
+        // Widened here rather than by declaring a second Rust `StackFrame` beside the
+        // generated one. A hand-written copy of a WIT record is the drift
+        // `rust-rules/lanekeep-rule`'s own header warns about one layer up: a field added to
+        // the record does not break a struct-literal conversion, so nothing notices the two
+        // moving apart. There is no per-type form of this option, and the blanket is
+        // harmless — every record, variant and enum in this world is built from strings,
+        // lists, options and integers, all of which are already `Eq`.
+        additional_derives: [PartialEq, Eq],
     });
 }
 

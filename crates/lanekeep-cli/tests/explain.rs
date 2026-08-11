@@ -28,7 +28,7 @@ impl Project {
         std::fs::create_dir_all(dir.join("src")).expect("creates dir");
 
         let project = Self { dir };
-        std::fs::write(project.dir.join("lanekeep.config.ts"), config).expect("writes config");
+        std::fs::write(project.dir.join("lanekeep.json"), config).expect("writes config");
         std::fs::write(project.dir.join("src/a.ts"), "const a = 1;\n").expect("writes source");
         project
     }
@@ -57,13 +57,17 @@ fn describe(output: &Output) -> String {
     )
 }
 
-const CONFIG: &str = "import { defineConfig } from 'lanekeep';\n\
-     import noDefaultExport from 'lanekeep/no-default-export';\n\
-     import noUnusedExports from 'lanekeep/no-unused-exports';\n\
-     export default defineConfig({\n\
-     \x20 include: ['src/**'],\n\
-     \x20 rules: [noDefaultExport, noUnusedExports({})],\n\
-     });\n";
+/// A per-file rule and a cross-file one, which is what `explain` has to tell apart.
+///
+/// JSON rather than a `lanekeep.config.ts`: both of these rules are compiled into a component
+/// now, and a component is not a value a module can import. What `explain` reads is a loaded
+/// `Config`, which is the same either way.
+const CONFIG: &str = r#"{
+      "include": ["src/**"],
+      "timeouts": {"rule": 600000, "global": 600000},
+      "rules": ["lanekeep/no-default-export",
+                {"rule": "lanekeep/no-unused-exports", "options": {}}]
+    }"#;
 
 #[test]
 fn explain_prints_the_card() {

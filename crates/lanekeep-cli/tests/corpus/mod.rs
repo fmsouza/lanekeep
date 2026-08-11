@@ -2,6 +2,29 @@
 //!
 //! `RuleTester` runs one subject file at a time, which is exactly what a cross-file rule
 //! cannot be tested with. This drives the binary over a real directory instead.
+//!
+//! # It generates a `lanekeep.json`, and it has to
+//!
+//! This wrote a `lanekeep.config.ts` importing `lanekeep/<rule>` until the four TypeScript
+//! built-ins were compiled into a component. A component is not a value a module can import —
+//! `lanekeep_js::ResolveError::NotAModule` says so, and says to name it in a `lanekeep.json` —
+//! so the config format is forced by what the rules now are, exactly as it already was for
+//! `RuleTester::for_component`.
+//!
+//! **The change is what makes the two test files that use this meaningful.** They are held to
+//! passing unmodified across the migration, and a helper that kept writing a `.config.ts` could
+//! only have done that by keeping the rules resolvable as modules — which is to say by having
+//! them still run in QuickJS. Those files would then have been green before the change and green
+//! after it, while asserting nothing about the thing that changed.
+
+// Each `tests/*.rs` is its own crate and uses the reading it needs — `run` for the two
+// cross-file rules, `run_failing` for the one that is about a rule refusing to finish — so an
+// unused method here is code another crate uses. `allow` rather than `expect`, because `expect`
+// would be unfulfilled in whichever crate happens to use all of it.
+#![allow(
+    dead_code,
+    reason = "one module shared by several test crates, each using the part it needs"
+)]
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,7 +39,10 @@ pub(crate) struct Corpus {
 }
 
 impl Corpus {
-    /// Build a project whose config is `<rule>(<options>)`.
+    /// Build a project whose one rule is `<rule>` configured with `<options>`.
+    ///
+    /// `options` is written the way a `.config.ts` would have spelled it — a JavaScript object
+    /// literal — because that is what the callers pass and they do not change. See [`as_json`].
     pub(crate) fn new(rule: &str, options: &str, files: &[(&str, &str)]) -> Self {
         let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -25,15 +51,20 @@ impl Corpus {
         ));
         let _ = std::fs::remove_dir_all(&dir);
 
+        let config = serde_json::json!({
+            "include": ["src/**"],
+            // Both budgets, and neither is what these tests are about. The per-rule one is the
+            // half the first attempt missed: raising `global` alone left a cross-file rule's
+            // own handler on the 1 s default, which a component rule breaches on emulated or
+            // heavily contended hardware while passing in 1.5 s natively.
+            "timeouts": { "rule": 600_000, "global": 600_000 },
+            "rules": [{ "rule": format!("lanekeep/{rule}"), "options": as_json(options) }],
+        });
+
         let corpus = Self { dir };
-        corpus.write(
-            "lanekeep.config.ts",
-            &format!(
-                "import {{ defineConfig }} from 'lanekeep';\n\
-                 import rule from 'lanekeep/{rule}';\n\
-                 export default defineConfig({{ include: ['src/**'], rules: [rule({options})] }});\n"
-            ),
-        );
+        // `to_string` rather than `to_string_pretty`: nothing reads this by eye except when a
+        // test fails, and a failure prints the tool's error rather than the config.
+        corpus.write("lanekeep.json", &config.to_string());
         for (path, contents) in files {
             corpus.write(path, contents);
         }
@@ -48,19 +79,33 @@ impl Corpus {
         std::fs::write(full, contents).expect("writes file");
     }
 
+    /// What the tool said when the run could not finish.
+    ///
+    /// The other half of [`Corpus::run`], for the case that one refuses: a rule that throws
+    /// cancels the run and exits `2`, which [`Corpus::run`] treats — correctly, for its own
+    /// callers — as the test having gone wrong. Here it is the subject.
+    ///
+    /// Both streams, joined, because where a failure is written is a reporter's decision and
+    /// not what any caller of this is asserting.
+    pub(crate) fn run_failing(&self) -> String {
+        let output = self.invoke();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "the run was supposed to be cancelled by a failing rule:\n{stderr}\n{stdout}"
+        );
+        format!("{stderr}{stdout}")
+    }
+
     /// Violations as `file:line:column message`, in the order the tool reported them.
     ///
     /// Rendered rather than structured, because the ordering *is* part of what these tests
     /// assert — a cross-file rule that reports the same set in a different order every run
     /// has failed the determinism invariant even though the set is right.
     pub(crate) fn run(&self) -> Vec<String> {
-        let output = Command::new(env!("CARGO_BIN_EXE_lanekeep"))
-            .arg("check")
-            .arg(&self.dir)
-            .arg("--format")
-            .arg("json")
-            .output()
-            .expect("runs the binary");
+        let output = self.invoke();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -88,10 +133,119 @@ impl Corpus {
             })
             .collect()
     }
+
+    /// One `lanekeep check` over this project, however it turns out.
+    ///
+    /// Shared by both readings above so that neither can drift into checking a different run
+    /// from the other — the budgets in particular, which are what keep a loaded machine from
+    /// being reported as a misbehaving rule.
+    fn invoke(&self) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_lanekeep"))
+            .arg("check")
+            .arg(&self.dir)
+            .arg("--format")
+            .arg("json")
+            // Ten minutes, in milliseconds, and far above what the work needs.
+            //
+            // The rules these tests drive live in a 12.4 MiB component, and every corpus is a
+            // fresh directory, so the first `check` in each one compiles that component from
+            // scratch — measured at 14.4 s on an otherwise idle machine, and several times that
+            // when nextest is running two dozen of these at once. The default 15 s budget is a
+            // limit on *rule execution*, and tripping it here would be reporting a machine's
+            // load as a rule's misbehavior, which is the failure `AGENTS.md`'s limits invariant
+            // exists to keep out of the output.
+            //
+            // **Nothing here stops a hung rule, and that is deliberate rather than an
+            // oversight.** This was 45 s with a comment claiming a hang would still fail inside
+            // a minute; the number was then raised for CI hardware and the claim was left
+            // standing beside it, false. The backstop is nextest's own `slow-timeout` —
+            // `.config/nextest.toml` sets 30 s with `terminate-after = 4` — which kills the
+            // test after two minutes and reports it as terminated. That is the better layer for
+            // it: a harness saying "this test was killed" is the truth, where a budget breach
+            // says a rule misbehaved when what happened was the machine.
+            //
+            // The config this helper writes carries the same two budgets, because `--timeout`
+            // sets only the global one.
+            .arg("--timeout")
+            .arg("600000")
+            .output()
+            .expect("runs the binary")
+    }
 }
 
 impl Drop for Corpus {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// A JavaScript object literal as JSON.
+///
+/// The callers spell their options the way a `lanekeep.config.ts` would — `{}`,
+/// `{ maxDepth: 24 }`, `{ entryPoints: ['src/index.ts'] }` — and they are held to passing
+/// unmodified, so the conversion happens here. Two differences from JSON and no others: a key
+/// may be a bare identifier, and a string may be single-quoted.
+///
+/// **It validates rather than approximating.** A shape this does not handle produces something
+/// `serde_json` refuses, and the panic names the input and what it became. That matters more
+/// than the conversion being general: `AGENTS.md` records that a fixture refused by an earlier
+/// gate than the one under test either passes for the wrong reason or fails with a message
+/// pointing somewhere else — a silently mangled option would leave a rule configured with
+/// something nobody wrote, and an over-reporting rule reads exactly like a rule that works.
+fn as_json(options: &str) -> serde_json::Value {
+    let mut out = String::with_capacity(options.len() + 16);
+    let mut chars = options.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            // A single-quoted string becomes a double-quoted one. No escape handling: none of
+            // these fixtures contains one, and `serde_json` refuses whatever it would produce.
+            '\'' => {
+                out.push('"');
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+            }
+            // A bare identifier is a key if a colon follows it, and a literal otherwise —
+            // `true`, `false` and `null` are spelled the same in both languages, so they are
+            // left alone by not being followed by one.
+            c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+                let mut word = String::from(c);
+                while let Some(&next) = chars.peek() {
+                    if next.is_ascii_alphanumeric() || next == '_' || next == '$' {
+                        word.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let mut spacing = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next.is_whitespace() {
+                        spacing.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if chars.peek() == Some(&':') {
+                    out.push('"');
+                    out.push_str(&word);
+                    out.push('"');
+                } else {
+                    out.push_str(&word);
+                }
+                out.push_str(&spacing);
+            }
+            _ => out.push(c),
+        }
+    }
+
+    serde_json::from_str(&out).unwrap_or_else(|e| {
+        panic!("`{options}` is not a rule's options that this helper can put in a JSON config\n  it became `{out}`, which {e}")
+    })
 }
