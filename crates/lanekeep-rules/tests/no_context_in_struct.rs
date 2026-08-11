@@ -137,12 +137,11 @@ const CASES: &[Case] = &[
         source: "package a\n\nimport context \"context\"\n\ntype C struct {\n\tc context.Context\n}\n",
         expected: Expected::ReportsAt(&[(6, 2)]),
     },
-    // The rule's one known false positive, asserted rather than left to be discovered.
+    // The rule's known false positive, asserted rather than left to be discovered.
     //
-    // `ctx.bindingKind` says a name is an import; it does not say which module. Telling these
-    // apart needs the host API to expose the module, which bumps its version and so the cache key
-    // — a change this rule does not justify on its own. Pinned here so that if the API ever does
-    // grow that, this case fails and points at the rule to tighten.
+    // `bindingKind` says a name is an import; *which* package it is, is then decided by comparing
+    // the qualifier's text against `context` — so an import whose local name is spelled `context`
+    // is reported whatever it points at.
     //
     // **It survived the migration asserting the same thing**, which is the point of writing a
     // known limitation down: a port that quietly fixed it would have been a port that changed
@@ -152,6 +151,29 @@ const CASES: &[Case] = &[
         source: "package a\n\nimport context \"example.com/app/context\"\n\n\
                  type C struct {\n\tc context.Context\n}\n",
         expected: Expected::ReportsAt(&[(6, 2)]),
+    },
+    // And the same text comparison read the other way round: the false *negative*, which is the
+    // half that costs a user something.
+    //
+    // This is the standard library's `context.Context`, stored in a struct, and the rule does not
+    // report it — because the qualifier is spelled `ctxpkg` and the comparison is on the
+    // qualifier's text. A missed violation is the worse direction of the two: the false positive
+    // above arrives with a message a reader can argue with, while this one is silence.
+    //
+    // **The host API is not what leaves it open.** `check-context` declares `resolves-to-import`
+    // and `is-imported-from`, both generated into `go-rules`' own bindings, and Go's resolver
+    // carries the whole import path — so `ctx.ResolvesToImport(pkg, "context", none)` in place of
+    // the text comparison would close this case and the one above at once, add no host function,
+    // and move no cache key. It is not done because this rule is a port held to reporting
+    // identically to the TypeScript it replaced, which compared text too.
+    //
+    // Pinned so that a revision which tightens the rule fails here and has to say so, rather than
+    // silently changing what a config that names this rule reports.
+    Case {
+        name: "the_standard_context_under_another_alias_is_not_reported",
+        source: "package a\n\nimport ctxpkg \"context\"\n\n\
+                 type Client struct {\n\tctx ctxpkg.Context\n}\n",
+        expected: Expected::Accepts,
     },
     // No import at all: `context` here is a local package-level name, so the qualifier does not
     // resolve to an import and the rule must not fire. An unresolved qualifier is not the

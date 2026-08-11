@@ -10,18 +10,31 @@
 // It is architectural rather than stylistic: the damage shows up as unrelated requests failing
 // together, which is nearly impossible to attribute back to the field.
 //
-// # The resolver is what keeps this from being a text match
+// # Half of this is resolved and half of it is a text match
 //
 // [types.CheckContext.BindingKind] says whether the qualifier is an import at all, so a
-// package-level name that happens to read `context` does not fire.
+// package-level name that happens to read `context` does not fire. That much is resolved.
 //
-// What it deliberately does *not* distinguish is which module the import points at. The host API
-// answers what kind of binding a name has, not where it came from, so a package aliased to
-// `context` and exposing a `Context` is reported the same as the standard library's. Widening
-// the host API to expose the module would bump its version, which is a cache key input — a
-// bigger change than this rule justifies. The false positive it leaves is narrow and, where it
-// happens, is usually the same mistake wearing a different import path. It is pinned by a case
-// in `crates/lanekeep-rules/tests/no_context_in_struct.rs` rather than left to be rediscovered.
+// **Which package it is, is decided by comparing text.** [check] asks for `ctx.Text(pkg)` and
+// compares it against [PACKAGE], so the rule is really "an imported qualifier *spelled*
+// `context`" — and that spelling is the import's local name, which an author chooses. Both
+// halves of the resulting inaccuracy are real, and both are pinned by cases in
+// `crates/lanekeep-rules/tests/no_context_in_struct.rs`:
+//
+//	import context "example.com/app/context"     // reported, and it is not the standard library
+//	import ctxpkg "context"                      // not reported, and it is
+//
+// The host API is not what stops this. `check-context` already declares `resolves-to-import` and
+// `is-imported-from` — the module-aware predicates, generated into this package's own bindings as
+// [types.CheckContext.ResolvesToImport] and [types.CheckContext.IsImportedFrom] — and Go's
+// resolver carries the whole import path, `net/http` rather than `http`. A revision that asked
+// `ctx.ResolvesToImport(pkg, "context", cm.None[string]())` instead would close both cases at
+// once, add no host function and so move no cache key.
+//
+// It is not done here because this file is a port held to reporting identically to the
+// TypeScript it replaced (below), and that file compared text too. Changing what the rule means
+// is a change to make on its own, against its own tests, rather than inside a migration — and
+// the cases above exist so that a revision which does it fails them and has to say so.
 //
 // # A port, held to reporting identically
 //
