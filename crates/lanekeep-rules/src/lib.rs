@@ -784,24 +784,42 @@ mod tests {
     /// The migration test above hashes `include_bytes!` output after folding, and the claim
     /// that makes true is that a CRLF checkout of a frozen file folds to the exact same digest
     /// as the LF one it was recorded from — not merely that the two engines agree with each
-    /// other. This turns one frozen file's real LF bytes into CRLF the way a Windows checkout
-    /// with `core.autocrlf` on would, and checks the folded hash against the recorded constant
-    /// directly, rather than only comparing the two foldings to each other.
+    /// other. This builds a synthetic CRLF variant of one frozen file and checks the folded hash
+    /// against the recorded constant directly, rather than only comparing two foldings to each
+    /// other.
+    ///
+    /// **Built from the folded bytes, not from `include_bytes!`'s raw output, and that is
+    /// load-bearing.** `include_bytes!` reflects whatever this checkout actually has — LF on
+    /// macOS and Linux, CRLF on Windows with `core.autocrlf` on — so expanding every `\n` to
+    /// `\r\n` directly against it is only correct on the platforms where it was already LF. On a
+    /// Windows checkout the raw bytes are already `\r\n`, and replacing `\n` with `\r\n` turns
+    /// that into `\r\r\n`; `fold` only drops the `\r` immediately before a `\n`, so one `\r`
+    /// survives and the result hashes to the *CRLF* digest instead of the LF one — the exact
+    /// failure this test exists to catch, reintroduced by the test's own fixture. Folding first
+    /// gives canonical LF regardless of platform, and the synthetic CRLF variant is built from
+    /// *that* — the same shape as the `path.join` fixture in `AGENTS.md` that normalized the
+    /// path it was meant to test: a fixture whose construction depends on the very thing under
+    /// test proves nothing on the platform where that thing differs.
     #[test]
     fn a_crlf_checkout_still_matches_the_frozen_digest() {
         const RECORDED: &str = "3ba0f2ba906a2b900740865d67cdb0f9c307d179916f8da6d2755f1aea532c1a";
-        let lf = include_bytes!("../rules/no-circular-imports.ts");
+        let canonical = fold(include_bytes!("../rules/no-circular-imports.ts"));
 
-        let mut crlf = Vec::with_capacity(lf.len());
-        for &byte in lf {
+        let mut crlf = Vec::with_capacity(canonical.len());
+        for &byte in &canonical {
             if byte == b'\n' {
                 crlf.push(b'\r');
             }
             crlf.push(byte);
         }
+        // Both sides are already folded to canonical LF before this comparison, so it holds
+        // regardless of whether this checkout gave `include_bytes!` LF or CRLF bytes — unlike
+        // comparing against the raw bytes, which would be trivially true on a Windows checkout
+        // for the same reason the digest above was wrong: `crlf` and the raw CRLF bytes are the
+        // same value there, so that comparison would assert nothing on the one platform this
+        // test is for.
         assert_ne!(
-            lf.as_slice(),
-            crlf.as_slice(),
+            canonical, crlf,
             "the fixture must actually contain newlines, or this proves nothing"
         );
 
