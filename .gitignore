@@ -72,3 +72,9 @@ $RECYCLE.BIN/
 # Design scaffolding kept local to the working copy, not part of the published project
 /docs/adr/
 /docs/superpowers/
+
+# Per-plan execution scratch: ledgers, task briefs, implementer reports, review packages.
+# Sibling of the two above and ignored for the same reason, but listed separately because it is
+# written by tooling rather than by hand — an implementer running `git add -A` mid-task would
+# otherwise commit the whole working set.
+/.superpowers/

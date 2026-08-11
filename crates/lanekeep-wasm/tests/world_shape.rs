@@ -46,8 +46,75 @@ const WORLD_SHAPE: &[u8] = include_bytes!("fixtures/world-shape.wasm");
 const TYPESCRIPT_BUILTINS: &[u8] =
     include_bytes!("../../lanekeep-rules/components/typescript-builtins.wasm");
 
+/// The Go built-ins, as built by `just go-rules`.
+///
+/// Named for the reason [`TYPESCRIPT_BUILTINS`] is, and the reason bites harder here: `just
+/// go-rules` needs TinyGo, which no gate installs and most contributors do not have, so a
+/// checkout where nobody has run it would leave [`no_shipped_rule_component_imports_ambient_authority`]
+/// green over the components beside this one and silent about its absence. `include_bytes!` is
+/// not silent.
+const GO_BUILTINS: &[u8] = include_bytes!("../../lanekeep-rules/components/go-builtins.wasm");
+
 /// The path the stub reports as the file under check.
 const FILE: &str = "src/lib.ts";
+
+/// The text the stub reports for node 0, and for no other node.
+///
+/// `init`, because [`the_go_builtins_component_answers_the_world_it_targets`] drives a guest that
+/// branches on exactly this string: `lanekeep/no-package-init` reports a `func init()` and
+/// nothing else.
+const INIT_TEXT: &str = "init";
+
+/// The text the stub reports for every node the table below does not name.
+///
+/// **Several constants rather than one, and the others are what make this one mean something.** A
+/// stub answering `init` for every node cannot tell a rule that fires on `func init()` from a
+/// rule that fires on every function declaration it is handed — both report, and reporting is
+/// what a working rule looks like. Keyed on the handle, one test can drive a rule several times
+/// and watch it decline all but once.
+const OTHER_TEXT: &str = "Register";
+
+/// The handles the stub answers specially, and what each one stands for.
+///
+/// A handle is meaningless on its own — the arena the real host reads is not here — so these are
+/// simply the addresses at which this stub keeps its answers. What each one is *for* is the
+/// branch of a guest it lets a test reach:
+///
+/// | handle | `text` | `binding-kind` | the branch it exercises |
+/// | --- | --- | --- | --- |
+/// | 0 | `init` | const | `no-package-init` reports |
+/// | 2 | `Context` | const | `no-context-in-struct`'s type name matches |
+/// | 3 | `context` | **import** | its qualifier is an imported package: reports |
+/// | 4 | `context` | const | a local name that reads `context`: declines |
+/// | 5 | `context` | **none** | a qualifier that resolves to nothing: declines |
+/// | any other | `Register` | const | neither rule fires |
+///
+/// Handle 5 is not symmetry. `binding-kind` is an `option<binding-kind>`, and `import` is the
+/// **first** case of that enum — so a guest reading the option's value without first asking
+/// whether it has one gets `import` for a name that resolves to no binding at all, and reports a
+/// type that merely reads like the standard library's. That is the same shape as the `if (!node)`
+/// bug that cost `no-unwrap` its `#[test]` exemption, and it is invisible without a `none` here.
+const NODE_INIT: u32 = 0;
+const NODE_CONTEXT_TYPE: u32 = 2;
+const NODE_IMPORTED_PKG: u32 = 3;
+const NODE_LOCAL_PKG: u32 = 4;
+const NODE_UNRESOLVED_PKG: u32 = 5;
+
+/// The text a `context.Context` field's type name carries.
+const CONTEXT_TYPE_TEXT: &str = "Context";
+
+/// The text its qualifier carries, whatever the qualifier turns out to resolve to.
+const CONTEXT_PKG_TEXT: &str = "context";
+
+/// Where each Go built-in sits in `go-rules/main.go`'s table.
+///
+/// **Alphabetical, and that is a constraint rather than a habit.** `crates/lanekeep-rules`'
+/// `COMPONENT_RULES` is sorted by rule name, and the index in each of its rows is what this
+/// component is then dispatched on — so a table in a different order here means a config naming
+/// one rule running the other, with both answering perfectly well and nothing to notice. Adding a
+/// third Go rule renumbers whichever of these it sorts before.
+const NO_CONTEXT_IN_STRUCT: u32 = 0;
+const NO_PACKAGE_INIT: u32 = 1;
 
 /// The store's data: the table the contexts live in, and what the guest reported through
 /// them.
@@ -77,8 +144,24 @@ impl HostCheckContext for StubHost {
         Ok(Some("program".to_owned()))
     }
 
-    fn text(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Option<String>> {
-        Ok(None)
+    /// A constant per handle — still constants, and still nothing read out of the context, but
+    /// several of them, so a guest that branches on the text can be watched taking each branch.
+    /// The table is in [`NODE_INIT`]'s doc comment.
+    ///
+    /// The fixture this file was written for never calls `text` at all — see
+    /// [`the_imported_instance_declares_only_what_the_guest_calls`], which names the three
+    /// `check-context` methods it does call — so nothing but the two tests over the shipped Go
+    /// component can observe any of them.
+    fn text(&mut self, _: Resource<CheckContext>, node: u32) -> wasmtime::Result<Option<String>> {
+        Ok(Some(
+            match node {
+                NODE_INIT => INIT_TEXT,
+                NODE_CONTEXT_TYPE => CONTEXT_TYPE_TEXT,
+                NODE_IMPORTED_PKG | NODE_LOCAL_PKG | NODE_UNRESOLVED_PKG => CONTEXT_PKG_TEXT,
+                _ => OTHER_TEXT,
+            }
+            .to_owned(),
+        ))
     }
 
     fn is_named(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<bool> {
@@ -128,12 +211,21 @@ impl HostCheckContext for StubHost {
         Ok(false)
     }
 
+    /// One handle resolves to an import, one to nothing at all, and everything else to a `const`.
+    ///
+    /// The `None` arm is the one worth having: it is the answer for a name that resolves to no
+    /// binding, and it is what tells a guest that reads this option's *value* from one that asks
+    /// whether it has one. See [`NODE_INIT`]'s table.
     fn binding_kind(
         &mut self,
         _: Resource<CheckContext>,
-        _: u32,
+        node: u32,
     ) -> wasmtime::Result<Option<BindingKind>> {
-        Ok(Some(BindingKind::Const))
+        Ok(match node {
+            NODE_IMPORTED_PKG => Some(BindingKind::Import),
+            NODE_UNRESOLVED_PKG => None,
+            _ => Some(BindingKind::Const),
+        })
     }
 
     fn is_shadowed(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<bool> {
@@ -259,6 +351,20 @@ impl Host for StubHost {}
 /// Builds everything a call needs: an engine, the fixture, a linker carrying the stub host,
 /// and a store.
 ///
+/// No `expect` grant of its own, because it makes no `expect` call: an unfulfilled `#[expect]`
+/// is itself an error under this workspace's lints, so the attribute has to sit where the calls
+/// actually are, which is [`linked_to`].
+fn linked() -> (wasmtime::Engine, Component, Linker<StubHost>) {
+    linked_to(WORLD_SHAPE)
+}
+
+/// The same, over any component targeting this world.
+///
+/// The parameter is what lets a *shipped* component be driven through the stub host rather than
+/// only inspected — see [`the_go_builtins_component_answers_the_world_it_targets`]. Every host
+/// method here answers with a constant, so what this proves is that the guest half of the world
+/// is satisfied, which is precisely the claim this file is about.
+///
 /// A crate-level `expect` is what licenses the `expect` calls here. `clippy.toml`'s
 /// `allow-expect-in-tests` reaches `#[test]` functions and `#[cfg(test)]` modules; a helper
 /// in an integration-test crate is neither, so the identical line that passes inside a test
@@ -267,9 +373,9 @@ impl Host for StubHost {}
     clippy::expect_used,
     reason = "a helper in a tests/ crate is outside clippy.toml's allow-expect-in-tests"
 )]
-fn linked() -> (wasmtime::Engine, Component, Linker<StubHost>) {
+fn linked_to(bytes: &[u8]) -> (wasmtime::Engine, Component, Linker<StubHost>) {
     let engine = engine().expect("the shipped wasmtime configuration builds an engine");
-    let component = Component::new(&engine, WORLD_SHAPE).expect("the fixture is a valid component");
+    let component = Component::new(&engine, bytes).expect("the component is valid");
     let mut linker = Linker::new(&engine);
     Rule::add_to_linker::<_, HasSelf<_>>(&mut linker, |host| host)
         .expect("the generated host traits satisfy every import the world declares");
@@ -529,10 +635,12 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// so a fixture on the wrong target passes every shape assertion right up until a real rule
 /// formats a string.
 ///
-/// The two tests above check one artifact; this directory holds fourteen of them, and it held
+/// The two tests above check one artifact; this directory holds fifteen of them, and it held
 /// eleven when that sentence was first written. Each new fixture widened the gap silently, which
 /// is why this one is written the way it is — and why the count above is the only number here,
-/// stated as something that moves rather than as a fact about the tree.
+/// stated as something that moves rather than as a fact about the tree. Take it from `ls
+/// crates/lanekeep-wasm/tests/fixtures/*.wasm` rather than from this sentence; the test itself
+/// never reads it.
 ///
 /// # Globbed, and that is the whole point
 ///
@@ -669,6 +777,383 @@ fn the_typescript_builtins_component_imports_no_ambient_authority() {
         imports,
         vec![HOST_INTERFACE.to_owned()],
         "equality, not containment: a component importing nothing is also wrong"
+    );
+}
+
+/// **And the one shipped component built from Go, on exactly the same terms.**
+///
+/// The equality is what makes this worth stating separately from the glob below, because TinyGo
+/// is the toolchain in this tree with the most to give away by accident. Its `wasip2` target
+/// imports `wasi:clocks/wall-clock`, `wasi:filesystem/types`, `wasi:cli/stdout` and
+/// `wasi:random/random` unconditionally — the guest's runtime reaches for them whether or not any
+/// rule does — so a rebuild on it is not a rule that leaks a little, it is a rule with a clock, a
+/// filesystem and a source of randomness in a sandbox whose whole purpose is to withhold all
+/// three. `-target=wasm-unknown` is what keeps the list at one, and this is the assertion that
+/// says so.
+///
+/// The other direction matters here too, and is not symmetry: a component that imports nothing at
+/// all is a rule that cannot call `report`, which is what a guest built with its host import
+/// tree-shaken away would look like.
+#[test]
+fn the_go_builtins_component_imports_no_ambient_authority() {
+    let engine = engine().expect("the shipped wasmtime configuration builds an engine");
+    let component = Component::new(&engine, GO_BUILTINS)
+        .expect("the shipped Go built-ins are a valid component");
+
+    let imports = instance_imports(&engine, &component);
+    assert_eq!(
+        imports,
+        vec![HOST_INTERFACE.to_owned()],
+        "equality, not containment: a component importing nothing is also wrong"
+    );
+}
+
+/// And the Go component answers the world, rather than merely satisfying its type.
+///
+/// A digest says the artifact was built from the sources beside it; the test above says it reaches
+/// nothing it should not. Neither says the thing was *built right* — a guest whose exports were
+/// wired to the wrong handlers, or whose rule table came out empty, passes both. `rules` is the
+/// export that settles it: it is what a host enumerates before anything else, and what
+/// `crates/lanekeep-rules`' own dispatch table is checked against once this component ships.
+///
+/// **Here as well as in `crates/lanekeep-rules/tests/component_rules.rs`**, which is where the
+/// equivalent claim about the other three components lives. That file reads its components out of
+/// `lanekeep_rules::component`, which resolves a *rule name*, and it now names both Go rules — so
+/// the two tests overlap, deliberately. This one is the lower of the pair: it links the component
+/// against the world in `crates/lanekeep-wasm/wit/` directly, so it fails on a component that no
+/// longer answers the world it was built for, where the other fails on a *table* that disagrees
+/// with what the component enumerates. A rebuild against a moved world reddens this file first,
+/// and it says so in terms of the ABI rather than in terms of a rule name.
+///
+/// It was written when the swap had not happened and no rule name resolved here at all, which is
+/// the state that made it the only place this component could be reached. That is no longer the
+/// reason it exists; the paragraph above is.
+#[test]
+fn the_go_builtins_component_answers_the_world_it_targets() {
+    let (engine, component, linker) = linked_to(GO_BUILTINS);
+    let mut store = Store::new(&engine, StubHost::default());
+    // Out of reach, for the reason `a_component_targeting_the_world_instantiates_and_answers_both_probes`
+    // gives: `lanekeep_wasm::engine` enables epoch interruption and every store starts at a
+    // deadline that has already elapsed.
+    store.set_epoch_deadline(u64::MAX / 2);
+
+    let rule = Rule::instantiate(&mut store, &component, &linker)
+        .expect("the Go component instantiates against this world");
+
+    assert_eq!(
+        rule.call_rules(&mut store).expect("rules returns"),
+        vec![
+            "lanekeep/no-context-in-struct".to_owned(),
+            "lanekeep/no-package-init".to_owned(),
+        ],
+        "the ids `go-rules/main.go`'s table declares, in the order it declares them — which is \
+         the order every other export's index is read against, and which is alphabetical because \
+         `crates/lanekeep-rules`' own tables are"
+    );
+    assert!(
+        rule.call_has_check(&mut store, NO_PACKAGE_INIT)
+            .expect("has-check returns"),
+        "the rule at this index has a per-file pass"
+    );
+    assert!(
+        !rule
+            .call_has_reduce(&mut store, NO_PACKAGE_INIT)
+            .expect("has-reduce returns"),
+        "and no cross-file one: every export is mandatory because a WIT world has no optional \
+         ones, which is not the same as every pass being present"
+    );
+
+    // What the rule says it is. The prose of the card is held to the TypeScript rule it was
+    // ported from by the shared case table those two run against; what is asserted here is the
+    // shape, and specifically the three gate lists that are **empty**. An empty `cm.List` in a
+    // Go guest is a null data pointer with a zero length, and it crosses the canonical ABI at
+    // every one of these fields — so if that lifted wrong, it would do so in `metadata`, once,
+    // before any file is read, and take the whole run with it.
+    let metadata = rule
+        .call_metadata(&mut store, NO_PACKAGE_INIT)
+        .expect("metadata returns");
+    assert_eq!(metadata.id, "lanekeep/no-package-init");
+    assert_eq!(metadata.languages, vec!["go".to_owned()]);
+    assert_eq!(metadata.gates.file_contains, vec!["init".to_owned()]);
+    assert!(
+        metadata.gates.path_matches.is_empty()
+            && metadata.gates.path_not_matches.is_empty()
+            && metadata.gates.file_not_contains.is_empty(),
+        "the three gates this rule does not use are empty lists rather than anything else: \
+         {:?}",
+        metadata.gates
+    );
+
+    // `null` is what the world sends a rule named with no options, and every rule is configured
+    // once before any check. This one has none and accepts anyway; see `takesNoOptions`.
+    rule.call_configure(&mut store, NO_PACKAGE_INIT, "null")
+        .expect("configure returns")
+        .expect("a rule with no options accepts the world's `null`");
+
+    // The per-file pass, end to end. The stub answers `text` with [`INIT_TEXT`] at node 0, so a
+    // match whose `name` capture binds node 0 is a `func init()` as far as the guest can tell.
+    //
+    // **This is the call that a component built the obvious way does not survive**, and nothing
+    // cheaper than making it finds out. `check` takes a `borrow<check-context>`, the canonical
+    // ABI counts that loan, and `wit-bindgen-go` emits no `resource.drop` to close it — so a
+    // guest that simply used the handle returns with the loan outstanding and wasmtime answers
+    // `borrow handles still remain at the end of the call`, discarding every report the rule
+    // made on the way. `go-rules/main.go` drops it; this is what says so.
+    let check_ctx = store
+        .data_mut()
+        .table
+        .push(context())
+        .expect("the resource table accepts a check context");
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(&mut store, NO_PACKAGE_INIT, borrow, &captures(NODE_INIT))
+        .expect("check returns")
+        .expect("the guest does not report a failure");
+
+    assert_eq!(
+        store.data().reported,
+        vec![
+            "check node=7 message=`init` runs at import time in an order nothing states, so what \
+             it sets up is untraceable from the code that depends on it fix=none"
+                .to_owned()
+        ],
+        "the rule reported at the node its `func` capture bound, not at the one its `name` \
+         capture did"
+    );
+
+    // And the same call over a declaration named something else, which must report nothing.
+    //
+    // Without this the test cannot tell this rule from one that fires on every function
+    // declaration handed to it — both report, and reporting is what a working rule looks like.
+    // The only thing that differs between the two calls is which node the `name` capture binds,
+    // and so which of the stub's two texts the guest reads.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(&mut store, NO_PACKAGE_INIT, borrow, &captures(1))
+        .expect("check returns")
+        .expect("the guest does not report a failure");
+
+    assert_eq!(
+        store.data().reported.len(),
+        1,
+        "a declaration whose name is not `init` is not a violation: {:?}",
+        store.data().reported
+    );
+
+    // And the cross-file pass a rule without one refuses, through the error channel rather than
+    // by trapping. `frames` is empty, which is the other zero-length list crossing the ABI.
+    let reduce_ctx = store
+        .data_mut()
+        .table
+        .push(ReduceContext::new(Vec::new(), Vec::new()))
+        .expect("the resource table accepts a reduce context");
+    let refused = rule
+        .call_reduce(
+            &mut store,
+            NO_PACKAGE_INIT,
+            Resource::new_borrow(reduce_ctx.rep()),
+        )
+        .expect("reduce returns")
+        .expect_err("this rule has no cross-file pass");
+    assert!(
+        refused.message.contains("no cross-file pass"),
+        "{refused:?}"
+    );
+    assert!(refused.frames.is_empty(), "{refused:?}");
+}
+
+/// One match of `(function_declaration name: (identifier) @name) @func`, with `name` at `node`.
+///
+/// The declaration is always node 7, so what varies between calls is only the text the stub
+/// answers for the name — which is the one input the rule under test branches on.
+fn captures(node: u32) -> Vec<types::MatchEntry> {
+    vec![
+        types::MatchEntry {
+            name: "name".to_owned(),
+            node,
+        },
+        types::MatchEntry {
+            name: "func".to_owned(),
+            node: 7,
+        },
+    ]
+}
+
+/// And the second rule the same component hosts, driven the same way.
+///
+/// A test of its own rather than more assertions in the one above, because what makes the pair
+/// worth having is that **both are reached through the same instance by index**: the rule that
+/// answers is decided by a number, and a component whose table drifted out of alphabetical order
+/// would answer every call perfectly while answering for the wrong rule. `rules` is asserted
+/// there; this is the other end of the same claim, that index 0 is the rule `rules` named at
+/// position 0.
+///
+/// What the guest reads here is three host answers per match — the type name's text, the
+/// qualifier's text, and the qualifier's binding kind — so the four calls below walk the rule's
+/// four outcomes. The `none` binding kind is the one that would be missed by eye; see
+/// [`NODE_INIT`]'s table for why an option whose first enum case is `import` is a trap rather
+/// than a formality.
+///
+/// **This is not the fidelity suite.** Every value here is a constant and no Go file is parsed;
+/// `crates/lanekeep-rules/tests/no_context_in_struct.rs` is where the rule meets the real grammar
+/// and the real resolver. What this can say, and that file cannot until the built-in is swapped
+/// over, is that the shipped artifact hosts a working second rule at all.
+#[test]
+fn the_go_builtins_component_runs_its_second_rule_by_index() {
+    let (engine, component, linker) = linked_to(GO_BUILTINS);
+    let mut store = Store::new(&engine, StubHost::default());
+    store.set_epoch_deadline(u64::MAX / 2);
+    let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
+
+    let metadata = rule
+        .call_metadata(&mut store, NO_CONTEXT_IN_STRUCT)
+        .expect("metadata returns");
+    assert_eq!(metadata.id, "lanekeep/no-context-in-struct");
+    assert_eq!(metadata.languages, vec!["go".to_owned()]);
+    assert_eq!(metadata.gates.file_contains, vec!["context".to_owned()]);
+    assert!(
+        rule.call_has_check(&mut store, NO_CONTEXT_IN_STRUCT)
+            .expect("has-check returns")
+            && !rule
+                .call_has_reduce(&mut store, NO_CONTEXT_IN_STRUCT)
+                .expect("has-reduce returns"),
+        "a per-file rule, like its neighbor"
+    );
+
+    let check_ctx = store
+        .data_mut()
+        .table
+        .push(context())
+        .expect("the resource table accepts a check context");
+
+    // A `context.Context` field whose qualifier is an imported package: the one case that reports.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(
+        &mut store,
+        NO_CONTEXT_IN_STRUCT,
+        borrow,
+        &field(NODE_IMPORTED_PKG, NODE_CONTEXT_TYPE),
+    )
+    .expect("check returns")
+    .expect("the guest does not report a failure");
+
+    assert_eq!(
+        store.data().reported,
+        vec![
+            "check node=9 message=a context.Context stored in a struct outlives the call it was \
+             scoped to, so cancelling one request can cancel unrelated work fix=none"
+                .to_owned()
+        ],
+        "reported at the node the `field` capture bound, not at either of the two it read"
+    );
+
+    // The same field, with a qualifier that is a local `const` rather than an import. A rule that
+    // skipped the binding kind reports here, and the report would look exactly like the one above.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(
+        &mut store,
+        NO_CONTEXT_IN_STRUCT,
+        borrow,
+        &field(NODE_LOCAL_PKG, NODE_CONTEXT_TYPE),
+    )
+    .expect("check returns")
+    .expect("the guest does not report a failure");
+
+    // And with a qualifier that resolves to nothing at all. `import` is the first case of
+    // `binding-kind`, so a guest reading the option's value without asking whether it has one
+    // gets `import` here and reports — silently, and only ever by adding violations.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(
+        &mut store,
+        NO_CONTEXT_IN_STRUCT,
+        borrow,
+        &field(NODE_UNRESOLVED_PKG, NODE_CONTEXT_TYPE),
+    )
+    .expect("check returns")
+    .expect("the guest does not report a failure");
+
+    // And an imported qualifier carrying some other type entirely.
+    let borrow = Resource::new_borrow(check_ctx.rep());
+    rule.call_check(
+        &mut store,
+        NO_CONTEXT_IN_STRUCT,
+        borrow,
+        &field(NODE_IMPORTED_PKG, 6),
+    )
+    .expect("check returns")
+    .expect("the guest does not report a failure");
+
+    assert_eq!(
+        store.data().reported.len(),
+        1,
+        "only the imported `context.Context` is a violation: {:?}",
+        store.data().reported
+    );
+}
+
+/// One match of this rule's query, with the qualifier at `pkg` and the type name at `name`.
+///
+/// The field declaration is always node 9, so what varies between calls is only which of the
+/// stub's answers the guest reads for the two nodes it inspects.
+///
+/// Both of the rule's query patterns bind exactly these three captures — that is what lets the
+/// bare and pointer forms share one handler — so one shape here covers both.
+fn field(pkg: u32, name: u32) -> Vec<types::MatchEntry> {
+    vec![
+        types::MatchEntry {
+            name: "pkg".to_owned(),
+            node: pkg,
+        },
+        types::MatchEntry {
+            name: "name".to_owned(),
+            node: name,
+        },
+        types::MatchEntry {
+            name: "field".to_owned(),
+            node: 9,
+        },
+    ]
+}
+
+/// An index the component does not host is refused, and the two ways it is refused differ.
+///
+/// `configure`, `check` and `reduce` return a `result`, so they answer with a message naming what
+/// went wrong. `metadata`, `has-check` and `has-reduce` have no channel at all, so the only
+/// honest answer left is a trap: inventing one rule's answer for another rule's index would be a
+/// host and a component silently disagreeing about which rule is running, which is the failure
+/// the `rules`-then-index arrangement exists to make impossible.
+///
+/// **A store of its own, and that is not tidiness.** A trap poisons a `wasmtime::Store`
+/// permanently — every later call on it fails with `cannot enter component instance`, a message
+/// about the runtime's bookkeeping that names nothing that went wrong — so a trap probe sharing a
+/// store with anything else would make whatever ran after it fail for a reason that has nothing
+/// to do with the code under test. The graceful refusal is asserted first here for the same
+/// reason: after the trap there is nothing left to ask.
+#[test]
+fn the_go_builtins_component_refuses_an_index_it_does_not_host() {
+    let (engine, component, linker) = linked_to(GO_BUILTINS);
+    let mut store = Store::new(&engine, StubHost::default());
+    store.set_epoch_deadline(u64::MAX / 2);
+    let rule = Rule::instantiate(&mut store, &component, &linker).expect("instantiates");
+
+    let refused = rule
+        .call_configure(&mut store, 7, "null")
+        .expect("configure returns")
+        .expect_err("this component hosts no rule at index 7");
+    assert!(
+        refused.contains("no rule at index 7"),
+        "the refusal has to name the index it refused: {refused}"
+    );
+
+    // `root_cause`, not the rendered error, on this crate's standing terms: wasmtime prefixes a
+    // failure with a backtrace whose frames already name the export, so a `to_string` containing
+    // `has-check` would pass whatever happened — and here the rendered form does not carry the
+    // trap's own words at all, only its `Caused by:` does.
+    let trapped = rule
+        .call_has_check(&mut store, 7)
+        .expect_err("an export with no error channel can only trap");
+    assert_eq!(
+        trapped.root_cause().to_string(),
+        "wasm trap: wasm `unreachable` instruction executed",
+        "a guest with nowhere to put a refusal traps rather than answering: {trapped:?}"
     );
 }
 

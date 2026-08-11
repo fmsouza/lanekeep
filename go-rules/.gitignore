@@ -1,0 +1,15 @@
+# Anchored literal paths only, following `rust-rules/.gitignore`'s convention rather than
+# arriving at it by accident.
+#
+# The component this module ships is *not* ignored and is not written here: `just go-rules`
+# builds it into `crates/lanekeep-rules/components/`, where it is committed alongside the
+# Rust- and TypeScript-authored ones, because `crates/lanekeep-rules` embeds it with
+# `include_bytes!` and no gate may require TinyGo. The generated bindings under `internal/`
+# are committed too, for the same reason: `wit-bindgen-go` is deterministic, and committing
+# its output keeps `just check` free of a Go toolchain entirely.
+#
+# What is left is what a person produces by hand while working on a rule — a one-off
+# `tinygo build -o …` at the module root, which should never reach a commit.
+/out.wasm
+/rule.wasm
+/go-builtins.wasm

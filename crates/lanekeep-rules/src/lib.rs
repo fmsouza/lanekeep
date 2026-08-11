@@ -1,9 +1,10 @@
 //! Built-in rules shipped with lanekeep.
 //!
 //! The rules shipping with lanekeep, authored against the same host API that project-authored
-//! rules use and embedded into the binary at build time. Four are TypeScript modules evaluated
-//! in QuickJS; the rest are WebAssembly components — two built from `rust-rules/`, and four
-//! authored in TypeScript and compiled ahead of time into one shared component.
+//! rules use and embedded into the binary at build time. Two are TypeScript modules evaluated
+//! in QuickJS; the rest are WebAssembly components — two built from `rust-rules/`, four authored
+//! in TypeScript and compiled ahead of time into one shared component, and two authored in Go
+//! into another.
 //!
 //! Built-ins deliberately get no privileged path into the engine. Rules dogfooding the
 //! public API is the strongest available evidence that the API is sufficient for real work
@@ -62,9 +63,9 @@
 /// The rules this build runs as TypeScript modules, as `(name, source)`.
 ///
 /// Evaluated in QuickJS, from source, on every run. What is left here after the four flagship
-/// TypeScript rules were compiled ahead of time: two rules targeting Python and two targeting
-/// Go, none of which any component hosts yet. Read the split off the `language` declaration in
-/// each source below rather than off this sentence — it said three and one when the table
+/// TypeScript rules were compiled ahead of time and the two Go ones were ported: the two rules
+/// targeting Python, which no component hosts yet. Read the target off the `language` declaration
+/// in each source below rather than off this sentence — it said three and one when the table
 /// underneath it already said two and two.
 ///
 /// Ordered, so the source stays greppable and a diff shows what moved. Nothing derives an
@@ -75,16 +76,8 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
         include_str!("../rules/no-broad-except.ts"),
     ),
     (
-        "no-context-in-struct",
-        include_str!("../rules/no-context-in-struct.ts"),
-    ),
-    (
         "no-mutable-default-argument",
         include_str!("../rules/no-mutable-default-argument.ts"),
-    ),
-    (
-        "no-package-init",
-        include_str!("../rules/no-package-init.ts"),
     ),
 ];
 
@@ -114,6 +107,20 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
 /// `crates/lanekeep-cli/tests/no_circular_imports.rs` and `.../no_unused_exports.rs`, which
 /// drive the binary.
 ///
+/// # A rule authored in another language has no entry here, and its TypeScript is deleted
+///
+/// The qualifier that decides membership is **`just typescript-builtins` reads this file** — not
+/// "this rule used to be TypeScript". Every claim above depends on it: the digest ties source to
+/// artifact only because the build consumes the source, and `no_default_export.rs` runs this text
+/// only because it is the text that was compiled.
+///
+/// So a rule ported to Rust or Go belongs in neither table. `no-unwrap` and `no-glob-import`
+/// had their `.ts` deleted when they became `rust-rules/` crates, and `no-context-in-struct` and
+/// `no-package-init` when they became `go-rules/` packages — in both cases the Rust or the Go
+/// *is* the source, and a `.ts` left sitting here would be tied to no build, asserted by no
+/// digest, run by nothing, and free to drift from the rule that actually ships while looking
+/// exactly like the four entries that cannot.
+///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
 const COMPONENT_SOURCES: &[(&str, &str)] = &[
     (
@@ -137,8 +144,9 @@ const COMPONENT_SOURCES: &[(&str, &str)] = &[
 /// The components this build ships, as `(component name, bytes)`.
 ///
 /// **Keyed by the component rather than by a rule**, because a component hosts one rule or
-/// several and the artifact is what is embedded. `typescript-builtins` hosts four; the two
-/// built from `rust-rules/<name>/` host one each and are named after it.
+/// several and the artifact is what is embedded. `typescript-builtins` hosts four and
+/// `go-builtins` hosts two; the two built from `rust-rules/<name>/` host one each and are named
+/// after it.
 ///
 /// A rule is authored once and runs once — [`COMPONENT_RULES`] and [`BUILT_IN_RULES`] are
 /// disjoint, and a name in both would be two programs answering to one id with nothing to say
@@ -146,9 +154,9 @@ const COMPONENT_SOURCES: &[(&str, &str)] = &[
 /// authored text of a rule this table already hosts, and nothing resolves a specifier through
 /// it.
 ///
-/// Built by `just rust-rules` and `just typescript-builtins`, which are also what copy the
-/// artifacts here. The bytes are committed, so the gate needs neither `cargo component`, a wasm
-/// target, nor Node.
+/// Built by `just rust-rules`, `just typescript-builtins` and `just go-rules`, which are also
+/// what copy the artifacts here. The bytes are committed, so the gate needs none of
+/// `cargo component`, a wasm target, Node, Go or TinyGo.
 ///
 /// One shipped component: its name, its bytes, and its source map if it has one.
 ///
@@ -165,9 +173,10 @@ type BuiltInComponent = (&'static str, &'static [u8], Option<&'static [u8]>);
 /// go and look at, and it is embedded here for the reason the bytes are: a built-in is in the
 /// binary, so nothing is read from disk and nothing in a project can shadow it.
 ///
-/// `None` for the two components built from Rust, and it is not an omission: a Rust rule that
-/// fails does so by panicking, which traps, and a trap arrives at the host with no stack at all.
-/// There would be nothing to remap.
+/// `None` for the two components built from Rust and for the one built from Go, and it is not an
+/// omission: those fail by panicking, which traps, and a trap arrives at the host with no stack
+/// at all. There would be nothing to remap. `go-rules/` builds with `-panic=trap` and
+/// `-no-debug`, so there is not even a name inside the artifact to map back to.
 ///
 /// **In this table rather than beside it**, so that a component and its map cannot be wired
 /// separately. They are one build's output — `just typescript-builtins` writes both — and a map
@@ -176,6 +185,11 @@ type BuiltInComponent = (&'static str, &'static [u8], Option<&'static [u8]>);
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
 const BUILT_IN_COMPONENTS: &[BuiltInComponent] = &[
+    (
+        "go-builtins",
+        include_bytes!("../components/go-builtins.wasm"),
+        None,
+    ),
     (
         "no-glob-import",
         include_bytes!("../components/no-glob-import.wasm"),
@@ -202,15 +216,18 @@ const BUILT_IN_COMPONENTS: &[BuiltInComponent] = &[
 ///
 /// The index is the position a rule sits at in its component's own enumeration, which for
 /// `typescript-builtins` is the order `crates/lanekeep-rules/typescript/entry.ts` passes to
-/// `register`. Inserting a rule in the middle of that array renumbers every rule after it, so
-/// a new one goes wherever the alphabet puts it and this table is re-recorded.
+/// `register` and for `go-builtins` is the order `go-rules/main.go`'s `ruleset` declares.
+/// Inserting a rule in the middle of either renumbers every rule after it, so a new one goes
+/// wherever the alphabet puts it and this table is re-recorded.
 ///
 /// Ordered by rule name, on the same terms as [`BUILT_IN_RULES`] — a reader looking a rule up
 /// is looking up a name, and the component column is what they learn.
 const COMPONENT_RULES: &[(&str, &str, u32)] = &[
     ("no-circular-imports", "typescript-builtins", 0),
+    ("no-context-in-struct", "go-builtins", 0),
     ("no-default-export", "typescript-builtins", 1),
     ("no-glob-import", "no-glob-import", 0),
+    ("no-package-init", "go-builtins", 1),
     ("no-restricted-imports", "typescript-builtins", 2),
     ("no-unused-exports", "typescript-builtins", 3),
     ("no-unwrap", "no-unwrap", 0),
@@ -376,10 +393,15 @@ mod tests {
         // which is what makes them survive a migration — and is also what would let any of
         // these quietly revert to TypeScript with nothing red.
         //
-        // Two shapes, deliberately together. The Rust pair has no source at all; the TypeScript
-        // four keep theirs and must still not be *served* as modules, which is the weaker and
-        // more easily lost half.
-        for name in ["no-unwrap", "no-glob-import"] {
+        // Two shapes, deliberately together. The four rules ported to another language have no
+        // source at all; the four compiled *from* their TypeScript keep theirs and must still not
+        // be *served* as modules, which is the weaker and more easily lost half.
+        for name in [
+            "no-context-in-struct",
+            "no-glob-import",
+            "no-package-init",
+            "no-unwrap",
+        ] {
             assert!(
                 component(name).is_some(),
                 "`{name}` ships as a component and does not"
@@ -387,7 +409,9 @@ mod tests {
             assert_eq!(
                 source(name),
                 None,
-                "`{name}`'s TypeScript original is deleted and must not resolve"
+                "`{name}` is authored in the language it inspects, so its TypeScript original is \
+                 deleted and must not resolve — a `.ts` still answering here would be tied to no \
+                 build and free to drift from the rule that ships"
             );
         }
 
@@ -416,25 +440,41 @@ mod tests {
 
     #[test]
     fn every_rule_of_a_shared_component_names_a_different_index() {
-        // The specific failure: four rules in one artifact, and a table that gave two of them
+        // The specific failure: several rules in one artifact, and a table that gave two of them
         // the same index would dispatch one config entry to the other's handler. Nothing about
         // the output would look wrong — a rule that reports what a different rule should have
         // reported is still a rule reporting.
-        let hosted: Vec<(&str, u32)> = COMPONENT_RULES
-            .iter()
-            .filter(|(_, host, _)| *host == "typescript-builtins")
-            .map(|(name, _, index)| (*name, *index))
-            .collect();
-        assert_eq!(
-            hosted,
-            vec![
-                ("no-circular-imports", 0),
-                ("no-default-export", 1),
-                ("no-restricted-imports", 2),
-                ("no-unused-exports", 3),
-            ],
-            "the shared component's slots moved; `typescript/entry.ts` decides them"
-        );
+        //
+        // Both shared components, because the failure is a property of sharing rather than of
+        // either artifact, and a check written for one of them is a check the next one is not
+        // held to.
+        for (component_name, expected, decided_by) in [
+            (
+                "typescript-builtins",
+                vec![
+                    ("no-circular-imports", 0),
+                    ("no-default-export", 1),
+                    ("no-restricted-imports", 2),
+                    ("no-unused-exports", 3),
+                ],
+                "`typescript/entry.ts`",
+            ),
+            (
+                "go-builtins",
+                vec![("no-context-in-struct", 0), ("no-package-init", 1)],
+                "`go-rules/main.go`'s `ruleset`",
+            ),
+        ] {
+            let hosted: Vec<(&str, u32)> = COMPONENT_RULES
+                .iter()
+                .filter(|(_, host, _)| *host == component_name)
+                .map(|(name, _, index)| (*name, *index))
+                .collect();
+            assert_eq!(
+                hosted, expected,
+                "`{component_name}`'s slots moved; {decided_by} decides them"
+            );
+        }
     }
 
     #[test]

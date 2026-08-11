@@ -1,0 +1,38 @@
+# What the committed Go artifacts were built from: the shipped built-ins component, and the
+# determinism fixture behind `crates/lanekeep-wasm/tests/go_map_order.rs`.
+#
+# Written by `just go-rules`, asserted by `crates/lanekeep-wasm/tests/fixture_currency.rs`, and
+# not to be edited by hand: a value here that no build produced is exactly the claim this file
+# exists to deny. `<path> <blake3>`, sorted, paths relative to the repository root.
+#
+# A line that moves when the artifacts did not means a rule's source, the SDK they are built on,
+# the generated bindings or the world they are built against was changed without rebuilding — run
+# `just go-rules`.
+crates/lanekeep-rules/components/go-builtins.wasm 9cd9dad1cc289dde2349acf42be4a3999f18a2558824797ab4cccba74915259b
+crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm 33de5c491ba2b92778c8e56f5bcf4ee276390a76cea14e395609a63e42b56250
+crates/lanekeep-wasm/wit/world.wit 290f483be47beb5e9df599e78e2d04572af8d4586459d361bb0741714ec975ae
+go-rules/.gitignore 02af855e1226375a64521b31bd8994a45c665fbe93ea55dfdb4b38f062d98c36
+go-rules/fixtures/maporder/main.go 6c03e440e7c13c06438f4f5cddeef5fdc293f0282f9d6613f9ab44fc994a1f71
+go-rules/go.mod 25d0033f110d1e59cc9e59ecc9b2bda4102adaa59f0414844df1d8e17c889e4c
+go-rules/go.sum 8cc73f2fca3116360a720bb388e1a588223131894b817971f659443c55b57003
+go-rules/internal/lanekeep/host/rule/empty.s cedeeff551bb1e50bfc4ab8c6299a62fb7b25cae79805253a45adc7dc18696c9
+go-rules/internal/lanekeep/host/rule/rule.exports.go ad1086deeed3d6cb82e7ae501f28cfe6d929028a1908e965c69dd7784f663668
+go-rules/internal/lanekeep/host/rule/rule.wasm.go e2911fb4bd0b4eaea97ad9e787aee0399a2fda7b8e6c0b3c548c5fc7784bd6dc
+go-rules/internal/lanekeep/host/rule/rule.wit.go 8c05b5ee0b3f1d3f1880e0229b84a8b59e78fad48613e238fdc18f9b41b61993
+go-rules/internal/lanekeep/host/types/abi.go b44aee505b74f4d3c1bac2e2b4c83bca694f9c1647ba6842f6db9e6d89a597fe
+go-rules/internal/lanekeep/host/types/empty.s cedeeff551bb1e50bfc4ab8c6299a62fb7b25cae79805253a45adc7dc18696c9
+go-rules/internal/lanekeep/host/types/types.wasm.go 2afa7885a9eb9e500b0f5131d59920d5fd133ac1db948df3fd8059b9778be98d
+go-rules/internal/lanekeep/host/types/types.wit.go 509f782ef74ab403a21537061225ba1f7790dbc6a6404853457cae1b245bb4cd
+go-rules/lanekeep/capture.go 1204297483bd9bd43df742286a173f52361271c22930fb35b24380972dd42310
+go-rules/lanekeep/capture_test.go 630b58245ba6ccf889823a8f089df580eae2885eb72ef4cc16f7849f5a1401d0
+go-rules/lanekeep/doc.go 69f2a5853e8ed6ba291dcc6df03b8ef28765bdde3a9b4ddbc56adc22de78c991
+go-rules/lanekeep/glob.go b52e51a8bbbd5783ba2f6deda2a9c7c82dcf19dcf1019f047f762cd985860516
+go-rules/lanekeep/glob_test.go 4a0fabe8315d6fa8fd03e40018aea96f7905c0d490f83b8356fa81687efc9dba
+go-rules/lanekeep/handlers.go b5ccbdb976f2fcec3b36dbaa3df839e156c278ca2ebb1252f5ac6fa090eaaff4
+go-rules/lanekeep/handlers_test.go e3a5fb18837f2d822366cd24b7f639fc99b5b21391b04dcc3a3efea6e0f87aab
+go-rules/lanekeep/rand.go 01fcfa1dfd2b5bb12be543f87e6356c70cecf284a3d2c567876f68b3bd83cdf1
+go-rules/lanekeep/rand_host.go 00a9a34aab44e6ada571cfbfedd8a1b21b0561dfd0bafc02c01a64529eba605d
+go-rules/lanekeep/realloc.go fdca8a8bb650063e8b5b946af4b4dc677e9f149ceac508dc359327dcaf0e017a
+go-rules/main.go 5f4bcab446d47be1e9513136a5f4320c3fbe1d91ea116a82561cc351d8d2e52a
+go-rules/rules/nocontextinstruct/rule.go c0e9a629a25a89b2232e7c1c470872356916b06b8a715d020e11dff25b4a9975
+go-rules/rules/nopackageinit/rule.go 05e716c71a50c4669401ec2870e0270523e20d4866d03d1525ec5dde63003fe3

@@ -66,6 +66,23 @@ TOOLS=(
     # Builds the WebAssembly rule components. Not needed by any gate — the built
     # fixtures are committed — but needed by `just wasm-fixtures` to rebuild one.
     "cargo-component:cargo-component"
+    # `tinygo build` shells out to this for `component embed` and `component new`, so
+    # `just go-rules` needs it and nothing else here does. Installed rather than merely
+    # required, because `_require`'s message tells you to run this script — a promise that
+    # was false for wasm-tools until this line existed. TinyGo itself cannot be installed
+    # from cargo; docs/authoring-go-rules.md says so and says what to do instead.
+    #
+    # **Pinned, and to the version `.github/workflows/ci.yml`'s `go-rules` job downloads.**
+    # That job rebuilds the committed Go artifacts and fails on a byte diff, and this is the
+    # encoder that writes their component sections — so an unpinned install here is a
+    # contributor building through one encoder and CI diffing against another, which reddens
+    # a job about the rule they changed for a reason that is not about it. The version lives
+    # in two places and they have to move together; the justfile's `go-rules` recipe echoes
+    # what it actually used, which is where a mismatch is readable.
+    #
+    # The pin reaches a fresh machine and not an existing one: the loop below skips anything
+    # already on PATH, whatever version it is.
+    "wasm-tools:wasm-tools@1.255.0"
 )
 
 missing=()

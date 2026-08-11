@@ -422,6 +422,176 @@ typescript-builtins:
     LANEKEEP_BLESS_TYPESCRIPT_BUILTINS=1 cargo test --quiet -p lanekeep-wasm \
         --test fixture_currency -- --exact every_committed_typescript_component_is_the_one_its_sources_build
 
+# Rebuild the committed Go built-ins component from go-rules/.
+#
+# The fourth recipe that rewrites a committed artifact, and outside every gate for the reason the
+# other three are: it needs a toolchain the gate deliberately does not — TinyGo here — and the
+# artifact it produces is committed and read with `include_bytes!`. `just check` passes on a
+# machine with neither TinyGo nor Go.
+#
+# **One component for every Go rule, and not one each**, which `go-rules/main.go` explains: the
+# rules are listed there, and the index a rule sits at in that slice is what `lanekeep_rules`
+# dispatches on.
+#
+# # The build flags, and which of them are not preferences
+#
+# `-target=wasm-unknown` is the requirement `rust-rules` states as `--target
+# wasm32-unknown-unknown`, for the same reason: it is the only TinyGo target whose components
+# import nothing but the declared world. `wasip2` imports a clock, a filesystem and randomness —
+# the capabilities the sandbox exists to withhold — and `crates/lanekeep-wasm/tests/world_shape.rs`
+# is what would catch a rebuild on it.
+#
+# **`-no-debug` is a correctness requirement rather than a size lever.** Without it TinyGo writes
+# the build directory into the artifact's DWARF, so every checkout produces different bytes for
+# identical source — and a component's bytes are a `ruleset_hash` input, so two people on one
+# commit would compute two cache keys.
+#
+# Measured on TinyGo 0.41.1 against the artifact **this recipe builds today**:
+# `crates/lanekeep-rules/components/go-builtins.wasm`, hosting the two Go built-ins. Both halves
+# are reproducible from a checkout, so a later reader can re-run them rather than trusting the
+# numbers — run this recipe for the first row, and the same `tinygo build` with `-no-debug`
+# removed for the second:
+#
+#     wc -c < crates/lanekeep-rules/components/go-builtins.wasm
+#     strings crates/lanekeep-rules/components/go-builtins.wasm | grep -cE '/Users|/opt/homebrew'
+#
+# | build | bytes | lines naming an absolute path |
+# | --- | --- | --- |
+# | with `-no-debug` | 13,187 | **0** |
+# | without | 322,301 | **85**, twelve of them this worktree's own |
+#
+# The 85 is `grep -c`, so it counts *lines* rather than occurrences, and most of them are the
+# TinyGo cache and the Go module cache rather than the checkout. Twelve name the worktree, which
+# is the half that makes the bytes differ per machine.
+#
+# **Every one of those figures moves when a rule is added**, which is the whole reason the
+# artifact is named rather than a commit. An earlier version of this comment quoted the one-rule
+# build's numbers and kept them through a rebuild that changed all three; the version after that
+# quoted the two-rule numbers against "the commit that added `no-context-in-struct`", which is
+# 13,207 rather than 13,187 — 13,187 is what the artifact came out at one commit later, when the
+# SDK changed under it. Neither mistake is reachable from a figure keyed to what the recipe
+# builds and a command that rebuilds it. Re-measure when you change what this recipe builds, or
+# delete the table rather than leave it stale.
+#
+# No `-opt` flag, which is also deliberate: `-opt=z` is this target's default, and `-opt=2` and
+# `-opt=1` both produce a *larger* artifact.
+#
+# # The four versions that decide the bytes, one of which the build command never names
+#
+# `tinygo build` shells out twice: to **`wasm-opt`** for the `-Oz` pass, and to **`wasm-tools`**
+# for `component embed` and `component new`. Neither appears in the command below, neither is
+# bundled on every platform, and both are as much an input to the artifact as the Go standard
+# library the compiler reads out of `GOROOT`. So the bytes are a function of four versions: Go,
+# TinyGo, binaryen and wasm-tools.
+#
+# **`wasm-opt` is the one that has actually moved.** TinyGo looks for it at `$TINYGOROOT/bin/`
+# first and honors `$WASMOPT` ahead of even that. The official Linux tarball ships **binaryen
+# 116** in its own root; Homebrew's TinyGo ships none at all, so a Mac uses whatever is on
+# `PATH` — **131** on the machine these artifacts were built on. Measured 2026-08-11 against
+# `go-builtins.wasm`, everything else held equal: **13,187 bytes through 131 and 13,274 through
+# 116**, different sha256s. `go-maporder.wasm` comes out byte-identical through both, so the
+# fixture cannot stand in for that check.
+#
+# The reassuring half of the same measurement, and what `.github/workflows/ci.yml`'s `go-rules`
+# job rests on: with all four matched, the artifact does **not** depend on the operating system
+# or the architecture. darwin/arm64 and linux/amd64 both produce
+# `881bc3cc47da05a6e76e59067a97581762bb53a1461f40d807f167b67d7d4a3c`.
+#
+# The versions are echoed below rather than checked. A mismatch surfaces as a byte diff whose
+# cause is in the log beside it, which is as much as a recipe can do without pinning a toolchain
+# it has no way to install.
+go-rules:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just _require tinygo
+    just _require go
+    # Not optional, and not obvious: `tinygo build` invokes it for the component encoding, and
+    # nothing else in this repository needs it. Without this line the failure is `exec:
+    # "wasm-tools": executable file not found in $PATH`, from inside a build that has already
+    # spent a minute in LLVM.
+    just _require wasm-tools
+    root="$(pwd)"
+
+    # What the artifacts below will have been built through, in the log next to them.
+    echo "toolchain:"
+    echo "  $(go version)"
+    echo "  $(tinygo version)"
+    echo "  wasm-opt $(${WASMOPT:-wasm-opt} --version | sed -E 's/^wasm-opt version //')"
+    echo "  $(wasm-tools --version)"
+
+    # `gofmt` and `go vet` before the build, on the reasoning the `rust-rules` recipe sets out at
+    # length: this recipe is the only path a Go artifact reaches a commit by, and the digest
+    # manifest is what forces the recipe to be run, so checks placed ahead of the recording sit
+    # on the only route to a green tree. Recording first would make them skippable by ignoring
+    # one exit code.
+    #
+    # `go test` as well. `just test-go` runs the same three now, so this is no longer the only
+    # place they execute — and it stays here regardless, because the two answer different
+    # questions: the gate asks whether the source is sound, and this asks it *before* an
+    # artifact built from that source is copied over a committed one.
+    #
+    # `go build ./...` is deliberately not here: `main.go` is a `package main` whose imports are
+    # `//go:wasmimport` declarations with no body, so it type-checks everywhere and *links* only
+    # on a wasm target. On the host it fails with `relocation target ... not defined`, which is
+    # the toolchain working correctly and would read like a broken build. `go vet` and `go test`
+    # compile every package here without linking that one, which is the coverage there is.
+    echo "checking go-rules/"
+    unformatted="$(cd go-rules && gofmt -l .)"
+    if [ -n "${unformatted}" ]; then
+        echo "error: not gofmt'd:" >&2
+        echo "${unformatted}" >&2
+        exit 1
+    fi
+    (cd go-rules && go vet ./...)
+    (cd go-rules && go test ./...)
+
+    echo "building go-builtins"
+    (cd go-rules && tinygo build \
+        -target=wasm-unknown \
+        -wit-package "${root}/crates/lanekeep-wasm/wit" \
+        -wit-world rule \
+        -panic=trap \
+        -no-debug \
+        -o "${root}/crates/lanekeep-rules/components/go-builtins.wasm" \
+        .)
+
+    # The determinism fixture, built here rather than by `wasm-fixtures` for the reason that
+    # recipe's every other artifact is built there: **the recipe that records a digest has to be
+    # the recipe that can rebuild the artifact.** `wasm-fixtures` needs `cargo-component` and
+    # nothing else; adding this one to it would make a recipe that builds eleven Rust guests
+    # require TinyGo to build a twelfth, and a checkout without TinyGo would then be unable to run
+    # it at all. So the artifact lands beside its siblings in `tests/fixtures/`, where
+    # `include_bytes!` and `tests/world_shape.rs`'s ambient-authority glob both find it, and its
+    # digest is recorded below — `fixture_currency.rs` subtracts it from the fixtures walk with
+    # exactly the note that partition already carries for the TypeScript and Go components.
+    #
+    # It is not a rule and ships to nobody. What it is for is the one claim about Go rules that
+    # cannot be read off any source: `go-rules/lanekeep`'s `Handlers` resets TinyGo's
+    # map-iteration generators before every host-called path, so a Go rule's map order does not
+    # depend on how many files that worker already handled. See
+    # `crates/lanekeep-wasm/tests/go_map_order.rs`.
+    echo "building the map-order fixture"
+    (cd go-rules && tinygo build \
+        -target=wasm-unknown \
+        -wit-package "${root}/crates/lanekeep-wasm/wit" \
+        -wit-world rule \
+        -panic=trap \
+        -no-debug \
+        -o "${root}/crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm" \
+        ./fixtures/maporder)
+
+    # Record what it was built from, so the gate can tell a stale component from a current one
+    # without needing TinyGo to find out. A manifest and a variable of its own rather than any of
+    # the three that already exist — sharing one would mean this recipe re-recording artifacts it
+    # did not build, and the recipe that did build them re-recording this one, which is how a
+    # stale artifact gets blessed by somebody doing the right thing elsewhere.
+    #
+    # `cargo test` rather than `cargo nextest run`, for the reason the other three give: what is
+    # wanted is the side effect and not the verdict. `--exact` keeps this to the one test.
+    echo "recording Go component digests"
+    LANEKEEP_BLESS_GO_RULES=1 cargo test --quiet -p lanekeep-wasm \
+        --test fixture_currency -- --exact every_committed_go_component_is_the_one_its_sources_build
+
 # Test rust-rules/: its own workspace, so `cargo test --workspace` at the root does not reach
 # it.
 #
@@ -465,27 +635,70 @@ test-scripts:
     @./scripts/test-workflows.sh
     @./scripts/test-release-config.sh
 
-# The Go launcher: formatting, vet, and its own tests.
+# The Go code: formatting, vet, and tests. **Two modules, and the second one is the reason
+# this recipe is not one command.**
 #
-# Skipped where Go is absent rather than failing. It is one distribution lane, and making
-# the Rust gate require a Go toolchain would cost every contributor for something most of
-# them never touch — the same trade `test-shell-portability.sh` makes for bash 3.2. CI has
-# Go on every runner, so it is a real check there.
+# `cmd/lanekeep` is the launcher and lives in the root module. `go-rules/` is a module of its
+# own, and a nested module is excluded from `./...` by construction — `go list ./...` at the
+# root reports only the launcher, whatever is underneath `go-rules/`. So for the whole of the
+# branch that introduced that module, the Go SDK's tests ran in no gate at all: reachable only
+# through `just go-rules`, a recipe that requires TinyGo and that neither gate invokes. Green,
+# and asserting nothing.
+#
+# None of the four commands below needs TinyGo, which is what puts the second module here on
+# exactly the launcher's terms. `just go-rules` runs the same three ahead of its build and
+# keeps doing so — that recipe is the only path an artifact reaches a commit by, so its checks
+# have to sit on that path whether or not they also run here.
+#
+# **`go build ./...` is deliberately absent, and would fail if it were here.** `go-rules`'s
+# `main.go` is a `package main` whose host functions are `//go:wasmimport` declarations with no
+# body: it type-checks everywhere and *links* only on a wasm target. On the host it fails with
+# `relocation target ... not defined`, which is the toolchain working correctly and reads like
+# a broken build. `go vet` and `go test` compile every package without linking that one.
+#
+# Skipped where Go is absent rather than failing — one guard for both modules, so a machine
+# without Go skips the same set it would have run. It is one distribution lane plus one
+# authoring lane, and making the Rust gate require a Go toolchain would cost every contributor
+# for something most of them never touch: the same trade `test-shell-portability.sh` makes for
+# bash 3.2. CI has Go on every runner, so it is a real check there.
+#
+# `go-rules/` has one dependency, so the first run here populates a module cache. Offline with
+# an empty one it fails, exactly as a cold `cargo` would — that is not new to this recipe.
 test-go:
     #!/usr/bin/env bash
     set -euo pipefail
     if ! command -v go >/dev/null 2>&1; then
-        echo "note: no go toolchain here, so the launcher tests are skipped (CI covers them)"
+        echo "note: no go toolchain here, so the launcher and rule-SDK tests are skipped (CI covers them)"
         exit 0
     fi
-    unformatted="$(gofmt -l ./cmd)"
+
+    # One `gofmt` over both, and from the repository root so the paths it prints can be opened
+    # from where the reader is standing. `gofmt` walks directories and knows nothing about
+    # module boundaries, which is the one place that fact helps rather than hurts.
+    unformatted="$(gofmt -l ./cmd ./go-rules)"
     if [ -n "${unformatted}" ]; then
         echo "error: not gofmt'd:" >&2
         echo "${unformatted}" >&2
         exit 1
     fi
+
     go vet ./...
     go test ./...
+
+    # And the nested module, which the two lines above cannot see.
+    (cd go-rules && go vet ./...)
+    (cd go-rules && go test ./...)
+
+    # A second vet of the same module under the build tag TinyGo's `wasm-unknown` target sets.
+    # `go-rules/lanekeep` is two files split on that tag — `rand.go` for the real reset,
+    # `rand_host.go` for the host no-op — and the two tags have to partition every build
+    # between them or the package declares `ResetRand` twice. They did not: `rand.go` was
+    # tagged `wasm_unknown` alone, which an ordinary `-tags wasm_unknown` on a host toolchain
+    # also satisfies, so both files were selected and the package stopped compiling. Nothing
+    # here noticed, because the plain vet above passes without the tag and TinyGo's own build
+    # is a recipe no gate runs. `go vet` is enough — this is a type-check, and it costs a
+    # second.
+    (cd go-rules && go vet -tags wasm_unknown ./...)
 
 # The authoring package's JavaScript tests.
 #

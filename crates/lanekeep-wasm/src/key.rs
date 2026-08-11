@@ -19,16 +19,19 @@
 //! hand-maintained semver has precisely the failure mode the `u32` has.
 //!
 //! **The WIT bytes are not the whole surface.** An interface the host binds *beside* the
-//! declared world is reachable by a component exactly as a declared one is, and the world
-//! file says nothing about it. That is not hypothetical: TinyGo's runtime imports
-//! `wasi:random/random` unconditionally, and the host must **bind** it rather than decline it,
-//! since a declined import means the component never instantiates at all. Whatever fixed byte
-//! cycle it is bound to then decides a Go rule's map iteration order, and therefore which
-//! violation it reports — measured 2026-08-05 with TinyGo 0.41.1, where a fixed source pinned
-//! the order across twelve runs and a different source pinned a different one. Change the
-//! cycle with the world, the component and the config all identical and every cache-key input
-//! is unchanged while the answer moves. [`EXTERNAL_BINDINGS`] is where that value is declared,
-//! and it is folded in here so the declaration is already an input on the day one is added.
+//! declared world is reachable by a component exactly as a declared one is, and the world file
+//! says nothing about it. Whatever fixed answers such an interface gives can decide what a rule
+//! reports — an entropy source is the clearest case, since a guest runtime seeded from one
+//! decides its own map iteration order and therefore which violation a rule picks. Change that
+//! value with the world, the component and the config all identical, and every cache-key input
+//! is unchanged while the answer moves. [`EXTERNAL_BINDINGS`] is where such a binding is
+//! declared, and it is folded in here so the declaration is already an input on the day one is
+//! added.
+//!
+//! This paragraph named TinyGo's `wasi:random/random` as the live instance of that until Go
+//! authoring was actually built, and it was wrong in a way worth leaving a mark for: nothing is
+//! bound beside the world today, and the hazard it was describing is real anyway. See
+//! [`EXTERNAL_BINDINGS`], which is where both halves are set out.
 //!
 //! # [`compile_env_hash`] — how a component is compiled
 //!
@@ -126,11 +129,38 @@ impl ExternalBinding {
 /// `wasm32-unknown-unknown` imports exactly `lanekeep:host/types@0.1.0`, so nothing needs to
 /// be bound beside the world today, and `crate::runtime::RuleSet::new` binds nothing else.
 ///
-/// The Go authoring lane is what changes that: TinyGo's runtime imports `wasi:random/random`,
-/// `wasi:io/streams`, `wasi:io/error` and `wasi:cli/stdout` whether the rule uses them or not,
-/// and those must be bound rather than declined. **Whatever binds one belongs here in the same
-/// change**, because this list is folded into [`host_api_hash`] and the thing it describes is
-/// not otherwise anywhere in the cache key. `crate::runtime::RuleSet::linker_mut` asks for a
+/// A Go rule does not change that. This note predicted the opposite — that TinyGo's runtime
+/// imports `wasi:random/random`, `wasi:io/streams`, `wasi:io/error` and `wasi:cli/stdout`
+/// unconditionally, so the Go lane would force them to be bound — and the word that fails is
+/// *unconditionally*. It is true of `-target=wasip2` and false of `-target=wasm-unknown`, which
+/// is what `just go-rules` builds: there `hardwareRand()` is `return 0, false` by construction
+/// and the artifact has **no WASI import at all**. Measured 2026-08-11 on TinyGo 0.41.1 against
+/// the committed `go-builtins.wasm`, through `crate::load::instance_imports` — the production
+/// filter — its import list is exactly `["lanekeep:host/types@0.1.0"]`, byte for byte the shape
+/// a Rust rule has. So this list stays empty, [`host_api_hash`] does not move, and adding Go
+/// authoring invalidated no cached result in any checkout.
+///
+/// # Correcting only that would leave this file more wrong than it was
+///
+/// The worry underneath the old note is *understated* rather than resolved, and the two must be
+/// read together. It treated the hazard as living in a host binding — something this list would
+/// capture on the day it was added — and the measurement says the hazard **survives with this
+/// list empty**, because it was never really about entropy. TinyGo seeds its map-iteration
+/// generator from `hardwareRand()` and then *advances* it on every draw, and iteration order
+/// depends on the position in that sequence rather than on the seed. One instance serves a
+/// whole (worker, component) pair, so the number of draws standing before any given `check` is
+/// a rayon scheduling artifact: a Go rule that iterates a map reports differently between two
+/// runs with every cache-key input identical, on a fixed seed, with nothing bound beside the
+/// world.
+///
+/// That is a guest-side problem and it is fixed in the guest, not here.
+/// `go-rules/lanekeep`'s `Handlers` resets both generators before every host-called path, and
+/// `crates/lanekeep-wasm/tests/go_map_order.rs` is the regression test.
+/// `docs/authoring-go-rules.md` states the whole of it.
+///
+/// **Whatever binds an interface beside the world still belongs here in the same change**,
+/// because this list is folded into [`host_api_hash`] and the thing it describes is not
+/// otherwise anywhere in the cache key. `crate::runtime::RuleSet::linker_mut` asks for a
 /// declaration at the call site so that binding without writing one down is not a thing that
 /// can be done by forgetting.
 pub const EXTERNAL_BINDINGS: &[ExternalBinding] = &[];

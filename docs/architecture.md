@@ -11,7 +11,7 @@ Not a linter in the ESLint sense. ESLint enforces language-level correctness; la
 ### v1 goals
 
 - TypeScript / JavaScript (incl. TSX/JSX).
-- **Rules are programs, authored in TypeScript** — the same language as the code they inspect. Turing-complete, with no expressiveness ceiling to hit. A rule may also be a WebAssembly component (§4), which is how six of the ten built-ins ship: two written in Rust, and four compiled from the TypeScript they were already written in. TypeScript is the form a project starts from and the one this document is written in, and it is now the form on **both** sides of that door.
+- **Rules are programs, authored in TypeScript** — the same language as the code they inspect. Turing-complete, with no expressiveness ceiling to hit. A rule may also be a WebAssembly component (§4), which is how eight of the ten built-ins ship: two written in Rust, two written in Go, and four compiled from the TypeScript they were already written in. TypeScript is the form a project starts from and the one this document is written in, and it is now the form on **both** sides of that door.
 - **Rules run sandboxed inside the binary.** An embedded JavaScript engine, or wasmtime for a component, reaching only host functions lanekeep chooses to expose.
 - **The hot path stays in Rust.** A rule declares a tree-sitter query; Rust matches it at native speed and calls into TypeScript only on matches.
 - Built-in rules ship with the tool and are authored against the same API user rules use.
@@ -157,7 +157,7 @@ A rule declares metadata, a tree-sitter query that gates execution, and a handle
 
 Neither is privileged. A component is held to the same validation a TypeScript rule is — namespace, card, query, `has-check` — by the same code, and both engines run in one pass over one corpus. Which form a rule takes is invisible to a config: `lanekeep/no-unwrap` names the rule, not its implementation, so a rule migrating from one to the other requires no config change.
 
-**A component's source language is not part of the arrangement, and six of the ten built-ins are components today.** Two are written in Rust and compiled with `cargo component` — `docs/authoring-rust-rules.md` is how one is written. The other four are *the same TypeScript files they were as modules*, compiled ahead of time by `componentize-js` into one shared component (§5.2). That form is the reason the arrangement has to be two ways of shipping a rule rather than "TypeScript rules are modules and everything else is a component": the four moved with their sources frozen byte-for-byte, and the four test files that covered them as modules pass unmodified against them as a component. Which engine runs a rule and which language it was written in became independent questions in that change.
+**A component's source language is not part of the arrangement, and eight of the ten built-ins are components today.** Two are written in Rust and compiled with `cargo component` — `docs/authoring-rust-rules.md` is how one is written. Two are written in Go and compiled with TinyGo into one shared component — `docs/authoring-go-rules.md`, and they are the migration that shows the arrangement holding in the harder direction: their TypeScript is deleted, so a Go rule is the component or it is nothing. The other four are *the same TypeScript files they were as modules*, compiled ahead of time by `componentize-js` into one shared component (§5.2). That form is the reason the arrangement has to be two ways of shipping a rule rather than "TypeScript rules are modules and everything else is a component": the four moved with their sources frozen byte-for-byte, and the four test files that covered them as modules pass unmodified against them as a component. Which engine runs a rule and which language it was written in became independent questions in that change.
 
 The TypeScript form is the one everything below is written in, because it is the one a project starts from.
 
@@ -930,6 +930,26 @@ The fix is that config load and the engine share one artifact cache, `.lanekeep/
 
 So "compiling one is tens of milliseconds" is ~6 s for this artifact, "~70 ms per component" is ~6 s, and "components no longer measurably cost anything at config load" is 213 ms for one rule against a 25 ms warm budget. The precompiled `.cwasm` is 34 MB.
 
+**A TinyGo component sits at the other end of that range, and its size is the third one worth writing down.** `crates/lanekeep-rules/components/go-builtins.wasm` hosts both Go built-ins in **13,187 bytes** — `wc -c` on the committed artifact, built by `just go-rules` on TinyGo 0.41.1 with `-target=wasm-unknown -panic=trap -no-debug` — against 107,914 and 111,759 bytes for the two Rust rule components and 13,029,888 for the shared JavaScript one.
+
+Its shape is a floor plus a per-rule cost, and the two rules do not cost the same. Three builds off the current tree, one SDK, dropping one row at a time from `go-rules/main.go`'s `ruleset` — which is ordered alphabetically, so the first row is `no-context-in-struct` and the second is `no-package-init`:
+
+| built | bytes |
+|---|---|
+| both rules, as committed | **13,187** |
+| `no-context-in-struct` alone (drop the second row) | 11,192 |
+| `no-package-init` alone (drop the first row) | 9,941 |
+
+So `no-context-in-struct` costs **3,246** bytes and `no-package-init` **1,995**, and the floor they share — the TinyGo runtime, the SDK and the dispatch table — is **7,946**. That figure is worth more than either marginal one, and it is the one to quote: it falls out of both subtractions independently and agrees to the byte, which is what says the three builds belong to one tree.
+
+There is no single "cost of a Go rule" to state. A rule resolving bindings costs 63% more than one comparing text, and any single marginal figure is really the cost of whichever rule was added last. **Take all three numbers from one build of one SDK** — an earlier draft of this paragraph subtracted across an SDK change and got a fourth number that no tree reproduces, which is "compare two binaries over one corpus, never one binary over two trees" from AGENTS.md, in miniature.
+
+Two things follow. The component-count arithmetic for Go is Rust's rather than JavaScript's — one component per rule would be perfectly affordable at 13 KB each — and the reason both Go rules share one anyway is exactly the 7,946-byte floor, which a second artifact would pay again: 11,192 + 9,941 = 21,133 bytes as two components against 13,187 as one. And **the figures in the two paragraphs above do not apply to it**, which is a claim about the class rather than about the number: those were measured against a component of about 26 KB, the Rust ones ship at ~108 KB today, and the Go one is 13 KB — all three within a factor of ten of each other and all three about a thousandth of the JavaScript component. It is that last ratio the two paragraphs above turn on.
+
+For scale at the other end, and read as magnitudes rather than as a ratio because the two were not taken on one profile: `crates/lanekeep-rules/tests/no_context_in_struct.rs` runs its whole nine-case table against the committed Go component in 0.12 s on the dev profile, where `crates/lanekeep-rules/tests/typescript_builtins_as_components.rs`'s header records ~6.5 s for a *single* first `run` against the JavaScript one on the release profile.
+
+**Both Go built-ins are migrations, one for one, so the built-in count is unchanged at ten** — eight of them components now, and the two that remain TypeScript modules are the Python pair. Nothing in this section is re-baselined by that change: a Go rule adds no host function, no boundary crossing and no cache-key input, and §15.1's per-crossing figures were taken against a Rust component and a JavaScript one, neither of which moved.
+
 **The warm column grows faster than the rule count, and that is a defect rather than a property.** The increments are +534 ms, +745 ms, +906 ms: `lanekeep-config` loads once per rule *reference*, so four rules of one component deserialize the same 34 MB artifact repeatedly and instantiate it more than once, where the whole point of sharing the component is to pay for the engine once. The fix is a memo keyed on the content identity `Loaded` already carries — the same identity `lanekeep-wasm` keys instance sharing on (§6.9) — rather than anything structural. It is not done, and until it is, **naming a fifth rule of that component costs about another second of warm time**.
 
 None of this is on the path of a project that uses no components, and none of it changes a result. It is the cost of the form, and §15.1 has the other half — what a component costs per `check` invocation once it is loaded.
@@ -1042,7 +1062,7 @@ The four TypeScript built-ins now sharing one component do not run faster than t
 
 ## 16. Milestones
 
-**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships ten built-in rules, six of them as WebAssembly components; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
+**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships ten built-in rules, eight of them as WebAssembly components; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
 Two things named here are still outstanding, and each is stated where it belongs rather than only here: the §15 performance budgets are targets that are not met, and M5's authoring path compiles the rules that ship with lanekeep but not a project's own.
 

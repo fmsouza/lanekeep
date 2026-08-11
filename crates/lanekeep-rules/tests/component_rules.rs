@@ -78,8 +78,10 @@ fn the_table_agrees_with_every_component_it_names() {
     // entirely, a derived list would simply stop mentioning it and pass.
     const EXPECTED: &[(&str, u32, &str)] = &[
         ("no-circular-imports", 0, "typescript-builtins"),
+        ("no-context-in-struct", 0, "go-builtins"),
         ("no-default-export", 1, "typescript-builtins"),
         ("no-glob-import", 0, "no-glob-import"),
+        ("no-package-init", 1, "go-builtins"),
         ("no-restricted-imports", 2, "typescript-builtins"),
         ("no-unused-exports", 3, "typescript-builtins"),
         ("no-unwrap", 0, "no-unwrap"),

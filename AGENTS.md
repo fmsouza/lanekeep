@@ -27,7 +27,7 @@ passes here it passes there.
 | `just check-fast` | Format, clippy, tests. What pre-commit runs. |
 | `just check` | The full gate. What pre-push and CI run. |
 | `just test` | Rust tests via nextest |
-| `just test-go` | The Go launcher's tests, skipped where Go is absent |
+| `just test-go` | Both Go modules — the launcher and the rule SDK — skipped where Go is absent |
 | `just test -- <filter>` | A subset — `just test -- cache::` |
 | `just fmt` | Apply formatting |
 | `just snapshot` | Review pending insta snapshots |
@@ -122,6 +122,9 @@ crates/
 rust-rules/          a second Cargo workspace: rule crates authored in Rust
   lanekeep-rule      the SDK they share: a capture lookup and a glob matcher
                      see docs/authoring-rust-rules.md before adding one
+go-rules/            a Go module: the Go-authored rules, all in one component
+  lanekeep           their SDK, plus TinyGo's tax — a cabi_realloc shim and a PRNG reset
+                     see docs/authoring-go-rules.md before adding one
 cmd/lanekeep/        the Go launcher, so `go tool lanekeep` works
 docs/                architecture, playbooks
 scripts/             repository tooling, with its own tests
@@ -568,13 +571,14 @@ eleven committed WebAssembly fixtures then read as stale that way — `bindings`
 does not. That is now the check rather than the investigation —
 `crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
 `tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
-there too, because fourteen of the fifteen committed today name it as their component target —
+there too, because fifteen of the sixteen committed today name it as their component target —
 every one but `spike`, which targets its own `wit/spike.wit` — and a world edit with no rebuild
 leaves every fixture satisfying an ABI that no longer exists. Count them with `ls
 crates/lanekeep-wasm/tests/fixtures/*.wasm` plus the one in `rejected/`, not from this sentence:
-it has been wrong twice, and a stale count here is the same failure the paragraph above is about.
+it has been wrong three times, and a stale count here is the same failure the paragraph above is
+about.
 
-**And one of the fifteen breaks that protocol, because `componentize-js` output is not reproducible
+**And one of the sixteen breaks that protocol, because `componentize-js` output is not reproducible
 at all.** `js-globals.wasm` is built by `jco componentize` rather than by `cargo component`, and
 three builds over one unchanged tree — jco 1.27.0, measured 2026-08-10 — gave 13,023,574,
 13,023,571 and 13,023,630 bytes, three distinct sha256s, with 2,968,012 bytes differing between
@@ -594,19 +598,25 @@ behavioral rather than byte-wise: `tests/js_globals.rs` derives its probes from 
 an artifact that no longer satisfies the contract fails the moment the contract moves. That is
 weaker — it catches a stale artifact only where the two disagree — and it is what there is.
 
-**There are three digest manifests now, one per recipe that rewrites a committed artifact, and
+**There are four digest manifests now, one per recipe that rewrites a committed artifact, and
 what may be shared between them is an input rather than an artifact.** `just wasm-fixtures`
-writes `fixture-digests.txt`, `just rust-rules` writes `rule-component-digests.txt`, and
-`just typescript-builtins` writes `typescript-component-digests.txt`. All three record
-`wit/world.wit`, deliberately: it is a build input to every component in the tree, and a change
-to it has to send you to every recipe. An *artifact* is the opposite case, because exactly one
-recipe can produce it — and `typescript-builtins.wasm` sits in
-`crates/lanekeep-rules/components/`, beside two artifacts a different recipe builds. Recording
-it in that recipe's manifest as well would mean a rebuild of the TypeScript component, whose
-bytes change every time, leaves the *Rust* manifest red until somebody runs `just rust-rules`: a
-recipe about other artifacts, needing `cargo component` and a wasm target, to fix a build it had
-no part in. `fixture_currency.rs`'s `TYPESCRIPT_ARTIFACTS` is the one list that partitions them,
-read by the manifest that owns them and by the manifest that must subtract them.
+writes `fixture-digests.txt`, `just rust-rules` writes `rule-component-digests.txt`,
+`just typescript-builtins` writes `typescript-component-digests.txt`, and `just go-rules` writes
+`go-component-digests.txt`. All four record `wit/world.wit`, deliberately: it is a build input to
+every component in the tree, and a change to it has to send you to every recipe. An *artifact* is
+the opposite case, because exactly one recipe can produce it — and `typescript-builtins.wasm`
+sits in `crates/lanekeep-rules/components/`, beside artifacts two different recipes build.
+Recording it in another recipe's manifest as well would mean a rebuild of the TypeScript
+component, whose bytes change every time, leaves the *Rust* manifest red until somebody runs
+`just rust-rules`: a recipe about other artifacts, needing `cargo component` and a wasm target,
+to fix a build it had no part in. `fixture_currency.rs` partitions them three ways rather than
+two — the Go component's artifacts are the third set, subtracted by the same mechanism and for
+the same reason: `just wasm-fixtures` cannot rebuild `go-maporder.wasm`, which needs TinyGo.
+
+Count the manifests with `ls crates/lanekeep-wasm/tests/*digests*.txt`. This sentence said
+"three" for a while after the fourth landed, which is the entry below about grepping a formula
+arriving in the file that warns about it: the sweep that added the Go recipe matched recipe names
+and artifact paths, and "three" is neither.
 
 **And `jco componentize` needs a far newer Node than `just test-js` does, which is discovered at
 *install* time and reported at build time, by neither.** `test-js` requires Node 18, the floor
@@ -790,14 +800,14 @@ intrinsics are an allowlist and `Object` is not on it), which is what `builtin.d
 along. The mirror image is a genuine factory referenced *bare* from a JSON config, which renders
 as a function where a rule object is expected.
 
-**No shipped built-in is in either shape today, and the mechanism is unchanged.** Six of the ten
-are components now: the two Rust rules first, then `no-default-export`,
-`no-restricted-imports`, `no-circular-imports` and `no-unused-exports` — which is all three of
-the genuine factories and both rules the dual shape was written for. A bare reference to a
-component renders as `null`, the placeholder holding its place in the entry module's array, and
-its options arrive through `configure` as JSON data rather than through a call. The four still
-shipped as modules — two Python, two Go — each `export default defineRule({…})` and take no
-options at all, so none of them can exhibit either half. Verified rather than assumed: no file
+**No shipped built-in is in either shape today, and the mechanism is unchanged.** Eight of the
+ten are components now: the two Rust rules first, then `no-default-export`,
+`no-restricted-imports`, `no-circular-imports` and `no-unused-exports`, then the two Go rules —
+which is all three of the genuine factories and both rules the dual shape was written for. A bare
+reference to a component renders as `null`, the placeholder holding its place in the entry
+module's array, and its options arrive through `configure` as JSON data rather than through a
+call. The two still shipped as modules are both Python, each `export default defineRule({…})`
+taking no options at all, so neither can exhibit either half. Verified rather than assumed: no file
 under `crates/lanekeep-rules/rules/` still carries the `for (const key in …)` copy, and the only
 surviving instance of the dual shape in this repository is
 `crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy that ships to nobody.
@@ -1038,6 +1048,174 @@ process anybody should rely on twice.
 Search for the *claim* in the several ways someone would have written it, and expect the plainest
 spelling to be the one the pattern misses. Prose is where a fact goes stale most quietly, because
 nothing about it looks like code that could be wrong.
+
+**`grep -c` counts lines, not occurrences, and the difference reached a committed comment.** The
+`go-rules` recipe recorded "this worktree's path eleven times" in an artifact built without
+`-no-debug`, taken from a `grep -c`. The figure it was reporting is the number of *lines* carrying
+an absolute path — most of them the TinyGo build cache and the Go module cache rather than the
+checkout — and the subset that actually names the worktree, which is the part that makes bytes
+differ per machine, is a different and smaller number. Use `grep -o … | wc -l` when the quantity
+is occurrences, and say which of the two a written-down figure is.
+
+**`-no-debug` is a `ruleset_hash` correctness requirement for a TinyGo rule, not a size lever.**
+Without it TinyGo writes the build directory into the artifact's DWARF, so identical source in two
+checkouts produces different bytes — and a component's bytes are a cache-key input, so every
+developer computes a different key for one commit. This is the rustup-toolchain-name trap above
+and strictly worse: a toolchain name differs between two people who reached one compiler by
+different routes, and a checkout path differs for everybody. Measured on TinyGo 0.41.1 against the
+committed `crates/lanekeep-rules/components/go-builtins.wasm`, which `just go-rules` rebuilds:
+**13,187 bytes** with the flag and **322,301** without, with
+`strings … | grep -cE '/Users|/opt/homebrew'` finding **0** lines against **85**, twelve of which
+name the worktree. Nothing turns red — the artifact is valid and the rule works — so the flag has
+to survive every future edit of that recipe, and the `justfile` says so where the command is
+written, along with what each figure is keyed to and why it is keyed to the artifact rather than
+to a commit.
+
+**`-target=wasip2` fails at *encode* time rather than at load, which is the good news.** The
+expected failure mode was a component with too many imports, argued about at load. Instead
+`wasm-tools component new` refuses the module outright — `module requires an import interface
+named wasi:cli/environment@0.2.0` — because `world rule` declares one import and TinyGo's wasip2
+runtime needs that one whatever the guest does. No flag combination fixes it (six were tried), so
+there is no wasip2 artifact to reject and no load-time test worth writing for the case. Loud,
+local to the rule author, and unshippable is a better shape than a rejection three layers away.
+
+**And `bytecodealliance/componentize-go` is ruled out by the same wall, which is worth knowing
+before someone re-evaluates it as the obvious tool.** It is actively maintained and does for Go
+what `cargo component` does for Rust, and it wraps the **upstream** `go` toolchain rather than
+TinyGo. Built against a world declaring zero imports it produced a component importing **18** WASI
+Preview 2 interfaces, among them `wasi:clocks/wall-clock`, `wasi:filesystem/types`,
+`wasi:filesystem/preopens` and `wasi:random/random` — none of them declared. It is not a missing
+flag: upstream issue #66 requests a `--stub-wasi` that does not exist, and closed bug #56 shows
+Go's garbage collector calling `wasi:clocks` *mid-allocation* rather than only at startup, so the
+imports are structural to that runtime. Worth re-checking if upstream Go grows a no-WASI wasm
+target or that flag lands; not worth a second look before then.
+
+**`-opt=2` and `-opt=1` produce a *larger* TinyGo artifact than the default.** `-opt=z` is already
+`wasm-unknown`'s default (it is in `targets/wasm-unknown.json`, along with `gc=leaking` and
+`scheduler=none`), so naming it buys nothing and reaching for a "higher" level costs size.
+Measured on TinyGo 0.41.1 against `crates/lanekeep-rules/components/go-builtins.wasm`, by running
+`just go-rules`'s own `tinygo build` with each flag added: **13,187** bytes with no `-opt` at all,
+**13,187** at `-opt=z` — the same artifact, since that is the default — **13,245** at `-opt=2` and
+**13,841** at `-opt=1`. Pass no `-opt` flag at all.
+
+An earlier version of this entry gave 804,006 / 1,145,410 / 1,150,350, which are the same three
+comparisons on a throwaway design spike that is not in this tree and cannot be rebuilt from any
+commit in it. The ordering was right and the numbers were unreproducible, which is the trap
+further down about a figure measured against a working tree.
+
+**`//go:linkname` on a *variable* emits a definition under TinyGo and links silently to nothing
+under host Go, so `go test` passes against a dead write.** The SDK has to reach TinyGo's runtime
+globals to reset the map-iteration generator, and the pragma that reads like the right one is the
+wrong one in both toolchains at once. Under TinyGo it fails the build with `error: Linking globals
+named 'runtime.xorshift32State': symbol multiply defined!` — a message about the linker that says
+nothing about the pragma. Under host Go the identical declaration links *fine* and writes to a
+symbol nobody reads, which was proved with a throwaway module: `go test` and `go vet` both exit 0
+on a `//go:linkname` to a symbol upstream Go's runtime does not have. So "the tests pass" would
+have been worth nothing.
+
+`//go:extern runtime.xorshift32State` is the working pragma, and it is the safer one in the way
+that matters most: a wrong symbol name fails the link loudly — `wasm-ld: error: lto.tmp: undefined
+symbol: runtime.xorshift32StateTYPO` — which is what lets the names be trusted without a test
+asserting them, and is the exact opposite of what `//go:linkname` gives. Every `//go:linkname` in
+TinyGo 0.41.1's own `src/` is on a function; there is no var precedent to copy.
+
+**And the global map iteration reads is `xorshift32State`, not `xorshift64State`.**
+`hashmap.go` calls `fastrand()` at all three of its sites — lines 77 and 294 for a map's hash
+seed, 402-403 for an iterator's start bucket and index — and `fastrand()` advances the 32-bit
+global alone. An earlier design named the 64-bit one, which `hashmap.go` never touches: resetting
+it and nothing else leaves map order exactly as scheduling-dependent as before while reading, at
+the call site, as though the hazard were closed. Measured with a probe that resets each in turn.
+Both are reset now, the 64-bit one because `fastrand64` backs `math/rand` and is the same class of
+advancing global.
+
+**A build tag of `!wasm_unknown` silently selects the host stub on `wasip2`, which builds.**
+The SDK's PRNG reset is `//go:build wasm_unknown` with a documented no-op counterpart so that host
+tooling compiles, and the counterpart's obvious tag is wrong: from `tinygo info`, `wasip2` carries
+`tinygo` and not `wasm_unknown`, so a `wasip2` build picked the no-op and exited 0. `!tinygo` is
+the tag that makes a wrong target a compile error instead — `undefined: ResetRand`, naming the SDK's
+own use sites. The `cabi_realloc` canary cannot cover for this, because it is excluded under
+`wasip2` too. Generally: a negated tag names the targets it excludes, so it excludes exactly one
+and admits every other, and on a family of targets that is almost never the intent.
+
+**`wit-bindgen-go` emits no `resource.drop` for a `borrow<>`, and without an explicit
+`defer …ResourceDrop()` every report the rule made is discarded.** `check` and `reduce` take
+`borrow<check-context>` / `borrow<reduce-context>`, and the canonical ABI *counts* that loan: the
+handle enters the guest's table against a borrow scope, and the runtime checks at the end of the
+call that everything lent has been given back. Dropping a borrow does not run the resource's
+destructor — the host keeps the value, only the loan closes. `wit-bindgen-go` 0.7.0's
+`wasmexport_Check` reinterprets the integer and hands it straight over, so the loan is outstanding
+at return and wasmtime answers **`borrow handles still remain at the end of the call`**: a message
+about the runtime's own bookkeeping that names neither the rule, nor the handle, nor the export,
+and which arrives *after* the rule body has run.
+
+It is invisible to everything short of a real call. The artifact is a valid component, its import
+list is exactly the declared world, `rules`, `metadata`, `configure`, `has-check` and `has-reduce`
+all answer correctly, its digest is current and it is byte-reproducible. The two exports that take
+a context are the only ones that fail, and they are the two that no load-time check, no import
+assertion and no metadata read ever exercises — so the failure looks exactly like a rule that
+found nothing. `defer` rather than a drop before each `return`, so a handler that grows a second
+early return cannot leave one path lending.
+
+The general form outlives this generator: **a component that passes every static check can still
+fail on the first call that borrows anything, and the diagnostic will name the runtime rather than
+the guest.** A build, an import assertion and a metadata read are not evidence that a rule works.
+
+**`import` is the zero value of `binding-kind`, and `cm.Option.Value()` returns the zero value for
+a `none` — so the chainable spelling reports every name that resolves to no binding at all.**
+`binding-kind: func(n: node) -> option<binding-kind>`, and `%import` is the first case of that
+enum, so `BindingKindImport == 0`. `Value()` has a value receiver and chains
+(`ctx.Text(n).Value()` is correct and is what every string comparison uses); `Some()` and `None()`
+have pointer receivers, so `ctx.BindingKind(n).Some()` does not compile and the option has to be
+bound to a variable first. The path of least resistance is therefore the wrong one, and only for
+this method. It presents as a rule that is too strict and never as a crash, so the failure only
+ever *adds* violations and a user who sees one assumes their code is at fault — the same shape as
+the handle-zero bug that cost `no-unwrap` its whole `#[test]` exemption.
+
+Two consequences worth carrying with it. **Any WIT `enum` whose first case is the interesting one
+has this**, not only `binding-kind`; treat `Value()` on an `option<enum>` as wrong by default. And
+**a stub host that always answers `Some(…)` cannot catch it** — the `None` arm in
+`crates/lanekeep-wasm/tests/world_shape.rs`'s `binding_kind` is the only reason a committed test
+sees this at all.
+
+**A gitignored directory holding `.go` files but no `go.mod` is adopted by the root module, so
+`go vet ./...` fails on scratch work.** `go list`, `go vet` and `go test` walk the filesystem and
+honor no `.gitignore`; Go skips directories named `testdata` or beginning with `.` or `_`, and
+nothing else. A scratch copy under `/target/` — never near a commit — reddened `just test-go` with
+`no required module provides package …`, about files that are not part of the change and are not
+in the repository. Put a `go.mod` in any scratch directory containing Go files, which is what makes
+it a nested module and invisible; that is the same construction that keeps `go-rules/` out of the
+root module's `./...`.
+
+**And the same construction cost the Go SDK's tests every gate for the whole of the branch that
+introduced them, which is the half of it that mattered.** `just test-go` ran `go vet ./...` and
+`go test ./...` in the root module, so it reported on `cmd/lanekeep` and on nothing else;
+`go-rules/lanekeep`'s test functions were reachable only through `just go-rules`, a recipe that
+requires TinyGo and that neither gate invokes. Nothing said so — `just check` was green, and a recipe called `test-go`
+reads like it covers the Go code. `test-go` now runs `gofmt -l`, `go vet` and `go test` in both
+modules behind one `command -v go` guard, since none of the three needs TinyGo. Carry the general
+form: **`./...` is scoped to a module, not to a directory**, so adding a nested module silently
+subtracts it from every wildcard the parent runs.
+
+**A TinyGo build's bytes depend on two tools its command never names, and one of them travels
+with the TinyGo you installed.** `tinygo build` shells out to `wasm-opt` for the `-Oz` pass and to
+`wasm-tools` for `component embed` and `component new`, so an artifact is a function of four
+versions — Go, whose `GOROOT` supplies the standard library it compiles; TinyGo; binaryen;
+wasm-tools — of which the recipe names two. `wasm-tools` at least fails loudly when absent
+(`exec: "wasm-tools": executable file not found in $PATH`, after a minute in LLVM, which is why
+`just go-rules` now `_require`s it). `wasm-opt` is the quiet one: TinyGo prefers
+`$TINYGOROOT/bin/wasm-opt` over `PATH` and honors `$WASMOPT` ahead of both, and **the official
+Linux tarball ships binaryen 116 inside its own root while Homebrew's TinyGo ships none at all**
+— so one command, one TinyGo version and two machines can run two different optimizers. Measured
+2026-08-11 with everything else held equal: `go-builtins.wasm` is **13,187 bytes through binaryen
+131 and 13,274 through 116**, with different digests.
+
+Two things to carry with it. The reassuring one: with all four matched the artifact does **not**
+depend on the operating system or the architecture — linux/amd64 reproduces the darwin/arm64
+bytes exactly, which is what `.github/workflows/ci.yml`'s rebuild-and-diff job rests on and why
+that job pins four versions rather than one. And the warning: `go-maporder.wasm`, the small
+fixture built by the same recipe, is byte-identical through 116 and 131, so **a fixture cannot
+stand in for this check** — only the real artifact is large enough for two optimizers to disagree
+about.
 
 ## What not to do
 

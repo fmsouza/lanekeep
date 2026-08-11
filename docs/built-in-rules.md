@@ -14,7 +14,7 @@ Name one by specifier and put it in your `rules` array. In a `lanekeep.json`, wh
 ```
 
 Or in a `lanekeep.config.ts`, for a rule that is a TypeScript module — which today means the two
-Python rules and the two Go ones:
+Python rules and nothing else:
 
 ```ts
 import { defineConfig } from 'lanekeep'
@@ -30,13 +30,13 @@ Built-ins resolve before the filesystem is consulted, so a file at
 `lanekeep/no-broad-except.ts` in your project does not shadow one. A rule whose behavior
 depended on whether a same-named file happened to exist would be unreasonable to debug.
 
-**Six of the ten are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
+**Eight of the ten are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
 cannot import one.** The two Rust rules — `lanekeep/no-glob-import` and `lanekeep/no-unwrap` —
-and the four TypeScript ones — `lanekeep/no-default-export`,
-`lanekeep/no-restricted-imports`, `lanekeep/no-circular-imports` and
-`lanekeep/no-unused-exports` — are WebAssembly components. They have no JavaScript left to
-import at run time, and they describe themselves rather than being read out of a `defineRule`
-call.
+the two Go ones — `lanekeep/no-context-in-struct` and `lanekeep/no-package-init` — and the four
+TypeScript ones — `lanekeep/no-default-export`, `lanekeep/no-restricted-imports`,
+`lanekeep/no-circular-imports` and `lanekeep/no-unused-exports` — are WebAssembly components.
+They have no JavaScript left to import at run time, and they describe themselves rather than
+being read out of a `defineRule` call.
 
 **Name them from a `lanekeep.json` and everything below works the same, options included.**
 Importing one from a TypeScript config fails at load with a message that says so and names the
@@ -44,9 +44,13 @@ remedy — which is the whole of the difference a user sees. Every example in th
 whichever format the rule it documents accepts.
 
 The four TypeScript rules are compiled from *exactly* the sources they were written in; nothing
-about them changed but the engine that runs them. Which form a rule takes is not part of its
+about them changed but the engine that runs them. The Rust and Go ones are written in the
+language they check and have no TypeScript at all. Which form a rule takes is not part of its
 interface: the specifier, the id, the options and the output are the same either way, and a rule
-that changes form does not change your config.
+that changes form does not change your config — the two Go rules were TypeScript modules until
+this release, and every case in their test suites passed unchanged across the move. Their
+`.ts` sources are recoverable with `git log --diff-filter=D -- crates/lanekeep-rules/rules/`,
+which is where a reader who wants to compare the two implementations should start.
 
 Built-in ids are namespaced `lanekeep/`. Project rules use `local/`, or a namespace the
 project declares in its config — `namespaces: ['acme']` allows `acme/no-numeric-sizes`.
@@ -336,7 +340,20 @@ reported.
 
 Both Go rules are about *implicit* structure — a dependency the code does not state, and an
 ordering nothing writes down. Neither is a style preference: each produces a failure that
-surfaces far from its cause.
+surfaces far from its cause, which is what makes it worth stating as a project convention
+rather than arguing case by case in review.
+
+**Both are components**, like the two Rust rules and the four TypeScript ones, so name them from
+a `lanekeep.json`:
+
+```json
+{ "rules": ["lanekeep/no-context-in-struct", "lanekeep/no-package-init"] }
+```
+
+They are written in the language they check, in [`go-rules/`](../go-rules), and compiled to
+WebAssembly with TinyGo — see [`authoring-go-rules.md`](authoring-go-rules.md). Neither takes
+options. Both resolve identifiers rather than matching text, which is what keeps them from
+firing on a project that has taken a name for something of its own.
 
 ## `lanekeep/no-context-in-struct`
 
@@ -357,13 +374,17 @@ func (c *Client) Do(ctx context.Context) error { return nil }
 The context package says it directly: do not store Contexts inside a struct type. A stored
 context outlives the call it was scoped to, so cancellation and deadlines stop meaning what
 the caller intended — a long-lived client holds the context of whichever request happened to
-build it, and cancelling that request cancels work belonging to every other.
+construct it, and cancelling that request cancels work belonging to every other.
+
+It is architectural rather than stylistic because of how the damage arrives: as unrelated
+requests failing together, which is nearly impossible to attribute back to the field that
+caused it.
 
 Both `context.Context` and `*context.Context` are reported; they differ by a `pointer_type` in
 the tree, so each needs its own query pattern.
 
-A qualifier that is not an import does not fire — a package-level name that happens to read
-`context` is not the standard library.
+`ctx.bindingKind` is what keeps this from being a text match: it says whether the qualifier is
+an import at all, so a package-level name that happens to read `context` does not fire.
 
 ### What it cannot tell apart
 
@@ -398,10 +419,14 @@ func Register(r map[string]Driver) {
 An `init` function runs when the package is imported, before `main`, in an order the language
 decides. Nothing calls it, so nothing in the code says when it happens — a reader tracing
 startup finds no edge leading to it. Two packages registering into a shared map depend on an
-order neither states, and the failure moves when an unrelated import is added.
+order neither states, and the failure — a missing registration, a nil global — surfaces far from
+the cause and moves when an unrelated import is added.
 
 It is also how a package acquires hidden startup cost: an import that looks free opens a
 connection or reads a file.
+
+Wiring done explicitly from `main` — or a `New...` returning an error — is traceable, testable,
+and ordered by the code rather than by the linker.
 
 Every `init` in a file is reported; Go permits several, which is what makes the ordering hard
 to reason about in the first place. A *method* named `init`, or a variable holding a function
@@ -505,6 +530,14 @@ needed something a project rule cannot have would be evidence the host API is wr
 For a rule in Rust, steps 1 and 2 become `rust-rules/<name>/` and `BUILT_IN_COMPONENTS`;
 [`authoring-rust-rules.md`](authoring-rust-rules.md) has the whole of it. Step 3 is the same
 file with the same `RuleTester`, through `RuleTester::for_component`.
+
+For a rule in Go, step 1 becomes `go-rules/rules/<name>/` plus a row in `go-rules/main.go`'s
+`ruleset`, and step 2 becomes a `COMPONENT_RULES` row naming `go-builtins` and the index that
+row sits at — every Go rule shares one component, so `BUILT_IN_COMPONENTS` already has its
+entry. [`authoring-go-rules.md`](authoring-go-rules.md) has the whole of it, including the six
+things about TinyGo that are not preferences — four of which fail silently, and two of which
+stop the build and say so. Step 3 uses `RuleTester::for_built_in` rather than `for_component`,
+for the reason the note below gives about a shared artifact.
 
 To ship a TypeScript rule as a component instead of a module, step 1 is unchanged — it is the
 same file, importing only from `lanekeep` — and steps 2 and 3 gain a build. List it in
