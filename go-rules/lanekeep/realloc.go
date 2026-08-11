@@ -41,6 +41,15 @@ import "unsafe"
 //go:linkname runtimeRealloc runtime.realloc
 func runtimeRealloc(ptr unsafe.Pointer, size uintptr) unsafe.Pointer
 
+// Both pragmas, deliberately, though **either one alone produces the export** — measured, by
+// building with each in turn and reading the artifact's export list. They are here because
+// this function is standing in for one of the generated exports, and every export in
+// `internal/lanekeep/host/rule/rule.wasm.go` carries exactly this pair: `//go:wasmexport rules`
+// above `//export rules`, and so on for all seven. Matching that is what keeps a reader from
+// having to work out whether the difference means something. (TinyGo's own wasip2 shim, in
+// `src/runtime/runtime_wasip2.go`, writes only `//export` — so there is no single upstream
+// convention to defer to, and the neighboring generated code is the better guide.)
+
 //go:wasmexport cabi_realloc
 //export cabi_realloc
 func cabi_realloc(ptr unsafe.Pointer, oldsize, align, newsize uintptr) unsafe.Pointer {

@@ -41,23 +41,35 @@
 // picks *which* node to report by map order reports a different violation, not the same one
 // in a different position.
 //
-// [ResetRand] closes it by returning the generators to their initial position at the top of
-// every handler, which makes map order a function of that call's inputs alone. It is the
-// posture the QuickJS sandbox already takes with `Math.random` and `Date.now`: withhold the
-// capability rather than ask authors not to reach for it. Documenting "sort before you
-// iterate" was rejected as unenforceable, and refusing `range` over a map was rejected as
-// costing Go authors a normal language feature the reset already makes safe.
+// [ResetRand] closes it by returning the generators to their initial position, which makes map
+// order a function of that call's inputs alone. It is the posture the QuickJS sandbox already
+// takes with `Math.random` and `Date.now`: withhold the capability rather than ask authors not
+// to reach for it. Documenting "sort before you iterate" was rejected as unenforceable, and
+// refusing `range` over a map was rejected as costing Go authors a normal language feature the
+// reset already makes safe.
 //
-// # What a rule author has to remember
+// # The reset is structural, not a rule an author follows
 //
-// Call [ResetRand] first in every check and reduce. Nothing else in this package needs to be
-// called in any particular order.
+// Nothing here asks an author to remember anything. A rule declares its passes through
+// [NewHandlers], whose [Handlers.Check] and [Handlers.Reduce] reset before delegating, and the
+// declared handler is unreachable except through them — the fields are unexported and there is
+// no other constructor. So the reset happens on every invocation by construction.
 //
-//	func check(ctx *types.CheckContext, m types.Match) {
-//		lanekeep.ResetRand()
+// An earlier version of this package did ask, in a section here headed "what a rule author has
+// to remember". That was documentation standing in for enforcement of exactly the hazard the
+// design authority had already rejected documentation for, and it would have failed in the
+// quietest possible way: a rule that omitted the call passes every test anyone would write and
+// misbehaves only under a real corpus, on a schedule, with every cache-key input identical.
+//
+//	func check(ctx types.CheckContext, m types.Match) error {
 //		node, ok := lanekeep.Capture(m.Slice(), "name")
 //		...
 //	}
+//
+//	var rule = lanekeep.NewHandlers(check, nil)  // the reset comes with it
+//
+// [ResetRand] stays exported because the fixtures that prove it need to drive it directly, not
+// because a rule should call it.
 //
 // One sharp edge belongs to the generated bindings rather than to this package, and it will
 // hit every author on their first optional-returning call: `cm.Option[T]`'s `Some` is a
