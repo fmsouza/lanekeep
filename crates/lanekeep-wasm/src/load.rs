@@ -47,8 +47,17 @@
 //! 0.693, a factor of 259, and nothing turns on which. The one-time cost is negligible:
 //! `Component::serialize` costs 36.4 µs at the median against 9,183.4 µs to compile the same
 //! component (n = 200 each), so the break-even against compiling is the first load. The
-//! `.cwasm` is 5.43× the component — 90,224 bytes for 16,618 — which for the built-ins is
-//! under a megabyte on disk.
+//! `.cwasm` is 5.43× the component — 90,224 bytes for 16,618.
+//!
+//! **That ratio was measured against components of a few tens of kilobytes, and what the
+//! built-ins cost on disk is now set by one that is not.** Measured 2026-08-11 on this branch,
+//! against `.lanekeep/components` after a run naming all three shipped components: the two Rust
+//! ones compile 107,914 and 111,759 bytes into 356,408 and 360,216 — the same order as above —
+//! and `typescript-builtins.wasm`, a JavaScript engine with four rules on top of it, compiles
+//! 13,029,888 bytes into **34,874,912**, a ratio of 2.68. So a project naming any one of the
+//! four TypeScript built-ins writes about 33 MiB, and naming all three components writes
+//! 35,591,536 bytes. `docs/architecture.md` §15 carries what that costs in time; this is what it
+//! costs in space, and the two figures have the same cause.
 //!
 //! **Mapping is about residency.** `include_bytes!` produces a byte slice, a byte slice
 //! cannot be mapped, and wasmtime builds copy-on-write memory images only from something it

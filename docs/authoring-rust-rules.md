@@ -160,10 +160,22 @@ than a `lanekeep.config.ts`, because a component is not a value a TypeScript mod
 
 ## Shipping it as a built-in
 
-Add it to `BUILT_IN_COMPONENTS` in
-[`crates/lanekeep-rules/src/lib.rs`](../crates/lanekeep-rules/src/lib.rs), keeping the table in
-order. A name belongs to exactly one of the two tables; a rule in both would be two programs
-answering to one id.
+**Two tables, not one**, both in
+[`crates/lanekeep-rules/src/lib.rs`](../crates/lanekeep-rules/src/lib.rs), each kept in order:
+
+- `BUILT_IN_COMPONENTS`, keyed by the *component* — its name, its bytes, and its source map if
+  it has one. This is the artifact.
+- `COMPONENT_RULES`, keyed by the *rule* — `(rule name, component name, index)`. This is what a
+  config resolves through: `component()` and `hosted()` read it and nothing else, so a component
+  listed only in the first table is embedded in the binary and reachable by no specifier.
+
+A component built from `rust-rules/<name>/` hosts one rule and its two rows agree on the name,
+which is why this used to read as one step. It is one step only in that case. The gate catches
+the omission either way — `every_component_is_a_rule_that_ships` asserts both directions — but
+it catches it as a failing unit test rather than at the place you were editing.
+
+A rule name belongs to exactly one of `BUILT_IN_RULES` and `COMPONENT_RULES`; a rule in both
+would be two programs answering to one id.
 
 Nothing else changes. `lanekeep/<name>` resolves to the component wherever it resolved to a
 module, so a rule migrating from TypeScript needs no config edit anywhere — which is the

@@ -32,7 +32,7 @@ depended on whether a same-named file happened to exist would be unreasonable to
 
 **Six of the ten are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
 cannot import one.** The two Rust rules — `lanekeep/no-glob-import` and `lanekeep/no-unwrap` —
-and the four TypeScript-and-JavaScript ones — `lanekeep/no-default-export`,
+and the four TypeScript ones — `lanekeep/no-default-export`,
 `lanekeep/no-restricted-imports`, `lanekeep/no-circular-imports` and
 `lanekeep/no-unused-exports` — are WebAssembly components. They have no JavaScript left to
 import at run time, and they describe themselves rather than being read out of a `defineRule`
@@ -60,7 +60,14 @@ A rule that names no language defaults to `['typescript', 'tsx']`.
 
 ---
 
-# TypeScript and JavaScript
+# TypeScript
+
+**These four run on `.ts` and `.tsx` and not on JavaScript.** None of them declares a `language`,
+so all four take the default above — `['typescript', 'tsx']` — and `javascript` is a separate
+language covering `.js`, `.mjs`, `.cjs` and `.jsx`. This section was headed "TypeScript and
+JavaScript" for a while and the rules underneath it never fired on a `.js` file, which is the
+quiet kind of wrong: a rule that does not run looks exactly like a codebase with nothing to
+report. Extending them is a rule change rather than a documentation one.
 
 ## `lanekeep/no-default-export`
 
@@ -408,7 +415,7 @@ objects to.
 Both Rust rules are about *legibility of dependencies and failure*: where a name came from, and
 what happens when something goes wrong.
 
-**Both are components**, like the four cross-language rules above, so name them from a
+**Both are components**, like the four TypeScript rules above, so name them from a
 `lanekeep.json`:
 
 ```json
@@ -506,6 +513,16 @@ dispatched on, record it in `COMPONENT_RULES` rather than `BUILT_IN_RULES`, and 
 `just typescript-builtins` to rebuild the shared artifact and re-record its source digests. The
 rule's own tests do not change, which is the point and was the acceptance test for the four that
 moved: same source, same expectations, different engine.
+
+**Add a test that runs the component, because "the tests do not change" does not mean they cover
+it.** A test built on `lanekeep_rules::source(name)` runs the TypeScript in QuickJS whatever form
+the rule ships in, so for two of the four the unchanged file went on testing the source and said
+nothing about the artifact. `RuleTester::for_built_in` names the rule by its specifier —
+`"lanekeep/no-default-export"` — which resolves through the embedded table to one rule of the
+shared component; `RuleTester::for_component` cannot do this, because it writes the artifact to a
+path and a path reference contributes every rule in it.
+`crates/lanekeep-rules/tests/typescript_builtins_as_components.rs` is the worked example, and its
+header explains why it is deliberately a subset: every case there compiles a 12.4 MiB artifact.
 
 Cover the forms that do not look like the obvious one. Every gap found while writing these
 two rules was a form that read differently in source but meant the same thing.

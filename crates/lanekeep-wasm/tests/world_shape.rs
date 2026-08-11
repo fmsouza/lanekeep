@@ -529,8 +529,10 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// so a fixture on the wrong target passes every shape assertion right up until a real rule
 /// formats a string.
 ///
-/// The two tests above check one artifact out of eleven. Each new fixture widened that gap
-/// silently, which is why this one is written the way it is.
+/// The two tests above check one artifact; this directory holds fourteen of them, and it held
+/// eleven when that sentence was first written. Each new fixture widened the gap silently, which
+/// is why this one is written the way it is — and why the count above is the only number here,
+/// stated as something that moves rather than as a fact about the tree.
 ///
 /// # Globbed, and that is the whole point
 ///
@@ -543,8 +545,9 @@ fn the_component_imports_exactly_the_one_declared_interface() {
 /// # A property, not a snapshot
 ///
 /// What is asserted is that every *instance* import is the one host interface. Not a
-/// transcript of what the eleven artifacts import today: that would be a list again, and it
-/// would have to be edited by whoever adds a fixture, which is the failure mode being fixed.
+/// transcript of what the artifacts in this directory import today: that would be a list again,
+/// and it would have to be edited by whoever adds a fixture, which is the failure mode being
+/// fixed.
 /// Importing nothing at all passes — `spike.wasm` targets its own `wit/spike.wit` and reaches
 /// no part of `std` that touches the adapter — because importing nothing is strictly less
 /// authority, never more.

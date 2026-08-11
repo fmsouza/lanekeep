@@ -79,11 +79,23 @@
 //! a rule index.** A component is a compiled program and the rules on top of it are noise:
 //! measured 2026-08-10, a JavaScript engine compiled to a component is 12.34 MiB and three
 //! further rules with real bodies add 9,702 bytes. A per-rule instance cache would build that
-//! engine once per rule in every worker's store — giving back at run time exactly what the
-//! shared artifact saves on disk, and breaching the shipped 64 MiB per-worker ceiling, which
-//! `MemoryCeiling` sums across every memory in a store. The one exception is two slots naming
-//! the *same* rule of one component, which hold different configurations of one guest slot and
-//! cannot share; [`RuleSet::add`] splits those.
+//! engine once per rule in every worker's store, giving back at run time exactly what the
+//! shared artifact saves on disk. The one exception is two slots naming the *same* rule of one
+//! component, which hold different configurations of one guest slot and cannot share;
+//! [`RuleSet::add`] splits those.
+//!
+//! **The ceiling argument that used to sit in that sentence was wrong twice over, and the
+//! measured version is worth more than the claim it replaces.** It said four per-rule instances
+//! breached the shipped 64 MiB per-worker ceiling. Four copies of 12.34 MiB is 49.4 MiB, which
+//! is under it — and artifact bytes are not what `MemoryCeiling` sums, which is linear memory.
+//! Measured 2026-08-11 through this type: `typescript-builtins.wasm` declares 145 pages, so an
+//! instance grants 9,502,720 bytes before it runs, and one store takes **seven** and refuses the
+//! eighth with [`WasmError::MemoryExceeded`] — bare, and equally after each has been configured
+//! and had `metadata` read. So four is not a breach; what it costs is headroom, taking what is
+//! left for a rule's own allocations from 54.9 MiB to 27.8 MiB, because linear memories never
+//! shrink and every grant counts against the same ceiling. What does not survive a per-rule
+//! bound is the next component: eight rules in one artifact would be refused outright, and the
+//! shared TypeScript one already hosts four.
 //!
 //! **What that bound is worth depended on a number that was wrong, and it is corrected here.**
 //! An earlier version of this paragraph said "roughly three hundred and fifty instantiations

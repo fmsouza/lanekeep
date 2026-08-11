@@ -646,11 +646,17 @@ bench *ARGS:
 # `_componentize` gives the shipped built-ins — the point of the arm is the engine underneath the
 # rule, so a component built any other way would answer about a component nothing ships.
 #
-# **The artifact is not committed, and that is a size decision rather than a taste one.** It is
-# 13 MB; every crate in this workspace is published, and crates.io refuses a package over 10 MiB,
-# so committing it under `crates/lanekeep-engine/benches/` would make that crate unpublishable to
-# hold a benchmark input. `target/` is gitignored, `just bench` runs without it, and
+# **The artifact is not committed.** `target/` is gitignored, `just bench` runs without it, and
 # `crossings.rs` prints two arms and names this recipe when it is absent.
+#
+# This comment used to say committing it would make `lanekeep-engine` unpublishable, because
+# crates.io refuses a package over 10 MiB. That is not true and it points a reader at the wrong
+# thing: the cap is on the *compressed* package, and `lanekeep-rules` already commits a 13,029,888
+# byte `typescript-builtins.wasm` inside a package that measures 4,336,984 bytes. Anyone who
+# believed the old sentence would go looking for a committed artifact to delete. The real reasons
+# are that this is a benchmark input rather than something a crate ships, that `componentize-js` is
+# not byte-reproducible so no currency check could tell a stale committed copy from a current one,
+# and that the room left under the cap is worth keeping for artifacts users run.
 #
 # Outside every gate for the reason `typescript-builtins` is: it needs Node and jco, which
 # `just check` deliberately does not.

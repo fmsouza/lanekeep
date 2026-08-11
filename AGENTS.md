@@ -568,10 +568,13 @@ eleven committed WebAssembly fixtures then read as stale that way — `bindings`
 does not. That is now the check rather than the investigation —
 `crates/lanekeep-wasm/tests/fixture-digests.txt` records what every artifact was built from, and
 `tests/fixture_currency.rs` fails when the sources beside it have moved. `wit/world.wit` is in
-there too, because twelve of the thirteen committed today name it as their component target and a
-world edit with no rebuild leaves every fixture satisfying an ABI that no longer exists.
+there too, because fourteen of the fifteen committed today name it as their component target —
+every one but `spike`, which targets its own `wit/spike.wit` — and a world edit with no rebuild
+leaves every fixture satisfying an ABI that no longer exists. Count them with `ls
+crates/lanekeep-wasm/tests/fixtures/*.wasm` plus the one in `rejected/`, not from this sentence:
+it has been wrong twice, and a stale count here is the same failure the paragraph above is about.
 
-**And the thirteenth breaks that protocol, because `componentize-js` output is not reproducible
+**And one of the fifteen breaks that protocol, because `componentize-js` output is not reproducible
 at all.** `js-globals.wasm` is built by `jco componentize` rather than by `cargo component`, and
 three builds over one unchanged tree — jco 1.27.0, measured 2026-08-10 — gave 13,023,574,
 13,023,571 and 13,023,630 bytes, three distinct sha256s, with 2,968,012 bytes differing between

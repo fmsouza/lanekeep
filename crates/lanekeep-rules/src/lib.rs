@@ -62,8 +62,10 @@
 /// The rules this build runs as TypeScript modules, as `(name, source)`.
 ///
 /// Evaluated in QuickJS, from source, on every run. What is left here after the four flagship
-/// TypeScript rules were compiled ahead of time: three rules targeting Python and one targeting
-/// Go, none of which any component hosts yet.
+/// TypeScript rules were compiled ahead of time: two rules targeting Python and two targeting
+/// Go, none of which any component hosts yet. Read the split off the `language` declaration in
+/// each source below rather than off this sentence — it said three and one when the table
+/// underneath it already said two and two.
 ///
 /// Ordered, so the source stays greppable and a diff shows what moved. Nothing derives an
 /// order from this table directly — see [`names`], which merges the tables and sorts.
@@ -103,6 +105,14 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
 /// digest of the inputs is the only staleness check available. Neither substitutes for the
 /// other: source tests over a stale artifact pass while the shipped rule is a previous version,
 /// and a current artifact built from a wrong rule is current and wrong.
+///
+/// **And neither is behavioral coverage of the compiled rule**, which is a third claim again:
+/// a digest says the artifact was built from this text and says nothing about what it does.
+/// `crates/lanekeep-rules/tests/typescript_builtins_as_components.rs` runs `no-default-export`
+/// and `no-restricted-imports` through the component by specifier, which is the only route to a
+/// single rule of a shared artifact. The other two are covered as components by
+/// `crates/lanekeep-cli/tests/no_circular_imports.rs` and `.../no_unused_exports.rs`, which
+/// drive the binary.
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
 const COMPONENT_SOURCES: &[(&str, &str)] = &[

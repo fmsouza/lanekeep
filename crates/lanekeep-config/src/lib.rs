@@ -567,13 +567,22 @@ pub struct LoadOptions<'a> {
     /// A project root under which compiled components may be cached, or `None` for a load with
     /// nowhere to write.
     ///
-    /// **This is the difference between a component costing tens of milliseconds per config load
-    /// and costing nothing.** With `None`, `describe_components` compiles every component from
+    /// **This is the difference between a component costing something per config load and
+    /// costing nothing.** With `None`, `describe_components` compiles every component from
     /// scratch to ask it what it is, throws the compilation away, and the engine compiles the
-    /// same bytes again at prepare time. Measured on the release binary, one component added
-    /// ~58 ms to a `lanekeep rules` that checks no files at all, and two added ~116 ms — against
-    /// a §15 warm-run budget of 25 ms for the whole invocation. Config load runs per LSP request,
-    /// per MCP tool call and per `--watch` iteration, so this is paid on every one of them.
+    /// same bytes again at prepare time. Measured on the release binary, one 26 KB Rust
+    /// component added ~58 ms to a `lanekeep rules` that checks no files at all, and two added
+    /// ~116 ms — against a §15 warm-run budget of 25 ms for the whole invocation. Config load
+    /// runs per LSP request, per MCP tool call and per `--watch` iteration, so this is paid on
+    /// every one of them.
+    ///
+    /// **Those figures are for a component of a few tens of kilobytes and do not generalize.**
+    /// The shared TypeScript built-ins are one 12.4 MiB artifact, and compiling it is about six
+    /// seconds — a hundredfold, not a factor. `docs/architecture.md` §15 has the table. So the
+    /// choice between `Some` and `None` is a question about seconds rather than milliseconds for
+    /// any caller whose config names one of those four rules, which is why
+    /// `RuleTester::for_built_in` would be unusable without a root and why `lanekeep-testkit`
+    /// names one.
     ///
     /// Given a root, both loads write and map artifacts under the same [`COMPONENT_CACHE_PATH`],
     /// keyed on the specifier and the bytes — so the first run compiles once instead of twice and
@@ -582,8 +591,10 @@ pub struct LoadOptions<'a> {
     /// deserialize and is discarded rather than trusted.
     ///
     /// Named by the caller rather than inferred, because a rules root is the project root only by
-    /// the CLI's choice — `lanekeep-testkit` anchors one at a temporary fixture directory — and
-    /// guessing would make loading a config write somewhere nobody asked for.
+    /// the CLI's choice, and guessing would make loading a config write somewhere nobody asked
+    /// for. `lanekeep-testkit` anchors a rules root at a temporary fixture directory and names
+    /// *that* — which is the shape this field is for: the caller knows it owns the directory and
+    /// removes it, and this function could not have known either.
     ///
     /// [`COMPONENT_CACHE_PATH`]: lanekeep_wasm::COMPONENT_CACHE_PATH
     pub artifacts: Option<&'a Path>,
@@ -933,12 +944,24 @@ fn describe_components(
     // otherwise. A rules root is not a project root — `lanekeep-testkit` anchors one at a
     // temporary fixture directory — so guessing a location to write `.lanekeep/components` into
     // would make loading a config write somewhere nobody asked for. Naming it is
-    // `LoadOptions::artifacts`, passed through `load_with`, and the CLI names it.
+    // `LoadOptions::artifacts`, passed through `load_with`; the CLI names the project it was
+    // pointed at, and `lanekeep-testkit` names the throwaway project it created and removes.
     //
     // It matters because without one this compiles every component only to throw the
-    // compilation away, and the engine compiles the same bytes again at prepare time: ~58 ms per
-    // component, on every config load, and config load runs per LSP request, per MCP tool call
-    // and per `--watch` iteration. With one, both loads map the same artifact.
+    // compilation away, and the engine compiles the same bytes again at prepare time — on every
+    // config load, and config load runs per LSP request, per MCP tool call and per `--watch`
+    // iteration. With one, both loads map the same artifact.
+    //
+    // **The cost of taking the uncached arm is set by the largest component named, and the two
+    // sizes that ship differ by two orders of magnitude.** This sentence used to say "~58 ms per
+    // component" without qualification; that figure was measured against components of about
+    // 26 KB and is still right for them — a run naming only `lanekeep/no-unwrap` is 80 ms cold
+    // and its `.cwasm` 356 KB. `typescript-builtins.wasm` is 12.4 MiB, and compiling it is
+    // **about six seconds** (`docs/architecture.md` §15's table: 6,115 ms cold for one rule of
+    // it against 32 ms for a module rule). Paid twice, on every load, by every caller that takes
+    // this arm — which is `lanekeep_config::load` and whoever calls it. `lanekeep-testkit` used
+    // to be the example here and no longer is: it names its own throwaway project, which it
+    // created and removes, and takes the cached arm.
     let loader = artifacts.map_or_else(
         lanekeep_wasm::ComponentLoader::without_cache,
         lanekeep_wasm::ComponentLoader::for_project_root,
@@ -2560,20 +2583,24 @@ mod tests {
         );
     }
 
-    /// The two entry points differ in exactly one observable way, and it is worth tens of
-    /// milliseconds per config load.
+    /// The two entry points differ in exactly one observable way, and what it is worth ranges
+    /// from tens of milliseconds to seconds.
     ///
     /// `load` has nowhere to write, so it compiles each component only to discard the
     /// compilation, and the engine compiles the same bytes again at prepare time.
     /// [`load_with`] given a [`LoadOptions::artifacts`] root leaves a `.cwasm` under
     /// `COMPONENT_CACHE_PATH` that both this load and the engine's own loader map — measured at
-    /// ~58 ms per component per load before, and at TypeScript parity after.
+    /// ~58 ms per component per load before, and at TypeScript parity after, against components
+    /// of about 26 KB. The shared TypeScript component is 12.4 MiB and about six seconds, so the
+    /// same difference is three orders of magnitude wider there.
     ///
     /// Asserted on the artifact rather than on a duration: a timing assertion on a loaded machine
     /// is a flake, and the file either exists or it does not. Both directions are asserted,
     /// because a change making *every* load write would pass a one-sided test while putting a
-    /// cache directory inside every `lanekeep-testkit` fixture — which is the reason `load` does
-    /// not do it.
+    /// cache directory somewhere its caller never named — which is what `load` must not do, since
+    /// it is handed a rules root and a rules root is not a place to write. A caller that *does*
+    /// own the directory says so: `lanekeep-testkit` names its own throwaway project, which is
+    /// the difference between choosing a location and guessing one.
     #[test]
     fn only_a_load_given_a_project_root_caches_what_it_compiled() {
         let files = &[(

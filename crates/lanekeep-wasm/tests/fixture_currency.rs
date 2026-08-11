@@ -19,9 +19,9 @@
 //! # What is covered, and why it is more than the fixture directories
 //!
 //! `wit/world.wit` is in here too, and it is the sharpest case rather than an afterthought.
-//! Every fixture but `spike` names that directory under `[package.metadata.component.target]`,
-//! so the world is a build input to twelve of the thirteen committed artifacts. Ten spell the
-//! path `../../../wit`; `rejected/wasip1` sits a directory deeper and spells it
+//! Every fixture but `spike` names that directory, so the world is a build input to fourteen of
+//! the fifteen committed artifacts. Twelve name it under `[package.metadata.component.target]`
+//! and spell the path `../../../wit`; `rejected/wasip1` sits a directory deeper and spells it
 //! `../../../../wit`, which is worth knowing before grepping for the three-level form and
 //! concluding it is not a consumer. `js-globals` names it on a command line rather than in a
 //! manifest — `jco componentize --wit crates/lanekeep-wasm/wit` — so it is a consumer that
@@ -534,8 +534,8 @@ fn reconcile(
 /// Every file the committed artifacts are built from, and the artifacts themselves.
 ///
 /// `roots` are relative to `base`, and `base` is what the recorded paths are relative to. For
-/// the fixtures that is this crate, whose roots are `wit/` — twelve of the thirteen fixtures name
-/// it as their component target — and `tests/fixtures/`, which holds both the guest crates and
+/// the fixtures that is this crate, whose roots are `wit/` — fourteen of the fifteen fixtures
+/// name it as their component target — and `tests/fixtures/`, which holds both the guest crates and
 /// their build output. The `.wasm` files need no separate pass; they sit in a root as ordinary
 /// files.
 /// A root may also name a single file, which is how the JavaScript fixture's two build inputs
