@@ -709,6 +709,16 @@ mod tests {
     /// — and `just typescript-builtins` rewrites it, correctly, on every rebuild. A tripwire
     /// something re-blesses is not a tripwire. These move only when a person changes them, and
     /// changing one is a decision about the frozen set rather than a build step.
+    ///
+    /// Hashed after folding CRLF to LF, on the same terms as
+    /// `crates/lanekeep-wasm/tests/fixture_currency.rs`'s `digest`: there is no `.gitattributes`
+    /// in this repository, so a Windows checkout with `core.autocrlf` on holds these same five
+    /// files under different bytes than Linux or macOS does, and `include_bytes!` below sees
+    /// whichever bytes are actually checked out. The constants were recorded from LF bytes, and
+    /// folding LF is a no-op, so they are unchanged — only the set of platforms that reproduce
+    /// them grows. [`fold`] is duplicated from that other copy rather than imported: it is six
+    /// lines, and the original lives in a `tests/` integration crate of a different crate, which
+    /// reaching from a unit test here would cost a new dependency edge rather than a shared one.
     #[test]
     fn the_rules_the_migration_moved_are_byte_for_byte_what_they_were() {
         const FROZEN: &[(&str, &str, &[u8])] = &[
@@ -741,7 +751,7 @@ mod tests {
 
         for (path, expected, bytes) in FROZEN {
             assert_eq!(
-                blake3::hash(bytes).to_hex().as_str(),
+                blake3::hash(&fold(bytes)).to_hex().as_str(),
                 *expected,
                 "`crates/lanekeep-rules/{path}` changed, and it is one of the five files this \
                  migration is only correct if it did not touch\n  \
@@ -749,6 +759,58 @@ mod tests {
                  re-record the digest with the reasoning"
             );
         }
+    }
+
+    /// CRLF to LF, leaving a lone carriage return alone.
+    ///
+    /// Duplicated from `crates/lanekeep-wasm/tests/fixture_currency.rs`'s helper of the same
+    /// name — see the doc comment on
+    /// [`the_rules_the_migration_moved_are_byte_for_byte_what_they_were`] for why this copy
+    /// exists rather than a shared one.
+    fn fold(raw: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(raw.len());
+        let mut bytes = raw.iter().peekable();
+        while let Some(&byte) = bytes.next() {
+            if byte == b'\r' && bytes.peek() == Some(&&b'\n') {
+                continue;
+            }
+            out.push(byte);
+        }
+        out
+    }
+
+    /// Proof that folding is what lets the frozen digests hold on a Windows checkout.
+    ///
+    /// The migration test above hashes `include_bytes!` output after folding, and the claim
+    /// that makes true is that a CRLF checkout of a frozen file folds to the exact same digest
+    /// as the LF one it was recorded from — not merely that the two engines agree with each
+    /// other. This turns one frozen file's real LF bytes into CRLF the way a Windows checkout
+    /// with `core.autocrlf` on would, and checks the folded hash against the recorded constant
+    /// directly, rather than only comparing the two foldings to each other.
+    #[test]
+    fn a_crlf_checkout_still_matches_the_frozen_digest() {
+        const RECORDED: &str = "3ba0f2ba906a2b900740865d67cdb0f9c307d179916f8da6d2755f1aea532c1a";
+        let lf = include_bytes!("../rules/no-circular-imports.ts");
+
+        let mut crlf = Vec::with_capacity(lf.len());
+        for &byte in lf {
+            if byte == b'\n' {
+                crlf.push(b'\r');
+            }
+            crlf.push(byte);
+        }
+        assert_ne!(
+            lf.as_slice(),
+            crlf.as_slice(),
+            "the fixture must actually contain newlines, or this proves nothing"
+        );
+
+        assert_eq!(
+            blake3::hash(&fold(&crlf)).to_hex().as_str(),
+            RECORDED,
+            "a CRLF checkout of a frozen file must fold to the digest recorded from its LF \
+             bytes, or the fold above does not actually fix the Windows failure"
+        );
     }
 
     #[test]
