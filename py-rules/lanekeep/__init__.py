@@ -5,6 +5,8 @@ the generated `wit_world` bindings, which exist only at build time; importing
 them here would break the host-side SDK tests.
 """
 
+from .capture import capture
+from .glob import glob_matches
 from .handlers import Handlers
 
-__all__ = ["Handlers"]
+__all__ = ["Handlers", "capture", "glob_matches"]
