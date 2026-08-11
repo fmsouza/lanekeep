@@ -81,52 +81,45 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The TypeScript original of a component-hosted rule, as `(name, source)`.
+/// The TypeScript a component-hosted rule was authored in, as `(name, source)`.
 ///
 /// **Not what runs, and not importable.** Every name here is in [`COMPONENT_RULES`], which is
-/// what a config resolves. They are kept because a rule's source is the thing a reader reviews,
-/// and because the doc comment above each `defineRule` is where the argument for the rule is
-/// written down at length — the components carry a card and no prose.
+/// what a config resolves; `just typescript-builtins` is what turns these four files into
+/// `components/typescript-builtins.wasm`. They are kept because a rule's source is the thing
+/// a reader reviews and the thing `crates/lanekeep-rules/tests/no_default_export.rs` and
+/// `.../no_restricted_imports.rs` hold to their cases — those two run the author's TypeScript
+/// through QuickJS, which is the engine it was written against and no longer the engine it
+/// ships on.
 ///
-/// # Two relationships, and they are not the same one
+/// The two claims that keeps honest are different and both are needed. That the *source* is
+/// right is what those tests assert. That the *artifact* is this source compiled is what
+/// `crates/lanekeep-wasm/tests/fixture_currency.rs` asserts, against
+/// `tests/typescript-component-digests.txt` — `componentize-js` is not byte-reproducible, so a
+/// digest of the inputs is the only staleness check available. Neither substitutes for the
+/// other: source tests over a stale artifact pass while the shipped rule is a previous version,
+/// and a current artifact built from a wrong rule is current and wrong.
 ///
-/// Four of these are a **build input**. `just typescript-builtins` turns
-/// `no-circular-imports`, `no-default-export`, `no-restricted-imports` and `no-unused-exports`
-/// into `components/typescript-builtins.wasm`, and `crates/lanekeep-rules/tests/`'s
-/// `no_default_export.rs` and `no_restricted_imports.rs` still run this exact text through
-/// QuickJS — the engine it was written against and no longer the engine it ships on.
+/// **And neither is behavioral coverage of the compiled rule**, which is a third claim again:
+/// a digest says the artifact was built from this text and says nothing about what it does.
+/// `crates/lanekeep-rules/tests/typescript_builtins_as_components.rs` runs `no-default-export`
+/// and `no-restricted-imports` through the component by specifier, which is the only route to a
+/// single rule of a shared artifact. The other two are covered as components by
+/// `crates/lanekeep-cli/tests/no_circular_imports.rs` and `.../no_unused_exports.rs`, which
+/// drive the binary.
 ///
-/// Two are a **specification the port was held to**. `no-context-in-struct` and
-/// `no-package-init` ship from `components/go-builtins.wasm`, which `just go-rules` builds from
-/// `go-rules/`; these two files are no input to it, they are compiled by nothing, and since the
-/// swap no test evaluates them. What stands in for that is a table:
-/// `crates/lanekeep-rules/tests/no_context_in_struct.rs` and `.../no_package_init.rs` ran the
-/// module and the component against one set of cases until the swap landed, which is a stronger
-/// claim than two test files that each look reasonable.
+/// # A rule authored in another language has no entry here, and its TypeScript is deleted
 ///
-/// # So the staleness check differs, and only one half of this table has one
+/// The qualifier that decides membership is **`just typescript-builtins` reads this file** — not
+/// "this rule used to be TypeScript". Every claim above depends on it: the digest ties source to
+/// artifact only because the build consumes the source, and `no_default_export.rs` runs this text
+/// only because it is the text that was compiled.
 ///
-/// That the *artifact* is the source compiled is what `crates/lanekeep-wasm/tests/`'s
-/// `fixture_currency.rs` asserts, against `tests/typescript-component-digests.txt` —
-/// `componentize-js` is not byte-reproducible, so a digest of the inputs is the only check
-/// available. Neither substitutes for the other: source tests over a stale artifact pass while
-/// the shipped rule is a previous version, and a current artifact built from a wrong rule is
-/// current and wrong.
-///
-/// **No such tie exists for the Go pair, and none can.** `tests/go-component-digests.txt`
-/// records `go-rules/` and `wit/world.wit`, because those are what the artifact is built from;
-/// a `.ts` file no build reads cannot be recorded as an input to it. These two can therefore
-/// drift from the rules that ship, silently, in a way the other four cannot — the recourse is
-/// that they are read as documentation rather than executed, so a divergence misleads a reader
-/// without changing a result.
-///
-/// **And a digest is not behavioral coverage of the compiled rule either**, which is a third
-/// claim again: it says the artifact was built from this text and says nothing about what it
-/// does. `crates/lanekeep-rules/tests/typescript_builtins_as_components.rs` runs
-/// `no-default-export` and `no-restricted-imports` through the component by specifier, which is
-/// the only route to a single rule of a shared artifact; the other two are covered as components
-/// by `crates/lanekeep-cli/tests/no_circular_imports.rs` and `.../no_unused_exports.rs`, which
-/// drive the binary. The Go pair's own suites do it by the same route.
+/// So a rule ported to Rust or Go belongs in neither table. `no-unwrap` and `no-glob-import`
+/// had their `.ts` deleted when they became `rust-rules/` crates, and `no-context-in-struct` and
+/// `no-package-init` when they became `go-rules/` packages — in both cases the Rust or the Go
+/// *is* the source, and a `.ts` left sitting here would be tied to no build, asserted by no
+/// digest, run by nothing, and free to drift from the rule that actually ships while looking
+/// exactly like the four entries that cannot.
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
 const COMPONENT_SOURCES: &[(&str, &str)] = &[
@@ -135,16 +128,8 @@ const COMPONENT_SOURCES: &[(&str, &str)] = &[
         include_str!("../rules/no-circular-imports.ts"),
     ),
     (
-        "no-context-in-struct",
-        include_str!("../rules/no-context-in-struct.ts"),
-    ),
-    (
         "no-default-export",
         include_str!("../rules/no-default-export.ts"),
-    ),
-    (
-        "no-package-init",
-        include_str!("../rules/no-package-init.ts"),
     ),
     (
         "no-restricted-imports",
@@ -408,10 +393,15 @@ mod tests {
         // which is what makes them survive a migration — and is also what would let any of
         // these quietly revert to TypeScript with nothing red.
         //
-        // Three shapes, deliberately together. The Rust pair has no source at all; the
-        // TypeScript four and the Go two keep theirs and must still not be *served* as modules,
-        // which is the weaker and more easily lost half.
-        for name in ["no-unwrap", "no-glob-import"] {
+        // Two shapes, deliberately together. The four rules ported to another language have no
+        // source at all; the four compiled *from* their TypeScript keep theirs and must still not
+        // be *served* as modules, which is the weaker and more easily lost half.
+        for name in [
+            "no-context-in-struct",
+            "no-glob-import",
+            "no-package-init",
+            "no-unwrap",
+        ] {
             assert!(
                 component(name).is_some(),
                 "`{name}` ships as a component and does not"
@@ -419,7 +409,9 @@ mod tests {
             assert_eq!(
                 source(name),
                 None,
-                "`{name}`'s TypeScript original is deleted and must not resolve"
+                "`{name}` is authored in the language it inspects, so its TypeScript original is \
+                 deleted and must not resolve — a `.ts` still answering here would be tied to no \
+                 build and free to drift from the rule that ships"
             );
         }
 
@@ -442,30 +434,6 @@ mod tests {
                 source(name).is_some(),
                 "`{name}`'s authored TypeScript is what its component was built from and what \
                  its tests run — it is kept, and only stops being importable"
-            );
-        }
-
-        // The Go pair, which looks like the four above and is a weaker claim in one place worth
-        // naming: their TypeScript is neither a build input nor run by anything, so `source`
-        // answering here says only that the original was kept for a reader. What says the
-        // *component* is right is `crates/lanekeep-rules/tests/no_context_in_struct.rs` and
-        // `.../no_package_init.rs`, which held both implementations to one table of cases while
-        // both existed.
-        for name in ["no-context-in-struct", "no-package-init"] {
-            let (bytes, _) = component(name).unwrap_or_default();
-            assert!(
-                !bytes.is_empty(),
-                "`{name}` ships as a component built from `go-rules/` and does not"
-            );
-            assert!(
-                !BUILT_IN_RULES.iter().any(|(n, _)| *n == name),
-                "`{name}` is back in the table the sandbox evaluates from — the Go component \
-                 and the TypeScript module would be two programs answering to one id"
-            );
-            assert!(
-                source(name).is_some(),
-                "`{name}`'s TypeScript original is kept as the specification the port was held \
-                 to, and only stops being importable"
             );
         }
     }
