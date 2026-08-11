@@ -106,6 +106,13 @@
 //! rebuild-and-diff protocol works on it and these digests are a second opinion rather than the
 //! only one. That holds only with `-no-debug`: without it the artifact carries the build
 //! directory in DWARF, and no two checkouts agree.
+//!
+//! That fourth recipe also owns a *fixture*, which is the first time an artifact under
+//! `tests/fixtures/` has not belonged to `just wasm-fixtures`. [`GO_FIXTURE_ARTIFACTS`] is what
+//! moves it, and the deciding rule is the one this whole file is about: a digest belongs to the
+//! recipe that can rebuild the artifact, and `wasm-fixtures` needs `cargo-component` where this
+//! needs TinyGo. Recording it in [`MANIFEST`] would put a TinyGo build behind a recipe that has
+//! never heard of one.
 
 // `clippy.toml`'s `allow-expect-in-tests` reaches `#[test]` functions and `#[cfg(test)]`
 // modules and nothing else, so the helpers below — which are neither — need the grant
@@ -196,24 +203,27 @@ const GO_BLESS: &str = "LANEKEEP_BLESS_GO_RULES";
 /// Where the Go built-ins' digests live, relative to this crate.
 const GO_MANIFEST: &str = "tests/go-component-digests.txt";
 
-/// The header written above the Go built-ins' digests.
+/// The header written above the Go artifacts' digests.
 const GO_HEADER: &str = "\
-# What the committed Go built-ins component was built from.
+# What the committed Go artifacts were built from: the shipped built-ins component, and the
+# determinism fixture behind `crates/lanekeep-wasm/tests/go_map_order.rs`.
 #
 # Written by `just go-rules`, asserted by `crates/lanekeep-wasm/tests/fixture_currency.rs`, and
 # not to be edited by hand: a value here that no build produced is exactly the claim this file
 # exists to deny. `<path> <blake3>`, sorted, paths relative to the repository root.
 #
-# A line that moves when the artifact did not means a rule's source, the SDK it is built on, the
-# generated bindings or the world it is built against was changed without rebuilding — run
+# A line that moves when the artifacts did not means a rule's source, the SDK they are built on,
+# the generated bindings or the world they are built against was changed without rebuilding — run
 # `just go-rules`.
 ";
 
-/// The artifact `just go-rules` builds, and nothing else builds.
+/// The shipped component `just go-rules` builds, and nothing else builds.
 ///
 /// Read with opposite signs by two tests, exactly as [`TYPESCRIPT_ARTIFACTS`] is — its own
 /// manifest's artifact list, and what
 /// [`every_committed_rule_component_is_the_one_its_sources_build`] must leave out of its walk.
+/// [`GO_FIXTURE_ARTIFACTS`] is the other half of what that recipe owns, and it is a separate list
+/// because it is subtracted from a different walk.
 ///
 /// **A list of its own rather than an entry in [`TYPESCRIPT_ARTIFACTS`]**, which would compile
 /// and would be wrong in the direction this file is about: that constant is what
@@ -222,6 +232,35 @@ const GO_HEADER: &str = "\
 /// that needs Node, knows nothing about TinyGo, and cannot rebuild it. Ownership is per recipe,
 /// and a lane gets a list because it has a recipe.
 const GO_ARTIFACTS: &[&str] = &["crates/lanekeep-rules/components/go-builtins.wasm"];
+
+/// The fixtures `just go-rules` builds, which live under `tests/fixtures/` and belong to
+/// [`GO_MANIFEST`] all the same.
+///
+/// Separate from [`GO_ARTIFACTS`] because the two are subtracted from *different* walks: that
+/// list is what [`every_committed_rule_component_is_the_one_its_sources_build`] must leave out of
+/// `crates/lanekeep-rules/components/`, and this one is what
+/// [`every_committed_artifact_is_the_one_its_sources_build`] must leave out of `tests/fixtures/`.
+/// Folding them into one would make each of those subtractions assert the presence of a file that
+/// is not in its walk at all.
+///
+/// **This is the first artifact under `tests/fixtures/` that `just wasm-fixtures` does not
+/// build**, and the reason it is filed here rather than there is the rule this file is built on:
+/// the recipe that records a digest has to be the recipe that can rebuild the artifact. That
+/// recipe globs the directory for Rust crates and needs `cargo-component`; this fixture is Go and
+/// needs TinyGo. Recording it in [`MANIFEST`] would leave every checkout without TinyGo unable to
+/// make `just wasm-fixtures` produce a clean tree.
+///
+/// Keyed on the repository root, like the rest of [`GO_MANIFEST`], and read against this crate by
+/// stripping [`CRATE_FROM_ROOT`] — one list read two ways rather than two lists to keep in step.
+const GO_FIXTURE_ARTIFACTS: &[&str] = &["crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm"];
+
+/// This crate's own path from the repository root, with its trailing separator.
+///
+/// [`GO_FIXTURE_ARTIFACTS`] names files inside this crate in the *repository's* key space,
+/// because that is the space its manifest uses; the fixtures walk is keyed on this crate. This is
+/// what converts between the two, and a path that does not start with it is a path that has moved
+/// out of this crate — which the strip refuses rather than silently passing through.
+const CRATE_FROM_ROOT: &str = "crates/lanekeep-wasm/";
 
 /// The files under `crates/lanekeep-rules/components/` that `just rust-rules` does not build.
 ///
@@ -303,7 +342,7 @@ const TYPESCRIPT_SOURCES: &[&str] = &[
 #[test]
 fn every_committed_artifact_is_the_one_its_sources_build() {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let computed = digests(
+    let mut computed = digests(
         &crate_dir,
         &[
             "wit",
@@ -316,6 +355,24 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
             "../../packages/lanekeep/runtime/entry.js",
         ],
     );
+
+    // The Go fixture sits in this directory and is not this recipe's to rebuild, exactly as two
+    // shipped components sit in `crates/lanekeep-rules/components/` and are not `just
+    // rust-rules`' to rebuild. Subtracted rather than filtered by extension or prefix: a name is
+    // a decision somebody made, and a pattern would quietly adopt the next Go fixture into a
+    // manifest whose recipe cannot build it.
+    for artifact in GO_FIXTURE_ARTIFACTS {
+        let key = artifact
+            .strip_prefix(CRATE_FROM_ROOT)
+            .expect("a Go fixture recorded against this crate's walk is inside this crate");
+        assert!(
+            computed.remove(key).is_some(),
+            "`{artifact}` is not there. It is a fixture `just go-rules` builds and `just \
+             wasm-fixtures` cannot, so it is subtracted from this walk — and subtracting \
+             something that is absent means the path moved and this manifest has silently taken \
+             ownership of an artifact it cannot rebuild."
+        );
+    }
 
     // A walk that found nothing would agree with an empty manifest and assert precisely
     // nothing, which is the one way this test could be green while checking no fixture at all.
@@ -485,16 +542,23 @@ fn every_committed_typescript_component_is_the_one_its_sources_build() {
     );
 }
 
-/// The same claim once more, for the shipped component built from Go.
+/// The same claim once more, for everything `just go-rules` builds.
 ///
-/// Three roots. `go-rules/` holds everything the component is compiled from — the rules, the SDK
+/// `go-rules/` holds everything the artifacts are compiled from — the rules, the fixture, the SDK
 /// they share, the committed `wit-bindgen-go` bindings, and the module files that pin
 /// `go.bytecodealliance.org/cm` — so it is a directory rather than a list of files, on
 /// `rust-rules/`'s terms and for its reason: everything in it is a build input by construction.
-/// `crates/lanekeep-wasm/wit/` is here because the component is built against it with TinyGo's
-/// `-wit-package`, so a world edit with no rebuild leaves the artifact satisfying an ABI that no
-/// longer exists. And the artifact itself, named through [`GO_ARTIFACTS`] so the one list decides
-/// which manifest owns it.
+/// `crates/lanekeep-wasm/wit/` is here because both artifacts are built against it with TinyGo's
+/// `-wit-package`, so a world edit with no rebuild leaves them satisfying an ABI that no longer
+/// exists. And the artifacts themselves, named through [`GO_ARTIFACTS`] and
+/// [`GO_FIXTURE_ARTIFACTS`] so those two lists decide which manifest owns what.
+///
+/// **Two artifacts, one recipe, one manifest** — the shipped component and the determinism
+/// fixture behind `crates/lanekeep-wasm/tests/go_map_order.rs`. They share every input but their
+/// own `main.go`, so a change to the SDK's `ResetRand` invalidates both, which is exactly the
+/// coupling worth having: the fixture exists to prove something about that SDK, and an edit to it
+/// that rebuilt only the shipped component would leave the proof running against the previous
+/// one.
 ///
 /// **The `go-rules/` walk covers its tests too, which over-invalidates a little and is the right
 /// trade.** Editing `go-rules/lanekeep/glob_test.go` demands a `just go-rules`, and that rebuild
@@ -509,26 +573,31 @@ fn every_committed_go_component_is_the_one_its_sources_build() {
     let root = repository_root();
     let mut roots: Vec<&str> = vec!["crates/lanekeep-wasm/wit", "go-rules"];
     roots.extend_from_slice(GO_ARTIFACTS);
+    roots.extend_from_slice(GO_FIXTURE_ARTIFACTS);
     let computed = digests(&root, &roots);
 
     // A named root that is missing already panics inside `digests`, so what is left to check is
     // the two directories — either could come back empty and agree with an empty manifest.
     // Properties rather than counts, on the other tests' terms: a rule added or removed is a
     // change to make deliberately and not a reason for the gate to go red.
+    let expected = GO_ARTIFACTS.len() + GO_FIXTURE_ARTIFACTS.len();
     let artifacts = GO_ARTIFACTS
         .iter()
+        .chain(GO_FIXTURE_ARTIFACTS)
         .filter(|artifact| computed.contains_key(**artifact))
         .count();
     let sources = counted(&computed, "go-rules/", "go");
     assert!(
-        artifacts == GO_ARTIFACTS.len()
+        artifacts == expected
             && sources > 0
             && computed.contains_key("go-rules/main.go")
+            && computed.contains_key("go-rules/fixtures/maporder/main.go")
             && computed.contains_key("crates/lanekeep-wasm/wit/world.wit"),
-        "the walk found {artifacts} components and {sources} Go sources, and {} the component \
-         entry and {} the world: it is no longer looking where this component is built from, and \
-         has been asserting nothing",
+        "the walk found {artifacts} of {expected} artifacts and {sources} Go sources, and {} the \
+         component entry, {} the fixture entry and {} the world: it is no longer looking where \
+         these artifacts are built from, and has been asserting nothing",
         found(&computed, "go-rules/main.go"),
+        found(&computed, "go-rules/fixtures/maporder/main.go"),
         found(&computed, "crates/lanekeep-wasm/wit/world.wit"),
     );
 
@@ -537,7 +606,7 @@ fn every_committed_go_component_is_the_one_its_sources_build() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join(GO_MANIFEST),
         GO_BLESS,
         GO_HEADER,
-        "the committed Go built-ins component",
+        "the committed Go artifacts",
         "just go-rules",
         None,
     );

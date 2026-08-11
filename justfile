@@ -513,6 +513,31 @@ go-rules:
         -o "${root}/crates/lanekeep-rules/components/go-builtins.wasm" \
         .)
 
+    # The determinism fixture, built here rather than by `wasm-fixtures` for the reason that
+    # recipe's every other artifact is built there: **the recipe that records a digest has to be
+    # the recipe that can rebuild the artifact.** `wasm-fixtures` needs `cargo-component` and
+    # nothing else; adding this one to it would make a recipe that builds eleven Rust guests
+    # require TinyGo to build a twelfth, and a checkout without TinyGo would then be unable to run
+    # it at all. So the artifact lands beside its siblings in `tests/fixtures/`, where
+    # `include_bytes!` and `tests/world_shape.rs`'s ambient-authority glob both find it, and its
+    # digest is recorded below — `fixture_currency.rs` subtracts it from the fixtures walk with
+    # exactly the note that partition already carries for the TypeScript and Go components.
+    #
+    # It is not a rule and ships to nobody. What it is for is the one claim about Go rules that
+    # cannot be read off any source: `go-rules/lanekeep`'s `Handlers` resets TinyGo's
+    # map-iteration generators before every host-called path, so a Go rule's map order does not
+    # depend on how many files that worker already handled. See
+    # `crates/lanekeep-wasm/tests/go_map_order.rs`.
+    echo "building the map-order fixture"
+    (cd go-rules && tinygo build \
+        -target=wasm-unknown \
+        -wit-package "${root}/crates/lanekeep-wasm/wit" \
+        -wit-world rule \
+        -panic=trap \
+        -no-debug \
+        -o "${root}/crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm" \
+        ./fixtures/maporder)
+
     # Record what it was built from, so the gate can tell a stale component from a current one
     # without needing TinyGo to find out. A manifest and a variable of its own rather than any of
     # the three that already exist — sharing one would mean this recipe re-recording artifacts it
