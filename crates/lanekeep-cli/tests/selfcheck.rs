@@ -18,15 +18,6 @@ fn plain(name: &str, source: &str, extension: &str) -> RuleTester {
     RuleTester::with_extension(name, source, extension).expect("the rule builds")
 }
 
-/// A factory rule, called with the given options literal.
-///
-/// `RuleTester::configured` writes `rule({options})` into the generated config, so the module
-/// must default-export a factory. Scope options must name `subject/`, which is where the
-/// tester writes the file under test — a scope naming a real crate path matches nothing.
-fn configured(name: &str, source: &str, options: &str) -> RuleTester {
-    RuleTester::configured(name, source, options).expect("the rule builds")
-}
-
 /// A factory rule whose subject files use a given extension.
 ///
 /// `configured` writes the subject as `.ts` — the rule's own `language` is not consulted —
