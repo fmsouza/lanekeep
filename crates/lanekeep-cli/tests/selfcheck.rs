@@ -18,24 +18,6 @@ fn plain(name: &str, source: &str, extension: &str) -> RuleTester {
     RuleTester::with_extension(name, source, extension).expect("the rule builds")
 }
 
-#[test]
-fn the_harness_runs() {
-    // Replaced by real cases in later tasks. Present so this file compiles and the
-    // dev-dependency is exercised from the first commit.
-    let rule = "import { defineRule } from 'lanekeep'\n\
-                export default defineRule({\n\
-                  id: 'local/probe',\n\
-                  language: ['typescript'],\n\
-                  severity: 'error',\n\
-                  card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
-                  query: '(debugger_statement) @s',\n\
-                  check(ctx, m) { ctx.report(m.s) },\n\
-                })\n";
-    plain("probe", rule, "ts")
-        .reports_at("debugger;\n", &[(1, 1)])
-        .expect("the tester reports where the rule says");
-}
-
 const GATES: &str = include_str!("../../../lanekeep/rules/gates-are-and.ts");
 
 fn gates() -> RuleTester {
