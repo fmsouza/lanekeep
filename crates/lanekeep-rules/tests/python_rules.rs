@@ -35,6 +35,11 @@ const EXPLICIT_ENCODING_RULE_ID: &str = "local/py-explicit-encoding";
 /// The remediation every `py-explicit-encoding` violation carries, from the rule's card.
 const EXPLICIT_ENCODING_REMEDIATION: &str = "pass `encoding=\"utf-8\"` — the default is \
                                             locale-dependent, and on Windows it is cp1252";
+/// The rule id every `py-stdout-buffer` violation carries.
+const STDOUT_BUFFER_RULE_ID: &str = "local/py-stdout-buffer";
+/// The remediation every `py-stdout-buffer` violation carries, from the rule's card.
+const STDOUT_BUFFER_REMEDIATION: &str = "write bytes through `sys.stdout.buffer.write`, which \
+                                         neither re-encodes nor translates newlines";
 /// The severity every violation carries, resolved by config rather than declared by the rule.
 const SEVERITY: Severity = Severity::Error;
 
@@ -334,6 +339,50 @@ fn the_python_py_explicit_encoding_component_matches_the_typescript_original() {
             .expect("runs"),
         EXPLICIT_ENCODING_RULE_ID,
         EXPLICIT_ENCODING_REMEDIATION,
+    )
+    .expect("the id, severity and remediation match the TypeScript original's");
+}
+
+#[test]
+fn the_python_py_stdout_buffer_component_matches_the_typescript_original() {
+    let Some(tester) = tester("py-stdout-buffer") else {
+        return;
+    };
+    tester
+        .reports_at("import sys\nsys.stdout.write(\"hi\")\n", &[(2, 1)])
+        .expect("stdout re-encodes to cp1252 on Windows and truncates");
+    assert_identity(
+        &tester
+            .run("import sys\nsys.stdout.write(\"hi\")\n")
+            .expect("runs"),
+        STDOUT_BUFFER_RULE_ID,
+        STDOUT_BUFFER_REMEDIATION,
+    )
+    .expect("the id, severity and remediation match the TypeScript original's");
+    tester
+        .accepts("import sys\nsys.stdout.buffer.write(b\"hi\")\n")
+        .expect("bytes are neither re-encoded nor newline-translated");
+    tester
+        .accepts("def go(f):\n    f.write(\"hi\")\n# sys.stdout\n")
+        .expect("only sys.stdout has the encoding problem");
+    tester
+        .accepts("import sys\nsys.stdout.flush()\n")
+        .expect("only write carries the encoding and newline problem; flush takes no text");
+    tester
+        .accepts("print(\"hi\")\n# sys.stdout\n")
+        .expect("print shares the encoding problem but this rule's query does not reach it");
+    tester
+        .reports_messages(
+            "import sys\nsys.stdout.write(\"hi\")\n",
+            &["sys.stdout encodes with the locale codec, which on Windows truncates the output at the first non-ASCII byte"],
+        )
+        .expect("the message is the TypeScript original's");
+    assert_identity(
+        &tester
+            .run("import sys\nsys.stdout.write(\"hi\")\n")
+            .expect("runs"),
+        STDOUT_BUFFER_RULE_ID,
+        STDOUT_BUFFER_REMEDIATION,
     )
     .expect("the id, severity and remediation match the TypeScript original's");
 }

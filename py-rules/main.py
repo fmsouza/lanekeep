@@ -20,6 +20,7 @@ from wit_world.imports import types
 from rules.nomutabledefaultargument import rule as nomutabledefaultargument
 from rules.nobroadexcept import rule as nobroadexcept
 from rules.pyexplicitencoding import rule as pyexplicitencoding
+from rules.pystdoutbuffer import rule as pystdoutbuffer
 
 # Ordered by id, matching the convention `crates/lanekeep-rules`' COMPONENT_RULES
 # uses. The index a rule sits at is what every export but `rules` dispatches on.
@@ -27,6 +28,7 @@ RULESET = [
     (nobroadexcept.ID, nobroadexcept.handlers()),
     (nomutabledefaultargument.ID, nomutabledefaultargument.handlers()),
     (pyexplicitencoding.ID, pyexplicitencoding.handlers()),
+    (pystdoutbuffer.ID, pystdoutbuffer.handlers()),
 ]
 
 
