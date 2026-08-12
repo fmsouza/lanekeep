@@ -79,7 +79,7 @@
       }
     },
     {
-      "rule": "./lanekeep/rules/binding-kinds-are-typed.ts",
+      "rule": "./crates/lanekeep-rules/components/binding-kinds-are-typed.wasm",
       "options": {
         "bindingPath": "crates/lanekeep-lang/src/binding.rs",
         "typesPath": "packages/lanekeep/index.d.ts"

@@ -6,6 +6,7 @@
 #
 # A line that moves when no artifact did means a rule's source, or the world it is built
 # against, was changed without rebuilding — run `just rust-rules`.
+crates/lanekeep-rules/components/binding-kinds-are-typed.wasm 25ab764681f2acf666cbb5401d87a53606e8aa8c6e598ef216fef4b731da2390
 crates/lanekeep-rules/components/deterministic-iteration.wasm 29c1d2578000af14283a49e8be7846f9f8d3d7b4f907edc608a9466fe227d9b0
 crates/lanekeep-rules/components/host-api-matches-types.wasm f03d20367d85eba21b4aee75592d57364adadffe5c71fb417fc75ec38d8d2fbb
 crates/lanekeep-rules/components/no-ambient-authority.wasm 9016e0622a2222a384f1896c1c00afb4709bce703c2aaf38a6e5fcf02d97f98f
@@ -17,8 +18,11 @@ crates/lanekeep-rules/components/sandbox-containment.wasm 1c9fdd94b1c7ba4757c019
 crates/lanekeep-rules/components/tracked-reads-only.wasm d39e5006b0607971f02405bb34245f7488a15b66b4b75538a9a1475dd9311b43
 crates/lanekeep-wasm/wit/world.wit 290f483be47beb5e9df599e78e2d04572af8d4586459d361bb0741714ec975ae
 rust-rules/.gitignore 084ea2569f638ccc64f50f72b805897bd927cfa3cee75e81f3081dd598ab0773
-rust-rules/Cargo.lock 6d9f53c7c3e4118f1055cb3225c74b52c1ff71dfdf563582c179b5a2dda11838
-rust-rules/Cargo.toml 6bf5a8c4a928a15c8f500db67774d438df1e54d0054dcac966a0a0f2cf590d8d
+rust-rules/Cargo.lock f3696c787a03d892db1f198edcd0ca3eeaf5426163134bf314b2668065fd6f97
+rust-rules/Cargo.toml 2f6b328d3ac19b8cad400eceab837ea6b23128de849f29b4f8000f9e1d47e007
+rust-rules/binding-kinds-are-typed/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
+rust-rules/binding-kinds-are-typed/Cargo.toml 759e776a44b828c0dcc75e5ef0d1e74f740d4f3805de6c126faab44276b29885
+rust-rules/binding-kinds-are-typed/src/lib.rs ecf2f89afcc9385f1009b2d5520b12d6849398bf8f52ae7df4f3c1a4c1554f40
 rust-rules/deterministic-iteration/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
 rust-rules/deterministic-iteration/Cargo.toml 9f377112ed8ba6bf11622fa0f86b4214e2c4388c052bbab8f2ca915cebf92172
 rust-rules/deterministic-iteration/src/lib.rs 39519727e27d0d63b641c640f0ad0228a81ff27a0e9f1833c14e8cf56fe47e28
