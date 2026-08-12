@@ -44,61 +44,6 @@ fn the_harness_runs() {
         .expect("the tester reports where the rule says");
 }
 
-const AUTHORITY: &str = include_str!("../../../lanekeep/rules/no-ambient-authority.ts");
-
-fn authority() -> RuleTester {
-    configured_rs("authority", AUTHORITY, "{ allow: [] }")
-}
-
-#[test]
-fn a_subprocess_import_is_reported() {
-    authority()
-        .reports_at("use std::process::Command;\n", &[(1, 1)])
-        .expect("nothing but changed.rs spawns a process");
-}
-
-#[test]
-fn a_socket_is_reported() {
-    authority()
-        .reports_at("use std::net::TcpStream;\n", &[(1, 1)])
-        .expect("§13's no network, ever, is enforced rather than aspirational");
-}
-
-#[test]
-fn the_git_caller_passes() {
-    RuleTester::configured_with_extension(
-        "authority-allow",
-        AUTHORITY,
-        "rs",
-        "{ allow: ['subject/input.rs'] }",
-    )
-    .expect("the rule builds")
-    .accepts("use std::process::Command;\n")
-    .expect("--since shells out to git, and that is the one place");
-}
-
-#[test]
-fn ordinary_std_passes() {
-    authority()
-        .accepts("use std::collections::BTreeMap;\nuse std::fs;\n")
-        .expect("only network and subprocess are the boundary");
-}
-
-#[test]
-fn exit_code_is_not_reported_but_command_still_is() {
-    // `std::process` alone would also match `std::process::ExitCode`, which is how `main()`
-    // reports its own exit status and reaches nothing outside the process. `process::Command`
-    // is the capability the rule is actually about, and it still catches the qualified path.
-    // Both imports in one subject so a `FORBIDDEN` list containing bare `std::process` — which
-    // would report both lines — is what this test would catch.
-    authority()
-        .reports_at(
-            "use std::process::Command;\nuse std::process::ExitCode;\n",
-            &[(1, 1)],
-        )
-        .expect("ExitCode is not subprocess capability; Command still is");
-}
-
 const TRACKED: &str = include_str!("../../../lanekeep/rules/tracked-reads-only.ts");
 
 fn tracked() -> RuleTester {

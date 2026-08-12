@@ -31,7 +31,7 @@
       "options": { "allow": ["crates/lanekeep-wasm/"] }
     },
     {
-      "rule": "./lanekeep/rules/no-ambient-authority.ts",
+      "rule": "./crates/lanekeep-rules/components/no-ambient-authority.wasm",
       "options": { "allow": ["crates/lanekeep-core/src/changed.rs"] }
     },
     {
