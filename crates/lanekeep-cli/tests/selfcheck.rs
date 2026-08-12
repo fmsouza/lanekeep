@@ -27,6 +27,14 @@ fn configured(name: &str, source: &str, options: &str) -> RuleTester {
     RuleTester::configured(name, source, options).expect("the rule builds")
 }
 
+/// A factory rule whose subject files use a given extension.
+///
+/// `configured` writes the subject as `.ts` — the rule's own `language` is not consulted —
+/// so a rule targeting Rust needs this to get a `.rs` subject the rule will actually run on.
+fn configured_rs(name: &str, source: &str, options: &str) -> RuleTester {
+    RuleTester::configured_with_extension(name, source, "rs", options).expect("the rule builds")
+}
+
 #[test]
 fn the_harness_runs() {
     // Replaced by real cases in later tasks. Present so this file compiles and the
@@ -48,7 +56,7 @@ fn the_harness_runs() {
 const ONE_PARSER: &str = include_str!("../../../lanekeep/rules/one-parser-per-file.ts");
 
 fn one_parser() -> RuleTester {
-    configured("one-parser", ONE_PARSER, "{ allow: [] }")
+    configured_rs("one-parser", ONE_PARSER, "{ allow: [] }")
 }
 
 #[test]
@@ -75,9 +83,10 @@ fn a_parser_in_a_test_module_passes() {
 
 #[test]
 fn an_allowed_path_passes() {
-    RuleTester::configured(
+    RuleTester::configured_with_extension(
         "one-parser-allow",
         ONE_PARSER,
+        "rs",
         "{ allow: ['subject/input.rs'] }",
     )
     .expect("the rule builds")
@@ -88,7 +97,7 @@ fn an_allowed_path_passes() {
 const CONTAINMENT: &str = include_str!("../../../lanekeep/rules/sandbox-containment.ts");
 
 fn containment() -> RuleTester {
-    configured("containment", CONTAINMENT, "{ allow: [] }")
+    configured_rs("containment", CONTAINMENT, "{ allow: [] }")
 }
 
 #[test]
@@ -112,7 +121,7 @@ fn a_qualified_use_of_the_engine_is_reported_once() {
 
 #[test]
 fn the_sandbox_crate_passes() {
-    RuleTester::configured("containment-allow", CONTAINMENT, "{ allow: ['subject/'] }")
+    RuleTester::configured_with_extension("containment-allow", CONTAINMENT, "rs", "{ allow: ['subject/'] }")
         .expect("the rule builds")
         .accepts("use rquickjs::Ctx;\n")
         .expect("lanekeep-js is where the engine is allowed to be named");
@@ -128,7 +137,7 @@ fn an_unrelated_import_passes() {
 const AUTHORITY: &str = include_str!("../../../lanekeep/rules/no-ambient-authority.ts");
 
 fn authority() -> RuleTester {
-    configured("authority", AUTHORITY, "{ allow: [] }")
+    configured_rs("authority", AUTHORITY, "{ allow: [] }")
 }
 
 #[test]
@@ -147,9 +156,10 @@ fn a_socket_is_reported() {
 
 #[test]
 fn the_git_caller_passes() {
-    RuleTester::configured(
+    RuleTester::configured_with_extension(
         "authority-allow",
         AUTHORITY,
+        "rs",
         "{ allow: ['subject/input.rs'] }",
     )
     .expect("the rule builds")
@@ -182,7 +192,7 @@ fn exit_code_is_not_reported_but_command_still_is() {
 const TRACKED: &str = include_str!("../../../lanekeep/rules/tracked-reads-only.ts");
 
 fn tracked() -> RuleTester {
-    configured("tracked", TRACKED, "{ scope: ['subject/'], allow: [] }")
+    configured_rs("tracked", TRACKED, "{ scope: ['subject/'], allow: [] }")
 }
 
 #[test]
@@ -197,9 +207,10 @@ fn an_untracked_read_is_reported() {
 
 #[test]
 fn the_tracking_module_passes() {
-    RuleTester::configured(
+    RuleTester::configured_with_extension(
         "tracked-allow",
         TRACKED,
+        "rs",
         "{ scope: ['subject/'], allow: ['subject/input.rs'] }",
     )
     .expect("the rule builds")
@@ -209,9 +220,10 @@ fn the_tracking_module_passes() {
 
 #[test]
 fn a_file_outside_the_scope_passes() {
-    RuleTester::configured(
+    RuleTester::configured_with_extension(
         "tracked-scope",
         TRACKED,
+        "rs",
         "{ scope: ['crates/lanekeep-js/'], allow: [] }",
     )
     .expect("the rule builds")
@@ -224,7 +236,7 @@ fn an_empty_scope_is_refused() {
     // `RuleTester::configured` only writes the fixture to disk; the factory is not called
     // until `run` loads the config, which is what `accepts` triggers below. The error surfaces
     // there, as a `TestError::Load`, not from `configured` itself.
-    let error = RuleTester::configured("tracked-noscope", TRACKED, "{ scope: [], allow: [] }")
+    let error = RuleTester::configured_with_extension("tracked-noscope", TRACKED, "rs", "{ scope: [], allow: [] }")
         .expect("the rule builds")
         .accepts("fn go() {}\n")
         .expect_err("a rule scoped to nothing must refuse to load rather than check nothing");
@@ -261,7 +273,7 @@ fn a_near_miss_identifier_is_not_reported() {
 const OBSERVATION: &str = include_str!("../../../lanekeep/rules/no-ambient-observation.ts");
 
 fn observation() -> RuleTester {
-    configured(
+    configured_rs(
         "observation",
         OBSERVATION,
         "{ scope: ['subject/'], allow: [] }",
@@ -290,9 +302,10 @@ fn an_environment_read_is_reported() {
 
 #[test]
 fn the_one_clock_site_passes() {
-    RuleTester::configured(
+    RuleTester::configured_with_extension(
         "observation-allow",
         OBSERVATION,
+        "rs",
         "{ scope: ['subject/'], allow: ['subject/input.rs'] }",
     )
     .expect("the rule builds")
@@ -312,9 +325,10 @@ fn an_empty_observation_scope_is_refused() {
     // there, as a `TestError::Load`, not from `configured` itself. Task 5 established this
     // shape the hard way — a test asserting on `configured`'s own Result passes whether the
     // guard exists or not.
-    let error = RuleTester::configured(
+    let error = RuleTester::configured_with_extension(
         "observation-noscope",
         OBSERVATION,
+        "rs",
         "{ scope: [], allow: [] }",
     )
     .expect("the rule builds")
@@ -333,7 +347,7 @@ fn an_empty_observation_scope_is_refused() {
 const ITERATION: &str = include_str!("../../../lanekeep/rules/deterministic-iteration.ts");
 
 fn iteration() -> RuleTester {
-    configured("iteration", ITERATION, "{ scope: ['subject/'] }")
+    configured_rs("iteration", ITERATION, "{ scope: ['subject/'] }")
 }
 
 #[test]
@@ -364,9 +378,10 @@ fn a_file_outside_the_iteration_scope_passes() {
     // this file is one module, and two `#[test]` functions sharing a name is `E0428`, not a
     // rule-behavior question — the same collision the brief's empty-scope test already
     // anticipated for a different pair of names, just not for this one.
-    RuleTester::configured(
+    RuleTester::configured_with_extension(
         "iteration-scope",
         ITERATION,
+        "rs",
         "{ scope: ['crates/lanekeep-report/'] }",
     )
     .expect("the rule builds")
@@ -381,7 +396,7 @@ fn an_empty_iteration_scope_is_refused() {
     // there, as a `TestError::Load`, not from `configured` itself. Task 5 established this
     // shape the hard way — a test asserting on `configured`'s own Result passes whether the
     // guard exists or not.
-    let error = RuleTester::configured("iteration-noscope", ITERATION, "{ scope: [] }")
+    let error = RuleTester::configured_with_extension("iteration-noscope", ITERATION, "rs", "{ scope: [] }")
         .expect("the rule builds")
         .accepts("fn go() {}\n")
         .expect_err("a rule scoped to nothing must refuse to load rather than check nothing");
@@ -1071,9 +1086,9 @@ fn a_registration_missing_from_the_types_is_reported() {
     // — so the tester's own directory is the root, and the types file is written beside the
     // subject. `reports_messages` rather than `reports_at`: every finding is reported at the
     // file root, so the position says nothing and the message is the assertion.
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "host-api",
-        HOST_API,
+        HOST_API, "rs",
         "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1095,9 +1110,9 @@ fn a_registration_missing_from_the_types_is_reported() {
 
 #[test]
 fn a_type_with_no_registration_is_reported() {
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "host-api-invented",
-        HOST_API,
+        HOST_API, "rs",
         "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1119,9 +1134,9 @@ fn a_type_with_no_registration_is_reported() {
 
 #[test]
 fn a_matching_pair_passes() {
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "host-api-clean",
-        HOST_API,
+        HOST_API, "rs",
         "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1146,9 +1161,9 @@ fn a_registered_name_starting_with_r_is_recognized() {
     // real repository. None of this file's other fixtures register a name starting with `r`,
     // so none of them would have caught it — this one registers and declares `root` and
     // requires the pair to reconcile cleanly rather than becoming `root` vs. `oot`.
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "host-api-r-initial",
-        HOST_API,
+        HOST_API, "rs",
         "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1170,9 +1185,9 @@ fn a_registration_inside_test_code_is_ignored() {
     // `host.rs`'s own `#[cfg(test)] mod tests { ... }` never calls `object.set("literal",
     // ...)` today, so nothing in the real repository exercises this exclusion — this fixture
     // stands in for what a future test-only registration inside `host.rs` would look like.
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "host-api-test-code",
-        HOST_API,
+        HOST_API, "rs",
         "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1200,9 +1215,9 @@ fn the_real_host_and_types_reconcile() {
     const REAL_HOST: &str = include_str!("../../lanekeep-js/src/host.rs");
     const REAL_TYPES: &str = include_str!("../../../packages/lanekeep/index.d.ts");
 
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "host-api-real",
-        HOST_API,
+        HOST_API, "rs",
         "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1227,9 +1242,9 @@ fn the_rule_still_matches_the_real_host_source() {
     // `the_rule_still_matches_the_real_binding_source` below.
     const REAL_HOST: &str = include_str!("../../lanekeep-js/src/host.rs");
 
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "host-api-floor",
-        HOST_API,
+        HOST_API, "rs",
         "{ hostPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1250,9 +1265,9 @@ const KINDS: &str = include_str!("../../../lanekeep/rules/binding-kinds-are-type
 
 #[test]
 fn a_binding_kind_missing_from_the_union_is_reported() {
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "kinds",
-        KINDS,
+        KINDS, "rs",
         "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1272,9 +1287,9 @@ fn a_binding_kind_missing_from_the_union_is_reported() {
 
 #[test]
 fn a_complete_union_passes() {
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "kinds-clean",
-        KINDS,
+        KINDS, "rs",
         "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1299,9 +1314,9 @@ fn a_match_outside_as_str_and_kind_str_is_not_reported() {
     // Fix round 1: the query scans the whole file, so a `Display` impl or an error-message
     // match elsewhere in `binding.rs` must not be mistaken for a source of binding kinds.
     // Scoping is enforced by checking which function encloses each match arm.
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "kinds-scoped",
-        KINDS,
+        KINDS, "rs",
         "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1332,9 +1347,9 @@ fn a_kind_str_only_arm_is_reported_too() {
     // dropping `'kind_str'` from `KIND_FUNCTIONS` leaves this fixture accepted (reporting
     // nothing), which is exactly the silent failure this test exists to catch — none of the
     // other fixtures in this file contain a `kind_str`-shaped match, so none of them would.
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "kinds-kind-str",
-        KINDS,
+        KINDS, "rs",
         "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");
@@ -1363,9 +1378,9 @@ fn the_rule_still_matches_the_real_binding_source() {
     // a two-arm toy file while the real one drifted out of reach.
     const BINDING: &str = include_str!("../../lanekeep-lang/src/binding.rs");
 
-    let tester = RuleTester::configured(
+    let tester = RuleTester::configured_with_extension(
         "kinds-floor",
-        KINDS,
+        KINDS, "rs",
         "{ bindingPath: 'subject/input.rs', typesPath: 'types.d.ts' }",
     )
     .expect("the rule builds");

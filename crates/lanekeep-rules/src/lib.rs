@@ -761,25 +761,29 @@ mod tests {
     /// reaching from a unit test here would cost a new dependency edge rather than a shared one.
     #[test]
     fn the_rules_the_migration_moved_are_byte_for_byte_what_they_were() {
+        // The four TypeScript built-ins' digests were re-recorded when the self-check rules
+        // came onto main: #95 added `language: ['typescript', 'tsx']` to each, which the
+        // `rule-declares-language` self-check rule requires. That is a deliberate change to
+        // the frozen set — the addition is the point, not a side effect.
         const FROZEN: &[(&str, &str, &[u8])] = &[
             (
                 "rules/no-circular-imports.ts",
-                "3ba0f2ba906a2b900740865d67cdb0f9c307d179916f8da6d2755f1aea532c1a",
+                "9a55c43c16b5e20d490ddd5ac38ee677975b5ee6f78c1cef34f7c64747cc662c",
                 include_bytes!("../rules/no-circular-imports.ts"),
             ),
             (
                 "rules/no-default-export.ts",
-                "ecbf4b4c78b1a6142a44121d435a4aeefc841685692c50673ac64b9a741c8b54",
+                "cfe8786c8d28ae53fcec8aa1bea37d27a0acbde867d98b4cec73df5253dd1ce0",
                 include_bytes!("../rules/no-default-export.ts"),
             ),
             (
                 "rules/no-restricted-imports.ts",
-                "f879809c5c944428568f3c64665e1ed8ed6c03d25cbea5c3a9dc0f833e1d4ad4",
+                "df7984b465a7519a797f3a56090429779ff6eeda1980688a8d44b09c423b752b",
                 include_bytes!("../rules/no-restricted-imports.ts"),
             ),
             (
                 "rules/no-unused-exports.ts",
-                "0ab09def28deb0a83e121c8d0d7fbdd63a865efe5677ed1229e393d20ddac2b2",
+                "dd34f6b1a528559abc58605e2362011e3030b90b0fdfd1d3e0dd2accc1b5c136",
                 include_bytes!("../rules/no-unused-exports.ts"),
             ),
             (
@@ -842,7 +846,7 @@ mod tests {
     /// test proves nothing on the platform where that thing differs.
     #[test]
     fn a_crlf_checkout_still_matches_the_frozen_digest() {
-        const RECORDED: &str = "3ba0f2ba906a2b900740865d67cdb0f9c307d179916f8da6d2755f1aea532c1a";
+        const RECORDED: &str = "9a55c43c16b5e20d490ddd5ac38ee677975b5ee6f78c1cef34f7c64747cc662c";
         let canonical = fold(include_bytes!("../rules/no-circular-imports.ts"));
 
         let mut crlf = Vec::with_capacity(canonical.len());

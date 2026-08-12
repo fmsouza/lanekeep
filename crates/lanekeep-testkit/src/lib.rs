@@ -28,7 +28,7 @@
 //! ```
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -344,16 +344,66 @@ impl RuleTester {
         rule_expr: &str,
     ) -> Result<Self, TestError> {
         let tester = Self::empty(name, extension, TS_CONFIG);
-        tester.write("rule.ts", rule_source)?;
+        // Nested one level rather than sitting at the fixture's own top, so a rule that
+        // imports a sibling module the way this repository's local rules do — `../modules/x`
+        // from `lanekeep/rules/some-rule.ts` — resolves inside the fixture instead of
+        // escaping it. `mirror_modules` is what makes `../modules/x` resolve to something
+        // real rather than merely legal.
+        tester.write("rules/rule.ts", rule_source)?;
+        tester.mirror_modules()?;
         tester.write(
             TS_CONFIG,
             &format!(
                 "import {{ defineConfig }} from 'lanekeep';\n\
-                 import rule from './rule';\n\
+                 import rule from './rules/rule';\n\
                  export default defineConfig({{ include: ['subject/**'], rules: [{rule_expr}] }});\n"
             ),
         )?;
         Ok(tester)
+    }
+
+    /// Copy this repository's own `lanekeep/modules/` into the fixture, as `modules/` — a
+    /// sibling of `rules/rule.ts`, one level up from it, exactly as `lanekeep/modules/` sits
+    /// relative to `lanekeep/rules/` in the real repository.
+    ///
+    /// A rule tested here is given as a source string, not a path, so there is no file on
+    /// disk this crate could otherwise learn the rule's real location from — and no way to
+    /// thread one through without changing the shape every existing caller of `new`,
+    /// `with_extension` and `configured` already depends on. Locating the source directory
+    /// from this crate's own manifest directory keeps that shape unchanged.
+    ///
+    /// A no-op when the source directory does not exist, which is true for everything other
+    /// than this workspace's own tests: a rule with no relative import never reads the copy,
+    /// and a project outside this repository that depends on this crate to test its own
+    /// rules has no such directory to find.
+    fn mirror_modules(&self) -> Result<(), TestError> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanekeep/modules");
+        let Ok(read_dir) = std::fs::read_dir(&source) else {
+            return Ok(());
+        };
+
+        // Read-dir order is not guaranteed; fixed order keeps a failure in here reproducible.
+        let mut paths = read_dir
+            .map(|entry| {
+                entry
+                    .map(|e| e.path())
+                    .map_err(|e| TestError::Setup(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let contents =
+                std::fs::read_to_string(&path).map_err(|e| TestError::Setup(e.to_string()))?;
+            self.write(&format!("modules/{name}"), &contents)?;
+        }
+        Ok(())
     }
 
     /// Write the throwaway project for a component rule.
@@ -404,6 +454,20 @@ impl RuleTester {
             components: no_components,
             component_maps: no_component_maps,
         }
+    }
+
+    /// Write a fixture file into the tester's project, at a path relative to it.
+    ///
+    /// A cross-file rule — one whose `reduce` reads files other than the subject — needs a
+    /// corpus to read, and this is how a test builds it. The subject itself is still written
+    /// by [`RuleTester::run`]; this is for the *other* files the rule reaches through
+    /// `ctx.files()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Setup`] if the file cannot be written.
+    pub fn write_fixture(&self, path: &str, contents: &str) -> Result<(), TestError> {
+        self.write(path, contents)
     }
 
     fn write(&self, path: &str, contents: &str) -> Result<(), TestError> {
