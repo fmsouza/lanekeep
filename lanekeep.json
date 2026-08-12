@@ -42,7 +42,7 @@
       }
     },
     {
-      "rule": "./lanekeep/rules/no-ambient-observation.ts",
+      "rule": "./crates/lanekeep-rules/components/no-ambient-observation.wasm",
       "options": {
         "scope": [
           "crates/lanekeep-cache/",

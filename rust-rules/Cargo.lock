@@ -35,6 +35,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "no-ambient-observation"
+version = "0.0.0"
+dependencies = [
+ "lanekeep-rule",
+ "serde",
+ "serde_json",
+ "wit-bindgen-rt",
+]
+
+[[package]]
 name = "no-glob-import"
 version = "0.0.0"
 dependencies = [
