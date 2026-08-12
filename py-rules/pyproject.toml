@@ -1,0 +1,6 @@
+[project]
+name = "lanekeep-py-rules"
+version = "0.1.0"
+description = "The Python authoring lane for lanekeep rules"
+requires-python = ">=3.11"
+dependencies = ["componentize-py==0.25.0"]

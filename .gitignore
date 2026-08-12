@@ -78,3 +78,12 @@ $RECYCLE.BIN/
 # written by tooling rather than by hand — an implementer running `git add -A` mid-task would
 # otherwise commit the whole working set.
 /.superpowers/
+
+# Python authoring lane: the venv, the generated bindings, and the built artifact.
+# The artifact is not committed — componentize-py output is not byte-reproducible.
+/py-rules/.venv/
+/py-rules/bindings/
+/py-rules/target/
+
+# Python bytecode caches from the py-rules authoring lane's host-side tests.
+__pycache__/
