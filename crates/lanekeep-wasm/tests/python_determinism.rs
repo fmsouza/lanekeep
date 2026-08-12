@@ -1,6 +1,6 @@
 //! Rebuilding a Python rule can change its behavior without changing its source.
 //!
-//! CPython's hash seed is drawn from `wasi:random` during pre-init and frozen into the
+//! `CPython`'s hash seed is drawn from `wasi:random` during pre-init and frozen into the
 //! heap image — `hash('lanekeep')` differs per build and is stable per artifact. A rule
 //! that iterates a `set` of strings gets an order set by that seed, so the same source
 //! built twice can report different violations. Sorting violations by
@@ -8,7 +8,7 @@
 //! report by set order.
 //!
 //! There is no runtime reset available — the seed is baked into the heap image, and
-//! `PYTHONHASHSEED` in the host environment cannot help because pre-init runs CPython
+//! `PYTHONHASHSEED` in the host environment cannot help because pre-init runs `CPython`
 //! *inside* the guest. The mitigation is authoring guidance: sort (`sorted()`) when order
 //! matters, and never pick "the first" of a set or stop after N. This file demonstrates
 //! both halves against two builds of one source, so the guidance is grounded in evidence
@@ -84,11 +84,11 @@ fn observables(bytes: &[u8]) -> (String, String, String) {
     for report in &reports {
         let message = report.message.as_deref().unwrap_or("");
         if let Some(v) = message.strip_prefix("hash=") {
-            hash = v.to_owned();
+            hash = v.to_string();
         } else if let Some(v) = message.strip_prefix("set-order=") {
-            set_order = v.to_owned();
+            set_order = v.to_string();
         } else if let Some(v) = message.strip_prefix("sorted=") {
-            sorted = v.to_owned();
+            sorted = v.to_string();
         }
     }
     (hash, set_order, sorted)
