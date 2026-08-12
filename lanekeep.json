@@ -1,0 +1,105 @@
+{
+  "$schema": "./schema/lanekeep.schema.json",
+
+  "include": [
+    "crates/**/*.rs",
+    "crates/lanekeep-rules/rules/*.ts",
+    "crates/lanekeep-rules/modules/*.ts",
+    "lanekeep/rules/*.ts",
+    "lanekeep/modules/*.ts",
+    "packages/lanekeep/*.ts",
+    "scripts/*.py",
+    "cmd/**/*.go"
+  ],
+  "exclude": [
+    "**/target/**",
+    "packages/lanekeep/builtin.d.ts"
+  ],
+
+  "rules": [
+    "lanekeep/no-broad-except",
+    "lanekeep/no-mutable-default-argument",
+    "lanekeep/no-package-init",
+    "lanekeep/no-context-in-struct",
+    { "rule": "lanekeep/no-circular-imports", "options": {} },
+    {
+      "rule": "./lanekeep/rules/one-parser-per-file.ts",
+      "options": { "allow": [] }
+    },
+    {
+      "rule": "./lanekeep/rules/sandbox-containment.ts",
+      "options": { "allow": ["crates/lanekeep-js/"] }
+    },
+    {
+      "rule": "./lanekeep/rules/no-ambient-authority.ts",
+      "options": { "allow": ["crates/lanekeep-core/src/changed.rs"] }
+    },
+    {
+      "rule": "./lanekeep/rules/tracked-reads-only.ts",
+      "options": {
+        "scope": ["crates/lanekeep-js/"],
+        "allow": ["crates/lanekeep-js/src/files.rs", "crates/lanekeep-js/src/loader.rs"]
+      }
+    },
+    {
+      "rule": "./lanekeep/rules/no-ambient-observation.ts",
+      "options": {
+        "scope": [
+          "crates/lanekeep-cache/",
+          "crates/lanekeep-config/",
+          "crates/lanekeep-core/",
+          "crates/lanekeep-query/",
+          "crates/lanekeep-js/",
+          "crates/lanekeep-engine/"
+        ],
+        "allow": [
+          "crates/lanekeep-core/src/suppression.rs",
+          "crates/lanekeep-js/src/limits.rs",
+          "crates/lanekeep-engine/benches/corpus.rs"
+        ]
+      }
+    },
+    {
+      "rule": "./lanekeep/rules/deterministic-iteration.ts",
+      "options": { "scope": ["crates/lanekeep-report/", "crates/lanekeep-cache/"] }
+    },
+    "./lanekeep/rules/gates-are-and.ts",
+    "./lanekeep/rules/rule-declares-language.ts",
+    "./lanekeep/rules/reduce-touches-no-tree.ts",
+    "./lanekeep/rules/facts-must-serialize.ts",
+    "./lanekeep/rules/node-handle-truthiness.ts",
+    "./lanekeep/rules/no-eval-in-rules.ts",
+    "./lanekeep/rules/py-explicit-encoding.ts",
+    "./lanekeep/rules/py-stdout-buffer.ts",
+    {
+      "rule": "./lanekeep/rules/host-api-matches-types.ts",
+      "options": {
+        "hostPath": "crates/lanekeep-js/src/host.rs",
+        "typesPath": "packages/lanekeep/index.d.ts"
+      }
+    },
+    {
+      "rule": "./lanekeep/rules/binding-kinds-are-typed.ts",
+      "options": {
+        "bindingPath": "crates/lanekeep-lang/src/binding.rs",
+        "typesPath": "packages/lanekeep/index.d.ts"
+      }
+    },
+    {
+      "rule": "lanekeep/no-glob-import",
+      "options": { "allow": ["*prelude*", "super::*"] }
+    },
+    {
+      "rule": "lanekeep/no-unwrap",
+      "options": {
+        "allow": [
+          "crates/lanekeep-engine/benches/corpus.rs",
+          "crates/lanekeep-lang-go/src/lib.rs",
+          "crates/lanekeep-lang-python/src/lib.rs",
+          "crates/lanekeep-lang-rust/src/lib.rs",
+          "crates/lanekeep-languages/src/lib.rs"
+        ]
+      }
+    }
+  ]
+}

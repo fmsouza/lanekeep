@@ -463,7 +463,14 @@ struct Scaffold {
     include: &'static str,
     /// The `exclude` glob, or none when the language has no obvious test convention.
     exclude: Option<&'static str>,
-    /// Built-in rules to enable, by specifier.
+    /// Built-in rules to enable, each pre-formatted as a `rules` array entry — a quoted bare
+    /// specifier, or the `{ "rule": ..., "options": {} }` object form a factory rule needs.
+    ///
+    /// `lanekeep/no-unwrap` is a factory — it is how its `allow` option is reached at all —
+    /// so a bare quoted string for it would fail config load with `missing 'id'` the moment a
+    /// Rust project ran `init`. Formatting each entry here rather than quoting a bare
+    /// specifier in `starter_config` is what lets the two forms coexist without
+    /// `starter_config` having to know which built-ins are factories.
     builtins: &'static [&'static str],
     /// Filename of the starter rule, under `lanekeep/rules/`.
     rule_file: &'static str,
@@ -620,7 +627,7 @@ const TYPESCRIPT: Scaffold = Scaffold {
     language: "TypeScript",
     include: "src/**/*.{ts,tsx}",
     exclude: Some("**/*.{test,spec}.{ts,tsx}"),
-    builtins: &["lanekeep/no-default-export"],
+    builtins: &["\"lanekeep/no-default-export\""],
     rule_file: "no-debugger.ts",
     rule: TYPESCRIPT_RULE,
 };
@@ -629,7 +636,7 @@ const PYTHON: Scaffold = Scaffold {
     language: "Python",
     include: "**/*.py",
     exclude: Some("**/test_*.py"),
-    builtins: &["lanekeep/no-broad-except"],
+    builtins: &["\"lanekeep/no-broad-except\""],
     rule_file: "no-print.ts",
     rule: PYTHON_RULE,
 };
@@ -638,7 +645,7 @@ const GO: Scaffold = Scaffold {
     language: "Go",
     include: "**/*.go",
     exclude: Some("**/*_test.go"),
-    builtins: &["lanekeep/no-package-init"],
+    builtins: &["\"lanekeep/no-package-init\""],
     rule_file: "no-fmt-println.ts",
     rule: GO_RULE,
 };
@@ -649,7 +656,9 @@ const RUST: Scaffold = Scaffold {
     // A Rust project keeps its unit tests beside the code they cover, so there is no test
     // path to exclude — `#[cfg(test)]` is the convention, not a directory.
     exclude: None,
-    builtins: &["lanekeep/no-unwrap"],
+    // The object form, not a bare specifier: `no-unwrap` is a factory, and calling it with no
+    // options is what makes it behave the way the bare form used to.
+    builtins: &["{ \"rule\": \"lanekeep/no-unwrap\", \"options\": {} }"],
     rule_file: "no-dbg.ts",
     rule: RUST_RULE,
 };
@@ -684,10 +693,12 @@ fn detect(project_root: &Path) -> &'static Scaffold {
 /// it — `lanekeep.config.ts` still works, and is the better choice for a config that computes
 /// something or shares a preset.
 fn starter_config(scaffold: &Scaffold) -> String {
+    // Each entry already carries its own quoting — a bare specifier or an object — so this
+    // only has to indent it, not decide which form it needs.
     let mut rules: Vec<String> = scaffold
         .builtins
         .iter()
-        .map(|specifier| format!("    \"{specifier}\""))
+        .map(|entry| format!("    {entry}"))
         .collect();
     rules.push(format!("    \"./lanekeep/rules/{}\"", scaffold.rule_file));
 

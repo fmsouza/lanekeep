@@ -28,6 +28,7 @@ export default function noCircularImports(options) {
 
   return defineRule({
     id: 'lanekeep/no-circular-imports',
+    language: ['typescript', 'tsx'],
     severity: 'error',
 
     card: {

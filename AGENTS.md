@@ -97,6 +97,22 @@ IDs, a versioned host API in the cache key, tracked effects from the start, AST 
 crossing as handles rather than objects, and a clean `Rule` boundary that built-ins get
 no exemption from.
 
+## The invariants are checked
+
+`just lanekeep` runs lanekeep against this repository, after `test` in both gates and on
+purpose: if the engine is broken, its verdict about this source means nothing. `lanekeep.json`
+runs twenty-three rules against it: sixteen live in `lanekeep/rules/`, one file each, and seven
+are lanekeep's own built-ins, checking the tool against itself. Each is configured with
+whatever options it needs.
+
+Changing an invariant means changing its rule in the same pull request. A rule that no longer
+matches anything is not evidence that the invariant holds; every one of the sixteen has a test
+in `crates/lanekeep-cli/tests/selfcheck.rs` proving it still reports.
+
+What this does **not** cover: shell, YAML, TOML and the justfile, for which lanekeep has no
+grammar. Workflow pinning stays with `scripts/test-workflows.sh`, bash portability with
+`scripts/test-shell-portability.sh`, dependency policy with `deny.toml`.
+
 ## Repository map
 
 ```
@@ -900,6 +916,19 @@ first error before it reached the save, so a corpus that overran its budget woul
 stranded cold forever the moment the budget started being enforced. The *no-prune* half is
 doctrine this change added to §6.8, and it could not have been there before — an aborted run
 wrote nothing at all, so there was no save whose pruning behavior anyone had to decide.
+
+**A generated module reaches neither hash, and a rule's `options` used to live in one.** For a
+`lanekeep.json` the rules are compiled into an entry module lanekeep writes itself, and
+`hash_ruleset` covers the sources the loader *read* — never that one. `hash_config`
+canonicalized severity, include/exclude and timeouts and stopped there. So editing an option
+invalidated nothing: a warm run kept answering the previous configuration for as long as the
+cache survived, in both directions, and the dangerous one is silent — a restriction added still
+reports clean, and only `--no-cache` disagrees, which reads as "the rule is broken" rather than
+"the answer is old". Found by pointing lanekeep at this repository: an `allow` entry was removed
+and the run stayed green. `lanekeep init` generates JSON, so this was the default path. Two
+things worth carrying forward: a fixture written against a `.ts` config passes against this bug,
+because there the options are ordinary source in a module the loader does read; and anything new
+a config can say has to reach one of the two hashes on purpose — nothing checks that for you.
 
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,

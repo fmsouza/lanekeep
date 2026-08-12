@@ -35,10 +35,10 @@ _require tool:
 # ---------------------------------------------------------------------------
 
 # Pre-commit gate. Fast enough to run on every commit without being resented.
-check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py
+check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py lanekeep
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py docs deny machete typos-check msrv
+check: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py lanekeep docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -847,6 +847,16 @@ py-rules:
     LANEKEEP_PY_DETERMINISM_A="${root}/py-rules/target/py-determinism-a.wasm" \
     LANEKEEP_PY_DETERMINISM_B="${root}/py-rules/target/py-determinism-b.wasm" \
     cargo nextest run -p lanekeep-wasm --test python_determinism
+
+# lanekeep checking its own source.
+#
+# The rules live in `lanekeep/rules/` and encode the invariants in AGENTS.md — the ones a
+# reviewer has to remember rather than the ones clippy already knows. Runs after `test` in
+# both gates on purpose: if the engine is broken, its verdict about this source means
+# nothing, so the tests that prove the engine works come first.
+lanekeep:
+    cargo build -p lanekeep-cli
+    ./target/debug/lanekeep check .
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 #

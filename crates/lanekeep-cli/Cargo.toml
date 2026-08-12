@@ -32,6 +32,7 @@ lanekeep-rules = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+lanekeep-testkit = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]
