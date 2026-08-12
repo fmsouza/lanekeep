@@ -6,9 +6,9 @@
 #
 # A line that moves when no artifact did means a rule's source, or the world it is built
 # against, was changed without rebuilding — run `just rust-rules`.
-crates/lanekeep-rules/components/binding-kinds-are-typed.wasm 25ab764681f2acf666cbb5401d87a53606e8aa8c6e598ef216fef4b731da2390
+crates/lanekeep-rules/components/binding-kinds-are-typed.wasm 83c1224a0d0c2d79615865447c35f5300e551d1089d933edc5235d0e16f2f79c
 crates/lanekeep-rules/components/deterministic-iteration.wasm 29c1d2578000af14283a49e8be7846f9f8d3d7b4f907edc608a9466fe227d9b0
-crates/lanekeep-rules/components/host-api-matches-types.wasm f03d20367d85eba21b4aee75592d57364adadffe5c71fb417fc75ec38d8d2fbb
+crates/lanekeep-rules/components/host-api-matches-types.wasm 41450db1cdd4deb3b8c11f7325d329fe6caee613797485bfe0e590364d241be4
 crates/lanekeep-rules/components/no-ambient-authority.wasm 9016e0622a2222a384f1896c1c00afb4709bce703c2aaf38a6e5fcf02d97f98f
 crates/lanekeep-rules/components/no-ambient-observation.wasm 17dcf246d182b1da335edb76115175f7d06636a11372d4ae3cca77985e3cd484
 crates/lanekeep-rules/components/no-glob-import.wasm 9dcb3cc5a7248a9c4d1f9948945207d050201d2b5a2cae2178c038de2311be64
@@ -22,13 +22,13 @@ rust-rules/Cargo.lock f3696c787a03d892db1f198edcd0ca3eeaf5426163134bf314b2668065
 rust-rules/Cargo.toml 2f6b328d3ac19b8cad400eceab837ea6b23128de849f29b4f8000f9e1d47e007
 rust-rules/binding-kinds-are-typed/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
 rust-rules/binding-kinds-are-typed/Cargo.toml 759e776a44b828c0dcc75e5ef0d1e74f740d4f3805de6c126faab44276b29885
-rust-rules/binding-kinds-are-typed/src/lib.rs ecf2f89afcc9385f1009b2d5520b12d6849398bf8f52ae7df4f3c1a4c1554f40
+rust-rules/binding-kinds-are-typed/src/lib.rs b2464a8183b730da699e1050c50291d10c4278e21fb64ec94d4b33b908fff22e
 rust-rules/deterministic-iteration/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
 rust-rules/deterministic-iteration/Cargo.toml 9f377112ed8ba6bf11622fa0f86b4214e2c4388c052bbab8f2ca915cebf92172
 rust-rules/deterministic-iteration/src/lib.rs 39519727e27d0d63b641c640f0ad0228a81ff27a0e9f1833c14e8cf56fe47e28
 rust-rules/host-api-matches-types/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
 rust-rules/host-api-matches-types/Cargo.toml 3eb2cc9f00d7af63a8f58652f06c1954f59078718c486fa5904e8db980412b38
-rust-rules/host-api-matches-types/src/lib.rs 125542cebfe65ceb49383f44c3e70bb4d73e7366981698661f08b759ec9d3b70
+rust-rules/host-api-matches-types/src/lib.rs b7d193153260a543a93bf7ce0b55b00c9ed0a0eff9bc661f362a3c5bbc5bc51f
 rust-rules/lanekeep-rule/Cargo.toml 3f59c77203fc4806f3c2e62fac5abe31efe04a0fc973ed37ac145793f62001f3
 rust-rules/lanekeep-rule/src/lib.rs 7212fe294418081c78553444ca635e87e3956411d4566ab62c6002f699240f65
 rust-rules/no-ambient-authority/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61

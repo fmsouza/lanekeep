@@ -407,11 +407,14 @@ fn strip_quotes(text: &str) -> &str {
         rest = after_quote;
     }
 
-    // Trailing `"#*`: the closing `"`, then any `#`. Only when there is a closing quote, so a
-    // name that merely ends in `#` is not eaten.
-    if let Some(after_quote) = rest.strip_suffix('"') {
-        let trailing_hashes = after_quote.bytes().rev().take_while(|&b| b == b'#').count();
-        rest = &after_quote[..after_quote.len() - trailing_hashes];
+    // Trailing `"#*`: the closing `"`, then any `#` after it. The TypeScript regex `/"#*$/`
+    // matches a `"` followed by `#*` at the end, so the last `"` is found and stripped along
+    // with whatever `#`s follow it — not the `#`s that precede it. Only when everything after
+    // the last `"` is `#`s, so a name that merely ends in `#` is not eaten.
+    if let Some(quote) = rest.rfind('"')
+        && rest[quote + 1..].bytes().all(|b| b == b'#')
+    {
+        rest = &rest[..quote];
     }
 
     rest

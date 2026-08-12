@@ -48,6 +48,9 @@ enum Expected {
     /// Exactly these messages, in order. Every finding is reported at the match arm, so the
     /// position says nothing and the message is the assertion.
     ReportsMessages(&'static [&'static str]),
+    /// At least this many violations. The real-binding floor test asserts the rule actually
+    /// matched the real `binding.rs`'s match arms rather than silently no-op-ing.
+    AtLeast(usize),
 }
 
 /// The rule id every violation carries.
@@ -136,10 +139,22 @@ const CASES: &[Case] = &[
     // render is a member of the published union. A moved or renamed file fails to COMPILE here
     // rather than silently checking nothing.
     Case {
-        name: "the_rule_still_matches_the_real_binding_source",
+        name: "the_real_binding_and_types_reconcile",
         source: include_str!("../../lanekeep-lang/src/binding.rs"),
         types: include_str!("../../../packages/lanekeep/index.d.ts"),
         expected: Expected::Accepts,
+    },
+    // Reconciling cleanly, above, is not enough on its own — a rule that returned early for
+    // every file would also reconcile cleanly, vacuously. A `'nothing'` union here proves
+    // `check` actually read and matched the real binding.rs's `as_str`/`kind_str` match arms
+    // rather than silently no-op-ing. There are 17 string-literal arms across the two functions;
+    // this floor leaves generous headroom below that count so one or two future kinds do not
+    // make the test flaky.
+    Case {
+        name: "the_rule_still_matches_the_real_binding_source",
+        source: include_str!("../../lanekeep-lang/src/binding.rs"),
+        types: "export type BindingKind =\n  | 'nothing'\n",
+        expected: Expected::AtLeast(10),
     },
 ];
 
@@ -175,6 +190,12 @@ fn assert_case(tester: &RuleTester, case: &Case) -> Result<(), TestError> {
                 &format!("{actual:?}"),
             ))
         }
+        Expected::AtLeast(floor) if violations.len() >= floor => Ok(()),
+        Expected::AtLeast(floor) => Err(mismatch(
+            case,
+            &format!("at least {floor} violations"),
+            &format!("{}", violations.len()),
+        )),
     }
 }
 
