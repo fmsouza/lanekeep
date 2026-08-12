@@ -251,10 +251,46 @@ jobs:
           git --no-pager diff --stat
           exit 1
 
+  # The Python component, built and proven through the real engine.
+  #
+  # Unlike the Go job beside it, there is no rebuild-and-diff step: `componentize-py`
+  # output is not byte-reproducible, so there is nothing to diff. The proof is the
+  # fidelity and determinism tests `just py-rules` runs against the freshly-built
+  # artifact — a Python rule that reports the wrong thing fails the job.
+  py-rules:
+    name: py-rules (build and test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # `just py-rules` runs the fidelity and determinism tests through `cargo nextest`,
+      # so this job needs the Rust toolchain as well as the Python one.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: py-rules
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just,cargo-nextest
+
+      # Which creates the venv, installs componentize-py 0.25.0, builds the three
+      # artifacts, runs the SDK tests, and runs the fidelity and determinism tests.
+      - run: just py-rules
+
   ci-ok:
     name: ci
     if: always()
-    needs: [gate, test, msrv, bench, go-rules]
+    needs: [gate, test, msrv, bench, go-rules, py-rules]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every job succeeded
