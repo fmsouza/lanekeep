@@ -1,4 +1,4 @@
-//! `local/no-ambient-observation`: clock and environment reads outside the two legitimate sites.
+//! `local/no-ambient-observation`: clock and environment reads outside the legitimate sites.
 //!
 //! §8.1: everything is deterministic given `(bytes, path, ruleset, config, tracked reads)`.
 //! Anything else a result depends on is an input the cache key does not have, so the entry is
@@ -7,15 +7,22 @@
 //! cache. There is no 'it's only used for logging' exception; a cached result is a cached
 //! result."
 //!
-//! Two sites legitimately read the clock, and `allow` names both so the distinction is
+//! The clock reads that legitimately exist, and `allow` names each so the distinction is
 //! reviewable rather than assumed:
 //!
 //! - `suppression::today`, which a suppression's `expires:` has to be compared against. Fixed
 //!   once per run, in UTC, so two files checked a millisecond apart cannot disagree.
-//! - `RunClock::start` in `lanekeep-js`, which fixes the origin the global run budget is
-//!   measured from. A timeout clock cannot change *what* gets cached: §6.8 cancels the whole
-//!   run on a breach — exit `2`, no report, no entry for any file still in flight — so it can
-//!   stop a result being produced but cannot produce a different one.
+//! - `RunClock::start` in `lanekeep-core/src/limits.rs`, which fixes the origin the global run
+//!   budget is measured from. A timeout clock cannot change *what* gets cached: §6.8 cancels
+//!   the whole run on a breach — exit `2`, no report, no entry for any file still in flight —
+//!   so it can stop a result being produced but cannot produce a different one.
+//! - The compile-budget timing in `lanekeep-config/src/lib.rs`, and the two benches
+//!   (`corpus.rs`, `crossings.rs`) that measure the engine.
+//! - The `Instant::now()` in `lanekeep-wasm/src/runtime.rs`, which a test uses to assert that
+//!   dropping an engine stops its ticker promptly.
+//!
+//! The two test files in `lanekeep-wasm/tests/` that read an environment variable to locate a
+//! probe artifact (`python_determinism.rs`, `fixture_currency.rs`) are also in `allow`.
 //!
 //! Anything else reading the clock is an input the cache key does not have.
 //!
@@ -37,7 +44,7 @@
 //! the host imports one, so the engine's own Rust source can no longer observe the environment
 //! by accident — the rule's force is now "no environment observation in the host's imports."
 //! The Rust rule still scans the engine's Rust source for clock and environment reads, with the
-//! two legitimate sites above in the `allow` set, but the boundary it polices is the host's
+//! legitimate sites above in the `allow` set, but the boundary it polices is the host's
 //! import surface rather than the engine's runtime.
 //!
 //! There are no unit tests in this crate, and that is a decision rather than an omission. It
@@ -239,7 +246,7 @@ impl Rule for NoAmbientObservation {
             return Ok(());
         }
 
-        // The two sites that legitimately read the clock. The TypeScript original tests the file
+        // The sites that legitimately read the clock. The TypeScript original tests the file
         // path with `includes`, so this is an exact match rather than the prefix or glob the
         // other rules' `allow` lists use.
         if ALLOW.with_borrow(|allow| allow.iter().any(|path| path == &file_path)) {

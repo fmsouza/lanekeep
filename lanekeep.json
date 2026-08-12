@@ -44,7 +44,7 @@
       "rule": "./crates/lanekeep-rules/components/tracked-reads-only.wasm",
       "options": {
         "scope": ["crates/lanekeep-js/"],
-        "allow": ["crates/lanekeep-js/src/files.rs", "crates/lanekeep-js/src/loader.rs"]
+        "allow": ["crates/lanekeep-js/src/loader.rs"]
       }
     },
     {
@@ -56,15 +56,18 @@
           "crates/lanekeep-core/",
           "crates/lanekeep-query/",
           "crates/lanekeep-js/",
-          "crates/lanekeep-engine/"
+          "crates/lanekeep-engine/",
+          "crates/lanekeep-wasm/"
         ],
         "allow": [
           "crates/lanekeep-core/src/suppression.rs",
-          "crates/lanekeep-js/src/limits.rs",
           "crates/lanekeep-engine/benches/corpus.rs",
           "crates/lanekeep-config/src/lib.rs",
           "crates/lanekeep-core/src/limits.rs",
-          "crates/lanekeep-engine/benches/crossings.rs"
+          "crates/lanekeep-engine/benches/crossings.rs",
+          "crates/lanekeep-wasm/src/runtime.rs",
+          "crates/lanekeep-wasm/tests/python_determinism.rs",
+          "crates/lanekeep-wasm/tests/fixture_currency.rs"
         ]
       }
     },

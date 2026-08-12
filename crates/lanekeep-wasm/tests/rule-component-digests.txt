@@ -36,7 +36,7 @@ rust-rules/no-ambient-authority/Cargo.toml ddf71cc0606a370817319c9e434ce0d13d60f
 rust-rules/no-ambient-authority/src/lib.rs 768d9fb9d622d8bab05607c8d07c818f9b1732cb267c8bee7ff0403ee88c55ff
 rust-rules/no-ambient-observation/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
 rust-rules/no-ambient-observation/Cargo.toml 594c36266541573192c290d1a1c9107827def5e6bd734c2344ac77c3cbdc762e
-rust-rules/no-ambient-observation/src/lib.rs aa36247a33fa17a472888bae1c4557e67190fe2475608e8947074c5e3ec45adf
+rust-rules/no-ambient-observation/src/lib.rs 345201c324987cebb28519efd7acd1ef6a52ed6398c723612e50707a056ce903
 rust-rules/no-glob-import/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
 rust-rules/no-glob-import/Cargo.toml 2f486211f6fdb452950d65dcab863cf7d729f30d8044467891586877b42646f9
 rust-rules/no-glob-import/src/lib.rs 4c04538ce6ca5cb3fa93ab0f928e56246e892c97a33519001fa6dde2b65f86a3
@@ -51,4 +51,4 @@ rust-rules/sandbox-containment/Cargo.toml fca01c2eb67791b2edd8f254dde27ac71ddcf8
 rust-rules/sandbox-containment/src/lib.rs 6b25cf4702cd8ed5f0e6e63efa6c126ea8e32ed0063171a4a5d4dcc467f0794f
 rust-rules/tracked-reads-only/.gitignore 02c57bcc21a7e6fda532dbde6e186f310c6b3ad00d289b8b750459d00b49ff61
 rust-rules/tracked-reads-only/Cargo.toml 905a6a1488554760d5864affa0ee569b231cccbb22400352e452f130dec6b62b
-rust-rules/tracked-reads-only/src/lib.rs 1fc2b773826fd31c703b7a0f20521e67135c0ed56012747f342dbc19f66b7f0c
+rust-rules/tracked-reads-only/src/lib.rs 9a044524dd32dbe4de0feb49319a19a3b804a99c643f0f9629a2a69cf585989c

@@ -7,9 +7,10 @@
 //! entry that is correct on every test anyone thinks to write and wrong on the one case that
 //! matters — the file changes and nothing invalidates.
 //!
-//! Two files legitimately touch the filesystem: `files.rs`, which *is* the tracking, and
-//! `loader.rs`, which reads rule modules at load time, before any rule runs and therefore
-//! before there is an entry to attribute a dependency to. `allow` carries both.
+//! One file legitimately touches the filesystem inside the sandbox crate: `loader.rs`, which
+//! reads rule modules at load time, before any rule runs and therefore before there is an entry
+//! to attribute a dependency to. `allow` carries it. The tracking itself — `FileAccess` — lives
+//! in `lanekeep-core/src/files.rs`, outside this rule's `scope`, so it is not policed here.
 //!
 //! # A port, held to reporting identically
 //!
