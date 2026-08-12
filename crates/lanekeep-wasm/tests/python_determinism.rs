@@ -54,7 +54,9 @@ fn observables(bytes: &[u8]) -> (String, String, String) {
 
     let source = "x = 1\n";
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&TypeScript.grammar()).expect("the grammar loads");
+    parser
+        .set_language(&TypeScript.grammar())
+        .expect("the grammar loads");
     let tree = parser.parse(source, None).expect("it parses");
     let arena = NodeArena::new(tree, source.to_owned());
     let context = runtime
@@ -94,8 +96,12 @@ fn observables(bytes: &[u8]) -> (String, String, String) {
 
 #[test]
 fn rebuilding_a_python_rule_can_change_its_behavior() {
-    let Some(a) = artifact("LANEKEEP_PY_DETERMINISM_A") else { return };
-    let Some(b) = artifact("LANEKEEP_PY_DETERMINISM_B") else { return };
+    let Some(a) = artifact("LANEKEEP_PY_DETERMINISM_A") else {
+        return;
+    };
+    let Some(b) = artifact("LANEKEEP_PY_DETERMINISM_B") else {
+        return;
+    };
 
     let (hash_a, set_a, sorted_a) = observables(&a);
     let (hash_b, set_b, sorted_b) = observables(&b);
