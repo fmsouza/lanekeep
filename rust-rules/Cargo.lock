@@ -147,6 +147,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracked-reads-only"
+version = "0.0.0"
+dependencies = [
+ "lanekeep-rule",
+ "serde",
+ "serde_json",
+ "wit-bindgen-rt",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"

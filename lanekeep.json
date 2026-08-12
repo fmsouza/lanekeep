@@ -35,7 +35,7 @@
       "options": { "allow": ["crates/lanekeep-core/src/changed.rs"] }
     },
     {
-      "rule": "./lanekeep/rules/tracked-reads-only.ts",
+      "rule": "./crates/lanekeep-rules/components/tracked-reads-only.wasm",
       "options": {
         "scope": ["crates/lanekeep-js/"],
         "allow": ["crates/lanekeep-js/src/files.rs", "crates/lanekeep-js/src/loader.rs"]
