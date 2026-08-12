@@ -18,14 +18,6 @@ fn plain(name: &str, source: &str, extension: &str) -> RuleTester {
     RuleTester::with_extension(name, source, extension).expect("the rule builds")
 }
 
-/// A factory rule whose subject files use a given extension.
-///
-/// `configured` writes the subject as `.ts` — the rule's own `language` is not consulted —
-/// so a rule targeting Rust needs this to get a `.rs` subject the rule will actually run on.
-fn configured_rs(name: &str, source: &str, options: &str) -> RuleTester {
-    RuleTester::configured_with_extension(name, source, "rs", options).expect("the rule builds")
-}
-
 #[test]
 fn the_harness_runs() {
     // Replaced by real cases in later tasks. Present so this file compiles and the
@@ -42,77 +34,6 @@ fn the_harness_runs() {
     plain("probe", rule, "ts")
         .reports_at("debugger;\n", &[(1, 1)])
         .expect("the tester reports where the rule says");
-}
-
-const ITERATION: &str = include_str!("../../../lanekeep/rules/deterministic-iteration.ts");
-
-fn iteration() -> RuleTester {
-    configured_rs("iteration", ITERATION, "{ scope: ['subject/'] }")
-}
-
-#[test]
-fn an_unordered_import_is_reported() {
-    iteration()
-        .reports_at("use std::collections::HashMap;\n", &[(1, 1)])
-        .expect("iteration order here becomes report order or cache bytes");
-}
-
-#[test]
-fn an_unordered_annotation_is_reported() {
-    // Three distinct sites on one line would be three violations; this has one.
-    iteration()
-        .reports_at("fn go(m: HashSet<u8>) {}\n", &[(1, 10)])
-        .expect("the type is the decision, wherever it is written");
-}
-
-#[test]
-fn an_ordered_collection_passes() {
-    iteration()
-        .accepts("use std::collections::BTreeMap;\nfn go(m: BTreeSet<u8>) {}\n")
-        .expect("BTreeMap and BTreeSet iterate in key order");
-}
-
-#[test]
-fn a_file_outside_the_iteration_scope_passes() {
-    // Named distinctly from `tracked-reads-only`'s `a_file_outside_the_scope_passes` above:
-    // this file is one module, and two `#[test]` functions sharing a name is `E0428`, not a
-    // rule-behavior question — the same collision the brief's empty-scope test already
-    // anticipated for a different pair of names, just not for this one.
-    RuleTester::configured_with_extension(
-        "iteration-scope",
-        ITERATION,
-        "rs",
-        "{ scope: ['crates/lanekeep-report/'] }",
-    )
-    .expect("the rule builds")
-    .accepts("use std::collections::HashMap;\n")
-    .expect("a HashMap whose order never leaves its crate is fine");
-}
-
-#[test]
-fn an_empty_iteration_scope_is_refused() {
-    // `RuleTester::configured` only writes the fixture to disk; the factory is not called
-    // until `run` loads the config, which is what `accepts` triggers below. The error surfaces
-    // there, as a `TestError::Load`, not from `configured` itself. Task 5 established this
-    // shape the hard way — a test asserting on `configured`'s own Result passes whether the
-    // guard exists or not.
-    let error = RuleTester::configured_with_extension(
-        "iteration-noscope",
-        ITERATION,
-        "rs",
-        "{ scope: [] }",
-    )
-    .expect("the rule builds")
-    .accepts("fn go() {}\n")
-    .expect_err("a rule scoped to nothing must refuse to load rather than check nothing");
-    // Assert on wording unique to the thrown message, not on a short word. `RuleTester`'s
-    // temp directory embeds the tester's name and every `ConfigError`'s `Display` interpolates
-    // that path, so `contains("scope")` would be satisfied by the path alone for any load
-    // error at all — including one that has nothing to do with this guard.
-    assert!(
-        format!("{error}").contains("silently checks nothing"),
-        "{error}"
-    );
 }
 
 const GATES: &str = include_str!("../../../lanekeep/rules/gates-are-and.ts");
