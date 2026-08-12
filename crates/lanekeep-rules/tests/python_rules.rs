@@ -30,6 +30,11 @@ const MUTABLE_DEFAULT_RULE_ID: &str = "lanekeep/no-mutable-default-argument";
 /// The remediation every `no-mutable-default-argument` violation carries, from the rule's card.
 const MUTABLE_DEFAULT_REMEDIATION: &str = "default to None and build the value inside the \
                                            function, so each call gets its own";
+/// The rule id every `py-explicit-encoding` violation carries.
+const EXPLICIT_ENCODING_RULE_ID: &str = "local/py-explicit-encoding";
+/// The remediation every `py-explicit-encoding` violation carries, from the rule's card.
+const EXPLICIT_ENCODING_REMEDIATION: &str = "pass `encoding=\"utf-8\"` — the default is \
+                                            locale-dependent, and on Windows it is cp1252";
 /// The severity every violation carries, resolved by config rather than declared by the rule.
 const SEVERITY: Severity = Severity::Error;
 
@@ -248,6 +253,87 @@ fn the_python_no_mutable_default_argument_component_matches_the_typescript_origi
             .expect("runs"),
         MUTABLE_DEFAULT_RULE_ID,
         MUTABLE_DEFAULT_REMEDIATION,
+    )
+    .expect("the id, severity and remediation match the TypeScript original's");
+}
+
+#[test]
+fn the_python_py_explicit_encoding_component_matches_the_typescript_original() {
+    let Some(tester) = tester("py-explicit-encoding") else {
+        return;
+    };
+    tester
+        .reports_at("def go(p):\n    return open(p)\n", &[(2, 12)])
+        .expect("Windows defaults to cp1252 and the failure is a truncated read");
+    assert_identity(
+        &tester
+            .run("def go(p):\n    return open(p)\n")
+            .expect("runs"),
+        EXPLICIT_ENCODING_RULE_ID,
+        EXPLICIT_ENCODING_REMEDIATION,
+    )
+    .expect("the id, severity and remediation match the TypeScript original's");
+    tester
+        .reports_at("def go(p):\n    return Path(p).read_text()\n", &[(2, 12)])
+        .expect("read_text takes the same default");
+    tester
+        .reports_at(
+            "def go(p, data):\n    return Path(p).write_text(data)\n",
+            &[(2, 12)],
+        )
+        .expect("write_text takes the same default as read_text, and needs the same encoding");
+    tester
+        .accepts("def go(p):\n    a = open(p, encoding=\"utf-8\")\n    b = Path(p).read_text(encoding=\"utf-8\")\n")
+        .expect("naming the encoding is the whole fix");
+    tester
+        .accepts("def go(p):\n    return len(p)\n")
+        .expect("only the text-reading calls take an encoding");
+    tester
+        .accepts("def go(p):\n    return open(p, \"rb\")\n")
+        .expect("a binary open takes no encoding at all; there is nothing to add");
+    tester
+        .accepts("def go(p):\n    return open(p, mode=\"rb\")\n")
+        .expect("mode is still binary whether it is positional or a keyword");
+    tester
+        .reports_at("def go(p):\n    return open(p, \"r\")\n", &[(2, 12)])
+        .expect("text mode still needs an explicit encoding; only binary is exempt");
+    tester
+        .reports_at("def go():\n    return open(\"b.txt\")\n", &[(2, 12)])
+        .expect("a path containing `b` is not a mode; only the second positional argument is");
+    tester
+        .reports_at(
+            "def go(p, readable_mode):\n    return open(p, mode=readable_mode)\n",
+            &[(2, 12)],
+        )
+        .expect("a mode that is not a string literal cannot be proven binary, so it must still be reported");
+    tester
+        .accepts("def go(p):\n    return open(p, mode=\"rb\")\n")
+        .expect(
+            "a string-literal mode keyword is exactly what the new check is supposed to accept",
+        );
+    tester
+        .reports_at("def go(p):\n    return open(p, buffering=1)\n", &[(2, 12)])
+        .expect("buffering is not mode; only a keyword named mode can indicate binary");
+    tester
+        .reports_at(
+            "def go(p):\n    return open(p, errors=\"backslashreplace\")\n",
+            &[(2, 12)],
+        )
+        .expect(
+            "errors is not mode, and its value being a string that contains `b` must not matter",
+        );
+    tester
+        .reports_messages(
+            "def go(p):\n    return open(p)\n",
+            &["`open` without `encoding=` reads cp1252 on Windows, which fails on the first non-ASCII byte"],
+        )
+        .expect("the message is the TypeScript original's");
+    assert_identity(
+        &tester
+            .run("def go(p):\n    return open(p)\n")
+            .expect("runs"),
+        EXPLICIT_ENCODING_RULE_ID,
+        EXPLICIT_ENCODING_REMEDIATION,
     )
     .expect("the id, severity and remediation match the TypeScript original's");
 }
