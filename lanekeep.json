@@ -23,7 +23,7 @@
     "lanekeep/no-context-in-struct",
     { "rule": "lanekeep/no-circular-imports", "options": {} },
     {
-      "rule": "./lanekeep/rules/one-parser-per-file.ts",
+      "rule": "./crates/lanekeep-rules/components/one-parser-per-file.wasm",
       "options": { "allow": [] }
     },
     {

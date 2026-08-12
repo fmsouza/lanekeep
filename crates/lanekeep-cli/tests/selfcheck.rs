@@ -44,47 +44,6 @@ fn the_harness_runs() {
         .expect("the tester reports where the rule says");
 }
 
-const ONE_PARSER: &str = include_str!("../../../lanekeep/rules/one-parser-per-file.ts");
-
-fn one_parser() -> RuleTester {
-    configured_rs("one-parser", ONE_PARSER, "{ allow: [] }")
-}
-
-#[test]
-fn a_second_parser_is_reported() {
-    one_parser()
-        .reports_at(
-            "fn go() {\n    let mut parser = tree_sitter::Parser::new();\n}\n",
-            &[(2, 22)],
-        )
-        .expect("a parser outside the shared parse means the file is parsed twice");
-}
-
-#[test]
-fn a_parser_in_a_test_module_passes() {
-    // Panicking is the failure mechanism in a test, and so is parsing a fixture. The
-    // exemption is what the deleted substring test achieved by splitting on `#[cfg(test)]`.
-    one_parser()
-        .accepts(
-            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
-             let mut parser = tree_sitter::Parser::new();\n    }\n}\n",
-        )
-        .expect("test code parses its own fixtures");
-}
-
-#[test]
-fn an_allowed_path_passes() {
-    RuleTester::configured_with_extension(
-        "one-parser-allow",
-        ONE_PARSER,
-        "rs",
-        "{ allow: ['subject/input.rs'] }",
-    )
-    .expect("the rule builds")
-    .accepts("fn go() {\n    let mut parser = tree_sitter::Parser::new();\n}\n")
-    .expect("the two real parsers are named in lanekeep.json");
-}
-
 const CONTAINMENT: &str = include_str!("../../../lanekeep/rules/sandbox-containment.ts");
 
 fn containment() -> RuleTester {

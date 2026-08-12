@@ -45,6 +45,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "one-parser-per-file"
+version = "0.0.0"
+dependencies = [
+ "lanekeep-rule",
+ "serde",
+ "serde_json",
+ "wit-bindgen-rt",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
