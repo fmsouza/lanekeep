@@ -24,7 +24,13 @@
     { "rule": "lanekeep/no-circular-imports", "options": {} },
     {
       "rule": "./crates/lanekeep-rules/components/one-parser-per-file.wasm",
-      "options": { "allow": [] }
+      "options": {
+        "allow": [
+          "crates/lanekeep-engine/benches/*",
+          "crates/lanekeep-rules/tests/*",
+          "crates/lanekeep-wasm/tests/*"
+        ]
+      }
     },
     {
       "rule": "./crates/lanekeep-rules/components/sandbox-containment.wasm",
@@ -55,7 +61,10 @@
         "allow": [
           "crates/lanekeep-core/src/suppression.rs",
           "crates/lanekeep-js/src/limits.rs",
-          "crates/lanekeep-engine/benches/corpus.rs"
+          "crates/lanekeep-engine/benches/corpus.rs",
+          "crates/lanekeep-config/src/lib.rs",
+          "crates/lanekeep-core/src/limits.rs",
+          "crates/lanekeep-engine/benches/crossings.rs"
         ]
       }
     },
@@ -92,6 +101,7 @@
       "options": {
         "allow": [
           "crates/lanekeep-engine/benches/corpus.rs",
+          "crates/lanekeep-engine/benches/crossings.rs",
           "crates/lanekeep-lang-go/src/lib.rs",
           "crates/lanekeep-lang-python/src/lib.rs",
           "crates/lanekeep-lang-rust/src/lib.rs",
