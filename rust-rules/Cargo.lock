@@ -73,6 +73,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-containment"
+version = "0.0.0"
+dependencies = [
+ "lanekeep-rule",
+ "serde",
+ "serde_json",
+ "wit-bindgen-rt",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"

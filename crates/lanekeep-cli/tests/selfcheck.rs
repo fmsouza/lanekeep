@@ -44,51 +44,6 @@ fn the_harness_runs() {
         .expect("the tester reports where the rule says");
 }
 
-const CONTAINMENT: &str = include_str!("../../../lanekeep/rules/sandbox-containment.ts");
-
-fn containment() -> RuleTester {
-    configured_rs("containment", CONTAINMENT, "{ allow: [] }")
-}
-
-#[test]
-fn naming_the_engine_is_reported() {
-    containment()
-        .reports_at("use rquickjs::Ctx;\n", &[(1, 1)])
-        .expect("§5.1 keeps every line that knows QuickJS exists inside lanekeep-js");
-}
-
-#[test]
-fn a_qualified_use_of_the_engine_is_reported_once() {
-    // The query alternates over the use declaration and the path inside it, which match the
-    // same line. One site is one violation.
-    containment()
-        .reports_at(
-            "fn go() {\n    let c = rquickjs::Ctx::new();\n}\n",
-            &[(2, 13)],
-        )
-        .expect("a qualified reference is the same violation as an import");
-}
-
-#[test]
-fn the_sandbox_crate_passes() {
-    RuleTester::configured_with_extension(
-        "containment-allow",
-        CONTAINMENT,
-        "rs",
-        "{ allow: ['subject/'] }",
-    )
-    .expect("the rule builds")
-    .accepts("use rquickjs::Ctx;\n")
-    .expect("lanekeep-js is where the engine is allowed to be named");
-}
-
-#[test]
-fn an_unrelated_import_passes() {
-    containment()
-        .accepts("use std::collections::BTreeMap;\n")
-        .expect("only the engine is contained");
-}
-
 const AUTHORITY: &str = include_str!("../../../lanekeep/rules/no-ambient-authority.ts");
 
 fn authority() -> RuleTester {

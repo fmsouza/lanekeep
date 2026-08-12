@@ -27,8 +27,8 @@
       "options": { "allow": [] }
     },
     {
-      "rule": "./lanekeep/rules/sandbox-containment.ts",
-      "options": { "allow": ["crates/lanekeep-js/"] }
+      "rule": "./crates/lanekeep-rules/components/sandbox-containment.wasm",
+      "options": { "allow": ["crates/lanekeep-wasm/"] }
     },
     {
       "rule": "./lanekeep/rules/no-ambient-authority.ts",
