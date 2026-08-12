@@ -69,7 +69,6 @@
     "./lanekeep/rules/facts-must-serialize.ts",
     "./lanekeep/rules/node-handle-truthiness.ts",
     "./lanekeep/rules/no-eval-in-rules.ts",
-    "./py-rules/target/python-builtins.wasm",
     "./lanekeep/rules/py-stdout-buffer.ts",
     {
       "rule": "./crates/lanekeep-rules/components/host-api-matches-types.wasm",
