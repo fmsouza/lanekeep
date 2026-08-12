@@ -72,7 +72,7 @@
     "./lanekeep/rules/py-explicit-encoding.ts",
     "./lanekeep/rules/py-stdout-buffer.ts",
     {
-      "rule": "./lanekeep/rules/host-api-matches-types.ts",
+      "rule": "./crates/lanekeep-rules/components/host-api-matches-types.wasm",
       "options": {
         "hostPath": "crates/lanekeep-js/src/host.rs",
         "typesPath": "packages/lanekeep/index.d.ts"
