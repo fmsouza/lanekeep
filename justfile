@@ -800,8 +800,11 @@ test-py:
 #
 # **`--stub-wasi` is a requirement, not a preference.** A default build imports 26
 # instances (wall clock, environment, filesystem, sockets); a `--stub-wasi` build
-# imports exactly the declared world. `crates/lanekeep-wasm/tests/world_shape.rs` is what
-# would catch a rebuild without it.
+# imports exactly the declared world. The load-time import check in `ComponentLoader`
+# is what would catch a rebuild without it — it surfaces as a `TestError::Load` on the
+# fidelity test's first run. (`world_shape.rs`'s ambient-authority glob only covers
+# committed fixtures under `tests/fixtures/*.wasm`; the Python artifact is not committed
+# and lives in `py-rules/target/`, so that test never sees it.)
 #
 # Three artifacts, because the determinism test needs two builds of one source: the main
 # `python-builtins.wasm` (hosting the two example rules) and a determinism probe built
@@ -813,6 +816,7 @@ py-rules:
     #!/usr/bin/env bash
     set -euo pipefail
     just _require python3
+    just _require cargo-nextest
     root="$(pwd)"
 
     # The venv, created once. `componentize-py` is the one tool the gates deliberately do

@@ -78,12 +78,15 @@ same values the dispatch uses.
 ## The traps that are not preferences
 
 **`--stub-wasi` traps rather than absents.** The clock, filesystem, network,
-`os.urandom`, `uuid`, `datetime.now()`, `subprocess` and `print()` all trap as a bare
+`os.urandom`, `uuid`, `datetime.now()` and `print()` all trap as a bare
 `wasm trap: unreachable` — **uncatchable from Python** (`BaseException` never sees it)
-and poisoning the store, so a rule that reaches for one aborts the run. Meanwhile
-`random.random()`, `os.environ`, `os.getcwd()` and `sys.version` return frozen values.
-A rule must not reach for either half: the first traps, the second is a constant that
-looks like an observation.
+and poisoning the store, so a rule that reaches for one aborts the run. `subprocess` is
+the exception: wasi has no processes, so `subprocess.run` raises a *catchable* `OSError`
+that the component entry's `except Exception` converts to a graceful `rule-error` — the
+run does not abort. Still do not reach for it: a rule that needs a subprocess has left
+the sandbox's intent. Meanwhile `random.random()`, `os.environ`, `os.getcwd()` and
+`sys.version` return frozen values. A rule must not reach for either half: the first
+traps, the second is a constant that looks like an observation.
 
 **A node handle is an integer and the root's is zero.** `capture` returns `None` for a
 miss — compare with `is None`, never with truthiness, because `0` is falsy in Python
