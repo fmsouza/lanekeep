@@ -82,7 +82,16 @@ jobs:
           # crate is checked — just not by this job. Exempting the one package is
           # narrower than adding that pseudo-license to the list above, which would let
           # any unparseable declaration through.
-          allow-dependencies-licenses: pkg:cargo/rustc-demangle
+          #
+          # componentize-py is the same shape on the Python side: its metadata carries
+          # no parseable `License`/`License-Expression`, and this action reports
+          # `LicenseRef-bad-apache-2.0-and-llvm-exception` — a parser artifact for the
+          # Bytecode Alliance's Apache-2.0 WITH LLVM-exception, which is already on the
+          # allow list above. The recipe pins it to 0.25.0 and `just py-rules` is the
+          # only path that installs it.
+          allow-dependencies-licenses: >-
+            pkg:cargo/rustc-demangle,
+            pkg:pypi/componentize-py
 
   # OpenSSF Scorecard: branch protection, pinned actions, signed releases, and the
   # rest of the supply-chain posture, scored by someone other than us.
