@@ -8,13 +8,13 @@
 # A line that moves when the artifact did not means a rule's source, the runtime it is bundled
 # with, the world it is built against or the toolchain it is pinned to was changed without
 # rebuilding — run `just typescript-builtins`.
-crates/lanekeep-rules/components/typescript-builtins.wasm a2d03ff0f4a46b53ead80748e1fcf704343d2c5f5e1b9cd59bf48a322ae47e54
-crates/lanekeep-rules/components/typescript-builtins.wasm.map 766faa34491cc0f0eb644524adc81815cda2e6940e3febf1344d68900ec774e6
+crates/lanekeep-rules/components/typescript-builtins.wasm b00aa919a0cf34bed2b2fda0fd50295335522a2a854a891c18ec8c262ae23003
+crates/lanekeep-rules/components/typescript-builtins.wasm.map e1623cce2cbf1e2c712b52213a83e33ad5318c59a8a154fbefdfd86617b7b230
 crates/lanekeep-rules/modules/paths.ts 92e6793d4d5640229a938b38514863691a63f9bd245a015d6bb581bb49cae65c
-crates/lanekeep-rules/rules/no-circular-imports.ts 3ba0f2ba906a2b900740865d67cdb0f9c307d179916f8da6d2755f1aea532c1a
-crates/lanekeep-rules/rules/no-default-export.ts ecbf4b4c78b1a6142a44121d435a4aeefc841685692c50673ac64b9a741c8b54
-crates/lanekeep-rules/rules/no-restricted-imports.ts f879809c5c944428568f3c64665e1ed8ed6c03d25cbea5c3a9dc0f833e1d4ad4
-crates/lanekeep-rules/rules/no-unused-exports.ts 0ab09def28deb0a83e121c8d0d7fbdd63a865efe5677ed1229e393d20ddac2b2
+crates/lanekeep-rules/rules/no-circular-imports.ts 9a55c43c16b5e20d490ddd5ac38ee677975b5ee6f78c1cef34f7c64747cc662c
+crates/lanekeep-rules/rules/no-default-export.ts cfe8786c8d28ae53fcec8aa1bea37d27a0acbde867d98b4cec73df5253dd1ce0
+crates/lanekeep-rules/rules/no-restricted-imports.ts df7984b465a7519a797f3a56090429779ff6eeda1980688a8d44b09c423b752b
+crates/lanekeep-rules/rules/no-unused-exports.ts dd34f6b1a528559abc58605e2362011e3030b90b0fdfd1d3e0dd2accc1b5c136
 crates/lanekeep-rules/typescript/entry.ts 70f2270524af06c5ac70faf47d02fd3e01452731f5deaec3b2fdc0fb065580ec
 crates/lanekeep-rules/typescript/rolldown.config.mjs c7c7207e05efe6cf76273d3b3d4b68ae3d55f37305c7550ec2b894a6d2735e95
 crates/lanekeep-wasm/wit/world.wit 290f483be47beb5e9df599e78e2d04572af8d4586459d361bb0741714ec975ae
