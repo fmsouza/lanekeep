@@ -28,6 +28,91 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # Build the four shipped WebAssembly components from source, once, and hand them to the build
+  # and publish jobs. They are no longer committed, so the release build needs them produced here
+  # before `cargo build` embeds them via `include_bytes!` and before `cargo publish` packages them.
+  #
+  # Runs on one Linux runner rather than on each of the four `build` targets: the Rust and Go
+  # components are byte-reproducible across platforms, and the TypeScript component's bytes do not
+  # matter for a release — what matters is that the file exists to embed. Building once is correct
+  # and keeps the component toolchains off the native build matrix.
+  components:
+    name: components (build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just,cargo-binstall
+
+      - name: Install cargo-component
+        run: cargo binstall --no-confirm --locked cargo-component
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.5"
+          cache: false
+
+      - name: Install TinyGo
+        env:
+          TINYGO_VERSION: "0.41.1"
+          TINYGO_SHA256: "e156d1d93a376eef639a4143d13be07e8c463fb6cf2d7d447698ed4474d23e91"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/tinygo.tar.gz" \
+            "https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo${TINYGO_VERSION}.linux-amd64.tar.gz"
+          echo "${TINYGO_SHA256}  ${RUNNER_TEMP}/tinygo.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/tinygo.tar.gz"
+          echo "${RUNNER_TEMP}/tinygo/bin" >> "${GITHUB_PATH}"
+
+      - name: Install binaryen (wasm-opt)
+        env:
+          BINARYEN_VERSION: "131"
+          BINARYEN_SHA256: "b5bf1f0eaf17c63ee588ff7a5954dc8f6ce2c26989051c66f24dfe9ece3e46db"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/binaryen.tar.gz" \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          echo "${BINARYEN_SHA256}  ${RUNNER_TEMP}/binaryen.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/binaryen.tar.gz"
+          echo "WASMOPT=${RUNNER_TEMP}/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" >> "${GITHUB_ENV}"
+
+      - name: Install wasm-tools
+        env:
+          WASM_TOOLS_VERSION: "1.255.0"
+          WASM_TOOLS_SHA256: "a62237f4731c45f665f1115cad39acaeec02963cbc848c9473ab033eed837072"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/wasm-tools.tar.gz" \
+            "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz"
+          echo "${WASM_TOOLS_SHA256}  ${RUNNER_TEMP}/wasm-tools.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/wasm-tools.tar.gz"
+          echo "${RUNNER_TEMP}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux" >> "${GITHUB_PATH}"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install the jco toolchain
+        run: npm ci --prefix packages/lanekeep
+
+      - run: |
+          just rust-rules
+          just go-rules
+          just typescript-builtins
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components/
+          if-no-files-found: error
+          retention-days: 7
+
   # One job per target, each built natively. Cross-compilation would be fewer jobs and more
   # ways to be subtly wrong — a binary that links against the wrong libc is a bug reported by
   # a user rather than by CI.
@@ -43,6 +128,7 @@ jobs:
   # a platform nobody has run once is how a broken binary reaches a user.
   build:
     name: build (${{ matrix.target }})
+    needs: components
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -122,6 +208,13 @@ jobs:
           python3 -m venv "${RUNNER_TEMP}/zig"
           "${RUNNER_TEMP}/zig/bin/pip" install --quiet cargo-zigbuild==0.23.0 ziglang==0.16.0
           echo "${RUNNER_TEMP}/zig/bin" >> "${GITHUB_PATH}"
+
+      # The built components, restored so `crates/lanekeep-rules/build.rs` finds them already
+      # present (a no-op) rather than reaching for the component toolchains on a native build.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
 
       # The `dist` profile, not `release`: it turns on LTO and strips symbols, which is
       # what a shipped binary wants and what a developer's `cargo build --release` should
@@ -348,6 +441,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: "1.95.0"
+
+      # The built components, restored so `cargo publish` packages them into `lanekeep-rules`'
+      # tarball (`Cargo.toml` includes `components/**`) and its verify build finds them via
+      # `include_bytes!`. Without them the crate cannot publish.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
 
       - name: Publish crates
         if: steps.gates.outputs.crates == 'yes'

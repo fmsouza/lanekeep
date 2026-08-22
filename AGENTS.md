@@ -142,7 +142,7 @@ crates/
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
   lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring
-  lanekeep-rules     built-in rules: TypeScript sources, plus the committed components
+  lanekeep-rules     built-in rules: TypeScript sources, plus the components built at build time
   lanekeep-report    human, json, sarif, agent reporters
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
   lanekeep-testkit   RuleTester
@@ -626,25 +626,16 @@ behavioral rather than byte-wise: `tests/js_globals.rs` derives its probes from 
 an artifact that no longer satisfies the contract fails the moment the contract moves. That is
 weaker — it catches a stale artifact only where the two disagree — and it is what there is.
 
-**There are four digest manifests now, one per recipe that rewrites a committed artifact, and
-what may be shared between them is an input rather than an artifact.** `just wasm-fixtures`
-writes `fixture-digests.txt`, `just rust-rules` writes `rule-component-digests.txt`,
-`just typescript-builtins` writes `typescript-component-digests.txt`, and `just go-rules` writes
-`go-component-digests.txt`. All four record `wit/world.wit`, deliberately: it is a build input to
-every component in the tree, and a change to it has to send you to every recipe. An *artifact* is
-the opposite case, because exactly one recipe can produce it — and `typescript-builtins.wasm`
-sits in `crates/lanekeep-rules/components/`, beside artifacts two different recipes build.
-Recording it in another recipe's manifest as well would mean a rebuild of the TypeScript
-component, whose bytes change every time, leaves the *Rust* manifest red until somebody runs
-`just rust-rules`: a recipe about other artifacts, needing `cargo component` and a wasm target,
-to fix a build it had no part in. `fixture_currency.rs` partitions them three ways rather than
-two — the Go component's artifacts are the third set, subtracted by the same mechanism and for
-the same reason: `just wasm-fixtures` cannot rebuild `go-maporder.wasm`, which needs TinyGo.
-
-Count the manifests with `ls crates/lanekeep-wasm/tests/*digests*.txt`. This sentence said
-"three" for a while after the fourth landed, which is the entry below about grepping a formula
-arriving in the file that warns about it: the sweep that added the Go recipe matched recipe names
-and artifact paths, and "three" is neither.
+**There are two digest manifests now, one per recipe that rewrites a *committed* artifact.** The
+shipped components under `crates/lanekeep-rules/components/` are no longer committed — they are
+build-time artifacts produced by `crates/lanekeep-rules/build.rs` and the `just rust-rules` /
+`just typescript-builtins` / `just go-rules` recipes, so a digest that ties a *committed* binary to
+its sources has nothing left to assert for them. What remains committed is the wasm-loader test
+fixtures, and their currency is what the two manifests hold: `just wasm-fixtures` writes
+`fixture-digests.txt`, and `just go-rules` writes `go-component-digests.txt` for the one fixture it
+builds rather than `wasm-fixtures` — `go-maporder.wasm`, which needs TinyGo and is subtracted from
+the fixtures walk. Both record `wit/world.wit`, deliberately: it is a build input to every
+component in the tree, and a change to it has to send you to every recipe.
 
 **And `jco componentize` needs a far newer Node than `just test-js` does, which is discovered at
 *install* time and reported at build time, by neither.** `test-js` requires Node 18, the floor
@@ -1104,7 +1095,7 @@ checkouts produces different bytes — and a component's bytes are a cache-key i
 developer computes a different key for one commit. This is the rustup-toolchain-name trap above
 and strictly worse: a toolchain name differs between two people who reached one compiler by
 different routes, and a checkout path differs for everybody. Measured on TinyGo 0.41.1 against the
-committed `crates/lanekeep-rules/components/go-builtins.wasm`, which `just go-rules` rebuilds:
+`crates/lanekeep-rules/components/go-builtins.wasm`, which `just go-rules` rebuilds:
 **13,187 bytes** with the flag and **322,301** without, with
 `strings … | grep -cE '/Users|/opt/homebrew'` finding **0** lines against **85**, twelve of which
 name the worktree. Nothing turns red — the artifact is valid and the rule works — so the flag has

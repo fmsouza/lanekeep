@@ -92,12 +92,12 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
 /// ships on.
 ///
 /// The two claims that keeps honest are different and both are needed. That the *source* is
-/// right is what those tests assert. That the *artifact* is this source compiled is what
-/// `crates/lanekeep-wasm/tests/fixture_currency.rs` asserts, against
-/// `tests/typescript-component-digests.txt` — `componentize-js` is not byte-reproducible, so a
-/// digest of the inputs is the only staleness check available. Neither substitutes for the
-/// other: source tests over a stale artifact pass while the shipped rule is a previous version,
-/// and a current artifact built from a wrong rule is current and wrong.
+/// right is what those tests assert. That the *artifact* is this source compiled is what the
+/// build guarantees: the component is no longer committed — `crates/lanekeep-rules/build.rs`
+/// (and `just typescript-builtins`) compiles it from these exact files at build time, so there is
+/// no stale committed binary for a digest manifest to detect. Neither substitutes for the other:
+/// source tests over a stale artifact would pass while the shipped rule is a previous version, and
+/// a current artifact built from a wrong rule is current and wrong.
 ///
 /// **And neither is behavioral coverage of the compiled rule**, which is a third claim again:
 /// a digest says the artifact was built from this text and says nothing about what it does.
@@ -743,12 +743,13 @@ mod tests {
     /// cannot be argued with is that the rules did not change. "We did not edit them" is not
     /// evidence; it is the thing being asserted.
     ///
-    /// Hand-written constants, and that is the difference between this and
-    /// `crates/lanekeep-wasm/tests/typescript-component-digests.txt`. That manifest answers a
-    /// different question — whether the committed artifact was built from the sources beside it
-    /// — and `just typescript-builtins` rewrites it, correctly, on every rebuild. A tripwire
-    /// something re-blesses is not a tripwire. These move only when a person changes them, and
-    /// changing one is a decision about the frozen set rather than a build step.
+    /// Hand-written constants, and that is the difference between this and a digest manifest: the
+    /// old `typescript-component-digests.txt` answered a different question — whether the
+    /// committed artifact was built from the sources beside it — and was rewritten on every
+    /// rebuild. A tripwire something re-blesses is not a tripwire. The component is now built
+    /// from these sources at build time rather than committed, so the manifest is gone; these
+    /// constants move only when a person changes them, and changing one is a decision about the
+    /// frozen set rather than a build step.
     ///
     /// Hashed after folding CRLF to LF, on the same terms as
     /// `crates/lanekeep-wasm/tests/fixture_currency.rs`'s `digest`: there is no `.gitattributes`

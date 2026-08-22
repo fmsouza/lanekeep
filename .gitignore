@@ -87,3 +87,12 @@ $RECYCLE.BIN/
 
 # Python bytecode caches from the py-rules authoring lane's host-side tests.
 __pycache__/
+
+# Built WebAssembly components. These are build-time artifacts produced from the committed
+# sources in rust-rules/, go-rules/ and crates/lanekeep-rules/typescript/ by the CI build and
+# publish jobs (and by `crates/lanekeep-rules/build.rs` during a local build). They are not
+# committed — only their sources are.
+/crates/lanekeep-rules/components/
+
+# Orchestrator working state (specs/plans/progress). Never committed.
+/docs/dsh/

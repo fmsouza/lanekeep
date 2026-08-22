@@ -1,14 +1,13 @@
-# What the committed Go artifacts were built from: the shipped built-ins component, and the
-# determinism fixture behind `crates/lanekeep-wasm/tests/go_map_order.rs`.
+# What the committed Go fixture was built from: the determinism fixture behind
+# `crates/lanekeep-wasm/tests/go_map_order.rs`.
 #
 # Written by `just go-rules`, asserted by `crates/lanekeep-wasm/tests/fixture_currency.rs`, and
 # not to be edited by hand: a value here that no build produced is exactly the claim this file
 # exists to deny. `<path> <blake3>`, sorted, paths relative to the repository root.
 #
-# A line that moves when the artifacts did not means a rule's source, the SDK they are built on,
-# the generated bindings or the world they are built against was changed without rebuilding — run
-# `just go-rules`.
-crates/lanekeep-rules/components/go-builtins.wasm 9cd9dad1cc289dde2349acf42be4a3999f18a2558824797ab4cccba74915259b
+# A line that moves when the fixture did not means a source under `go-rules/`, the SDK it is
+# built on, the generated bindings or the world it is built against was changed without
+# rebuilding — run `just go-rules`.
 crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm 33de5c491ba2b92778c8e56f5bcf4ee276390a76cea14e395609a63e42b56250
 crates/lanekeep-wasm/wit/world.wit 290f483be47beb5e9df599e78e2d04572af8d4586459d361bb0741714ec975ae
 go-rules/.gitignore 02af855e1226375a64521b31bd8994a45c665fbe93ea55dfdb4b38f062d98c36

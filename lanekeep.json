@@ -38,7 +38,12 @@
     },
     {
       "rule": "./crates/lanekeep-rules/components/no-ambient-authority.wasm",
-      "options": { "allow": ["crates/lanekeep-core/src/changed.rs"] }
+      "options": {
+        "allow": [
+          "crates/lanekeep-core/src/changed.rs",
+          "crates/lanekeep-rules/build.rs"
+        ]
+      }
     },
     {
       "rule": "./crates/lanekeep-rules/components/tracked-reads-only.wasm",
@@ -108,7 +113,8 @@
           "crates/lanekeep-lang-go/src/lib.rs",
           "crates/lanekeep-lang-python/src/lib.rs",
           "crates/lanekeep-lang-rust/src/lib.rs",
-          "crates/lanekeep-languages/src/lib.rs"
+          "crates/lanekeep-languages/src/lib.rs",
+          "crates/lanekeep-rules/build.rs"
         ]
       }
     }

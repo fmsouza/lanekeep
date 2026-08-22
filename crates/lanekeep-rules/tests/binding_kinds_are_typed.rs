@@ -283,12 +283,19 @@ fn rendered(violations: &[Violation]) -> String {
 /// below is the same parallelism without either cost. Each case already has a directory of its
 /// own, which is what makes it safe: a tester is never shared, so there is nothing between the
 /// threads to synchronize.
-fn assert_every_case(build: impl Fn(&Case) -> RuleTester + Sync) {
+fn assert_every_case(build: impl Fn(&Case) -> Option<RuleTester> + Sync) {
     let build = &build;
     let results: Vec<Option<String>> = std::thread::scope(|scope| {
         let running: Vec<_> = CASES
             .iter()
-            .map(|case| scope.spawn(move || assert_case(&build(case), case)))
+            .map(|case| {
+                scope.spawn(move || {
+                    let Some(tester) = build(case) else {
+                        return Ok(());
+                    };
+                    assert_case(&tester, case)
+                })
+            })
             .collect();
         running
             .into_iter()
@@ -310,22 +317,33 @@ fn assert_every_case(build: impl Fn(&Case) -> RuleTester + Sync) {
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// The artifact `just rust-rules` built into `components/`, or `None` when absent.
+/// When absent the test returns early; CI builds the artifact before running the gate.
+fn component_bytes(name: &str) -> Option<Vec<u8>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("components")
+        .join(format!("{name}.wasm"));
+    std::fs::read(path).ok()
+}
+
 /// The rule: a WebAssembly component built from `rust-rules/binding-kinds-are-typed/`.
 ///
 /// A **project rule** (`local/` id), so it is not embedded in the binary the way a built-in is.
-/// The tester reads the committed artifact `just rust-rules` produced from disk, and a path
-/// reference contributes every rule the artifact hosts — which is one, so the index is
-/// discarded and the whole component is the rule.
+/// The artifact is a build output that `just rust-rules` writes into `components/`, and the test
+/// reads it from disk there — it is not embedded, and is not committed to git. When it is absent
+/// (a checkout that has not run `just rust-rules`), the tests skip rather than fail.
 ///
 /// The options reach it as data rather than as source. A component cannot close over a
 /// host-supplied value the way a JavaScript factory does, so `configure(options-json)` is where
 /// they arrive — which is why the table's option strings are JSON. Every case shares the same
 /// options, because the rule only runs on the binding file and the types fixture is always the
 /// other file it reads.
-fn component(_case: &Case) -> RuleTester {
-    const COMPONENT: &[u8] = include_bytes!("../components/binding-kinds-are-typed.wasm");
-    RuleTester::for_component_configured("binding-kinds-are-typed", COMPONENT, "rs", OPTIONS)
-        .expect("builds")
+fn component(_case: &Case) -> Option<RuleTester> {
+    let component = component_bytes("binding-kinds-are-typed")?;
+    Some(
+        RuleTester::for_component_configured("binding-kinds-are-typed", &component, "rs", OPTIONS)
+            .expect("builds"),
+    )
 }
 
 #[test]
