@@ -28,6 +28,7 @@ jobs:
   # drifts, and the moment it drifts "passes locally" stops meaning anything.
   gate:
     name: gate (just check)
+    needs: components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +59,7 @@ jobs:
   # are platform-independent, so running them three times buys nothing but minutes.
   test:
     name: test (${{ matrix.os }})
+    needs: components
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
