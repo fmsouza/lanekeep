@@ -210,9 +210,15 @@ jobs:
           tool: just,cargo-binstall
 
       # `just rust-rules` needs it to build the rule components; it is not in any gate, so this
-      # is the one place it is installed.
+      # is the one place it is installed. `--force` because cargo-binstall has been observed to
+      # report "already installed" and skip on a fresh runner where the binary is not actually
+      # present; `command -v` fails the step loudly if it is still not on PATH after install.
+      # Pinned to the version AGENTS.md's measurements name, so the Rust components' bytes stay
+      # reproducible across runs.
       - name: Install cargo-component
-        run: cargo binstall --no-confirm --locked cargo-component
+        run: |
+          cargo binstall --no-confirm --force cargo-component@0.21.1
+          command -v cargo-component
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
