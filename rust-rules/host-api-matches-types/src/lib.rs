@@ -186,7 +186,10 @@ impl Rule for HostApiMatchesTypes {
                 file_contains: Vec::new(),
                 file_not_contains: Vec::new(),
             },
-            timeout: None,
+            // The whole reconciliation of `host.rs` against `index.d.ts` is one invocation, and
+            // it is genuinely heavy — two trees parsed and cross-referenced. The 1s default is
+            // not enough on a slow CI runner, so it declares a budget of its own.
+            timeout: Some(5_000),
         }
     }
 

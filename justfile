@@ -823,7 +823,11 @@ py-rules:
 # nothing, so the tests that prove the engine works come first.
 lanekeep:
     cargo build -p lanekeep-cli
-    ./target/debug/lanekeep check .
+    # The self-check compiles and instantiates ~twenty components on a cold CI cache before it
+    # checks anything, which the 15s default budget cannot absorb — the gate reddens on a cold
+    # runner while a warm local one passes. The budget is raised here, not in `lanekeep.json`,
+    # because the self-check is lanekeep's own; a user's budget stays the documented default.
+    ./target/debug/lanekeep check . --timeout 60000
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 #

@@ -170,7 +170,10 @@ impl Rule for BindingKindsAreTyped {
                 file_contains: Vec::new(),
                 file_not_contains: Vec::new(),
             },
-            timeout: None,
+            // Same shape as `host-api-matches-types`: the whole reconciliation of `binding.rs`
+            // against `index.d.ts` is one heavy invocation, so it declares a budget of its own
+            // rather than risk the 1s default on a slow CI runner.
+            timeout: Some(5_000),
         }
     }
 
