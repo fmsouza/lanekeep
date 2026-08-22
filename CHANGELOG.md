@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/fmsouza/lanekeep/compare/v0.6.1...v0.7.0) - 2026-08-22
+
+### Added
+
+- *(rules)* [**breaking**] author the Go built-ins in Go, compiled to a component ([#118](https://github.com/fmsouza/lanekeep/pull/118))
+- *(rules)* author rules in Python, compiled to a component ([#124](https://github.com/fmsouza/lanekeep/pull/124))
+- *(wasm)* [**breaking**] the host API in WIT, and lanekeep-wasm ([#103](https://github.com/fmsouza/lanekeep/pull/103))
+- *(rules)* [**breaking**] rules authored in Rust, compiled to components ([#106](https://github.com/fmsouza/lanekeep/pull/106))
+- *(rules)* [**breaking**] compile TypeScript rules to WebAssembly components ([#116](https://github.com/fmsouza/lanekeep/pull/116))
+- *(rules)* [**breaking**] migrate the sixteen self-check rules to WASM components ([#126](https://github.com/fmsouza/lanekeep/pull/126))
+
+### Fixed
+
+- *(rules)* honor the allow option on the Rust-targeting built-ins ([#105](https://github.com/fmsouza/lanekeep/pull/105))
+- *(cli)* honor --timeout ([#91](https://github.com/fmsouza/lanekeep/pull/91))
+
+### Performance
+
+- *(engine)* match every rule in one traversal ([#93](https://github.com/fmsouza/lanekeep/pull/93))
+
 ## [0.6.1](https://github.com/fmsouza/lanekeep/compare/v0.6.0...v0.6.1) - 2026-08-03
 
 ### Performance
