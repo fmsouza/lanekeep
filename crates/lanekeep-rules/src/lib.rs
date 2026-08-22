@@ -92,12 +92,12 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
 /// ships on.
 ///
 /// The two claims that keeps honest are different and both are needed. That the *source* is
-/// right is what those tests assert. That the *artifact* is this source compiled is what
-/// `crates/lanekeep-wasm/tests/fixture_currency.rs` asserts, against
-/// `tests/typescript-component-digests.txt` — `componentize-js` is not byte-reproducible, so a
-/// digest of the inputs is the only staleness check available. Neither substitutes for the
-/// other: source tests over a stale artifact pass while the shipped rule is a previous version,
-/// and a current artifact built from a wrong rule is current and wrong.
+/// right is what those tests assert. That the *artifact* is this source compiled is what the
+/// build guarantees: the component is no longer committed — `crates/lanekeep-rules/build.rs`
+/// (and `just typescript-builtins`) compiles it from these exact files at build time, so there is
+/// no stale committed binary for a digest manifest to detect. Neither substitutes for the other:
+/// source tests over a stale artifact would pass while the shipped rule is a previous version, and
+/// a current artifact built from a wrong rule is current and wrong.
 ///
 /// **And neither is behavioral coverage of the compiled rule**, which is a third claim again:
 /// a digest says the artifact was built from this text and says nothing about what it does.
@@ -743,12 +743,13 @@ mod tests {
     /// cannot be argued with is that the rules did not change. "We did not edit them" is not
     /// evidence; it is the thing being asserted.
     ///
-    /// Hand-written constants, and that is the difference between this and
-    /// `crates/lanekeep-wasm/tests/typescript-component-digests.txt`. That manifest answers a
-    /// different question — whether the committed artifact was built from the sources beside it
-    /// — and `just typescript-builtins` rewrites it, correctly, on every rebuild. A tripwire
-    /// something re-blesses is not a tripwire. These move only when a person changes them, and
-    /// changing one is a decision about the frozen set rather than a build step.
+    /// Hand-written constants, and that is the difference between this and a digest manifest: the
+    /// old `typescript-component-digests.txt` answered a different question — whether the
+    /// committed artifact was built from the sources beside it — and was rewritten on every
+    /// rebuild. A tripwire something re-blesses is not a tripwire. The component is now built
+    /// from these sources at build time rather than committed, so the manifest is gone; these
+    /// constants move only when a person changes them, and changing one is a decision about the
+    /// frozen set rather than a build step.
     ///
     /// Hashed after folding CRLF to LF, on the same terms as
     /// `crates/lanekeep-wasm/tests/fixture_currency.rs`'s `digest`: there is no `.gitattributes`
@@ -761,25 +762,29 @@ mod tests {
     /// reaching from a unit test here would cost a new dependency edge rather than a shared one.
     #[test]
     fn the_rules_the_migration_moved_are_byte_for_byte_what_they_were() {
+        // The four TypeScript built-ins' digests were re-recorded when the self-check rules
+        // came onto main: #95 added `language: ['typescript', 'tsx']` to each, which the
+        // `rule-declares-language` self-check rule requires. That is a deliberate change to
+        // the frozen set — the addition is the point, not a side effect.
         const FROZEN: &[(&str, &str, &[u8])] = &[
             (
                 "rules/no-circular-imports.ts",
-                "3ba0f2ba906a2b900740865d67cdb0f9c307d179916f8da6d2755f1aea532c1a",
+                "9a55c43c16b5e20d490ddd5ac38ee677975b5ee6f78c1cef34f7c64747cc662c",
                 include_bytes!("../rules/no-circular-imports.ts"),
             ),
             (
                 "rules/no-default-export.ts",
-                "ecbf4b4c78b1a6142a44121d435a4aeefc841685692c50673ac64b9a741c8b54",
+                "cfe8786c8d28ae53fcec8aa1bea37d27a0acbde867d98b4cec73df5253dd1ce0",
                 include_bytes!("../rules/no-default-export.ts"),
             ),
             (
                 "rules/no-restricted-imports.ts",
-                "f879809c5c944428568f3c64665e1ed8ed6c03d25cbea5c3a9dc0f833e1d4ad4",
+                "df7984b465a7519a797f3a56090429779ff6eeda1980688a8d44b09c423b752b",
                 include_bytes!("../rules/no-restricted-imports.ts"),
             ),
             (
                 "rules/no-unused-exports.ts",
-                "0ab09def28deb0a83e121c8d0d7fbdd63a865efe5677ed1229e393d20ddac2b2",
+                "dd34f6b1a528559abc58605e2362011e3030b90b0fdfd1d3e0dd2accc1b5c136",
                 include_bytes!("../rules/no-unused-exports.ts"),
             ),
             (
@@ -842,7 +847,7 @@ mod tests {
     /// test proves nothing on the platform where that thing differs.
     #[test]
     fn a_crlf_checkout_still_matches_the_frozen_digest() {
-        const RECORDED: &str = "3ba0f2ba906a2b900740865d67cdb0f9c307d179916f8da6d2755f1aea532c1a";
+        const RECORDED: &str = "9a55c43c16b5e20d490ddd5ac38ee677975b5ee6f78c1cef34f7c64747cc662c";
         let canonical = fold(include_bytes!("../rules/no-circular-imports.ts"));
 
         let mut crlf = Vec::with_capacity(canonical.len());

@@ -1,6 +1,22 @@
 [package]
 name = "lanekeep-rules"
 description = "Built-in rules shipped with lanekeep."
+build = "build.rs"
+# The `components/` directory is gitignored — the `.wasm` artifacts are build-time outputs, not
+# committed — so without an explicit `include` cargo's default packaging (which honors
+# `.gitignore`) drops them and the crate's `include_bytes!` of the shipped built-ins fails to
+# verify at publish time. The build job builds them into `components/` before `cargo publish`,
+# and this list makes sure they ride along in the published tarball. Everything else is the
+# crate's own source, enumerated so the explicit list does not silently exclude it.
+include = [
+    "src/**",
+    "rules/**",
+    "modules/**",
+    "typescript/**",
+    "tests/**",
+    "components/**",
+    "build.rs",
+]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

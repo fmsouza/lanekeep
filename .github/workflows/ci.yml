@@ -28,6 +28,7 @@ jobs:
   # drifts, and the moment it drifts "passes locally" stops meaning anything.
   gate:
     name: gate (just check)
+    needs: components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,12 +46,20 @@ jobs:
         with:
           tool: just,cargo-nextest,cargo-deny,cargo-machete,typos
 
+      # The built components, restored so `crates/lanekeep-rules/build.rs` finds them already
+      # present (a no-op) and `lanekeep.json`/the self-check tests can read them from disk.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
+
       - run: just check
 
   # Other platforms run the tests only. Formatting, clippy, licensing and spelling
   # are platform-independent, so running them three times buys nothing but minutes.
   test:
     name: test (${{ matrix.os }})
+    needs: components
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -71,6 +80,13 @@ jobs:
         with:
           tool: just,cargo-nextest
 
+      # The built components, for the same reason the gate job downloads them: build.rs reads
+      # the shipped components and the self-check tests read theirs from disk.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
+
       - run: just test
 
       # The justfile forces bash, which exists on the Windows runner via Git Bash,
@@ -89,6 +105,7 @@ jobs:
   # form that overrides the pin.
   msrv:
     name: msrv
+    needs: components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,6 +124,13 @@ jobs:
         with:
           tool: just
 
+      # The built components, so `build.rs` finds them present (a no-op) instead of reaching for
+      # the component toolchains, which this job does not install.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
+
       - run: just msrv
 
   # A single required check to point branch protection at. Adding a job above does
@@ -120,6 +144,7 @@ jobs:
   # threshold is still visible to anyone reading the log, which is the point.
   bench:
     name: bench (budgets)
+    needs: components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -136,31 +161,64 @@ jobs:
         with:
           tool: just
 
+      # The built components, for the same reason as every other job that compiles lanekeep-rules:
+      # build.rs reads them, and this job does not install the component toolchains.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
+
       - run: just bench
 
-  # The Go component, rebuilt from source and compared byte for byte against what is committed.
+  # The WebAssembly components, built from source and uploaded so the gate and test jobs can
+  # embed and read them without installing `cargo component`, Node, TinyGo or the other component
+  # toolchains. The components are no longer committed — this job is what produces them.
   #
-  # This check is possible here and impossible for the TypeScript component beside it.
-  # `componentize-js` output is a SpiderMonkey heap image and is not reproducible between two
-  # builds of one unchanged tree, so for that artifact a digest manifest is the whole staleness
-  # check; it catches a source edited without a rebuild and cannot catch an artifact that no
-  # source in the tree produces. A TinyGo build *is* reproducible, so this job closes the second
-  # half — and it is the only thing that can, since `LANEKEEP_BLESS_GO_RULES=1` will happily
-  # re-record whatever bytes are already in the tree.
+  # It also carries the one still-committed component's currency check. `just go-rules` rebuilds
+  # the `go-maporder.wasm` fixture (the shipped `go-builtins.wasm` is un-committed now) and
+  # re-records its digest, and the diff below fails if the committed fixture drifted from its
+  # source. The shipped components' bytes are not diffed — they are build outputs, not inputs.
   #
-  # **Four versions are pinned because all four are inputs to the artifact's bytes.** `tinygo
+  # **Four versions are pinned because all four are inputs to the Go fixture's bytes.** `tinygo
   # build` shells out to `wasm-opt` and to `wasm-tools`, and compiles the standard library out of
   # the Go toolchain's `GOROOT`; `just go-rules` documents the measurement. Installed by hand
   # rather than through actions, so that the four sit in one table a reader can compare against
   # the machine that produced the committed bytes. A floating version anywhere here is a red diff
   # nobody introduced.
-  go-rules:
-    name: go-rules (rebuild and diff)
+  components:
+    name: components (build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # `cargo component` needs the wasm target, and `just rust-rules` runs clippy and rustdoc
+      # over the rule crates once their bindings exist.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: components
+
+      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        with:
+          tool: just,cargo-binstall
+
+      # `just rust-rules` needs it to build the rule components; it is not in any gate, so this
+      # is the one place it is installed. `--force` because cargo-binstall has been observed to
+      # report "already installed" and skip on a fresh runner where the binary is not actually
+      # present; `command -v` fails the step loudly if it is still not on PATH after install.
+      # Pinned to the version AGENTS.md's measurements name, so the Rust components' bytes stay
+      # reproducible across runs.
+      - name: Install cargo-component
+        run: |
+          cargo binstall --no-confirm --force cargo-component@0.21.1
+          command -v cargo-component
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -181,10 +239,8 @@ jobs:
           echo "${RUNNER_TEMP}/tinygo/bin" >> "${GITHUB_PATH}"
 
       # Not the one TinyGo brings. Its Linux tarball bundles binaryen 116 at
-      # `$TINYGOROOT/bin/wasm-opt`, and the committed artifacts were built through 131 — 87 bytes
-      # apart on `go-builtins.wasm`, with `go-maporder.wasm` identical through both, so nothing
-      # smaller than the real artifact would notice. `WASMOPT` is the one override TinyGo honors
-      # ahead of the copy in its own root.
+      # `$TINYGOROOT/bin/wasm-opt`, and the committed fixture was built through 131.
+      # `WASMOPT` is the one override TinyGo honors ahead of the copy in its own root.
       - name: Install binaryen (wasm-opt)
         env:
           BINARYEN_VERSION: "131"
@@ -210,26 +266,23 @@ jobs:
           tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/wasm-tools.tar.gz"
           echo "${RUNNER_TEMP}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux" >> "${GITHUB_PATH}"
 
-      # `just go-rules` records the digest manifest through `cargo test`, so this job needs the
-      # Rust toolchain as well as the Go one.
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # `just typescript-builtins` needs the pinned jco toolchain, which `npm ci` installs.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          toolchain: "1.95.0"
+          node-version: "24"
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: go-rules
+      - name: Install the jco toolchain
+        run: npm ci --prefix packages/lanekeep
 
-      - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
-        with:
-          tool: just
+      # Build all three lanes: the Rust rule components (shipped + self-check), the Go built-ins
+      # and fixture, and the TypeScript built-ins. `just go-rules` also re-records the Go
+      # fixture's digest, so a stale fixture lands in the diff below.
+      - run: |
+          just rust-rules
+          just go-rules
+          just typescript-builtins
 
-      # Which also runs `gofmt -l`, `go vet` and `go test` over `go-rules/`, and re-records the
-      # digest manifest — so a stale manifest lands in the diff below exactly as a stale artifact
-      # does. That is the intent and not a side effect.
-      - run: just go-rules
-
-      - name: The committed artifacts must be the ones these sources build
+      - name: The committed Go fixture must be the one its sources build
         # **The assignment is a statement of its own, and that is the whole point.** `bash -e`
         # does not abort on a command substitution that fails inside `[ ... ]` — the exit
         # status the shell sees is the test's, not git's. Written as
@@ -241,15 +294,22 @@ jobs:
         run: |
           dirty="$(git status --porcelain)"
           if [ -z "$dirty" ]; then
-            echo "the committed Go artifacts are exactly what their sources build"
+            echo "the committed Go fixture is exactly what its sources build"
             exit 0
           fi
-          echo "::error::the rebuilt Go artifacts differ from the committed ones — run 'just go-rules' and commit the result"
+          echo "::error::the rebuilt Go fixture differs from the committed one — run 'just go-rules' and commit the result"
           echo "if you did run it and this is still red, compare the toolchain versions printed"
-          echo "above against the four this job pins: they are all inputs to the artifact's bytes."
+          echo "above against the four this job pins: they are all inputs to the fixture's bytes."
           git status --porcelain
           git --no-pager diff --stat
           exit 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components/
+          if-no-files-found: error
+          retention-days: 1
 
   # The Python component, built and proven through the real engine.
   #
@@ -259,6 +319,7 @@ jobs:
   # artifact — a Python rule that reports the wrong thing fails the job.
   py-rules:
     name: py-rules (build and test)
+    needs: components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -283,6 +344,13 @@ jobs:
         with:
           tool: just,cargo-nextest
 
+      # `just py-rules` compiles `lanekeep-rules` (for `python_rules.rs`), so build.rs needs the
+      # built components present — this job does not install the component toolchains.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
+
       # Which creates the venv, installs componentize-py 0.25.0, builds the three
       # artifacts, runs the SDK tests, and runs the fidelity and determinism tests.
       - run: just py-rules
@@ -290,7 +358,7 @@ jobs:
   ci-ok:
     name: ci
     if: always()
-    needs: [gate, test, msrv, bench, go-rules, py-rules]
+    needs: [gate, test, msrv, bench, components, py-rules]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every job succeeded

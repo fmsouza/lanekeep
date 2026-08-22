@@ -138,20 +138,21 @@ just rust-rules
 ```
 
 That builds every crate under `rust-rules/` that declares a component target, copies the
-artifact to `crates/lanekeep-rules/components/<name>.wasm`, runs clippy and rustdoc over the
-whole workspace — the one place that is possible, since the bindings now exist — and records
-what each artifact was built from in
-[`crates/lanekeep-wasm/tests/rule-component-digests.txt`](../crates/lanekeep-wasm/tests/rule-component-digests.txt).
+artifact to `crates/lanekeep-rules/components/<name>.wasm`, and runs clippy and rustdoc over the
+whole workspace — the one place that is possible, since the bindings now exist. The artifact is
+not committed: it is a build output that `crates/lanekeep-rules/build.rs` and the CI components
+job produce where they are needed.
 
 It needs `cargo-component` and the `wasm32-unknown-unknown` target; `scripts/setup-dev.sh`
-installs both. **CI has neither**, and does not need them: the artifacts are committed, and
-`fixture_currency.rs` fails when a rule's source has moved and its artifact has not. That test
-is what makes running this recipe non-optional rather than a convention.
+installs both. **CI installs them too**, in the `components` job, so the components are built
+fresh there rather than read from a committed copy. That is what makes running this recipe locally
+non-optional when a rule's source changes: the self-check tests and `lanekeep.json` read the
+artifact from `components/`, and skip or fail when it is absent.
 
-The build is byte-reproducible on the pinned toolchain, so `just rust-rules` on a consistent
-tree leaves `git status` clean. Reach it through `rust-toolchain.toml` — a toolchain's *name*
-reaches a component's bytes, so `stable` and `1.95.0` are the same compiler and not the same
-artifact.
+The build is byte-reproducible on the pinned toolchain — which matters because a component's
+bytes are a `ruleset_hash` input, so two people on one commit must compute the same bytes.
+Reach it through `rust-toolchain.toml` — a toolchain's *name* reaches a component's bytes, so
+`stable` and `1.95.0` are the same compiler and not the same artifact.
 
 Test it in `crates/lanekeep-rules/tests/<name>.rs` with `RuleTester::for_component` and
 `for_component_configured`, which take the bytes from `lanekeep_rules::component(name)` and run

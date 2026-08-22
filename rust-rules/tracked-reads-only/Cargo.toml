@@ -1,0 +1,57 @@
+# `local/tracked-reads-only`, compiled to a WebAssembly component.
+#
+# A project rule, referenced by `.wasm` path in `lanekeep.json` rather than embedded in the
+# binary the way a built-in is. Follows `rust-rules/no-unwrap/Cargo.toml` — the working template
+# for a component crate — with the differences that come of being a shipped rule rather than a
+# fixture: the workspace keys come from `rust-rules/Cargo.toml`, so the lints, the release
+# profile and the license are declared once for every rule crate rather than per crate.
+[package]
+name = "tracked-reads-only"
+description = "Filesystem reads that record no cache dependency, as a lanekeep rule component."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The SDK: a name lookup over a query match, and the glob matcher that ports the TypeScript
+# `matches` helper. A plain host-target library — it is not itself a component.
+#
+# `version` beside `path`, and it is not decoration. A path dependency without one is a `*`
+# requirement, and `deny.toml`'s `wildcards = "deny"` refuses those — for the good reason that a
+# published crate carrying one accepts any future version of it. `just deny` runs that same
+# policy file over this workspace, so stating the version is what satisfies the check rather
+# than exempting this workspace from it. It matches `[workspace.package] version`; a bump there
+# without one here fails resolution loudly.
+lanekeep-rule = { path = "../lanekeep-rule", version = "0.0.0" }
+# A rule's options cross the boundary as JSON, because a component cannot close over a
+# host-supplied value the way a JavaScript factory does. Parsing them with serde rather than by
+# hand is the example this crate sets for every rule that follows: a hand-rolled reader of one
+# rule's option shape is a JSON parser with one user and no tests.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# The world is read from the engine's own wit/ directory rather than from a copy under this
+# crate: a copy would prove that a file which was once the world is targetable, and nothing
+# would catch the two drifting.
+[package.metadata.component.target]
+path = "../../crates/lanekeep-wasm/wit"
+world = "rule"
+
+[package.metadata.component.dependencies]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build` generates
+# and `.gitignore` deliberately excludes. cargo-machete reads source, so on a fresh checkout it
+# sees a dependency nothing references and fails the gate — while a machine that has built this
+# crate once sees it used and passes. `just machete` runs `cargo machete --with-metadata` from
+# the repository root, which descends into this nested workspace, so the gate reaches here today
+# even though nothing else in it does yet.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]

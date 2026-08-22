@@ -35,10 +35,10 @@ _require tool:
 # ---------------------------------------------------------------------------
 
 # Pre-commit gate. Fast enough to run on every commit without being resented.
-check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py
+check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py lanekeep
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py docs deny machete typos-check msrv
+check: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py lanekeep docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -303,13 +303,12 @@ wasm-fixtures:
     LANEKEEP_BLESS_WASM_FIXTURES=1 cargo test --quiet -p lanekeep-wasm \
         --test fixture_currency -- --exact every_committed_artifact_is_the_one_its_sources_build
 
-# Rebuild the committed rule components from rust-rules/.
+# Rebuild the rule components from rust-rules/ into `crates/lanekeep-rules/components/`.
 #
 # Deliberately not part of any gate, exactly as `wasm-fixtures` is not: it needs
-# `cargo component`, which CI does not install, and it rewrites committed artifacts. The
-# artifacts under `crates/lanekeep-rules/components/` are what the gate reads, through
-# `lanekeep_rules::component`, so a machine with neither `cargo component` nor a wasm target
-# still runs every rule component against `crates/lanekeep-rules/tests/`.
+# `cargo component`, which the gate does not install. The artifacts it writes under
+# `crates/lanekeep-rules/components/` are build outputs, not committed — `build.rs` and the CI
+# components job produce them where they are needed.
 #
 # `--target wasm32-unknown-unknown` is a requirement, not a preference — the same one
 # `wasm-fixtures` documents at length. `cargo component` defaults to `wasm32-wasip1`, whose
@@ -321,6 +320,9 @@ rust-rules:
     set -euo pipefail
     just _require cargo-component
     root="$(pwd)"
+    # The components directory is gitignored and empty on a fresh checkout, so the `cp` below
+    # has nowhere to write until it exists.
+    mkdir -p "${root}/crates/lanekeep-rules/components"
     built=0
     for dir in rust-rules/*/; do
         [ -f "${dir}Cargo.toml" ] || continue
@@ -355,42 +357,16 @@ rust-rules:
     # require `cargo component` to produce one. This recipe has already produced them, so this is
     # the one place the rule crates' own source can be held to the workspace lints and to
     # docs.rs's link resolution.
-    #
-    # **Before the recording, and that is what makes it more than advice.** These artifacts only
-    # reach a commit through this recipe, and the digest manifest is what forces the recipe to be
-    # run: a changed rule source with no re-record is a red gate. So placing the checks ahead of
-    # the recording puts them on the only path to a green tree — a contributor who ignores a
-    # clippy failure here has no recorded digest either, and `just check` says so. Recording
-    # first would make this pair skippable by ignoring one exit code.
-    #
-    # The cost is that a failure here leaves rebuilt artifacts copied and their digests stale,
-    # so the next `just check` reports the currency failure as well. That is not extra work:
-    # the fix for it is to run this recipe again, which is what fixing the clippy error leads
-    # to anyway.
     echo "checking the rule crates, now that their bindings exist"
     cargo clippy --manifest-path rust-rules/Cargo.toml --workspace --all-targets --all-features -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path rust-rules/Cargo.toml --workspace --no-deps --all-features
 
-    # Record what all of that was built from, so the gate can tell a stale component from a
-    # current one without needing `cargo component` to find out. Exactly what `wasm-fixtures`
-    # does, and for the same reason: without it, editing a rule's source and not running this
-    # recipe leaves `crates/lanekeep-rules/tests/` holding the *previous* component to the
-    # current expectations, green and meaningless.
-    #
-    # A manifest and a variable of its own rather than the fixtures'. Sharing one would mean
-    # this recipe re-recording the fixtures it did not build and `wasm-fixtures` re-recording
-    # the components it did not build, which is how a stale artifact gets blessed by someone
-    # doing the right thing elsewhere. `--exact` keeps this to the one test.
-    echo "recording rule component digests"
-    LANEKEEP_BLESS_RULE_COMPONENTS=1 cargo test --quiet -p lanekeep-wasm \
-        --test fixture_currency -- --exact every_committed_rule_component_is_the_one_its_sources_build
-
-# Rebuild the committed TypeScript built-ins component.
+# Rebuild the TypeScript built-ins component from its committed sources.
 #
-# The third recipe that rewrites a committed artifact, and outside every gate for the reason the
-# other two are: it needs a toolchain the gate deliberately does not — Node here, rather than
-# `cargo component` — and the artifact it produces is committed and read with `include_bytes!`.
-# `just check` passes on a machine with no Node at all.
+# The second recipe that produces a shipped component, and outside every gate for the reason the
+# other is: it needs a toolchain the gate deliberately does not — Node here, rather than
+# `cargo component` — and the artifact it produces is read with `include_bytes!` after being
+# built, not committed. `just check` passes on a machine with no Node at all.
 #
 # **One component for every TypeScript rule, and not one each.** Measured on this entry,
 # 2026-08-10, a matched pair from one sitting: hosting `no-default-export` alone gives 13,021,569
@@ -403,31 +379,23 @@ rust-rules:
 # otherwise resolve imports the way npm does — see `typescript/rolldown.config.mjs`, which wires
 # `packages/lanekeep/runtime/resolve.js` into rolldown rather than restating it. Everything else
 # about the build is in `_componentize`, which the JavaScript fixture shares.
-#
-# The last step records what the artifact was built from, and it is the whole of the staleness
-# check rather than half of it: `componentize-js` is not byte-reproducible, so there is no
-# rebuild-and-diff to fall back on. See `crates/lanekeep-wasm/tests/fixture_currency.rs`.
 typescript-builtins:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The components directory is gitignored and empty on a fresh checkout, so jco and the
+    # source-map plugin below have nowhere to write until it exists.
+    mkdir -p crates/lanekeep-rules/components
     just _componentize \
         crates/lanekeep-rules/typescript/entry.ts \
         crates/lanekeep-rules/components/typescript-builtins.wasm \
         --bundle-config crates/lanekeep-rules/typescript/rolldown.config.mjs
 
-    # `cargo test` rather than `cargo nextest run`, for the reason `wasm-fixtures` gives: what
-    # is wanted here is the side effect and not the verdict, and nextest has no way to say
-    # "this one writes a file". The same test asserts under `just test` with the variable unset.
-    echo "recording TypeScript component digests"
-    LANEKEEP_BLESS_TYPESCRIPT_BUILTINS=1 cargo test --quiet -p lanekeep-wasm \
-        --test fixture_currency -- --exact every_committed_typescript_component_is_the_one_its_sources_build
-
-# Rebuild the committed Go built-ins component from go-rules/.
+# Rebuild the Go built-ins component from go-rules/.
 #
-# The fourth recipe that rewrites a committed artifact, and outside every gate for the reason the
-# other three are: it needs a toolchain the gate deliberately does not — TinyGo here — and the
-# artifact it produces is committed and read with `include_bytes!`. `just check` passes on a
-# machine with neither TinyGo nor Go.
+# The third recipe that produces a shipped component, and outside every gate for the reason the
+# others are: it needs a toolchain the gate deliberately does not — TinyGo here — and the
+# artifact it produces is read with `include_bytes!` after being built, not committed.
+# `just check` passes on a machine with neither TinyGo nor Go.
 #
 # **One component for every Go rule, and not one each**, which `go-rules/main.go` explains: the
 # rules are listed there, and the index a rule sits at in that slice is what `lanekeep_rules`
@@ -512,6 +480,10 @@ go-rules:
     just _require wasm-tools
     root="$(pwd)"
 
+    # The components directory is gitignored and empty on a fresh checkout, so `tinygo build -o`
+    # below has nowhere to write until it exists.
+    mkdir -p "${root}/crates/lanekeep-rules/components"
+
     # What the artifacts below will have been built through, in the log next to them.
     echo "toolchain:"
     echo "  $(go version)"
@@ -562,8 +534,8 @@ go-rules:
     # require TinyGo to build a twelfth, and a checkout without TinyGo would then be unable to run
     # it at all. So the artifact lands beside its siblings in `tests/fixtures/`, where
     # `include_bytes!` and `tests/world_shape.rs`'s ambient-authority glob both find it, and its
-    # digest is recorded below — `fixture_currency.rs` subtracts it from the fixtures walk with
-    # exactly the note that partition already carries for the TypeScript and Go components.
+    # digest is recorded below — `fixture_currency.rs` subtracts it from the fixtures walk and
+    # records it in this recipe's own manifest instead.
     #
     # It is not a rule and ships to nobody. What it is for is the one claim about Go rules that
     # cannot be read off any source: `go-rules/lanekeep`'s `Handlers` resets TinyGo's
@@ -580,17 +552,12 @@ go-rules:
         -o "${root}/crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm" \
         ./fixtures/maporder)
 
-    # Record what it was built from, so the gate can tell a stale component from a current one
-    # without needing TinyGo to find out. A manifest and a variable of its own rather than any of
-    # the three that already exist — sharing one would mean this recipe re-recording artifacts it
-    # did not build, and the recipe that did build them re-recording this one, which is how a
-    # stale artifact gets blessed by somebody doing the right thing elsewhere.
-    #
-    # `cargo test` rather than `cargo nextest run`, for the reason the other three give: what is
-    # wanted is the side effect and not the verdict. `--exact` keeps this to the one test.
-    echo "recording Go component digests"
+    # Record what the fixture was built from, so the gate can tell a stale fixture from a current
+    # one without needing TinyGo to find out. `cargo test` rather than `cargo nextest run`, for
+    # the reason `wasm-fixtures` gives: what is wanted is the side effect and not the verdict.
+    echo "recording Go fixture digests"
     LANEKEEP_BLESS_GO_RULES=1 cargo test --quiet -p lanekeep-wasm \
-        --test fixture_currency -- --exact every_committed_go_component_is_the_one_its_sources_build
+        --test fixture_currency -- --exact every_committed_go_fixture_is_the_one_its_sources_build
 
 # Test rust-rules/: its own workspace, so `cargo test --workspace` at the root does not reach
 # it.
@@ -847,6 +814,20 @@ py-rules:
     LANEKEEP_PY_DETERMINISM_A="${root}/py-rules/target/py-determinism-a.wasm" \
     LANEKEEP_PY_DETERMINISM_B="${root}/py-rules/target/py-determinism-b.wasm" \
     cargo nextest run -p lanekeep-wasm --test python_determinism
+
+# lanekeep checking its own source.
+#
+# The rules live in `lanekeep/rules/` and encode the invariants in AGENTS.md — the ones a
+# reviewer has to remember rather than the ones clippy already knows. Runs after `test` in
+# both gates on purpose: if the engine is broken, its verdict about this source means
+# nothing, so the tests that prove the engine works come first.
+lanekeep:
+    cargo build -p lanekeep-cli
+    # The self-check compiles and instantiates ~twenty components on a cold CI cache before it
+    # checks anything, which the 15s default budget cannot absorb — the gate reddens on a cold
+    # runner while a warm local one passes. The budget is raised here, not in `lanekeep.json`,
+    # because the self-check is lanekeep's own; a user's budget stays the documented default.
+    ./target/debug/lanekeep check . --timeout 60000
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 #

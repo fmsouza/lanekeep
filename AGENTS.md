@@ -97,6 +97,34 @@ IDs, a versioned host API in the cache key, tracked effects from the start, AST 
 crossing as handles rather than objects, and a clean `Rule` boundary that built-ins get
 no exemption from.
 
+## The invariants are checked
+
+`just lanekeep` runs lanekeep against this repository, after `test` in both gates and on
+purpose: if the engine is broken, its verdict about this source means nothing. `lanekeep.json`
+runs twenty-one rules against it: eight Rust-inspecting and six TypeScript-inspecting
+self-check rules — the eight as WebAssembly components, the six as TypeScript modules — plus
+seven of lanekeep's own built-ins, checking the tool against itself. The two Python-inspecting
+self-check rules are exercised by `crates/lanekeep-rules/tests/python_rules.rs` rather than
+the config. Each is configured with whatever options it needs.
+
+Changing an invariant means changing its rule in the same pull request. A rule that no longer
+matches anything is not evidence that the invariant holds; every one of the sixteen has a test
+proving it still reports — the Rust and Python rules in `crates/lanekeep-rules/tests/`, the
+TypeScript rules in `crates/lanekeep-cli/tests/selfcheck.rs`.
+
+The sixteen self-check rules are now split between components and modules. The eight
+Rust-inspecting rules and the two Python-inspecting rules are WebAssembly components; the six
+TypeScript-inspecting rules remain TypeScript modules. The four deletion candidates all moved
+through the migration — `host-api-matches-types` and `binding-kinds-are-typed` to Rust
+components, `gates-are-and` and `rule-declares-language` remaining TypeScript modules — and
+their deletion is deferred pending single-sourcing `index.d.ts` from WIT. Three rules changed
+meaning when they moved to the WASM host: `sandbox-containment`, `no-ambient-authority` and
+`no-ambient-observation` now target the host rather than the TypeScript sandbox.
+
+What this does **not** cover: shell, YAML, TOML and the justfile, for which lanekeep has no
+grammar. Workflow pinning stays with `scripts/test-workflows.sh`, bash portability with
+`scripts/test-shell-portability.sh`, dependency policy with `deny.toml`.
+
 ## Repository map
 
 ```
@@ -114,7 +142,7 @@ crates/
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
   lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring
-  lanekeep-rules     built-in rules: TypeScript sources, plus the committed components
+  lanekeep-rules     built-in rules: TypeScript sources, plus the components built at build time
   lanekeep-report    human, json, sarif, agent reporters
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
   lanekeep-testkit   RuleTester
@@ -598,25 +626,16 @@ behavioral rather than byte-wise: `tests/js_globals.rs` derives its probes from 
 an artifact that no longer satisfies the contract fails the moment the contract moves. That is
 weaker — it catches a stale artifact only where the two disagree — and it is what there is.
 
-**There are four digest manifests now, one per recipe that rewrites a committed artifact, and
-what may be shared between them is an input rather than an artifact.** `just wasm-fixtures`
-writes `fixture-digests.txt`, `just rust-rules` writes `rule-component-digests.txt`,
-`just typescript-builtins` writes `typescript-component-digests.txt`, and `just go-rules` writes
-`go-component-digests.txt`. All four record `wit/world.wit`, deliberately: it is a build input to
-every component in the tree, and a change to it has to send you to every recipe. An *artifact* is
-the opposite case, because exactly one recipe can produce it — and `typescript-builtins.wasm`
-sits in `crates/lanekeep-rules/components/`, beside artifacts two different recipes build.
-Recording it in another recipe's manifest as well would mean a rebuild of the TypeScript
-component, whose bytes change every time, leaves the *Rust* manifest red until somebody runs
-`just rust-rules`: a recipe about other artifacts, needing `cargo component` and a wasm target,
-to fix a build it had no part in. `fixture_currency.rs` partitions them three ways rather than
-two — the Go component's artifacts are the third set, subtracted by the same mechanism and for
-the same reason: `just wasm-fixtures` cannot rebuild `go-maporder.wasm`, which needs TinyGo.
-
-Count the manifests with `ls crates/lanekeep-wasm/tests/*digests*.txt`. This sentence said
-"three" for a while after the fourth landed, which is the entry below about grepping a formula
-arriving in the file that warns about it: the sweep that added the Go recipe matched recipe names
-and artifact paths, and "three" is neither.
+**There are two digest manifests now, one per recipe that rewrites a *committed* artifact.** The
+shipped components under `crates/lanekeep-rules/components/` are no longer committed — they are
+build-time artifacts produced by `crates/lanekeep-rules/build.rs` and the `just rust-rules` /
+`just typescript-builtins` / `just go-rules` recipes, so a digest that ties a *committed* binary to
+its sources has nothing left to assert for them. What remains committed is the wasm-loader test
+fixtures, and their currency is what the two manifests hold: `just wasm-fixtures` writes
+`fixture-digests.txt`, and `just go-rules` writes `go-component-digests.txt` for the one fixture it
+builds rather than `wasm-fixtures` — `go-maporder.wasm`, which needs TinyGo and is subtracted from
+the fixtures walk. Both record `wit/world.wit`, deliberately: it is a build input to every
+component in the tree, and a change to it has to send you to every recipe.
 
 **And `jco componentize` needs a far newer Node than `just test-js` does, which is discovered at
 *install* time and reported at build time, by neither.** `test-js` requires Node 18, the floor
@@ -901,6 +920,19 @@ stranded cold forever the moment the budget started being enforced. The *no-prun
 doctrine this change added to §6.8, and it could not have been there before — an aborted run
 wrote nothing at all, so there was no save whose pruning behavior anyone had to decide.
 
+**A generated module reaches neither hash, and a rule's `options` used to live in one.** For a
+`lanekeep.json` the rules are compiled into an entry module lanekeep writes itself, and
+`hash_ruleset` covers the sources the loader *read* — never that one. `hash_config`
+canonicalized severity, include/exclude and timeouts and stopped there. So editing an option
+invalidated nothing: a warm run kept answering the previous configuration for as long as the
+cache survived, in both directions, and the dangerous one is silent — a restriction added still
+reports clean, and only `--no-cache` disagrees, which reads as "the rule is broken" rather than
+"the answer is old". Found by pointing lanekeep at this repository: an `allow` entry was removed
+and the run stayed green. `lanekeep init` generates JSON, so this was the default path. Two
+things worth carrying forward: a fixture written against a `.ts` config passes against this bug,
+because there the options are ordinary source in a module the loader does read; and anything new
+a config can say has to reach one of the two hashes on purpose — nothing checks that for you.
+
 **A Linux binary's glibc floor is inherited from the runner image unless something pins it.**
 A dynamically linked binary cannot run against a glibc older than the one it was built against,
 so the build machine silently decides the oldest distribution the release supports. When
@@ -1063,7 +1095,7 @@ checkouts produces different bytes — and a component's bytes are a cache-key i
 developer computes a different key for one commit. This is the rustup-toolchain-name trap above
 and strictly worse: a toolchain name differs between two people who reached one compiler by
 different routes, and a checkout path differs for everybody. Measured on TinyGo 0.41.1 against the
-committed `crates/lanekeep-rules/components/go-builtins.wasm`, which `just go-rules` rebuilds:
+`crates/lanekeep-rules/components/go-builtins.wasm`, which `just go-rules` rebuilds:
 **13,187 bytes** with the flag and **322,301** without, with
 `strings … | grep -cE '/Users|/opt/homebrew'` finding **0** lines against **85**, twelve of which
 name the worktree. Nothing turns red — the artifact is valid and the rule works — so the flag has
