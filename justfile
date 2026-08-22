@@ -320,6 +320,9 @@ rust-rules:
     set -euo pipefail
     just _require cargo-component
     root="$(pwd)"
+    # The components directory is gitignored and empty on a fresh checkout, so the `cp` below
+    # has nowhere to write until it exists.
+    mkdir -p "${root}/crates/lanekeep-rules/components"
     built=0
     for dir in rust-rules/*/; do
         [ -f "${dir}Cargo.toml" ] || continue
@@ -379,6 +382,9 @@ rust-rules:
 typescript-builtins:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The components directory is gitignored and empty on a fresh checkout, so jco and the
+    # source-map plugin below have nowhere to write until it exists.
+    mkdir -p crates/lanekeep-rules/components
     just _componentize \
         crates/lanekeep-rules/typescript/entry.ts \
         crates/lanekeep-rules/components/typescript-builtins.wasm \
@@ -473,6 +479,10 @@ go-rules:
     # spent a minute in LLVM.
     just _require wasm-tools
     root="$(pwd)"
+
+    # The components directory is gitignored and empty on a fresh checkout, so `tinygo build -o`
+    # below has nowhere to write until it exists.
+    mkdir -p "${root}/crates/lanekeep-rules/components"
 
     # What the artifacts below will have been built through, in the log next to them.
     echo "toolchain:"

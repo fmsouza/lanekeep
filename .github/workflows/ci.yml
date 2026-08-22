@@ -103,6 +103,7 @@ jobs:
   # form that overrides the pin.
   msrv:
     name: msrv
+    needs: components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -121,6 +122,13 @@ jobs:
         with:
           tool: just
 
+      # The built components, so `build.rs` finds them present (a no-op) instead of reaching for
+      # the component toolchains, which this job does not install.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
+
       - run: just msrv
 
   # A single required check to point branch protection at. Adding a job above does
@@ -134,6 +142,7 @@ jobs:
   # threshold is still visible to anyone reading the log, which is the point.
   bench:
     name: bench (budgets)
+    needs: components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -149,6 +158,13 @@ jobs:
       - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
         with:
           tool: just
+
+      # The built components, for the same reason as every other job that compiles lanekeep-rules:
+      # build.rs reads them, and this job does not install the component toolchains.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
 
       - run: just bench
 
@@ -295,6 +311,7 @@ jobs:
   # artifact — a Python rule that reports the wrong thing fails the job.
   py-rules:
     name: py-rules (build and test)
+    needs: components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -318,6 +335,13 @@ jobs:
       - uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
         with:
           tool: just,cargo-nextest
+
+      # `just py-rules` compiles `lanekeep-rules` (for `python_rules.rs`), so build.rs needs the
+      # built components present — this job does not install the component toolchains.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: components
+          path: crates/lanekeep-rules/components
 
       # Which creates the venv, installs componentize-py 0.25.0, builds the three
       # artifacts, runs the SDK tests, and runs the fidelity and determinism tests.

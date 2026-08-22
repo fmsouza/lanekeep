@@ -46,6 +46,12 @@ fn main() {
         .to_path_buf();
     let components_dir = manifest_dir.join("components");
 
+    // The directory is gitignored and empty on a fresh checkout, so the build helpers below need
+    // it to exist before they can write an artifact into it. Idempotent, and a no-op when the
+    // artifacts are already present.
+    fs::create_dir_all(&components_dir)
+        .unwrap_or_else(|e| panic!("failed to create `{}`: {e}", components_dir.display()));
+
     // Declare every input this script reads *up front and unconditionally*. Two reasons:
     //
     // 1. Cargo re-runs the build script when any `rerun-if-changed` path is created, deleted or
