@@ -101,24 +101,21 @@ no exemption from.
 
 `just lanekeep` runs lanekeep against this repository, after `test` in both gates and on
 purpose: if the engine is broken, its verdict about this source means nothing. `lanekeep.json`
-runs twenty-one rules against it: eight Rust-inspecting and six TypeScript-inspecting
-self-check rules — the eight as WebAssembly components, the six as TypeScript modules — plus
+runs seventeen rules against it: six Rust-inspecting and four TypeScript-inspecting
+self-check rules — the six as WebAssembly components, the four as TypeScript modules — plus
 seven of lanekeep's own built-ins, checking the tool against itself. The two Python-inspecting
 self-check rules are exercised by `crates/lanekeep-rules/tests/python_rules.rs` rather than
 the config. Each is configured with whatever options it needs.
 
 Changing an invariant means changing its rule in the same pull request. A rule that no longer
-matches anything is not evidence that the invariant holds; every one of the sixteen has a test
+matches anything is not evidence that the invariant holds; every one of the twelve has a test
 proving it still reports — the Rust and Python rules in `crates/lanekeep-rules/tests/`, the
 TypeScript rules in `crates/lanekeep-cli/tests/selfcheck.rs`.
 
-The sixteen self-check rules are now split between components and modules. The eight
-Rust-inspecting rules and the two Python-inspecting rules are WebAssembly components; the six
-TypeScript-inspecting rules remain TypeScript modules. The four deletion candidates all moved
-through the migration — `host-api-matches-types` and `binding-kinds-are-typed` to Rust
-components, `gates-are-and` and `rule-declares-language` remaining TypeScript modules — and
-their deletion is deferred pending single-sourcing `index.d.ts` from WIT. Three rules changed
-meaning when they moved to the WASM host: `sandbox-containment`, `no-ambient-authority` and
+The twelve self-check rules are split between components and modules. The six Rust-inspecting
+rules and the two Python-inspecting rules are WebAssembly components; the four
+TypeScript-inspecting rules remain TypeScript modules. Three rules changed meaning when they
+moved to the WASM host: `sandbox-containment`, `no-ambient-authority` and
 `no-ambient-observation` now target the host rather than the TypeScript sandbox.
 
 What this does **not** cover: shell, YAML, TOML and the justfile, for which lanekeep has no

@@ -390,6 +390,17 @@ typescript-builtins:
         crates/lanekeep-rules/components/typescript-builtins.wasm \
         --bundle-config crates/lanekeep-rules/typescript/rolldown.config.mjs
 
+# Regenerate `packages/lanekeep/index.d.ts` from the WIT world.
+#
+# `index.d.ts` is not maintained by hand: it is rendered from
+# `crates/lanekeep-wasm/wit/world.wit` by `crates/lanekeep-types-gen`, which maps the world's
+# `check-context`/`reduce-context`/`binding-kind` onto the QuickJS-shaped surface a TypeScript
+# rule author reaches. `crates/lanekeep-types-gen/tests/generated.rs` asserts the committed file
+# is exactly this output, so a hand edit fails `just test`; run this to re-record it after the
+# world changes.
+generate-index-dts:
+    cargo run -p lanekeep-types-gen
+
 # Rebuild the Go built-ins component from go-rules/.
 #
 # The third recipe that produces a shipped component, and outside every gate for the reason the

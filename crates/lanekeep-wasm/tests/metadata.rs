@@ -115,6 +115,50 @@ fn nothing_reaches_a_check_without_having_been_configured() {
     );
 }
 
+#[test]
+fn a_component_naming_no_language_is_refused() {
+    // `{"no-language":true}` makes the fixture's `metadata` return an empty `languages` list.
+    // An empty list is not "every language" — it is *no file at all*, and silently: the rule
+    // loads and reports nothing, which is indistinguishable from the code being clean. The host
+    // refuses it at metadata time, before any file is checked, which is what this asserts.
+    let (mut runtime, slot) = runtime_for_options("metadata", r#"{"no-language":true}"#);
+
+    let error = runtime
+        .metadata(slot)
+        .expect_err("a component whose metadata names no language must be refused at load");
+
+    assert!(
+        matches!(error, WasmError::InvalidMetadata { .. }),
+        "the refusal must be the named variant, not a trap: {error:?}"
+    );
+    assert!(
+        format!("{error}").contains("fixture/metadata"),
+        "the refusal must name the rule: {error}"
+    );
+}
+
+#[test]
+fn a_component_declaring_a_conjunctive_content_gate_is_refused() {
+    // `{"bad-gate":true}` makes the fixture's `metadata` return a `file_contains` gate of two
+    // substrings. A content gate is an *and* — every substring must be present — so a file
+    // containing only one is rejected, and the rule reports nothing while looking healthy. The
+    // host refuses it at metadata time.
+    let (mut runtime, slot) = runtime_for_options("metadata", r#"{"bad-gate":true}"#);
+
+    let error = runtime
+        .metadata(slot)
+        .expect_err("a content gate listing more than one substring must be refused at load");
+
+    assert!(
+        matches!(error, WasmError::InvalidMetadata { .. }),
+        "the refusal must be the named variant, not a trap: {error:?}"
+    );
+    assert!(
+        format!("{error}").contains("fixture/metadata"),
+        "the refusal must name the rule: {error}"
+    );
+}
+
 /// A check context over one trivial file, so `check` has something to be given.
 fn context(runtime: &mut WasmRuntime) -> Resource<CheckContext> {
     let source = "const x = 1;\n";

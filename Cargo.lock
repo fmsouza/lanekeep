@@ -1012,6 +1012,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lanekeep-types-gen"
+version = "0.0.0"
+dependencies = [
+ "wit-parser",
+]
+
+[[package]]
 name = "lanekeep-wasm"
 version = "0.6.1"
 dependencies = [
