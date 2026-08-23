@@ -18,100 +18,6 @@ fn plain(name: &str, source: &str, extension: &str) -> RuleTester {
     RuleTester::with_extension(name, source, extension).expect("the rule builds")
 }
 
-const GATES: &str = include_str!("../../../lanekeep/rules/gates-are-and.ts");
-
-fn gates() -> RuleTester {
-    plain("gates", GATES, "ts")
-}
-
-#[test]
-fn a_two_substring_gate_is_reported() {
-    gates()
-        .reports_at(
-            "const r = { gates: { fileContains: ['unwrap', 'expect'] } }\n",
-            &[(1, 22)],
-        )
-        .expect("both substrings must be present, which rejects nearly every file");
-}
-
-#[test]
-fn a_one_substring_gate_passes() {
-    gates()
-        .accepts("const r = { gates: { fileContains: ['makeStyles'] } }\n")
-        .expect("one substring is the shape the gate is for");
-}
-
-#[test]
-fn the_negative_form_is_checked_too() {
-    gates()
-        .reports_at(
-            "const r = { gates: { fileNotContains: ['a', 'b'] } }\n",
-            &[(1, 22)],
-        )
-        .expect("fileNotContains has the same conjunction");
-}
-
-#[test]
-fn an_unrelated_array_passes() {
-    // The trailing comment is load-bearing: the rule's own gate is `Contains`, and a fixture
-    // that never contains that substring is rejected before the query runs at all. Without
-    // it, this would pass whether or not `check` filters by key — which is the one thing
-    // this case exists to prove.
-    gates()
-        .accepts("const r = { pathMatches: ['a', 'b'] } // Contains\n")
-        .expect("only the content gates are conjunctions");
-}
-
-const DECLARES: &str = include_str!("../../../lanekeep/rules/rule-declares-language.ts");
-
-fn declares() -> RuleTester {
-    plain("declares", DECLARES, "ts")
-}
-
-#[test]
-fn a_rule_without_a_language_is_reported() {
-    declares()
-        .reports_at(
-            "const r = defineRule({ id: 'local/x', query: '(x) @y' })\n",
-            &[(1, 11)],
-        )
-        .expect("the default is typescript and tsx, so a Rust rule would run on nothing");
-}
-
-#[test]
-fn a_rule_with_a_language_passes() {
-    declares()
-        .accepts("const r = defineRule({ id: 'local/x', language: 'rust', query: '(x) @y' })\n")
-        .expect("naming the language is the whole requirement");
-}
-
-#[test]
-fn a_rule_with_several_languages_passes() {
-    declares()
-        .accepts("const r = defineRule({ id: 'local/x', language: ['typescript', 'tsx'] })\n")
-        .expect("the default written out is still written out");
-}
-
-#[test]
-fn an_unrelated_call_passes() {
-    declares()
-        .accepts("const c = defineConfig({ rules: [] })\n")
-        .expect("only defineRule declares a language");
-}
-
-#[test]
-fn a_same_shaped_call_under_a_different_name_passes() {
-    // `an_unrelated_call_passes` above is excluded by the gate before the query ever runs —
-    // `defineConfig` does not contain the substring `defineRule` — so it cannot tell whether
-    // `check` itself filters by callee name. This fixture satisfies the gate on a comment
-    // alone, leaving a call with the identical shape the query matches: an identifier callee
-    // with a single object argument. Only the identifier check inside `check` keeps this
-    // unreported.
-    declares()
-        .accepts("foo({ a: 1 }) // defineRule\n")
-        .expect("the query matches any identifier call with an object argument; only defineRule is this rule's concern");
-}
-
 const REDUCE: &str = include_str!("../../../lanekeep/rules/reduce-touches-no-tree.ts");
 
 fn reduce() -> RuleTester {
@@ -224,11 +130,6 @@ fn a_call_rooted_at_the_match_still_passes() {
 
 #[test]
 fn an_unrelated_report_call_passes() {
-    // Named distinctly from `rule-declares-language.ts`'s `an_unrelated_call_passes` above:
-    // this file is one module, and two `#[test]` functions sharing a name is `E0428`, not a
-    // rule-behavior question — the same collision several rules above already ran into under
-    // different names.
-    //
     // Two things load-bearing here, both confirmed by mutation. The trailing comment: the
     // rule's own gate is `fileContains: ['emitFact']`, and a fixture that never contains that
     // substring is rejected before the query runs at all — without it, this passes whether or

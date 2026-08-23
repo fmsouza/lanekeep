@@ -156,6 +156,10 @@ members = {package["name"] for package in metadata["packages"]}
 problems = []
 for package in metadata["packages"]:
     name = package["name"]
+    if package.get("publish") == []:
+        # `publish = false` crates are repository tooling, not shipped artifacts, so they are
+        # not in the publication order and must not be flagged for it.
+        continue
     if name not in position:
         problems.append(f"{name} was never published")
         continue

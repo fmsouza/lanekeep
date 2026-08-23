@@ -9,7 +9,7 @@
 # built on, the generated bindings or the world it is built against was changed without
 # rebuilding — run `just go-rules`.
 crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm 33de5c491ba2b92778c8e56f5bcf4ee276390a76cea14e395609a63e42b56250
-crates/lanekeep-wasm/wit/world.wit 290f483be47beb5e9df599e78e2d04572af8d4586459d361bb0741714ec975ae
+crates/lanekeep-wasm/wit/world.wit ba1491901856194198db0c8d85446b044c31ca5095d4a442f2d433ee800cdd35
 go-rules/.gitignore 02af855e1226375a64521b31bd8994a45c665fbe93ea55dfdb4b38f062d98c36
 go-rules/fixtures/maporder/main.go 6c03e440e7c13c06438f4f5cddeef5fdc293f0282f9d6613f9ab44fc994a1f71
 go-rules/go.mod 25d0033f110d1e59cc9e59ecc9b2bda4102adaa59f0414844df1d8e17c889e4c

@@ -14,10 +14,27 @@
 #[allow(warnings)]
 mod bindings;
 
+use std::cell::Cell;
+
 use bindings::lanekeep::host::types::{RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
+
+thread_local! {
+    /// Whether this run asks the fixture to name no language, via `{"no-language":true}`.
+    ///
+    /// `Cell` rather than `RefCell`: `configure` only writes and `metadata` only reads, and
+    /// neither borrow outlives the call. These flags are how a test reaches the host-side
+    /// metadata refusal (`crates/lanekeep-wasm`'s `validate_metadata`) through the real load
+    /// path — a component whose `metadata` names no language, or declares a conjunctive content
+    /// gate, must be refused before any file is checked.
+    static NO_LANGUAGE: Cell<bool> = const { Cell::new(false) };
+    /// Whether this run asks the fixture to declare a content gate of more than one substring,
+    /// via `{"bad-gate":true}`. `file-contains` is an *and*, so two substrings reject every file
+    /// containing only one of them.
+    static BAD_GATE: Cell<bool> = const { Cell::new(false) };
+}
 
 impl Guest for Component {
     /// The one rule this component hosts. Every other export takes its index.
@@ -27,9 +44,15 @@ impl Guest for Component {
 
     fn metadata(rule: u32) -> RuleMetadata {
         only(rule);
+        let no_language = NO_LANGUAGE.with(Cell::get);
+        let bad_gate = BAD_GATE.with(Cell::get);
         RuleMetadata {
             id: "fixture/metadata".to_owned(),
-            languages: vec!["rust".to_owned()],
+            languages: if no_language {
+                Vec::new()
+            } else {
+                vec!["rust".to_owned()]
+            },
             severity: "error".to_owned(),
             card: RuleCard {
                 message: "a fixture".to_owned(),
@@ -43,7 +66,11 @@ impl Guest for Component {
             gates: RuleGates {
                 path_matches: vec!["src/**/*.rs".to_owned()],
                 path_not_matches: vec!["**/generated/**".to_owned()],
-                file_contains: vec!["call".to_owned()],
+                file_contains: if bad_gate {
+                    vec!["a".to_owned(), "b".to_owned()]
+                } else {
+                    vec!["call".to_owned()]
+                },
                 file_not_contains: vec!["skip".to_owned()],
             },
             timeout: Some(1500),
@@ -78,6 +105,8 @@ impl Guest for Component {
         if !options_json.starts_with('{') {
             return Err("expected an object".to_owned());
         }
+        NO_LANGUAGE.with(|flag| flag.set(options_json.contains("no-language")));
+        BAD_GATE.with(|flag| flag.set(options_json.contains("bad-gate")));
         if options_json.contains("\"burn\"") {
             burn();
         }

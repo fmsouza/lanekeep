@@ -1,30 +1,23 @@
 /**
  * Type definitions for authoring lanekeep rules.
  *
+ * **Generated from `crates/lanekeep-wasm/wit/world.wit` by `crates/lanekeep-types-gen`.** Do not
+ * edit by hand — run `just generate-index-dts` and commit the result.
+ *
  * These describe the host API a rule reaches inside lanekeep's sandbox. Nothing here runs in
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
- *
- * Every member below is asserted against the host's own registration by
- * `local/host-api-matches-types`, one of this repository's own self-check rules
- * (`lanekeep/rules/host-api-matches-types.ts`). A method that exists here and not there — or
- * the reverse — is reported, because a definition that drifts from the engine is worse than
- * none: it produces confident autocomplete for something that does not exist.
- *
- * `BindingKind` specifically is checked the same way, by `local/binding-kinds-are-typed`
- * (`lanekeep/rules/binding-kinds-are-typed.ts`).
+ * The world is the single source of truth, so a definition here cannot drift from the engine the
+ * way a hand-maintained one could.
  */
 
 /**
  * A node in the parse tree.
  *
  * Deliberately opaque. Nodes cross into the sandbox as integer handles rather than objects,
- * which is one of the one-way doors in the architecture — and the reason this is a branded
- * type rather than `number` is that **the root node's handle is `0`**. Written as a plain
- * number, `if (!node)` looks like a null check and silently discards the root, which is how
- * a rule loses its whole top-level case without any error.
- *
- * Compare against `undefined` explicitly.
+ * and the reason this is a branded type rather than `number` is that **the root node's handle
+ * is `0`** — written as a plain number, `if (!node)` looks like a null check and silently
+ * discards the root. Compare against `undefined` explicitly.
  */
 export type Node = number & { readonly __lanekeepNode: unique symbol }
 
@@ -154,80 +147,33 @@ export interface NodeLocation {
   column: number
 }
 
-/** What a rule's `check` handler reaches. */
+/** A rule's RuleContext surface. */
 export interface RuleContext {
-  /** Path of the file being checked, relative to the project root. */
   readonly filePath: string
-  /** The whole file, as text. */
   readonly fileText: string
-  /** The tree's root node. Its handle is `0` — see {@link Node}. */
   readonly root: Node
-
-  /** The node's kind, as tree-sitter names it. */
-  kind(node: Node): string
-  /** The source text the node spans. */
-  text(node: Node): string
-  /** Whether this is a named node rather than an anonymous token. */
-  isNamed(node: Node): boolean
-  /** One-based line of the node's start. */
-  line(node: Node): number
-  /** One-based column of the node's start. */
-  column(node: Node): number
-
-  /** The node's parent, or `undefined` at the root. */
-  parent(node: Node): Node | undefined
-  /** Every child, including anonymous tokens. */
-  children(node: Node): Node[]
-  /** Named children only. */
-  namedChildren(node: Node): Node[]
-  /** Every ancestor, innermost first. */
-  ancestors(node: Node): Node[]
-
-  /**
-   * Whether an identifier resolves to a given import.
-   *
-   * Handles aliasing, so `import { makeStyles as ms }` resolves correctly. This is the call
-   * that separates a rule from a grep: a text match both misses the alias and fires on a
-   * local of the same name.
-   *
-   * @param name Which export. Omit to match the module regardless of which name was taken.
-   *   Two spellings are special and are the only way to name those imports:
-   *   `'default'` matches `import x from 'm'`, and `'*'` matches
-   *   `import * as x from 'm'`. Every other value is matched against the exported
-   *   name, so `import { a as b }` is named by `'a'` and not by `'b'`.
-   */
-  resolvesToImport(node: Node, module: string, name?: string): boolean
-  /** Whether an identifier came from a module matching this glob. */
-  isImportedFrom(node: Node, pattern: string): boolean
-  /** How the name was introduced, or `undefined` when it does not resolve. */
-  bindingKind(node: Node): BindingKind | undefined
-  /** Whether an outer binding of the same name is hidden by this one. */
-  isShadowed(node: Node): boolean
-
-  /** Run a query inside a subtree. */
-  querySubtree(node: Node, query: string): Match[]
-  /** The nearest ancestor matching a query, with its captures. */
-  closestAncestor(node: Node, query: string): Match | undefined
-
-  /**
-   * Read another file, relative to the project root.
-   *
-   * Tracked: the read becomes part of the cache key, so a change to that file invalidates
-   * this one's result. Confined to the project root; `undefined` when absent or outside.
-   */
+  kind(n: Node): string | undefined
+  text(n: Node): string | undefined
+  isNamed(n: Node): boolean
+  line(n: Node): number | undefined
+  column(n: Node): number | undefined
+  parent(n: Node): Node | undefined
+  children(n: Node): Node[]
+  namedChildren(n: Node): Node[]
+  ancestors(n: Node): Node[]
+  resolvesToImport(n: Node, module: string, name?: string): boolean
+  isImportedFrom(n: Node, pattern: string): boolean
+  bindingKind(n: Node): BindingKind | undefined
+  isShadowed(n: Node): boolean
+  querySubtree(n: Node, query: string): Match[]
+  closestAncestor(n: Node, query: string): Match | undefined
   readFile(path: string): string | undefined
-  /** Whether a file exists, tracked the same way. */
   fileExists(path: string): boolean
-
-  /** Emit a fact for the reduce phase. */
   emitFact(fact: Fact): void
+  loc(n: Node): NodeLocation | undefined
+  report(at: Node, message?: string | ReportOptions): void
   /** Facts emitted so far, optionally filtered by `kind`. */
   facts(kind?: string): EmittedFact[]
-
-  /** The node's location, in the shape a fact carries and a reduce phase reports at. */
-  loc(node: Node): NodeLocation | undefined
-  /** Report a violation at a node. */
-  report(at: Node, message?: string | ReportOptions): void
 }
 
 /** A violation the reduce phase reports, which has no node to point at. */
@@ -240,19 +186,10 @@ export interface ReduceLocation {
   column?: number
 }
 
-/**
- * What a rule's `reduce` handler reaches.
- *
- * Deliberately smaller than {@link RuleContext}: **the reduce phase never touches parse
- * trees.** Facts are small and serializable, which is what keeps cross-file rules parallel
- * and cacheable — handing a tree to `reduce` would make the whole corpus resident.
- */
+/** A rule's ReduceContext surface. */
 export interface ReduceContext {
-  /** Every file the run checked, relative to the project root. */
   readonly files: string[]
-  /** Facts from every file, optionally filtered by `kind`. */
   facts(kind?: string): EmittedFact[]
-  /** Report a violation against a file. */
   report(at: ReduceLocation, message?: string | ReportOptions): void
 }
 

@@ -1,0 +1,26 @@
+# Generates `packages/lanekeep/index.d.ts` from `crates/lanekeep-wasm/wit/world.wit`.
+#
+# The WIT world is the authoritative description of the host API every rule reaches — the
+# component rules bind against it, and the TypeScript rules reach the same functions in a
+# camelCase spelling under QuickJS. This crate is what keeps the published TypeScript
+# definitions honest about that: it renders the world's `types` interface (the binding kinds,
+# the records, and the two contexts) into the QuickJS-shaped `index.d.ts`, so the definitions
+# can no longer drift from the world.
+#
+# `publish = false`, deliberately: this is repository tooling, not a crate anyone depends on,
+# and its only consumer is the `just generate-index-dts` recipe and the test that asserts the
+# committed `index.d.ts` is the file it renders.
+[package]
+name = "lanekeep-types-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Only `std` is needed to parse and walk a WIT `Resolve`; `serde`/`decoding` are for
+# serialization and binary decoding, neither of which this generator does.
+wit-parser = { version = "0.252.0", default-features = false, features = ["std"] }

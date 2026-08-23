@@ -4,16 +4,14 @@
 // *component* rule. `src/bindings.rs` generates the Rust bindings from it with
 // `wasmtime::component::bindgen!`, and the engine implements exactly what it declares.
 //
-// It is not yet the single source of truth for the other engine's boundary, and the difference
-// is worth stating here because the title above invites the opposite reading.
-// `packages/lanekeep/index.d.ts` — the definitions a TypeScript rule author installs — is
-// **hand-maintained**, and what holds it honest is `crates/lanekeep-js/tests/host_types.rs`,
-// which compares it against the QuickJS host in `crates/lanekeep-js/src/host.rs`. Nothing
-// generates it from this world: there is no generator, no build script and no recipe. Go
-// authoring does not exist at all yet — `src/key.rs`'s `EXTERNAL_BINDINGS` records what it
-// will need. Single-sourcing the published definitions from here is the unmet leg of the
-// decision record's condition 10, so nothing gated on that condition is unblocked by this
-// file's existence.
+// It is also the single source of truth for the *other* engine's boundary. The definitions a
+// TypeScript rule author installs, `packages/lanekeep/index.d.ts`, are **generated** from this
+// world by `crates/lanekeep-types-gen`, which maps the `check-context` / `reduce-context` /
+// `binding-kind` declarations onto the QuickJS-shaped surface the sandbox exposes
+// (`report`/`emitFact` folding parameters into an object, `facts` on the per-file context, and
+// so on). What holds that mapping honest is `crates/lanekeep-types-gen/tests/generated.rs`,
+// which asserts the committed file is exactly the renderer's output — there is no second,
+// hand-maintained description to drift.
 //
 // Its bytes are a cache-key input — `host_api_hash` is blake3 over this source, taken by
 // `src/key.rs` — so an edit here, including to a comment, invalidates every cached result.

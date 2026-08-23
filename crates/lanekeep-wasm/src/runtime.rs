@@ -1616,7 +1616,9 @@ impl WasmRuntime {
         self.arm(timeout);
         let outcome = self.with_instance(slot, |rule, store| rule.call_metadata(store, index));
         self.disarm();
-        outcome.map_err(|error| self.classify(&error, timeout))
+        let metadata = outcome.map_err(|error| self.classify(&error, timeout))?;
+        validate_metadata(&metadata)?;
+        Ok(metadata)
     }
 
     /// Which of its component's rules a slot names.
@@ -1969,6 +1971,38 @@ impl WasmRuntime {
     }
 }
 
+/// Whether a component's own account of a rule is one the host will run.
+///
+/// An empty `languages` list is not "every language" — a rule runs only on files whose language
+/// it names, so an empty list means it can never run, silently. And a `file-contains` gate listing
+/// more than one substring is an *and* — every one must be present — so a file containing only one
+/// is rejected while the rule looks healthy. Both are refused at metadata time, before any file is
+/// checked, rather than run as a rule that silently reports nothing.
+///
+/// `file-not-contains` is deliberately not refused: it is an *or* — a file whose bytes contain
+/// any of these is skipped — so several entries are meaningful.
+fn validate_metadata(metadata: &types::RuleMetadata) -> Result<(), WasmError> {
+    if metadata.languages.is_empty() {
+        return Err(WasmError::InvalidMetadata {
+            rule: metadata.id.clone(),
+            detail: "names no language — a rule runs only on files whose language it names, so \
+                     an empty list means it can never run"
+                .to_owned(),
+        });
+    }
+    if metadata.gates.file_contains.len() > 1 {
+        return Err(WasmError::InvalidMetadata {
+            rule: metadata.id.clone(),
+            detail: format!(
+                "declares a content gate of {} substrings, which requires all of them — a file \
+                 containing only one is rejected silently",
+                metadata.gates.file_contains.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2057,5 +2091,62 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "dropping the engine waited for the tick interval"
         );
+    }
+
+    /// A `RuleMetadata` the host accepts, with one field a test can change.
+    fn valid_metadata() -> types::RuleMetadata {
+        types::RuleMetadata {
+            id: "fixture/valid".to_owned(),
+            languages: vec!["rust".to_owned()],
+            severity: "error".to_owned(),
+            card: types::RuleCard {
+                message: "m".to_owned(),
+                remediation: "r".to_owned(),
+                examples: types::RuleExamples {
+                    bad: "b".to_owned(),
+                    good: "g".to_owned(),
+                },
+            },
+            query: "(x) @y".to_owned(),
+            gates: types::RuleGates {
+                path_matches: Vec::new(),
+                path_not_matches: Vec::new(),
+                file_contains: vec!["call".to_owned()],
+                file_not_contains: Vec::new(),
+            },
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn valid_metadata_is_accepted() {
+        assert!(validate_metadata(&valid_metadata()).is_ok());
+    }
+
+    #[test]
+    fn a_metadata_naming_no_language_is_refused() {
+        let mut metadata = valid_metadata();
+        metadata.languages.clear();
+        let error =
+            validate_metadata(&metadata).expect_err("an empty language list is no file at all");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+        assert!(format!("{error}").contains("fixture/valid"));
+    }
+
+    #[test]
+    fn a_conjunctive_content_gate_is_refused() {
+        let mut metadata = valid_metadata();
+        metadata.gates.file_contains = vec!["a".to_owned(), "b".to_owned()];
+        let error = validate_metadata(&metadata).expect_err("two substrings require both");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+    }
+
+    #[test]
+    fn a_negative_content_gate_of_several_substrings_is_not_refused() {
+        // `file-not-contains` is an *or*: a file whose bytes contain any of these is skipped.
+        // Several entries are meaningful, unlike `file-contains`, which is an *and*.
+        let mut metadata = valid_metadata();
+        metadata.gates.file_not_contains = vec!["skip".to_owned(), "generated".to_owned()];
+        assert!(validate_metadata(&metadata).is_ok());
     }
 }

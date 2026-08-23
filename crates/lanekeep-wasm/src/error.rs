@@ -162,6 +162,20 @@ pub enum WasmError {
         permitted: Vec<String>,
     },
 
+    /// A component described a rule the host will not run.
+    ///
+    /// Read off the `metadata` export at prepare time, and refused rather than run: a rule
+    /// whose metadata names no language, or declares a conjunctive content gate, would load and
+    /// report nothing — which is indistinguishable from the code being clean. This is the
+    /// component half of the checks `lanekeep-config` runs on a TypeScript rule's default export.
+    #[error("rule `{rule}` has invalid metadata: {detail}")]
+    InvalidMetadata {
+        /// The rule's own id, so the refusal names what to fix.
+        rule: String,
+        /// What about the metadata is wrong.
+        detail: String,
+    },
+
     /// The runtime failed for a reason lanekeep does not model.
     ///
     /// Building an engine, compiling a component, linking the world, instantiating: the

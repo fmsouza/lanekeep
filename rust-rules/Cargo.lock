@@ -3,16 +3,6 @@
 version = 4
 
 [[package]]
-name = "binding-kinds-are-typed"
-version = "0.0.0"
-dependencies = [
- "lanekeep-rule",
- "serde",
- "serde_json",
- "wit-bindgen-rt",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -20,16 +10,6 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "deterministic-iteration"
-version = "0.0.0"
-dependencies = [
- "lanekeep-rule",
- "serde",
- "serde_json",
- "wit-bindgen-rt",
-]
-
-[[package]]
-name = "host-api-matches-types"
 version = "0.0.0"
 dependencies = [
  "lanekeep-rule",
