@@ -107,6 +107,9 @@ fn run_git(root: &Path, args: &[&str]) -> Result<Vec<String>, ChangeError> {
         .arg("-C")
         .arg(root)
         .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .map_err(|e| ChangeError::Unavailable {
             detail: e.to_string(),
@@ -154,6 +157,9 @@ mod tests {
                 .arg("-C")
                 .arg(&self.dir)
                 .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
                 .output()
                 .expect("runs git");
             assert!(
