@@ -45,6 +45,9 @@ impl Repo {
             .arg("-C")
             .arg(&self.dir)
             .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .expect("runs git");
         assert!(
@@ -73,6 +76,9 @@ impl Repo {
             .arg("check")
             .arg(&self.dir)
             .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .expect("runs the binary")
     }
