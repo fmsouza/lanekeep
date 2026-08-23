@@ -19,8 +19,17 @@ fn the_committed_index_dts_is_the_generated_one() {
         std::fs::write("../../packages/lanekeep/index.d.ts", &generated).expect("writes");
     }
 
+    // A Windows checkout with `core.autocrlf` on holds the committed file under CRLF bytes, while
+    // the renderer emits LF. Fold CRLF to LF before comparing, on the same terms as
+    // `crates/lanekeep-wasm/tests/fixture_currency.rs`'s `fold`.
     assert_eq!(
-        generated, committed,
+        generated,
+        fold_crlf(committed),
         "`packages/lanekeep/index.d.ts` has drifted from `world.wit` — run `just generate-index-dts`"
     );
+}
+
+/// CRLF to LF, leaving a lone carriage return alone.
+fn fold_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n")
 }
