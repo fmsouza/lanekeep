@@ -23,4 +23,4 @@ workspace = true
 [dependencies]
 # Only `std` is needed to parse and walk a WIT `Resolve`; `serde`/`decoding` are for
 # serialization and binary decoding, neither of which this generator does.
-wit-parser = { version = "0.252.0", default-features = false, features = ["std"] }
+wit-parser = { version = "0.257.1", default-features = false, features = ["std"] }
