@@ -69,8 +69,9 @@ Three things follow from who reads the output:
 - **It runs in the inner loop.** Agents and developers invoke it after every edit, so a warm run
   is measured in tens of milliseconds — for a config whose rules are all TypeScript modules. A
   rule that ships as a compiled component has to be loaded first, and the four TypeScript
-  built-ins share a 12.4 MiB one: naming any of them costs **about 6.5 seconds on a project's
-  first run** and **about 0.2 seconds on every run after it**, and leaves 33 MiB in `.lanekeep`.
+  built-ins share a 12.4 MiB one: a config naming all four of them costs **about 6.5 seconds on a
+  project's first run** and **about 0.2 seconds on every run after it** — the component is
+  deserialized once per run, not once per rule — and leaves 33 MiB in `.lanekeep`.
   `lanekeep init` scaffolds one of those four, so that is what a new TypeScript project meets
   first. [`docs/architecture.md`](docs/architecture.md) §15 has the table and what is owed.
 
