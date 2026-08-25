@@ -876,7 +876,11 @@ fn prepare(
         // resolves without it works identically and reports the same violations — which is why
         // it is asserted end to end in `crates/lanekeep-rules/tests/source_maps.rs` rather than
         // left to whoever notices.
-        .with_builtin_component_maps(lanekeep_rules::component_source_map);
+        .with_builtin_component_maps(lanekeep_rules::component_source_map)
+        // And the fourth: the "declared as a component" table, so a name whose component row is
+        // broken (its host missing from the table) is refused as a lanekeep bug rather than
+        // served from a stale TypeScript source or reported as a misspelling.
+        .with_builtin_component_declared(lanekeep_rules::is_declared_component);
     let config_path = config_path(project_root, config)?;
 
     let sandbox = lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))

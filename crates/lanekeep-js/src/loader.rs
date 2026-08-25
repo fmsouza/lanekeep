@@ -86,6 +86,15 @@ pub type BuiltinComponent = fn(&str) -> Option<(&'static [u8], u32)>;
 /// and a trap reaches the host with no stack to remap.
 pub type BuiltinComponentMap = fn(&str) -> Option<&'static [u8]>;
 
+/// Resolves whether a built-in rule name is *declared* as a component, regardless of whether
+/// its host ships.
+///
+/// The sibling of [`BuiltinComponent`] that answers a different question. `BuiltinComponent`
+/// answers `None` for a name that is not a component *and* for one whose row names a host this
+/// build does not ship; this hook tells the two apart, so the resolver can refuse the broken
+/// row as a lanekeep bug rather than report a misspelling or serve a stale source.
+pub type BuiltinComponentDeclared = fn(&str) -> bool;
+
 /// The longest a component-hosted built-in's name may be before refusing it stops being
 /// actionable.
 ///
@@ -133,6 +142,11 @@ fn no_builtin_components(_name: &str) -> Option<(&'static [u8], u32)> {
 /// The default: no source maps, which is also the answer for every component that has none.
 fn no_builtin_component_maps(_name: &str) -> Option<&'static [u8]> {
     None
+}
+
+/// The default: no name is declared as a component.
+fn no_builtin_component_declared(_name: &str) -> bool {
+    false
 }
 
 /// The prefix a built-in specifier carries, as in `lanekeep/no-default-export`.
@@ -219,6 +233,25 @@ pub enum ResolveError {
         /// The built-in's name, without the `lanekeep/` prefix.
         name: String,
     },
+
+    /// The specifier names a built-in that is declared as a component, but the component's
+    /// host is missing from the built-in table.
+    ///
+    /// Its own variant rather than a [`ResolveError::NotFound`] with a different string,
+    /// because the two are different facts and only one of them is the user's mistake. A
+    /// built-in that is not there is a typo; a built-in whose component row is broken is a
+    /// lanekeep bug, and telling a reader to check their spelling would send them looking for
+    /// something that is not wrong.
+    ///
+    /// **One line, carrying both the fact and the remedy, on the same terms as
+    /// [`ResolveError::NotAModule`].** QuickJS truncates a thrown error at 255 bytes, so the
+    /// message is budgeted the same way — see [`MAX_COMPONENT_NAME`] and
+    /// `the_broken_row_refusal_survives_quickjs_beside_a_long_path`.
+    #[error("`lanekeep/{name}` is a component missing its host — lanekeep bug")]
+    ComponentHostMissing {
+        /// The built-in's name, without the `lanekeep/` prefix.
+        name: String,
+    },
 }
 
 /// Where rule modules live, and what may be imported.
@@ -228,6 +261,7 @@ pub struct RuleRoot {
     builtins: BuiltinSource,
     builtin_components: BuiltinComponent,
     builtin_component_maps: BuiltinComponentMap,
+    builtin_component_declared: BuiltinComponentDeclared,
 }
 
 impl RuleRoot {
@@ -247,6 +281,7 @@ impl RuleRoot {
             builtins: no_builtins,
             builtin_components: no_builtin_components,
             builtin_component_maps: no_builtin_component_maps,
+            builtin_component_declared: no_builtin_component_declared,
         })
     }
 
@@ -280,6 +315,21 @@ impl RuleRoot {
     #[must_use]
     pub const fn with_builtin_component_maps(mut self, maps: BuiltinComponentMap) -> Self {
         self.builtin_component_maps = maps;
+        self
+    }
+
+    /// Serve the "declared as a component" table, so a name whose component row is broken is
+    /// refused as a lanekeep bug rather than served from a stale source or reported as a typo.
+    ///
+    /// Beside [`RuleRoot::with_builtin_components`]: the component lookup answers `None` for a
+    /// name that is not a component *and* for one whose host is missing, and this hook is what
+    /// tells the two apart.
+    #[must_use]
+    pub const fn with_builtin_component_declared(
+        mut self,
+        declared: BuiltinComponentDeclared,
+    ) -> Self {
+        self.builtin_component_declared = declared;
         self
     }
 
@@ -338,6 +388,15 @@ impl RuleRoot {
             // rather than quietly served.
             if (self.builtin_components)(name).is_some() {
                 return Err(ResolveError::NotAModule {
+                    name: name.to_owned(),
+                });
+            }
+            // A name declared as a component but whose host is missing is a broken table, not
+            // a misspelling and not a module. Refused here — before the source lookup — so a
+            // stale TypeScript copy is never substituted for the component that should have
+            // shipped.
+            if (self.builtin_component_declared)(name) {
+                return Err(ResolveError::ComponentHostMissing {
                     name: name.to_owned(),
                 });
             }
@@ -719,6 +778,9 @@ mod tests {
             "compiled-from-source" => {
                 Some("export default { id: 'lanekeep/compiled-from-source' } satisfies unknown;")
             }
+            // A name that is *declared* as a component but whose host is missing, and that
+            // still has a source — the exact shape the broken-table refusal must not serve.
+            "broken-row" => Some("export default { id: 'lanekeep/broken-row' } satisfies unknown;"),
             _ => None,
         }
     }
@@ -758,6 +820,13 @@ mod tests {
             "compiled-from-source" => Some((b"\0asm\x01\x00\x00\x00", 3)),
             _ => None,
         }
+    }
+
+    /// Stands in for the real "declared as a component" table, on the same terms as
+    /// [`stub_builtin_components`]. `broken-row` is declared but absent from the component
+    /// table, which is the broken-table state the resolver must refuse rather than serve.
+    fn stub_builtin_component_declared(name: &str) -> bool {
+        matches!(name, "compiled" | "compiled-from-source" | "broken-row")
     }
 
     #[test]
@@ -869,6 +938,56 @@ mod tests {
         assert!(
             stub_builtins("compiled-from-source").is_some(),
             "the fixture must have both, or this test asserts nothing"
+        );
+    }
+
+    #[test]
+    fn a_declared_component_whose_host_is_missing_is_refused_not_served() {
+        // The broken-table state, and the decision it forces. `broken-row` is declared as a
+        // component (the declared hook answers) but its host is missing (the component hook
+        // does not), and it *also* has a source — so without the declared check this name
+        // would be silently served from its stale TypeScript. The refusal is what makes the
+        // check load-bearing rather than a reworded NotFound.
+        let fixture = Fixture::new("builtin-broken-row", &[("a.ts", "export const a = 1;")]);
+        let root = fixture
+            .root()
+            .with_builtins(stub_builtins)
+            .with_builtin_components(stub_builtin_components)
+            .with_builtin_component_declared(stub_builtin_component_declared);
+
+        let error = root
+            .resolve("", "lanekeep/broken-row")
+            .expect_err("a broken component row is refused, not served");
+
+        assert!(
+            matches!(&error, ResolveError::ComponentHostMissing { name } if name == "broken-row"),
+            "expected ComponentHostMissing, got {error:?}"
+        );
+        assert!(
+            stub_builtins("broken-row").is_some(),
+            "the fixture must have a source, or this test asserts nothing"
+        );
+    }
+
+    #[test]
+    fn the_broken_row_refusal_survives_quickjs_beside_a_long_path() {
+        // The same budget as `the_refusal_survives_quickjs_beside_a_long_path`, held for the
+        // broken-row refusal too: it reaches a user through the same QuickJS framing, so a
+        // message that does not fit beside a real path loses its remedy to truncation.
+        const BUDGET: usize = 255;
+        const PATH: usize = 108;
+
+        let framing = "Error resolving module '' from '': ".len();
+        let name = "x".repeat(MAX_COMPONENT_NAME);
+        let specifier = format!("lanekeep/{name}").len();
+        let message = ResolveError::ComponentHostMissing { name }.to_string();
+
+        let total = framing + specifier + PATH + message.len();
+        assert!(
+            total <= BUDGET,
+            "QuickJS keeps {BUDGET} bytes and this needs {total} beside a {PATH}-byte path \
+             ({} of them the message): the remedy is what gets cut\n  {message}",
+            message.len(),
         );
     }
 

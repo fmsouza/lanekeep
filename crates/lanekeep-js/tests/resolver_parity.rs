@@ -98,6 +98,12 @@ fn every_refusal() -> Vec<(&'static str, ResolveError)> {
                 name: "<%name%>".to_owned(),
             },
         ),
+        (
+            "ComponentHostMissing",
+            ResolveError::ComponentHostMissing {
+                name: "<%name%>".to_owned(),
+            },
+        ),
     ]
 }
 
@@ -191,7 +197,8 @@ fn the_table_above_cannot_fall_behind_the_enum() {
             | ResolveError::EscapesRoot { .. }
             | ResolveError::NotFound { .. }
             | ResolveError::Unreadable { .. }
-            | ResolveError::NotAModule { .. } => {}
+            | ResolveError::NotAModule { .. }
+            | ResolveError::ComponentHostMissing { .. } => {}
         }
     }
 }
