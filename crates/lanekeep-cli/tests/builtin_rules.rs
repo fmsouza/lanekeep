@@ -368,20 +368,14 @@ fn a_built_in_component_can_be_configured() {
 /// to satisfy. The name is one character for that reason, and the failure below prints the
 /// length it actually had, so a machine with an unusually long `TMPDIR` says so rather than
 /// reading as a regression in the message.
+#[allow(clippy::single_element_loop)]
 #[test]
 fn a_typescript_config_cannot_import_a_built_in_component() {
-    for (name, subject, source) in [
-        (
-            "no-unwrap",
-            "src/a.rs",
-            "fn f() {\n    let c = load().unwrap();\n}\n",
-        ),
-        (
-            "no-restricted-imports",
-            "src/a.ts",
-            "import merge from 'lodash';\nexport { merge };\n",
-        ),
-    ] {
+    for (name, subject, source) in [(
+        "no-unwrap",
+        "src/a.rs",
+        "fn f() {\n    let c = load().unwrap();\n}\n",
+    )] {
         let project = Project::new(
             "c",
             &[

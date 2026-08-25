@@ -1,13 +1,18 @@
-//! Rebuilds the four shipped WebAssembly components from source when their committed
-//! artifacts are missing.
+//! Rebuilds the shipped WebAssembly components from source when their artifacts are missing.
 //!
-//! The four artifacts (`go-builtins.wasm`, `no-glob-import.wasm`, `no-unwrap.wasm`,
-//! `typescript-builtins.wasm` and its `.map`) are committed and read with `include_bytes!`,
-//! so a normal build — and, critically, `cargo publish`'s verify build, where the sources
-//! these were built from are absent from the package — must be a strict no-op. Only when an
-//! artifact is actually missing do we reach for a toolchain, and only then do we emit
-//! `rerun-if-changed` directives, so a checkout that has everything never re-runs the
-//! script and a package that has only the four artifacts never attempts a rebuild.
+//! Three artifacts are shipped and embedded via `include_bytes!`: `go-builtins.wasm`,
+//! `no-glob-import.wasm` and `no-unwrap.wasm`. They are read with `include_bytes!`, so a normal
+//! build — and, critically, `cargo publish`'s verify build, where the sources these were built
+//! from are absent from the package — must be a strict no-op. Only when an artifact is actually
+//! missing do we reach for a toolchain, and only then do we emit `rerun-if-changed` directives,
+//! so a checkout that has everything never re-runs the script and a package that has only the
+//! three artifacts never attempts a rebuild.
+//!
+//! `typescript-builtins.wasm` is no longer shipped — the four TypeScript built-ins run as
+//! QuickJS modules (see `src/lib.rs`'s `BUILT_IN_RULES`). It is still built when missing so
+//! that tests and benchmarks that `include_bytes!` it (in `lanekeep-wasm/tests/world_shape.rs`
+//! and `lanekeep-rules/tests/source_maps.rs`) can compile, but it is not embedded in the
+//! published binary and is excluded from the published `.crate`.
 //!
 //! This deliberately does *not* shell out to `just`: the underlying commands are invoked
 //! directly, so the build is self-contained and reproduces the `just rust-rules`,

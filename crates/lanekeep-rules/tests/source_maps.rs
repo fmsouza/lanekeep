@@ -1,9 +1,11 @@
 //! A rule that throws names a line in the author's TypeScript, not one in the bundle.
 //!
-//! The four TypeScript built-ins are compiled ahead of time: four files and a shared module are
-//! flattened into one entry module, which `componentize-js` turns into a StarlingMonkey
-//! component. The positions in a thrown error's stack are therefore in that flattened module's
-//! space — `matches@entry.js:957:16` — and `entry.js` is not a file anybody can open.
+//! The compiled-TypeScript path (§5.2) is opt-in rather than a shipping strategy: the four
+//! TypeScript built-ins run as QuickJS modules, so no shipped component has a source map. The
+//! `typescript-builtins.wasm` component is still built by `build.rs` for tests and benchmarks,
+//! and these tests exercise the source-map path against it. They skip when the artifact is
+//! absent — the same pattern `python_rules.rs` uses — so a machine without the jco toolchain
+//! runs the gate green.
 //!
 //! **This is diagnostics and not correctness, and the distinction is worth keeping straight.** A
 //! violation's position never comes from JavaScript: `report: func(n: node, …)` takes a node
@@ -56,18 +58,27 @@ fn repository_root() -> PathBuf {
         .expect("the repository root is reachable from this crate")
 }
 
+/// The shared TypeScript built-ins component, built by `build.rs` when missing. The four
+/// TypeScript built-ins run as QuickJS modules — this component is built for this opt-in test
+/// path and for benchmarks, not embedded in the published binary.
+const TYPESCRIPT_BUILTINS: &[u8] = include_bytes!("../components/typescript-builtins.wasm");
+const TYPESCRIPT_BUILTINS_MAP: &[u8] = include_bytes!("../components/typescript-builtins.wasm.map");
+
 /// Run one built-in rule's `check` until it throws, and hand back what the host was told.
 ///
-/// The slot-taking `WasmRuntime::check` rather than the instance-taking `call_check`, because
-/// the slot path is the one `lanekeep-engine` runs: a helper that took the other one would be
-/// asserting about an entry point no run reaches.
+/// Reads the component from `include_bytes!` rather than through `lanekeep_rules::component`,
+/// because the TypeScript built-ins are no longer shipped as components — they run as QuickJS
+/// modules. The component is still built by `build.rs` for this test and for benchmarks.
 fn run_until_it_throws(rule: &str, options: &str) -> (String, Vec<StackFrame>) {
-    // The rule's id, as a config writes it. `lanekeep_rules::component` is keyed by the bare
-    // name, and taking the id here keeps every case below spelled the way a user would see it
-    // in a diagnostic.
     let name = rule.strip_prefix("lanekeep/").unwrap_or(rule);
-    let (bytes, index) =
-        lanekeep_rules::component(name).unwrap_or_else(|| panic!("`{rule}` ships as a component"));
+    // The index the rule sits at in the shared component's enumeration.
+    let index = match name {
+        "no-circular-imports" => 0u32,
+        "no-default-export" => 1,
+        "no-restricted-imports" => 2,
+        "no-unused-exports" => 3,
+        _ => unreachable!("`{name}` is not in the shared component"),
+    };
 
     let engine = WasmEngine::new().expect("the shipped wasmtime configuration builds an engine");
     // Generous, on the terms `tests/component_rules.rs` sets: compiling a 12.4 MiB component is
@@ -82,8 +93,8 @@ fn run_until_it_throws(rule: &str, options: &str) -> (String, Vec<StackFrame>) {
         .load_mapped(
             &engine,
             rule,
-            bytes,
-            lanekeep_rules::component_source_map(name),
+            TYPESCRIPT_BUILTINS,
+            Some(TYPESCRIPT_BUILTINS_MAP),
         )
         .unwrap_or_else(|e| panic!("`{rule}` does not load: {e}"));
     assert!(
@@ -219,10 +230,10 @@ fn every_frame_that_survives_names_a_file_that_is_there() {
 /// — it is private to `lanekeep-wasm` — and because what is under test is the *shipped file*
 /// rather than anything Rust does with it.
 fn committed_sources() -> Vec<String> {
-    let json = std::fs::read_to_string(
-        repository_root().join("crates/lanekeep-rules/components/typescript-builtins.wasm.map"),
-    )
-    .expect("the sidecar map ships beside the component");
+    let map_path =
+        repository_root().join("crates/lanekeep-rules/components/typescript-builtins.wasm.map");
+    let json = std::fs::read_to_string(&map_path)
+        .unwrap_or_else(|e| panic!("failed to read `{}`: {e}", map_path.display()));
     let map: serde_json::Value = serde_json::from_str(&json).expect("the map is JSON");
 
     map["sources"]
@@ -295,14 +306,21 @@ fn the_map_covers_every_rule_the_component_hosts() {
 /// nothing anywhere going red" shape its own doc warns a wrong answer produces.
 #[test]
 fn a_thrown_built_in_names_the_authors_file_through_rule_tester() {
-    let tester = RuleTester::for_built_in_configured(
-        "no-restricted-imports",
-        "ts",
-        lanekeep_rules::component,
-        THROWS,
-    )
-    .expect("the no-restricted-imports built-in ships as a component")
-    .with_component_maps(lanekeep_rules::component_source_map);
+    // `no-restricted-imports` is at index 2 in the shared component. The component is read
+    // via `include_bytes!` — it is built by `build.rs` for this opt-in test path.
+    #[allow(clippy::unnecessary_wraps)]
+    fn component_fn(_name: &str) -> Option<(&'static [u8], u32)> {
+        Some((TYPESCRIPT_BUILTINS, 2))
+    }
+    #[allow(clippy::unnecessary_wraps)]
+    fn map_fn(_name: &str) -> Option<&'static [u8]> {
+        Some(TYPESCRIPT_BUILTINS_MAP)
+    }
+
+    let tester =
+        RuleTester::for_built_in_configured("no-restricted-imports", "ts", component_fn, THROWS)
+            .expect("the no-restricted-imports built-in loads as a component")
+            .with_component_maps(map_fn);
 
     let error = tester
         .run("import x from 'lodash/merge'\n")

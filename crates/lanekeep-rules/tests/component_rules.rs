@@ -1,23 +1,18 @@
 //! The name → (component, index) table, against what the components actually host.
 //!
 //! `lanekeep_rules::component` is an explicit table rather than a lookup through the component,
-//! because resolving a specifier must not require executing guest code — a config load that had
-//! to instantiate a 12.4 MiB engine to find out what `lanekeep/no-default-export` means would
-//! pay for the whole component to answer a question about a name. The cost of an explicit table
-//! is that it can drift from the thing it describes, and the drift is silent: a config entry
+//! because resolving a specifier must not require executing guest code — a config load that
+//! had to instantiate a component to find out what `lanekeep/no-unwrap` means would pay for
+//! the whole component to answer a question about a name. The cost of an explicit table is
+//! that it can drift from the thing it describes, and the drift is silent: a config entry
 //! would be dispatched to a rule that is not the one it named, and a rule reporting is what a
 //! working rule looks like.
 //!
 //! So the table is asserted, in the gate, against every shipped component's own `rules()`. This
 //! is the only place that comparison can be made: `lanekeep-rules` has no wasm runtime of its
-//! own — it is a table and four `include_bytes!`es — and `lanekeep-wasm`, which does, sits below
-//! it and cannot see which rules ship. A dev-dependency is what closes that, and it is a
+//! own — it is a table and three `include_bytes!`es — and `lanekeep-wasm`, which does, sits
+//! below it and cannot see which rules ship. A dev-dependency is what closes that, and it is a
 //! dev-dependency rather than a dependency because nothing in the crate's own code runs a guest.
-//!
-//! **This is also the first thing in the tree to assert that `typescript-builtins.wasm` hosts
-//! four working rules.** The component was committed by the task before this one, whose smoke
-//! test was deleted before the commit, so until now nothing but a digest said what was inside
-//! it.
 
 #![expect(
     clippy::expect_used,
@@ -77,13 +72,9 @@ fn the_table_agrees_with_every_component_it_names() {
     // checked against itself is not checked: if a rule were dropped from `COMPONENT_RULES`
     // entirely, a derived list would simply stop mentioning it and pass.
     const EXPECTED: &[(&str, u32, &str)] = &[
-        ("no-circular-imports", 0, "typescript-builtins"),
         ("no-context-in-struct", 0, "go-builtins"),
-        ("no-default-export", 1, "typescript-builtins"),
         ("no-glob-import", 0, "no-glob-import"),
         ("no-package-init", 1, "go-builtins"),
-        ("no-restricted-imports", 2, "typescript-builtins"),
-        ("no-unused-exports", 3, "typescript-builtins"),
         ("no-unwrap", 0, "no-unwrap"),
     ];
 
@@ -151,55 +142,5 @@ fn the_table_agrees_with_every_component_it_names() {
             ids.len(),
             rules.len()
         );
-    }
-}
-
-/// The shared component hosts four rules, and they are the four.
-///
-/// Separate from the test above because it asserts a different thing: that one names the right
-/// slot for each rule, this one names the whole enumeration in order. A component that gained a
-/// fifth rule, or lost one, passes every per-rule assertion above for the rules it still has.
-#[test]
-fn the_shared_component_enumerates_the_four_typescript_built_ins() {
-    let (bytes, _) =
-        lanekeep_rules::component("no-default-export").expect("the shared component ships");
-    let ids = hosted("typescript-builtins", bytes);
-
-    assert_eq!(
-        ids,
-        vec![
-            "lanekeep/no-circular-imports",
-            "lanekeep/no-default-export",
-            "lanekeep/no-restricted-imports",
-            "lanekeep/no-unused-exports",
-        ],
-        "the order is the one `crates/lanekeep-rules/typescript/entry.ts` passes to `register`, \
-         and it is what `COMPONENT_RULES` dispatches on"
-    );
-}
-
-/// The four rules of the shared component are one artifact, not four.
-///
-/// The whole reason `world rule` takes a rule index. Measured when the component was built: one
-/// rule costs 13,021,569 bytes and four cost 13,028,097, so an artifact each would multiply a
-/// StarlingMonkey build by the number of rules that ship. If these ever stop being the same
-/// bytes, that arrangement has been undone by accident.
-#[test]
-fn the_four_typescript_built_ins_share_one_artifact() {
-    let mut seen: Option<*const u8> = None;
-    for rule in [
-        "no-circular-imports",
-        "no-default-export",
-        "no-restricted-imports",
-        "no-unused-exports",
-    ] {
-        let (bytes, _) = lanekeep_rules::component(rule).expect("the rule ships");
-        match seen {
-            None => seen = Some(bytes.as_ptr()),
-            Some(first) => assert!(
-                std::ptr::eq(first, bytes.as_ptr()),
-                "`{rule}` is served from a different artifact than the rules beside it"
-            ),
-        }
     }
 }
