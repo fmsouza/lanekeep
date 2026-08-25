@@ -5,7 +5,11 @@
   "typesVersions": {
     "*": {
       "no-broad-except": ["builtin.d.ts"],
-      "no-mutable-default-argument": ["builtin.d.ts"]
+      "no-circular-imports": ["builtin.d.ts"],
+      "no-default-export": ["builtin.d.ts"],
+      "no-mutable-default-argument": ["builtin.d.ts"],
+      "no-restricted-imports": ["builtin.d.ts"],
+      "no-unused-exports": ["builtin.d.ts"]
     }
   },
   "exports": {
@@ -21,7 +25,19 @@
     "./no-broad-except": {
       "types": "./builtin.d.ts"
     },
+    "./no-circular-imports": {
+      "types": "./builtin.d.ts"
+    },
+    "./no-default-export": {
+      "types": "./builtin.d.ts"
+    },
     "./no-mutable-default-argument": {
+      "types": "./builtin.d.ts"
+    },
+    "./no-restricted-imports": {
+      "types": "./builtin.d.ts"
+    },
+    "./no-unused-exports": {
       "types": "./builtin.d.ts"
     }
   },

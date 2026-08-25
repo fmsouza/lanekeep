@@ -11,7 +11,7 @@ Not a linter in the ESLint sense. ESLint enforces language-level correctness; la
 ### v1 goals
 
 - TypeScript / JavaScript (incl. TSX/JSX).
-- **Rules are programs, authored in TypeScript** — the same language as the code they inspect. Turing-complete, with no expressiveness ceiling to hit. A rule may also be a WebAssembly component (§4), which is how eight of the ten built-ins ship: two written in Rust, two written in Go, and four compiled from the TypeScript they were already written in. TypeScript is the form a project starts from and the one this document is written in, and it is now the form on **both** sides of that door.
+- **Rules are programs, authored in TypeScript** — the same language as the code they inspect. Turing-complete, with no expressiveness ceiling to hit. A rule may also be a WebAssembly component (§4), which is how four of the ten built-ins ship: two written in Rust and two written in Go. The four TypeScript-inspecting built-ins run as QuickJS modules — they were briefly compiled to a StarlingMonkey component and reverted, because the compiled form cost 13 MB of binary and 110× per host-API crossing for no speed benefit (§15.1). TypeScript is the form a project starts from and the one this document is written in.
 - **Rules run sandboxed inside the binary.** An embedded JavaScript engine, or wasmtime for a component, reaching only host functions lanekeep chooses to expose.
 - **The hot path stays in Rust.** A rule declares a tree-sitter query; Rust matches it at native speed and calls into TypeScript only on matches.
 - Built-in rules ship with the tool and are authored against the same API user rules use.
@@ -1112,25 +1112,18 @@ Re-verified 2026-08-25 in the same session as the table above, against the artif
 
 | Lane | Ceiling | Measured artifact | Headroom |
 |---|---|---|---|
-| crates.io (`.crate`) | 10 MiB, compressed | `lanekeep-rules` ≈ 4.6 MiB — the four shipped components, the eight self-check ones and the source map all ride in the tarball (`cargo package --list`) | ~2× — the tightest lane |
+| crates.io (`.crate`) | 10 MiB, compressed | `lanekeep-rules` ≈ 1 MiB — the three shipped components (go-builtins, no-glob-import, no-unwrap) ride in the tarball; the 13 MB `typescript-builtins.wasm` is excluded because the four TS built-ins run as QuickJS modules | ~10× |
 | PyPI (wheel) | 100 MB per file | 10.2–11.3 MB across the three wheels measured here; the fourth (Windows) builds in CI | ~10× |
 | npm (platform package) | ~500 MB per version | 9.7–10.7 MiB gzipped; the launcher wrapper is 24 KB | ~50× |
 | GitHub release archive | 2 GiB per file | 10.2–11.3 MB tar.gz | ~200× |
 | Homebrew | formula pins the archive's checksum, out of band | the same archives | — |
 | Go module | no binary at all | `cmd/lanekeep` fetches the release binary and verifies it against the same release's `SHA256SUMS` | — |
 
-The reconciliation this issue asked for, stated once: the pre-migration analysis cost the
-TypeScript built-ins at ~8 MB of engine *each* — four engines, if they shipped as four
-components, which is what put crates.io 3× over its cap. #99's shared component is the
-mitigation, and the two are now consistent: **one** engine serves all four built-ins
-(`typescript-builtins.wasm`, 13,029,888 bytes; its precompiled form, 34,874,912 bytes,
-never leaves `.lanekeep/components`). The lane arithmetic that matters is the `.crate` at
-~4.6 MiB — under the cap with the components riding in it, because `build.rs` builds them
-from source at publish rather than omitting them. The reason the components are uncommitted
-is not the cap but byte-reproducibility and the cache-key invariants (§8.1); the tightness of
-this lane is why its contents — the components riding in the tarball — are the thing worth
-checking with `cargo package --list` before a release, since nothing else enforces the cap
-until the upload rejects it.
+The four TypeScript built-ins were briefly compiled into one shared `typescript-builtins.wasm`
+(13,029,888 bytes) and reverted to QuickJS modules, because the StarlingMonkey component cost
+13 MB of binary and 110× per host-API crossing (§15.1) for no speed benefit. The `.crate` dropped
+from ~4.6 MiB to ~1 MiB, and the binary dropped from ~30 MB to ~17 MB. The compiled-TS-to-WASM
+path (§5.2) remains as opt-in for project rules that want it.
 
 **The glibc floor was re-asserted in the same session.** `check_glibc_floor.py` reads the
 `.gnu.version_r` of the built binary, and a WebAssembly runtime is a new source of symbol
@@ -1143,7 +1136,7 @@ its wheel is written. The floor survives the runtime.
 
 ## 16. Milestones
 
-**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships ten built-in rules, eight of them as WebAssembly components; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
+**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships ten built-in rules, four of them as WebAssembly components (two Rust, two Go) and six as QuickJS modules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
 Two things named here are still outstanding, and each is stated where it belongs rather than only here: the §15 performance budgets are targets that are not met, and M5's authoring path compiles the rules that ship with lanekeep but not a project's own.
 
@@ -1177,7 +1170,7 @@ Rust is the fourth, and the one whose *patterns* do the most work. The other thr
 
 What Python does *not* share with JavaScript is the interesting part. It has no block scope, so resolving a name means walking a scope's whole body rather than its direct children — the JavaScript resolver can look at direct children only because a block *is* a scope there. And a class body is opaque to functions nested inside it, so `def m(self): return LIMIT` does not see a class-level `LIMIT`. Neither rule could be expressed by reusing the JavaScript resolver, which is the evidence that mattered: the trait is the boundary, not a shared implementation.
 
-**M5 — a second authoring path for the first language. Done, with one thing deferred.** A TypeScript rule can be compiled ahead of time into a WebAssembly component (§5.2) instead of being loaded into QuickJS, and four of the built-ins ship that way from sources that did not change by a byte. The acceptance test was picked to be one nobody could argue with: those four rules' sources are frozen and asserted with digests, and the four test files that covered them as modules pass **unmodified**. Two of those four reach the component — they drive the binary — and two run the authored source in QuickJS, so `lanekeep-rules/tests/typescript_builtins_as_components.rs` covers the other two against the artifact; §14's fifth door has the full statement. Output fidelity was checked the only way that means anything — two release binaries over one unchanging corpus, same md5, same 42 violations, same per-rule split — rather than one binary over two trees, which measures the tree.
+**M5 — a second authoring path for the first language. Done, then reverted by measurement.** A TypeScript rule can be compiled ahead of time into a WebAssembly component (§5.2) instead of being loaded into QuickJS. Four built-ins were compiled that way from sources that did not change by a byte, and their test files passed **unmodified** across the migration. The compiled path was then **reverted**: the StarlingMonkey component cost 13 MB of binary and 110× per host-API crossing (§15.1) for no speed benefit, so the four TypeScript built-ins returned to QuickJS modules. The compiled-TS-to-WASM path (§5.2) remains as opt-in for project rules; it is no longer a migration target. The "eventually one engine" aspiration — dropping QuickJS for wasmtime alone — is retired by the same measurement.
 
 Four things this bought, and one it cost.
 

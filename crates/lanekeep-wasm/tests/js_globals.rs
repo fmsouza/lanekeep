@@ -537,7 +537,7 @@ fn no_fourth_shape(source: &str) {
              would be reachable inside a WebAssembly component with nothing going red. Write it \
              as `assert_eq!(type_of(&s, \"the.name\"), \"undefined\", …)` — `type_of` evaluates \
              `typeof (the.name)`, so a dotted name needs nothing special.",
-            &before[opener..].chars().take(70).collect::<String>()
+            before[opener..].chars().take(70).collect::<String>()
         );
     }
 }

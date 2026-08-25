@@ -387,7 +387,20 @@ pub(crate) fn rules_module(rules: &[ResolvedRule]) -> String {
 
         references.push(match &rule.options {
             None => binding,
-            Some(options) => format!("{binding}({})", literal(options)),
+            Some(options) => {
+                let specifier = js_string(&rule.specifier);
+                format!(
+                    "(function() {{ var __r = {binding}; var __o = {literal}; \
+                     if (typeof __r === 'function') return __r(__o); \
+                     if (__o !== null && __o !== undefined) \
+                     throw new Error({specifier} + ' takes no options — \
+                     it exports a rule object, not a factory'); \
+                     return __r; }})()",
+                    binding = binding,
+                    literal = literal(options),
+                    specifier = specifier,
+                )
+            }
         });
     }
 
@@ -523,13 +536,23 @@ mod tests {
     #[test]
     fn a_configured_rule_is_called_with_its_options() {
         // The distinction a rule author already makes between a rule and a rule factory.
+        // The entry module wraps the call in a guard that checks `typeof __r === 'function'`
+        // so a non-factory rule given options throws a descriptive error rather than
+        // `not a function` from QuickJS.
         let source = compile(
             "configured-rule",
             r#"{"rules": [{"rule": "lanekeep/no-restricted-imports",
                 "options": {"restrictions": [{"module": "stripe"}]}}]}"#,
         )
         .expect("compiles");
-        assert!(source.contains("__lanekeepRule0({\"restrictions\":[{\"module\":\"stripe\"}]})"));
+        assert!(
+            source.contains(r#"{"restrictions":[{"module":"stripe"}]}"#),
+            "the options literal must appear in the entry module:\n{source}"
+        );
+        assert!(
+            source.contains("__lanekeepRule0"),
+            "the rule binding must be referenced:\n{source}"
+        );
     }
 
     #[test]

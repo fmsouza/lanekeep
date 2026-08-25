@@ -6,15 +6,20 @@ build = "build.rs"
 # committed — so without an explicit `include` cargo's default packaging (which honors
 # `.gitignore`) drops them and the crate's `include_bytes!` of the shipped built-ins fails to
 # verify at publish time. The build job builds them into `components/` before `cargo publish`,
-# and this list makes sure they ride along in the published tarball. Everything else is the
-# crate's own source, enumerated so the explicit list does not silently exclude it.
+# and this list makes sure they ride along in the published tarball. Only the three shipped
+# components are listed: `typescript-builtins.wasm` (13 MB) is no longer embedded in the binary
+# — the four TypeScript built-ins run as QuickJS modules — so it is excluded to keep the
+# `.crate` under crates.io's 10 MiB cap. Everything else is the crate's own source, enumerated
+# so the explicit list does not silently exclude it.
 include = [
     "src/**",
     "rules/**",
     "modules/**",
     "typescript/**",
     "tests/**",
-    "components/**",
+    "components/go-builtins.wasm",
+    "components/no-glob-import.wasm",
+    "components/no-unwrap.wasm",
     "build.rs",
 ]
 version.workspace = true

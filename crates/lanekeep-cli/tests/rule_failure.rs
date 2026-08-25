@@ -1,15 +1,11 @@
 //! What a user is shown when a built-in rule throws, through the binary.
 //!
-//! `crates/lanekeep-rules/tests/source_maps.rs` asserts that the remapping works. This asserts
-//! that it is *wired*, which is a different claim and the one that can be lost silently.
-//!
-//! A built-in's source map reaches the runtime through four crates — `lanekeep_rules`'
-//! component table, `RuleRoot::with_builtin_component_maps`, `ComponentRule::source_map`,
-//! `ComponentLoader::load_mapped` — and `main.rs` is where the first of those is installed. A
-//! build that installed the component lookup and not the map lookup would run every rule
-//! correctly, report every violation at the right position, and pass every other test in the
-//! tree; the only symptom is that a thrown rule names `entry.js`. So the wiring is asserted from
-//! outside the binary, where nothing can stand in for it.
+//! The four TypeScript built-ins run as QuickJS modules, so a thrown error's stack names the
+//! rule's module specifier — `lanekeep/no-restricted-imports` — with line and column that point
+//! at the author's TypeScript (the stripper preserves offsets, so a position in the generated
+//! JavaScript is the same position in the source). This is the native path: no source map to
+//! wire, no bundle to remap, and the test asserts that the rule's own specifier appears in
+//! the reported failure rather than an opaque `eval_script` frame.
 
 #![expect(
     clippy::expect_used,
@@ -39,18 +35,9 @@ fn a_built_in_that_throws_is_reported_in_the_typescript_it_was_authored_in() {
     .run_failing();
 
     assert!(
-        reported.contains("crates/lanekeep-rules/rules/no-restricted-imports.ts:"),
-        "the failure does not name the rule's own source:\n{reported}"
+        reported.contains("lanekeep/no-restricted-imports:"),
+        "the failure does not name the rule's own specifier:\n{reported}"
     );
-    // And not the bundle it was compiled into, nor the build machine's temporary directory,
-    // which is where `componentize-js`'s own generated glue reports from.
-    //
-    // `@entry.js:` rather than `entry.js:`, and the difference is a real frame rather than
-    // pedantry: the stack legitimately ends in `packages/lanekeep/runtime/entry.js`, which is
-    // lanekeep's own runtime calling the rule and a file a reader can open. What must not be
-    // there is the bundle, which a frame spells with no directory in front of it at all.
-    assert!(!reported.contains("@entry.js:"), "{reported}");
-    assert!(!reported.contains("initializer.js"), "{reported}");
 }
 
 #[test]
@@ -59,16 +46,8 @@ fn a_cross_file_rule_that_throws_is_reported_in_its_own_source_too() {
     // file: `entryPoints: 5` survives `configure` and dies at `entryPoints.includes` inside
     // `reduce`, which runs once for the whole corpus rather than per match.
     //
-    // Worth having beside the test above rather than folded into it. The two rules are separate
-    // programs at separate offsets in one bundle, so a map right about one and wrong about the
-    // other passes either test alone — and `reduce`'s frames arrive through a different path in
-    // the runtime than `check`'s, which nothing else here exercises.
-    //
-    // **This was reported as needing "a `reduce`-driving harness built for the purpose", and
-    // that was wrong.** It is true of the in-process route in
-    // `crates/lanekeep-rules/tests/source_maps.rs`, which would need facts and a file list to
-    // build a `reduce-context`. It is not true here: the binary builds all of that from a corpus
-    // on disk, which is what `Corpus` already writes.
+    // Worth having beside the test above rather than folded into it: `reduce`'s frames arrive
+    // through a different path in the runtime than `check`'s, which nothing else here exercises.
     let reported = Corpus::new(
         "no-unused-exports",
         "{ entryPoints: 5 }",
@@ -77,9 +56,7 @@ fn a_cross_file_rule_that_throws_is_reported_in_its_own_source_too() {
     .run_failing();
 
     assert!(
-        reported.contains("crates/lanekeep-rules/rules/no-unused-exports.ts:"),
-        "the failure does not name the rule's own source:\n{reported}"
+        reported.contains("lanekeep/no-unused-exports:"),
+        "the failure does not name the rule's own specifier:\n{reported}"
     );
-    assert!(!reported.contains("@entry.js:"), "{reported}");
-    assert!(!reported.contains("initializer.js"), "{reported}");
 }
