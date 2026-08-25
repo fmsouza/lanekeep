@@ -24,7 +24,7 @@
 //! `query` and `card` exist. The note above `entry_source` in this file records what
 //! that cost.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1173,7 +1173,13 @@ struct Compiled {
     /// The entry's options as JSON, serialized once so every worker gets the same bytes.
     options: String,
     /// The compiled, import-checked component.
-    admitted: lanekeep_wasm::Loaded,
+    ///
+    /// Behind an [`Arc`] because a shared component — the four migrated built-ins are one — is
+    /// named once per rule *reference*, and the whole point of the load memo is to deserialize
+    /// it once and hand the same [`lanekeep_wasm::Loaded`] to every reference. [`RuleSet::add`]
+    /// then shares the instance on [`lanekeep_wasm::Loaded::identity`], which it already did; the
+    /// work this avoids is the deserialize, not the instantiation.
+    admitted: std::sync::Arc<lanekeep_wasm::Loaded>,
 }
 
 /// Read and compile every component the config names, before the run clock starts.
@@ -1195,6 +1201,18 @@ fn compile_components(
 ) -> Result<Vec<Compiled>, (usize, String)> {
     let started = std::time::Instant::now();
     let mut compiled = Vec::new();
+
+    // **One deserialize per component, not one per rule reference.** A shared component — the
+    // four migrated built-ins are one — is named once per rule, and deserializing the same
+    // ~34 MB artifact four times is the §15 defect: the warm column grows faster than the rule
+    // count. The loader is lock-free by design (`&self`, so parallel loads never contend), so
+    // this memo lives here rather than behind a lock in the loader. It is keyed on the
+    // component's content identity — `blake3::hash` of the bytes, the same digest
+    // [`lanekeep_wasm::Loaded::identity`] carries and [`RuleSet::add`] already shares instances
+    // on — and not on the name, because two different components can share a name across
+    // configs. `RuleSet::add` then shares the instance, which it already did; the work this
+    // skips is the deserialize.
+    let mut memo: HashMap<[u8; 32], std::sync::Arc<lanekeep_wasm::Loaded>> = HashMap::new();
 
     for (position, rule) in resolved.iter().enumerate() {
         // Whether this reference is a component at all comes first, so a config of TypeScript
@@ -1218,14 +1236,34 @@ fn compile_components(
             .as_ref()
             .map_or_else(|| "null".to_owned(), json::literal);
 
-        let admitted = loader
-            .load_mapped(
-                engine,
-                &rule.specifier,
-                bytes.as_slice(),
-                source_map.as_ref().map(ComponentBytes::as_slice),
-            )
-            .map_err(|e| (position, e.to_string()))?;
+        // The identity of these bytes — content rather than name, as above. Hashed here to look
+        // the memo up *before* paying for a load, so a second reference to one component skips
+        // `load_mapped` entirely. `load_mapped` hashes the same bytes again to name its
+        // artifact, so the first reference pays two hashes; that is one hash per unique
+        // component rather than one per reference, and a blake3 of 34 MB is milliseconds against
+        // the seconds a deserialize costs.
+        let identity = *blake3::hash(bytes.as_slice()).as_bytes();
+
+        let admitted = if let Some(existing) = memo.get(&identity) {
+            // The source map is a property of the component, not of the identity, and
+            // [`RuleSet::add`] already collapses every reference of one identity to the first
+            // one's map — so handing the first reference's `Loaded` to the rest is consistent
+            // with the invariant rather than a new assumption about it.
+            std::sync::Arc::clone(existing)
+        } else {
+            let fresh = std::sync::Arc::new(
+                loader
+                    .load_mapped(
+                        engine,
+                        &rule.specifier,
+                        bytes.as_slice(),
+                        source_map.as_ref().map(ComponentBytes::as_slice),
+                    )
+                    .map_err(|e| (position, e.to_string()))?,
+            );
+            memo.insert(identity, std::sync::Arc::clone(&fresh));
+            fresh
+        };
 
         compiled.push(Compiled {
             position,
@@ -2829,6 +2867,64 @@ mod tests {
         )
         .expect("the same component compiles fine under the shipped budget");
         assert_eq!(compiled.len(), 1);
+    }
+
+    /// Four references to one shared component deserialize it once, not once per reference.
+    ///
+    /// `docs/architecture.md` §15 names this as a defect rather than a property:
+    /// [`compile_components`] calls [`ComponentLoader::load_mapped`] once per rule *reference*,
+    /// so a config naming every rule of a shared component deserializes the same bytes
+    /// repeatedly. The loader is deliberately lock-free — `&self` throughout, so parallel loads
+    /// have no contention — so the dedup belongs here rather than in the loader, keyed on the
+    /// component's content identity: the blake3 of its bytes, the same
+    /// [`lanekeep_wasm::Loaded::identity`] [`RuleSet::add`] already shares instances on.
+    #[test]
+    fn four_references_to_one_component_load_it_once() {
+        let fixture = Fixture::new("config-load-one-component", &[]);
+        fixture.write_component("rules/shared.wasm", "world-shape");
+
+        let root = RuleRoot::new(&fixture.dir).expect("canonicalizes");
+        let engine = WasmEngine::new().expect("the shipped configuration builds an engine");
+        let loader = lanekeep_wasm::ComponentLoader::without_cache();
+        // Four references to the same component path — the shape of a config naming every rule
+        // of one shared component, which is what the four migrated built-ins are.
+        let path = root.path().join("rules/shared.wasm");
+        let resolved: Vec<ResolvedRule> = (0..4)
+            .map(|_| ResolvedRule {
+                specifier: "./rules/shared.wasm".to_owned(),
+                reference: RuleReference::Component(path.clone()),
+                options: None,
+            })
+            .collect();
+
+        let compiled = compile_components(
+            &root,
+            &resolved,
+            &engine,
+            &loader,
+            COMPILE_BUDGET_PER_COMPONENT,
+        )
+        .expect("the shared component compiles");
+
+        assert_eq!(compiled.len(), 4, "one Compiled per reference");
+        assert_eq!(
+            loader.compilations(),
+            1,
+            "one component compiled once, not once per reference"
+        );
+        assert_eq!(
+            loader.embedded_loads(),
+            1,
+            "and deserialized once — the memo hands one Loaded to every reference"
+        );
+        assert!(
+            Arc::ptr_eq(&compiled[0].admitted, &compiled[1].admitted),
+            "the same Loaded is handed to the second reference"
+        );
+        assert!(
+            Arc::ptr_eq(&compiled[0].admitted, &compiled[3].admitted),
+            "and to every one after it"
+        );
     }
 
     /// A caller's `--timeout` has to govern config load, because config load runs guest code.

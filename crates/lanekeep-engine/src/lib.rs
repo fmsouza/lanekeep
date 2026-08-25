@@ -30,7 +30,7 @@
 //! One parse per file, not per rule. Parsing is the dominant cost, and a file with twenty
 //! applicable rules must not pay it twenty times.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -722,7 +722,13 @@ impl Engine {
         // the host world — once, here, before any worker exists. A rule whose bytes are
         // missing or whose imports reach past the sandbox fails now, naming itself, rather
         // than on whichever file happened to match it first.
-        let components = load_components(&mut rules, project_root)?;
+        //
+        // Writes precompiled artifacts under the project's own `.lanekeep/components`, and falls
+        // back to compiling in-process when that is not writable. Compiling twenty components costs
+        // about 186 ms against about 0.74 ms to map twenty precompiled ones, which is 23% of the
+        // whole cold budget spent before a file is read.
+        let loader = ComponentLoader::for_project_root(project_root);
+        let components = load_components(&mut rules, &loader)?;
 
         // Every registered grammar, so a tree-sitter bump invalidates rather than silently
         // reusing results computed against different node shapes.
@@ -2411,7 +2417,7 @@ fn unused_violations(directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Vio
 /// cache key does not know about.
 fn load_components(
     rules: &mut [Prepared],
-    project_root: &Path,
+    loader: &ComponentLoader,
 ) -> Result<Option<Components>, RunError> {
     if rules.iter().all(|rule| rule.spec.component.is_none()) {
         return Ok(None);
@@ -2424,11 +2430,16 @@ fn load_components(
         detail: e.to_string(),
     })?;
 
-    // Writes precompiled artifacts under the project's own `.lanekeep/components`, and falls
-    // back to compiling in-process when that is not writable. Compiling twenty components costs
-    // about 186 ms against about 0.74 ms to map twenty precompiled ones, which is 23% of the
-    // whole cold budget spent before a file is read.
-    let loader = ComponentLoader::for_project_root(project_root);
+    // **One deserialize per component, not one per rule reference** — the second pass of the §15
+    // defect. `lanekeep_config::compile_components` already dedups by identity on its own pass;
+    // this is the engine's own load, at prepare time, which the same four rules re-pay in full.
+    // The loader is lock-free (`&self`), so the memo is here rather than behind a lock in it,
+    // keyed on the component's content identity — `blake3::hash` of the bytes, the same digest
+    // `Loaded::identity` carries and `RuleSet::add` already shares instances on — and not on
+    // the name, because two different components can share a name across configs. `RuleSet::add`
+    // shares the instance on that identity, which it already did; the work this skips is the
+    // deserialize.
+    let mut memo: HashMap<[u8; 32], lanekeep_wasm::Loaded> = HashMap::new();
 
     for rule in rules.iter_mut() {
         let Some(component) = rule.spec.component.clone() else {
@@ -2439,20 +2450,38 @@ fn load_components(
         // folded these exact bytes and `lanekeep-config` read this rule's metadata out of them,
         // so executing a second read would let a file that changed in between describe one
         // rule, key another and run a third — with every check passing and nothing to notice.
-        let admitted = loader
-            .load_mapped(
-                &engine,
-                &name,
-                component.bytes.as_slice(),
-                // The map the config carried, not one looked up here. It is only correct for
-                // the bundle beside it, and this crate has no way to check that pairing —
-                // `lanekeep-config` read both out of one table.
-                component.source_map.as_ref().map(ComponentBytes::as_slice),
-            )
-            .map_err(|e: WasmError| RunError::Component {
-                rule: name.clone(),
-                detail: e.to_string(),
-            })?;
+        //
+        // The identity of those bytes — content rather than name, as above — is hashed here to
+        // look the memo up *before* paying for a load, so a second rule of one component skips
+        // `load_mapped` entirely. The `Loaded` lives in the memo for this call; `RuleSet::add`
+        // borrows it, copies the identity and the source map it needs, and returns — so the
+        // borrow ends before the next iteration mutates the memo. The map drops at the end of
+        // the call, after `Components::linked` has taken what it keeps.
+        let identity = *blake3::hash(component.bytes.as_slice()).as_bytes();
+        // `entry` rather than `contains_key` + `get`: the same lookup answers whether to load
+        // and hands back the `Loaded` for `RuleSet::add`, so a second rule of one component
+        // borrows the first rule's load without paying for another deserialize — and without an
+        // `expect` that this crate's non-test source avoids.
+        let admitted = match memo.entry(identity) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let fresh = loader
+                    .load_mapped(
+                        &engine,
+                        &name,
+                        component.bytes.as_slice(),
+                        // The map the config carried, not one looked up here. It is only correct
+                        // for the bundle beside it, and this crate has no way to check that
+                        // pairing — `lanekeep-config` read both out of one table.
+                        component.source_map.as_ref().map(ComponentBytes::as_slice),
+                    )
+                    .map_err(|e: WasmError| RunError::Component {
+                        rule: name.clone(),
+                        detail: e.to_string(),
+                    })?;
+                entry.insert(fresh)
+            }
+        };
         // The options travel with the rule rather than being handed over later, because an
         // instance is built lazily per worker: `RuleSet::add` records them and
         // `WasmRuntime::rule` hands them to every instance it builds. A configuration step
@@ -2468,7 +2497,7 @@ fn load_components(
         // constant here instead would run the same rule under each of its neighbors' ids, with
         // the id, the query and the card all correct and only the handler wrong.
         let slot = set
-            .add(&name, &admitted, component.index, component.options)
+            .add(&name, admitted, component.index, component.options)
             .map_err(|e| RunError::Component {
                 rule: name,
                 detail: e.to_string(),
@@ -6368,6 +6397,61 @@ export default defineRule({
             assert!(
                 worker.wasm.is_none(),
                 "a worker with no component match must not build a store at all"
+            );
+        }
+
+        /// A `Prepared` rule from a hand-built spec — the work `Engine::prepare` does for one
+        /// TypeScript rule, so [`load_components`](super::load_components) can be driven directly
+        /// with a test loader rather than through a whole `Engine::prepare`.
+        fn prepared(spec: RuleSpec) -> Prepared {
+            let language = lanekeep_lang_js::registry()
+                .by_id("typescript")
+                .expect("typescript is registered")
+                .clone();
+            let query =
+                CompiledQuery::compile(language.as_ref(), &spec.query).expect("the query compiles");
+            let gates = CompiledGates::compile(&spec.gates).expect("the gates compile");
+            Prepared {
+                index: 0,
+                spec,
+                gates,
+                compiled: vec![(language, query)],
+                slot: None,
+            }
+        }
+
+        /// `load_components` deserializes a shared component once at prepare time, not once per
+        /// rule.
+        ///
+        /// The second of the two passes the §15 defect names: the engine's own `load_components`
+        /// called [`ComponentLoader::load_mapped`] per rule, so the same component was
+        /// deserialized again at prepare time. The dedup is keyed on the same content identity as
+        /// `lanekeep_config::compile_components`, keeping the loader itself lock-free.
+        #[test]
+        fn load_components_deserializes_one_shared_component_once() {
+            let loader = ComponentLoader::without_cache();
+            // Four rules of one component: distinct ids and indices, the same fixture bytes —
+            // the shape of a config naming every rule a shared component hosts.
+            let mut rules: Vec<Prepared> = ["a", "b", "c", "d"]
+                .iter()
+                .enumerate()
+                .map(|(index, id)| prepared(component_rule(&format!("local/{id}"), index, false)))
+                .collect();
+            for (index, rule) in rules.iter_mut().enumerate() {
+                rule.index = index;
+            }
+
+            let components = load_components(&mut rules, &loader).expect("loads");
+            assert!(components.is_some(), "the config named a component");
+            assert_eq!(
+                loader.compilations(),
+                1,
+                "one shared component compiled once at prepare time, not once per rule"
+            );
+            assert_eq!(
+                loader.embedded_loads(),
+                1,
+                "and deserialized once — one Loaded handed to every rule of it"
             );
         }
 

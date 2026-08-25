@@ -928,6 +928,14 @@ The fix is that config load and the engine share one artifact cache, `.lanekeep/
 | three | 7,451 ms | ~1,492 ms |
 | **four — the migrated set** | **8,312 ms** | **~2,398 ms** |
 
+**The two paragraphs above and the table were measured before the load memo, and the memo is the
+four-row's eraser.** Re-measured 2026-08-26 on the release binary over a fresh one-file project
+naming all four built-ins, before and after on the same machine: cold **9.98 s → 6.88 s** and warm
+**2.50 s → 0.26 s** (three warm runs each, ±0.05 s). The all-four row now sits at the one-rule
+figures, because the shared component is deserialized once per load pass and its `Loaded` handed
+to every rule of it, in `lanekeep-config` and in the engine's own prepare-time load alike. The
+precompiled `.cwasm` is 34 MB and there is still exactly one of it in `.lanekeep/components`.
+
 So "compiling one is tens of milliseconds" is ~6 s for this artifact, "~70 ms per component" is ~6 s, and "components no longer measurably cost anything at config load" is 213 ms for one rule against a 25 ms warm budget. The precompiled `.cwasm` is 34 MB.
 
 **A TinyGo component sits at the other end of that range, and its size is the third one worth writing down.** `crates/lanekeep-rules/components/go-builtins.wasm` hosts both Go built-ins in **13,187 bytes** — `wc -c` on the artifact, built by `just go-rules` on TinyGo 0.41.1 with `-target=wasm-unknown -panic=trap -no-debug` — against 107,914 and 111,759 bytes for the two Rust rule components and 13,029,888 for the shared JavaScript one.
@@ -950,7 +958,7 @@ For scale at the other end, and read as magnitudes rather than as a ratio becaus
 
 **Both Go built-ins are migrations, one for one, so the built-in count is unchanged at ten** — eight of them components now, and the two that remain TypeScript modules are the Python pair. Nothing in this section is re-baselined by that change: a Go rule adds no host function, no boundary crossing and no cache-key input, and §15.1's per-crossing figures were taken against a Rust component and a JavaScript one, neither of which moved.
 
-**The warm column grows faster than the rule count, and that is a defect rather than a property.** The increments are +534 ms, +745 ms, +906 ms: `lanekeep-config` loads once per rule *reference*, so four rules of one component deserialize the same 34 MB artifact repeatedly and instantiate it more than once, where the whole point of sharing the component is to pay for the engine once. The fix is a memo keyed on the content identity `Loaded` already carries — the same identity `lanekeep-wasm` keys instance sharing on (§6.9) — rather than anything structural. It is not done, and until it is, **naming a fifth rule of that component costs about another second of warm time**.
+**The warm column grows faster than the rule count, and that was a defect rather than a property — closed with a load memo.** The increments were +534 ms, +745 ms, +906 ms: `lanekeep-config` loaded once per rule *reference*, so four rules of one component deserialized the same 34 MB artifact repeatedly and instantiated it more than once, where the whole point of sharing the component is to pay for the engine once. The fix is a memo keyed on the content identity `Loaded` already carries — the same identity `lanekeep-wasm` keys instance sharing on (§6.9) — rather than anything structural, and it lives in both sequential load passes (`compile_components` and the engine's prepare-time `load_components`) rather than behind a lock in the loader, which stays lock-free. The memo is keyed on the bytes, not the name, because two different components can share a name across configs. Done, and re-measured above: the four-row now sits at the one-rule figures, so **naming a fifth rule of that component costs nothing extra in warm time**.
 
 None of this is on the path of a project that uses no components, and none of it changes a result. It is the cost of the form, and §15.1 has the other half — what a component costs per `check` invocation once it is loaded.
 
