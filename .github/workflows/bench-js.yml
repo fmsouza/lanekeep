@@ -1,0 +1,207 @@
+# Re-measure the JavaScript bench arm that the gate cannot run.
+#
+# `crates/lanekeep-engine/benches/crossings.rs` has a third arm — `no-unwrap` compiled from
+# the same TypeScript the QuickJS arm runs, inside StarlingMonkey — that produced §15.1's
+# headline: a host call costs ~110x through a JavaScript component against QuickJS's ~320 ns,
+# and a `check` invocation costs +98 to +107 µs before it crosses anything. That arm needs
+# Node and `jco` and a ~13 MB artifact built into `target/`, so the PR `bench` job (`just
+# bench`) cannot run it: the bench degrades to two arms and names this recipe when the artifact
+# is absent. The figures most likely to drift are then the ones nothing watches.
+#
+# This workflow is the watcher. It is **scheduled**, not part of the gate — the build is
+# minutes, and the gate must stay fast. It is keyed on `packages/lanekeep/package-lock.json`
+# changing, because that lockfile is what decides the artifact's bytes (rolldown,
+# StarlingMonkey, wizer and binaryen all live under it), and it runs weekly as a backstop for a
+# drift that arrives without a commit to the lockfile — a runner image or a transitive that
+# moved. It can also be dispatched by hand.
+#
+# # Tolerance, stated rather than left implicit
+#
+# `componentize-js` is **not byte-reproducible** — three builds of one unchanged tree gave
+# three distinct sha256s — so this workflow cannot assert bytes. It re-measures and compares
+# against the recorded figures.
+#
+# The comparison is on the **ratio** (JavaScript ns/call ÷ QuickJS ns/call), not the absolute
+# µs. §15.1 records ~110x on an Apple M3 Max (three runs: 109.3, 111.0, 112.6) and states the
+# bench's own caveat that absolute times cannot be asserted on a hosted runner; the ratio is
+# the machine-independent quantity, and the absolute figures this workflow prints are for a
+# human to read, not for a step to gate on.
+#
+# The window is **half an order of magnitude either side of 110 — [35, 350]**. That catches an
+# order-of-magnitude drift from a toolchain bump (the thing the lockfile decides) while
+# tolerating the cross-hardware and run-to-run variance a hosted runner brings. A figure
+# outside that range is a real signal worth a human, not noise to be absorbed.
+name: Bench (JavaScript arm)
+
+on:
+  schedule:
+    # Monday 04:00 UTC. Weekly rather than nightly: the figure only needs re-checking when the
+    # toolchain moves, and the `push.paths` trigger below covers that; this is the periodic
+    # backstop for a drift that arrives without a commit to the lockfile.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+  push:
+    paths:
+      - packages/lanekeep/package-lock.json
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench-js:
+    name: bench (javascript arm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+          # `just rust-rules` builds the rule components with `cargo component`, which needs the
+          # wasm target. The bench also reads the shipped `no-unwrap.wasm` that build.rs produces.
+          targets: wasm32-unknown-unknown
+
+      # Deliberately uncached. This workflow exists to catch drift in the JavaScript arm when
+      # the toolchain moves, and the measured figures come from artifacts built fresh every run
+      # — `just bench-js-component` rebuilds the 13 MB component and `just rust-rules` rebuilds
+      # the components, neither of which `Swatinem/rust-cache` touches anyway (it caches the
+      # Rust compile of the bench harness, not the measured path). A cache here would only
+      # speed up compiling wasmtime, at the cost of a license the repo's dependency-review
+      # allow-list does not carry; the weekly cadence can absorb the cold compile.
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: just,cargo-binstall
+
+      # `just rust-rules` needs it to build the rule components. Pinned to the version
+      # AGENTS.md's measurements name, so the Rust components' bytes stay reproducible across
+      # runs. `--force` because cargo-binstall has been observed to report "already installed"
+      # and skip on a fresh runner; `command -v` fails the step loudly if it is still not on
+      # PATH after install.
+      - name: Install cargo-component
+        run: |
+          cargo binstall --no-confirm --force cargo-component@0.21.1
+          command -v cargo-component
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.5"
+          # The root module has no `go.sum`, and the cache step errors rather than shrugs when
+          # it cannot find the file it keys on.
+          cache: false
+
+      - name: Install TinyGo
+        env:
+          TINYGO_VERSION: "0.41.1"
+          TINYGO_SHA256: "e156d1d93a376eef639a4143d13be07e8c463fb6cf2d7d447698ed4474d23e91"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/tinygo.tar.gz" \
+            "https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo${TINYGO_VERSION}.linux-amd64.tar.gz"
+          echo "${TINYGO_SHA256}  ${RUNNER_TEMP}/tinygo.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/tinygo.tar.gz"
+          echo "${RUNNER_TEMP}/tinygo/bin" >> "${GITHUB_PATH}"
+
+      # Not the one TinyGo brings. Its Linux tarball bundles binaryen 116 at `$TINYGOROOT/bin/
+      # wasm-opt`, and the components are built through 131. `WASMOPT` is the one override
+      # TinyGo honors ahead of the copy in its own root.
+      - name: Install binaryen (wasm-opt)
+        env:
+          BINARYEN_VERSION: "131"
+          BINARYEN_SHA256: "b5bf1f0eaf17c63ee588ff7a5954dc8f6ce2c26989051c66f24dfe9ece3e46db"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/binaryen.tar.gz" \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          echo "${BINARYEN_SHA256}  ${RUNNER_TEMP}/binaryen.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/binaryen.tar.gz"
+          echo "WASMOPT=${RUNNER_TEMP}/binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt" >> "${GITHUB_ENV}"
+
+      # TinyGo shells out to this for `component embed` and `component new`. It ships with
+      # neither TinyGo nor the runner image, so without it the build dies at the encoding step
+      # after a minute in LLVM.
+      - name: Install wasm-tools
+        env:
+          WASM_TOOLS_VERSION: "1.255.0"
+          WASM_TOOLS_SHA256: "a62237f4731c45f665f1115cad39acaeec02963cbc848c9473ab033eed837072"
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/wasm-tools.tar.gz" \
+            "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz"
+          echo "${WASM_TOOLS_SHA256}  ${RUNNER_TEMP}/wasm-tools.tar.gz" | sha256sum -c -
+          tar -C "${RUNNER_TEMP}" -xzf "${RUNNER_TEMP}/wasm-tools.tar.gz"
+          echo "${RUNNER_TEMP}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux" >> "${GITHUB_PATH}"
+
+      # `just typescript-builtins` and `just bench-js-component` need the pinned jco toolchain,
+      # which `npm ci` installs.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install the jco toolchain
+        run: npm ci --prefix packages/lanekeep
+
+      # Build all three lanes so `build.rs` is a no-op when the bench compiles `lanekeep-rules`:
+      # `build.rs` rebuilds every shipped component from source when any is missing, and the
+      # bench reads the shipped `no-unwrap.wasm` at run time. This is the `components` job's
+      # build, re-run here because a scheduled workflow has no upstream artifact to download.
+      - name: Build the components
+        run: |
+          just rust-rules
+          just go-rules
+          just typescript-builtins
+
+      # The 13 MB JavaScript artifact the third arm measures. Built into `target/` (gitignored),
+      # not committed — `componentize-js` is not byte-reproducible, so no currency check could
+      # tell a stale committed copy from a current one.
+      - name: Build the JavaScript bench component
+        run: just bench-js-component
+
+      - name: Run the crossings bench
+        # `pipefail` so a bench failure (compile error, panic) fails this step directly rather
+        # than being masked by `tee`'s exit 0 and surfacing indirectly in the assert step below.
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo bench -p lanekeep-engine --bench crossings 2>&1 | tee bench-output.txt
+
+      # Assert the JavaScript arm ran and its host-call ratio is within the stated tolerance.
+      # The ratio is the machine-independent quantity; the absolute µs the bench prints are for
+      # a human reading the log, not for this step (see the file header's "Tolerance" section).
+      - name: Assert the JavaScript arm's ratio is within tolerance
+        run: |
+          set -uo pipefail
+          out="bench-output.txt"
+
+          ratio_line="$(grep -E 'a host call costs [0-9]+\.[0-9]+x through the TypeScript component' "$out" || true)"
+          if [ -z "$ratio_line" ]; then
+            echo "FAIL: the JavaScript component arm did not run (no ratio line in the bench output)."
+            echo "      \`just bench-js-component\` builds it; check the build step above."
+            echo "--- bench output ---"
+            cat "$out"
+            exit 1
+          fi
+
+          ratio="$(printf '%s\n' "$ratio_line" | grep -oE '[0-9]+\.[0-9]+' | head -n1)"
+          echo "JavaScript arm host-call ratio: ${ratio}x"
+          echo "  (recorded ~110x on an Apple M3 Max — docs/architecture.md §15.1)"
+
+          # Tolerance: half an order of magnitude either side of 110 — [35, 350]. See the file
+          # header for the rationale. `awk` exits non-zero when the condition is false.
+          awk -v r="$ratio" 'BEGIN { exit !(r + 0 >= 35 && r + 0 <= 350) }' || {
+            echo "FAIL: ratio ${ratio}x is outside the tolerance [35, 350] (half an order of"
+            echo "      magnitude either side of the recorded ~110x). A toolchain bump moved"
+            echo "      the figure by more than half an order of magnitude — worth a human."
+            exit 1
+          }
+          echo "PASS: ratio ${ratio}x is within the tolerance [35, 350]."
+
+          # Printed for a human, not gated: the per-`check` invocation cost is absolute and
+          # machine-dependent (recorded +98 to +107 µs on an M3 Max; a hosted runner differs).
+          echo
+          echo "per- invocation cost (absolute, machine-dependent — recorded, not gated):"
+          grep -E 'per invocation, before it crosses' "$out" || true
