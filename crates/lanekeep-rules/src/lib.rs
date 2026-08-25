@@ -291,14 +291,46 @@ pub fn component_source_map(name: &str) -> Option<&'static [u8]> {
     hosted(name)?.0.2
 }
 
+/// Whether a name is declared as a component rule, regardless of whether its host ships.
+///
+/// The distinction from [`component`] is the point. `component` answers `None` for two
+/// different facts: a name that is not a component at all, and a name whose
+/// `COMPONENT_RULES` row names a host this build does not ship. The first is a typo; the
+/// second is a broken table — a lanekeep bug, not a misspelling — and only this lookup can
+/// tell them apart.
+///
+/// `lanekeep_js::RuleRoot` asks this after [`component`] and before [`source`], so a name
+/// that is declared as a component but whose host is missing is refused as a broken table
+/// rather than silently served from its (stale) TypeScript source.
+#[must_use]
+pub fn is_declared_component(name: &str) -> bool {
+    is_declared_component_in(COMPONENT_RULES, name)
+}
+
+/// The generic half of [`is_declared_component`], split out so a test can build a broken table.
+fn is_declared_component_in(rules: &[(&str, &str, u32)], name: &str) -> bool {
+    rules.iter().any(|(candidate, _, _)| *candidate == name)
+}
+
 /// The row of [`BUILT_IN_COMPONENTS`] that hosts a rule, and the index it sits at.
 ///
 /// One lookup behind both accessors, so a rule cannot be found by one and missed by the other.
 fn hosted(name: &str) -> Option<(&'static BuiltInComponent, u32)> {
-    let (_, host, index) = COMPONENT_RULES
-        .iter()
-        .find(|(candidate, _, _)| *candidate == name)?;
-    let component = BUILT_IN_COMPONENTS
+    hosted_in(COMPONENT_RULES, BUILT_IN_COMPONENTS, name)
+}
+
+/// The generic half of [`hosted`], split out so a test can build a broken table.
+///
+/// The broken-table state — a `rules` row whose host is absent from `components` — is not
+/// constructible from the `const` tables, which the gate holds consistent; a test that needs
+/// to see it passes its own.
+fn hosted_in<'a>(
+    rules: &[(&str, &str, u32)],
+    components: &'a [BuiltInComponent],
+    name: &str,
+) -> Option<(&'a BuiltInComponent, u32)> {
+    let (_, host, index) = rules.iter().find(|(candidate, _, _)| *candidate == name)?;
+    let component = components
         .iter()
         .find(|(candidate, _, _)| candidate == host)?;
     Some((component, *index))
@@ -557,6 +589,21 @@ mod tests {
         // Still evaluated as TypeScript, and asked by name rather than assumed: this is what
         // distinguishes "not migrated" from "migrated and the table was not updated".
         assert_eq!(component("no-broad-except"), None);
+    }
+
+    #[test]
+    fn a_declared_component_whose_host_is_missing_is_distinguished_from_unknown() {
+        // The broken-table state: a `COMPONENT_RULES` row whose host is absent from
+        // `BUILT_IN_COMPONENTS`. `component` answers `None` for it — indistinguishable from a
+        // name that is not a component at all — and `is_declared_component` is the lookup that
+        // tells the two apart, so the resolver can refuse it as a lanekeep bug rather than
+        // report a misspelling or silently serve a stale source.
+        let rules = [("no-context-in-struct", "go-builtins", 0u32)];
+        let components: [BuiltInComponent; 0] = [];
+
+        assert!(hosted_in(&rules, &components, "no-context-in-struct").is_none());
+        assert!(is_declared_component_in(&rules, "no-context-in-struct"));
+        assert!(!is_declared_component_in(&rules, "no-such-rule"));
     }
 
     #[test]

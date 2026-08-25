@@ -447,6 +447,25 @@ function notAModule(name) {
   }
 }
 
+/**
+ * The specifier names a built-in that is declared as a component, but the component's host is
+ * missing from the built-in table.
+ *
+ * A Rust-only refinement, and deliberately not wired into `resolve`. This resolver's
+ * `components` list is the *declared* table — a name in it is refused as `notAModule` whether
+ * or not its host ships — so it has no "declared but host missing" state to distinguish. The
+ * Rust resolver has two tables (`component` for a host that ships, `is_declared_component` for
+ * a name that is merely declared) and needs the second message to tell a broken table from a
+ * misspelling. The message is here so `resolver_parity.rs` can hold the two copies together.
+ */
+function componentHostMissing(name) {
+  return {
+    code: 'component-host-missing',
+    name,
+    message: `\`lanekeep/${name}\` is a component missing its host — lanekeep bug`,
+  }
+}
+
 /** Membership in an array or a `Set`, and `false` for a table that was not supplied. */
 function contains(names, name) {
   if (names === undefined || names === null) return false
