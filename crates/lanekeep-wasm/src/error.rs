@@ -335,6 +335,14 @@ mod tests {
             .is_limit_breach(),
             "a refusal is a configuration problem, not a budget problem"
         );
+        assert!(
+            !WasmError::RuleFailed {
+                message: "boom".to_owned(),
+                frames: Vec::new(),
+            }
+            .is_limit_breach(),
+            "a rule's own failure is a bug in the rule, not a budget problem"
+        );
     }
 
     #[test]
@@ -375,6 +383,41 @@ mod tests {
         }
         .to_string();
         assert!(rendered.contains("permitted: nothing"), "{rendered}");
+    }
+
+    #[test]
+    fn a_rule_failure_renders_its_frames_indented() {
+        // `indent_frames` is the only reader of a `stack-frame`'s file, line and column, and the
+        // wasm counterpart of `lanekeep_js::error::indent_stack` — which has three tests to this
+        // one's none. The two engines render a failed rule into one set of diagnostics, so the
+        // shape they produce has to agree: `function@file:line:column`, one frame to a line,
+        // indented under the message. A mutation that dropped a field or changed the separator
+        // would pass every other test in this file, because nothing else reads these positions.
+        let rendered = WasmError::RuleFailed {
+            message: "boom".to_owned(),
+            frames: vec![StackFrame {
+                function: "matches".to_owned(),
+                file: "rule.ts".to_owned(),
+                line: 13,
+                column: 25,
+            }],
+        }
+        .to_string();
+        assert!(rendered.starts_with("rule threw: boom"), "{rendered}");
+        assert!(rendered.contains("\n  matches@rule.ts:13:25"), "{rendered}");
+    }
+
+    #[test]
+    fn a_rule_failure_without_frames_renders_cleanly() {
+        // A Rust rule has no stack to offer, so `frames` is empty and the rendering must not
+        // invent a line for one — the same property `lanekeep_js::error::indent_stack`'s
+        // `a_script_error_without_a_stack_renders_cleanly` asserts on the other engine.
+        let rendered = WasmError::RuleFailed {
+            message: "boom".to_owned(),
+            frames: Vec::new(),
+        }
+        .to_string();
+        assert_eq!(rendered, "rule threw: boom");
     }
 
     #[test]
