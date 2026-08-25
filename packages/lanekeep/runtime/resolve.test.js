@@ -11,11 +11,11 @@
 
 import { strict as assert } from 'node:assert'
 import { existsSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { dirname, join, sep } from 'node:path'
+import { dirname, join, sep, win32 } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
 
-import { confine, resolve } from './resolve.js'
+import { confine, normalize, resolve } from './resolve.js'
 import * as host from '../index.js'
 
 /**
@@ -496,4 +496,49 @@ test('confine refuses a traversal that only lands inside by way of a symlink', {
   // Normalizing lexically lands outside, and this refuses. Fail-closed, and on purpose.
   const answer = confine(`${root}${sep}link${sep}..${sep}..${sep}x.ts`, { rulesRoot: root })
   assert.equal(answer.error?.code, 'escapes-root', JSON.stringify(answer))
+})
+
+// --- windows parity -----------------------------------------------------------------
+//
+// `loader.rs` is the specification, and `node:path`'s defaults are the *host platform's*: a
+// leading `/` is a root on win32, where Rust's `Path::is_absolute` says a lone `RootDir` is
+// rooted rather than absolute. `normalize` likewise seeds `depth` at 1 for any non-empty root,
+// where Rust counts a Windows root (`Prefix` + `RootDir`) as 2. Both divergences are latent —
+// the specifiers are refused either way — but the two implementations of one boundary have to
+// read identically, so the port moves. These pin the moves under win32 semantics on any host,
+// through a `pathImpl` seam that defaults to the current (host) behavior.
+
+// Pins `a_rule_may_not_import_an_absolute_path`'s Windows half. `loader.rs` refuses
+// `/etc/passwd` as `BareSpecifier` on Windows (a lone `/` root is rooted, not absolute), where
+// `node:path`'s `win32.isAbsolute` is `true` and the port used to take the absolute branch and
+// refuse it as `escapes-root`. Both refuse; this pins the *reason* so the two implementations
+// read identically. The entry case (`base === ''`) is where the divergence lives: with a base
+// of its own both branches refuse as `bare-specifier`.
+test('an absolute posix path is refused as a bare specifier on windows', (t) => {
+  const f = fixture(t, 'win32-bare', { 'main.ts': '' })
+  const { error } = resolve('/etc/passwd', '', {
+    rulesRoot: f.dir,
+    pathImpl: win32,
+  })
+  assert.equal(error?.code, 'bare-specifier', JSON.stringify(error))
+})
+
+// Pins `lanekeep_core::files::normalize`'s Windows root depth: Rust counts a drive root
+// (`C:\`) as `Prefix` + `RootDir` = 2, so two `..` do not pop the drive. The port seeded `depth`
+// at 1 for any non-empty root, which pops the drive after one `..` past its last segment.
+// `C:\a\..\..` keeps the drive under either seed (two segments absorb), but `C:\..\..` keeps it
+// only when the seed is 2 — at 1 it yields `C:\..`, the drive popped. The second assertion drives
+// the same depth through `resolve`: a `C:\..`-shaped specifier under win32 is absolute (drive),
+// takes the entry door, normalizes back to the drive root, and is refused as `escapes-root` for
+// being outside the (posix) rules root.
+test('normalize counts a windows root as two components', (t) => {
+  assert.equal(normalize('C:\\a\\..\\..', win32), 'C:\\', 'the drive is never popped')
+  assert.equal(normalize('C:\\..\\..', win32), 'C:\\', 'two .. do not escape a drive root')
+
+  const f = fixture(t, 'win32-depth', { 'main.ts': '' })
+  const { error } = resolve('C:\\..\\x', '', {
+    rulesRoot: f.dir,
+    pathImpl: win32,
+  })
+  assert.equal(error?.code, 'escapes-root', JSON.stringify(error))
 })

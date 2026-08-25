@@ -33,7 +33,17 @@
  */
 
 import { realpathSync, statSync } from 'node:fs'
-import { basename, dirname, isAbsolute, parse, sep } from 'node:path'
+import { basename, dirname, parse, sep } from 'node:path'
+
+/**
+ * The host platform's path primitives, as the default for `pathImpl`.
+ *
+ * `pathImpl` is the seam a test uses to drive win32 semantics on any host: the bundler's resolver
+ * runs on whichever platform the build runs on, but a rule's imports are written for the
+ * platform the rule targets, and the two need not agree. The default — no `pathImpl` passed — is
+ * the host, which is what `rolldown.config.mjs` relies on and what every existing caller does.
+ */
+const HOST_PATH = { parse, sep }
 
 /** The specifier that resolves to lanekeep's own module. */
 const HOST_MODULE = 'lanekeep'
@@ -51,8 +61,56 @@ const BUILTIN_PREFIX = 'lanekeep/'
  */
 const EXTENSIONS = ['ts', 'tsx', 'js', 'jsx', 'mjs']
 
-/** Separators, as the platform spells them. Windows accepts both; Unix accepts one. */
-const SEPARATORS = sep === '\\' ? /[\\/]+/ : /\/+/
+/**
+ * Separators, as `pathImpl`'s platform spells them. Windows accepts both slashes; Unix one.
+ *
+ * A function of the impl rather than a module constant, because `normalize` is the only user and
+ * it has to split a specifier written for the *target* platform — a win32 specifier uses `\`,
+ * which a posix-host `SEPARATORS` of `/\/+/` would not split.
+ */
+function separatorsOf(pathImpl) {
+  return pathImpl.sep === '\\' ? /[\\/]+/ : /\/+/
+}
+
+/**
+ * Whether `path` is absolute, as `Path::is_absolute` rules it — not as `node:path`'s `isAbsolute`
+ * does.
+ *
+ * `node:path`'s `isAbsolute` is the *host platform's*, and on win32 it answers `true` for a path
+ * with a root alone — `/etc/passwd` — where Rust's `Path::is_absolute` answers `false`: a lone
+ * `RootDir` is *rooted*, not absolute; absolute requires `Prefix` + `RootDir` (a drive or a UNC
+ * share, with its root directory). The two implementations of this confinement boundary have to
+ * agree on *why* a specifier is refused, not merely that it is, so the port follows Rust.
+ *
+ * `pathImpl` defaults to the host, which keeps the host's behavior exactly — on a posix host
+ * `parse('/etc/passwd').root === '/'` and `sep === '/'`, so this is `true`, as `isAbsolute` was.
+ */
+function isAbsoluteLike(pathImpl, path) {
+  const impl = pathImpl ?? HOST_PATH
+  const { root } = impl.parse(path)
+  if (root === '') return false
+  // Posix: a leading slash is the root, and that is absolute there.
+  if (impl.sep === '/') return true
+  // Win32: Rust requires Prefix + RootDir. A drive root (`C:\`) or a UNC root
+  // (`\\server\share\`) carries both; a lone `\` or `/` is RootDir only and is rooted, not
+  // absolute. `C:foo` has a Prefix but no RootDir, so it is relative-to-drive and not absolute.
+  return /^[A-Za-z]:[\\/]/.test(root) || (root.startsWith('\\\\') && /[\\/]$/.test(root))
+}
+
+/**
+ * The depth `normalize` seeds at for a root, as `Path::components` counts it.
+ *
+ * Rust's `lanekeep_core::files::normalize` walks `Path::components`, so a Windows root is
+ * `Prefix` + `RootDir` = two components and a posix root is `RootDir` = one. Seeding `depth` at
+ * the same count is what keeps `..` from being absorbed one step too far under `C:\` —
+ * `C:\..\..` stays at `C:\`, where a seed of 1 pops the drive to `C:\..`.
+ */
+function rootDepth(root, pathImpl) {
+  const impl = pathImpl ?? HOST_PATH
+  if (root === '') return 0
+  if (impl.sep === '/') return 1
+  return isAbsoluteLike(impl, root) ? 2 : 1
+}
 
 /**
  * Resolve a specifier written in `importer`.
@@ -89,7 +147,7 @@ const SEPARATORS = sep === '\\' ? /[\\/]+/ : /\/+/
  * plugin has to be able to render one.
  */
 export function resolve(specifier, importer, options = {}) {
-  const { rulesRoot, builtins } = options
+  const { rulesRoot, builtins, pathImpl } = options
 
   // Ahead of everything, including canonicalizing the root: the host module and the built-ins
   // are answered without the filesystem being consulted at all. A resolver that stat'd the
@@ -121,15 +179,19 @@ export function resolve(specifier, importer, options = {}) {
   // A rule writing `import '/etc/passwd'` always has an importer — its own path — so it falls
   // through to the bare-specifier refusal rather than through this door. Containment is
   // checked either way.
-  if (isAbsolute(specifier)) {
+  //
+  // `isAbsoluteLike` follows `Path::is_absolute`, not `node:path`'s `isAbsolute`: on win32 a
+  // lone `/` is rooted rather than absolute, so `/etc/passwd` is refused as a bare specifier
+  // there — as Rust refuses it — rather than taken through this door and refused as an escape.
+  if (isAbsoluteLike(pathImpl, specifier)) {
     if (base !== '') return { error: bareSpecifier(specifier) }
-    return within(root.path, spellings, specifier, normalize(specifier))
+    return within(root.path, spellings, specifier, normalize(specifier, pathImpl))
   }
 
   if (!specifier.startsWith('.')) return { error: bareSpecifier(specifier) }
 
   const directory = base === HOST_MODULE || base === '' ? root.path : parentOf(base, root.path)
-  return within(root.path, spellings, specifier, normalize(concat(directory, specifier)))
+  return within(root.path, spellings, specifier, normalize(concat(directory, specifier), pathImpl))
 }
 
 /**
@@ -281,12 +343,13 @@ function candidates(base) {
  * outside the root and is refused — dropping it would silently turn `../../secrets` into
  * `secrets`, which is a file inside the root that the author did not ask for.
  */
-function normalize(path) {
-  const { root } = parse(path)
+export function normalize(path, pathImpl) {
+  const impl = pathImpl ?? HOST_PATH
+  const { root } = impl.parse(path)
   const out = []
-  let depth = root === '' ? 0 : 1
+  let depth = rootDepth(root, impl)
 
-  for (const segment of path.slice(root.length).split(SEPARATORS)) {
+  for (const segment of path.slice(root.length).split(separatorsOf(impl))) {
     if (segment === '' || segment === '.') continue
     if (segment === '..') {
       if (depth === 0) {
@@ -302,7 +365,7 @@ function normalize(path) {
     depth += 1
   }
 
-  return root + out.join(sep)
+  return root + out.join(impl.sep)
 }
 
 /**
