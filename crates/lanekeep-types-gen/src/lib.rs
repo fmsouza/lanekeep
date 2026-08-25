@@ -354,8 +354,12 @@ const HEADER: &str = "\
  * These describe the host API a rule reaches inside lanekeep's sandbox. Nothing here runs in
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
- * The world is the single source of truth, so a definition here cannot drift from the engine the
- * way a hand-maintained one could.
+ * The world is the single source of truth for every member the renderer emits straight from it.
+ * Two members deviate from the world on purpose, and both are QuickJS-shaped: `today` is omitted
+ * from `RuleContext` because QuickJS exposes it as a conditional property rather than a callable,
+ * a shape this renderer cannot state honestly from the world; and `facts` is added to
+ * `RuleContext` because QuickJS hands a per-file rule `facts` that the world declares only on
+ * `reduce-context`. Nothing else is added or omitted by hand.
  */
 ";
 
