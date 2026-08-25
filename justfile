@@ -221,6 +221,12 @@ _componentize source out *ARGS:
 # every test in `lanekeep-wasm` asserting against the previous binary, green and
 # meaningless. See `crates/lanekeep-wasm/tests/fixture_currency.rs`.
 #
+# It also records the toolchain that built them — `rustc` and `cargo component` versions —
+# beside the source digests, so a rebuild through a different toolchain is a *named* failure
+# rather than an unexplained byte diff. `cargo component` uses `wasm-tools` as a library
+# (pinned in each fixture's committed `Cargo.lock`, already a digest input), not by shelling
+# out to the CLI, so the CLI version is not recorded here.
+#
 # `--target wasm32-unknown-unknown` is a requirement, not a preference. `cargo component`
 # defaults to `wasm32-wasip1`, whose components import a wall clock and a filesystem as
 # soon as the guest touches anything in `std` — the two capabilities the sandbox exists to
@@ -476,9 +482,12 @@ generate-index-dts:
 # or the architecture. darwin/arm64 and linux/amd64 both produce
 # `881bc3cc47da05a6e76e59067a97581762bb53a1461f40d807f167b67d7d4a3c`.
 #
-# The versions are echoed below rather than checked. A mismatch surfaces as a byte diff whose
-# cause is in the log beside it, which is as much as a recipe can do without pinning a toolchain
-# it has no way to install.
+# The versions are echoed below for the log, and **recorded** into
+# `crates/lanekeep-wasm/tests/go-component-digests.txt` by the bless step at the end of this
+# recipe — `fixture_currency.rs` captures the same four from `PATH` and names the tool that
+# drifted, so a rebuild through a different binaryen is a named failure rather than an 87-byte
+# diff. The recorded values are the four `.github/workflows/ci.yml` pins; a contributor whose
+# toolchain differs from them gets the named failure and rebuilds with the pinned toolchain.
 go-rules:
     #!/usr/bin/env bash
     set -euo pipefail
