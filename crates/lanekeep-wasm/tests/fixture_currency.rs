@@ -48,10 +48,12 @@
 //! `1.26.5` is an input to the bytes. Recording the whole string would make the manifest
 //! machine-specific and red on every platform change.
 //!
-//! The comparison is made only against tools that are present: the gate job has no TinyGo,
-//! `wasm-opt`, `wasm-tools` or `cargo component`, so it checks the digests and skips the tool
-//! versions, while a maintainer's `just go-rules` / `just wasm-fixtures` — and CI's `components`
-//! job — has the toolchain and gets the named check.
+//! The comparison is made only when the whole toolchain is present: a rebuild needs every tool,
+//! so a partial toolchain is not a rebuild context and its stray versions are not drift. The
+//! gate job has the runner image's default `go` but no TinyGo, `wasm-opt`, `wasm-tools` or
+//! `cargo component`, so it checks the digests and skips the tool versions, while a maintainer's
+//! `just go-rules` / `just wasm-fixtures` — and CI's `components` job — has the full toolchain
+//! and gets the named check.
 //!
 //! # What is deliberately not covered
 //!
@@ -210,7 +212,8 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
     let tools = tool_versions(&[
         ("rustc", "rustc", &["--version"][..]),
         ("cargo-component", "cargo-component", &["--version"][..]),
-    ]);
+    ])
+    .unwrap_or_default();
 
     reconcile(
         &computed,
@@ -273,7 +276,8 @@ fn every_committed_go_fixture_is_the_one_its_sources_build() {
         ("tinygo", "tinygo", &["version"][..]),
         ("wasm-opt", wasmopt.as_str(), &["--version"][..]),
         ("wasm-tools", "wasm-tools", &["--version"][..]),
-    ]);
+    ])
+    .unwrap_or_default();
 
     reconcile(
         &computed,
@@ -326,10 +330,11 @@ fn counted(computed: &BTreeMap<String, String>, prefix: &str, extension: &str) -
 
 /// Compare what is in the tree against what was recorded, or rewrite the record.
 ///
-/// `tools` is the toolchain captured from the current `PATH` — only the tools that are present,
-/// so the gate job (which has no component toolchain) compares nothing here and still checks the
-/// digests. `what` and `recipe` are the two halves of the failure message: what went stale, and
-/// which recipe makes it current again.
+/// `tools` is the toolchain captured from the current `PATH` — the full set when every tool is
+/// present, empty when the toolchain is incomplete (a partial toolchain is not a rebuild context,
+/// so the gate job compares nothing here and still checks the digests). `what` and `recipe` are
+/// the two halves of the failure message: what went stale, and which recipe makes it current
+/// again.
 fn reconcile(
     computed: &BTreeMap<String, String>,
     tools: &BTreeMap<String, String>,
@@ -593,19 +598,21 @@ fn version_of(program: &str, args: &[&str]) -> Option<String> {
         })
 }
 
-/// The tool versions that decide a committed artifact's bytes, for the tools that are present.
+/// The tool versions that decide a committed artifact's bytes, or `None` when the toolchain is
+/// incomplete.
 ///
-/// Each entry is `(name, program, args)`. A tool that is not installed is dropped rather than
-/// recorded, so the gate job — which has no component toolchain — records nothing here and the
-/// assert path skips the comparison, while a maintainer's recipe has the toolchain and gets the
-/// named check.
-fn tool_versions(tools: &[(&str, &str, &[&str])]) -> BTreeMap<String, String> {
-    tools
-        .iter()
-        .filter_map(|(name, program, args)| {
-            version_of(program, args).map(|version| ((*name).to_owned(), version))
-        })
-        .collect()
+/// Each entry is `(name, program, args)`. The versions are only meaningful as a *set*: a rebuild
+/// needs every tool, so a partial toolchain is not a rebuild context and its stray versions are
+/// not drift. The gate job has the runner image's default `go` but no TinyGo, `wasm-opt` or
+/// `wasm-tools` — comparing that `go` against the recorded one would name a drift nobody
+/// introduced. So a single missing tool makes the whole set `None`, and the caller skips the
+/// comparison; a maintainer's recipe has all four and gets the named check.
+fn tool_versions(tools: &[(&str, &str, &[&str])]) -> Option<BTreeMap<String, String>> {
+    let mut found = BTreeMap::new();
+    for (name, program, args) in tools {
+        found.insert((*name).to_owned(), version_of(program, args)?);
+    }
+    Some(found)
 }
 
 /// The manifest, back into the map [`render`] wrote it from.
