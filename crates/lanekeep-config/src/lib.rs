@@ -1007,16 +1007,10 @@ fn describe_components(
         // A component hosting nothing is a configured rule that can never report, which is the
         // failure this tool exists not to produce — and it is silent, because an empty list
         // reads downstream exactly like a reference nobody wrote. Refused where the reference
-        // is, so the diagnostic names the entry.
-        if ids.is_empty() {
-            return Err(fail(
-                position,
-                format!(
-                    "`{}` is a component that hosts no rules — there is nothing for this entry \
-                     to run",
-                    rule.specifier
-                ),
-            ));
+        // is, so the diagnostic names the entry. The check is a pure helper so it is testable
+        // without building a component that answers `rules()` with nothing.
+        if let Err(detail) = no_rules_detail(&ids, &rule.specifier) {
+            return Err(fail(position, detail));
         }
 
         let wanted = contributed(&ids, entry.only, &rule.specifier)
@@ -1095,6 +1089,23 @@ fn describe_components(
     }
 
     Ok(described)
+}
+
+/// The detail string for refusing a component whose `rules()` answered nothing.
+///
+/// An empty list is a configured rule that can never report — and it is silent, because an
+/// empty list reads downstream exactly like a reference nobody wrote. Lifted out of
+/// [`describe_components`] so the refusal is unit-testable without a `.wasm` fixture: the
+/// question is whether an empty id list and a specifier produce the refusal, nothing a
+/// component has to run to answer. The caller wraps the detail in [`ConfigError::Rule`].
+fn no_rules_detail(ids: &[String], specifier: &str) -> Result<(), String> {
+    if ids.is_empty() {
+        return Err(format!(
+            "`{specifier}` is a component that hosts no rules — there is nothing for this entry \
+             to run"
+        ));
+    }
+    Ok(())
 }
 
 /// How long one component may take to read, compile and admit.
@@ -3123,6 +3134,38 @@ mod tests {
         let config = load_with_components(&fixture.dir, "lanekeep.json", built_in_components)
             .expect("a component whose two exports agree must load");
         assert_eq!(config.rules[0].id.to_string(), "fixture/metadata");
+    }
+
+    /// A component whose `rules()` answers nothing is refused, and the refusal names the entry.
+    ///
+    /// The check is reached through [`no_rules_detail`] rather than a `.wasm` fixture that
+    /// answers `rules()` with an empty list, because the question is whether an empty id list and
+    /// a specifier produce the refusal — nothing a component has to run to answer. Deleting the
+    /// branch in [`describe_components`] used to survive the whole suite; this reaches it
+    /// directly, the way `a_component_naming_no_language_is_refused` reaches `validate_metadata`.
+    #[test]
+    fn a_component_hosting_no_rules_is_refused_with_its_specifier() {
+        let error = no_rules_detail(&[], "./rules/empty.wasm")
+            .expect_err("an empty rule list is nothing to run");
+        assert!(
+            error.contains("./rules/empty.wasm"),
+            "the refusal has to name the entry, which is what a reader can act on: {error}"
+        );
+        assert!(
+            error.contains("hosts no rules"),
+            "and what is wrong with it: {error}"
+        );
+    }
+
+    /// And a component hosting rules is not refused, so the check above is not an unconditional
+    /// refusal. The pair is what makes the first test mean something: a `no_rules_detail` that
+    /// always erred would pass it and fail here.
+    #[test]
+    fn a_component_hosting_rules_is_not_refused() {
+        assert!(
+            no_rules_detail(&["fixture/one".to_owned()], "./rules/one.wasm").is_ok(),
+            "a non-empty id list is a component with something to run"
+        );
     }
 
     #[test]
