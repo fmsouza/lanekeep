@@ -10,31 +10,20 @@
 // It is architectural rather than stylistic: the damage shows up as unrelated requests failing
 // together, which is nearly impossible to attribute back to the field.
 //
-// # Half of this is resolved and half of it is a text match
+// # The qualifier is resolved by import, not by spelling
 //
 // [types.CheckContext.BindingKind] says whether the qualifier is an import at all, so a
-// package-level name that happens to read `context` does not fire. That much is resolved.
+// package-level name that happens to read `context` does not fire. [check] then asks
+// [types.CheckContext.ResolvesToImport] which module the import binds to, so the qualifier's
+// local spelling is irrelevant: the standard library under an alias is reported, and a
+// non-standard package imported under the name `context` is not. Both directions are pinned by
+// cases in `crates/lanekeep-rules/tests/no_context_in_struct.rs`:
 //
-// **Which package it is, is decided by comparing text.** [check] asks for `ctx.Text(pkg)` and
-// compares it against [PACKAGE], so the rule is really "an imported qualifier *spelled*
-// `context`" — and that spelling is the import's local name, which an author chooses. Both
-// halves of the resulting inaccuracy are real, and both are pinned by cases in
-// `crates/lanekeep-rules/tests/no_context_in_struct.rs`:
+//	import ctxpkg "context"                      // reported, and it is the standard library
+//	import context "example.com/app/context"     // not reported, and it is not
 //
-//	import context "example.com/app/context"     // reported, and it is not the standard library
-//	import ctxpkg "context"                      // not reported, and it is
-//
-// The host API is not what stops this. `check-context` already declares `resolves-to-import` and
-// `is-imported-from` — the module-aware predicates, generated into this package's own bindings as
-// [types.CheckContext.ResolvesToImport] and [types.CheckContext.IsImportedFrom] — and Go's
-// resolver carries the whole import path, `net/http` rather than `http`. A revision that asked
-// `ctx.ResolvesToImport(pkg, "context", cm.None[string]())` instead would close both cases at
-// once, add no host function and so move no cache key.
-//
-// It is not done here because this file is a port held to reporting identically to the
-// TypeScript it replaced (below), and that file compared text too. Changing what the rule means
-// is a change to make on its own, against its own tests, rather than inside a migration — and
-// the cases above exist so that a revision which does it fails them and has to say so.
+// `resolves-to-import` was already declared in the world and generated into this package's own
+// bindings, so asking it adds no host function and moves no cache key.
 //
 // # A port, held to reporting identically
 //
@@ -71,9 +60,6 @@ const NAME = "name"
 // FIELD is the capture bound to the whole field declaration, which is where a violation is
 // reported.
 const FIELD = "field"
-
-// PACKAGE is the qualifier a violation has. Compared against, not searched for.
-const PACKAGE = "context"
 
 // TYPE is the type name a violation has.
 const TYPE = "Context"
@@ -192,13 +178,10 @@ func check(ctx types.CheckContext, m lanekeep.Match) error {
 		return nil
 	}
 
-	// `Value()` is the empty string when the host has no text for the node, which is neither of
-	// these and so is not a violation — the same answer the TypeScript original's
+	// `Value()` is the empty string when the host has no text for the node, which is not `Context`
+	// and so is not a violation — the same answer the TypeScript original's
 	// `ctx.text(m.name) !== 'Context'` gives for `undefined`.
 	if ctx.Text(name).Value() != TYPE {
-		return nil
-	}
-	if ctx.Text(pkg).Value() != PACKAGE {
 		return nil
 	}
 
@@ -207,6 +190,13 @@ func check(ctx types.CheckContext, m lanekeep.Match) error {
 	kind := ctx.BindingKind(pkg)
 	binding := kind.Some()
 	if binding == nil || *binding != types.BindingKindImport {
+		return nil
+	}
+
+	// Which package the import binds to is resolved by the host, not by the qualifier's spelling:
+	// the standard library under an alias is still `context`, and a non-standard package imported
+	// under the name `context` is not.
+	if !ctx.ResolvesToImport(pkg, "context", cm.None[string]()) {
 		return nil
 	}
 
