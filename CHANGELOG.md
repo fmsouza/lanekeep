@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/fmsouza/lanekeep/compare/v0.6.1...v0.7.0) - 2026-08-25
+
+### Added
+
+- *(wasm)* record toolchain versions in the digest manifests ([#137](https://github.com/fmsouza/lanekeep/pull/137))
+- *(rules)* [**breaking**] author the Go built-ins in Go, compiled to a component ([#118](https://github.com/fmsouza/lanekeep/pull/118))
+- *(rules)* author rules in Python, compiled to a component ([#124](https://github.com/fmsouza/lanekeep/pull/124))
+- *(wasm)* [**breaking**] the host API in WIT, and lanekeep-wasm ([#103](https://github.com/fmsouza/lanekeep/pull/103))
+- *(rules)* [**breaking**] rules authored in Rust, compiled to components ([#106](https://github.com/fmsouza/lanekeep/pull/106))
+- *(rules)* [**breaking**] compile TypeScript rules to WebAssembly components ([#116](https://github.com/fmsouza/lanekeep/pull/116))
+- *(rules)* [**breaking**] migrate the sixteen self-check rules to WASM components ([#126](https://github.com/fmsouza/lanekeep/pull/126))
+- single-source index.d.ts from WIT and validate metadata host-side ([#129](https://github.com/fmsouza/lanekeep/pull/129))
+
+### Documentation
+
+- *(wasm)* correct the superseded memory-ceiling claim in world.wit ([#138](https://github.com/fmsouza/lanekeep/pull/138))
+
+### Fixed
+
+- *(wasm)* prune superseded component artifacts from the cache ([#143](https://github.com/fmsouza/lanekeep/pull/143))
+- *(rules)* honor the allow option on the Rust-targeting built-ins ([#105](https://github.com/fmsouza/lanekeep/pull/105))
+- *(no-context-in-struct)* resolve qualifier by import, not spelling ([#135](https://github.com/fmsouza/lanekeep/pull/135))
+- *(cli)* honor --timeout ([#91](https://github.com/fmsouza/lanekeep/pull/91))
+- *(cli)* scrub inherited git env in git-spawning tests ([#130](https://github.com/fmsouza/lanekeep/pull/130))
+- *(loader)* refuse a component whose host is missing, not serve source ([#136](https://github.com/fmsouza/lanekeep/pull/136))
+
+### Other
+
+- close four coverage gaps found by mutation during #99 ([#141](https://github.com/fmsouza/lanekeep/pull/141))
+
+### Performance
+
+- *(engine)* match every rule in one traversal ([#93](https://github.com/fmsouza/lanekeep/pull/93))
+- *(config)* load a shared component once per pass, not per rule ([#144](https://github.com/fmsouza/lanekeep/pull/144))
+
 ## [0.6.1](https://github.com/fmsouza/lanekeep/compare/v0.6.0...v0.6.1) - 2026-08-03
 
 ### Performance
