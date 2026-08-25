@@ -57,7 +57,13 @@ const BUILTIN_DTS: &str = "builtin.d.ts";
 /// broke `package.json` is a programmer error the panic names, on the same terms
 /// `crates/lanekeep-types-gen` parses `world.wit`.
 pub fn render_package_json(current: &str) -> String {
-    let mut out = current.to_string();
+    // Normalize CRLF to LF so the preserved fields and the generated blocks share one line
+    // ending. A Windows checkout holds the committed file under CRLF, and the generated
+    // blocks emit LF — mixing the two would make this output disagree with
+    // `fold_crlf(committed)` in the equality test. The committed file is LF, so this is a
+    // no-op off Windows, on the same terms `crates/lanekeep-types-gen`'s renderer emits LF.
+    let current = current.replace("\r\n", "\n");
+    let mut out = current;
     out = replace_value(&out, "typesVersions", &types_versions_block());
     out = replace_value(&out, "exports", &exports_block());
     out
@@ -290,6 +296,21 @@ mod tests {
         let once = render_package_json(EMPTY);
         let twice = render_package_json(&once);
         assert_eq!(once, twice, "running the renderer twice must not drift");
+    }
+
+    #[test]
+    fn the_renderer_normalizes_crlf_so_a_windows_checkout_stays_a_fixed_point() {
+        // A Windows checkout holds the committed file under CRLF. The renderer must fold that
+        // to LF — the generated blocks emit LF, and mixing the two would disagree with
+        // `fold_crlf(committed)` in the equality test (this is exactly what reddened the
+        // Windows CI job before the normalization).
+        let crlf = EMPTY.replace('\n', "\r\n");
+        let rendered = render_package_json(&crlf);
+        assert!(
+            !rendered.contains("\r\n"),
+            "the rendered file must be LF, not a mix of CRLF and LF"
+        );
+        assert_eq!(rendered, render_package_json(EMPTY));
     }
 
     #[test]
