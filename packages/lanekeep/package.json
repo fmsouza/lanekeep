@@ -4,7 +4,8 @@
   "types": "index.d.ts",
   "typesVersions": {
     "*": {
-      "*": ["builtin.d.ts"]
+      "no-broad-except": ["builtin.d.ts"],
+      "no-mutable-default-argument": ["builtin.d.ts"]
     }
   },
   "exports": {
@@ -17,12 +18,16 @@
     "./runtime/entry": "./runtime/entry.js",
     "./runtime/host": "./runtime/host.js",
     "./package.json": "./package.json",
-    "./*": {
+    "./no-broad-except": {
+      "types": "./builtin.d.ts"
+    },
+    "./no-mutable-default-argument": {
       "types": "./builtin.d.ts"
     }
   },
   "devDependencies": {
     "@bytecodealliance/componentize-js": "0.22.0",
-    "@bytecodealliance/jco": "1.27.0"
+    "@bytecodealliance/jco": "1.27.0",
+    "typescript": "5.9.3"
   }
 }

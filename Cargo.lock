@@ -951,6 +951,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lanekeep-package-gen"
+version = "0.0.0"
+dependencies = [
+ "lanekeep-rules",
+]
+
+[[package]]
 name = "lanekeep-query"
 version = "0.6.1"
 dependencies = [

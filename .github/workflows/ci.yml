@@ -53,6 +53,17 @@ jobs:
           name: components
           path: crates/lanekeep-rules/components
 
+      # `just check`'s `test-js-types` runs `tsc` over `packages/lanekeep`, which needs the
+      # `typescript` dev dependency installed. The authoring package's lockfile is the single
+      # source for that toolchain, the same way `crates/lanekeep-rules/build.rs`'s is for the
+      # component toolchains — `npm ci` reproduces it exactly.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install the authoring package's dev dependencies
+        run: npm ci --prefix packages/lanekeep
+
       - run: just check
 
   # Other platforms run the tests only. Formatting, clippy, licensing and spelling

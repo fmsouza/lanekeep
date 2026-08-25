@@ -1,41 +1,12 @@
 /**
- * Types reached through the `typesVersions` mapping in `package.json`.
+ * Types for the importable built-in subpaths — the module built-ins, reached through the
+ * per-name `exports`/`typesVersions` entries `crates/lanekeep-package-gen` generates from
+ * `COMPONENT_RULES`. A component built-in has no entry there, so importing one is a compile
+ * error rather than a default export that lies.
  *
- * That mapping points *every* specifier here, the bare `lanekeep` included — TypeScript's
- * `"*"` pattern does not exclude the package root, and a narrower pattern would have to
- * predict what future built-ins are called. So this file is a superset: it re-exports
- * everything `index.d.ts` has, and adds the default export a built-in subpath needs.
- *
- * A `declare module 'lanekeep/*'` block inside `index.d.ts` would have been the obvious way
- * to do this and does nothing at all: a `declare module` inside a file that has its own
- * imports or exports is module augmentation, not an ambient declaration, so TypeScript
- * ignores it and the import stays unresolved. That failed silently until a compile test
- * caught it.
- *
- * The default covers the two shapes an *importable* built-in can take, because which one it is
+ * The default covers the two shapes an importable built-in can take, because which one it is
  * cannot be known from the specifier: a rule taking options is a factory —
  * `noRestrictedImports({ ... })` — and one taking none is the rule itself.
- *
- * **There is a third shape, and this file types it wrongly.** A built-in may ship as a
- * WebAssembly component, which has no module to import at all. Six of the ten do today:
- * `lanekeep/no-circular-imports`, `lanekeep/no-default-export`, `lanekeep/no-glob-import`,
- * `lanekeep/no-restricted-imports`, `lanekeep/no-unused-exports` and `lanekeep/no-unwrap`.
- * The `typesVersions` mapping points every specifier here, so importing one type-checks and
- * then fails at run time with a resolution error naming the reason. Name it in `lanekeep.json`
- * instead — `"rules": ["lanekeep/no-unwrap"]` — which is the spelling `lanekeep init` scaffolds
- * and which works whichever form the rule takes.
- *
- * **The list above is a copy, and `COMPONENT_RULES` in
- * `crates/lanekeep-rules/src/lib.rs` is the original.** That table is what a config resolves
- * through and what the gate asserts against every shipped component's own `rules()`; nothing
- * checks it against this comment. It said two when four more had already migrated, which is the
- * failure this sentence exists to make cheap to notice: read the table, not this file.
- *
- * Typing that honestly needs the mapping to distinguish specifiers, which means either
- * enumerating built-ins in `package.json` — a list that goes stale on the next migration — or
- * generating it. Left as follow-up for the second sub-project running: the TypeScript authoring
- * revision spec §4 promised it and did not deliver it, and this comment is what stands in for it
- * meanwhile. There is no `tsc` gate over this package, so nothing here is red.
  */
 export * from './index'
 

@@ -35,10 +35,10 @@ _require tool:
 # ---------------------------------------------------------------------------
 
 # Pre-commit gate. Fast enough to run on every commit without being resented.
-check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py lanekeep
+check-fast: fmt-check lint test test-rust-rules test-scripts test-go test-js test-js-types test-py lanekeep
 
 # Full gate. What CI runs and what pre-push runs. If this is green, the PR is green.
-check: fmt-check lint test test-rust-rules test-scripts test-go test-js test-py lanekeep docs deny machete typos-check msrv
+check: fmt-check lint test test-rust-rules test-scripts test-go test-js test-js-types test-py lanekeep docs deny machete typos-check msrv
 
 # ---------------------------------------------------------------------------
 # Components
@@ -407,6 +407,18 @@ typescript-builtins:
 generate-index-dts:
     cargo run -p lanekeep-types-gen
 
+# Regenerate `packages/lanekeep/package.json`'s built-in subpath mapping and the
+# `types.test-d.ts` gate from `COMPONENT_RULES` in `crates/lanekeep-rules/src/lib.rs`.
+#
+# `package.json`'s `exports`/`typesVersions` are not hand-maintained for built-in subpaths:
+# the component built-ins are omitted (a component has no module to import, so importing one
+# must be a compile error) and the module built-ins point at `builtin.d.ts`. A migration that
+# moves a rule between the two tables updates both automatically the next time this runs;
+# `crates/lanekeep-package-gen/tests/generated.rs` fails the gate if the committed files are
+# not the ones this renders. Run this after editing `COMPONENT_RULES` and commit the result.
+generate-builtin-subpaths:
+    cargo run -p lanekeep-package-gen
+
 # Rebuild the Go built-ins component from go-rules/.
 #
 # The third recipe that produces a shipped component, and outside every gate for the reason the
@@ -755,6 +767,28 @@ test-js:
         exit 1
     fi
     echo "${ran} passed, 0 failed"
+
+# `tsc --noEmit` over `packages/lanekeep`: the type gate that catches a built-in subpath being
+# importable when it should not be. A component built-in has no module to import, so the
+# `@ts-expect-error` lines in `types.test-d.ts` must fire; a module built-in must still compile
+# as `Rule & ((options?) => Rule)`. The mapping `package.json` resolves those through is
+# generated from `COMPONENT_RULES` by `crates/lanekeep-package-gen` (`just
+# generate-builtin-subpaths`), and `crates/lanekeep-package-gen/tests/generated.rs` fails the
+# gate if it has drifted.
+#
+# Skipped where `typescript` is not installed, on `test-js`'s terms and for its reasons: the
+# authoring package's dev dependencies are not part of the Rust toolchain a contributor
+# already has, and making the gate require `npm ci` would cost every contributor for something
+# most of them never touch. CI installs them on the gate runner, so it is a real check there.
+test-js-types:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tsc="packages/lanekeep/node_modules/.bin/tsc"
+    if [ ! -x "$tsc" ]; then
+        echo "note: no tsc in packages/lanekeep/node_modules, so the type gate is skipped (CI covers it)"
+        exit 0
+    fi
+    "$tsc" --noEmit -p packages/lanekeep
 
 # The Python rule-authoring SDK's tests.
 #

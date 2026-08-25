@@ -1,0 +1,21 @@
+# Regenerates `packages/lanekeep/package.json`'s built-in subpath mapping and the
+# `types.test-d.ts` gate from `COMPONENT_RULES`, so the mapping cannot go stale again.
+#
+# `publish = false`, deliberately: repository tooling, not a crate anyone depends on, and
+# its only consumers are the `just generate-builtin-subpaths` recipe and the test that
+# asserts the committed files are the ones it renders.
+[package]
+name = "lanekeep-package-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+# `lanekeep-rules` is the authoritative table: `names()` lists every built-in rule and
+# `is_declared_component` distinguishes the ones that ship as WebAssembly components (which
+# have no module to import) from the ones that still run as TypeScript modules.
+lanekeep-rules = { version = "0.6.1", path = "../lanekeep-rules" }
