@@ -34,12 +34,28 @@
 //! `wit/spike.wit` and does not care. Over-invalidation costs a rebuild of a directory
 //! `just wasm-fixtures` rebuilds wholesale anyway.
 //!
-//! # What is deliberately not covered
+//! # What is recorded, and how it stays machine-independent
 //!
-//! **The toolchain that built the artifact.** `cargo component`, `wit-bindgen` and `rustc`
-//! versions all move the output bytes, and recording them would make this file machine-specific
-//! and red on every upgrade. The artifact digest is here instead, so a rebuild that changes the
-//! bytes shows up as a reviewable line rather than a silent binary diff.
+//! **The toolchain that built the artifact, as version numbers.** `cargo component`, `rustc`,
+//! `go`, `tinygo`, `wasm-opt` and `wasm-tools` versions all move the output bytes, and a
+//! contributor building through a different one produces different bytes from identical recorded
+//! sources. Each manifest records the versions beside the source digests, as `# tool <name>
+//! <version>` lines, so a rebuild through a different toolchain is a *named* failure — which
+//! tool, which version — rather than an 87-byte diff with no explanation.
+//!
+//! Only the version *number* is recorded, not the full `--version` string: `go version` prints
+//! `go1.26.5 darwin/arm64` on one machine and `go1.26.5 linux/amd64` on another, and only the
+//! `1.26.5` is an input to the bytes. Recording the whole string would make the manifest
+//! machine-specific and red on every platform change.
+//!
+//! The comparison is made only when the whole toolchain is present: a rebuild needs every tool,
+//! so a partial toolchain is not a rebuild context and its stray versions are not drift. The
+//! gate job has the runner image's default `go` but no TinyGo, `wasm-opt`, `wasm-tools` or
+//! `cargo component`, so it checks the digests and skips the tool versions, while a maintainer's
+//! `just go-rules` / `just wasm-fixtures` — and CI's `components` job — has the full toolchain
+//! and gets the named check.
+//!
+//! # What is deliberately not covered
 //!
 //! **That a digest was produced by an actual build.** Running `just wasm-fixtures` records
 //! whatever is in the tree, so blessing without rebuilding is still possible. What this rules
@@ -77,7 +93,8 @@ const BLESS: &str = "LANEKEEP_BLESS_WASM_FIXTURES";
 /// Where the recorded digests live, relative to this crate.
 const MANIFEST: &str = "tests/fixture-digests.txt";
 
-/// The header written above the digests, explaining the file to whoever meets it in a diff.
+/// The header written above the tool versions and digests, explaining the file to whoever
+/// meets it in a diff.
 const HEADER: &str = "\
 # What every committed `.wasm` fixture in this directory was built from.
 #
@@ -87,6 +104,10 @@ const HEADER: &str = "\
 #
 # A line that moves when no artifact did means a fixture's source was changed without
 # rebuilding it — run `just wasm-fixtures`.
+#
+# tool-versions (the toolchain that built the artifacts, asserted by fixture_currency.rs):
+#   A version here that differs from the toolchain on PATH names the tool that drifted, not
+#   an unexplained byte diff. Rebuild with the pinned toolchain and re-record: `just wasm-fixtures`.
 ";
 
 /// The fixture `just go-rules` builds, which lives under `tests/fixtures/` all the same.
@@ -119,7 +140,7 @@ const GO_BLESS: &str = "LANEKEEP_BLESS_GO_RULES";
 /// Where the Go fixture's digests live, relative to this crate.
 const GO_MANIFEST: &str = "tests/go-component-digests.txt";
 
-/// The header written above the Go fixture's digests.
+/// The header written above the Go fixture's tool versions and digests.
 const GO_HEADER: &str = "\
 # What the committed Go fixture was built from: the determinism fixture behind
 # `crates/lanekeep-wasm/tests/go_map_order.rs`.
@@ -131,6 +152,10 @@ const GO_HEADER: &str = "\
 # A line that moves when the fixture did not means a source under `go-rules/`, the SDK it is
 # built on, the generated bindings or the world it is built against was changed without
 # rebuilding — run `just go-rules`.
+#
+# tool-versions (the toolchain that built the fixture, asserted by fixture_currency.rs):
+#   A version here that differs from the toolchain on PATH names the tool that drifted, not
+#   an unexplained byte diff. Rebuild with the pinned toolchain and re-record: `just go-rules`.
 ";
 
 #[test]
@@ -184,8 +209,15 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
         }
     );
 
+    let tools = tool_versions(&[
+        ("rustc", "rustc", &["--version"][..]),
+        ("cargo-component", "cargo-component", &["--version"][..]),
+    ])
+    .unwrap_or_default();
+
     reconcile(
         &computed,
+        &tools,
         &crate_dir.join(MANIFEST),
         BLESS,
         HEADER,
@@ -235,8 +267,21 @@ fn every_committed_go_fixture_is_the_one_its_sources_build() {
         found(&computed, "crates/lanekeep-wasm/wit/world.wit"),
     );
 
+    // `wasm-opt` is the one tool whose program is an override: TinyGo honors `$WASMOPT` ahead
+    // of the copy in its own root, and the `go-rules` recipe passes it through, so the version
+    // captured here has to be the one the recipe actually used.
+    let wasmopt = std::env::var("WASMOPT").unwrap_or_else(|_| "wasm-opt".to_owned());
+    let tools = tool_versions(&[
+        ("go", "go", &["version"][..]),
+        ("tinygo", "tinygo", &["version"][..]),
+        ("wasm-opt", wasmopt.as_str(), &["--version"][..]),
+        ("wasm-tools", "wasm-tools", &["--version"][..]),
+    ])
+    .unwrap_or_default();
+
     reconcile(
         &computed,
+        &tools,
         &Path::new(env!("CARGO_MANIFEST_DIR")).join(GO_MANIFEST),
         GO_BLESS,
         GO_HEADER,
@@ -285,10 +330,14 @@ fn counted(computed: &BTreeMap<String, String>, prefix: &str, extension: &str) -
 
 /// Compare what is in the tree against what was recorded, or rewrite the record.
 ///
-/// `what` and `recipe` are the two halves of the failure message: what went stale, and which
-/// recipe makes it current again.
+/// `tools` is the toolchain captured from the current `PATH` — the full set when every tool is
+/// present, empty when the toolchain is incomplete (a partial toolchain is not a rebuild context,
+/// so the gate job compares nothing here and still checks the digests). `what` and `recipe` are
+/// the two halves of the failure message: what went stale, and which recipe makes it current
+/// again.
 fn reconcile(
     computed: &BTreeMap<String, String>,
+    tools: &BTreeMap<String, String>,
     manifest: &Path,
     bless: &str,
     header: &str,
@@ -296,16 +345,35 @@ fn reconcile(
     recipe: &str,
 ) {
     if std::env::var_os(bless).is_some() {
-        std::fs::write(manifest, render(header, computed)).expect("the manifest is writable");
+        std::fs::write(manifest, render(header, tools, computed))
+            .expect("the manifest is writable");
         return;
     }
 
-    let recorded = parse(
-        &std::fs::read_to_string(manifest).expect("the digests manifest is committed"),
-        manifest,
-    );
+    let text = std::fs::read_to_string(manifest).expect("the digests manifest is committed");
+    let recorded = parse(&text, manifest);
+    let recorded_tools = parse_tools(&text, manifest);
 
     let mut wrong: Vec<String> = Vec::new();
+
+    // Tool versions first: a mismatch here names the tool, which is the whole point of recording
+    // them. A tool that is recorded but absent from this `PATH` is skipped rather than compared —
+    // the gate job has no component toolchain, and "not installed" is not a version drift.
+    for (name, version) in tools {
+        match recorded_tools.get(name) {
+            Some(known) if known == version => {}
+            Some(known) => {
+                wrong.push(format!(
+                    "  {name}: recorded {known}, this toolchain has {version}"
+                ));
+            }
+            None => wrong.push(format!(
+                "  {name}: this toolchain has {version}, but the manifest records no version \
+                 for it"
+            )),
+        }
+    }
+
     for (path, digest) in computed {
         match recorded.get(path) {
             Some(known) if known == digest => {}
@@ -460,8 +528,19 @@ fn slashed(path: &Path, base: &Path) -> String {
 }
 
 /// The manifest text, header and all.
-fn render(header: &str, digests: &BTreeMap<String, String>) -> String {
+fn render(
+    header: &str,
+    tools: &BTreeMap<String, String>,
+    digests: &BTreeMap<String, String>,
+) -> String {
     let mut out = String::from(header);
+    for (name, version) in tools {
+        out.push_str("# tool ");
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(version);
+        out.push('\n');
+    }
     for (path, digest) in digests {
         out.push_str(path);
         out.push(' ');
@@ -469,6 +548,71 @@ fn render(header: &str, digests: &BTreeMap<String, String>) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The tool versions, back into the map [`render`] wrote them from.
+///
+/// Only the `# tool <name> <version>` lines; the header prose and the digest lines are left to
+/// [`parse`]. The `# tool ` prefix is what keeps the two apart: no header line starts with it.
+fn parse_tools(text: &str, path: &Path) -> BTreeMap<String, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("# tool "))
+        .map(|line| {
+            let rest = line.trim_start_matches("# tool ").trim();
+            assert!(
+                rest.split_once(' ').is_some(),
+                "{}: `{line}` is not `# tool <name> <version>`. This file is written by the \
+                 recipe its own header names and is not meant to be edited by hand; re-record it.",
+                path.display()
+            );
+            let (name, version) = rest.split_once(' ').expect("asserted just above");
+            (name.to_owned(), version.to_owned())
+        })
+        .collect()
+}
+
+/// The version number a tool reports, or `None` when it is not installed.
+///
+/// The version is the first whitespace-delimited token that contains a digit, with any leading
+/// non-digit characters stripped — which is how every tool here reports its version: `go version
+/// go1.26.5 darwin/arm64` → `1.26.5`, `wasm-opt version 131` → `131`, `wasm-tools 1.255.0` →
+/// `1.255.0`, `rustc 1.95.0 (…)` → `1.95.0`. Only the number is kept so the manifest is not
+/// machine-specific: the platform half of `go version`'s output is not an input to the bytes.
+fn version_of(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .find(|token| token.chars().any(|c| c.is_ascii_digit()))
+        .map(|token| {
+            token
+                .trim_start_matches(|c: char| !c.is_ascii_digit())
+                .to_owned()
+        })
+}
+
+/// The tool versions that decide a committed artifact's bytes, or `None` when the toolchain is
+/// incomplete.
+///
+/// Each entry is `(name, program, args)`. The versions are only meaningful as a *set*: a rebuild
+/// needs every tool, so a partial toolchain is not a rebuild context and its stray versions are
+/// not drift. The gate job has the runner image's default `go` but no TinyGo, `wasm-opt` or
+/// `wasm-tools` — comparing that `go` against the recorded one would name a drift nobody
+/// introduced. So a single missing tool makes the whole set `None`, and the caller skips the
+/// comparison; a maintainer's recipe has all four and gets the named check.
+fn tool_versions(tools: &[(&str, &str, &[&str])]) -> Option<BTreeMap<String, String>> {
+    let mut found = BTreeMap::new();
+    for (name, program, args) in tools {
+        found.insert((*name).to_owned(), version_of(program, args)?);
+    }
+    Some(found)
 }
 
 /// The manifest, back into the map [`render`] wrote it from.

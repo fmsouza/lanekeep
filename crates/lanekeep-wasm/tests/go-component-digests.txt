@@ -8,6 +8,14 @@
 # A line that moves when the fixture did not means a source under `go-rules/`, the SDK it is
 # built on, the generated bindings or the world it is built against was changed without
 # rebuilding — run `just go-rules`.
+#
+# tool-versions (the toolchain that built the fixture, asserted by fixture_currency.rs):
+#   A version here that differs from the toolchain on PATH names the tool that drifted, not
+#   an unexplained byte diff. Rebuild with the pinned toolchain and re-record: `just go-rules`.
+# tool go 1.26.5
+# tool tinygo 0.41.1
+# tool wasm-opt 131
+# tool wasm-tools 1.255.0
 crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm 33de5c491ba2b92778c8e56f5bcf4ee276390a76cea14e395609a63e42b56250
 crates/lanekeep-wasm/wit/world.wit ba1491901856194198db0c8d85446b044c31ca5095d4a442f2d433ee800cdd35
 go-rules/.gitignore 02af855e1226375a64521b31bd8994a45c665fbe93ea55dfdb4b38f062d98c36

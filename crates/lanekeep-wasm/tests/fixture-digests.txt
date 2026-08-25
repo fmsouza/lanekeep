@@ -6,6 +6,12 @@
 #
 # A line that moves when no artifact did means a fixture's source was changed without
 # rebuilding it — run `just wasm-fixtures`.
+#
+# tool-versions (the toolchain that built the artifacts, asserted by fixture_currency.rs):
+#   A version here that differs from the toolchain on PATH names the tool that drifted, not
+#   an unexplained byte diff. Rebuild with the pinned toolchain and re-record: `just wasm-fixtures`.
+# tool cargo-component 0.21.1
+# tool rustc 1.95.0
 ../../packages/lanekeep/runtime/entry.js a334f1d316af9c925d9f37511008416d55abd72fe6e0c83900cf13e8043b0fdc
 ../../packages/lanekeep/runtime/host.js 013bfdc9c8913ba474aa4784a4a97a888706bd9ff4f9d39666accbfe69d1264f
 tests/fixtures/bindings.wasm 95b60714793f2bbad4b65a6af2572493ca15d2925d199002138fab3a17334f90
