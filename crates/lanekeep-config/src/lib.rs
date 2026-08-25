@@ -3996,13 +3996,23 @@ mod tests {
         );
     }
 
-    /// One path can carry two byte sequences, and both have to reach the key.
+    /// One path can carry two byte sequences, and both have to reach the key — not just the
+    /// count of them, but the bytes themselves.
     ///
     /// `component_bytes` reads once per `ResolvedRule` and nothing deduplicates `rules`, so a
     /// config naming one file twice — bare in one entry and with options in another — reads it
-    /// twice. A rewrite between those reads produces exactly the pair below, and both rules go on
-    /// to execute the bytes they carry. Deduplicating on the path alone kept one of them
-    /// arbitrarily, so the key described a ruleset that was not running.
+    /// twice. A rewrite between those reads produces a pair that carry one path and two
+    /// different byte sequences, and both rules go on to execute the bytes they carry.
+    ///
+    /// **The mutant this data discriminates is a component fold that records *how many* distinct
+    /// byte sequences there are but not *what* they are.** The rules fold names a component by
+    /// its position in `distinct` and nothing about its code, so it cannot catch that mutant
+    /// alone: two rulesets with the same positions, indices and options but different byte
+    /// values would hash equal. The comparison below holds the rules fold fixed — both pairs
+    /// sort to the same two positions, same index, same options — and varies only the bytes, so
+    /// a fold that dropped the bytes makes the two equal. Comparing against a "collapsed" pair
+    /// (`[before, before]`) does not isolate the fold, because the rules fold already differs
+    /// there (one rule against two) and backstops whatever the component fold did.
     ///
     /// The window is microseconds and the trigger is exotic. It is asserted anyway because the
     /// claim it falsifies — the bytes hashed are the bytes that run — is the one the component
@@ -4029,16 +4039,25 @@ mod tests {
             "the rewrite is what makes this pair interesting"
         );
 
+        // A third read of the same file, rewritten again to a byte sequence that sorts to the
+        // same position `after` does — both precede `before` (`after` < `again` < `before`) — so
+        // the rules fold (positions, index, options) is identical to the first pair's. The only
+        // thing that differs between the two rulesets is the byte value of the second component.
+        fixture.write_all(&[("r.wasm", "\u{0}asm-again")]);
+        let again = fixture.component("r.wasm");
+        assert_eq!(after.path, again.path, "still one file, read a third time");
         assert_ne!(
-            hex(&hash_ruleset(&sandbox, &[&before, &after])),
-            hex(&hash_ruleset(&sandbox, &[&before, &before])),
-            "a run executing two different components must not key as one executing the first \
-             twice — deduplicating on the path alone made these equal"
+            after.bytes.as_slice(),
+            again.bytes.as_slice(),
+            "the second rewrite is a third byte sequence, not a reread of the second"
         );
+
         assert_ne!(
             hex(&hash_ruleset(&sandbox, &[&before, &after])),
-            hex(&hash_ruleset(&sandbox, &[&after, &after])),
-            "nor as one executing the second twice"
+            hex(&hash_ruleset(&sandbox, &[&before, &again])),
+            "two rulesets whose rules fold agrees but whose second component's bytes differ \
+             must not key equal — a component fold that hashed the count of distinct programs \
+             but not the bytes made these equal"
         );
     }
 
