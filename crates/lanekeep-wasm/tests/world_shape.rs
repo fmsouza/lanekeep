@@ -192,14 +192,18 @@ impl HostCheckContext for StubHost {
         Ok(Vec::new())
     }
 
+    /// One handle resolves to the `context` module, and everything else to nothing. The rule asks
+    /// this only after `binding_kind` has said the qualifier is an import, so the only node that
+    /// reaches it is [`NODE_IMPORTED_PKG`] — and it answers `true` for the module the rule asks
+    /// about, `context`, and `false` for any other.
     fn resolves_to_import(
         &mut self,
         _: Resource<CheckContext>,
-        _: u32,
-        _: String,
+        node: u32,
+        module: String,
         _: Option<String>,
     ) -> wasmtime::Result<bool> {
-        Ok(false)
+        Ok(node == NODE_IMPORTED_PKG && module == "context")
     }
 
     fn is_imported_from(
@@ -986,11 +990,11 @@ fn captures(node: u32) -> Vec<types::MatchEntry> {
 /// there; this is the other end of the same claim, that index 0 is the rule `rules` named at
 /// position 0.
 ///
-/// What the guest reads here is three host answers per match — the type name's text, the
-/// qualifier's text, and the qualifier's binding kind — so the four calls below walk the rule's
-/// four outcomes. The `none` binding kind is the one that would be missed by eye; see
-/// [`NODE_INIT`]'s table for why an option whose first enum case is `import` is a trap rather
-/// than a formality.
+/// What the guest reads here is four host answers per match — the type name's text, the
+/// qualifier's text, the qualifier's binding kind, and which module the qualifier resolves to —
+/// so the four calls below walk the rule's four outcomes. The `none` binding kind is the one that
+/// would be missed by eye; see [`NODE_INIT`]'s table for why an option whose first enum case is
+/// `import` is a trap rather than a formality.
 ///
 /// **This is not the fidelity suite.** Every value here is a constant and no Go file is parsed;
 /// `crates/lanekeep-rules/tests/no_context_in_struct.rs` is where the rule meets the real grammar
