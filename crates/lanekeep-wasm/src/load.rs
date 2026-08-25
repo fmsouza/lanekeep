@@ -95,6 +95,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use wasmtime::Engine;
@@ -382,6 +383,16 @@ pub struct ComponentLoader {
     /// Distinguishes the temporary files two threads compiling the same rule would otherwise
     /// both write to.
     sequence: AtomicUsize,
+    /// The `.cwasm` filenames this run has loaded, so a prune keeps the current run's
+    /// components and removes only what a previous run left behind.
+    ///
+    /// Behind a [`Mutex`] and not lock-free: this is prune bookkeeping on the once-per-run
+    /// load path, not a dedupe cache. The load path's parallelism is preserved — the compile
+    /// and map work is never serialized, only a brief set insert — and a cache keyed by
+    /// identity, which *would* have to be behind a lock to be one, is what this is not. A
+    /// `without_cache` run records nothing and prunes nothing, so the lock is never taken on
+    /// that path.
+    loaded: Mutex<BTreeSet<String>>,
 }
 
 impl ComponentLoader {
@@ -395,6 +406,7 @@ impl ComponentLoader {
             embedded: AtomicUsize::new(0),
             compilations: AtomicUsize::new(0),
             sequence: AtomicUsize::new(0),
+            loaded: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -565,6 +577,23 @@ impl ComponentLoader {
         let digest = blake3::hash(bytes);
         let identity = *digest.as_bytes();
 
+        // Claim this artifact for the current run, so a prune after a later write keeps it.
+        // Only when there is a cache directory: a `without_cache` run writes nothing and
+        // prunes nothing, and recording its claim would take a lock the path exists to avoid.
+        // Recorded on every load — warm-mapped, written, or the fallback below — because the
+        // keep-set has to span the whole run, and an upgrade maps an unchanged component warm
+        // while it writes the one that was rebuilt.
+        if self.cache_dir.is_some() {
+            // A poisoned mutex means a thread panicked under the lock, and the only code under
+            // this lock is a `BTreeSet` insert/clone that cannot panic — so recovering the
+            // guard regardless is correct and avoids `expect_used` in non-test source.
+            let mut guard = match self.loaded.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.insert(artifact_name(&digest));
+        }
+
         if let Some(path) = self.artifact_path_for(&digest) {
             if path.is_file() {
                 if let Some(component) = map(engine.engine(), &path) {
@@ -605,6 +634,12 @@ impl ComponentLoader {
                 && let Some(component) = map(engine.engine(), &path)
             {
                 self.mapped.fetch_add(1, Ordering::Relaxed);
+                // A new artifact is on disk, so a previous run's superseded ones can go. The
+                // current run's keep-set — recorded above, spanning warm and written loads
+                // alike — is what stops a component this run is still using from being pruned.
+                // Best-effort and lock-free across runs: a file a concurrent run holds is
+                // unlinked safely on Unix and the error swallowed on Windows.
+                self.prune(&path);
                 // Checked again rather than inherited from `checked`. These are different
                 // bytes off a different path — the same ones a *later* run will take at step 1
                 // — and "the compilation it came from was fine" is exactly the kind of
@@ -693,6 +728,52 @@ impl ComponentLoader {
             return false;
         }
         true
+    }
+
+    /// Best-effort removal of `.cwasm` artifacts this run did not load.
+    ///
+    /// Content-addressing is what makes a superseded artifact unservable on its own — a
+    /// different component is a different file, never an overwrite — so the only thing left
+    /// to do is reclaim the disk a lanekeep upgrade leaves behind. Called after a write, so
+    /// the just-written artifact (and everything else this run loaded, warm or cold) is in
+    /// [`ComponentLoader::loaded`] and stays; what goes is what the run never touched.
+    ///
+    /// **Every failure is swallowed.** The loader is `&self` throughout — there is no lock
+    /// coordinating runs — so a concurrent run may hold a file this removes. On Unix an
+    /// mmap'd file unlinks safely (the mapping keeps the inode); on Windows `remove_file` on
+    /// an open file fails and is ignored. A file removed between `read_dir` and
+    /// `remove_file` is the same case, and `read_dir`'s own failure is the directory going
+    /// away, which is a `without_cache`-shaped failure rather than one to report.
+    ///
+    /// The keep-set is snapshotted before the directory is read, so the lock is held only for
+    /// the clone and not across the removals: another thread in this run can keep loading
+    /// while a previous run's artifacts are unlinked.
+    fn prune(&self, just_written: &Path) {
+        let Some(dir) = just_written.parent() else {
+            return;
+        };
+        let keep: BTreeSet<String> = match self.loaded.lock() {
+            Ok(guard) => guard.clone(),
+            // See the recording site: the lock body cannot panic, so a poisoned guard is
+            // recovered rather than treated as unreachable.
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some(ARTIFACT_EXTENSION) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if keep.contains(name) {
+                continue;
+            }
+            drop(std::fs::remove_file(&path));
+        }
     }
 }
 

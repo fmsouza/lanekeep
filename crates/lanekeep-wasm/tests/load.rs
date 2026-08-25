@@ -75,6 +75,13 @@ const WASIP1: &[u8] = include_bytes!("fixtures/rejected/wasip1.wasm");
 /// more, which is why the check admits it.
 const SPIKE: &[u8] = include_bytes!("fixtures/spike.wasm");
 
+/// A third acceptable component, distinct in bytes from the two above.
+///
+/// The prune test needs a component neither a previous run nor the current one shares a
+/// content-address with, and one that still passes the import check on the declared world —
+/// which `two-rules.wasm` does, as `instantiation.rs` loads it through the default loader.
+const TWO_RULES: &[u8] = include_bytes!("fixtures/two-rules.wasm");
+
 /// The path the context reports as the file under check.
 const FILE: &str = "src/example.ts";
 
@@ -525,6 +532,75 @@ fn a_different_component_gets_a_different_artifact() {
     warm.load(&engine, "rule", WORLD_SHAPE)
         .expect("the first component is still there");
     assert_eq!(warm.compilations(), 0, "it was read back, not rebuilt");
+}
+
+/// A superseded artifact is pruned when a subsequent run writes a new one.
+///
+/// The defect from #110: `.lanekeep/components` never pruned, and artifact names are
+/// content-addressed on bytes that are not byte-reproducible, so every lanekeep upgrade that
+/// shipped a rebuilt component left the old ~34 MB `.cwasm` behind permanently. Pruning
+/// reclaims it, keeping the content-addressing (which is what makes a stale artifact
+/// unservable on its own).
+///
+/// One run loads two distinct components and keeps both — neither superseded the other, both
+/// are this run's. A fresh run, the shape of an upgrade shipping a rebuilt component, writes a
+/// third and removes the two the new run never touched; the one it just wrote survives. That
+/// is "outside the current run's identity set" rather than "older than the just-written", so a
+/// run that maps an unchanged component warm — the case the loader's lock-free parallel load
+/// path exists for — never prunes it.
+#[test]
+fn a_superseded_artifact_is_pruned_when_a_new_one_is_written() {
+    let cache = Cache::new("prune");
+    let engine = WasmEngine::new().expect("the shipped configuration builds");
+
+    // The first run loads two distinct components. Both are this run's, so both stay.
+    let first = cache.loader();
+    first
+        .load(&engine, "rule", WORLD_SHAPE)
+        .expect("the first component loads");
+    first
+        .load(&engine, "rule", SPIKE)
+        .expect("the second component loads");
+    assert_eq!(
+        cache.artifacts().len(),
+        2,
+        "one run keeps every artifact it loaded — neither superseded the other"
+    );
+
+    let world = first
+        .artifact_path(WORLD_SHAPE)
+        .expect("a loader with a cache directory names the artifact");
+    let spike = first
+        .artifact_path(SPIKE)
+        .expect("a loader with a cache directory names the artifact");
+
+    // A fresh run, as a second process would be: a new loader over the same directory. It
+    // writes a third, distinct component and prunes the two the run never touched.
+    let second = cache.loader();
+    let third = second
+        .artifact_path(TWO_RULES)
+        .expect("a loader with a cache directory names the artifact");
+    second
+        .load(&engine, "rule", TWO_RULES)
+        .expect("the third component loads");
+
+    assert!(
+        !world.exists(),
+        "the artifact from the previous run is pruned, not left to accumulate"
+    );
+    assert!(
+        !spike.exists(),
+        "every artifact the new run did not load is pruned"
+    );
+    assert!(
+        third.exists(),
+        "the artifact the run just wrote survives the prune"
+    );
+    assert_eq!(
+        cache.artifacts().len(),
+        1,
+        "only the current run's artifact remains"
+    );
 }
 
 /// No cache directory, so the fallback — and it is counted rather than silent.
