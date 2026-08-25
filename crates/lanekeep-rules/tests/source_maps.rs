@@ -35,6 +35,7 @@ use lanekeep_js::{Limits, RunClock};
 use lanekeep_lang::Language;
 use lanekeep_lang_js::TypeScript;
 use lanekeep_nodes::NodeArena;
+use lanekeep_testkit::RuleTester;
 use lanekeep_wasm::bindings::types::{MatchEntry, StackFrame};
 use lanekeep_wasm::host::CheckContext;
 use lanekeep_wasm::{
@@ -282,4 +283,41 @@ fn the_map_covers_every_rule_the_component_hosts() {
             "the map does not cover `{rule}`: {sources:?}"
         );
     }
+}
+
+/// `RuleTester::with_component_maps` is the published way to hand a built-in component's source
+/// map to a tester, and it had no callers and no tests.
+///
+/// The map is diagnostics-only — it decides where a *thrown* error is reported and nothing
+/// about what a rule finds — so the assertion is about the thrown frame's file, read out of the
+/// run failure's rendered form. Without the map the frame stays in the bundle's space
+/// (`entry.js`), which is the "rules that work and diagnostics that name `entry.js`, with
+/// nothing anywhere going red" shape its own doc warns a wrong answer produces.
+#[test]
+fn a_thrown_built_in_names_the_authors_file_through_rule_tester() {
+    let tester = RuleTester::for_built_in_configured(
+        "no-restricted-imports",
+        "ts",
+        lanekeep_rules::component,
+        THROWS,
+    )
+    .expect("the no-restricted-imports built-in ships as a component")
+    .with_component_maps(lanekeep_rules::component_source_map);
+
+    let error = tester
+        .run("import x from 'lodash/merge'\n")
+        .expect_err("the rule throws on a restriction with no `module`");
+    let rendered = error.to_string();
+
+    assert!(
+        rendered.contains("crates/lanekeep-rules/rules/no-restricted-imports.ts"),
+        "the frame was not remapped into the author's source: {rendered}"
+    );
+    // The bundle's own file is the bare `entry.js` the flattened rule module compiles into —
+    // distinct from `packages/lanekeep/runtime/entry.js`, which is a real file the runtime
+    // wrapper lives in and a frame is entitled to name. The map exists to replace the former.
+    assert!(
+        !rendered.contains("@entry.js:"),
+        "an unmapped bundle frame survived into the diagnostic: {rendered}"
+    );
 }

@@ -1007,16 +1007,10 @@ fn describe_components(
         // A component hosting nothing is a configured rule that can never report, which is the
         // failure this tool exists not to produce — and it is silent, because an empty list
         // reads downstream exactly like a reference nobody wrote. Refused where the reference
-        // is, so the diagnostic names the entry.
-        if ids.is_empty() {
-            return Err(fail(
-                position,
-                format!(
-                    "`{}` is a component that hosts no rules — there is nothing for this entry \
-                     to run",
-                    rule.specifier
-                ),
-            ));
+        // is, so the diagnostic names the entry. The check is a pure helper so it is testable
+        // without building a component that answers `rules()` with nothing.
+        if let Err(detail) = no_rules_detail(&ids, &rule.specifier) {
+            return Err(fail(position, detail));
         }
 
         let wanted = contributed(&ids, entry.only, &rule.specifier)
@@ -1095,6 +1089,23 @@ fn describe_components(
     }
 
     Ok(described)
+}
+
+/// The detail string for refusing a component whose `rules()` answered nothing.
+///
+/// An empty list is a configured rule that can never report — and it is silent, because an
+/// empty list reads downstream exactly like a reference nobody wrote. Lifted out of
+/// [`describe_components`] so the refusal is unit-testable without a `.wasm` fixture: the
+/// question is whether an empty id list and a specifier produce the refusal, nothing a
+/// component has to run to answer. The caller wraps the detail in [`ConfigError::Rule`].
+fn no_rules_detail(ids: &[String], specifier: &str) -> Result<(), String> {
+    if ids.is_empty() {
+        return Err(format!(
+            "`{specifier}` is a component that hosts no rules — there is nothing for this entry \
+             to run"
+        ));
+    }
+    Ok(())
 }
 
 /// How long one component may take to read, compile and admit.
@@ -3125,6 +3136,38 @@ mod tests {
         assert_eq!(config.rules[0].id.to_string(), "fixture/metadata");
     }
 
+    /// A component whose `rules()` answers nothing is refused, and the refusal names the entry.
+    ///
+    /// The check is reached through [`no_rules_detail`] rather than a `.wasm` fixture that
+    /// answers `rules()` with an empty list, because the question is whether an empty id list and
+    /// a specifier produce the refusal — nothing a component has to run to answer. Deleting the
+    /// branch in [`describe_components`] used to survive the whole suite; this reaches it
+    /// directly, the way `a_component_naming_no_language_is_refused` reaches `validate_metadata`.
+    #[test]
+    fn a_component_hosting_no_rules_is_refused_with_its_specifier() {
+        let error = no_rules_detail(&[], "./rules/empty.wasm")
+            .expect_err("an empty rule list is nothing to run");
+        assert!(
+            error.contains("./rules/empty.wasm"),
+            "the refusal has to name the entry, which is what a reader can act on: {error}"
+        );
+        assert!(
+            error.contains("hosts no rules"),
+            "and what is wrong with it: {error}"
+        );
+    }
+
+    /// And a component hosting rules is not refused, so the check above is not an unconditional
+    /// refusal. The pair is what makes the first test mean something: a `no_rules_detail` that
+    /// always erred would pass it and fail here.
+    #[test]
+    fn a_component_hosting_rules_is_not_refused() {
+        assert!(
+            no_rules_detail(&["fixture/one".to_owned()], "./rules/one.wasm").is_ok(),
+            "a non-empty id list is a component with something to run"
+        );
+    }
+
     #[test]
     fn the_same_specifier_is_a_module_in_a_build_where_no_component_ships() {
         // The pair, and it is the assertion that makes the one above mean something. With no
@@ -3953,13 +3996,23 @@ mod tests {
         );
     }
 
-    /// One path can carry two byte sequences, and both have to reach the key.
+    /// One path can carry two byte sequences, and both have to reach the key — not just the
+    /// count of them, but the bytes themselves.
     ///
     /// `component_bytes` reads once per `ResolvedRule` and nothing deduplicates `rules`, so a
     /// config naming one file twice — bare in one entry and with options in another — reads it
-    /// twice. A rewrite between those reads produces exactly the pair below, and both rules go on
-    /// to execute the bytes they carry. Deduplicating on the path alone kept one of them
-    /// arbitrarily, so the key described a ruleset that was not running.
+    /// twice. A rewrite between those reads produces a pair that carry one path and two
+    /// different byte sequences, and both rules go on to execute the bytes they carry.
+    ///
+    /// **The mutant this data discriminates is a component fold that records *how many* distinct
+    /// byte sequences there are but not *what* they are.** The rules fold names a component by
+    /// its position in `distinct` and nothing about its code, so it cannot catch that mutant
+    /// alone: two rulesets with the same positions, indices and options but different byte
+    /// values would hash equal. The comparison below holds the rules fold fixed — both pairs
+    /// sort to the same two positions, same index, same options — and varies only the bytes, so
+    /// a fold that dropped the bytes makes the two equal. Comparing against a "collapsed" pair
+    /// (`[before, before]`) does not isolate the fold, because the rules fold already differs
+    /// there (one rule against two) and backstops whatever the component fold did.
     ///
     /// The window is microseconds and the trigger is exotic. It is asserted anyway because the
     /// claim it falsifies — the bytes hashed are the bytes that run — is the one the component
@@ -3986,16 +4039,25 @@ mod tests {
             "the rewrite is what makes this pair interesting"
         );
 
+        // A third read of the same file, rewritten again to a byte sequence that sorts to the
+        // same position `after` does — both precede `before` (`after` < `again` < `before`) — so
+        // the rules fold (positions, index, options) is identical to the first pair's. The only
+        // thing that differs between the two rulesets is the byte value of the second component.
+        fixture.write_all(&[("r.wasm", "\u{0}asm-again")]);
+        let again = fixture.component("r.wasm");
+        assert_eq!(after.path, again.path, "still one file, read a third time");
         assert_ne!(
-            hex(&hash_ruleset(&sandbox, &[&before, &after])),
-            hex(&hash_ruleset(&sandbox, &[&before, &before])),
-            "a run executing two different components must not key as one executing the first \
-             twice — deduplicating on the path alone made these equal"
+            after.bytes.as_slice(),
+            again.bytes.as_slice(),
+            "the second rewrite is a third byte sequence, not a reread of the second"
         );
+
         assert_ne!(
             hex(&hash_ruleset(&sandbox, &[&before, &after])),
-            hex(&hash_ruleset(&sandbox, &[&after, &after])),
-            "nor as one executing the second twice"
+            hex(&hash_ruleset(&sandbox, &[&before, &again])),
+            "two rulesets whose rules fold agrees but whose second component's bytes differ \
+             must not key equal — a component fold that hashed the count of distinct programs \
+             but not the bytes made these equal"
         );
     }
 
