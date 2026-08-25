@@ -180,8 +180,9 @@ but pin a version if you embed the crates.
 
 Known gaps, stated rather than implied:
 
-- **The performance budgets in [`docs/architecture.md`](docs/architecture.md) §15 are not met.**
-  They are targets, and that section says by how much and where the remaining time goes.
+- **Two of the three performance budgets in [`docs/architecture.md`](docs/architecture.md)
+  §15 are not met.** The cold budget is; they are targets, and that section says by how much
+  and where the remaining time goes.
 - **No type-aware analysis**, by design. Name resolution is syntactic — see §1 non-goals.
 
 ## Documentation

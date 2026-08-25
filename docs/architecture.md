@@ -513,7 +513,7 @@ This is the decision that keeps the rewrite worthwhile. Dispatching into JS per 
 
 A warm run with no changes executes **no JavaScript at all** — every file is a cache hit and handlers are never invoked. That is what made the warm budget (§15) aggressive in the first place: whatever a rule costs per invocation, a warm run pays none of it.
 
-**It no longer follows that a warm run is cheap, and the reason is upstream of this section.** A rule still has to be *loaded* before the cache can report that nothing changed, and loading a component means deserializing it. The four TypeScript built-ins share a 12.4 MiB one whose precompiled form is 34,874,912 bytes, and `lanekeep-config` deserializes it once per rule *reference* — so a warm run naming one of them is ~213 ms and naming all four is ~2.4 s, against a 25 ms warm budget, before a single file is hashed. §15 has the table, the measurement and the fix that is owed; what belongs here is only that the gate this section describes is no longer what decides the warm number.
+**It no longer follows that a warm run is cheap, and the reason is upstream of this section.** A rule still has to be *loaded* before the cache can report that nothing changed, and loading a component means deserializing it. The four TypeScript built-ins share a 12.4 MiB one whose precompiled form is 34,874,912 bytes, and `lanekeep-config` used to deserialize it once per rule *reference* — a warm run naming one of them was ~213 ms and naming all four was ~2.4 s, against a 25 ms warm budget, before a single file was hashed. The fix — a per-pass memo keyed on the component's content identity — landed with #109 and took the all-four run to the one-rule figure (~0.26 s); §15 has the table, the measurement and the numbers. What belongs here is only that the gate this section describes is no longer what decides the warm number.
 
 ---
 
@@ -809,23 +809,59 @@ Cheap now, breaking changes later. Lock all five before writing much code.
 
 Targets, gated in CI. Measured by `benches/corpus.rs` over a synthetic 2,000-file, 20-rule corpus.
 
-| Scenario | Budget | Measured (dev machine) |
+| Scenario | Budget | Measured, 2026-08-25, Apple M3 Max |
 |---|---|---|
-| Cold full run, ~2k files, ~20 rules | < 800 ms | ~1.1 s |
-| Warm run, no changes | < 25 ms | ~64 ms |
-| Warm run, 1 changed file, `--staged` | < 10 ms | ~51 ms |
+| Cold full run, ~2k files, ~20 rules | < 800 ms | ~0.65–0.72 s |
+| Warm run, no changes | < 25 ms | ~35–37 ms |
+| Warm run, 1 changed file, `--staged` | < 10 ms | ~13–15 ms |
 
-These are noisy to within about 10% between runs on the same machine, so read them as
-magnitudes rather than figures. The warm and `--staged` figures are higher than the ones
-this table carried before the combined query landed, and the difference is the machine and
-the session, not a regression — every number above was taken in one interleaved run against
-the previous commit as a baseline, which measured cold ~1.76 s, warm ~67 ms and `--staged`
-~61 ms on the same corpus minutes apart. Comparing a measurement to one taken on another
-day is the mistake this table has already made once.
+Measured 2026-08-25 in one session on one machine — Apple M3 Max (14 cores), macOS 26.5.2,
+rustc 1.95.0, wasmtime 47.0.4 — three runs of the same bench, each scenario the best of five
+attempts per run: cold 648.6–717.5 ms, warm 35.0–36.8 ms and `--staged` 12.6–14.9 ms. Noisy
+to within about 10% between runs on the same machine, so read them as magnitudes rather than
+figures; the table's earlier figures (cold ~1.1 s, warm ~64 ms, `--staged` ~51 ms) were
+higher on the same corpus, which is the standing warning in action — comparing a measurement
+to one taken on another day is the mistake this table has already made once, and the
+machine's mood is part of the measurement.
 
-**Nothing meets its budget yet, and the budgets stand.** They are targets to aim at, not release gates — a number chosen before anything existed does not get to decide whether the thing that exists is worth shipping. What they are for is direction: they say which way is better, and the gap between them and the measurements says how much room is left.
+**Two of the three budgets are still unmet, and the budgets stand.** Cold crossed below its
+budget this session — the first budget this table has ever met — and warm and `--staged` have
+not. The budgets remain targets to aim at, not release gates: a number chosen before anything
+existed does not get to decide whether the thing that exists is worth shipping. What they are
+for is direction, and the gap between them and the measurements says how much room is left.
 
-Measuring them is not grounds for moving them. The levers below are the answer, in that order, and relaxing a budget remains the last resort — the point of a target you have not hit is that it keeps pointing.
+Measuring them is not grounds for moving them. The levers below are the answer, in that order,
+and relaxing a budget remains the last resort — the point of a target you have not hit is that
+it keeps pointing.
+
+**Applying the pursue-versus-move test from the re-baseline: no budget moves.** A gap is
+*pursued* if a different implementation of the same WebAssembly mechanism would not pay it —
+which matches every lever this section has actually found — and it is grounds to *move* the
+budget only if every such implementation pays it. Cold is the informative row: it crossed
+below its budget this session, and every lever that closed it (the shared traversal, parallel
+query compilation, parsing once per file) was a different implementation of the same
+mechanism paying less. Warm and `--staged` fail the "pursued" branch for the opposite reason:
+their remaining gaps are discovery — reading and hashing every file to find what changed —
+plus loading and rewriting the whole-corpus cache file, costs paid identically by every
+implementation of the WebAssembly mechanism (this corpus runs no components) and by an engine
+with no WebAssembly at all. A gap that every implementation pays is move-grounds by the
+letter of the test, but moving for it would move for a cause the test does not measure: the
+mechanism is not what keeps these two budgets unmet, so the budgets stand, and the levers
+this section already names — a cheaper staleness check than content hashing, or a cache
+format that can be written in part — remain the pursued answer.
+
+**The eager-versus-lazy lesson was carried to the new engine, and re-verified in the same
+session.** The risk this project's own history names is per-component-per-worker eager
+instantiation — the QuickJS sandbox bug at 263 → 56 ms, at the worse multiplier of rules ×
+workers. `lanekeep-wasm` answers it with an `Option` per (worker, component), filled on first
+use, and `tests/instantiation.rs` asserts the bound rather than asking callers to behave: a
+warm worker whose files all hit the cache instantiates nothing, one instance serves every
+file a rule matches, and the two eager designs the tests are written against fail them.
+Re-run 2026-08-25 on this tree (wasmtime 47.0.4): 17 passed, 0 failed. The 82–96×
+measurement behind it — eager instantiation against lazy at twenty rules and fourteen
+workers, taken 2026-08-05 — is recorded in `crates/lanekeep-wasm/src/runtime.rs` and remains
+the record: the mechanism did not change, and the laziness `MEMORY_RESERVATION`'s arithmetic
+rests on is asserted rather than assumed.
 
 **The earlier numbers in this table were stale, and understated the gap by about half.** They
 were taken before Python, Go and Rust support existed; three more grammars means more rules
@@ -1060,11 +1096,48 @@ A Rust component's invocation is about 9 µs **cheaper** than a QuickJS one, whi
 
 So the lever is **fewer matches, not fewer crossings**: the query gate of §7.2, a `fileContains` gate that keeps a file from being parsed at all, and a query that binds the site the rule actually cares about instead of a broad shape it then filters in JavaScript. Reducing crossings per match is the right lever for a *heavy* rule such as `no-unwrap` — the Rust port's hoist of `line`/`column` out of a loop took 30% of its calls away, and that lever is available to a TypeScript rule unchanged — and it is the wrong one here.
 
-The four TypeScript built-ins now sharing one component do not run faster than they did as modules, and nothing in this document should be read as claiming they do. The case for compiling them is the authoring path and eventually one engine rather than two, not throughput. §15's budget table has **not** been re-baselined against them, and §15's config-load figures are the other half of the bill.
+The four TypeScript built-ins now sharing one component do not run faster than they did as modules, and nothing in this document should be read as claiming they do. The case for compiling them is the authoring path and eventually one engine rather than two, not throughput. §15's budget table has now been re-baselined against them — measured, dated and machine-named on 2026-08-25 in §15, on a tree where the migration and its memo are both in — and §15's config-load figures are the other half of the bill.
 
 **A TypeScript rule that is not compiled is unaffected.** This is the cost of the component form, not of authoring in TypeScript: a rule loaded as a module still runs in QuickJS at the first row's price. The coexistence window (§6) is what keeps that a choice for a rule someone writes.
 
 **It is not a choice for the four that migrated, and saying "coexistence" without that caveat reads as though nobody pays.** Those four have no module form any more — `COMPONENT_SOURCES` keeps their TypeScript as the text a reader reviews, and nothing resolves a specifier through it — so `lanekeep/no-default-export` is the component or it is nothing. And `lanekeep init` writes exactly that rule into every TypeScript project it scaffolds, which is the commonest project there is. Measured 2026-08-11 on the release binary over the scaffolded config and one source file: **6.4 s cold, 0.2 s warm, and 34,875,136 bytes written into `.lanekeep`** — four cold runs at 6.35, 6.36, 6.36 and 6.48 s. A user who never asked for a component meets one anyway. That is a real cost of this branch and it belongs in §15's ledger rather than behind a sentence about choice.
+
+### 15.2 Distribution lanes, re-verified
+
+Re-verified 2026-08-25 in the same session as the table above, against the artifacts a
+`dist` build actually produces. The binaries (one session, one tree: aarch64-apple-darwin
+30,498,016 bytes, aarch64-unknown-linux-gnu 30,749,120, x86_64-unknown-linux-gnu
+35,000,200) each embed wasmtime, cranelift and the shipped components, including the
+13,029,888-byte `typescript-builtins.wasm`. The lanes, tightest first:
+
+| Lane | Ceiling | Measured artifact | Headroom |
+|---|---|---|---|
+| crates.io (`.crate`) | 10 MiB, compressed | `lanekeep-rules` ≈ 4.6 MiB — the four shipped components, the eight self-check ones and the source map all ride in the tarball (`cargo package --list`) | ~2× — the tightest lane |
+| PyPI (wheel) | 100 MB per file | 10.2–11.3 MB across the three wheels measured here; the fourth (Windows) builds in CI | ~10× |
+| npm (platform package) | ~500 MB per version | 9.7–10.7 MiB gzipped; the launcher wrapper is 24 KB | ~50× |
+| GitHub release archive | 2 GiB per file | 10.2–11.3 MB tar.gz | ~200× |
+| Homebrew | formula pins the archive's checksum, out of band | the same archives | — |
+| Go module | no binary at all | `cmd/lanekeep` fetches the release binary and verifies it against the same release's `SHA256SUMS` | — |
+
+The reconciliation this issue asked for, stated once: the pre-migration analysis cost the
+TypeScript built-ins at ~8 MB of engine *each* — four engines, if they shipped as four
+components, which is what put crates.io 3× over its cap. #99's shared component is the
+mitigation, and the two are now consistent: **one** engine serves all four built-ins
+(`typescript-builtins.wasm`, 13,029,888 bytes; its precompiled form, 34,874,912 bytes,
+never leaves `.lanekeep/components`). The lane arithmetic that matters is the `.crate` at
+~4.6 MiB — under the cap with the components riding in it, because `build.rs` builds them
+from source at publish rather than omitting them. The reason the components are uncommitted
+is not the cap but byte-reproducibility and the cache-key invariants (§8.1); the tightness of
+this lane is why its contents — the components riding in the tarball — are the thing worth
+checking with `cargo package --list` before a release, since nothing else enforces the cap
+until the upload rejects it.
+
+**The glibc floor was re-asserted in the same session.** `check_glibc_floor.py` reads the
+`.gnu.version_r` of the built binary, and a WebAssembly runtime is a new source of symbol
+requirements, so the claim was checked rather than inherited: both Linux triples, built
+through zigbuild with the `.2.17` target suffix, report "glibc floor 2.17 (claiming 2.17)"
+and pass the check, and `build-python-wheels.sh` re-runs it for each manylinux tag before
+its wheel is written. The floor survives the runtime.
 
 ---
 
