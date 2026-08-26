@@ -177,7 +177,7 @@ jobs:
           set -uo pipefail
           out="bench-output.txt"
 
-          ratio_line="$(grep -E 'a host call costs [0-9]+\.[0-9]+x through the TypeScript component' "$out" || true)"
+          ratio_line="$(grep -E 'a host call costs [0-9]+\.[0-9]+x through the JS component' "$out" || true)"
           if [ -z "$ratio_line" ]; then
             echo "FAIL: the JavaScript component arm did not run (no ratio line in the bench output)."
             echo "      \`just bench-js-component\` builds it; check the build step above."
