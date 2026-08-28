@@ -38,6 +38,7 @@ pub mod fix;
 pub mod gates;
 pub mod limits;
 pub mod location;
+pub mod query_cover;
 pub mod rule_id;
 pub mod severity;
 pub mod suppression;

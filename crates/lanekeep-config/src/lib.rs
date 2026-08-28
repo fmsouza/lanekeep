@@ -436,11 +436,59 @@ impl RawLanguages {
 /// language to its own query, which is what lets one rule span grammars that do not share
 /// node vocabulary. Both normalize to one entry per declared language in `build_rule`, where
 /// the exact cover is enforced.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
+///
+/// Deserialized by hand rather than with `#[serde(untagged)]`, because untagged buffers the
+/// value and, on a mismatch, reports `data did not match any variant of untagged enum
+/// RawQueries` — a message naming a private Rust type, with the field and the expected shape
+/// gone. A `query` is the field an author gets wrong most now that it holds two shapes, so
+/// its refusal has to say what a query may be.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RawQueries {
     One(String),
     Many(BTreeMap<String, String>),
+}
+
+impl<'de> Deserialize<'de> for RawQueries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(query) => Ok(Self::One(query)),
+            serde_json::Value::Object(entries) => {
+                let mut queries = BTreeMap::new();
+                for (language, query) in entries {
+                    let serde_json::Value::String(query) = query else {
+                        return Err(D::Error::custom(format!(
+                            "`query` for `{language}` must be a string, not {}",
+                            json_kind(&query)
+                        )));
+                    };
+                    queries.insert(language, query);
+                }
+                Ok(Self::Many(queries))
+            }
+            other => Err(D::Error::custom(format!(
+                "`query` must be a string, or an object mapping each language to its own \
+                 query, not {}",
+                json_kind(&other)
+            ))),
+        }
+    }
+}
+
+/// What a JSON value is, for a refusal that names the shape it got.
+const fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1670,12 +1718,6 @@ fn raw_rule_from(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one validation sequence: id, namespace, handler, card, severity, languages, and \
-              now the per-language query cover — splitting any step out would scatter the \
-              refusal messages existing tests assert on"
-)]
 fn build_rule(
     raw: RawRule,
     position: usize,
@@ -1779,33 +1821,17 @@ fn build_rule(
                 .collect()
         }
         Some(RawQueries::Many(queries)) => {
-            if queries.is_empty() {
-                return Err(fail(format!(
-                    "`{id}` declares no query for any language — a rule with no query can \
-                     never match"
-                )));
-            }
-            // The exact cover, both directions, each naming the language: a declared language
-            // with no query would run on nothing, and a query for a language the rule does
-            // not target would never run — either one is the same silent failure the
-            // empty-`languages` refusal guards.
-            for language in &languages {
-                if !queries.contains_key(language) {
-                    return Err(fail(format!(
-                        "`{id}` declares no query for `{language}` — a rule runs only on \
-                         files whose language it names, so a language with no query can \
-                         never match"
-                    )));
-                }
-            }
-            for language in queries.keys() {
-                if !languages.contains(language) {
-                    return Err(fail(format!(
-                        "`{id}` declares a query for `{language}`, which it does not target \
-                         — that query can never run, and nothing would report the mistake"
-                    )));
-                }
-            }
+            // The exact cover, shared word for word with the component gate
+            // (`lanekeep-wasm`'s `validate_metadata`) through `lanekeep_core::query_cover`,
+            // so the two paths cannot drift in what they accept or in how they say no. The
+            // duplicate arm can never fire here — a `BTreeMap` cannot hold a language twice
+            // — and lives in the shared check for the path that can, a component's
+            // `list<query-for>`.
+            lanekeep_core::query_cover::check(&languages, queries.keys().map(String::as_str))
+                .map_err(|problem| fail(format!("`{id}` {}", problem.describe())))?;
+            // Per-entry emptiness is this gate's alone, deliberately: probe fixtures answer
+            // `metadata` with an empty query on purpose, so the host gate admits one and
+            // the last gate before a rule runs — this one — refuses it.
             for (language, query) in &queries {
                 if query.trim().is_empty() {
                     return Err(fail(format!(
@@ -3289,11 +3315,15 @@ mod tests {
              position in the config"
         );
         // And the *first* rule of the same component is reachable in its own right, so this is
-        // narrowing rather than an artifact of only ever asking for one thing.
-        assert_ne!(
-            rule.queries.get("rust"),
-            Some(&"(call_expression) @0".to_owned())
-        );
+        // narrowing rather than an artifact of only ever asking for one thing. Fetched with
+        // `expect` rather than compared through `get`: `assert_ne!` on two `Option`s passes
+        // vacuously when the key is absent, which is exactly the case this assertion exists
+        // to rule out.
+        let query = rule
+            .queries
+            .get("rust")
+            .expect("the narrowed rule targets rust");
+        assert_ne!(query, "(call_expression) @0");
     }
 
     /// The other index of the same artifact, so "it narrows" is not "it always picks index 1".
@@ -3681,6 +3711,132 @@ mod tests {
         assert!(rendered.contains("python"), "{rendered}");
     }
 
+    // --- an empty or malformed query, refused with the message these tests pin -----------
+    //
+    // The empty-query refusals went unasserted for a while: the one fixture that reached
+    // them grew an unusable card too, the card check fires first, and nothing else drove
+    // them — so deleting both `trim().is_empty()` blocks left the whole suite green. These
+    // pin the messages through the real TypeScript pipeline.
+
+    #[test]
+    fn a_typescript_rule_with_an_empty_query_is_refused() {
+        let fixture = Fixture::new(
+            "empty-query-string-ts",
+            &[
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     export default defineRule({\n\
+                       id: 'local/empty',\n\
+                       query: '',\n\
+                       card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+                       check(ctx, m) { ctx.report(m.call); },\n\
+                     });\n",
+                ),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("an empty query can never match, so it must not load");
+        let rendered = error.to_string();
+        assert!(rendered.contains("local/empty"), "{rendered}");
+        assert!(rendered.contains("has an empty `query`"), "{rendered}");
+    }
+
+    #[test]
+    fn a_typescript_rule_with_an_empty_query_for_one_language_is_refused() {
+        let fixture = Fixture::new(
+            "empty-query-for-language-ts",
+            &[
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     export default defineRule({\n\
+                       id: 'local/multi',\n\
+                       language: ['typescript', 'python'],\n\
+                       query: { typescript: '(call_expression) @call', python: '   ' },\n\
+                       card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+                       check(ctx, m) { ctx.report(m.call); },\n\
+                     });\n",
+                ),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("an empty query for one language can never match on it");
+        let rendered = error.to_string();
+        assert!(rendered.contains("local/multi"), "{rendered}");
+        assert!(rendered.contains("empty `query` for"), "{rendered}");
+        assert!(rendered.contains("python"), "{rendered}");
+    }
+
+    #[test]
+    fn a_query_of_the_wrong_shape_is_refused_naming_the_field() {
+        // The refusal has to say what a `query` may be. An untagged enum reported "data did
+        // not match any variant of untagged enum RawQueries" here — a private type's name,
+        // with the field and the expected shapes gone.
+        let fixture = Fixture::new(
+            "malformed-query-ts",
+            &[
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     export default defineRule({\n\
+                       id: 'local/malformed',\n\
+                       query: 42,\n\
+                       card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+                       check(ctx, m) { ctx.report(m.call); },\n\
+                     });\n",
+                ),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("a number is not a query in either shape");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("`query` must be a string, or an object"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("not a number"), "{rendered}");
+    }
+
+    #[test]
+    fn a_query_entry_of_the_wrong_shape_is_refused_naming_its_language() {
+        let fixture = Fixture::new(
+            "malformed-query-entry-ts",
+            &[
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     export default defineRule({\n\
+                       id: 'local/malformed',\n\
+                       query: { typescript: 5 },\n\
+                       card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+                       check(ctx, m) { ctx.report(m.call); },\n\
+                     });\n",
+                ),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("a number is not a query for a language either");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("`query` for `typescript` must be a string"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("not a number"), "{rendered}");
+    }
+
     #[test]
     fn a_component_declaring_a_language_without_a_query_is_refused() {
         // The same refusal on the component path, driven through the two functions the wasm
@@ -3882,7 +4038,11 @@ mod tests {
         // End to end, through a real guest: `world-shape.wasm` answers `metadata` with an empty
         // card and an empty query, because it is a probe rather than a rule. A component's
         // answers go through `build_rule` exactly as an extracted TypeScript rule's do, so it
-        // is refused for the reasons a TypeScript rule would be.
+        // is refused for the reasons a TypeScript rule would be. The card check fires first,
+        // so the card refusal is what this fixture reaches — asserted below, so a reordering
+        // that changed which refusal answers does not pass unnoticed. The empty-*query*
+        // refusal is pinned by its own tests above, and on the component path by
+        // `a_component_with_an_empty_query_for_a_language_is_refused`.
         let fixture = Fixture::new("component-validated", &[]);
         fixture.write_component("rules/probe.wasm", "world-shape");
         fixture.write_all(&[(
@@ -3901,6 +4061,34 @@ mod tests {
             error.to_string().contains("fixture/world-shape"),
             "the component's own id should name it: {error}"
         );
+        assert!(
+            error.to_string().contains("unusable card"),
+            "the card check fires first for this probe: {error}"
+        );
+    }
+
+    #[test]
+    fn a_component_with_an_empty_query_for_a_language_is_refused() {
+        // The host gate deliberately admits an empty query string — probe fixtures answer
+        // `metadata` with one on purpose — so the refusal belongs to the last gate before a
+        // rule runs, `build_rule`, and this drives it through a real guest: the `metadata`
+        // fixture's `{"empty-query":true}` flag makes its `metadata` answer a well-formed
+        // card and an empty query for its one language.
+        let fixture = Fixture::new("component-empty-query", &[]);
+        fixture.write_component("rules/probe.wasm", "metadata");
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"namespaces": ["fixture"],
+                "rules": [{"rule": "./rules/probe.wasm", "options": {"empty-query": true}}]}"#,
+        )]);
+
+        let error = fixture
+            .load_json()
+            .expect_err("an empty query for a language can never match on it");
+        let rendered = error.to_string();
+        assert!(rendered.contains("fixture/metadata"), "{rendered}");
+        assert!(rendered.contains("empty `query` for"), "{rendered}");
+        assert!(rendered.contains("rust"), "{rendered}");
     }
 
     // --- confinement ------------------------------------------------------------------
