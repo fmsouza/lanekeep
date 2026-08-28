@@ -52,6 +52,8 @@ pub enum CompileErrorKind {
     ImpossiblePattern,
     /// The query binds no captures, so a handler has nothing to reference.
     NoCaptures,
+    /// The query carries a predicate tree-sitter parses but never applies.
+    UnsupportedPredicate,
     /// The grammar rejected the query for a reason lanekeep does not model.
     Other,
 }
@@ -67,6 +69,7 @@ impl CompileErrorKind {
             Self::UnknownCapture => "the query refers to a capture it never binds",
             Self::ImpossiblePattern => "this pattern can never match",
             Self::NoCaptures => "the query binds no captures",
+            Self::UnsupportedPredicate => "the query uses a predicate that is never applied",
             Self::Other => "the grammar rejected this query",
         }
     }
@@ -109,6 +112,11 @@ impl fmt::Display for CompileError {
                     "  the {} grammar has no field `{}`",
                     self.language, self.detail
                 )?,
+                CompileErrorKind::UnsupportedPredicate => writeln!(
+                    f,
+                    "  the predicate `{}` is parsed but never applied; remove it",
+                    self.detail
+                )?,
                 _ => writeln!(f, "  {}", self.detail)?,
             }
         }
@@ -146,8 +154,10 @@ impl CompiledQuery {
     ///
     /// # Errors
     ///
-    /// Returns [`CompileError`] for malformed syntax, unknown node kinds or fields, and for
-    /// a query that binds no captures.
+    /// Returns [`CompileError`] for malformed syntax, unknown node kinds or fields, for a
+    /// query that binds no captures, and for a query carrying a predicate that tree-sitter
+    /// parses but never applies (anything beyond the text predicates `#eq?`/`#match?`/
+    /// `#any-of?` and their negations).
     pub fn compile(language: &dyn Language, source: &str) -> Result<Self, CompileError> {
         let grammar = language.grammar();
         let id = language.id();
@@ -184,6 +194,51 @@ impl CompiledQuery {
                 line: source.lines().nth(err.row).unwrap_or_default().to_owned(),
             }
         })?;
+
+        // The binding applies text predicates (`#eq?`, `#not-eq?`, `#match?`,
+        // `#not-match?`, `#any-of?`, `#not-any-of?`) while iterating matches, so those
+        // gate correctly here. Every other predicate — `#is?`/`#is-not?`, `#set!`, or an
+        // operator the binding does not know — is parsed but *never applied*: a rule
+        // carrying one gets every structural match as though the predicate were not there.
+        // Refusing it at compile time keeps that failure loud instead of silent.
+        for pattern in 0..query.pattern_count() {
+            let operator = query
+                .general_predicates(pattern)
+                .first()
+                .map(|predicate| predicate.operator.to_string())
+                .or_else(|| {
+                    query
+                        .property_predicates(pattern)
+                        .first()
+                        .map(|(_, is_positive)| {
+                            if *is_positive { "is?" } else { "is-not?" }.to_owned()
+                        })
+                })
+                .or_else(|| {
+                    query
+                        .property_settings(pattern)
+                        .first()
+                        .map(|_| "set!".to_owned())
+                });
+
+            if let Some(operator) = operator {
+                let start = query.start_byte_for_pattern(pattern);
+                let end = query.end_byte_for_pattern(pattern);
+                let needle = format!("#{operator}");
+                let offset = source[start..end]
+                    .find(&needle)
+                    .map_or(start, |rel| start + rel);
+                let (position, line) = position_at(source, offset);
+                return Err(CompileError {
+                    kind: CompileErrorKind::UnsupportedPredicate,
+                    language: id,
+                    position,
+                    offset,
+                    detail: needle,
+                    line: line.to_owned(),
+                });
+            }
+        }
 
         let capture_names: Vec<String> = query
             .capture_names()
@@ -313,6 +368,23 @@ impl<'tree> QueryMatch<'_, 'tree> {
             .filter(move |(n, _)| *n == name)
             .map(|(_, node)| *node)
     }
+}
+
+/// The one-based position of a byte offset in `source`, plus the line it lands on.
+///
+/// `Position` counts columns in characters rather than bytes, matching the caret rendering
+/// in [`CompileError`]'s `Display`, which pads by `column - 1`.
+fn position_at(source: &str, offset: usize) -> (Position, &str) {
+    let before = &source[..offset.min(source.len())];
+    let line = u32::try_from(before.bytes().filter(|&b| b == b'\n').count())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    let last_nl = before.rfind('\n').map_or(0, |i| i + 1);
+    let column = u32::try_from(before[last_nl..].chars().count())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    let line_text = source.lines().nth((line - 1) as usize).unwrap_or_default();
+    (Position::new(line, column), line_text)
 }
 
 #[cfg(test)]
@@ -585,5 +657,94 @@ mod tests {
         });
 
         assert_eq!(positions, [(1, 11), (2, 11)]);
+    }
+
+    #[test]
+    fn text_predicates_filter_matches() {
+        // The binding applies these while iterating; the tests pin that through this
+        // crate's own match path, so a tree-sitter upgrade that stops applying them turns
+        // red here rather than silently loosening every gated rule. Each query wraps the
+        // node and its predicate in one outer pair of parens: tree-sitter reads
+        // `(identifier) @id (#eq? @id ...)` as TWO patterns, with the predicate on a
+        // pattern of its own that filters nothing.
+        let source = "const alpha = 1; const beta = 2;";
+
+        let query = compile("((identifier) @id (#eq? @id \"alpha\"))");
+        assert_eq!(run(&query, source), vec![vec!["id=alpha".to_owned()]]);
+
+        let query = compile("((identifier) @id (#not-eq? @id \"alpha\"))");
+        assert_eq!(run(&query, source), vec![vec!["id=beta".to_owned()]]);
+
+        let query = compile("((identifier) @id (#match? @id \"^a\"))");
+        assert_eq!(run(&query, source), vec![vec!["id=alpha".to_owned()]]);
+
+        let query = compile("((identifier) @id (#not-match? @id \"^a\"))");
+        assert_eq!(run(&query, source), vec![vec!["id=beta".to_owned()]]);
+
+        let source = "const alpha = 1; const beta = 2; const gamma = 3;";
+        let query = compile("((identifier) @id (#any-of? @id \"alpha\" \"gamma\"))");
+        assert_eq!(
+            run(&query, source),
+            vec![vec!["id=alpha".to_owned()], vec!["id=gamma".to_owned()]]
+        );
+
+        let query = compile("((identifier) @id (#not-any-of? @id \"alpha\" \"gamma\"))");
+        assert_eq!(run(&query, source), vec![vec!["id=beta".to_owned()]]);
+    }
+
+    #[test]
+    fn rejects_a_general_predicate_naming_the_operator() {
+        // tree-sitter parses `#is?`/`#set!`/unknown operators but never applies them: a
+        // rule carrying one gets every structural match as though the predicate were not
+        // there. Refusing to compile keeps that failure loud instead of silent.
+        let err = compile_err("((identifier) @id (#is? @id \"x\"))");
+        assert_eq!(err.kind, CompileErrorKind::UnsupportedPredicate);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("#is?"),
+            "should name the operator: {rendered}"
+        );
+        assert!(
+            rendered.contains("-->"),
+            "should point at a position: {rendered}"
+        );
+        assert!(rendered.contains('^'), "should carry a caret: {rendered}");
+
+        let err = compile_err("((identifier) @id (#set! @id \"x\"))");
+        assert_eq!(err.kind, CompileErrorKind::UnsupportedPredicate);
+        assert!(err.to_string().contains("#set!"), "{}", err);
+
+        // `#is-not?` shares `#is?`'s never-applied bucket, under the negated name.
+        let err = compile_err("((identifier) @id (#is-not? @id \"x\"))");
+        assert_eq!(err.kind, CompileErrorKind::UnsupportedPredicate);
+        assert!(err.to_string().contains("#is-not?"), "{}", err);
+
+        let err = compile_err("((identifier) @id (#foo? @id \"x\"))");
+        assert_eq!(err.kind, CompileErrorKind::UnsupportedPredicate);
+        assert!(err.to_string().contains("#foo?"), "{}", err);
+    }
+
+    #[test]
+    fn general_predicate_error_points_at_the_operator() {
+        let err = CompiledQuery::compile(
+            &TypeScript,
+            "((pair\n  key: (property_identifier) @prop\n  value: (number) @v) @m\n  (#is? @prop \"x\"))",
+        )
+        .expect_err("should not compile");
+        assert_eq!(err.kind, CompileErrorKind::UnsupportedPredicate);
+        assert_eq!(err.position.line, 4, "should point at the fourth line");
+        assert!(
+            err.line.contains("#is?"),
+            "excerpt should be that line: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("query:4:"), "{rendered}");
+        // The caret must sit under the operator token, not at the start of the line.
+        let caret_line = rendered.lines().last().unwrap_or_default();
+        let caret_col = caret_line.find('^').unwrap_or(0);
+        assert!(
+            caret_col > 2,
+            "caret should be indented to the token: {rendered}"
+        );
     }
 }

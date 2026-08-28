@@ -1854,6 +1854,32 @@ mod tests {
     }
 
     #[test]
+    fn a_general_predicate_is_rejected_by_both_query_functions() {
+        // querySubtree and closestAncestor compile through the same path, so a predicate
+        // lanekeep refuses must be refused by both — a rule cannot smuggle one past by
+        // choosing a different way in.
+        let host = host_with_language("const a = 1;\n");
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+
+        let error = sandbox
+            .eval_with_host::<()>(
+                &host,
+                "ctx.querySubtree(ctx.root, '((identifier) @id (#is? @id \"a\"))')",
+            )
+            .expect_err("is rejected");
+        assert!(error.to_string().contains("#is?"), "{error}");
+
+        let error = sandbox
+            .eval_with_host::<()>(
+                &host,
+                "const d = ctx.querySubtree(ctx.root, '(variable_declarator name: (identifier) @n)');\n\
+                 ctx.closestAncestor(d[0].n, '((program) @p (#is? @p \"x\"))')",
+            )
+            .expect_err("is rejected");
+        assert!(error.to_string().contains("#is?"), "{error}");
+    }
+
+    #[test]
     fn closest_ancestor_finds_the_nearest_one() {
         // Nearest, not outermost — the whole reason a rule walks upward.
         let source = "function outer() { function inner() { const x = 1; } }\n";
