@@ -358,6 +358,11 @@ fn the_rest_of_the_glue_module(probe: &mut Probe) {
         "namedChildren=1",
         "ancestors=0",
         "isShadowed=false",
+        // The structural-summary method, computed host-side in one walk. The constants are
+        // the same ones `lanekeep-js`'s `structure_fingerprint_is_exposed_on_ctx` asserts
+        // for this source under QuickJS — the two surfaces must agree, because both fold
+        // the same `NodeArena`.
+        "fp={\"hash\":\"a0f2e92a59b964c75383ee14e32e0087bb376c7cc39572ff0b888a04d3dd9e4b\",\"nodes\":8}",
         // A match crosses as a list of entries and reaches a rule as captures keyed by name.
         "subtree=1:d",
         "loc={\"file\":\"src/a.ts\",\"line\":1,\"column\":1}",

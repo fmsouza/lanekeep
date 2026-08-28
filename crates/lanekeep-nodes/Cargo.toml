@@ -12,12 +12,14 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 lanekeep-lang = { workspace = true }
 lanekeep-query = { workspace = true }
 tree-sitter = { workspace = true }
 
 [dev-dependencies]
 lanekeep-lang-js = { workspace = true }
+lanekeep-lang-python = { workspace = true }
 
 [lints]
 workspace = true

@@ -63,6 +63,16 @@ use wasmtime::component::Resource;
 /// The guest, which reports `"{file}: {captures}"` for every match it is given.
 const WORLD_SHAPE: &[u8] = include_bytes!("fixtures/world-shape.wasm");
 
+/// What every world-shape report carries after the captures: the real host's fold of the
+/// one-statement source the harness checks. Pinned once, named once — the same constant
+/// `lanekeep-js`'s QuickJS test asserts for the same source.
+const FP_SUFFIX: &str = " fp=a0f2e92a59b964c75383ee14e32e0087bb376c7cc39572ff0b888a04d3dd9e4b:8";
+
+/// A world-shape report for one file, as the fixture now writes it.
+fn world_shape_report(path: &str) -> String {
+    format!("{path}: callee{FP_SUFFIX}")
+}
+
 /// One component hosting two rules, each reporting `"{id}: {captures}"`.
 const TWO_RULES: &[u8] = include_bytes!("fixtures/two-rules.wasm");
 
@@ -298,9 +308,9 @@ fn a_worker_instantiates_a_rule_once_however_many_files_match_it() {
     assert_eq!(
         worker.reports,
         vec![
-            "src/a.ts: callee".to_owned(),
-            "src/b.ts: callee".to_owned(),
-            "src/c.ts: callee".to_owned(),
+            world_shape_report("src/a.ts"),
+            world_shape_report("src/b.ts"),
+            world_shape_report("src/c.ts"),
         ],
         "and it really did run on all three, so the count is not one-because-nothing-happened"
     );
@@ -437,7 +447,7 @@ fn two_components_are_instantiated_once_each() {
     assert_eq!(
         worker.reports,
         vec![
-            "src/a.ts: callee".to_owned(),
+            world_shape_report("src/a.ts"),
             "fixture/first: callee".to_owned(),
         ]
     );
@@ -767,7 +777,7 @@ fn the_linker_accepts_bindings_beyond_the_declared_world() {
     worker
         .checked("src/a.ts", &[(slot, "callee")])
         .expect("and the rule runs");
-    assert_eq!(worker.reports, vec!["src/a.ts: callee".to_owned()]);
+    assert_eq!(worker.reports, vec![world_shape_report("src/a.ts")]);
     assert_eq!(worker.instantiations(), 1);
 }
 

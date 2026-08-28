@@ -106,6 +106,7 @@ const context = (options) => ({
       `children=${ctx.children(root).length}`,
       `namedChildren=${ctx.namedChildren(root).length}`,
       `ancestors=${ctx.ancestors(root).length}`,
+      `fp=${JSON.stringify(ctx.structureFingerprint(root))}`,
       `bindingKind=${ctx.bindingKind(root)}`,
       `isShadowed=${ctx.isShadowed(root)}`,
       `subtree=${matches.length}:${Object.keys(matches[0] ?? {}).join('+')}`,

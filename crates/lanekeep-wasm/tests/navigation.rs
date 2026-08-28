@@ -284,6 +284,33 @@ fn loc_carries_the_file_and_the_same_position_a_report_would() {
 }
 
 #[test]
+fn structure_fingerprint_reports_the_hosts_own_fold() {
+    // The guest reports what it saw through the boundary; the assertion compares it against
+    // a fresh arena's answer computed here, host-side. Two parses of one source must fold
+    // identically, so a mismatch means the WIT host wired the arena's method wrong — the
+    // one thing a stub host (world_shape.rs) cannot see. The dead handle's `none` is
+    // asserted too: nothing rather than a fabricated shape.
+    let reports = probe(TWO_STATEMENTS, "fingerprint");
+
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&TypeScript.grammar())
+        .expect("grammar loads");
+    let tree = parser.parse(TWO_STATEMENTS, None).expect("parses");
+    let expected = NodeArena::new(tree, TWO_STATEMENTS.to_owned())
+        .structure_fingerprint(NodeArena::ROOT)
+        .expect("the root resolves");
+
+    assert_eq!(
+        rendered(&reports),
+        [
+            format!("1:1 fp={}:{}", expected.hash, expected.nodes),
+            "1:1 dead=true".to_owned(),
+        ]
+    );
+}
+
+#[test]
 fn a_fix_is_a_byte_range_taken_from_the_node_it_names() {
     // A rule already has the node it matched; offsets it computed itself are offsets it can
     // get wrong, which is the one mistake that would let a fix corrupt a file.

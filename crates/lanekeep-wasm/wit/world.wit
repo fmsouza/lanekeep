@@ -153,6 +153,32 @@ interface types {
   /// distinction could cause does not exist here.
   type match = list<match-entry>;
 
+  /// A subtree's structural fingerprint: identifiers and literal values erased.
+  ///
+  /// Computed host-side in one walk, so a rule does not pay a per-node boundary crossing to
+  /// inspect a tree's shape — the exact cost invariant 3 (`docs/architecture.md` §4) exists
+  /// to prevent. Walking a subtree through `kind`/`children` is per-node dispatch, measured
+  /// at ~300 ns per crossing under QuickJS and ~1.1× that through a component (§15.1): a
+  /// 200-node body would spend hundreds of crossings per match to compute what the host
+  /// folds natively over a tree already resident in the arena. This method moves that cost
+  /// to one crossing per match, which is why no benchmark obligation triggers.
+  ///
+  /// The normalization is the whole contract, stated up front. Every non-extra node's kind
+  /// name contributes, named and anonymous — anonymous token kinds are the operators, so
+  /// `a + b` and `a - b` stay distinct. `extra` nodes (comments) are excluded entirely, so
+  /// a doc-comment difference is not an implementation difference. Token text is erased:
+  /// identifiers and literals contribute their kind (`identifier`, `number`, `string`) and
+  /// nothing else — language-agnostic by construction, with no per-language table of what
+  /// counts as an identifier. `ERROR`/`MISSING` nodes fold like any other kind, so a broken
+  /// parse hashes as its broken shape rather than failing.
+  record structure-fingerprint {
+    /// blake3 of the normalized fold, lowercase hex.
+    hash: string,
+    /// How many nodes the fold covered — the thresholding input, so a rule does not need a
+    /// second traversal to know whether a match is trivially small.
+    nodes: u32,
+  }
+
   /// A fact emitted during the per-file pass, for the reduce phase to consume.
   record emitted-fact {
     kind: string,
@@ -319,6 +345,15 @@ interface types {
     named-children: func(n: node) -> list<node>;
     /// Every ancestor, nearest first, ending at the root.
     ancestors: func(n: node) -> list<node>;
+
+    /// A structural summary of the subtree rooted at `n`: the fold's hash and the number
+    /// of nodes it covered.
+    ///
+    /// None when the handle does not resolve — nothing rather than a fabricated shape, the
+    /// same answer `kind`, `text` and `loc` give. The crossing economics are in the
+    /// `structure-fingerprint` record's docs above; this is the one crossing a rule pays
+    /// per call, where walking the subtree guest-side would pay one per node.
+    structure-fingerprint: func(n: node) -> option<structure-fingerprint>;
 
     /// Whether the identifier at `n` resolves to a binding introduced by importing `name`
     /// (or the module itself, when `name` is none) from `module`.

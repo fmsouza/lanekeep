@@ -318,7 +318,7 @@ use wasmtime::component::{Resource, ResourceTable};
 // importing either would collide with its own definition.
 use crate::bindings::types::{
     self, BindingKind, EmittedFact, FactError, Host, HostCheckContext, HostReduceContext,
-    NodeLocation, ReadError, ReduceLocation,
+    NodeLocation, ReadError, ReduceLocation, StructureFingerprint,
 };
 
 /// A violation a rule asked for.
@@ -1173,6 +1173,21 @@ impl HostCheckContext for HostState {
         n: Handle,
     ) -> wasmtime::Result<Vec<Handle>> {
         Ok(self.check_context_mut(&this)?.arena.ancestors(n))
+    }
+
+    fn structure_fingerprint(
+        &mut self,
+        this: Resource<CheckContext>,
+        n: Handle,
+    ) -> wasmtime::Result<Option<StructureFingerprint>> {
+        Ok(self
+            .check_context_mut(&this)?
+            .arena
+            .structure_fingerprint(n)
+            .map(|fingerprint| StructureFingerprint {
+                hash: fingerprint.hash,
+                nodes: fingerprint.nodes,
+            }))
     }
 
     // --- positions and reporting ---------------------------------------------------------

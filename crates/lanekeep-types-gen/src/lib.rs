@@ -75,6 +75,7 @@ pub fn render_index_dts(wit: &str) -> String {
         render_fact(),
         render_emitted_fact(),
         render_node_location(),
+        render_structure_fingerprint(),
         render_context(&resolve, "RuleContext", &check_context, true),
         render_reduce_location(),
         render_context(&resolve, "ReduceContext", &reduce_context, false),
@@ -208,6 +209,7 @@ fn render_type_id(resolve: &Resolve, id: wit_parser::TypeId) -> String {
             "binding-kind" => return "BindingKind".to_owned(),
             "node-location" => return "NodeLocation".to_owned(),
             "reduce-location" => return "ReduceLocation".to_owned(),
+            "structure-fingerprint" => return "StructureFingerprint".to_owned(),
             "fix" => return "Fix".to_owned(),
             "rule-card" => return "RuleCard".to_owned(),
             "emitted-fact" => return "EmittedFact".to_owned(),
@@ -526,6 +528,23 @@ export interface NodeLocation {
 }
 ";
 
+const STRUCTURE_FINGERPRINT: &str = "\
+/**
+ * A subtree's structural fingerprint: identifiers and literal values erased.
+ *
+ * Computed host-side in one walk, so a rule does not pay a per-node boundary crossing to
+ * inspect a tree's shape. Two functions differing only in identifier names, literal values
+ * or comments hash identically; differing in an operator or a statement, differently. A
+ * dead handle yields `undefined`, like `kind` and `loc`.
+ */
+export interface StructureFingerprint {
+  /** blake3 of the normalized fold, lowercase hex. */
+  hash: string
+  /** How many nodes the fold covered — the thresholding input. */
+  nodes: number
+}
+";
+
 const REDUCE_LOCATION: &str = "\
 /** A violation the reduce phase reports, which has no node to point at. */
 export interface ReduceLocation {
@@ -691,6 +710,10 @@ fn render_emitted_fact() -> String {
 
 fn render_node_location() -> String {
     NODE_LOCATION.to_owned()
+}
+
+fn render_structure_fingerprint() -> String {
+    STRUCTURE_FINGERPRINT.to_owned()
 }
 
 fn render_reduce_location() -> String {

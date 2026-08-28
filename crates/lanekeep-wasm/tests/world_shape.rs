@@ -23,6 +23,7 @@ use lanekeep_nodes::NodeArena;
 use lanekeep_wasm::bindings::types::{
     BindingKind, CheckContext, EmittedFact, FactError, Fix, Host, HostCheckContext,
     HostReduceContext, NodeLocation, ReadError, ReduceContext, ReduceLocation,
+    StructureFingerprint,
 };
 use lanekeep_wasm::bindings::{Rule, types};
 use lanekeep_wasm::engine;
@@ -190,6 +191,21 @@ impl HostCheckContext for StubHost {
 
     fn ancestors(&mut self, _: Resource<CheckContext>, _: u32) -> wasmtime::Result<Vec<u32>> {
         Ok(Vec::new())
+    }
+
+    /// A constant record, so the ABI round-trip is observable: the fixture reports what it
+    /// got back and the test asserts it equals this. That this is the *right* computation is
+    /// `tests/navigation.rs`'s business, which drives the real host; here only the shape is
+    /// under test.
+    fn structure_fingerprint(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: u32,
+    ) -> wasmtime::Result<Option<StructureFingerprint>> {
+        Ok(Some(StructureFingerprint {
+            hash: "abc123".to_owned(),
+            nodes: 42,
+        }))
     }
 
     /// One handle resolves to the `context` module, and everything else to nothing. The rule asks
@@ -474,9 +490,12 @@ fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
 
     assert_eq!(
         store.data().reported,
-        vec![format!("check node=7 message={FILE}: callee,arg fix=none")],
+        vec![format!(
+            "check node=7 message={FILE}: callee,arg fp=abc123:42 fix=none"
+        )],
         "the guest read the borrowed context, saw both captures in order, and reported at \
-         the first one with a message and no fix"
+         the first one with a message and no fix — and the `structure-fingerprint` record \
+         round-tripped the canonical ABI back to the stub host's constant"
     );
 }
 
@@ -547,9 +566,9 @@ fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
 ///
 /// This is the second of the two ways a load-time import check can be written wrong, and it
 /// is independent of the first. The instance the guest imports declares only the functions it
-/// actually calls — three of `check-context`'s twenty-four and three of `reduce-context`'s
+/// actually calls — four of `check-context`'s twenty-five and three of `reduce-context`'s
 /// three — so a check that compares an artifact against `wit/world.wit` for equality rejects
-/// every real rule. The test is discriminating rather than decorative: it names the three
+/// every real rule. The test is discriminating rather than decorative: it names the four
 /// `check-context` methods the fixture calls and asserts that a method it does not call is
 /// absent, which fails the moment either half of the claim stops holding.
 #[test]
@@ -579,11 +598,12 @@ fn the_imported_instance_declares_only_what_the_guest_calls() {
             "[method]check-context.file-path",
             "[method]check-context.report",
             "[method]check-context.root",
+            "[method]check-context.structure-fingerprint",
             "[method]reduce-context.facts",
             "[method]reduce-context.files",
             "[method]reduce-context.report",
         ],
-        "exactly the six the fixture calls, out of the twenty-seven the world declares"
+        "exactly the seven the fixture calls, out of the twenty-eight the world declares"
     );
     assert!(
         !methods.iter().any(|name| name.contains("query-subtree")),

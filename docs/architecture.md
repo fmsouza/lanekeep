@@ -349,6 +349,7 @@ The window closes when the last rule is loaded rather than compiled, and at that
 |---|---|
 | `ctx.text(node)` | Source text of a node |
 | `ctx.kind(node)` | Node kind |
+| `ctx.structureFingerprint(node)` | `{ hash, nodes }` of the subtree's normalized shape — identifiers and literal values erased, comments excluded — computed host-side in one walk (§15.1 is why the walk does not cross the boundary per node) |
 | `ctx.parent(node)` / `ctx.children(node)` | |
 | `ctx.ancestors(node)` | Lazy, outermost-last |
 | `ctx.closestAncestor(node, query)` | Nearest ancestor the query matches *at*; returns its captures, or `undefined` |
@@ -359,6 +360,8 @@ The window closes when the last rule is loaded rather than compiled, and at that
 Queries passed to either are compiled once per file and cached by source, including the failures — a rule calling `querySubtree` inside a handler calls it once per match with the same string, and compiling per call would make the second-cheapest operation in the host the most expensive one.
 
 Nodes cross the boundary as opaque integer handles into the Rust-side tree, never as materialized JavaScript objects. Materializing an AST is the cost that makes native tooling with JS plugins slow; the query gate plus handle-passing avoids paying it.
+
+`structureFingerprint` is the deliberate exception to handle-passing: computing a subtree's shape from handles would be one crossing per node — the exact cost invariant 3 exists to prevent — so the host folds the subtree in one walk and hands back `{ hash, nodes }`. The fold erases identifiers and literal values (an identifier contributes only its kind) and excludes comments, so two functions differing only in those hash identically while differing in an operator or a statement do not; `hash` is blake3 over a framed, length-prefixed encoding, and `nodes` is the exact count of folded nodes, for thresholding without a second traversal. A dead handle yields `undefined`, like `kind` and `loc`.
 
 ### 6.3 File and path
 
