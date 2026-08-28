@@ -7,5 +7,5 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["builtin.d.ts", "gates.test-d.ts", "index.d.ts", "types.test-d.ts"]
+  "include": ["builtin.d.ts", "gates.test-d.ts", "index.d.ts", "structure-fingerprint.test-d.ts", "types.test-d.ts"]
 }

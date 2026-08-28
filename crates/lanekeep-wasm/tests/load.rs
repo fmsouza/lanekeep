@@ -676,8 +676,11 @@ fn both_load_paths_produce_the_same_violations() {
     let from_mapped = violations(&engine, &mapped);
     assert_eq!(
         from_mapped,
-        vec![format!("{FILE}: callee")],
-        "the guest ran and reported through the real host"
+        vec![format!(
+            "{FILE}: callee fp=a0f2e92a59b964c75383ee14e32e0087bb376c7cc39572ff0b888a04d3dd9e4b:8"
+        )],
+        "the guest ran and reported through the real host — and its structure-fingerprint \
+         call returned the same fold `lanekeep-nodes` computes for this source"
     );
     assert_eq!(
         violations(&engine, &embedded),

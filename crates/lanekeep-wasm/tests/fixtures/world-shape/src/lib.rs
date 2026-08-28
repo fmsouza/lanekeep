@@ -98,9 +98,16 @@ impl Guest for Component {
         let path = ctx.file_path();
         let names: Vec<&str> = m.iter().map(|entry| entry.name.as_str()).collect();
         let node = m.first().map_or_else(|| ctx.root(), |entry| entry.node);
+        // A record type crossing back to the host: `structure-fingerprint` is the one
+        // method whose result is a record, so the canonical ABI has to carry it. The stub
+        // host answers a constant, and this world's check test asserts the round-trip.
+        let fingerprint = match ctx.structure_fingerprint(node) {
+            Some(fp) => format!("{}:{}", fp.hash, fp.nodes),
+            None => "none".to_owned(),
+        };
         ctx.report(
             node,
-            Some(&format!("{path}: {}", names.join(","))),
+            Some(&format!("{path}: {} fp={fingerprint}", names.join(","))),
             // No fix: `report`'s two optional parameters are independent, and passing one
             // without the other is the shape that could not be expressed as a union.
             None,

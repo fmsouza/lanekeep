@@ -17,7 +17,7 @@
 # tool wasm-opt 131
 # tool wasm-tools 1.255.0
 crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm 33de5c491ba2b92778c8e56f5bcf4ee276390a76cea14e395609a63e42b56250
-crates/lanekeep-wasm/wit/world.wit cda67b4f54a4a7bc6753b24e43866fada7b45cad414d67b07c72c5934fc4257a
+crates/lanekeep-wasm/wit/world.wit f4f5a000e938c3c33d9b3532c1a9a06c585bd616b34683beeba93baa134af51c
 go-rules/.gitignore 02af855e1226375a64521b31bd8994a45c665fbe93ea55dfdb4b38f062d98c36
 go-rules/fixtures/maporder/main.go 6c03e440e7c13c06438f4f5cddeef5fdc293f0282f9d6613f9ab44fc994a1f71
 go-rules/go.mod 25d0033f110d1e59cc9e59ecc9b2bda4102adaa59f0414844df1d8e17c889e4c

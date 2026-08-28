@@ -103,6 +103,7 @@ impl Guest for Component {
             "unsaid-fix" => unsaid_fix(ctx),
             "bare" => bare(ctx),
             "today" => today(ctx),
+            "fingerprint" => fingerprint(ctx),
             "trap-after-report" => trap_after_report(ctx),
             other => say(ctx, &format!("unknown probe `{other}`")),
         }
@@ -366,6 +367,21 @@ fn bare(ctx: &CheckContext) {
 /// counts.
 fn today(ctx: &CheckContext) {
     say(ctx, &format!("today={:?}", ctx.today()));
+}
+
+/// The structural-summary method, on the real host.
+///
+/// The hash and count are the host's own fold; this probe reports them so the host-side test
+/// can compare them against a fresh arena's answer. Also probes the `none` branch — an
+/// unresolvable handle must come back as `None` rather than as a fabricated shape.
+fn fingerprint(ctx: &CheckContext) {
+    let live = ctx.structure_fingerprint(ctx.root());
+    match live {
+        Some(fp) => say(ctx, &format!("fp={}:{}", fp.hash, fp.nodes)),
+        None => say(ctx, "fp=none-for-root"),
+    }
+    let dead = ctx.structure_fingerprint(UNRESOLVABLE);
+    say(ctx, &format!("dead={:?}", dead.is_none()));
 }
 
 /// A report, and then a call this host has no answer to give.

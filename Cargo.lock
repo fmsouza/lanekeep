@@ -944,8 +944,10 @@ dependencies = [
 name = "lanekeep-nodes"
 version = "0.7.0"
 dependencies = [
+ "blake3",
  "lanekeep-lang",
  "lanekeep-lang-js",
+ "lanekeep-lang-python",
  "lanekeep-query",
  "tree-sitter",
 ]

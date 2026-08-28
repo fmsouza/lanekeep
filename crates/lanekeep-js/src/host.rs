@@ -57,7 +57,9 @@ use lanekeep_query::CompiledQuery;
 ///
 /// History:
 /// - `1` — reporting, navigation, binding resolution, `emitFact`, `readFile`, `fileExists`.
-pub const HOST_API_VERSION: u32 = 1;
+/// - `2` — `structureFingerprint`: the structural-summary primitive (normalized subtree
+///   hash plus exact node count), computed host-side in one walk.
+pub const HOST_API_VERSION: u32 = 2;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +390,31 @@ impl HostContext {
             Function::new(ctx.clone(), move |handle: Handle| {
                 arena.borrow_mut().ancestors(handle)
             })?,
+        )?;
+
+        // A structural summary rather than a walk: the host folds the subtree in one pass
+        // and hands back `{ hash, nodes }`, so a rule pays one crossing per call where
+        // walking `kind`/`children` would pay one per node. A dead handle is `undefined`,
+        // the same answer `kind` gives — nothing rather than a fabricated shape.
+        //
+        // The object is built with the `Ctx` this closure takes as its first parameter,
+        // which is the one shape a host function may use to return an object — see
+        // `querySubtree`'s closure for the reason the arena is not captured alongside it.
+        let arena = Rc::clone(&self.arena);
+        object.set(
+            "structureFingerprint",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
+                    let Some(fingerprint) = arena.borrow().structure_fingerprint(handle) else {
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+                    let object = Object::new(ctx.clone())?;
+                    object.set("hash", fingerprint.hash)?;
+                    object.set("nodes", fingerprint.nodes)?;
+                    Ok(object.into_value())
+                },
+            )?,
         )?;
 
         Ok(())
@@ -1196,7 +1223,45 @@ mod tests {
              ctx.column(9999) === undefined &&
              ctx.parent(9999) === undefined &&
              ctx.children(9999).length === 0 &&
-             ctx.ancestors(9999).length === 0"
+             ctx.ancestors(9999).length === 0 &&
+             ctx.structureFingerprint(9999) === undefined"
+        ));
+    }
+
+    // --- structure fingerprint ------------------------------------------------------------
+
+    #[test]
+    fn structure_fingerprint_is_exposed_on_ctx() {
+        // The constants are the ones `crates/lanekeep-wasm/tests/js_globals.rs` asserts for
+        // the same source through the compiled-TypeScript component — the two surfaces must
+        // agree, because both fold the same `NodeArena`.
+        let host = host("const x = 1;\n");
+        assert_eq!(
+            run::<String>(&host, "ctx.structureFingerprint(ctx.root).hash"),
+            "a0f2e92a59b964c75383ee14e32e0087bb376c7cc39572ff0b888a04d3dd9e4b"
+        );
+        assert_eq!(
+            run::<u32>(&host, "ctx.structureFingerprint(ctx.root).nodes"),
+            8
+        );
+    }
+
+    #[test]
+    fn structure_fingerprint_erases_identifiers_through_ctx() {
+        let a = host("function f() { return a + b }");
+        let b = host("function g() { return c + d }");
+        assert_eq!(
+            run::<String>(&a, "ctx.structureFingerprint(ctx.root).hash"),
+            run::<String>(&b, "ctx.structureFingerprint(ctx.root).hash")
+        );
+    }
+
+    #[test]
+    fn structure_fingerprint_of_a_dead_handle_is_undefined() {
+        let host = host("const x = 1;");
+        assert!(run::<bool>(
+            &host,
+            "ctx.structureFingerprint(9999) === undefined"
         ));
     }
 

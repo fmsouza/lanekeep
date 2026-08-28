@@ -176,6 +176,21 @@ export interface NodeLocation {
   column: number
 }
 
+/**
+ * A subtree's structural fingerprint: identifiers and literal values erased.
+ *
+ * Computed host-side in one walk, so a rule does not pay a per-node boundary crossing to
+ * inspect a tree's shape. Two functions differing only in identifier names, literal values
+ * or comments hash identically; differing in an operator or a statement, differently. A
+ * dead handle yields `undefined`, like `kind` and `loc`.
+ */
+export interface StructureFingerprint {
+  /** blake3 of the normalized fold, lowercase hex. */
+  hash: string
+  /** How many nodes the fold covered — the thresholding input. */
+  nodes: number
+}
+
 /** A rule's RuleContext surface. */
 export interface RuleContext {
   readonly filePath: string
@@ -190,6 +205,7 @@ export interface RuleContext {
   children(n: Node): Node[]
   namedChildren(n: Node): Node[]
   ancestors(n: Node): Node[]
+  structureFingerprint(n: Node): StructureFingerprint | undefined
   resolvesToImport(n: Node, module: string, name?: string): boolean
   isImportedFrom(n: Node, pattern: string): boolean
   bindingKind(n: Node): BindingKind | undefined

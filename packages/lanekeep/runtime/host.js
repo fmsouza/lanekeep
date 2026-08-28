@@ -228,6 +228,9 @@ export function buildCheckContext(ctx) {
     children: (node) => ctx.children(node),
     namedChildren: (node) => ctx.namedChildren(node),
     ancestors: (node) => ctx.ancestors(node),
+    // A passthrough: the world's `option<structure-fingerprint>` arrives as `undefined` for
+    // a dead handle, which is exactly the value a rule compares against.
+    structureFingerprint: (node) => ctx.structureFingerprint(node),
 
     resolvesToImport: (node, module, name) => ctx.resolvesToImport(node, module, name),
     isImportedFrom: (node, pattern) => ctx.isImportedFrom(node, pattern),
