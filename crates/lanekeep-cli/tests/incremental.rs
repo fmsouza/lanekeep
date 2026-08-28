@@ -121,6 +121,26 @@ const PER_FILE_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 60
 const CROSS_FILE_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
      "rules": [{"rule": "lanekeep/no-unused-exports", "options": {}}]}"#;
 
+const DUPLICATE_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+     "rules": [{"rule": "lanekeep/duplicate-implementation", "options": {}}]}"#;
+
+/// A function body above `duplicate-implementation`'s default `minNodes`, so a full run
+/// over a pair of these would report. Under `--staged` the reduce phase is skipped, which
+/// is the point of the note test below.
+const DUPLICATE_FN: &str = "\
+function compute(list) {
+  const total = 0
+  for (const item of list) {
+    if (item.active) {
+      total += item.value
+    } else {
+      total -= item.value
+    }
+  }
+  return total
+}
+";
+
 #[test]
 fn staged_checks_only_what_is_staged() {
     let repo = Repo::new(
@@ -265,6 +285,34 @@ fn a_narrowed_run_says_which_cross_file_rules_did_not_run() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("lanekeep/no-unused-exports"),
+        "the skipped rule is not named: {stderr}"
+    );
+    assert!(stderr.contains("--staged"), "{stderr}");
+    assert_eq!(
+        violation_count(&output),
+        0,
+        "the cross-file rule should not have reported: {}",
+        describe(&output)
+    );
+}
+
+#[test]
+fn a_narrowed_run_names_the_duplicate_implementation_rule() {
+    // Every reduce rule is skipped under narrowing, and each one has to be named when it
+    // is — a second cross-file rule that stopped running without a word would read as a
+    // clean run too.
+    let repo = Repo::new(
+        "duplicate-note",
+        DUPLICATE_CONFIG,
+        &[("src/a.ts", DUPLICATE_FN), ("src/b.ts", DUPLICATE_FN)],
+    );
+    repo.write("src/a.ts", "function tiny() {\n  return 1\n}\n");
+    repo.git(&["add", "-A"]);
+
+    let output = repo.check(&["--staged"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lanekeep/duplicate-implementation"),
         "the skipped rule is not named: {stderr}"
     );
     assert!(stderr.contains("--staged"), "{stderr}");

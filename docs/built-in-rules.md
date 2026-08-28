@@ -14,7 +14,7 @@ Name one by specifier and put it in your `rules` array. In a `lanekeep.json`, wh
 ```
 
 Or in a `lanekeep.config.ts`, for a rule that is a TypeScript module — which today means the two
-Python rules and the five TypeScript-targeting rules:
+Python rules and the six TypeScript-targeting rules:
 
 ```ts
 import { defineConfig } from 'lanekeep'
@@ -30,7 +30,7 @@ Built-ins resolve before the filesystem is consulted, so a file at
 `lanekeep/no-broad-except.ts` in your project does not shadow one. A rule whose behavior
 depended on whether a same-named file happened to exist would be unreasonable to debug.
 
-**Four of the eleven are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
+**Four of the twelve are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
 cannot import one.** The two Rust rules — `lanekeep/no-glob-import` and `lanekeep/no-unwrap` —
 and the two Go ones — `lanekeep/no-context-in-struct` and `lanekeep/no-package-init` — are
 WebAssembly components. They have no JavaScript left to import at run time, and they describe
@@ -42,7 +42,7 @@ remedy — which is the whole of the difference a user sees. Every example in th
 whichever format the rule it documents accepts.
 
 The TypeScript rules are evaluated in QuickJS from the sources they were written in — the two
-Python-targeting rules and the five TypeScript-targeting ones (four of which briefly shipped
+Python-targeting rules and the six TypeScript-targeting ones (four of which briefly shipped
 compiled to a StarlingMonkey component before that form was reverted for cost). The Rust and Go
 ones are written in the language they check and have no TypeScript at all. Which form a rule
 takes is not part of its interface: the specifier, the id, the options and the output are the
@@ -351,6 +351,55 @@ through one fails at runtime the same way.
 
 A module importing itself is not reported. It is a different mistake, and "extract what both
 modules need into a third" is not advice that applies to it.
+
+## `lanekeep/duplicate-implementation`
+
+Two function bodies with the same shape — identical structure once identifiers and literal
+values are erased — are one implementation written twice. This is the failure no per-file rule
+can see: an agent that cannot view the whole corpus reimplements a helper that already exists,
+and each individual file looks fine. It is also the rule that most directly shows why the
+corpus-view architecture exists.
+
+```json
+{
+  "rules": [
+    {
+      "rule": "lanekeep/duplicate-implementation",
+      "options": { "minNodes": 60 }
+    }
+  ]
+}
+```
+
+### Options
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `minNodes` | `number` | Smallest body, in fingerprint nodes, that participates. Defaults to `40`. |
+
+The default is calibrated to fire on real helpers and stay quiet on the two-line pairs every
+codebase has. Raise it if a codebase has many small repeated shapes; lower it to catch smaller
+duplicates at the cost of more noise.
+
+### What counts as a duplicate
+
+Bodies are matched by structure, not by text. The fingerprint erases identifier names, literal
+values and comments, so:
+
+- Same shape with different names, values or comments → **flagged** (that is the point).
+- A changed operator or an added statement → **not flagged**.
+- A with-docstring/without-docstring pair → **flagged**: a docstring is a comment, and
+  comments are erased like any other, so the two bodies have the same shape.
+- Two identical bodies in one file → flagged, exactly like two in different files.
+
+Function declarations, methods, function expressions and block-bodied arrow functions all
+participate; expression-bodied arrow functions (one-liners) do not. Generator declarations and
+expressions are not covered in v1.
+
+### Full runs only
+
+Like every cross-file rule, this one is skipped under `--since` and `--staged` with a stderr
+notice naming it ([`architecture.md`](architecture.md) §8.4) — it reports on full runs only.
 
 # Python
 

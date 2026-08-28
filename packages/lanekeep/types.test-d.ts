@@ -17,6 +17,7 @@ import noPackageInit from 'lanekeep/no-package-init'
 // @ts-expect-error no-unwrap is a component, not importable
 import noUnwrap from 'lanekeep/no-unwrap'
 
+import duplicateImplementation from 'lanekeep/duplicate-implementation'
 import noBroadExcept from 'lanekeep/no-broad-except'
 import noCircularImports from 'lanekeep/no-circular-imports'
 import noDefaultExport from 'lanekeep/no-default-export'
@@ -25,6 +26,7 @@ import noRestrictedCalls from 'lanekeep/no-restricted-calls'
 import noRestrictedImports from 'lanekeep/no-restricted-imports'
 import noUnusedExports from 'lanekeep/no-unused-exports'
 
+void duplicateImplementation
 void noBroadExcept
 void noCircularImports
 void noDefaultExport

@@ -1,10 +1,11 @@
 //! Built-in rules shipped with lanekeep.
 //!
 //! The rules shipping with lanekeep, authored against the same host API that project-authored
-//! rules use and embedded into the binary at build time. Seven are TypeScript modules evaluated
-//! in QuickJS — the two Python-targeting rules and the five TypeScript-targeting rules that
-//! were briefly compiled to a StarlingMonkey component and reverted, because that form cost 13 MB
-//! and 110× per host-API crossing for no speed benefit. The rest are WebAssembly components —
+//! rules use and embedded into the binary at build time. Eight are TypeScript modules evaluated
+//! in QuickJS — the two Python-targeting rules and the six TypeScript-targeting rules, four of
+//! which were briefly compiled to a StarlingMonkey component and reverted, because that form cost
+//! 13 MB and 110× per host-API crossing for no speed benefit. The rest are WebAssembly
+//! components —
 //! two built from `rust-rules/` and two authored in Go into one shared component — where the
 //! component path is small (100 KB or less each) and fast (1.1× a QuickJS crossing).
 //!
@@ -64,9 +65,9 @@
 
 /// The rules this build runs as TypeScript modules, as `(name, source)`.
 ///
-/// Evaluated in QuickJS, from source, on every run. Seven rules ship this way: the two
-/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the five
-/// TypeScript-targeting rules (`no-circular-imports`, `no-default-export`,
+/// Evaluated in QuickJS, from source, on every run. Eight rules ship this way: the two
+/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the six
+/// TypeScript-targeting rules (`duplicate-implementation`, `no-circular-imports`, `no-default-export`,
 /// `no-restricted-calls`, `no-restricted-imports`, `no-unused-exports`). Four of them were
 /// briefly compiled ahead of time into a shared StarlingMonkey component and reverted, because
 /// the compiled form cost 13 MB of binary and 110× per host-API crossing for no speed benefit —
@@ -75,6 +76,10 @@
 /// Ordered, so the source stays greppable and a diff shows what moved. Nothing derives an
 /// order from this table directly — see [`names`], which merges the tables and sorts.
 const BUILT_IN_RULES: &[(&str, &str)] = &[
+    (
+        "duplicate-implementation",
+        include_str!("../rules/duplicate-implementation.ts"),
+    ),
     (
         "no-broad-except",
         include_str!("../rules/no-broad-except.ts"),
@@ -132,7 +137,7 @@ type BuiltInComponent = (&'static str, &'static [u8], Option<&'static [u8]>);
 /// Go all fail by panicking, which traps, and a trap arrives at the host with no stack at all.
 /// There is nothing to remap. `go-rules/` builds with `-panic=trap` and `-no-debug`, so there is
 /// not even a name inside the artifact to map back to. A source map would only be needed for a
-/// component compiled from TypeScript, and none ships today — the five TypeScript built-ins
+/// component compiled from TypeScript, and none ships today — the six TypeScript built-ins
 /// run as QuickJS modules (see [`BUILT_IN_RULES`]).
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
@@ -355,7 +360,7 @@ mod tests {
         // these quietly revert with nothing red.
         //
         // Two shapes, deliberately together. The four rules ported to another language have no
-        // source at all and ship as components; the five TypeScript rules ship as modules,
+        // source at all and ship as components; the six TypeScript rules ship as modules,
         // evaluated in QuickJS, because the compiled-component form (StarlingMonkey in WASM)
         // costs 13 MB and 110× per crossing for no speed benefit.
         for name in [
@@ -378,6 +383,7 @@ mod tests {
         }
 
         for name in [
+            "duplicate-implementation",
             "no-circular-imports",
             "no-default-export",
             "no-restricted-calls",
