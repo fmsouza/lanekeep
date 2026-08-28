@@ -14,7 +14,7 @@ Name one by specifier and put it in your `rules` array. In a `lanekeep.json`, wh
 ```
 
 Or in a `lanekeep.config.ts`, for a rule that is a TypeScript module — which today means the two
-Python rules and nothing else:
+Python rules and the five TypeScript-targeting rules:
 
 ```ts
 import { defineConfig } from 'lanekeep'
@@ -30,27 +30,27 @@ Built-ins resolve before the filesystem is consulted, so a file at
 `lanekeep/no-broad-except.ts` in your project does not shadow one. A rule whose behavior
 depended on whether a same-named file happened to exist would be unreasonable to debug.
 
-**Eight of the ten are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
+**Four of the eleven are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
 cannot import one.** The two Rust rules — `lanekeep/no-glob-import` and `lanekeep/no-unwrap` —
-the two Go ones — `lanekeep/no-context-in-struct` and `lanekeep/no-package-init` — and the four
-TypeScript ones — `lanekeep/no-default-export`, `lanekeep/no-restricted-imports`,
-`lanekeep/no-circular-imports` and `lanekeep/no-unused-exports` — are WebAssembly components.
-They have no JavaScript left to import at run time, and they describe themselves rather than
-being read out of a `defineRule` call.
+and the two Go ones — `lanekeep/no-context-in-struct` and `lanekeep/no-package-init` — are
+WebAssembly components. They have no JavaScript left to import at run time, and they describe
+themselves rather than being read out of a `defineRule` call.
 
 **Name them from a `lanekeep.json` and everything below works the same, options included.**
 Importing one from a TypeScript config fails at load with a message that says so and names the
 remedy — which is the whole of the difference a user sees. Every example in this document uses
 whichever format the rule it documents accepts.
 
-The four TypeScript rules are compiled from *exactly* the sources they were written in; nothing
-about them changed but the engine that runs them. The Rust and Go ones are written in the
-language they check and have no TypeScript at all. Which form a rule takes is not part of its
-interface: the specifier, the id, the options and the output are the same either way, and a rule
-that changes form does not change your config — the two Go rules were TypeScript modules until
-this release, and every case in their test suites passed unchanged across the move. Their
-`.ts` sources are recoverable with `git log --diff-filter=D -- crates/lanekeep-rules/rules/`,
-which is where a reader who wants to compare the two implementations should start.
+The TypeScript rules are evaluated in QuickJS from the sources they were written in — the two
+Python-targeting rules and the five TypeScript-targeting ones (four of which briefly shipped
+compiled to a StarlingMonkey component before that form was reverted for cost). The Rust and Go
+ones are written in the language they check and have no TypeScript at all. Which form a rule
+takes is not part of its interface: the specifier, the id, the options and the output are the
+same either way, and a rule that changes form does not change your config — the two Go rules
+were TypeScript modules until this release, and every case in their test suites passed
+unchanged across the move. Their `.ts` sources are recoverable with
+`git log --diff-filter=D -- crates/lanekeep-rules/rules/`, which is where a reader who wants
+to compare the two implementations should start.
 
 Built-in ids are namespaced `lanekeep/`. Project rules use `local/`, or a namespace the
 project declares in its config — `namespaces: ['acme']` allows `acme/no-numeric-sizes`.
@@ -66,8 +66,8 @@ A rule that names no language defaults to `['typescript', 'tsx']`.
 
 # TypeScript
 
-**These four run on `.ts` and `.tsx` and not on JavaScript.** None of them declares a `language`,
-so all four take the default above — `['typescript', 'tsx']` — and `javascript` is a separate
+**These five run on `.ts` and `.tsx` and not on JavaScript.** None of them declares a `language`,
+so all five take the default above — `['typescript', 'tsx']` — and `javascript` is a separate
 language covering `.js`, `.mjs`, `.cjs` and `.jsx`. This section was headed "TypeScript and
 JavaScript" for a while and the rules underneath it never fired on a `.js` file, which is the
 quiet kind of wrong: a rule that does not run looks exactly like a codebase with nothing to
@@ -165,6 +165,101 @@ every other directory, which would rot the first time someone adds one.
 `reason` is the field worth spending time on. An agent reading lanekeep's output needs to
 know what to do instead, not merely that something is banned — the reason is the part of the
 message that tells it.
+
+
+---
+
+## `lanekeep/no-restricted-calls`
+
+Forbid calling given callables, optionally only from given paths.
+
+The call-expression sibling of `no-restricted-imports`: "no `console.*` outside the logging
+layer", "no raw `fetch` outside the API client" — each is one restriction entry instead of a
+bespoke local rule. The restrictions themselves stay project-specific (they are the options);
+the mechanism — *where* a call may happen — is what is general.
+
+Its card: **message** `restricted call`, **remediation** "call something permitted here, or
+move this code where it is allowed", with the example pair `console.log(metrics)` (reported)
+and `log(metrics)` (fine).
+
+The restriction is the entire content of the rule, so naming it without options does nothing
+useful — give it `restrictions`:
+
+```json
+{
+  "rules": [
+    {
+      "rule": "lanekeep/no-restricted-calls",
+      "options": {
+        "restrictions": [
+          {
+            "call": "console.*",
+            "from": ["!src/logging/**"],
+            "reason": "route it through the logger"
+          },
+          { "call": "fetch", "reason": "use the API client" }
+        ]
+      }
+    }
+  ]
+}
+```
+
+This rule is a **factory** — a function you call with options, which returns a rule — so a
+`lanekeep.config.ts` calls it rather than naming it:
+
+```ts
+import noRestrictedCalls from 'lanekeep/no-restricted-calls'
+
+export default defineConfig({
+  rules: [noRestrictedCalls({ restrictions: [{ call: 'console.*' }] })],
+})
+```
+
+**Two spellings fail to load.** A bare `"lanekeep/no-restricted-calls"` in a JSON config, and an
+uncalled `noRestrictedCalls` reference in a TypeScript config (`rules: [noRestrictedCalls]`
+rather than `rules: [noRestrictedCalls({...})]`), both fail with `missing 'id'` — a factory
+function has no `id` of its own; only the rule it returns does.
+
+### Options
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `restrictions` | `Restriction[]` | What is forbidden. Defaults to `[]`. |
+
+Each restriction:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `call` | `string` | The callee to forbid. `*` matches anything, including `.`. |
+| `from` | `string[]` | Where the restriction applies. Omitted means everywhere. |
+| `reason` | `string` | What to do instead. Carried into the violation message. |
+
+`call` is matched against the callee **as written**, with whitespace stripped and `?.` folded to
+`.` — so `console\n  .log` and `console?.log` both match `console.*`. Matching the raw text
+rather than a resolved name is deliberate: a restriction is written against what an author
+types, on the same terms as `no-restricted-imports`. Only the callee is normalized, so write a
+restriction in dotted form (`console.*`, not `console?. *`).
+
+### What it cannot tell apart
+
+A call reached through computed member access — `console['log']('x')` or `obj[key]('x')` — is
+not captured by the query, and a `new` expression is not a call. Telling them apart is a
+different query rather than a normalization fix; a test pins the boundary so it stays a known
+limit rather than a surprise.
+
+An entry in `from` beginning with `!` is a carve-out — the restriction applies everywhere
+*except* there, and a carve-out beats an inclusion. That inversion is what makes "no `fetch`
+outside the API client" one restriction rather than an enumeration of every other directory,
+which would rot the first time someone adds one.
+
+`reason` is the field worth spending time on. An agent reading lanekeep's output needs to know
+what to do instead, not merely that something is banned — the reason is the part of the message
+that tells it.
+
+The violation names the callee and the reason — `calling 'console.log' is restricted — route it
+through the logger` — and is anchored at the call. One violation per call, even when several
+restrictions match it; the first matching restriction's reason is the one carried.
 
 
 ---
@@ -343,7 +438,7 @@ ordering nothing writes down. Neither is a style preference: each produces a fai
 surfaces far from its cause, which is what makes it worth stating as a project convention
 rather than arguing case by case in review.
 
-**Both are components**, like the two Rust rules and the four TypeScript ones, so name them from
+**Both are components**, like the two Rust rules, so name them from
 a `lanekeep.json`:
 
 ```json
@@ -440,7 +535,7 @@ objects to.
 Both Rust rules are about *legibility of dependencies and failure*: where a name came from, and
 what happens when something goes wrong.
 
-**Both are components**, like the four TypeScript rules above, so name them from a
+**Both are components**, like the two Go rules above, so name them from a
 `lanekeep.json`:
 
 ```json
@@ -547,14 +642,18 @@ not have (§1 non-goals). A test pins the behavior so it is a known limit rather
 ## Composing them
 
 The two cross-file rules share their module resolution, which is exported as
-`lanekeep/paths` and available to project rules too:
+`lanekeep/paths` and available to project rules too, and `no-restricted-imports` and
+`no-restricted-calls` share their pattern matching — the `*` globs and `!` carve-outs — as
+`lanekeep/patterns`:
 
 ```ts
 import { resolveImport, dirname, join } from 'lanekeep/paths'
+import { appliesTo, matches } from 'lanekeep/patterns'
 ```
 
 Two rules resolving `./a` differently would not look like a bug — each would be individually
-plausible — so the resolution has one definition.
+plausible — so the resolution has one definition. The same holds for a `*` glob or a `from`
+list: two rules interpreting one differently would each be individually plausible.
 
 ---
 
@@ -563,7 +662,8 @@ plausible — so the resolution has one definition.
 A built-in gets no privileged path into the engine, which is the point: a built-in that
 needed something a project rule cannot have would be evidence the host API is wrong.
 
-1. Write `crates/lanekeep-rules/rules/<name>.ts`, importing only from `lanekeep`.
+1. Write `crates/lanekeep-rules/rules/<name>.ts`, importing only from `lanekeep` and the shared
+   modules under the same prefix (such as `lanekeep/patterns`).
 2. Add it to `BUILT_IN_RULES` in [`crates/lanekeep-rules/src/lib.rs`](../crates/lanekeep-rules/src/lib.rs).
 3. Test it in `crates/lanekeep-rules/tests/<name>.rs` with `RuleTester`, which runs the real
    engine over a throwaway project — real config loading, real gates, real sandbox. A

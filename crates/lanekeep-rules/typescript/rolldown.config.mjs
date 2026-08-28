@@ -41,7 +41,8 @@
  * # Two roots, and only one of them is confined
  *
  * The *rules* root is `crates/lanekeep-rules/`, and everything under it — the entry, the four
- * rule sources, `modules/paths.ts` — is resolved and read through the resolver above.
+ * rule sources, `modules/paths.ts` and `modules/patterns.ts` — is resolved and read through
+ * the resolver above.
  *
  * `packages/lanekeep/` is lanekeep's own authoring package rather than rule code: the runtime
  * that `withhold()` and the `ctx` translation live in, and the `defineRule` identity function
@@ -108,9 +109,10 @@ const entryOnly = { 'lanekeep/runtime/entry': join(packageRoot, 'runtime/entry.j
 /**
  * What `lanekeep/<name>` may mean, as `name -> file`.
  *
- * `lanekeep_rules::BUILT_IN_MODULES` is the same table on the Rust side, and it has the same one
- * entry. A shared module is not a rule: it has no id, no card and no query, and it is here
- * because two of the four built-ins import `resolveImport` from it.
+ * `lanekeep_rules::BUILT_IN_MODULES` is the same table on the Rust side, and it has the same
+ * two entries. A shared module is not a rule: it has no id, no card and no query, and it is
+ * here because two of the four built-ins import `resolveImport` from `paths` and one imports
+ * the `*`-glob and `!`-carve-out helpers from `patterns`.
  *
  * **Rules are deliberately absent**, and `builtins.components` is deliberately not supplied
  * either. Nothing in this bundle may import a rule — the entry names its four by relative path,
@@ -119,7 +121,10 @@ const entryOnly = { 'lanekeep/runtime/entry': join(packageRoot, 'runtime/entry.j
  * that already exists in Rust, kept honest by nothing, in order to admit an import that must
  * not resolve.
  */
-const modules = { paths: join(rulesRoot, 'modules/paths.ts') }
+const modules = {
+  paths: join(rulesRoot, 'modules/paths.ts'),
+  patterns: join(rulesRoot, 'modules/patterns.ts'),
+}
 
 /**
  * The host module: `defineRule` and `defineConfig`, which are identity functions.

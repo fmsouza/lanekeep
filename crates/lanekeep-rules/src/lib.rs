@@ -1,8 +1,8 @@
 //! Built-in rules shipped with lanekeep.
 //!
 //! The rules shipping with lanekeep, authored against the same host API that project-authored
-//! rules use and embedded into the binary at build time. Six are TypeScript modules evaluated
-//! in QuickJS — the two Python-targeting rules and the four TypeScript-targeting rules that
+//! rules use and embedded into the binary at build time. Seven are TypeScript modules evaluated
+//! in QuickJS — the two Python-targeting rules and the five TypeScript-targeting rules that
 //! were briefly compiled to a StarlingMonkey component and reverted, because that form cost 13 MB
 //! and 110× per host-API crossing for no speed benefit. The rest are WebAssembly components —
 //! two built from `rust-rules/` and two authored in Go into one shared component — where the
@@ -64,13 +64,13 @@
 
 /// The rules this build runs as TypeScript modules, as `(name, source)`.
 ///
-/// Evaluated in QuickJS, from source, on every run. Six rules ship this way: the two
-/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the four
+/// Evaluated in QuickJS, from source, on every run. Seven rules ship this way: the two
+/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the five
 /// TypeScript-targeting rules (`no-circular-imports`, `no-default-export`,
-/// `no-restricted-imports`, `no-unused-exports`). The latter four were briefly compiled
-/// ahead of time into a shared StarlingMonkey component and reverted, because the compiled
-/// form cost 13 MB of binary and 110× per host-API crossing for no speed benefit — see
-/// `docs/architecture.md` §15.1 for the measurement.
+/// `no-restricted-calls`, `no-restricted-imports`, `no-unused-exports`). Four of them were
+/// briefly compiled ahead of time into a shared StarlingMonkey component and reverted, because
+/// the compiled form cost 13 MB of binary and 110× per host-API crossing for no speed benefit —
+/// see `docs/architecture.md` §15.1 for the measurement.
 ///
 /// Ordered, so the source stays greppable and a diff shows what moved. Nothing derives an
 /// order from this table directly — see [`names`], which merges the tables and sorts.
@@ -90,6 +90,10 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
     (
         "no-mutable-default-argument",
         include_str!("../rules/no-mutable-default-argument.ts"),
+    ),
+    (
+        "no-restricted-calls",
+        include_str!("../rules/no-restricted-calls.ts"),
     ),
     (
         "no-restricted-imports",
@@ -128,7 +132,7 @@ type BuiltInComponent = (&'static str, &'static [u8], Option<&'static [u8]>);
 /// Go all fail by panicking, which traps, and a trap arrives at the host with no stack at all.
 /// There is nothing to remap. `go-rules/` builds with `-panic=trap` and `-no-debug`, so there is
 /// not even a name inside the artifact to map back to. A source map would only be needed for a
-/// component compiled from TypeScript, and none ships today — the four TypeScript built-ins
+/// component compiled from TypeScript, and none ships today — the five TypeScript built-ins
 /// run as QuickJS modules (see [`BUILT_IN_RULES`]).
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
@@ -178,7 +182,10 @@ const COMPONENT_RULES: &[(&str, &str, u32)] = &[
 /// query, so anything that lists rules must not list them. They resolve through the same
 /// `lanekeep/` prefix, which is deliberate — a helper two built-ins both need is a helper a
 /// project rule will need eventually, and there is nothing to gain from hiding it.
-const BUILT_IN_MODULES: &[(&str, &str)] = &[("paths", include_str!("../modules/paths.ts"))];
+const BUILT_IN_MODULES: &[(&str, &str)] = &[
+    ("paths", include_str!("../modules/paths.ts")),
+    ("patterns", include_str!("../modules/patterns.ts")),
+];
 
 /// The TypeScript behind a `lanekeep/<name>`, rule or shared module.
 ///
@@ -348,7 +355,7 @@ mod tests {
         // these quietly revert with nothing red.
         //
         // Two shapes, deliberately together. The four rules ported to another language have no
-        // source at all and ship as components; the four TypeScript rules ship as modules,
+        // source at all and ship as components; the five TypeScript rules ship as modules,
         // evaluated in QuickJS, because the compiled-component form (StarlingMonkey in WASM)
         // costs 13 MB and 110× per crossing for no speed benefit.
         for name in [
@@ -373,6 +380,7 @@ mod tests {
         for name in [
             "no-circular-imports",
             "no-default-export",
+            "no-restricted-calls",
             "no-restricted-imports",
             "no-unused-exports",
         ] {
@@ -646,6 +654,10 @@ mod tests {
             source("paths").is_some(),
             "the shared path helpers must resolve"
         );
+        assert!(
+            source("patterns").is_some(),
+            "the shared pattern helpers must resolve"
+        );
     }
 
     /// The two copies of `paths.ts` are one file, and this is what keeps them that way.
@@ -680,6 +692,35 @@ mod tests {
         assert!(
             embedded == PACKAGED,
             "crates/lanekeep-rules/modules/paths.ts and packages/lanekeep/modules/paths.ts \
+             have diverged: {} bytes against {}, first differing at byte {at}\n  \
+             they are one file served by two engines — carry the change across, rather than \
+             leaving a rule to resolve its imports differently depending on which one ran it",
+            embedded.len(),
+            PACKAGED.len(),
+        );
+    }
+
+    /// The two copies of `patterns.ts` are one file, on the same terms as the `paths`
+    /// copy above: the sandbox serves the embedded one and a bundler reaches the
+    /// packaged one, and a rule must resolve its imports the same way under either.
+    #[test]
+    fn patterns_ships_byte_for_byte_to_the_authoring_package() {
+        const PACKAGED: &[u8] = include_bytes!("../../../packages/lanekeep/modules/patterns.ts");
+
+        let embedded = source("patterns").unwrap_or_default().as_bytes();
+        assert!(
+            !embedded.is_empty(),
+            "the shared pattern helpers must resolve"
+        );
+
+        let at = embedded
+            .iter()
+            .zip(PACKAGED)
+            .position(|(left, right)| left != right)
+            .unwrap_or_else(|| embedded.len().min(PACKAGED.len()));
+        assert!(
+            embedded == PACKAGED,
+            "crates/lanekeep-rules/modules/patterns.ts and packages/lanekeep/modules/patterns.ts \
              have diverged: {} bytes against {}, first differing at byte {at}\n  \
              they are one file served by two engines — carry the change across, rather than \
              leaving a rule to resolve its imports differently depending on which one ran it",
@@ -732,7 +773,7 @@ mod tests {
             ),
             (
                 "rules/no-restricted-imports.ts",
-                "df7984b465a7519a797f3a56090429779ff6eeda1980688a8d44b09c423b752b",
+                "18e3ff58132aa9d17850370de34a976299ad2cc4b27bd6f4f0b5db49fd83dd7d",
                 include_bytes!("../rules/no-restricted-imports.ts"),
             ),
             (

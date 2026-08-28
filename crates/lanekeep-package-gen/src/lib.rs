@@ -117,16 +117,17 @@ pub fn render_types_test_dts() -> String {
 /// The `exports` value text — the object literal that follows `"exports": `, indented for a
 /// top-level key (entries at four spaces, the closing brace at two).
 ///
-/// The static subpaths (the package root, the shared `paths` module, the runtime subpaths and
-/// the `./package.json` self-reference) are owned here alongside the built-in rule subpaths:
-/// they are the importable surface `package.json` declares, and generating the whole value
-/// keeps it a fixed point of the renderer. A new static entry is a change here, which
-/// `tests/generated.rs` makes visible rather than silent.
+/// The static subpaths (the package root, the shared `paths` and `patterns` modules, the
+/// runtime subpaths and the `./package.json` self-reference) are owned here alongside the
+/// built-in rule subpaths: they are the importable surface `package.json` declares, and
+/// generating the whole value keeps it a fixed point of the renderer. A new static entry is a
+/// change here, which `tests/generated.rs` makes visible rather than silent.
 fn exports_block() -> String {
     let mut entries: Vec<String> = vec![
         "    \".\": {\n      \"types\": \"./index.d.ts\",\n      \"default\": \"./index.js\"\n    }"
             .to_owned(),
         "    \"./paths\": \"./modules/paths.ts\"".to_owned(),
+        "    \"./patterns\": \"./modules/patterns.ts\"".to_owned(),
         "    \"./runtime/resolve\": \"./runtime/resolve.js\"".to_owned(),
         "    \"./runtime/entry\": \"./runtime/entry.js\"".to_owned(),
         "    \"./runtime/host\": \"./runtime/host.js\"".to_owned(),
