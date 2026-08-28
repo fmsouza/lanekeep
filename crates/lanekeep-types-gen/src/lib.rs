@@ -417,8 +417,27 @@ export interface RuleCard {
 ";
 
 const GATES: &str = "\
-/** Cheap rejections applied before a file is parsed. */
+/** Cheap rejections applied before a file is read or parsed. */
 export interface Gates {
+  /**
+   * Glob patterns a file's path must match for the rule to consider it.
+   *
+   * The path is relative to the project root, and the pattern must match the whole path —
+   * anchored, not a substring search. Patterns use the `globset` dialect, matched
+   * case-sensitively: `*` matches any run of characters (including `/`), `?` any single
+   * character, `[ab]`/`[!ab]` character classes and `{a,b}` alternates work, and `**`
+   * recurses directories — `src/**` admits everything under `src`, and `**` in front
+   * of `*.test.ts` admits a test file at any depth.
+   */
+  pathMatches?: string[]
+  /**
+   * Glob patterns that skip a file — a path matching any of these is never parsed. Checked
+   * before `pathMatches` and winning over it: a path a `pathMatches` pattern would have
+   * admitted is still skipped when a `pathNotMatches` pattern matches it.
+   *
+   * Same dialect and anchoring as `pathMatches`.
+   */
+  pathNotMatches?: string[]
   /**
    * Literal substrings a file's raw bytes must contain. A file missing any one of them is
    * never parsed.
@@ -429,6 +448,12 @@ export interface Gates {
    * form; omit the gate when no single substring covers every case.
    */
   fileContains?: string[]
+  /**
+   * Literal substrings that skip a file — a file whose raw bytes contain **any** of them is
+   * never parsed. The mirror image of `fileContains`'s *and*: where that gate requires every
+   * listed substring, this one rejects on the first that is present.
+   */
+  fileNotContains?: string[]
 }
 ";
 

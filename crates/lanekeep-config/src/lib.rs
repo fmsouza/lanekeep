@@ -2723,6 +2723,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn all_four_gates_survive_extraction_from_a_typescript_module() {
+        // A rule module declaring all four gates, each set to a different value on purpose.
+        // `EXTRACT` passes a rule's `gates` object through and `Gates` deserializes it under
+        // `rename_all = "camelCase"` — asserting two of the four would leave the other two
+        // mapped by nothing, and both a dropped-EXTRACT-field and a dropped-deserialize-field
+        // mutant would pass.
+        let fixture = Fixture::new(
+            "ts-module-gates",
+            &[
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     export default defineRule({\n\
+                       id: 'local/example',\n\
+                       query: '(identifier) @id',\n\
+                       gates: {\n\
+                         pathMatches: ['src/**/*.rs'],\n\
+                         pathNotMatches: ['**/generated/**'],\n\
+                         fileContains: ['call'],\n\
+                         fileNotContains: ['skip'],\n\
+                       },\n\
+                       card: { message: 'no', remediation: 'do this', examples: { bad: 'a', good: 'b' } },\n\
+                       check(ctx, m) { ctx.report(m.id); },\n\
+                     });\n",
+                ),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let config = fixture.load_config().expect("loads");
+        assert_eq!(config.rules[0].gates.path_matches, ["src/**/*.rs"]);
+        assert_eq!(config.rules[0].gates.path_not_matches, ["**/generated/**"]);
+        assert_eq!(config.rules[0].gates.file_contains, ["call"]);
+        assert_eq!(config.rules[0].gates.file_not_contains, ["skip"]);
+    }
+
     /// The two entry points differ in exactly one observable way, and what it is worth ranges
     /// from tens of milliseconds to seconds.
     ///
