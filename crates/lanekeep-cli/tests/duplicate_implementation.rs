@@ -295,6 +295,324 @@ fn two_identical_functions_in_one_file_are_reported() {
     );
 }
 
+// --- the other grammars ------------------------------------------------------------------
+//
+// The fingerprint is language-agnostic — a fold over node kinds with token text erased — so
+// what these fixtures assert per language is the query: that each grammar's function forms
+// reach the fingerprint at all. Every "groups" fixture is comfortably above the default
+// `minNodes` of 40 and every "stays silent" fixture is far below it, on the same reasoning
+// as the TypeScript fixtures above.
+
+/// Python: same shape as [`LARGE_FN`], spelled in the python grammar.
+const PY_FN: &str = "\
+def compute(items):
+    total = 0
+    count = 0
+    for item in items:
+        if item.active:
+            total += item.value
+            count += 1
+        else:
+            total -= item.value
+    return total
+";
+
+/// [`PY_FN`] with every identifier and literal value changed.
+const PY_RENAMED: &str = "\
+def summarize(entries):
+    acc = 1
+    seen = 2
+    for entry in entries:
+        if entry.ready:
+            acc += entry.score
+            seen += 3
+        else:
+            acc -= entry.score
+    return acc
+";
+
+/// A small python body, far below the default threshold.
+const PY_SMALL: &str = "\
+def tiny():
+    x = 1
+    return x
+";
+
+/// Go: the same shape again. The functions sit at line 3, after the package clause.
+const GO_FN: &str = "\
+package main
+
+func Compute(items []Item) int {
+\ttotal := 0
+\tcount := 0
+\tfor _, item := range items {
+\t\tif item.Active {
+\t\t\ttotal += item.Value
+\t\t\tcount += 1
+\t\t} else {
+\t\t\ttotal -= item.Value
+\t\t}
+\t}
+\treturn total
+}
+";
+
+/// [`GO_FN`] with every identifier and literal value changed.
+const GO_RENAMED: &str = "\
+package main
+
+func Summarize(entries []Record) int {
+\tacc := 1
+\tseen := 2
+\tfor _, entry := range entries {
+\t\tif entry.Ready {
+\t\t\tacc += entry.Score
+\t\t\tseen += 3
+\t\t} else {
+\t\t\tacc -= entry.Score
+\t\t}
+\t}
+\treturn acc
+}
+";
+
+/// A small go body, far below the default threshold.
+const GO_SMALL: &str = "\
+package main
+
+func Tiny() int {
+\tx := 1
+\treturn x
+}
+";
+
+/// Rust: the same shape once more.
+const RS_FN: &str = "\
+fn compute(items: &[Item]) -> i32 {
+    let mut total = 0;
+    let mut count = 0;
+    for item in items {
+        if item.active {
+            total += item.value;
+            count += 1;
+        } else {
+            total -= item.value;
+        }
+    }
+    total
+}
+";
+
+/// [`RS_FN`] with every identifier and literal value changed.
+const RS_RENAMED: &str = "\
+fn summarize(entries: &[Record]) -> i32 {
+    let mut acc = 1;
+    let mut seen = 2;
+    for entry in entries {
+        if entry.ready {
+            acc += entry.score;
+            seen += 3;
+        } else {
+            acc -= entry.score;
+        }
+    }
+    acc
+}
+";
+
+/// A small rust body, far below the default threshold.
+const RS_SMALL: &str = "\
+fn tiny() -> i32 {
+    let x = 1;
+    x
+}
+";
+
+#[test]
+fn python_renamed_identifiers_and_changed_literal_values_still_group() {
+    let found = corpus("{}", &[("src/a.py", PY_FN), ("src/b.py", PY_RENAMED)]).run();
+    assert_eq!(
+        found,
+        vec![
+            "src/a.py:1:1 'compute' duplicates the implementation at src/b.py:1",
+            "src/b.py:1:1 'summarize' duplicates the implementation at src/a.py:1",
+        ]
+    );
+}
+
+#[test]
+fn python_a_changed_operator_does_not_group() {
+    let b = PY_FN.replace("total += item.value", "total -= item.value");
+    let found = corpus("{}", &[("src/a.py", PY_FN), ("src/b.py", &b)]).run();
+    assert_eq!(found, Vec::<String>::new());
+}
+
+#[test]
+fn python_docstrings_are_statements_not_comments() {
+    // In python a docstring is an expression statement, not a comment, so the two
+    // directions pull apart — unlike TypeScript, where a doc comment is erased.
+    //
+    // Different docstrings still group: the string's text is erased and the shapes match.
+    let with_one = PY_FN.replace(
+        "    total = 0\n",
+        "    \"\"\"Sum the active items.\"\"\"\n    total = 0\n",
+    );
+    let with_other = PY_RENAMED.replace(
+        "    acc = 1\n",
+        "    \"\"\"Entirely different words here.\"\"\"\n    acc = 1\n",
+    );
+    let found = corpus("{}", &[("src/a.py", &with_one), ("src/b.py", &with_other)]).run();
+    assert_eq!(
+        found,
+        vec![
+            "src/a.py:1:1 'compute' duplicates the implementation at src/b.py:1",
+            "src/b.py:1:1 'summarize' duplicates the implementation at src/a.py:1",
+        ]
+    );
+
+    // With-docstring against without differs by a statement, so it does not group.
+    let found = corpus("{}", &[("src/a.py", PY_FN), ("src/b.py", &with_one)]).run();
+    assert_eq!(found, Vec::<String>::new());
+}
+
+#[test]
+fn go_renamed_identifiers_and_changed_literal_values_still_group() {
+    let found = corpus("{}", &[("src/a.go", GO_FN), ("src/b.go", GO_RENAMED)]).run();
+    assert_eq!(
+        found,
+        vec![
+            "src/a.go:3:1 'Compute' duplicates the implementation at src/b.go:3",
+            "src/b.go:3:1 'Summarize' duplicates the implementation at src/a.go:3",
+        ]
+    );
+}
+
+#[test]
+fn go_a_changed_operator_does_not_group() {
+    let b = GO_FN.replace("total += item.Value", "total -= item.Value");
+    let found = corpus("{}", &[("src/a.go", GO_FN), ("src/b.go", &b)]).run();
+    assert_eq!(found, Vec::<String>::new());
+}
+
+#[test]
+fn go_a_method_groups_with_a_function_of_the_same_body() {
+    // The fingerprint is rooted at the body, so a `method_declaration` and a
+    // `function_declaration` with one shape are one implementation — which is what an
+    // agent moving a helper onto a receiver produces.
+    let method = GO_FN.replace("func Compute(", "func (w Widget) Compute(");
+    let found = corpus("{}", &[("src/a.go", GO_FN), ("src/b.go", &method)]).run();
+    assert_eq!(
+        found,
+        vec![
+            "src/a.go:3:1 'Compute' duplicates the implementation at src/b.go:3",
+            "src/b.go:3:1 'Compute' duplicates the implementation at src/a.go:3",
+        ]
+    );
+}
+
+#[test]
+fn rust_renamed_identifiers_and_changed_literal_values_still_group() {
+    let found = corpus("{}", &[("src/a.rs", RS_FN), ("src/b.rs", RS_RENAMED)]).run();
+    assert_eq!(
+        found,
+        vec![
+            "src/a.rs:1:1 'compute' duplicates the implementation at src/b.rs:1",
+            "src/b.rs:1:1 'summarize' duplicates the implementation at src/a.rs:1",
+        ]
+    );
+}
+
+#[test]
+fn rust_a_changed_operator_does_not_group() {
+    let b = RS_FN.replace("total += item.value", "total -= item.value");
+    let found = corpus("{}", &[("src/a.rs", RS_FN), ("src/b.rs", &b)]).run();
+    assert_eq!(found, Vec::<String>::new());
+}
+
+#[test]
+fn min_nodes_applies_in_both_directions_in_every_language() {
+    // The option has to reach every grammar's facts, not just the TypeScript ones — and
+    // the raise is the direction that catches an ignored option, exactly as the
+    // TypeScript test above says.
+    for (ext, small, large) in [
+        ("py", PY_SMALL, PY_FN),
+        ("go", GO_SMALL, GO_FN),
+        ("rs", RS_SMALL, RS_FN),
+    ] {
+        let a = format!("src/a.{ext}");
+        let b = format!("src/b.{ext}");
+
+        let lowered = corpus(
+            "{ minNodes: 5 }",
+            &[(a.as_str(), small), (b.as_str(), small)],
+        )
+        .run();
+        assert_eq!(
+            lowered.len(),
+            2,
+            "a small {ext} pair should group at minNodes 5"
+        );
+
+        let raised = corpus(
+            "{ minNodes: 200 }",
+            &[(a.as_str(), large), (b.as_str(), large)],
+        )
+        .run();
+        assert_eq!(
+            raised,
+            Vec::<String>::new(),
+            "a large {ext} pair must stay silent at minNodes 200"
+        );
+    }
+}
+
+#[test]
+fn structurally_parallel_bodies_do_not_group_across_languages() {
+    // The same algorithm spelled in four grammars: interior node kinds differ per grammar
+    // (`attribute` against `selector_expression` against `field_expression`), so none of
+    // these four bodies share a fingerprint. Grouping across languages would report a
+    // "duplicate" nobody could deduplicate.
+    let found = corpus(
+        "{}",
+        &[
+            ("src/a.ts", LARGE_FN),
+            ("src/b.py", PY_FN),
+            ("src/c.go", GO_FN),
+            ("src/d.rs", RS_FN),
+        ],
+    )
+    .run();
+    assert_eq!(found, Vec::<String>::new());
+}
+
+#[test]
+fn a_mixed_corpus_reports_the_same_thing_every_run() {
+    // Determinism across grammars: every language's pair reports, sorted by
+    // (file, line, column), identically on every run.
+    let corpus = corpus(
+        "{}",
+        &[
+            ("src/a.py", PY_FN),
+            ("src/b.py", PY_RENAMED),
+            ("src/c.go", GO_FN),
+            ("src/d.go", GO_RENAMED),
+            ("src/e.rs", RS_FN),
+            ("src/f.rs", RS_RENAMED),
+            ("src/g.ts", LARGE_FN),
+            ("src/h.ts", LARGE_FN),
+        ],
+    );
+    let first = corpus.run();
+    assert_eq!(
+        first.len(),
+        8,
+        "every language's pair should report: {first:?}"
+    );
+    for attempt in 0..4 {
+        assert_eq!(corpus.run(), first, "output changed on attempt {attempt}");
+    }
+}
+
 #[test]
 fn the_same_corpus_reports_the_same_thing_every_run() {
     let corpus = corpus(

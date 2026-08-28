@@ -10,9 +10,15 @@ import { defineRule } from 'lanekeep'
  *
  * Matching is by structure, not by text: renaming an identifier or changing a literal value
  * still matches (that is the point), while changing an operator or adding a statement does
- * not. Comments never matter, a docstring included — the fingerprint is computed over the
- * body with comments erased, so a with-docstring/without-docstring pair has the same shape
- * and is flagged like any other pair.
+ * not. Comments never matter — the fingerprint is computed over the body with comments
+ * erased, so in TypeScript a with-docstring/without-docstring pair has the same shape and is
+ * flagged like any other pair. A *python* docstring is a statement rather than a comment, so
+ * there the two directions pull apart: differing docstrings still group (the string's text is
+ * erased), while with-docstring against without differs by a statement and does not.
+ *
+ * One rule, five grammars: `language` names them and `query` carries one entry per grammar.
+ * Grouping never crosses a language — parallel implementations in two languages have
+ * different interior node kinds, so their bodies cannot share a fingerprint.
  *
  * The `minNodes` threshold keeps tiny bodies (getters, one-line callbacks) out: a default of
  * 40 fires on real helpers, not on every two-line pair.
@@ -36,7 +42,7 @@ export default function duplicateImplementation(options) {
 
   return defineRule({
     id: 'lanekeep/duplicate-implementation',
-    language: ['typescript', 'tsx'],
+    language: ['typescript', 'tsx', 'python', 'go', 'rust'],
     severity: 'error',
 
     card: {
@@ -53,23 +59,39 @@ export default function duplicateImplementation(options) {
     // shape for it. See docs/cross-file-rules.md.
     timeout: 5_000,
 
-    // One query for both grammars: tsx shares the typescript node vocabulary for function
-    // definitions. The `body:` field of `arrow_function` is `statement_block | expression`;
-    // matching the block form alone is what keeps expression-bodied one-liners out.
-    query: `
-      (function_declaration
-        name: (identifier) @name
-        body: (statement_block) @body) @def
+    // One query per grammar it names. tsx shares the typescript node vocabulary, so those
+    // two entries are the same string; the other three grammars spell their function forms
+    // differently — python's `call` against everyone else's `call_expression` is the usual
+    // example — which is what the per-language map exists for. The fingerprint is rooted at
+    // the *body*, so within a language a method and a function of one shape still group.
+    //
+    // The `body:` field of `arrow_function` is `statement_block | expression`; matching the
+    // block form alone is what keeps expression-bodied one-liners out. Python lambdas and
+    // rust closures are excluded on the same reasoning: expression bodies are noise at any
+    // threshold.
+    query: {
+      typescript: TS_QUERY,
+      tsx: TS_QUERY,
+      python: `
+        (function_definition
+          name: (identifier) @name
+          body: (block) @body) @def
+      `,
+      go: `
+        (function_declaration
+          name: (identifier) @name
+          body: (block) @body) @def
 
-      (method_definition
-        body: (statement_block) @body) @def
-
-      (function_expression
-        body: (statement_block) @body) @def
-
-      (arrow_function
-        body: (statement_block) @body) @def
-    `,
+        (method_declaration
+          name: (field_identifier) @name
+          body: (block) @body) @def
+      `,
+      rust: `
+        (function_item
+          name: (identifier) @name
+          body: (block) @body) @def
+      `,
+    },
 
     check(ctx, m) {
       const fp = ctx.structureFingerprint(m.body)
@@ -111,6 +133,22 @@ export default function duplicateImplementation(options) {
     },
   })
 }
+
+/** The typescript grammar's function forms; tsx shares the vocabulary, so both entries use it. */
+const TS_QUERY = `
+  (function_declaration
+    name: (identifier) @name
+    body: (statement_block) @body) @def
+
+  (method_definition
+    body: (statement_block) @body) @def
+
+  (function_expression
+    body: (statement_block) @body) @def
+
+  (arrow_function
+    body: (statement_block) @body) @def
+`
 
 /** Facts in a stable order, so a message names the same counterparts every run. */
 function byPosition(a, b) {
