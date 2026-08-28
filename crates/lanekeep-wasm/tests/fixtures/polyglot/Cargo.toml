@@ -1,0 +1,49 @@
+# The fixture that declares one query per language, across two grammars that do not share
+# node vocabulary — Python spells a call `call`, TypeScript `call_expression`.
+#
+# `engine-rule` is the fixture shaped like a rule; this one exists for the one thing it
+# cannot show: the world's `queries: list<query-for>` carrying a *different* query per
+# language through a real component, dispatched by the engine against each grammar. Every
+# other committed fixture declares exactly one language, so before this one no end-to-end
+# test could tell per-language dispatch from a single query compiled twice.
+#
+# It lives here, beside the wasm crate's own fixtures, so it inherits the same guards:
+# `just wasm-fixtures` globs this directory, and `tests/world_shape.rs` asserts every
+# artifact it finds imports nothing but the host interface.
+#
+# Its own workspace, like every fixture here. An empty `[workspace]` table is what detaches
+# it; without one, cargo refuses to build it at all.
+[package]
+name = "polyglot"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# The world is read from the engine's own wit/ directory rather than from a copy under this
+# crate: a copy would prove that a file which was once the world is targetable, and nothing
+# would catch the two drifting.
+[package.metadata.component.target]
+path = "../../../wit"
+world = "rule"
+
+[package.metadata.component.dependencies]
+
+# The artifact is committed, so it is worth not committing debug information nobody reads.
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]
+
+# `wit-bindgen-rt` is used only by `src/bindings.rs`, which `cargo component build` generates
+# and `.gitignore` deliberately excludes. cargo-machete reads source, so on a fresh checkout it
+# sees a dependency nothing references and fails the gate — while a machine that has built the
+# fixture once sees it used and passes.
+[package.metadata.cargo-machete]
+ignored = ["wit-bindgen-rt"]

@@ -34,6 +34,16 @@ thread_local! {
     /// via `{"bad-gate":true}`. `file-contains` is an *and*, so two substrings reject every file
     /// containing only one of them.
     static BAD_GATE: Cell<bool> = const { Cell::new(false) };
+    /// Whether this run asks the fixture to name its one language in two queries, via
+    /// `{"duplicate-query":true}`. Both cover directions hold for that shape — the declared
+    /// language has an entry, every entry names a declared language — so before the duplicate
+    /// refusal existed the second query silently replaced the first, by position.
+    static DUPLICATE_QUERY: Cell<bool> = const { Cell::new(false) };
+    /// Whether this run asks the fixture to answer an empty query string, via
+    /// `{"empty-query":true}`. The host gate admits one deliberately — probe fixtures do this
+    /// on purpose — and `lanekeep-config`'s `build_rule` is the gate that refuses it; this
+    /// flag is how that refusal is driven through a real guest.
+    static EMPTY_QUERY: Cell<bool> = const { Cell::new(false) };
 }
 
 impl Guest for Component {
@@ -46,6 +56,8 @@ impl Guest for Component {
         only(rule);
         let no_language = NO_LANGUAGE.with(Cell::get);
         let bad_gate = BAD_GATE.with(Cell::get);
+        let duplicate_query = DUPLICATE_QUERY.with(Cell::get);
+        let empty_query = EMPTY_QUERY.with(Cell::get);
         RuleMetadata {
             id: "fixture/metadata".to_owned(),
             languages: if no_language {
@@ -63,7 +75,28 @@ impl Guest for Component {
                 },
             },
 
-            queries: vec![QueryFor { language: "rust".to_owned(), query: "(call_expression) @call".to_owned() }],
+            queries: if duplicate_query {
+                vec![
+                    QueryFor {
+                        language: "rust".to_owned(),
+                        query: "(call_expression) @call".to_owned(),
+                    },
+                    QueryFor {
+                        language: "rust".to_owned(),
+                        query: "(macro_invocation) @call".to_owned(),
+                    },
+                ]
+            } else if empty_query {
+                vec![QueryFor {
+                    language: "rust".to_owned(),
+                    query: String::new(),
+                }]
+            } else {
+                vec![QueryFor {
+                    language: "rust".to_owned(),
+                    query: "(call_expression) @call".to_owned(),
+                }]
+            },
             gates: RuleGates {
                 path_matches: vec!["src/**/*.rs".to_owned()],
                 path_not_matches: vec!["**/generated/**".to_owned()],
@@ -108,6 +141,8 @@ impl Guest for Component {
         }
         NO_LANGUAGE.with(|flag| flag.set(options_json.contains("no-language")));
         BAD_GATE.with(|flag| flag.set(options_json.contains("bad-gate")));
+        DUPLICATE_QUERY.with(|flag| flag.set(options_json.contains("duplicate-query")));
+        EMPTY_QUERY.with(|flag| flag.set(options_json.contains("empty-query")));
         if options_json.contains("\"burn\"") {
             burn();
         }
