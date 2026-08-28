@@ -352,55 +352,6 @@ through one fails at runtime the same way.
 A module importing itself is not reported. It is a different mistake, and "extract what both
 modules need into a third" is not advice that applies to it.
 
-## `lanekeep/duplicate-implementation`
-
-Two function bodies with the same shape — identical structure once identifiers and literal
-values are erased — are one implementation written twice. This is the failure no per-file rule
-can see: an agent that cannot view the whole corpus reimplements a helper that already exists,
-and each individual file looks fine. It is also the rule that most directly shows why the
-corpus-view architecture exists.
-
-```json
-{
-  "rules": [
-    {
-      "rule": "lanekeep/duplicate-implementation",
-      "options": { "minNodes": 60 }
-    }
-  ]
-}
-```
-
-### Options
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `minNodes` | `number` | Smallest body, in fingerprint nodes, that participates. Defaults to `40`. |
-
-The default is calibrated to fire on real helpers and stay quiet on the two-line pairs every
-codebase has. Raise it if a codebase has many small repeated shapes; lower it to catch smaller
-duplicates at the cost of more noise.
-
-### What counts as a duplicate
-
-Bodies are matched by structure, not by text. The fingerprint erases identifier names, literal
-values and comments, so:
-
-- Same shape with different names, values or comments → **flagged** (that is the point).
-- A changed operator or an added statement → **not flagged**.
-- A with-docstring/without-docstring pair → **flagged**: a docstring is a comment, and
-  comments are erased like any other, so the two bodies have the same shape.
-- Two identical bodies in one file → flagged, exactly like two in different files.
-
-Function declarations, methods, function expressions and block-bodied arrow functions all
-participate; expression-bodied arrow functions (one-liners) do not. Generator declarations and
-expressions are not covered in v1.
-
-### Full runs only
-
-Like every cross-file rule, this one is skipped under `--since` and `--staged` with a stderr
-notice naming it ([`architecture.md`](architecture.md) §8.4) — it reports on full runs only.
-
 # Python
 
 Both Python rules resolve identifiers rather than matching text, which is what keeps them
@@ -685,6 +636,72 @@ its own; only the rule it returns does.
 A method genuinely named `expect` on your own type — a mock builder, say — is reported like
 `Result::expect`. Telling them apart needs type information, which lanekeep deliberately does
 not have (§1 non-goals). A test pins the behavior so it is a known limit rather than a surprise.
+
+---
+
+# Every language
+
+## `lanekeep/duplicate-implementation`
+
+Two function bodies with the same shape — identical structure once identifiers and literal
+values are erased — are one implementation written twice. This is the failure no per-file rule
+can see: an agent that cannot view the whole corpus reimplements a helper that already exists,
+and each individual file looks fine. It is also the rule that most directly shows why the
+corpus-view architecture exists.
+
+It declares `['typescript', 'tsx', 'python', 'go', 'rust']`, with one query per grammar — the
+fingerprint itself is language-agnostic, a fold over node kinds with token text erased, so the
+per-language part is only which nodes count as a function. Grouping never crosses a language:
+the same algorithm in Python and in Go has different interior node kinds (`attribute` against
+`selector_expression`), so the two bodies cannot share a fingerprint.
+
+```json
+{
+  "rules": [
+    {
+      "rule": "lanekeep/duplicate-implementation",
+      "options": { "minNodes": 60 }
+    }
+  ]
+}
+```
+
+### Options
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `minNodes` | `number` | Smallest body, in fingerprint nodes, that participates. Defaults to `40`. |
+
+The default is calibrated to fire on real helpers and stay quiet on the two-line pairs every
+codebase has. Raise it if a codebase has many small repeated shapes; lower it to catch smaller
+duplicates at the cost of more noise. Fingerprint nodes count kinds, anonymous tokens and
+structure, so the same threshold reads slightly differently per grammar — a Python body reaches
+40 a line or two later than a TSX one.
+
+### What counts as a duplicate
+
+Bodies are matched by structure, not by text. The fingerprint erases identifier names, literal
+values and comments, so:
+
+- Same shape with different names, values or comments → **flagged** (that is the point).
+- A changed operator or an added statement → **not flagged**.
+- A doc-comment difference → **flagged**: comments are erased like any other. In Python a
+  docstring is a *statement*, not a comment, so the two directions pull apart — two bodies
+  whose docstrings merely differ still group (the string's text is erased), while a
+  with-docstring body against a without-docstring one differs by a statement and does not.
+- Two identical bodies in one file → flagged, exactly like two in different files.
+
+What participates, per language: function declarations, methods, function expressions and
+block-bodied arrow functions in TypeScript/TSX (expression-bodied arrows do not, and generator
+declarations and expressions are not covered in v1); `def` functions and methods in Python
+(lambdas do not); functions and methods in Go; `fn` items in Rust (closures do not). Within a
+language the fingerprint is rooted at the body, so a method whose body matches a function's is
+flagged like any other pair.
+
+### Full runs only
+
+Like every cross-file rule, this one is skipped under `--since` and `--staged` with a stderr
+notice naming it ([`architecture.md`](architecture.md) §8.4) — it reports on full runs only.
 
 ---
 
