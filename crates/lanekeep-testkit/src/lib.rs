@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lanekeep_core::Violation;
 use lanekeep_engine::Engine;
-use lanekeep_js::{BuiltinComponent, BuiltinComponentMap, RuleRoot};
+use lanekeep_js::{BuiltinComponent, BuiltinComponentMap, BuiltinSource, RuleRoot};
 use lanekeep_lang_js::{JavaScript, TypeScript};
 use thiserror::Error;
 
@@ -83,6 +83,10 @@ pub struct RuleTester {
     components: BuiltinComponent,
     /// The matching source-map lookup, on the same terms.
     component_maps: BuiltinComponentMap,
+    /// How `lanekeep/<name>` resolves to a built-in module's source — `lanekeep/patterns`
+    /// and friends — for a rule that imports one. [`no_builtins`] for every constructor,
+    /// which is what [`RuleRoot::new`] starts with anyway.
+    builtins: BuiltinSource,
 }
 
 /// A build with no built-in components, which is what every tester but a built-in one wants.
@@ -95,6 +99,14 @@ const fn no_components(_: &str) -> Option<(&'static [u8], u32)> {
 
 /// The source-map half of [`no_components`].
 const fn no_component_maps(_: &str) -> Option<&'static [u8]> {
+    None
+}
+
+/// A build with no built-in modules, which is what every tester but a module-rule one wants.
+///
+/// On the same terms as [`no_components`]: `lanekeep-js` keeps its own equivalent private,
+/// and a `fn` item is cheaper than widening its API for one caller.
+const fn no_builtins(_: &str) -> Option<&'static str> {
     None
 }
 
@@ -313,6 +325,18 @@ impl RuleTester {
         self
     }
 
+    /// Serve the built-in modules a rule imports — `lanekeep/patterns` and friends.
+    ///
+    /// The lookup for lanekeep's own rules is `lanekeep_rules::source`; it is a parameter
+    /// rather than a dependency for the same reason [`RuleTester::for_built_in`]'s
+    /// `components` is — `lanekeep-rules` dev-depends on this crate, and an edge the other
+    /// way would put each crate ahead of the other in the publication order.
+    #[must_use]
+    pub const fn with_builtins(mut self, builtins: BuiltinSource) -> Self {
+        self.builtins = builtins;
+        self
+    }
+
     /// Write the throwaway project for a built-in rule named by its specifier.
     fn build_built_in(
         name: &str,
@@ -453,6 +477,7 @@ impl RuleTester {
             config,
             components: no_components,
             component_maps: no_component_maps,
+            builtins: no_builtins,
         }
     }
 
@@ -495,6 +520,7 @@ impl RuleTester {
 
         let root = RuleRoot::new(&self.dir)
             .map_err(|e| TestError::Setup(e.to_string()))?
+            .with_builtins(self.builtins)
             .with_builtin_components(self.components)
             .with_builtin_component_maps(self.component_maps);
         let config_path = self.dir.join(self.config);

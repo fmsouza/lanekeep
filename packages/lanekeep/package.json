@@ -8,6 +8,7 @@
       "no-circular-imports": ["builtin.d.ts"],
       "no-default-export": ["builtin.d.ts"],
       "no-mutable-default-argument": ["builtin.d.ts"],
+      "no-restricted-calls": ["builtin.d.ts"],
       "no-restricted-imports": ["builtin.d.ts"],
       "no-unused-exports": ["builtin.d.ts"]
     }
@@ -18,6 +19,7 @@
       "default": "./index.js"
     },
     "./paths": "./modules/paths.ts",
+    "./patterns": "./modules/patterns.ts",
     "./runtime/resolve": "./runtime/resolve.js",
     "./runtime/entry": "./runtime/entry.js",
     "./runtime/host": "./runtime/host.js",
@@ -32,6 +34,9 @@
       "types": "./builtin.d.ts"
     },
     "./no-mutable-default-argument": {
+      "types": "./builtin.d.ts"
+    },
+    "./no-restricted-calls": {
       "types": "./builtin.d.ts"
     },
     "./no-restricted-imports": {

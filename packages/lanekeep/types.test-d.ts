@@ -21,6 +21,7 @@ import noBroadExcept from 'lanekeep/no-broad-except'
 import noCircularImports from 'lanekeep/no-circular-imports'
 import noDefaultExport from 'lanekeep/no-default-export'
 import noMutableDefaultArgument from 'lanekeep/no-mutable-default-argument'
+import noRestrictedCalls from 'lanekeep/no-restricted-calls'
 import noRestrictedImports from 'lanekeep/no-restricted-imports'
 import noUnusedExports from 'lanekeep/no-unused-exports'
 
@@ -28,5 +29,6 @@ void noBroadExcept
 void noCircularImports
 void noDefaultExport
 void noMutableDefaultArgument
+void noRestrictedCalls
 void noRestrictedImports
 void noUnusedExports

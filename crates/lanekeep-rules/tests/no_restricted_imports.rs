@@ -14,7 +14,9 @@ use lanekeep_testkit::RuleTester;
 
 fn tester(options: &str) -> RuleTester {
     let source = lanekeep_rules::source("no-restricted-imports").expect("the rule ships");
-    RuleTester::configured("no-restricted-imports", source, options).expect("builds")
+    RuleTester::configured("no-restricted-imports", source, options)
+        .expect("builds")
+        .with_builtins(lanekeep_rules::source)
 }
 
 #[test]

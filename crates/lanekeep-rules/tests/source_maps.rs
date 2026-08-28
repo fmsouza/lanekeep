@@ -1,6 +1,6 @@
 //! A rule that throws names a line in the author's TypeScript, not one in the bundle.
 //!
-//! The compiled-TypeScript path (§5.2) is opt-in rather than a shipping strategy: the four
+//! The compiled-TypeScript path (§5.2) is opt-in rather than a shipping strategy: the five
 //! TypeScript built-ins run as QuickJS modules, so no shipped component has a source map. The
 //! `typescript-builtins.wasm` component is still built by `build.rs` for tests and benchmarks,
 //! and these tests exercise the source-map path against it. They skip when the artifact is
@@ -58,7 +58,7 @@ fn repository_root() -> PathBuf {
         .expect("the repository root is reachable from this crate")
 }
 
-/// The shared TypeScript built-ins component, built by `build.rs` when missing. The four
+/// The shared TypeScript built-ins component, built by `build.rs` when missing. The five
 /// TypeScript built-ins run as QuickJS modules — this component is built for this opt-in test
 /// path and for benchmarks, not embedded in the published binary.
 const TYPESCRIPT_BUILTINS: &[u8] = include_bytes!("../components/typescript-builtins.wasm");
@@ -149,9 +149,9 @@ fn check_context(runtime: &mut WasmRuntime) -> lanekeep_wasm::Resource<CheckCont
 /// The options that make `no-restricted-imports` throw.
 ///
 /// A restriction with no `module`, so the rule reaches `matches(undefined, specifier)` and
-/// `undefined.split` throws. Provoked through the options rather than written into the rule
-/// because the four rule sources are frozen: a migration that needed one of them edited would
-/// have been the wrong migration.
+/// `undefined.split` throws — inside `lanekeep/patterns`, since the helpers were extracted to
+/// the shared module. Provoked through the options rather than written into the rule, because
+/// a rule that throws on purpose would be testing the map with code its author never wrote.
 const THROWS: &str = r#"{"restrictions": [{}]}"#;
 
 #[test]
@@ -160,8 +160,8 @@ fn a_thrown_error_names_a_line_in_the_checked_in_typescript() {
 
     let frame = frames.first().expect("a frame survives");
     assert_eq!(
-        frame.file, "crates/lanekeep-rules/rules/no-restricted-imports.ts",
-        "the innermost frame is in the bundle rather than in the rule: {frames:?}"
+        frame.file, "crates/lanekeep-rules/modules/patterns.ts",
+        "the innermost frame is in the bundle rather than in the author's code: {frames:?}"
     );
 
     let source = std::fs::read_to_string(repository_root().join(&frame.file))

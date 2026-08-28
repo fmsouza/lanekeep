@@ -14,7 +14,9 @@ use lanekeep_testkit::RuleTester;
 
 fn tester(options: &str) -> RuleTester {
     let source = lanekeep_rules::source("no-restricted-calls").expect("the rule ships");
-    RuleTester::configured("no-restricted-calls", source, options).expect("builds")
+    RuleTester::configured("no-restricted-calls", source, options)
+        .expect("builds")
+        .with_builtins(lanekeep_rules::source)
 }
 
 #[test]
@@ -147,7 +149,10 @@ fn the_first_matching_restriction_wins_and_carries_its_reason() {
     let [violation] = violations.as_slice() else {
         panic!("expected exactly one violation, got {}", violations.len());
     };
-    assert_eq!(violation.rule_id.to_string(), "lanekeep/no-restricted-calls");
+    assert_eq!(
+        violation.rule_id.to_string(),
+        "lanekeep/no-restricted-calls"
+    );
     assert!(
         violation.message.contains("console.log"),
         "message does not name the callee: {}",
