@@ -40,6 +40,26 @@
       },
       "examples": [{ "lanekeep/no-default-export": "warn" }]
     },
+    "suppressions": {
+      "type": "object",
+      "description": "Policy for suppression directives: which shapes of valid directive this project accepts. All off by default; a policy violation is reported as an ordinary lanekeep/suppression violation at the directive's own position, and the directive still silences what it names.",
+      "additionalProperties": false,
+      "properties": {
+        "requireExpiry": {
+          "type": "boolean",
+          "description": "A valid directive with no expires: is reported."
+        },
+        "maxExpiryDays": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "An expiry more than this many days after today is reported."
+        },
+        "forbidFileScope": {
+          "type": "boolean",
+          "description": "Any whole-file directive is reported."
+        }
+      }
+    },
     "timeouts": {
       "type": "object",
       "description": "Execution budgets, in milliseconds. Breaching one cancels the run and exits 2 rather than reporting a partial result as a clean one.",

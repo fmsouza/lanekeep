@@ -683,6 +683,28 @@ Directives are found by scanning for a standalone token rather than by walking c
 
 **An expired directive is reported but still silences.** Suddenly reporting everything it covered would turn a deadline into an avalanche on the day it passed. The expiry is a deadline in the ordinary sense: a directive dated the 31st still holds on the 31st.
 
+### Suppression policy
+
+The only policy the tool itself can state is "give a reason" — which an agent will happily fabricate. A project can say which shapes of valid directive it accepts, in a `suppressions` block beside `timeouts` in `lanekeep.json` (the same keys in `defineConfig()` for `lanekeep.config.ts`):
+
+```jsonc
+{
+  "suppressions": {
+    "requireExpiry": true,     // a valid directive with no `expires:` is reported
+    "maxExpiryDays": 90,       // an expiry more than 90 days after today is reported
+    "forbidFileScope": true    // any lanekeep-ignore-file directive is reported
+  }
+}
+```
+
+All three default off, so an existing config changes nothing. `maxExpiryDays` must be at least 1.
+
+**A policy violation is reported, never un-suppressed.** The directive still silences what it names, and the violation is an ordinary `lanekeep/suppression` violation at the directive's own position. Un-suppressing would turn enabling a policy into an avalanche of previously-accepted violations; the policy violation itself makes the run exit `1`, so an agent cannot buy a green run with a directive the policy forbids.
+
+**`lanekeep/suppression` cannot be suppressed.** The violations about directives themselves are emitted after the pass that applies directives, so nothing a file's own directives name can silence a malformed, expired or policy-violating directive's report — the policy polices, or it is not a policy.
+
+The policy is a `config_hash` input, like every other setting: changing it invalidates the cache the way any config change does. `maxExpiryDays` compares against the run's `today`, so its verdict is date-dependent — and the dated cache key already covers exactly the affected files, since a file whose bytes contain `expires:` gets a one-day key. `requireExpiry` and `forbidFileScope` are date-independent and cache under the plain key.
+
 ### Suppressions and the cache
 
 Two things follow from caching, and both are easy to get wrong:

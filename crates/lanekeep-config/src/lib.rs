@@ -269,6 +269,21 @@ impl std::fmt::Debug for ComponentBytes {
     }
 }
 
+/// Policy for suppression directives: which shapes of valid directive a project accepts.
+///
+/// All three keys default off, so an existing config changes nothing. A policy violation is
+/// reported as an ordinary `lanekeep/suppression` violation at the directive's own position;
+/// the directive still silences what it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SuppressionPolicy {
+    /// A valid directive with no `expires:` is reported.
+    pub require_expiry: bool,
+    /// An expiry more than this many days after the run's `today` is reported.
+    pub max_expiry_days: Option<u32>,
+    /// Any whole-file directive is reported.
+    pub forbid_file_scope: bool,
+}
+
 /// A loaded, validated configuration.
 #[expect(
     clippy::struct_field_names,
@@ -287,6 +302,8 @@ pub struct Config {
     pub rules: Vec<RuleSpec>,
     /// Budgets, with defaults filled in.
     pub limits: Limits,
+    /// The project's policy for which shapes of valid directive it accepts.
+    pub suppressions: SuppressionPolicy,
     /// Hash of every module in the rule import graph.
     pub ruleset_hash: Hash,
     /// Hash of the configuration values.
@@ -351,6 +368,8 @@ struct RawConfig {
     #[serde(default)]
     timeouts: RawTimeouts,
     #[serde(default)]
+    suppressions: RawSuppressions,
+    #[serde(default)]
     rules: Vec<RawRule>,
 }
 
@@ -358,6 +377,23 @@ struct RawConfig {
 struct RawTimeouts {
     rule: Option<u64>,
     global: Option<u64>,
+}
+
+/// The `suppressions` block as written — permissive, like [`RawTimeouts`], because the
+/// validation happens in `build`, where a malformed value becomes a diagnostic naming the
+/// field rather than a deserialization error naming a line of JSON the user never wrote.
+///
+/// Keys are camelCase in both config formats, matching the schema and the TypeScript
+/// interface `lanekeep-types-gen` renders.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSuppressions {
+    #[serde(default)]
+    require_expiry: bool,
+    #[serde(default)]
+    max_expiry_days: Option<u32>,
+    #[serde(default)]
+    forbid_file_scope: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +462,7 @@ const EXTRACT: &str = r"
             exclude: c.exclude ?? [],
             severity: c.severity ?? {},
             timeouts: c.timeouts ?? {},
+            suppressions: c.suppressions ?? {},
             rules: rules.map((r) => ({
                 id: r?.id ?? null,
                 language: r?.language ?? null,
@@ -721,6 +758,12 @@ fn build(
         limits = limits.with_global_timeout(global);
     }
 
+    // The suppression policy, validated once here — the single construction point both
+    // config formats converge on, which is what makes a `suppressions` block written in
+    // either format behave identically. Reached by `hash_config` below, because anything a
+    // config can say has to reach one of the two hashes on purpose (`AGENTS.md`).
+    let suppressions = parse_suppressions(&raw.suppressions, display)?;
+
     // Every component in the config, asked what it is. Once, here, before a `RuleSpec` exists
     // — not per worker: instantiation is 82 to 96 times the cost of not instantiating, which
     // is why `lanekeep_wasm::WasmRuntime::rule` defers it, and reading metadata through a
@@ -789,13 +832,21 @@ fn build(
         .collect();
 
     let ruleset_hash = hash_ruleset(sandbox, &components);
-    let config_hash = hash_config(&raw.include, &raw.exclude, &overrides, &limits, resolved);
+    let config_hash = hash_config(
+        &raw.include,
+        &raw.exclude,
+        &overrides,
+        &limits,
+        resolved,
+        &suppressions,
+    );
 
     Ok(Config {
         include: raw.include,
         exclude: raw.exclude,
         rules,
         limits,
+        suppressions,
         ruleset_hash,
         config_hash,
     })
@@ -820,6 +871,28 @@ fn parse_severity_overrides(
             Ok((id, severity))
         })
         .collect()
+}
+
+/// Validate the `suppressions` block into the policy the engine enforces.
+///
+/// A single place, reached by both config formats through `build` — the one function every
+/// `Config` is constructed by. `maxExpiryDays` of zero would forbid every expiry the day it
+/// was set; a horizon has to reach at least tomorrow.
+fn parse_suppressions(
+    raw: &RawSuppressions,
+    display: &str,
+) -> Result<SuppressionPolicy, ConfigError> {
+    if raw.max_expiry_days == Some(0) {
+        return Err(ConfigError::Shape {
+            path: display.to_owned(),
+            detail: "in `suppressions`: `maxExpiryDays` must be at least 1".to_owned(),
+        });
+    }
+    Ok(SuppressionPolicy {
+        require_expiry: raw.require_expiry,
+        max_expiry_days: raw.max_expiry_days,
+        forbid_file_scope: raw.forbid_file_scope,
+    })
 }
 
 /// Ask every component the config names which rules it hosts, and what each of them is.
@@ -1898,6 +1971,7 @@ fn hash_config(
     severity: &BTreeMap<RuleId, Severity>,
     limits: &Limits,
     resolved: &[ResolvedRule],
+    suppressions: &SuppressionPolicy,
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-config-v1");
@@ -1933,6 +2007,23 @@ fn hash_config(
     ] {
         hasher.update(&value.to_le_bytes());
     }
+
+    // The suppression policy, folded as the structured data it is: presence and value of
+    // `max_expiry_days`, not the JSON a user happened to write. This is the sixth input, on
+    // purpose — `AGENTS.md` records the shape of the alternative: a value a config can say
+    // that reaches no hash is a warm run answering the previous configuration.
+    hasher.update(b"suppressions");
+    hasher.update(&[u8::from(suppressions.require_expiry)]);
+    match suppressions.max_expiry_days {
+        Some(days) => {
+            hasher.update(&[1]);
+            hasher.update(&days.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&[u8::from(suppressions.forbid_file_scope)]);
 
     // In the order written, which over-invalidates on a reordering that changes nothing —
     // rules are sorted by ID before they are reported, so their position is not an input to
@@ -4265,6 +4356,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_config_hash_changes_with_a_suppression_policy() {
+        // Every key of the block is a `config_hash` input, asserted separately — a fold that
+        // dropped one arm would leave a policy edit that invalidates nothing, which is the
+        // exact "reaches no hash" shape `AGENTS.md` records. `maxExpiryDays` gets a value
+        // change as well as a presence change, because Some(30) and Some(31) must not hash
+        // alike any more than None and Some must.
+        let make = |extra: &str, tag: &str| {
+            Fixture::new(
+                &format!("suppression-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.config.ts",
+                        &config_with(&format!("rules: [rule]{extra}")),
+                    ),
+                ],
+            )
+            .load_config()
+            .expect("loads")
+            .config_hash
+        };
+
+        let none = hex(&make("", "none"));
+        assert_ne!(
+            none,
+            hex(&make(", suppressions: { requireExpiry: true }", "require")),
+            "turning on requireExpiry must invalidate"
+        );
+        assert_ne!(
+            none,
+            hex(&make(", suppressions: { maxExpiryDays: 30 }", "days")),
+            "adding maxExpiryDays must invalidate"
+        );
+        assert_ne!(
+            none,
+            hex(&make(", suppressions: { forbidFileScope: true }", "file")),
+            "turning on forbidFileScope must invalidate"
+        );
+        assert_ne!(
+            hex(&make(", suppressions: { maxExpiryDays: 30 }", "days30")),
+            hex(&make(", suppressions: { maxExpiryDays: 31 }", "days31")),
+            "changing maxExpiryDays must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_suppression_policy_is_read_from_a_typescript_config() {
+        let fixture = Fixture::new(
+            "suppression-policy-ts",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with(
+                        "rules: [rule], suppressions: { requireExpiry: true, \
+                         maxExpiryDays: 30, forbidFileScope: true }",
+                    ),
+                ),
+            ],
+        );
+        let config = fixture.load_config().expect("loads");
+        assert_eq!(
+            config.suppressions,
+            SuppressionPolicy {
+                require_expiry: true,
+                max_expiry_days: Some(30),
+                forbid_file_scope: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_zero_max_expiry_days_is_refused() {
+        // `build` is the one place both formats construct a `Config`, so one test proves the
+        // validation for both — unlike the hashing properties, which are asserted in pairs.
+        let fixture = Fixture::new(
+            "suppression-zero",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("rules: [rule], suppressions: { maxExpiryDays: 0 }"),
+                ),
+            ],
+        );
+        let error = fixture
+            .load_config()
+            .expect_err("a zero horizon is refused");
+        assert!(format!("{error}").contains("maxExpiryDays"), "{error}");
+    }
+
     /// A JSON rule's options are a cache-key input, and were reaching neither hash.
     ///
     /// The same config in the same directory, one option value edited: before this was
@@ -4460,6 +4643,89 @@ mod tests {
         };
 
         assert_ne!(hex(&make("{}", "d")), hex(&make(r#"{"rule": 5000}"#, "t")));
+    }
+
+    #[test]
+    fn the_config_hash_changes_with_a_suppression_policy_for_json() {
+        // The JSON half of the matched pair, and every key gets a turn: a fold that dropped
+        // one arm would leave that key's edits invalidating nothing, on the path that knows
+        // the policy as data. The fixture is rewritten in place so `ruleset_hash` is provably
+        // stable — the two hashes must disagree because the policy changed, not because a
+        // module moved.
+        let config = |suppressions: &str| {
+            format!(r#"{{"rules": ["./rule"], "suppressions": {suppressions}}}"#)
+        };
+
+        for (label, edited) in [
+            ("requireExpiry", r#"{"requireExpiry": true}"#),
+            ("maxExpiryDays", r#"{"maxExpiryDays": 30}"#),
+            ("forbidFileScope", r#"{"forbidFileScope": true}"#),
+        ] {
+            let fixture = Fixture::new(
+                &format!("json-suppression-hash-{label}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    ("lanekeep.json", &config("{}")),
+                ],
+            );
+
+            let before = fixture.load_json().expect("loads");
+            fixture.write_all(&[("lanekeep.json", &config(edited))]);
+            let after = fixture.load_json().expect("loads");
+
+            assert_ne!(
+                hex(&before.config_hash),
+                hex(&after.config_hash),
+                "editing `{label}` must invalidate"
+            );
+            assert_eq!(
+                hex(&before.ruleset_hash),
+                hex(&after.ruleset_hash),
+                "no module changed, so the ruleset hash must not move — which is exactly \
+                 why the config hash has to"
+            );
+        }
+
+        // A value change too, not just presence: Some(30) and Some(31) must not hash alike.
+        let fixture = Fixture::new(
+            "json-suppression-hash-days-value",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.json", &config(r#"{"maxExpiryDays": 30}"#)),
+            ],
+        );
+        let before = fixture.load_json().expect("loads");
+        fixture.write_all(&[("lanekeep.json", &config(r#"{"maxExpiryDays": 31}"#))]);
+        let after = fixture.load_json().expect("loads");
+        assert_ne!(
+            hex(&before.config_hash),
+            hex(&after.config_hash),
+            "changing maxExpiryDays must invalidate"
+        );
+        assert_eq!(hex(&before.ruleset_hash), hex(&after.ruleset_hash));
+    }
+
+    #[test]
+    fn the_suppression_policy_is_read_from_a_json_config() {
+        let fixture = Fixture::new(
+            "suppression-policy-json",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./rule"], "suppressions": {"requireExpiry": true, "maxExpiryDays": 30, "forbidFileScope": true}}"#,
+                ),
+            ],
+        );
+        let config = fixture.load_json().expect("loads");
+        assert_eq!(
+            config.suppressions,
+            SuppressionPolicy {
+                require_expiry: true,
+                max_expiry_days: Some(30),
+                forbid_file_scope: true,
+            }
+        );
     }
 
     /// `"x"` and `{ "rule": "x" }` are different configurations and must not hash alike.

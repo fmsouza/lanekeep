@@ -213,6 +213,8 @@ struct JsonConfig {
     #[serde(default)]
     timeouts: crate::RawTimeouts,
     #[serde(default)]
+    suppressions: crate::RawSuppressions,
+    #[serde(default)]
     rules: Vec<JsonRule>,
 }
 
@@ -298,6 +300,7 @@ pub(crate) fn parse(
             namespaces: config.namespaces,
             severity: config.severity,
             timeouts: config.timeouts,
+            suppressions: config.suppressions,
             rules: Vec::new(),
         },
         rules,
@@ -586,6 +589,8 @@ mod tests {
             r#"{"include": ["src/**/*.go"], "exclude": ["**/*_test.go"],
                 "namespaces": ["acme"], "severity": {"acme/a": "warn"},
                 "timeouts": {"rule": 100, "global": 5000},
+                "suppressions": {"requireExpiry": true, "maxExpiryDays": 30,
+                                 "forbidFileScope": true},
                 "rules": ["lanekeep/no-default-export"]}"#,
         )
         .expect("compiles");
@@ -597,6 +602,10 @@ mod tests {
             "warn",
             "severity",
             "timeouts",
+            "suppressions",
+            "requireExpiry",
+            "maxExpiryDays",
+            "forbidFileScope",
             "include",
             "exclude",
         ] {
@@ -620,6 +629,18 @@ mod tests {
         );
         assert_eq!(parsed.config.timeouts.rule, Some(100));
         assert_eq!(parsed.config.timeouts.global, Some(5000));
+    }
+
+    #[test]
+    fn suppressions_are_read_in_rust() {
+        let parsed = parse_config(
+            "suppressions-in-rust",
+            r#"{"suppressions": {"requireExpiry": true, "maxExpiryDays": 30, "forbidFileScope": true}}"#,
+        )
+        .expect("parses");
+        assert!(parsed.config.suppressions.require_expiry);
+        assert_eq!(parsed.config.suppressions.max_expiry_days, Some(30));
+        assert!(parsed.config.suppressions.forbid_file_scope);
     }
 
     #[test]
@@ -891,6 +912,7 @@ mod tests {
                 "namespaces",
                 "rules",
                 "severity",
+                "suppressions",
                 "timeouts"
             ],
             "the schema's fields changed; the parser below has to change with it"
@@ -904,6 +926,8 @@ mod tests {
             "namespaces": ["acme"],
             "severity": {"acme/a": "warn"},
             "timeouts": {"rule": 100, "global": 5000},
+            "suppressions": {"requireExpiry": true, "maxExpiryDays": 30,
+                             "forbidFileScope": true},
             "rules": ["lanekeep/no-default-export"]
         }"#;
         compile("schema-agreement", everything)

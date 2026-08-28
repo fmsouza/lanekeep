@@ -254,6 +254,15 @@ export interface Config {
     /** Wall-clock, for the whole run. */
     global?: number
   }
+  /** Policy for suppression directives. All off by default. */
+  suppressions?: {
+    /** A valid directive with no `expires:` is reported. */
+    requireExpiry?: boolean
+    /** An expiry more than this many days after today is reported. */
+    maxExpiryDays?: number
+    /** Any whole-file directive is reported. */
+    forbidFileScope?: boolean
+  }
   /** The rules to run, in order. */
   rules: Rule[]
 }

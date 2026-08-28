@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
 use lanekeep_config::{ComponentBytes, Config, ConfigError, RuleSpec};
-use lanekeep_core::suppression::{self, Date, Suppressions};
+use lanekeep_core::suppression::{self, Date, Scope, Suppressions};
 use lanekeep_core::{
     CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, RuleId, Severity,
     TrackedRead, Violation,
@@ -478,6 +478,17 @@ pub struct Engine {
     /// Fixed once for the run, so two files checked a millisecond apart cannot disagree
     /// about what day it is. Supplied by the host because the sandbox has no clock.
     today: Date,
+    /// The project's policy for which shapes of valid directive it accepts.
+    ///
+    /// Enforced in [`Self::directive_violations`] — the same post-cache stage that reports
+    /// malformed and expired directives. Two consequences are load-bearing. The violations
+    /// are emitted *after* the pass that applies directives, which is what makes
+    /// `lanekeep/suppression` unsuppressible. And the cached entry already carries them, so a
+    /// warm run reports them identically with no new key input: `maxExpiryDays` compares
+    /// against `today`, and a file whose bytes contain `expires:` already gets a one-day
+    /// dated key, while `requireExpiry` and `forbidFileScope` are date-independent and cache
+    /// under the plain key.
+    suppression_policy: lanekeep_config::SuppressionPolicy,
     limits: Limits,
     rules_root: RuleRoot,
     config_path: PathBuf,
@@ -771,6 +782,7 @@ impl Engine {
                 .unwrap_or_else(|_| project_root.to_path_buf()),
             discovery,
             limits: config.limits,
+            suppression_policy: config.suppressions,
             rules_root,
             config_path: config_path.to_path_buf(),
             typescript,
@@ -1550,30 +1562,88 @@ impl Engine {
         }
 
         for suppression in &directives.valid {
-            let Some(expires) = suppression.expires else {
-                continue;
-            };
-            if expires >= self.today {
-                continue;
+            // Each distinct problem reported once, in a fixed order — expired first, then the
+            // policy checks as the config's keys read — so a directive that breaks several
+            // rules of the policy produces the same list in every run.
+            if let Some(expires) = suppression.expires
+                && expires < self.today
+            {
+                violations.push(Violation {
+                    rule_id: rule_id.clone(),
+                    location: Location::new(
+                        path.clone(),
+                        Position::new(suppression.line, suppression.column),
+                    ),
+                    message: format!(
+                        "suppression expired on {expires} — \"{}\"",
+                        suppression.reason
+                    ),
+                    remediation: String::from(
+                        "fix what it was suppressing, or decide it is permanent and drop the \
+                         expiry",
+                    ),
+                    severity: Severity::Error,
+                    fix: None,
+                });
             }
 
-            violations.push(Violation {
-                rule_id: rule_id.clone(),
-                location: Location::new(
-                    path.clone(),
-                    Position::new(suppression.line, suppression.column),
-                ),
-                message: format!(
-                    "suppression expired on {expires} — \"{}\"",
-                    suppression.reason
-                ),
-                remediation: String::from(
-                    "fix what it was suppressing, or decide it is permanent and drop the \
-                     expiry",
-                ),
-                severity: Severity::Error,
-                fix: None,
-            });
+            if self.suppression_policy.require_expiry && suppression.expires.is_none() {
+                violations.push(Violation {
+                    rule_id: rule_id.clone(),
+                    location: Location::new(
+                        path.clone(),
+                        Position::new(suppression.line, suppression.column),
+                    ),
+                    message: String::from(
+                        "suppression has no `expires:` — `suppressions.requireExpiry` \
+                         requires one",
+                    ),
+                    remediation: String::from("add `expires: YYYY-MM-DD`, or turn the policy off"),
+                    severity: Severity::Error,
+                    fix: None,
+                });
+            }
+
+            if let Some(max) = self.suppression_policy.max_expiry_days
+                && let Some(expires) = suppression.expires
+                && expires > self.today.add_days(max)
+            {
+                violations.push(Violation {
+                    rule_id: rule_id.clone(),
+                    location: Location::new(
+                        path.clone(),
+                        Position::new(suppression.line, suppression.column),
+                    ),
+                    message: format!(
+                        "suppression expires {expires} — more than {max} days out under \
+                         `suppressions.maxExpiryDays`"
+                    ),
+                    remediation: String::from(
+                        "bring the expiry inside the policy's horizon, or raise the horizon",
+                    ),
+                    severity: Severity::Error,
+                    fix: None,
+                });
+            }
+
+            if self.suppression_policy.forbid_file_scope && suppression.scope == Scope::File {
+                violations.push(Violation {
+                    rule_id: rule_id.clone(),
+                    location: Location::new(
+                        path.clone(),
+                        Position::new(suppression.line, suppression.column),
+                    ),
+                    message: String::from(
+                        "file-scope suppression is forbidden — \
+                         `suppressions.forbidFileScope` is on",
+                    ),
+                    remediation: String::from(
+                        "narrow it to the lines that need it, or turn the policy off",
+                    ),
+                    severity: Severity::Error,
+                    fix: None,
+                });
+            }
         }
 
         violations
@@ -2804,8 +2874,13 @@ mod tests {
         }
 
         fn run(&self) -> Result<Outcome, RunError> {
+            self.prepare_with("lanekeep.config.ts")?.run()
+        }
+
+        /// The engine over the fixture's config under `name`, without running it.
+        fn prepare_with(&self, name: &str) -> Result<Engine, RunError> {
             let root = RuleRoot::new(&self.dir).expect("canonicalizes");
-            let config_path = self.dir.join("lanekeep.config.ts");
+            let config_path = self.dir.join(name);
 
             let sandbox =
                 lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
@@ -2813,7 +2888,7 @@ mod tests {
             let config = lanekeep_config::load(&sandbox, &root, &config_path)
                 .unwrap_or_else(|e| panic!("config failed to load: {e}"));
 
-            let engine = Engine::prepare(
+            Engine::prepare(
                 &config,
                 &self.dir,
                 root,
@@ -2821,8 +2896,7 @@ mod tests {
                 &lanekeep_lang_js::registry(),
                 Arc::new(TypeScript),
                 Arc::new(JavaScript),
-            )?;
-            engine.run()
+            )
         }
     }
 
@@ -4007,24 +4081,9 @@ export default defineRule({
             self.build().map(Engine::without_cache)?.run()
         }
 
-        /// The engine, without running it.
+        /// The engine over the fixture's `lanekeep.config.ts`, without running it.
         fn build(&self) -> Result<Engine, RunError> {
-            let root = RuleRoot::new(&self.dir).expect("canonicalizes");
-            let config_path = self.dir.join("lanekeep.config.ts");
-            let sandbox =
-                lanekeep_config::sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript))
-                    .expect("sandbox");
-            let config = lanekeep_config::load(&sandbox, &root, &config_path)
-                .unwrap_or_else(|e| panic!("config failed to load: {e}"));
-            Engine::prepare(
-                &config,
-                &self.dir,
-                root,
-                &config_path,
-                &lanekeep_lang_js::registry(),
-                Arc::new(TypeScript),
-                Arc::new(JavaScript),
-            )
+            self.prepare_with("lanekeep.config.ts")
         }
 
         fn cache(&self) -> Store {
@@ -4963,6 +5022,502 @@ export default defineRule({
         );
     }
 
+    // --- the suppression policy ------------------------------------------------------------
+    //
+    // The `suppressions` block's three keys, each tested on → violation at the directive's
+    // position naming the policy, off → silence, on both config formats.
+
+    #[test]
+    fn a_directive_without_an_expiry_is_reported_when_require_expiry_is_on() {
+        let project = Project::new(
+            "require-expiry-on",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { requireExpiry: true }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: legacy\n debugger;\n"),
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        let v = &outcome.violations[0];
+        assert_eq!(v.rule_id.to_string(), "lanekeep/suppression");
+        assert_eq!(v.location.position.line, 1, "reported at the directive");
+        assert!(
+            v.message.contains("suppressions.requireExpiry"),
+            "{}",
+            v.message
+        );
+    }
+
+    #[test]
+    fn a_directive_without_an_expiry_is_quiet_when_require_expiry_is_off() {
+        let project = Project::new(
+            "require-expiry-off",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: legacy\n debugger;\n"),
+                ),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+    }
+
+    #[test]
+    fn an_expiry_beyond_the_horizon_is_reported_when_max_expiry_days_is_set() {
+        let project = Project::new(
+            "horizon-on",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { maxExpiryDays: 90 }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: legacy expires: 2026-10-31\n \
+                         debugger;\n"
+                    ),
+                ),
+            ],
+        );
+        let outcome = project.run_on("2026-08-01").expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0]
+                .message
+                .contains("suppressions.maxExpiryDays")
+        );
+        assert!(outcome.violations[0].message.contains("2026-10-31"));
+        assert_eq!(outcome.violations[0].location.position.line, 1);
+    }
+
+    #[test]
+    fn an_expiry_within_the_horizon_is_quiet() {
+        // 90 days after 2026-08-01 is exactly 2026-10-30; "more than N days" is strict.
+        let project = Project::new(
+            "horizon-off",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { maxExpiryDays: 90 }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: legacy expires: 2026-10-30\n \
+                         debugger;\n"
+                    ),
+                ),
+            ],
+        );
+        assert!(
+            project
+                .run_on("2026-08-01")
+                .expect("runs")
+                .violations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_file_scope_directive_is_reported_when_forbid_file_scope_is_on() {
+        let project = Project::new(
+            "file-scope-on",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { forbidFileScope: true }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {WHOLE_FILE} local/no-debugger reason: generated\n debugger;\n"),
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0]
+                .message
+                .contains("suppressions.forbidFileScope")
+        );
+        assert_eq!(outcome.violations[0].location.position.line, 1);
+    }
+
+    #[test]
+    fn a_file_scope_directive_is_quiet_when_forbid_file_scope_is_off() {
+        let project = Project::new(
+            "file-scope-off",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    &format!("// {WHOLE_FILE} local/no-debugger reason: generated\n debugger;\n"),
+                ),
+            ],
+        );
+        assert!(project.run().expect("runs").violations.is_empty());
+    }
+
+    // The JSON path carries the policy into enforcement too — the format drift the config
+    // layer's matched pairs exist to catch would otherwise leave the JSON path silent.
+    #[test]
+    fn a_directive_without_an_expiry_is_reported_when_require_expiry_is_on_for_json() {
+        let project = Project::new(
+            "require-expiry-on-json",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.json",
+                    r#"{"include": ["src/**/*.ts"], "rules": ["./rule"],
+                       "suppressions": {"requireExpiry": true}}"#,
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: legacy\n debugger;\n"),
+                ),
+            ],
+        );
+        let outcome = project.run_json().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0]
+                .message
+                .contains("suppressions.requireExpiry")
+        );
+    }
+
+    #[test]
+    fn a_directive_without_an_expiry_is_quiet_when_require_expiry_is_off_for_json() {
+        let project = Project::new(
+            "require-expiry-off-json",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.json",
+                    r#"{"include": ["src/**/*.ts"], "rules": ["./rule"]}"#,
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: legacy\n debugger;\n"),
+                ),
+            ],
+        );
+        assert!(project.run_json().expect("runs").violations.is_empty());
+    }
+
+    #[test]
+    fn an_expiry_beyond_the_horizon_is_reported_when_max_expiry_days_is_set_for_json() {
+        let project = Project::new(
+            "horizon-on-json",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.json",
+                    r#"{"include": ["src/**/*.ts"], "rules": ["./rule"],
+                       "suppressions": {"maxExpiryDays": 90}}"#,
+                ),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: legacy expires: 2026-10-31\n \
+                         debugger;\n"
+                    ),
+                ),
+            ],
+        );
+        let date = Date::parse("2026-08-01").expect("valid date");
+        let outcome = project
+            .prepare_with("lanekeep.json")
+            .map(|engine| engine.with_today(date))
+            .expect("prepares")
+            .run()
+            .expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0]
+                .message
+                .contains("suppressions.maxExpiryDays")
+        );
+    }
+
+    #[test]
+    fn an_expiry_within_the_horizon_is_quiet_for_json() {
+        let project = Project::new(
+            "horizon-off-json",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.json",
+                    r#"{"include": ["src/**/*.ts"], "rules": ["./rule"],
+                       "suppressions": {"maxExpiryDays": 90}}"#,
+                ),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: legacy expires: 2026-10-30\n \
+                         debugger;\n"
+                    ),
+                ),
+            ],
+        );
+        let date = Date::parse("2026-08-01").expect("valid date");
+        let outcome = project
+            .prepare_with("lanekeep.json")
+            .map(|engine| engine.with_today(date))
+            .expect("prepares")
+            .run()
+            .expect("runs");
+        assert!(outcome.violations.is_empty(), "{:?}", messages(&outcome));
+    }
+
+    #[test]
+    fn a_far_future_expiry_is_quiet_without_max_expiry_days_for_json() {
+        // The "off" direction for `maxExpiryDays`, spelled on the JSON path: no policy block
+        // at all, an expiry far beyond any horizon — silence, because a key that is off
+        // reports nothing.
+        let project = Project::new(
+            "horizon-absent-json",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.json",
+                    r#"{"include": ["src/**/*.ts"], "rules": ["./rule"]}"#,
+                ),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "// {NEXT_LINE} local/no-debugger reason: legacy expires: 2099-01-01\n \
+                         debugger;\n"
+                    ),
+                ),
+            ],
+        );
+        let date = Date::parse("2026-08-01").expect("valid date");
+        let outcome = project
+            .prepare_with("lanekeep.json")
+            .map(|engine| engine.with_today(date))
+            .expect("prepares")
+            .run()
+            .expect("runs");
+        assert!(outcome.violations.is_empty(), "{:?}", messages(&outcome));
+    }
+
+    #[test]
+    fn a_file_scope_directive_is_reported_when_forbid_file_scope_is_on_for_json() {
+        let project = Project::new(
+            "file-scope-on-json",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.json",
+                    r#"{"include": ["src/**/*.ts"], "rules": ["./rule"],
+                       "suppressions": {"forbidFileScope": true}}"#,
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {WHOLE_FILE} local/no-debugger reason: generated\n debugger;\n"),
+                ),
+            ],
+        );
+        let outcome = project.run_json().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0]
+                .message
+                .contains("suppressions.forbidFileScope")
+        );
+    }
+
+    #[test]
+    fn a_file_scope_directive_is_quiet_when_forbid_file_scope_is_off_for_json() {
+        let project = Project::new(
+            "file-scope-off-json",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.json",
+                    r#"{"include": ["src/**/*.ts"], "rules": ["./rule"]}"#,
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {WHOLE_FILE} local/no-debugger reason: generated\n debugger;\n"),
+                ),
+            ],
+        );
+        assert!(project.run_json().expect("runs").violations.is_empty());
+    }
+
+    #[test]
+    fn a_directive_with_several_policy_problems_reports_each_deterministically() {
+        let project = Project::new(
+            "policy-multi",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { requireExpiry: true, forbidFileScope: true }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {WHOLE_FILE} local/no-debugger reason: generated\n debugger;\n"),
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 2, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0]
+                .message
+                .contains("suppressions.requireExpiry")
+        );
+        assert!(
+            outcome.violations[1]
+                .message
+                .contains("suppressions.forbidFileScope")
+        );
+    }
+
+    #[test]
+    fn an_expired_and_policy_violating_directive_reports_each_problem_once() {
+        let project = Project::new(
+            "expired-and-forbidden",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { forbidFileScope: true }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "// {WHOLE_FILE} local/no-debugger reason: legacy expires: 2025-01-01\n \
+                         debugger;\n"
+                    ),
+                ),
+            ],
+        );
+        let outcome = project.run_on("2026-08-01").expect("runs");
+        assert_eq!(outcome.violations.len(), 2, "{:?}", messages(&outcome));
+        assert!(
+            outcome.violations[0].message.contains("expired"),
+            "{}",
+            outcome.violations[0].message
+        );
+        assert!(
+            outcome.violations[1]
+                .message
+                .contains("suppressions.forbidFileScope")
+        );
+    }
+
+    #[test]
+    fn a_directive_naming_suppression_cannot_silence_a_policy_violation() {
+        // The policy polices, or it is not a policy: `lanekeep/suppression` is exempt from
+        // suppression entirely, because the violations about directives are emitted after the
+        // pass that applies them.
+        let project = Project::new(
+            "suppression-unsuppressible",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { requireExpiry: true }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "// {WHOLE_FILE} lanekeep/suppression reason: policy does not apply to me \
+                         expires: 2099-01-01\n\
+                         // {NEXT_LINE} local/no-debugger reason: legacy\n\
+                         debugger;\n"
+                    ),
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        let v = &outcome.violations[0];
+        assert_eq!(v.rule_id.to_string(), "lanekeep/suppression");
+        assert_eq!(v.location.position.line, 2);
+        assert!(v.message.contains("suppressions.requireExpiry"));
+    }
+
+    #[test]
+    fn a_directive_naming_suppression_cannot_silence_a_malformed_directive() {
+        // Current behavior for malformed-directive reports, established as the baseline the
+        // policy inherits: a whole-file directive naming `lanekeep/suppression` does not hide
+        // a malformed directive's report — line 4's report is on a line the whole-file
+        // directive covers, and it is still there. The debugger is silenced by line 2's own
+        // valid directive so the malformed report is the only thing left to find.
+        let project = Project::new(
+            "malformed-unsuppressible",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "// {WHOLE_FILE} lanekeep/suppression reason: does not cover me\n\
+                         // {NEXT_LINE} local/no-debugger reason: legacy\n\
+                         debugger;\n\
+                         // {NEXT_LINE} local/no-debugger\n"
+                    ),
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert_eq!(
+            outcome.violations[0].rule_id.to_string(),
+            "lanekeep/suppression"
+        );
+        assert_eq!(outcome.violations[0].location.position.line, 4);
+        assert!(outcome.violations[0].message.contains("no `reason:`"));
+    }
+
+    #[test]
+    fn a_policy_violation_survives_a_warm_run() {
+        // Enforcement happens at the same post-cache stage as the directive violations, so the
+        // cached entry already carries the policy violation and a warm run reports it
+        // identically — no new key input beyond `config_hash`.
+        let project = Project::new(
+            "policy-warm",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { requireExpiry: true }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: legacy\n debugger;\n"),
+                ),
+            ],
+        );
+        let cold = rendered(&project.run().expect("runs"));
+        let warm = rendered(&project.run().expect("runs"));
+        assert_eq!(warm, cold, "the cache changed the answer");
+        assert_eq!(
+            cold.len(),
+            1,
+            "the fixture should report the policy violation"
+        );
+    }
+
     // --- ctx.today and the cache -----------------------------------------------------------
 
     /// A rule that reports only when the date it is given starts with a given year.
@@ -5423,7 +5978,12 @@ export default defineRule({
             /// is every supported language rather than the JavaScript family, because a
             /// component's rules declare whichever language they were written against and the
             /// engine refuses a rule naming one it does not know.
-            fn run_json(&self) -> Result<Outcome, RunError> {
+            ///
+            /// `pub(super)` because the suppression-policy tests also run a `lanekeep.json`
+            /// through the engine, and their assertions — violation presence and message text —
+            /// do not depend on either choice this runner makes, so a second runner with a
+            /// second set of semantics would be drift waiting to happen.
+            pub(super) fn run_json(&self) -> Result<Outcome, RunError> {
                 let root = RuleRoot::new(&self.dir).expect("canonicalizes");
                 let config_path = self.dir.join("lanekeep.json");
                 let sandbox =
