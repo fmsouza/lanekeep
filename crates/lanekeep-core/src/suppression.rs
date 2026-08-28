@@ -107,6 +107,16 @@ impl Date {
 
         Some(Self { year, month, day })
     }
+
+    /// The date `days` days after this one.
+    ///
+    /// For a horizon check: whether an expiry is *more than* `n` days out is
+    /// `expires > today.add_days(n)`. Values past the 4-digit-year range clamp
+    /// the way `from_unix_days` clamps.
+    #[must_use]
+    pub fn add_days(self, days: u32) -> Self {
+        from_unix_days(days_from_civil(self) + i64::from(days))
+    }
 }
 
 impl std::fmt::Display for Date {
@@ -366,6 +376,19 @@ pub fn today() -> Date {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     from_unix_days(i64::try_from(seconds / 86_400).unwrap_or(0))
+}
+
+/// Civil date as a count of days since 1970-01-01.
+///
+/// Howard Hinnant's `days_from_civil`, the exact inverse of [`from_unix_days`].
+fn days_from_civil(date: Date) -> i64 {
+    let y = i64::from(date.year) - i64::from(date.month <= 2);
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let m = i64::from(date.month) + if date.month > 2 { -3 } else { 9 };
+    let doy = (153 * m + 2) / 5 + i64::from(date.day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Civil date from a count of days since 1970-01-01.
@@ -665,6 +688,33 @@ mod tests {
         assert_eq!(
             Date::parse("2026-08-01").expect("valid").to_string(),
             "2026-08-01"
+        );
+    }
+
+    #[test]
+    fn add_days_moves_across_months_and_years() {
+        let start = Date::parse("2026-08-01").expect("valid");
+        assert_eq!(
+            start.add_days(90),
+            Date::parse("2026-10-30").expect("valid")
+        );
+        assert_eq!(start.add_days(0), start);
+
+        let new_year = Date::parse("2026-12-31").expect("valid");
+        assert_eq!(
+            new_year.add_days(1),
+            Date::parse("2027-01-01").expect("valid")
+        );
+    }
+
+    #[test]
+    fn add_days_handles_leap_years() {
+        let leap = Date::parse("2024-02-28").expect("valid");
+        assert_eq!(leap.add_days(1), Date::parse("2024-02-29").expect("valid"));
+        let common = Date::parse("2023-02-28").expect("valid");
+        assert_eq!(
+            common.add_days(1),
+            Date::parse("2023-03-01").expect("valid")
         );
     }
 }
