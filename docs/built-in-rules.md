@@ -30,7 +30,7 @@ Built-ins resolve before the filesystem is consulted, so a file at
 `lanekeep/no-broad-except.ts` in your project does not shadow one. A rule whose behavior
 depended on whether a same-named file happened to exist would be unreasonable to debug.
 
-**Four of the twelve are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
+**Four of the built-ins are compiled rules rather than TypeScript modules, and a `lanekeep.config.ts`
 cannot import one.** The two Rust rules — `lanekeep/no-glob-import` and `lanekeep/no-unwrap` —
 and the two Go ones — `lanekeep/no-context-in-struct` and `lanekeep/no-package-init` — are
 WebAssembly components. They have no JavaScript left to import at run time, and they describe
@@ -545,6 +545,74 @@ not have (§1 non-goals). A test pins the behavior so it is a known limit rather
 ---
 
 # Every language
+
+## `lanekeep/no-assertionless-test`
+
+A test that asserts nothing passes forever and covers nothing.
+
+Agents pad coverage on request — a test body that calls the subject and checks nothing is the
+cheapest way to make a coverage number move — so this fires often and early in agent-written
+code. `jest/expect-expect` covers JavaScript; nothing covers Go, Python or Rust, and the
+multi-language form is what earns this a built-in slot: one rule id, one suppression
+vocabulary, one card, across every supported language.
+
+It declares `['typescript', 'tsx', 'python', 'go', 'rust']`, with one query per grammar. What
+is per-language is how a test is recognized and what counts as asserting:
+
+| Language | A test is | Asserts by default |
+| --- | --- | --- |
+| TypeScript/TSX | an `it(...)`/`test(...)` call (`.only`/`.skip` forms included) with a block-bodied callback | `expect*`, `assert*` |
+| Python | a `def test*` function, methods included | the `assert` statement, `self.assert*`, `self.fail`, `pytest.raises` |
+| Go | `func Test*` taking `*testing.T` | `t.Error*`, `t.Fatal*`, `t.Fail*`, `assert.*`, `require.*` |
+| Rust | a `fn` under `#[test]`, or an attribute path ending `::test` (`#[tokio::test]`) | `assert*!`, `debug_assert*!`, `panic!` |
+
+Two exemptions are correctness rather than convenience: a Go test that calls `t.Skip*` and a
+Rust test under `#[should_panic]` legitimately assert nothing and are never reported.
+
+```json
+{
+  "rules": [
+    {
+      "rule": "lanekeep/no-assertionless-test",
+      "options": {
+        "tests": ["src/**", "tests/**"],
+        "assertions": { "go": ["suite."] },
+        "allowHelpers": ["expectValidResponse"]
+      }
+    }
+  ]
+}
+```
+
+This rule is a **factory** on the same terms as `no-restricted-calls`: a `lanekeep.config.ts`
+calls it, and both a bare JSON reference and an uncalled TypeScript reference fail to load
+with `missing 'id'`. Unlike its neighbors, it is useful *without* options — every default
+above applies when it is configured with `{}`.
+
+### Options
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `tests` | `string[]` | Path globs that gate where the rule looks. Omitted means everywhere. |
+| `assertions` | `{ [language]: string[] }` | Per-language additions to the default vocabulary. |
+| `allowHelpers` | `string[]` | Names that count as asserting in every language. |
+
+Vocabulary entries are matched as **prefixes** of the normalized callee — whitespace stripped,
+`?.` folded to `.` — so `t.Error` covers `t.Errorf` and `self.assert` covers every
+`self.assert*` method. `tests` is the one gate a multi-token judgment can have, and it is only
+set when given: Rust unit tests conventionally live inline in `src/*.rs`, so a default test
+glob would silently exclude them, and a wrong gate is worse than none.
+
+### What it cannot tell apart
+
+The rule does not chase helpers: an assertion inside a function the test calls is invisible,
+which is the same limit `expect-expect` has — name such helpers in `allowHelpers` and they
+count as asserting. Go's receiver is matched by its conventional name, so a
+`func TestX(tt *testing.T)` asserting through `tt.Error` needs `assertions: { "go": ["tt."] }`.
+A Rust `#[cfg(test)]` attribute gates compilation and does not make a function a test; only
+`#[test]` and `::test` attribute paths do.
+
+---
 
 ## `lanekeep/no-restricted-calls`
 

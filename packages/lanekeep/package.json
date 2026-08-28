@@ -5,6 +5,7 @@
   "typesVersions": {
     "*": {
       "duplicate-implementation": ["builtin.d.ts"],
+      "no-assertionless-test": ["builtin.d.ts"],
       "no-broad-except": ["builtin.d.ts"],
       "no-circular-imports": ["builtin.d.ts"],
       "no-default-export": ["builtin.d.ts"],
@@ -26,6 +27,9 @@
     "./runtime/host": "./runtime/host.js",
     "./package.json": "./package.json",
     "./duplicate-implementation": {
+      "types": "./builtin.d.ts"
+    },
+    "./no-assertionless-test": {
       "types": "./builtin.d.ts"
     },
     "./no-broad-except": {
