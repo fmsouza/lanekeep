@@ -544,6 +544,13 @@ export interface Rule {
    * Rust matches it across a single shared parse and only matches reach `check`, which is
    * what keeps a JavaScript rule affordable. Write the narrowest query that captures what
    * you need; `check` then only refines.
+   *
+   * Text predicates filter matches in Rust before the handler, so a predicate can only
+   * narrow, never widen, what `check` sees: `#eq?`, `#not-eq?`, `#match?`, `#not-match?`,
+   * `#any-of?` and `#not-any-of?` are supported (plus the `any-` forms of `eq?`/`match?`).
+   * `#match?`/`#not-match?` run on the `regex` crate, which is deterministic and supports
+   * no backreferences or lookaround. `#is?`, `#is-not?`, `#set!`, or an operator the
+   * binding does not know is refused at compile time.
    */
   query: string
   /** A per-invocation budget overriding the default, in milliseconds. */
