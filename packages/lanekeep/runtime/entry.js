@@ -112,12 +112,20 @@ export function register(entries) {
     }
     // Shape only, exactly as the fields above: whether the query parses is `build_rule`'s
     // call. A single string applies to every declared language; an object maps each declared
-    // language to its own query (per-language grammar vocabulary). Either must be non-empty.
+    // language to its own query (per-language grammar vocabulary). Either must be non-empty —
+    // and the object's *values* are held to the same bar as the string form, because
+    // `metadata` lowers each one into a WIT `string` outside the error wrapper: a value this
+    // gate lets through as `undefined` or a number ships in the component and traps at
+    // config load with nothing to say which rule or which field it was.
     const query = rule.query
     const queryIsUsable =
       typeof query === 'string'
         ? query.length > 0
-        : query !== null && typeof query === 'object' && !Array.isArray(query) && Object.keys(query).length > 0
+        : query !== null &&
+          typeof query === 'object' &&
+          !Array.isArray(query) &&
+          Object.keys(query).length > 0 &&
+          Object.values(query).every((value) => typeof value === 'string' && value.length > 0)
     if (!queryIsUsable) missing.push('query')
 
     const card = rule.card

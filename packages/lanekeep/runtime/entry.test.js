@@ -155,3 +155,29 @@ test('an empty query object is refused like a missing query', () => {
     message: /query/,
   })
 })
+
+test('a query object whose value is not a string is refused at build time', () => {
+  // `metadata` lowers each value into a WIT string outside the error wrapper, so a value
+  // this gate admitted would trap at config load naming neither the rule nor the field —
+  // the exact failure `register` exists to make legible.
+  assert.throws(() => register([rule('local/numeric-value', { query: { typescript: 42 } })]), {
+    name: 'TypeError',
+    message: /query/,
+  })
+})
+
+test('a query object carrying undefined is refused at build time', () => {
+  // `Object.keys({ a: undefined })` is `['a']`, so a key-count check alone passes this —
+  // and `Partial<Record<...>>` makes it type-legal for an author to write.
+  assert.throws(
+    () => register([rule('local/undefined-value', { query: { typescript: undefined } })]),
+    { name: 'TypeError', message: /query/ },
+  )
+})
+
+test('a query object whose value is empty is refused like an empty string query', () => {
+  assert.throws(() => register([rule('local/empty-value', { query: { typescript: '' } })]), {
+    name: 'TypeError',
+    message: /query/,
+  })
+})
