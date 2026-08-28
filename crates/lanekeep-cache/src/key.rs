@@ -107,10 +107,12 @@ impl RunKey {
 
     /// The key for a file whose result depends on the date.
     ///
-    /// Only for a file carrying an expiring suppression. Folding the date into every key
-    /// would invalidate the whole cache daily for the sake of the handful of files that
-    /// have one — and leaving it out entirely would serve an expired suppression as though
-    /// it were still in force, which is the one thing an expiry exists to prevent.
+    /// Two ways a file becomes date-dependent, and the engine chooses this key on either:
+    /// an expiring suppression in the file's bytes, or a rule that read `ctx.today` while
+    /// checking it. Folding the date into every key instead would invalidate the whole
+    /// cache daily for the sake of the handful of files that depend on it — and leaving it
+    /// out entirely would serve yesterday's answer: an expired suppression as though it
+    /// were still in force, a date comparison frozen at whenever the cache was written.
     #[must_use]
     pub fn for_dated_file(&self, path: &str, content: &ContentHash, today: &str) -> CacheKey {
         let mut hasher = self.prefix.clone();
