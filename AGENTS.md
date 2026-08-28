@@ -816,28 +816,42 @@ intrinsics are an allowlist and `Object` is not on it), which is what `builtin.d
 along. The mirror image is a genuine factory referenced *bare* from a JSON config, which renders
 as a function where a rule object is expected.
 
-**No shipped built-in is in either shape today, and the mechanism is unchanged.** Eight of the
-ten are components now: the two Rust rules first, then `no-default-export`,
-`no-restricted-imports`, `no-circular-imports` and `no-unused-exports`, then the two Go rules —
-which is all three of the genuine factories and both rules the dual shape was written for. A bare
-reference to a component renders as `null`, the placeholder holding its place in the entry
-module's array, and its options arrive through `configure` as JSON data rather than through a
-call. The two still shipped as modules are both Python, each `export default defineRule({…})`
-taking no options at all, so neither can exhibit either half. Verified rather than assumed: no file
-under `crates/lanekeep-rules/rules/` still carries the `for (const key in …)` copy, and the only
-surviving instance of the dual shape in this repository is
+**That fix is retired rather than still running, and the split it served has moved twice since
+— so read the split from the tables, not from this paragraph.** `BUILT_IN_RULES` and
+`COMPONENT_RULES` in `crates/lanekeep-rules/src/lib.rs` are the source of truth. As of #167
+twelve built-ins ship, four as WebAssembly components — `no-unwrap` and `no-glob-import` from
+Rust crates, `no-package-init` and `no-context-in-struct` sharing the Go component — and eight
+as QuickJS modules: the four TypeScript-inspecting rules went into a StarlingMonkey component
+and came back in #147 (13 MB of binary and 110× per host-API crossing for no speed benefit,
+architecture §15.1), and `no-restricted-calls` and `duplicate-implementation` arrived as modules
+after them. Three of the eight are genuine factories — `no-restricted-imports`,
+`no-restricted-calls`, `duplicate-implementation` — and none carries the `for (const key in …)`
+copy: the dual shape is gone, not restored. The one surviving instance of it is
 `crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy that ships to nobody.
 
-So the live surface is **project** rules, which is where it always mattered most: a rule
-declaring `check(ctx, m, options)` and exporting a plain object ignores every option it
-documents, in a repository where no built-in demonstrates the mistake any more.
+What stands in the dual shape's place is `rules_module` in `crates/lanekeep-config/src/json.rs`,
+and it treats the two kinds differently. A component's options travel as JSON data to
+`configure` — `null` when the rule is named bare — and its slot in the entry module's array is a
+literal `null` placeholder. A module rule named bare is imported and used as it comes, so a
+factory referenced bare fails config load with ``missing `id` `` — a message naming the symptom,
+a function with no `id`, rather than the cause, a factory nobody called; configuring it, `{}`
+included, makes the entry module call it. A module rule configured with options is called when
+it is a function, and refused with "takes no options — it exports a rule object, not a factory"
+when it is not.
 
-**This paragraph was itself stale for a while, in the file that exists to stop that**, and how it
-happened is the useful part: the migration swept for the rule *names* it was changing, and this
-text describes them by *shape* — "the three genuine factories", "the eight built-ins that are
-still TypeScript modules". That is the entry below about grepping a formula rather than a claim,
-arriving once more. A count written out in prose is the spelling no pattern matches and no test
-covers.
+So the live surface for the *silent* half is still **project** rules, which is where it always
+mattered most: a rule declaring `check(ctx, m, options)` and exporting a plain object ignores
+every option it documents, and no shipped built-in demonstrates the mistake — the factories
+close over their options, and the plain objects take none.
+
+**This section has now been stale twice, in the file that exists to stop that**, and the
+mechanism was the same both times: the text described the built-ins by shape and count — "the
+three genuine factories", "eight of the ten are components" — and the changes that moved them
+(#147's revert, then two new factory modules in #166 and #167) swept for names, which no count
+written in prose matches. That is the entry below about grepping a formula rather than a claim,
+arriving again. A count written out in prose is the spelling no pattern matches and no test
+covers — hence the opening instruction: derive the split from the tables, and treat any number
+this section states as a claim to recompute rather than to trust.
 
 **`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
 `ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a
