@@ -20,6 +20,7 @@ mod bindings;
 // what a guest gets flat and what it reaches through the interface path, and it is worth
 // knowing before sub-project 3 writes an authoring crate around it.
 use bindings::lanekeep::host::types::{
+    QueryFor,
     ReduceLocation, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
@@ -48,7 +49,8 @@ impl Guest for Component {
                     good: String::new(),
                 },
             },
-            query: String::new(),
+
+            queries: vec![QueryFor { language: "rust".to_owned(), query: String::new() }],
             gates: RuleGates {
                 path_matches: Vec::new(),
                 path_not_matches: Vec::new(),

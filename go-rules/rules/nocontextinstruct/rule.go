@@ -123,7 +123,7 @@ func Metadata() types.RuleMetadata {
 				Good: "type Client struct{}\n\nfunc (c *Client) Do(ctx context.Context) error { return nil }",
 			},
 		},
-		Query: QUERY,
+		Queries: lanekeep.Queries("go", QUERY),
 		Gates: types.RuleGates{
 			PathMatches:     cm.ToList(noPatterns),
 			PathNotMatches:  cm.ToList(noPatterns),

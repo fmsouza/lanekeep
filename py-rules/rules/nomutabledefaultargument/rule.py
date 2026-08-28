@@ -36,7 +36,7 @@ def metadata():
             file_contains=[],
             file_not_contains=[],
         ),
-        query="(default_parameter value: (_) @value) @param",
+        queries=[types.QueryFor(language="python", query="(default_parameter value: (_) @value) @param")],
         timeout=None,
     )
 

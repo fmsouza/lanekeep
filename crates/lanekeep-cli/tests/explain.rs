@@ -2,6 +2,7 @@
 
 #![expect(
     clippy::expect_used,
+    clippy::panic,
     reason = "`clippy.toml`'s allow-*-in-tests only reaches `#[test]` functions and \
               `#[cfg(test)]` modules. The helpers below are neither, so the grant it \
               already makes for unit tests has to be restated for them."
@@ -155,7 +156,37 @@ fn explain_as_json_is_valid_and_complete() {
     );
     assert!(parsed["examples"]["bad"].as_str().is_some());
     assert!(parsed["examples"]["good"].as_str().is_some());
-    assert!(parsed["query"].as_str().is_some_and(|q| !q.is_empty()));
+    assert_queries_shape(&parsed);
+}
+
+/// The `queries` object: one entry per declared language, every value a real query.
+///
+/// Asserted on the *values* and not only the container — "is a non-empty object" is
+/// satisfied by `{"typescript": ""}`, which is exactly the document a regressed `rule_json`
+/// would produce.
+fn assert_queries_shape(rule: &serde_json::Value) {
+    let queries = rule["queries"]
+        .as_object()
+        .unwrap_or_else(|| panic!("`queries` is an object keyed by language: {rule:?}"));
+    assert!(!queries.is_empty(), "{rule:?}");
+    for (language, query) in queries {
+        assert!(
+            query.as_str().is_some_and(|q| !q.is_empty()),
+            "the `{language}` query is a non-empty string: {rule:?}"
+        );
+    }
+    let languages: Vec<&str> = rule["languages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`languages` is an array: {rule:?}"))
+        .iter()
+        .filter_map(|l| l.as_str())
+        .collect();
+    for language in queries.keys() {
+        assert!(
+            languages.contains(&language.as_str()),
+            "every `queries` key is a declared language: {rule:?}"
+        );
+    }
 }
 
 #[test]
@@ -167,20 +198,29 @@ fn rules_as_json_lists_every_configured_rule() {
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("bad json ({e}): {stdout}"));
 
-    assert_eq!(parsed["version"], 1);
+    // Version 2 is the `queries`-object shape; the version moves whenever a field's shape
+    // does, because this document exists to be consumed by machines.
+    assert_eq!(parsed["version"], 2);
     assert_eq!(parsed["declared"], 2);
     assert_eq!(parsed["enabled"], 2);
 
-    let ids: Vec<&str> = parsed["rules"]
-        .as_array()
-        .expect("rules array")
-        .iter()
-        .filter_map(|r| r["id"].as_str())
-        .collect();
+    let rules = parsed["rules"].as_array().expect("rules array");
+    let ids: Vec<&str> = rules.iter().filter_map(|r| r["id"].as_str()).collect();
     assert_eq!(
         ids,
         vec!["lanekeep/no-default-export", "lanekeep/no-unused-exports"]
     );
+
+    // The per-rule shape, pinned here too: `explain --json` and `rules --json` share
+    // `rule_json`, and for a while only the explain half asserted anything about it — so
+    // this half could change shape with no test noticing.
+    for rule in rules {
+        assert_queries_shape(rule);
+        assert!(
+            rule.get("query").is_none(),
+            "the singular key is gone: {rule:?}"
+        );
+    }
 }
 
 #[test]

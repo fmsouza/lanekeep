@@ -164,6 +164,25 @@ macro_rules! ruleset {
     };
 }
 
+/// Build the `queries` list of a `RuleMetadata`, one `QueryFor` per language.
+///
+/// The convenience for the common case: a rule targets one grammar and has one query, so
+/// `metadata` stays one line instead of a hand-written `vec![QueryFor { ... }]`. A rule that
+/// targets several grammars writes the list out by hand, since each grammar has its own query.
+///
+/// ```ignore
+/// queries: lanekeep_rule::queries!["rust" => "(call_expression) @call"],
+/// ```
+///
+/// `QueryFor` resolves in the rule crate's own generated `bindings` module, exactly as
+/// `RuleMetadata` does — which is why this is a macro and not a function.
+#[macro_export]
+macro_rules! queries {
+    ($($language:literal => $query:expr),+ $(,)?) => {
+        vec![$(QueryFor { language: $language.to_owned(), query: $query.to_owned() }),+]
+    };
+}
+
 /// The id at `index`, or `None` when the component hosts no such rule.
 ///
 /// Called by [`ruleset!`]'s expansion and by nothing a rule author writes. It is a function

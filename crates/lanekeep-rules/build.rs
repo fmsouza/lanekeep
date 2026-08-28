@@ -88,33 +88,93 @@ fn main() {
         stdout(&format!("cargo:rerun-if-changed={}", input.display()));
     }
 
-    if !components_dir.join("go-builtins.wasm").exists() {
-        build_go_builtins(&repo_root, &components_dir);
-    }
+    // Existence is not currency: an artifact built against an older `world.wit` still
+    // exists, and a world edit that changes an export's shape makes every such artifact fail
+    // at prepare — as a component-type mismatch classified as the *rule's* failure, naming
+    // neither staleness nor the file. `rerun-if-changed` re-runs this script on a world
+    // edit; the stamp below is what makes the re-run act. The stamp is the world's own
+    // bytes, and the check runs only when the world is readable — in `cargo publish`'s
+    // verify build the sources are absent from the package, the read fails, and this stays
+    // the strict no-op the module documentation requires.
+    //
+    // Staleness *attempts* a rebuild, and a failed attempt keeps the old artifact behind a
+    // `cargo:warning`, where a *missing* artifact's failed build still aborts. The
+    // difference is what there is to fall back to: with no artifact the crate cannot compile
+    // at all, while a stale one compiles and only the component-running tests disagree with
+    // it — and a machine that cannot rebuild (no TinyGo, or a TinyGo refusing the host Go)
+    // must not be bricked by a world edit it can do nothing about locally.
+    let stamp = components_dir.join(".world-wit.stamp");
+    let world = fs::read(&world_wit).ok();
+    let stale = world
+        .as_ref()
+        .is_some_and(|world| !fs::read(&stamp).is_ok_and(|recorded| &recorded == world));
+    let mut refreshed_all = true;
 
-    if !components_dir.join("no-glob-import.wasm").exists() {
-        build_rust_component(&repo_root, &components_dir, "no-glob-import");
-    }
+    let refresh = |present: bool, build: &dyn Fn() -> Result<(), String>, recipe: &str| {
+        if present && !stale {
+            return true;
+        }
+        match build() {
+            Ok(()) => true,
+            Err(message) if !present => panic!("{message}"),
+            Err(message) => {
+                stdout(&format!(
+                    "cargo:warning=a shipped component was built against an older \
+                         `world.wit` and could not be rebuilt: {message}"
+                ));
+                stdout(&format!(
+                    "cargo:warning=the previous artifact is kept; component-running \
+                         tests will fail against it until `{recipe}` succeeds"
+                ));
+                false
+            }
+        }
+    };
 
-    if !components_dir.join("no-unwrap.wasm").exists() {
-        build_rust_component(&repo_root, &components_dir, "no-unwrap");
-    }
-
+    refreshed_all &= refresh(
+        components_dir.join("go-builtins.wasm").exists(),
+        &|| build_go_builtins(&repo_root, &components_dir),
+        "just go-rules",
+    );
+    refreshed_all &= refresh(
+        components_dir.join("no-glob-import.wasm").exists(),
+        &|| build_rust_component(&repo_root, &components_dir, "no-glob-import"),
+        "just rust-rules",
+    );
+    refreshed_all &= refresh(
+        components_dir.join("no-unwrap.wasm").exists(),
+        &|| build_rust_component(&repo_root, &components_dir, "no-unwrap"),
+        "just rust-rules",
+    );
     // The TypeScript component ships with its source map sidecar, and `lib.rs` embeds both — so
     // either missing is a missing artifact, and the check must match what `include_bytes!` reads.
-    if !components_dir.join("typescript-builtins.wasm").exists()
-        || !components_dir.join("typescript-builtins.wasm.map").exists()
+    refreshed_all &= refresh(
+        components_dir.join("typescript-builtins.wasm").exists()
+            && components_dir.join("typescript-builtins.wasm.map").exists(),
+        &|| build_typescript_builtins(&repo_root, &components_dir),
+        "just typescript-builtins",
+    );
+
+    // Recorded only once every artifact is current, so a kept-stale artifact leaves the
+    // stamp stale and the warning firing on every build until a rebuild lands.
+    if refreshed_all
+        && let Some(world) = world
+        && !fs::read(&stamp).is_ok_and(|recorded| recorded == world)
     {
-        build_typescript_builtins(&repo_root, &components_dir);
+        fs::write(&stamp, world)
+            .unwrap_or_else(|e| panic!("failed to write `{}`: {e}", stamp.display()));
     }
 }
 
 /// Rebuild `go-builtins.wasm` with TinyGo, reproducing `just go-rules`.
-fn build_go_builtins(repo_root: &Path, components_dir: &Path) {
+///
+/// Fallible rather than panicking, because the caller decides what a failure means: fatal
+/// for a missing artifact, a kept-stale warning for a rebuild.
+fn build_go_builtins(repo_root: &Path, components_dir: &Path) -> Result<(), String> {
     // `tinygo build` also invokes `wasm-opt` (WASMOPT) and `wasm-tools` internally, but the
     // recipe's own guard is `tinygo`; the failure of those two surfaces from inside the build
     // with the toolchain naming them.
-    require_tool("tinygo", "just go-rules");
+    require_tool("tinygo", "just go-rules")?;
 
     let status = Command::new("tinygo")
         .arg("build")
@@ -130,22 +190,22 @@ fn build_go_builtins(repo_root: &Path, components_dir: &Path) {
         .arg(".")
         .current_dir(repo_root.join("go-rules"))
         .status()
-        .unwrap_or_else(|e| {
-            panic!("failed to run `tinygo build` to build `go-builtins.wasm`: {e}")
-        });
+        .map_err(|e| format!("failed to run `tinygo build` to build `go-builtins.wasm`: {e}"))?;
 
     if !status.success() {
-        panic!(
+        return Err(
             "`tinygo build` failed to build `go-builtins.wasm` (the `just go-rules` equivalent)"
+                .to_owned(),
         );
     }
+    Ok(())
 }
 
 /// Rebuild one of the two shipped Rust components with `cargo component`, reproducing
 /// `just rust-rules` for that one crate. `name` is the directory name with hyphens, e.g.
 /// `no-unwrap`; cargo names the artifact with hyphens turned into underscores.
-fn build_rust_component(repo_root: &Path, components_dir: &Path, name: &str) {
-    require_tool("cargo-component", "just rust-rules");
+fn build_rust_component(repo_root: &Path, components_dir: &Path, name: &str) -> Result<(), String> {
+    require_tool("cargo-component", "just rust-rules")?;
 
     let underscore_name = name.replace('-', "_");
 
@@ -157,14 +217,14 @@ fn build_rust_component(repo_root: &Path, components_dir: &Path, name: &str) {
         .arg("wasm32-unknown-unknown")
         .current_dir(repo_root.join("rust-rules").join(name))
         .status()
-        .unwrap_or_else(|e| {
-            panic!("failed to run `cargo component build` to build `{name}.wasm`: {e}")
-        });
+        .map_err(|e| {
+            format!("failed to run `cargo component build` to build `{name}.wasm`: {e}")
+        })?;
 
     if !status.success() {
-        panic!(
+        return Err(format!(
             "`cargo component build` failed to build `{name}.wasm` (the `just rust-rules` equivalent)"
-        );
+        ));
     }
 
     fs::copy(
@@ -173,21 +233,21 @@ fn build_rust_component(repo_root: &Path, components_dir: &Path, name: &str) {
             .join(format!("{underscore_name}.wasm")),
         components_dir.join(format!("{name}.wasm")),
     )
-    .unwrap_or_else(|e| panic!("failed to copy the built `{name}.wasm` into components/: {e}"));
+    .map_err(|e| format!("failed to copy the built `{name}.wasm` into components/: {e}"))?;
+    Ok(())
 }
 
 /// Rebuild `typescript-builtins.wasm` (and its `.map`) with `jco componentize`,
 /// reproducing `just typescript-builtins` (which routes through `_componentize`).
-fn build_typescript_builtins(repo_root: &Path, components_dir: &Path) {
-    require_tool("node", "just typescript-builtins");
-    require_tool("npx", "just typescript-builtins");
+fn build_typescript_builtins(repo_root: &Path, components_dir: &Path) -> Result<(), String> {
+    require_tool("node", "just typescript-builtins")?;
+    require_tool("npx", "just typescript-builtins")?;
 
     let jco = repo_root.join("packages/lanekeep/node_modules/.bin/jco");
     if !jco.is_file() {
-        panic!(
-            "error: 'packages/lanekeep' has no installed jco.\n\
+        return Err("error: 'packages/lanekeep' has no installed jco.\n\
              run `npm --prefix packages/lanekeep ci` first, or run `just typescript-builtins`."
-        );
+            .to_owned());
     }
 
     let status = Command::new("npx")
@@ -209,20 +269,24 @@ fn build_typescript_builtins(repo_root: &Path, components_dir: &Path) {
         .arg("-o")
         .arg(components_dir.join("typescript-builtins.wasm"))
         .status()
-        .unwrap_or_else(|e| {
-            panic!("failed to run `jco componentize` to build `typescript-builtins.wasm`: {e}")
-        });
+        .map_err(|e| {
+            format!("failed to run `jco componentize` to build `typescript-builtins.wasm`: {e}")
+        })?;
 
     if !status.success() {
-        panic!(
+        return Err(
             "`jco componentize` failed to build `typescript-builtins.wasm` (the `just typescript-builtins` equivalent)"
+                .to_owned(),
         );
     }
+    Ok(())
 }
 
-/// Fail with an actionable message naming the missing tool and its `just` recipe
-/// equivalent, and exit non-zero. A build script may panic to abort the build.
-fn require_tool(tool: &str, recipe: &str) {
+/// An actionable refusal naming the missing tool and its `just` recipe equivalent.
+///
+/// A `Result` rather than a panic, so the caller decides whether a missing tool aborts the
+/// build (a missing artifact) or becomes a kept-stale warning (a failed refresh).
+fn require_tool(tool: &str, recipe: &str) -> Result<(), String> {
     if Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {}", tool))
@@ -230,12 +294,12 @@ fn require_tool(tool: &str, recipe: &str) {
         .map(|o| o.status.success())
         .unwrap_or(false)
     {
-        return;
+        return Ok(());
     }
-    panic!(
+    Err(format!(
         "error: required tool `{tool}` is not installed.\n\
          install it and re-run, or build the component with `{recipe}`."
-    );
+    ))
 }
 
 /// `println!` to stdout (cargo reads directives from the build script's stdout).

@@ -100,6 +100,10 @@ func wasmimport_CheckContextResolvesToImport(self0 uint32, n0 uint32, module0 *u
 //go:noescape
 func wasmimport_CheckContextRoot(self0 uint32) (result0 uint32)
 
+//go:wasmimport lanekeep:host/types@0.1.0 [method]check-context.structure-fingerprint
+//go:noescape
+func wasmimport_CheckContextStructureFingerprint(self0 uint32, n0 uint32, result *cm.Option[StructureFingerprint])
+
 //go:wasmimport lanekeep:host/types@0.1.0 [method]check-context.text
 //go:noescape
 func wasmimport_CheckContextText(self0 uint32, n0 uint32, result *cm.Option[string])

@@ -153,9 +153,9 @@ Implement this on day one even though only `lanekeep-lang-js` exists. It is chea
 
 ## 4. Rule definition format
 
-A rule declares metadata, a tree-sitter query that gates execution, and a handler invoked once per match. There are two ways to author one, and the rest of the engine treats them alike: **a TypeScript module with a default export**, evaluated in the sandbox of §5, or **a WebAssembly component** exporting the `rule` world of §6.9, executed by wasmtime. `RuleSpec::component` is the single field that decides which engine a rule goes to, and it is set where a rule is described rather than guessed at anywhere downstream.
+A rule declares metadata, a tree-sitter query that gates execution — one per language it targets, with a single string as sugar for "every declared language" — and a handler invoked once per match. There are two ways to author one, and the rest of the engine treats them alike: **a TypeScript module with a default export**, evaluated in the sandbox of §5, or **a WebAssembly component** exporting the `rule` world of §6.9, executed by wasmtime. `RuleSpec::component` is the single field that decides which engine a rule goes to, and it is set where a rule is described rather than guessed at anywhere downstream.
 
-Neither is privileged. A component is held to the same validation a TypeScript rule is — namespace, card, query, `has-check` — by the same code, and both engines run in one pass over one corpus. Which form a rule takes is invisible to a config: `lanekeep/no-unwrap` names the rule, not its implementation, so a rule migrating from one to the other requires no config change.
+Neither is privileged. A component is held to the same validation a TypeScript rule is — namespace, card, queries, `has-check` — by the same code, and both engines run in one pass over one corpus. Which form a rule takes is invisible to a config: `lanekeep/no-unwrap` names the rule, not its implementation, so a rule migrating from one to the other requires no config change.
 
 **A component's source language is not part of the arrangement, and eight of the ten built-ins are components today.** Two are written in Rust and compiled with `cargo component` — `docs/authoring-rust-rules.md` is how one is written. Two are written in Go and compiled with TinyGo into one shared component — `docs/authoring-go-rules.md`, and they are the migration that shows the arrangement holding in the harder direction: their TypeScript is deleted, so a Go rule is the component or it is nothing. The other four are *the same TypeScript files they were as modules*, compiled ahead of time by `componentize-js` into one shared component (§5.2). That form is the reason the arrangement has to be two ways of shipping a rule rather than "TypeScript rules are modules and everything else is a component": the four moved with their sources frozen byte-for-byte, and the four test files that covered them as modules pass unmodified against them as a component. Which engine runs a rule and which language it was written in became independent questions in that change.
 
@@ -203,6 +203,30 @@ export default defineRule({
   },
 })
 ```
+
+The `query` above is a single string, which means "this query, for every language the rule
+targets". A rule may instead declare one query per language, which is what lets one rule span
+grammars that do not share node vocabulary — Python spells a call `call`, the other supported
+grammars say `call_expression`, and the four function-definition kinds are four different
+names:
+
+```ts
+export default defineRule({
+  id: 'local/no-naked-calls',
+  language: ['typescript', 'python'],
+  query: {
+    typescript: '(call_expression) @call',
+    python: '(call) @call',
+  },
+  // ...
+})
+```
+
+Both mismatch directions are refused at config load, naming the language: a declared language
+with no query entry (the rule would run on nothing there, silently), and a query entry for a
+language the rule does not target (the query could never run, silently). A rule that targets
+several languages must name every one of them in the object — the string form expands to every
+declared language by construction.
 
 `check` is ordinary TypeScript. It may loop, accumulate state, build data structures, read other files through `ctx.readFile`, and call any helper the author writes — including code imported from sibling rule modules. There is no expressiveness ceiling and no escape hatch needed, because the hatch is the whole floor.
 
@@ -476,7 +500,7 @@ It has five exports a TypeScript rule has no need of, and each exists because a 
 | Export | Why it exists |
 |---|---|
 | `rules() -> list<string>` | A module *is* the rule; a component has to say which rules it hosts. Ids rather than metadata, and the split is load-bearing: `configure` must run before metadata is read, because a factory rule's card and query are produced by applying the factory to its options — but to configure rule *i* you must know *i* exists. A rule's id cannot depend on its options, because the id is how a config names the rule, so ids enumerate before configuration and everything else is read after it. |
-| `metadata(rule) -> rule-metadata` | A TypeScript rule's id, languages, severity, card, query, gates and timeout live in its `defineRule` call, and evaluating the module is how they are read. Nothing can evaluate a component to read a literal, so it answers for itself — once, at config load. |
+| `metadata(rule) -> rule-metadata` | A TypeScript rule's id, languages, severity, card, queries (one per language it targets), gates and timeout live in its `defineRule` call, and evaluating the module is how they are read. Nothing can evaluate a component to read a literal, so it answers for itself — once, at config load. |
 | `configure(rule, options-json) -> result<_, string>` | A JavaScript factory closes over its options. A component cannot close over a host-supplied value, so options cross as JSON data, once per instance, before any handler runs. A component that refuses its options fails config load with its own message, which is a refusal rather than a trap. |
 | `has-check(rule) -> bool` | Extraction records whether a TypeScript rule's `check` is callable, because a misspelled handler would otherwise load cleanly and never fire. A component is asked the same question rather than taken at its config's word. |
 | `has-reduce(rule) -> bool` | The same, for the cross-file phase. |
@@ -542,7 +566,7 @@ key = blake3(
 
 Every field is length-prefixed before hashing. Without that, `("ab", "c")` and `("a", "bc")` hash alike and two genuinely different runs share a key — the one failure a cache must not have.
 
-**A rule declares which languages it targets, and the file decides which grammar parses it.** `language` accepts one or several and defaults to `['typescript', 'tsx']`; a rule does not run on a file whose language it does not name, and the query is compiled once per language against that grammar. Choosing the grammar from the *rule* instead would parse a `.tsx` file with the TypeScript grammar, turning every JSX element into an `ERROR` node — and a query matches nothing inside one, silently, which on a React codebase means most of the code goes unchecked with no diagnostic.
+**A rule declares which languages it targets, and the file decides which grammar parses it.** `language` accepts one or several and defaults to `['typescript', 'tsx']`; a rule does not run on a file whose language it does not name, and each language's query — a single string for every declared language, or one per language when the grammars do not share node vocabulary — is compiled against that grammar. Choosing the grammar from the *rule* instead would parse a `.tsx` file with the TypeScript grammar, turning every JSX element into an `ERROR` node — and a query matches nothing inside one, silently, which on a React codebase means most of the code goes unchecked with no diagnostic.
 
 Grammars enter the key as the **whole registry**, not the one language a given file used. A file's rules can involve more than one grammar, and working out which is harder to get right than accepting that a tree-sitter bump invalidates everything. That over-invalidates by the files using the other languages, which costs a recompute.
 

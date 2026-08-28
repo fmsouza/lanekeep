@@ -36,7 +36,7 @@ class WitWorld(wit_world.WitWorld):
                 remediation="none",
                 examples=types.RuleExamples(bad="x", good="y"),
             ),
-            query="(identifier) @id",
+            queries=[types.QueryFor(language="python", query="(identifier) @id")],
             gates=types.RuleGates(
                 path_matches=[],
                 path_not_matches=[],

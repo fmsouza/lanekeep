@@ -1990,6 +1990,24 @@ fn validate_metadata(metadata: &types::RuleMetadata) -> Result<(), WasmError> {
                 .to_owned(),
         });
     }
+    // The exact cover — no queries at all, a duplicated language, a declared language with
+    // no query, a query for an undeclared language — shared word for word with the
+    // TypeScript gate (`lanekeep-config`'s `build_rule`) through `lanekeep_core::query_cover`,
+    // so the two paths cannot drift in what they accept or in how they say no. The duplicate
+    // arm is live only here: a component's `queries` is a `list<query-for>`, where copying an
+    // entry and editing only its query is one forgotten field away, and both cover directions
+    // would still hold while the first query was silently discarded. Per-entry emptiness is
+    // deliberately *not* checked here — probe fixtures answer `metadata` with an empty query
+    // on purpose, and `build_rule` is the gate that refuses one before a rule runs.
+    if let Err(problem) = lanekeep_core::query_cover::check(
+        &metadata.languages,
+        metadata.queries.iter().map(|q| q.language.as_str()),
+    ) {
+        return Err(WasmError::InvalidMetadata {
+            rule: metadata.id.clone(),
+            detail: problem.describe(),
+        });
+    }
     if metadata.gates.file_contains.len() > 1 {
         return Err(WasmError::InvalidMetadata {
             rule: metadata.id.clone(),
@@ -2107,7 +2125,10 @@ mod tests {
                     good: "g".to_owned(),
                 },
             },
-            query: "(x) @y".to_owned(),
+            queries: vec![types::QueryFor {
+                language: "rust".to_owned(),
+                query: "(x) @y".to_owned(),
+            }],
             gates: types::RuleGates {
                 path_matches: Vec::new(),
                 path_not_matches: Vec::new(),
@@ -2131,6 +2152,57 @@ mod tests {
             validate_metadata(&metadata).expect_err("an empty language list is no file at all");
         assert!(matches!(error, WasmError::InvalidMetadata { .. }));
         assert!(format!("{error}").contains("fixture/valid"));
+    }
+
+    #[test]
+    fn a_metadata_with_no_query_is_refused() {
+        let mut metadata = valid_metadata();
+        metadata.queries.clear();
+        let error = validate_metadata(&metadata).expect_err("no query can never match");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+        assert!(format!("{error}").contains("no query"));
+    }
+
+    #[test]
+    fn a_metadata_missing_a_query_for_a_declared_language_is_refused() {
+        let mut metadata = valid_metadata();
+        metadata.languages = vec!["rust".to_owned(), "go".to_owned()];
+        let error = validate_metadata(&metadata)
+            .expect_err("a declared language without a query is silent");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+        assert!(format!("{error}").contains("go"));
+    }
+
+    #[test]
+    fn a_metadata_with_a_query_for_an_undeclared_language_is_refused() {
+        let mut metadata = valid_metadata();
+        metadata.queries.push(types::QueryFor {
+            language: "go".to_owned(),
+            query: "(x) @y".to_owned(),
+        });
+        let error = validate_metadata(&metadata)
+            .expect_err("a query for an untargeted language never runs");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+        assert!(format!("{error}").contains("go"));
+    }
+
+    #[test]
+    fn a_metadata_naming_one_language_in_two_queries_is_refused() {
+        // Both cover directions hold for this metadata — the declared language has an entry,
+        // and every entry names a declared language — so before the duplicate refusal the
+        // second query silently replaced the first, by position, with nothing reporting it.
+        let mut metadata = valid_metadata();
+        let language = metadata.queries[0].language.clone();
+        metadata.queries.push(types::QueryFor {
+            language: language.clone(),
+            query: "(another) @y".to_owned(),
+        });
+        let error = validate_metadata(&metadata)
+            .expect_err("a language named twice runs only one of its queries");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+        let rendered = format!("{error}");
+        assert!(rendered.contains("two queries"), "{rendered}");
+        assert!(rendered.contains(&language), "{rendered}");
     }
 
     #[test]

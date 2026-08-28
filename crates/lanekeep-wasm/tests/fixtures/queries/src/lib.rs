@@ -27,7 +27,7 @@
 #[allow(warnings)]
 mod bindings;
 
-use bindings::lanekeep::host::types::{RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata};
+use bindings::lanekeep::host::types::{QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 /// A handle no arena in these tests will have issued.
@@ -63,7 +63,8 @@ impl Guest for Component {
                     good: String::new(),
                 },
             },
-            query: String::new(),
+
+            queries: vec![QueryFor { language: "rust".to_owned(), query: String::new() }],
             gates: RuleGates {
                 path_matches: Vec::new(),
                 path_not_matches: Vec::new(),

@@ -52,7 +52,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -143,9 +143,9 @@ impl Rule for DeterministicIteration {
                         .to_owned(),
                 },
             },
-            query: "[\n  (use_declaration argument: (_) @name)\n  (type_identifier) @name\n  \
+            queries: lanekeep_rule::queries!["rust" => "[\n  (use_declaration argument: (_) @name)\n  (type_identifier) @name\n  \
                     (scoped_identifier path: (identifier) @name)\n] @site"
-                .to_owned(),
+                .to_owned()],
             // No `file-contains` gate, deliberately.
             //
             // It would be an *and* over every unordered substring, and a file containing only

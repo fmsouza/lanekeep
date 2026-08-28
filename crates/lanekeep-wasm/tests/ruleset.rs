@@ -17,7 +17,7 @@ fn one_component_hosts_two_rules_with_independent_metadata() {
     assert_eq!(first.id, "fixture/first");
     assert_eq!(second.id, "fixture/second");
     assert_ne!(
-        first.query, second.query,
+        first.queries, second.queries,
         "two rules in one component must not collapse to one description"
     );
 }

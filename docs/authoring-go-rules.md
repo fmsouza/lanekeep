@@ -181,9 +181,22 @@ pass the rule does not have and `has-check`/`has-reduce` answer from the same va
 uses, so what the component says about itself and what it does cannot disagree. All three type
 parameters are named at the call site because an untyped `nil` carries nothing to infer from.
 
-`metadata` is the rule's id, languages, severity, card, query, gates and timeout — the
+`metadata` is the rule's id, languages, severity, card, queries, gates and timeout — the
 component's answer to what a `defineRule` call carries, validated by exactly the code that
-validates a TypeScript rule's. `configure` is handed the rule's options as a JSON string,
+validates a TypeScript rule's, including the same empty-queries and query/language-mismatch
+refusals.
+
+`queries` is one entry per language the rule targets, because a rule can span grammars that do
+not share node vocabulary. For the common single-language case the SDK's `Queries` constructor
+keeps it one line:
+
+```go
+Queries: lanekeep.Queries("go", "(call_expression) @call"),
+```
+
+A rule targeting several grammars writes the `cm.ToList([]types.QueryFor{{Language: ..., Query: ...}, ...})`
+out by hand, since each grammar has its own query. `configure` is handed the rule's options as a
+JSON string,
 `"null"` for a rule named with no options; parse it with `encoding/json`, and return an error to
 *refuse* a configuration rather than to fail. `check` and `reduce` return a plain Go `error`,
 which the entry converts into the world's `result<_, rule-error>`.

@@ -53,7 +53,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -139,8 +139,8 @@ impl Rule for NoAmbientAuthority {
                         .to_owned(),
                 },
             },
-            query: "[\n  (use_declaration argument: (_) @path)\n  (scoped_identifier path: (_) @path)\n] @site"
-                .to_owned(),
+            queries: lanekeep_rule::queries!["rust" => "[\n  (use_declaration argument: (_) @path)\n  (scoped_identifier path: (_) @path)\n] @site"
+                .to_owned()],
             // The TypeScript original declares no `fileContains` gate, so there is none here.
             gates: RuleGates {
                 path_matches: Vec::new(),

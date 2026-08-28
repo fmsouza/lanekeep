@@ -29,7 +29,13 @@ fn a_component_declares_its_own_identity() {
     assert_eq!(declared.id, "fixture/metadata");
     assert_eq!(declared.languages, vec!["rust".to_owned()]);
     assert_eq!(declared.severity, "error");
-    assert_eq!(declared.query, "(call_expression) @call");
+    assert_eq!(
+        declared.queries,
+        vec![lanekeep_wasm::bindings::types::QueryFor {
+            language: "rust".to_owned(),
+            query: "(call_expression) @call".to_owned(),
+        }]
+    );
     assert_eq!(declared.card.message, "a fixture");
     assert_eq!(declared.card.remediation, "do the other thing");
     assert_eq!(declared.card.examples.bad, "bad()");
@@ -134,6 +140,35 @@ fn a_component_naming_no_language_is_refused() {
     assert!(
         format!("{error}").contains("fixture/metadata"),
         "the refusal must name the rule: {error}"
+    );
+}
+
+#[test]
+fn a_component_naming_one_language_in_two_queries_is_refused() {
+    // `{"duplicate-query":true}` makes the fixture's `metadata` answer two `query-for`
+    // entries for its one language. Both cover directions hold for that shape — the declared
+    // language has an entry, every entry names a declared language — so before the duplicate
+    // refusal the second query silently replaced the first, by position, and the rule ran
+    // against a query its author had not chosen. Driven through the real load path, exactly
+    // as the `no-language` refusal is.
+    let (mut runtime, slot) = runtime_for_options("metadata", r#"{"duplicate-query":true}"#);
+
+    let error = runtime
+        .metadata(slot)
+        .expect_err("a language named twice runs only one of its queries");
+
+    assert!(
+        matches!(error, WasmError::InvalidMetadata { .. }),
+        "the refusal must be the named variant, not a trap: {error:?}"
+    );
+    let rendered = format!("{error}");
+    assert!(
+        rendered.contains("fixture/metadata"),
+        "the refusal must name the rule: {rendered}"
+    );
+    assert!(
+        rendered.contains("two queries") && rendered.contains("rust"),
+        "the refusal must name the duplicated language: {rendered}"
     );
 }
 

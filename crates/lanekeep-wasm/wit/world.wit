@@ -221,6 +221,12 @@ interface types {
     file-not-contains: list<string>,
   }
 
+  /// One rule's query for one language it targets.
+  record query-for {
+    language: string,
+    query: string,
+  }
+
   /// What a component says it is, read once at prepare time.
   ///
   /// A plain record returned by a function rather than a resource: it is read once and
@@ -238,7 +244,19 @@ interface types {
     languages: list<string>,
     severity: string,
     card: rule-card,
-    query: string,
+    /// One query per language this rule targets, so one rule can span grammars that do not
+    /// share node vocabulary — Python spells a call `call`, the other supported grammars say
+    /// `call_expression`, and the four function-definition kinds are four different names.
+    /// The authoring surfaces expand a single string to every declared language; this list
+    /// is the shape the host reads.
+    ///
+    /// The host refuses an empty list at load, before any file is checked — a rule with no
+    /// query can never match, and silently, exactly as an empty `languages` list can never
+    /// run at all. It also refuses the two mismatch directions, both naming the language: a
+    /// declared language with no query entry, and a query entry for a language the rule does
+    /// not target. A language silently running no query is the same failure the
+    /// empty-`languages` refusal guards — never fires, nothing reports the mistake.
+    queries: list<query-for>,
     gates: rule-gates,
     /// Milliseconds. None means the default per-invocation budget.
     timeout: option<u64>,

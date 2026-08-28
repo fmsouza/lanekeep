@@ -1228,8 +1228,11 @@ fn rules(project_root: &Path, config: Option<&Path>, as_json: bool) -> anyhow::R
 
     if as_json {
         let listing: Vec<serde_json::Value> = engine.rules().map(rule_json).collect();
+        // Version 2: a rule's singular `query` string became a `queries` object keyed by
+        // language. The document is consumed by machines, so a shape change moves the
+        // version even when every other field is unchanged.
         let document = serde_json::json!({
-            "version": 1,
+            "version": 2,
             "declared": declared,
             "enabled": engine.rule_count(),
             "rules": listing,
@@ -1261,6 +1264,12 @@ fn rules(project_root: &Path, config: Option<&Path>, as_json: bool) -> anyhow::R
 }
 
 /// One rule as JSON, shared by `rules --json` and `explain --json`.
+///
+/// `queries` — plural, an object keyed by language — replaced a singular `query` string
+/// when rules grew one query per language. The key changed with the shape on purpose: a
+/// consumer written against the string form fails loudly on a missing key instead of
+/// receiving an object where it read a string, and the `rules --json` envelope's `version`
+/// moved with it.
 fn rule_json(spec: &lanekeep_config::RuleSpec) -> serde_json::Value {
     serde_json::json!({
         "id": spec.id.to_string(),
@@ -1272,7 +1281,7 @@ fn rule_json(spec: &lanekeep_config::RuleSpec) -> serde_json::Value {
             "bad": spec.card.examples.bad.clone(),
             "good": spec.card.examples.good.clone(),
         },
-        "query": spec.query.clone(),
+        "queries": spec.queries.clone(),
         "crossFile": spec.has_reduce,
     })
 }
