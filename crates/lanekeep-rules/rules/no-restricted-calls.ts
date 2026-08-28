@@ -11,6 +11,12 @@ import { appliesTo, matches } from 'lanekeep/patterns'
  * A factory rather than a rule object, on the same terms as the import sibling: the
  * restriction is the whole content of the rule.
  *
+ * One rule, five grammars: `language` names them and `query` carries one entry per grammar.
+ * The restriction grammar, the `from` carve-outs and the raw-text matching are identical in
+ * every language — what varies is which nodes are a call and how a qualified callee is
+ * spelled (`console.log`, `requests.get`, `fmt.Println`, `std::fs::read`). A rust macro is
+ * not a call and cannot be restricted here.
+ *
  * @example
  * ```ts
  * import noRestrictedCalls from 'lanekeep/no-restricted-calls'
@@ -32,7 +38,7 @@ export default function noRestrictedCalls(options) {
 
   return defineRule({
     id: 'lanekeep/no-restricted-calls',
-    language: ['typescript', 'tsx'],
+    language: ['typescript', 'tsx', 'python', 'go', 'rust'],
     severity: 'error',
 
     card: {
@@ -47,7 +53,19 @@ export default function noRestrictedCalls(options) {
     // No gates: a restriction list has no single substring every violating file
     // contains, and `fileContains` is an *and* with no *or* form — a wrong gate is
     // worse than none.
-    query: '(call_expression function: [(identifier) (member_expression)] @callee) @call',
+    //
+    // One query per grammar it names. Python alone spells a call `call`; the callee
+    // shapes are each grammar's bare and qualified forms. A rust `macro_invocation` is
+    // deliberately not among them — `println!` is not a `call_expression`, and
+    // restricting macros is out of scope.
+    query: {
+      typescript:
+        '(call_expression function: [(identifier) (member_expression)] @callee) @call',
+      tsx: '(call_expression function: [(identifier) (member_expression)] @callee) @call',
+      python: '(call function: [(identifier) (attribute)] @callee) @call',
+      go: '(call_expression function: [(identifier) (selector_expression)] @callee) @call',
+      rust: '(call_expression function: [(identifier) (scoped_identifier) (field_expression)] @callee) @call',
+    },
 
     check(ctx, m) {
       // The callee as written, normalized once: whitespace stripped (`console\n  .log`

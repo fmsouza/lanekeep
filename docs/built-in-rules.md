@@ -13,8 +13,8 @@ Name one by specifier and put it in your `rules` array. In a `lanekeep.json`, wh
 }
 ```
 
-Or in a `lanekeep.config.ts`, for a rule that is a TypeScript module — which today means the two
-Python rules and the six TypeScript-targeting rules:
+Or in a `lanekeep.config.ts`, for a rule that is a TypeScript module — every built-in except
+the four compiled ones, whatever language each targets:
 
 ```ts
 import { defineConfig } from 'lanekeep'
@@ -41,9 +41,9 @@ Importing one from a TypeScript config fails at load with a message that says so
 remedy — which is the whole of the difference a user sees. Every example in this document uses
 whichever format the rule it documents accepts.
 
-The TypeScript rules are evaluated in QuickJS from the sources they were written in — the two
-Python-targeting rules and the six TypeScript-targeting ones (four of which briefly shipped
-compiled to a StarlingMonkey component before that form was reverted for cost). The Rust and Go
+The TypeScript-module rules are evaluated in QuickJS from the sources they were written in,
+whatever language each targets (four of them briefly shipped compiled to a StarlingMonkey
+component before that form was reverted for cost). The Rust and Go
 ones are written in the language they check and have no TypeScript at all. Which form a rule
 takes is not part of its interface: the specifier, the id, the options and the output are the
 same either way, and a rule that changes form does not change your config — the two Go rules
@@ -66,9 +66,9 @@ A rule that names no language defaults to `['typescript', 'tsx']`.
 
 # TypeScript
 
-**These five run on `.ts` and `.tsx` and not on JavaScript.** None of them declares a `language`,
-so all five take the default above — `['typescript', 'tsx']` — and `javascript` is a separate
-language covering `.js`, `.mjs`, `.cjs` and `.jsx`. This section was headed "TypeScript and
+**The rules in this section run on `.ts` and `.tsx` and not on JavaScript.** Each either takes
+the `['typescript', 'tsx']` default above or declares exactly that pair, and `javascript` is a
+separate language covering `.js`, `.mjs`, `.cjs` and `.jsx`. This section was headed "TypeScript and
 JavaScript" for a while and the rules underneath it never fired on a `.js` file, which is the
 quiet kind of wrong: a rule that does not run looks exactly like a codebase with nothing to
 report. Extending them is a rule change rather than a documentation one.
@@ -165,101 +165,6 @@ every other directory, which would rot the first time someone adds one.
 `reason` is the field worth spending time on. An agent reading lanekeep's output needs to
 know what to do instead, not merely that something is banned — the reason is the part of the
 message that tells it.
-
-
----
-
-## `lanekeep/no-restricted-calls`
-
-Forbid calling given callables, optionally only from given paths.
-
-The call-expression sibling of `no-restricted-imports`: "no `console.*` outside the logging
-layer", "no raw `fetch` outside the API client" — each is one restriction entry instead of a
-bespoke local rule. The restrictions themselves stay project-specific (they are the options);
-the mechanism — *where* a call may happen — is what is general.
-
-Its card: **message** `restricted call`, **remediation** "call something permitted here, or
-move this code where it is allowed", with the example pair `console.log(metrics)` (reported)
-and `log(metrics)` (fine).
-
-The restriction is the entire content of the rule, so naming it without options does nothing
-useful — give it `restrictions`:
-
-```json
-{
-  "rules": [
-    {
-      "rule": "lanekeep/no-restricted-calls",
-      "options": {
-        "restrictions": [
-          {
-            "call": "console.*",
-            "from": ["!src/logging/**"],
-            "reason": "route it through the logger"
-          },
-          { "call": "fetch", "reason": "use the API client" }
-        ]
-      }
-    }
-  ]
-}
-```
-
-This rule is a **factory** — a function you call with options, which returns a rule — so a
-`lanekeep.config.ts` calls it rather than naming it:
-
-```ts
-import noRestrictedCalls from 'lanekeep/no-restricted-calls'
-
-export default defineConfig({
-  rules: [noRestrictedCalls({ restrictions: [{ call: 'console.*' }] })],
-})
-```
-
-**Two spellings fail to load.** A bare `"lanekeep/no-restricted-calls"` in a JSON config, and an
-uncalled `noRestrictedCalls` reference in a TypeScript config (`rules: [noRestrictedCalls]`
-rather than `rules: [noRestrictedCalls({...})]`), both fail with `missing 'id'` — a factory
-function has no `id` of its own; only the rule it returns does.
-
-### Options
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `restrictions` | `Restriction[]` | What is forbidden. Defaults to `[]`. |
-
-Each restriction:
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `call` | `string` | The callee to forbid. `*` matches anything, including `.`. |
-| `from` | `string[]` | Where the restriction applies. Omitted means everywhere. |
-| `reason` | `string` | What to do instead. Carried into the violation message. |
-
-`call` is matched against the callee **as written**, with whitespace stripped and `?.` folded to
-`.` — so `console\n  .log` and `console?.log` both match `console.*`. Matching the raw text
-rather than a resolved name is deliberate: a restriction is written against what an author
-types, on the same terms as `no-restricted-imports`. Only the callee is normalized, so write a
-restriction in dotted form (`console.*`, not `console?. *`).
-
-### What it cannot tell apart
-
-A call reached through computed member access — `console['log']('x')` or `obj[key]('x')` — is
-not captured by the query, and a `new` expression is not a call. Telling them apart is a
-different query rather than a normalization fix; a test pins the boundary so it stays a known
-limit rather than a surprise.
-
-An entry in `from` beginning with `!` is a carve-out — the restriction applies everywhere
-*except* there, and a carve-out beats an inclusion. That inversion is what makes "no `fetch`
-outside the API client" one restriction rather than an enumeration of every other directory,
-which would rot the first time someone adds one.
-
-`reason` is the field worth spending time on. An agent reading lanekeep's output needs to know
-what to do instead, not merely that something is banned — the reason is the part of the message
-that tells it.
-
-The violation names the callee and the reason — `calling 'console.log' is restricted — route it
-through the logger` — and is anchored at the call. One violation per call, even when several
-restrictions match it; the first matching restriction's reason is the one carried.
 
 
 ---
@@ -640,6 +545,116 @@ not have (§1 non-goals). A test pins the behavior so it is a known limit rather
 ---
 
 # Every language
+
+## `lanekeep/no-restricted-calls`
+
+Forbid calling given callables, optionally only from given paths.
+
+The call-expression sibling of `no-restricted-imports`: "no `console.*` outside the logging
+layer", "no raw `fetch` outside the API client" — each is one restriction entry instead of a
+bespoke local rule. The restrictions themselves stay project-specific (they are the options);
+the mechanism — *where* a call may happen — is what is general.
+
+It declares `['typescript', 'tsx', 'python', 'go', 'rust']`, with one query per grammar. The
+restriction grammar, the `from` carve-outs and the raw-text matching are identical in every
+language; what is per-language is which nodes are a call and how a qualified callee is spelled:
+
+| Language | Qualified callee shape | Example restrictions |
+| --- | --- | --- |
+| TypeScript/TSX | member access | `console.*`, `fetch` |
+| Python | attribute access | `requests.*`, `open` |
+| Go | selector | `fmt.*`, `panic` |
+| Rust | path or method | `std::fs::*`, `*.fetch` |
+
+Its card: **message** `restricted call`, **remediation** "call something permitted here, or
+move this code where it is allowed", with the example pair `console.log(metrics)` (reported)
+and `log(metrics)` (fine).
+
+The restriction is the entire content of the rule, so naming it without options does nothing
+useful — give it `restrictions`:
+
+```json
+{
+  "rules": [
+    {
+      "rule": "lanekeep/no-restricted-calls",
+      "options": {
+        "restrictions": [
+          {
+            "call": "console.*",
+            "from": ["!src/logging/**"],
+            "reason": "route it through the logger"
+          },
+          { "call": "fetch", "reason": "use the API client" }
+        ]
+      }
+    }
+  ]
+}
+```
+
+This rule is a **factory** — a function you call with options, which returns a rule — so a
+`lanekeep.config.ts` calls it rather than naming it:
+
+```ts
+import noRestrictedCalls from 'lanekeep/no-restricted-calls'
+
+export default defineConfig({
+  rules: [noRestrictedCalls({ restrictions: [{ call: 'console.*' }] })],
+})
+```
+
+**Two spellings fail to load.** A bare `"lanekeep/no-restricted-calls"` in a JSON config, and an
+uncalled `noRestrictedCalls` reference in a TypeScript config (`rules: [noRestrictedCalls]`
+rather than `rules: [noRestrictedCalls({...})]`), both fail with `missing 'id'` — a factory
+function has no `id` of its own; only the rule it returns does.
+
+### Options
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `restrictions` | `Restriction[]` | What is forbidden. Defaults to `[]`. |
+
+Each restriction:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `call` | `string` | The callee to forbid. `*` matches anything, including `.`. |
+| `from` | `string[]` | Where the restriction applies. Omitted means everywhere. |
+| `reason` | `string` | What to do instead. Carried into the violation message. |
+
+`call` is matched against the callee **as written**, with whitespace stripped and `?.` folded to
+`.` — so `console\n  .log` and `console?.log` both match `console.*`. Matching the raw text
+rather than a resolved name is deliberate: a restriction is written against what an author
+types, on the same terms as `no-restricted-imports`. Only the callee is normalized, so write a
+restriction in dotted form (`console.*`, not `console?. *`).
+
+### What it cannot tell apart
+
+A call reached through computed member access — `console['log']('x')` or `obj[key]('x')` — is
+not captured by the query, and a `new` expression is not a call. Telling them apart is a
+different query rather than a normalization fix; a test pins the boundary so it stays a known
+limit rather than a surprise.
+
+The same boundary per language: a rust `macro_invocation` is not a `call_expression`, so
+`println!` cannot be restricted by this rule — restricting macros is out of scope, and a test
+pins it. Go's `go f()` and `defer f()` wrap an ordinary call, so the inner call still matches;
+that is covered rather than a gap.
+
+An entry in `from` beginning with `!` is a carve-out — the restriction applies everywhere
+*except* there, and a carve-out beats an inclusion. That inversion is what makes "no `fetch`
+outside the API client" one restriction rather than an enumeration of every other directory,
+which would rot the first time someone adds one.
+
+`reason` is the field worth spending time on. An agent reading lanekeep's output needs to know
+what to do instead, not merely that something is banned — the reason is the part of the message
+that tells it.
+
+The violation names the callee and the reason — `calling 'console.log' is restricted — route it
+through the logger` — and is anchored at the call. One violation per call, even when several
+restrictions match it; the first matching restriction's reason is the one carried.
+
+---
 
 ## `lanekeep/duplicate-implementation`
 

@@ -19,6 +19,14 @@ fn tester(options: &str) -> RuleTester {
         .with_builtins(lanekeep_rules::source)
 }
 
+/// A tester whose subject file uses the given extension, so the other grammars are reached.
+fn tester_for(extension: &str, options: &str) -> RuleTester {
+    let source = lanekeep_rules::source("no-restricted-calls").expect("the rule ships");
+    RuleTester::configured_with_extension("no-restricted-calls", source, extension, options)
+        .expect("builds")
+        .with_builtins(lanekeep_rules::source)
+}
+
 #[test]
 fn an_unrestricted_call_passes() {
     // A candidate callee that matches no restriction must not be reported — the
@@ -168,6 +176,121 @@ fn the_first_matching_restriction_wins_and_carries_its_reason() {
         "a later restriction's reason leaked into the message: {}",
         violation.message
     );
+}
+
+// --- the other grammars ------------------------------------------------------------------
+//
+// The restriction grammar, the `from` carve-outs and the raw-text matching carry over
+// unchanged; what is per-language is the query and the callee's spelling. Each language
+// gets its qualified-callee shape, its glob, and its `from` scoping asserted.
+
+#[test]
+fn python_bare_and_qualified_callees_are_reported() {
+    tester_for(
+        "py",
+        "{ restrictions: [{ call: 'open' }, { call: 'requests.*' }] }",
+    )
+    .reports_at(
+        "open('x')\nrequests.get('https://example.invalid')\nprint('ok')\n",
+        &[(1, 1), (2, 1)],
+    )
+    .expect("a bare identifier and an attribute callee are both reported");
+}
+
+#[test]
+fn python_from_scoping_applies() {
+    let included = tester_for(
+        "py",
+        "{ restrictions: [{ call: 'open', from: ['subject/*'] }] }",
+    );
+    included
+        .reports_at("open('x')\n", &[(1, 1)])
+        .expect("the subject is under subject/");
+
+    let exempt = tester_for(
+        "py",
+        "{ restrictions: [{ call: 'open', from: ['!subject/*'] }] }",
+    );
+    exempt
+        .accepts("open('x')\n")
+        .expect("the subject is inside the carve-out");
+}
+
+#[test]
+fn go_selector_calls_and_globs_are_reported() {
+    tester_for(
+        "go",
+        "{ restrictions: [{ call: 'fmt.*' }, { call: 'panic' }] }",
+    )
+    .reports_at(
+        "package main\n\nfunc run() {\n\tfmt.Println(\"x\")\n\tpanic(\"boom\")\n\tlog(\"ok\")\n}\n",
+        &[(4, 2), (5, 2)],
+    )
+    .expect("a selector callee and a bare builtin are both reported");
+}
+
+#[test]
+fn go_calls_inside_go_and_defer_statements_still_match() {
+    // `go f()` and `defer f()` wrap the call in another statement node; the inner
+    // `call_expression` is what the query matches, so the wrapping changes nothing.
+    tester_for(
+        "go",
+        "{ restrictions: [{ call: 'fetch' }, { call: 'cleanup' }] }",
+    )
+    .reports_at(
+        "package main\n\nfunc run() {\n\tgo fetch()\n\tdefer cleanup()\n}\n",
+        &[(4, 5), (5, 8)],
+    )
+    .expect("the wrapped calls are still calls");
+}
+
+#[test]
+fn go_from_scoping_applies() {
+    let exempt = tester_for(
+        "go",
+        "{ restrictions: [{ call: 'panic', from: ['!subject/*'] }] }",
+    );
+    exempt
+        .accepts("package main\n\nfunc run() {\n\tpanic(\"boom\")\n}\n")
+        .expect("the subject is inside the carve-out");
+}
+
+#[test]
+fn rust_scoped_and_method_callees_are_reported() {
+    // `std::fs::read` is a `scoped_identifier` callee and `client.fetch` a
+    // `field_expression` one; `*.fetch` shows a suffix glob reaching a method wherever
+    // its receiver came from. The chained spelling is normalized before matching, so a
+    // formatter breaking the receiver onto its own line changes nothing.
+    tester_for(
+        "rs",
+        "{ restrictions: [{ call: 'std::fs::*' }, { call: '*.fetch' }] }",
+    )
+    .reports_at(
+        "fn run(client: Client) {\n    std::fs::read(\"x\");\n    client\n        .fetch(\"y\");\n    helper(\"ok\");\n}\n",
+        &[(2, 5), (3, 5)],
+    )
+    .expect("a scoped callee and a method callee are both reported");
+}
+
+#[test]
+fn rust_a_macro_is_not_a_call() {
+    // `println!` is a `macro_invocation`, not a `call_expression` — restricting macros is
+    // out of scope and documented as such, so a macro spelled like a restricted name must
+    // not report.
+    tester_for("rs", "{ restrictions: [{ call: 'println*' }] }")
+        .accepts("fn run() {\n    println!(\"x\");\n}\n")
+        .expect("a macro invocation is not a call expression");
+}
+
+#[test]
+fn rust_from_scoping_applies() {
+    let exempt = tester_for(
+        "rs",
+        "{ restrictions: [{ call: 'std::fs::*', from: ['!subject/*'] }] }",
+    );
+    exempt
+        .accepts("fn run() {\n    std::fs::read(\"x\");\n}\n")
+        .expect("the subject is inside the carve-out");
 }
 
 #[test]
