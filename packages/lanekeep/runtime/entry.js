@@ -110,7 +110,15 @@ export function register(entries) {
     if (typeof rule.severity !== 'string' || rule.severity.length === 0) {
       missing.push('severity')
     }
-    if (typeof rule.query !== 'string' || rule.query.length === 0) missing.push('query')
+    // Shape only, exactly as the fields above: whether the query parses is `build_rule`'s
+    // call. A single string applies to every declared language; an object maps each declared
+    // language to its own query (per-language grammar vocabulary). Either must be non-empty.
+    const query = rule.query
+    const queryIsUsable =
+      typeof query === 'string'
+        ? query.length > 0
+        : query !== null && typeof query === 'object' && !Array.isArray(query) && Object.keys(query).length > 0
+    if (!queryIsUsable) missing.push('query')
 
     const card = rule.card
     if (card === null || typeof card !== 'object') {
@@ -169,7 +177,15 @@ export function metadata(rule) {
       remediation: defined.card.remediation,
       examples: { bad: defined.card.examples.bad, good: defined.card.examples.good },
     },
-    query: defined.query,
+    // The world carries one query per language, so the string sugar is expanded here — a
+    // rule that wrote one query string runs it against every language it declares, which is
+    // exactly what the authoring surfaces always meant. An object passes through as written;
+    // the host refuses a mismatch (a declared language with no entry, or an entry for a
+    // language the rule does not target) at load.
+    queries:
+      typeof defined.query === 'string'
+        ? languages.map((language) => ({ language, query: defined.query }))
+        : Object.entries(defined.query ?? {}).map(([language, query]) => ({ language, query })),
     gates: {
       // The published `Gates` type declares `fileContains` and nothing else, while the world
       // carries `lanekeep_core::Gates` field for field. The three a TypeScript rule cannot

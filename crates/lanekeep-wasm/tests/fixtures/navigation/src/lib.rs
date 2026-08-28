@@ -24,6 +24,7 @@
 mod bindings;
 
 use bindings::lanekeep::host::types::{
+    QueryFor,
     Fix, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
@@ -58,7 +59,8 @@ impl Guest for Component {
                     good: String::new(),
                 },
             },
-            query: String::new(),
+
+            queries: vec![QueryFor { language: "rust".to_owned(), query: String::new() }],
             gates: RuleGates {
                 path_matches: Vec::new(),
                 path_not_matches: Vec::new(),

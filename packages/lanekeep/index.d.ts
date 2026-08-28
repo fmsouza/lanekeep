@@ -269,6 +269,12 @@ export interface Rule {
    * what keeps a JavaScript rule affordable. Write the narrowest query that captures what
    * you need; `check` then only refines.
    *
+   * A single string applies to every declared language. An object maps each declared
+   * language to its own query — required when the grammars do not share node vocabulary
+   * (Python spells a call `call`, the other supported grammars say `call_expression`).
+   * Every declared language must have an entry and every entry must name a declared
+   * language; a mismatch is a config-load error naming the language.
+   *
    * Text predicates filter matches in Rust before the handler, so a predicate can only
    * narrow, never widen, what `check` sees: `#eq?`, `#not-eq?`, `#match?`, `#not-match?`,
    * `#any-of?` and `#not-any-of?` are supported (plus the `any-` forms of `eq?`/`match?`).
@@ -276,7 +282,7 @@ export interface Rule {
    * no backreferences or lookaround. `#is?`, `#is-not?`, `#set!`, or an operator the
    * binding does not know is refused at compile time.
    */
-  query: string
+  query: string | Partial<Record<LanguageId, string>>
   /** A per-invocation budget overriding the default, in milliseconds. */
   timeout?: number
   /** Called once per query match. */

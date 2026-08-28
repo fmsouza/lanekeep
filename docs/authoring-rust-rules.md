@@ -78,10 +78,22 @@ stack to hand back, and a panic in a guest is a trap either way — so return `O
 through `ctx`. It exists for guests whose language can catch its own failure, and it is the
 difference between a diagnostic that names a line and `wasm trap: unreachable`.
 
-`metadata` is where the rule's id, languages, severity, card, query, gates and timeout live. It
+`metadata` is where the rule's id, languages, severity, card, queries, gates and timeout live. It
 is the component's answer to what a `defineRule` call carries, it is read once at config load,
 and it is validated by exactly the code that validates a TypeScript rule's — same namespace
-check, same card check, same empty-query refusal, same words.
+check, same card check, same empty-queries and query/language-mismatch refusals, same words.
+
+`queries` is one entry per language the rule targets, because a rule can span grammars that do
+not share node vocabulary. For the common single-language case the SDK's `queries!` macro keeps
+it one line — `QueryFor` resolves in your crate's own generated `bindings` module, which is why
+this is a macro and not a function:
+
+```rust
+queries: lanekeep_rule::queries!["rust" => "(call_expression) @call"],
+```
+
+A rule targeting several grammars writes the `vec![QueryFor { language, query }, ...]` out by
+hand, since each grammar has its own query.
 
 `configure` is handed the rule's options as a JSON string, `"null"` for a rule named with no
 options, once per instance before any handler runs. Parse it with serde rather than by hand.

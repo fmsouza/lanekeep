@@ -230,6 +230,52 @@ type MatchEntry struct {
 //	type match = list<match-entry>
 type Match cm.List[MatchEntry]
 
+// StructureFingerprint represents the record "lanekeep:host/types@0.1.0#structure-fingerprint".
+//
+// A subtree's structural fingerprint: identifiers and literal values erased.
+//
+// Computed host-side in one walk, so a rule does not pay a per-node boundary crossing
+// to
+// inspect a tree's shape — the exact cost invariant 3 (`docs/architecture.md` §4)
+// exists
+// to prevent. Walking a subtree through `kind`/`children` is per-node dispatch, measured
+// at ~300 ns per crossing under QuickJS and ~1.1× that through a component (§15.1):
+// a
+// 200-node body would spend hundreds of crossings per match to compute what the host
+// folds natively over a tree already resident in the arena. This method moves that
+// cost
+// to one crossing per match, which is why no benchmark obligation triggers.
+//
+// The normalization is the whole contract, stated up front. Every non-extra node's
+// kind
+// name contributes, named and anonymous — anonymous token kinds are the operators,
+// so
+// `a + b` and `a - b` stay distinct. `extra` nodes (comments) are excluded entirely,
+// so
+// a doc-comment difference is not an implementation difference. Token text is erased:
+// identifiers and literals contribute their kind (`identifier`, `number`, `string`)
+// and
+// nothing else — language-agnostic by construction, with no per-language table of
+// what
+// counts as an identifier. `ERROR`/`MISSING` nodes fold like any other kind, so a
+// broken
+// parse hashes as its broken shape rather than failing.
+//
+//	record structure-fingerprint {
+//		hash: string,
+//		nodes: u32,
+//	}
+type StructureFingerprint struct {
+	_ cm.HostLayout `json:"-"`
+	// blake3 of the normalized fold, lowercase hex.
+	Hash string `json:"hash"`
+
+	// How many nodes the fold covered — the thresholding input, so a rule does not need
+	// a
+	// second traversal to know whether a match is trivially small.
+	Nodes uint32 `json:"nodes"`
+}
+
 // EmittedFact represents the record "lanekeep:host/types@0.1.0#emitted-fact".
 //
 // A fact emitted during the per-file pass, for the reduce phase to consume.
@@ -314,6 +360,20 @@ type RuleGates struct {
 	FileNotContains cm.List[string] `json:"file-not-contains"`
 }
 
+// QueryFor represents the record "lanekeep:host/types@0.1.0#query-for".
+//
+// One rule's query for one language it targets.
+//
+//	record query-for {
+//		language: string,
+//		query: string,
+//	}
+type QueryFor struct {
+	_        cm.HostLayout `json:"-"`
+	Language string        `json:"language"`
+	Query    string        `json:"query"`
+}
+
 // RuleMetadata represents the record "lanekeep:host/types@0.1.0#rule-metadata".
 //
 // What a component says it is, read once at prepare time.
@@ -332,7 +392,7 @@ type RuleGates struct {
 //		languages: list<string>,
 //		severity: string,
 //		card: rule-card,
-//		query: string,
+//		queries: list<query-for>,
 //		gates: rule-gates,
 //		timeout: option<u64>,
 //	}
@@ -351,8 +411,27 @@ type RuleMetadata struct {
 	Languages cm.List[string] `json:"languages"`
 	Severity  string          `json:"severity"`
 	Card      RuleCard        `json:"card"`
-	Query     string          `json:"query"`
-	Gates     RuleGates       `json:"gates"`
+
+	// One query per language this rule targets, so one rule can span grammars that do
+	// not
+	// share node vocabulary — Python spells a call `call`, the other supported grammars
+	// say
+	// `call_expression`, and the four function-definition kinds are four different names.
+	// The authoring surfaces expand a single string to every declared language; this
+	// list
+	// is the shape the host reads.
+	//
+	// The host refuses an empty list at load, before any file is checked — a rule with
+	// no
+	// query can never match, and silently, exactly as an empty `languages` list can never
+	// run at all. It also refuses the two mismatch directions, both naming the language:
+	// a
+	// declared language with no query entry, and a query entry for a language the rule
+	// does
+	// not target. A language silently running no query is the same failure the
+	// empty-`languages` refusal guards — never fires, nothing reports the mistake.
+	Queries cm.List[QueryFor] `json:"queries"`
+	Gates   RuleGates         `json:"gates"`
 
 	// Milliseconds. None means the default per-invocation budget.
 	Timeout cm.Option[uint64] `json:"timeout"`
@@ -983,6 +1062,27 @@ func (self CheckContext) Root() (result Node) {
 	self0 := cm.Reinterpret[uint32](self)
 	result0 := wasmimport_CheckContextRoot((uint32)(self0))
 	result = (Node)((uint32)(result0))
+	return
+}
+
+// StructureFingerprint represents the imported method "structure-fingerprint".
+//
+// A structural summary of the subtree rooted at `n`: the fold's hash and the number
+// of nodes it covered.
+//
+// None when the handle does not resolve — nothing rather than a fabricated shape,
+// the
+// same answer `kind`, `text` and `loc` give. The crossing economics are in the
+// `structure-fingerprint` record's docs above; this is the one crossing a rule pays
+// per call, where walking the subtree guest-side would pay one per node.
+//
+//	structure-fingerprint: func(n: node) -> option<structure-fingerprint>
+//
+//go:nosplit
+func (self CheckContext) StructureFingerprint(n Node) (result cm.Option[StructureFingerprint]) {
+	self0 := cm.Reinterpret[uint32](self)
+	n0 := (uint32)(n)
+	wasmimport_CheckContextStructureFingerprint((uint32)(self0), (uint32)(n0), &result)
 	return
 }
 

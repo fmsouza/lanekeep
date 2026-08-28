@@ -365,7 +365,7 @@ func metadataFor(id string) func() types.RuleMetadata {
 			// Never compiled and never run: the harness hands `check` a match it built itself,
 			// which is what lets one call be one observation. A syntactically real query all the
 			// same, so that nothing downstream has to special-case this fixture.
-			Query: "(program) @file",
+			Queries: lanekeep.Queries("typescript", "(program) @file"),
 			Gates: types.RuleGates{
 				PathMatches:     cm.ToList(noPatterns),
 				PathNotMatches:  cm.ToList(noPatterns),

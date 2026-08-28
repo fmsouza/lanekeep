@@ -48,10 +48,13 @@
 // the guest
 // keeps.** The host instantiates once per (worker, component) rather than once per
 // rule —
-// resident bytes are not artifact bytes, and four copies of a 12.34 MiB engine in
-// one store
-// breaches the memory ceiling rather than merely wasting it. So a `static mut`, a
-// lazily
+// resident bytes are not artifact bytes: an instance grants 9,502,720 bytes before
+// it runs,
+// and one store takes seven of them and refuses the eighth with `MemoryExceeded`,
+// so four is
+// not a breach — what it costs is headroom, taking what is left for a rule's own
+// allocations
+// from 54.9 MiB to 27.8 MiB. So a `static mut`, a lazily
 // built table, a memo: all of them are visible to every rule this component hosts,
 // and *when*
 // each rule sees them depends on the order the host's work-stealing scheduler handed

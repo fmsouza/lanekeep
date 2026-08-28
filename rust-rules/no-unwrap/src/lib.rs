@@ -57,7 +57,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -140,8 +140,8 @@ impl Rule for NoUnwrap {
                     good: "let config = load()?;".to_owned(),
                 },
             },
-            query: "(call_expression\n  function: (field_expression\n    field: (field_identifier) @method)) @call"
-                .to_owned(),
+            queries: lanekeep_rule::queries!["rust" => "(call_expression\n  function: (field_expression\n    field: (field_identifier) @method)) @call"
+                .to_owned()],
             // No `file-contains` gate, deliberately.
             //
             // It would be the obvious optimization and it is not expressible: `file-contains` is

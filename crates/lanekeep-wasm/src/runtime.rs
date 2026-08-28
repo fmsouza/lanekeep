@@ -1990,6 +1990,41 @@ fn validate_metadata(metadata: &types::RuleMetadata) -> Result<(), WasmError> {
                 .to_owned(),
         });
     }
+    if metadata.queries.is_empty() {
+        return Err(WasmError::InvalidMetadata {
+            rule: metadata.id.clone(),
+            detail: "declares no query for any language — a rule with no query can never \
+                     match, and silently"
+                .to_owned(),
+        });
+    }
+    // A language the rule targets with no query of its own, and a query for a language it
+    // does not target, are the same failure the empty-`languages` refusal guards: the rule
+    // loads, runs on nothing, and nothing reports the mistake. Both are refused here naming
+    // the language, before any file is checked.
+    for language in &metadata.languages {
+        if !metadata.queries.iter().any(|q| &q.language == language) {
+            return Err(WasmError::InvalidMetadata {
+                rule: metadata.id.clone(),
+                detail: format!(
+                    "declares no query for `{language}` — a rule runs only on files whose \
+                     language it names, so a language with no query can never match"
+                ),
+            });
+        }
+    }
+    for query in &metadata.queries {
+        if !metadata.languages.contains(&query.language) {
+            let language = &query.language;
+            return Err(WasmError::InvalidMetadata {
+                rule: metadata.id.clone(),
+                detail: format!(
+                    "declares a query for `{language}`, which it does not target — \
+                     that query can never run, and nothing would report the mistake"
+                ),
+            });
+        }
+    }
     if metadata.gates.file_contains.len() > 1 {
         return Err(WasmError::InvalidMetadata {
             rule: metadata.id.clone(),
@@ -2107,7 +2142,10 @@ mod tests {
                     good: "g".to_owned(),
                 },
             },
-            query: "(x) @y".to_owned(),
+            queries: vec![types::QueryFor {
+                language: "rust".to_owned(),
+                query: "(x) @y".to_owned(),
+            }],
             gates: types::RuleGates {
                 path_matches: Vec::new(),
                 path_not_matches: Vec::new(),
@@ -2131,6 +2169,38 @@ mod tests {
             validate_metadata(&metadata).expect_err("an empty language list is no file at all");
         assert!(matches!(error, WasmError::InvalidMetadata { .. }));
         assert!(format!("{error}").contains("fixture/valid"));
+    }
+
+    #[test]
+    fn a_metadata_with_no_query_is_refused() {
+        let mut metadata = valid_metadata();
+        metadata.queries.clear();
+        let error = validate_metadata(&metadata).expect_err("no query can never match");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+        assert!(format!("{error}").contains("no query"));
+    }
+
+    #[test]
+    fn a_metadata_missing_a_query_for_a_declared_language_is_refused() {
+        let mut metadata = valid_metadata();
+        metadata.languages = vec!["rust".to_owned(), "go".to_owned()];
+        let error = validate_metadata(&metadata)
+            .expect_err("a declared language without a query is silent");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+        assert!(format!("{error}").contains("go"));
+    }
+
+    #[test]
+    fn a_metadata_with_a_query_for_an_undeclared_language_is_refused() {
+        let mut metadata = valid_metadata();
+        metadata.queries.push(types::QueryFor {
+            language: "go".to_owned(),
+            query: "(x) @y".to_owned(),
+        });
+        let error = validate_metadata(&metadata)
+            .expect_err("a query for an untargeted language never runs");
+        assert!(matches!(error, WasmError::InvalidMetadata { .. }));
+        assert!(format!("{error}").contains("go"));
     }
 
     #[test]

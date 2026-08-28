@@ -16,7 +16,7 @@ mod bindings;
 
 use std::cell::Cell;
 
-use bindings::lanekeep::host::types::{RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata};
+use bindings::lanekeep::host::types::{QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata};
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 
 struct Component;
@@ -62,7 +62,8 @@ impl Guest for Component {
                     good: "good()".to_owned(),
                 },
             },
-            query: "(call_expression) @call".to_owned(),
+
+            queries: vec![QueryFor { language: "rust".to_owned(), query: "(call_expression) @call".to_owned() }],
             gates: RuleGates {
                 path_matches: vec!["src/**/*.rs".to_owned()],
                 path_not_matches: vec!["**/generated/**".to_owned()],

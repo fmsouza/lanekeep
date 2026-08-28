@@ -76,7 +76,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -181,7 +181,7 @@ impl Rule for NoAmbientObservation {
                         .to_owned(),
                 },
             },
-            query: "(call_expression function: (scoped_identifier) @callee) @call".to_owned(),
+            queries: lanekeep_rule::queries!["rust" => "(call_expression function: (scoped_identifier) @callee) @call".to_owned()],
             // No `file-contains` gate, deliberately.
             //
             // It would be an *and* over every forbidden substring, and a file containing only

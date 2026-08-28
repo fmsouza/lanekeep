@@ -87,7 +87,7 @@ func Metadata() types.RuleMetadata {
 		// `function_declaration` is only ever package level in Go — a function inside a function
 		// is a `func_literal`, which this cannot match. So matching the name is enough, and there
 		// is no nesting check to get wrong.
-		Query: "(function_declaration name: (identifier) @name) @func",
+		Queries: lanekeep.Queries("go", "(function_declaration name: (identifier) @name) @func"),
 		Gates: types.RuleGates{
 			PathMatches:     cm.ToList(noPatterns),
 			PathNotMatches:  cm.ToList(noPatterns),

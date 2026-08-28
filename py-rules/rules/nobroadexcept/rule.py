@@ -36,7 +36,7 @@ def metadata():
             file_contains=["except"],
             file_not_contains=[],
         ),
-        query="(except_clause) @clause",
+        queries=[types.QueryFor(language="python", query="(except_clause) @clause")],
         timeout=None,
     )
 

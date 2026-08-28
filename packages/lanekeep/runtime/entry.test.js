@@ -121,3 +121,37 @@ test('a rule missing what `metadata` reads is refused by name and by field', () 
 test('register refuses anything that is not an array', () => {
   assert.throws(() => register(rule('local/lonely')), { name: 'TypeError' })
 })
+
+test('a string query expands to one entry per declared language', () => {
+  // The sugar the authoring surfaces always meant: one query string runs against every
+  // language the rule declares, and `metadata` spells that out as the world's list.
+  register([rule('local/expanded', { language: ['typescript', 'tsx'] })])
+
+  assert.deepEqual(metadata(3).queries, [
+    { language: 'typescript', query: '(identifier) @it' },
+    { language: 'tsx', query: '(identifier) @it' },
+  ])
+})
+
+test('a per-language query passes through as written', () => {
+  // The map form is for grammars that do not share node vocabulary, so the entries are not
+  // expanded or rewritten here — the host validates the cover against the declared languages.
+  register([
+    rule('local/mapped', {
+      language: ['typescript', 'python'],
+      query: { typescript: '(call_expression) @c', python: '(call) @c' },
+    }),
+  ])
+
+  assert.deepEqual(metadata(4).queries, [
+    { language: 'typescript', query: '(call_expression) @c' },
+    { language: 'python', query: '(call) @c' },
+  ])
+})
+
+test('an empty query object is refused like a missing query', () => {
+  assert.throws(() => register([rule('local/empty-object', { query: {} })]), {
+    name: 'TypeError',
+    message: /query/,
+  })
+})

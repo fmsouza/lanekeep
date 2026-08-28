@@ -62,7 +62,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -152,7 +152,7 @@ impl Rule for NoGlobImport {
                     good: "use crate::models::{User, Session};".to_owned(),
                 },
             },
-            query: "(use_declaration argument: (use_wildcard) @wildcard) @use".to_owned(),
+            queries: lanekeep_rule::queries!["rust" => "(use_declaration argument: (use_wildcard) @wildcard) @use".to_owned()],
             // Unlike `no-unwrap`, this gate is expressible with one substring: every subject a
             // glob import can appear in contains the literal `use`, so `file-contains` — an
             // *and* over every listed substring — is satisfied by a single-element list rather

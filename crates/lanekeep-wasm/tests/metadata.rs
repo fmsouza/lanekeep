@@ -29,7 +29,13 @@ fn a_component_declares_its_own_identity() {
     assert_eq!(declared.id, "fixture/metadata");
     assert_eq!(declared.languages, vec!["rust".to_owned()]);
     assert_eq!(declared.severity, "error");
-    assert_eq!(declared.query, "(call_expression) @call");
+    assert_eq!(
+        declared.queries,
+        vec![lanekeep_wasm::bindings::types::QueryFor {
+            language: "rust".to_owned(),
+            query: "(call_expression) @call".to_owned(),
+        }]
+    );
     assert_eq!(declared.card.message, "a fixture");
     assert_eq!(declared.card.remediation, "do the other thing");
     assert_eq!(declared.card.examples.bad, "bad()");

@@ -44,12 +44,12 @@ def metadata():
             file_contains=[],
             file_not_contains=[],
         ),
-        query="""
+        queries=[types.QueryFor(language="python", query="""
             [
               (call function: (identifier) @fn arguments: (argument_list) @args)
               (call function: (attribute attribute: (identifier) @fn) arguments: (argument_list) @args)
             ] @call
-        """,
+        """)],
         timeout=None,
     )
 

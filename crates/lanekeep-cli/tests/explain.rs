@@ -155,7 +155,14 @@ fn explain_as_json_is_valid_and_complete() {
     );
     assert!(parsed["examples"]["bad"].as_str().is_some());
     assert!(parsed["examples"]["good"].as_str().is_some());
-    assert!(parsed["query"].as_str().is_some_and(|q| !q.is_empty()));
+    assert!(
+        parsed["query"].is_object()
+            && !parsed["query"]
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty),
+        "the query is one entry per declared language: {:?}",
+        parsed["query"]
+    );
 }
 
 #[test]

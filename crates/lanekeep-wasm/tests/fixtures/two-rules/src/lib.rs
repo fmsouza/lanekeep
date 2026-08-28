@@ -34,6 +34,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
+    QueryFor,
     RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata, StackFrame,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
@@ -110,7 +111,7 @@ impl Guest for Component {
             },
             // Distinct per rule, so two rules collapsing into one description is visible in a
             // field that has nothing to do with the tag.
-            query: format!("(call_expression) @{}", index),
+            queries: vec![QueryFor { language: "rust".to_owned(), query: format!("(call_expression) @{}", index) }],
             gates: RuleGates {
                 path_matches: Vec::new(),
                 path_not_matches: Vec::new(),

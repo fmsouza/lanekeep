@@ -54,7 +54,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -133,7 +133,7 @@ impl Rule for OneParserPerFile {
                     good: "let tree = file_tree.clone();".to_owned(),
                 },
             },
-            query: "(call_expression function: (scoped_identifier) @callee) @call".to_owned(),
+            queries: lanekeep_rule::queries!["rust" => "(call_expression function: (scoped_identifier) @callee) @call".to_owned()],
             // The `file-contains` gate, ported from the TypeScript original's
             // `fileContains: ['Parser::new']`. It is an *and* over one substring, so it is
             // exactly the single-substring case the `no-unwrap` rule's comment warns about

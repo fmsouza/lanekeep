@@ -1272,7 +1272,7 @@ fn rule_json(spec: &lanekeep_config::RuleSpec) -> serde_json::Value {
             "bad": spec.card.examples.bad.clone(),
             "good": spec.card.examples.good.clone(),
         },
-        "query": spec.query.clone(),
+        "query": spec.queries.clone(),
         "crossFile": spec.has_reduce,
     })
 }

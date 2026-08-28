@@ -339,7 +339,9 @@ impl CombinedQuery {
 /// Build one multi-pattern query per language, over every rule that declares it.
 ///
 /// Rules are visited in `rules` order and their patterns appended in that order, so
-/// `owners` is built alongside the source it describes and the two cannot drift.
+/// `owners` is built alongside the source it describes and the two cannot drift. Each
+/// language's combined query concatenates that language's own query per rule, selected from
+/// the rule's per-language map.
 ///
 /// Nothing is compiled here — see [`CombinedQuery::query`], which does it on first use so a
 /// warm run never pays for a query it will not run.
@@ -355,7 +357,9 @@ fn combine_queries(rules: &[Prepared]) -> BTreeMap<String, CombinedQuery> {
                     source: String::new(),
                     owners: Vec::new(),
                 });
-            entry.source.push_str(&rule.spec.query);
+            entry
+                .source
+                .push_str(&rule.spec.queries[language.id().as_str()]);
             // A query source need not end in a newline, and two patterns run together on
             // one line is a different query from the two of them.
             entry.source.push('\n');
@@ -630,6 +634,12 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`RunError`] for an invalid query, gate, or language reference.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the per-language query compile loop belongs here — a broken query surfaces \
+                  at prepare time, naming its rule — and extracting it would move that \
+                  diagnostic away from the place it is reported"
+    )]
     pub fn prepare(
         config: &Config,
         project_root: &Path,
@@ -671,52 +681,67 @@ impl Engine {
         // nearly zero, and would cost the guarantee the comment below describes: a broken query
         // is reported here, naming its rule, rather than staying silent until some file happens
         // to need it.
-        let prepared: Vec<Result<Prepared, RunError>> =
-            config
-                .rules
-                .par_iter()
-                .filter(|spec| spec.severity.is_enabled())
-                .map(|spec| {
-                    let mut compiled = Vec::with_capacity(spec.languages.len());
-                    for id in &spec.languages {
-                        let language = registry.by_id(id).cloned().ok_or_else(|| {
-                            RunError::UnknownLanguage {
+        let prepared: Vec<Result<Prepared, RunError>> = config
+            .rules
+            .par_iter()
+            .filter(|spec| spec.severity.is_enabled())
+            .map(|spec| {
+                let mut compiled = Vec::with_capacity(spec.languages.len());
+                for id in &spec.languages {
+                    let language =
+                        registry
+                            .by_id(id)
+                            .cloned()
+                            .ok_or_else(|| RunError::UnknownLanguage {
                                 rule: spec.id.to_string(),
                                 language: id.clone(),
                                 known: known.clone(),
-                            }
-                        })?;
-
-                        // Compiled against this grammar specifically. A query that is valid for
-                        // one dialect and not another is a rule bug, and this is where it
-                        // surfaces — at config load, naming the rule, rather than as silence at
-                        // run time.
-                        let query = CompiledQuery::compile(language.as_ref(), &spec.query)
-                            .map_err(|e: CompileError| RunError::Query {
-                                rule: spec.id.to_string(),
-                                detail: e.to_string(),
                             })?;
 
-                        compiled.push((language, query));
-                    }
-
-                    let gates =
-                        CompiledGates::compile(&spec.gates).map_err(|e| RunError::Gates {
+                    // Compiled against this grammar specifically, from this language's own
+                    // query string selected from the per-language map. A query that is valid
+                    // for one dialect and not another is a rule bug, and this is where it
+                    // surfaces — at config load, naming the rule, rather than as silence at
+                    // run time.
+                    // The exact cover was validated at config load; a missing entry here
+                    // is a bug in the engine's own bookkeeping, named rather than
+                    // silently compiled against nothing.
+                    let source = spec
+                        .queries
+                        .get(id.as_str())
+                        .ok_or_else(|| RunError::Query {
+                            rule: spec.id.to_string(),
+                            detail: format!(
+                                "no query declared for language `{id}` — this is an \
+                                     engine bug, not a config error"
+                            ),
+                        })?;
+                    let query = CompiledQuery::compile(language.as_ref(), source).map_err(
+                        |e: CompileError| RunError::Query {
                             rule: spec.id.to_string(),
                             detail: e.to_string(),
-                        })?;
+                        },
+                    )?;
 
-                    Ok(Prepared {
-                        // Filled in below, once config order is known.
-                        index: 0,
-                        spec: spec.clone(),
-                        gates,
-                        compiled,
-                        // Filled in below too, by the one place components are loaded.
-                        slot: None,
-                    })
+                    compiled.push((language, query));
+                }
+
+                let gates = CompiledGates::compile(&spec.gates).map_err(|e| RunError::Gates {
+                    rule: spec.id.to_string(),
+                    detail: e.to_string(),
+                })?;
+
+                Ok(Prepared {
+                    // Filled in below, once config order is known.
+                    index: 0,
+                    spec: spec.clone(),
+                    gates,
+                    compiled,
+                    // Filled in below too, by the one place components are loaded.
+                    slot: None,
                 })
-                .collect();
+            })
+            .collect();
 
         // The first failure by *config order*, not by whichever thread finished first. Two
         // broken rules must always name the same one, or the same project reports a different
@@ -5909,7 +5934,7 @@ export default defineRule({
                         good: "nothing".to_owned(),
                     },
                 },
-                query: QUERY.to_owned(),
+                queries: BTreeMap::from([("typescript".to_owned(), QUERY.to_owned())]),
                 gates: lanekeep_core::Gates::default(),
                 timeout: None,
                 has_reduce,
@@ -6341,6 +6366,7 @@ export default defineRule({
             // names only `typescript`.
             let mut rule = component_rule("local/middle", 1, false);
             rule.languages = vec!["tsx".to_owned()];
+            rule.queries = BTreeMap::from([("tsx".to_owned(), QUERY.to_owned())]);
 
             let project = Project::new(
                 "component-language",
@@ -6517,7 +6543,8 @@ export default defineRule({
         /// and the violation still lands at `@target`.
         fn burning_rule(id: &str, timeout: Duration) -> RuleSpec {
             let mut rule = component_rule(id, 1, false);
-            rule.query = format!("({QUERY}) @burn");
+            rule.queries
+                .insert("typescript".to_owned(), format!("({QUERY}) @burn"));
             rule.timeout = Some(timeout);
             rule
         }
@@ -6727,6 +6754,10 @@ export default defineRule({
             // the failure mode `AGENTS.md` records from the `.tsx` migration.
             let mut both = component_rule("local/middle", 1, false);
             both.languages = vec!["tsx".to_owned(), "typescript".to_owned()];
+            both.queries = BTreeMap::from([
+                ("tsx".to_owned(), QUERY.to_owned()),
+                ("typescript".to_owned(), QUERY.to_owned()),
+            ]);
             let outcome = project
                 .prepared(vec![both])
                 .expect("prepares")
@@ -6745,6 +6776,7 @@ export default defineRule({
             // gate in the dispatch itself.
             let mut elsewhere = component_rule("local/middle", 1, false);
             elsewhere.languages = vec!["tsx".to_owned()];
+            elsewhere.queries = BTreeMap::from([("tsx".to_owned(), QUERY.to_owned())]);
             let outcome = project
                 .prepared(vec![elsewhere])
                 .expect("prepares")
@@ -6788,7 +6820,10 @@ export default defineRule({
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../lanekeep-wasm/tests/fixtures/limits.wasm"),
             ));
-            spinner.query = "(variable_declarator) @spin".to_owned();
+            spinner.queries.insert(
+                "typescript".to_owned(),
+                "(variable_declarator) @spin".to_owned(),
+            );
             spinner.timeout = Some(Duration::from_millis(30));
 
             let engine = project.engine(vec![spinner]).without_cache();
@@ -6968,8 +7003,8 @@ export default defineRule({
                 .by_id("typescript")
                 .expect("typescript is registered")
                 .clone();
-            let query =
-                CompiledQuery::compile(language.as_ref(), &spec.query).expect("the query compiles");
+            let query = CompiledQuery::compile(language.as_ref(), &spec.queries["typescript"])
+                .expect("the query compiles");
             let gates = CompiledGates::compile(&spec.gates).expect("the gates compile");
             Prepared {
                 index: 0,
@@ -7205,6 +7240,52 @@ export default defineRule({
                 .to_string();
             assert!(error.contains("wasi:random/random"), "{error}");
             assert!(error.contains("EXTERNAL_BINDINGS"), "{error}");
+        }
+
+        #[test]
+        fn a_rule_with_per_language_queries_reports_on_every_language_it_declares() {
+            // One rule spanning two grammars that do not share node vocabulary — Python
+            // spells a call `call`, TypeScript `call_expression` — with a query per
+            // language. Both file types must report in one run; a rule that compiled the
+            // TypeScript query against Python would fail at prepare (the python grammar has
+            // no `call_expression` node kind), and one that compiled Python's `call` query
+            // against the TypeScript grammar would silently match nothing.
+            let project = Project::new(
+                "per-language-queries",
+                &[
+                    (
+                        "rule.ts",
+                        "import { defineRule } from 'lanekeep';\n\
+                        export default defineRule({\n\
+                          id: 'local/multi',\n\
+                          language: ['typescript', 'python'],\n\
+                          query: {\n\
+                            typescript: '(call_expression) @call',\n\
+                            python: '(call) @call',\n\
+                          },\n\
+                          card: { message: 'call', remediation: 'avoid', \
+                            examples: { bad: 'f()', good: 'f' } },\n\
+                          check(ctx, m) { ctx.report(m.call); },\n\
+                        });\n",
+                    ),
+                    (
+                        "lanekeep.json",
+                        r#"{"include": ["src/**/*.ts", "src/**/*.py"],
+                        "namespaces": ["local"], "rules": ["./rule"]}"#,
+                    ),
+                    ("src/a.ts", "foo();\n"),
+                    ("src/b.py", "foo()\n"),
+                ],
+            );
+
+            let outcome = project.run_json().expect("runs");
+            assert_eq!(
+                rendered(&outcome),
+                vec![
+                    "local/multi|src/a.ts|1:1|call".to_owned(),
+                    "local/multi|src/b.py|1:1|call".to_owned(),
+                ],
+            );
         }
     }
 }

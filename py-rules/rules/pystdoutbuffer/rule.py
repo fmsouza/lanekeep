@@ -39,9 +39,9 @@ def metadata():
             file_contains=["sys.stdout"],
             file_not_contains=[],
         ),
-        query="""
+        queries=[types.QueryFor(language="python", query="""
             (call function: (attribute object: (_) @obj attribute: (identifier) @method)) @call
-        """,
+        """)],
         timeout=None,
     )
 

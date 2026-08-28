@@ -51,7 +51,7 @@ mod bindings;
 use std::cell::RefCell;
 
 use bindings::lanekeep::host::types::{
-    MatchEntry, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
+    MatchEntry, QueryFor, RuleCard, RuleError, RuleExamples, RuleGates, RuleMetadata,
 };
 use bindings::{CheckContext, Guest, Match, ReduceContext};
 // `Node` comes from the SDK rather than from the bindings, and there is nothing to reconcile:
@@ -134,8 +134,8 @@ impl Rule for SandboxContainment {
                     good: "use lanekeep_wasm::runtime::WasmRuntime;".to_owned(),
                 },
             },
-            query: "[\n  (use_declaration argument: (_) @path)\n  (scoped_identifier path: (_) @path)\n] @site"
-                .to_owned(),
+            queries: lanekeep_rule::queries!["rust" => "[\n  (use_declaration argument: (_) @path)\n  (scoped_identifier path: (_) @path)\n] @site"
+                .to_owned()],
             // The `file-contains` gate, ported from the TypeScript original's
             // `fileContains: ['wasmtime']`. It is an *and* over one substring, so it is exactly
             // the single-substring case the `no-unwrap` rule's comment warns about writing wrong
