@@ -4,6 +4,7 @@
   "types": "index.d.ts",
   "typesVersions": {
     "*": {
+      "duplicate-implementation": ["builtin.d.ts"],
       "no-broad-except": ["builtin.d.ts"],
       "no-circular-imports": ["builtin.d.ts"],
       "no-default-export": ["builtin.d.ts"],
@@ -24,6 +25,9 @@
     "./runtime/entry": "./runtime/entry.js",
     "./runtime/host": "./runtime/host.js",
     "./package.json": "./package.json",
+    "./duplicate-implementation": {
+      "types": "./builtin.d.ts"
+    },
     "./no-broad-except": {
       "types": "./builtin.d.ts"
     },
