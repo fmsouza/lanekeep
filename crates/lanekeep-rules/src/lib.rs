@@ -81,6 +81,10 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
         include_str!("../rules/duplicate-implementation.ts"),
     ),
     (
+        "no-assertionless-test",
+        include_str!("../rules/no-assertionless-test.ts"),
+    ),
+    (
         "no-broad-except",
         include_str!("../rules/no-broad-except.ts"),
     ),

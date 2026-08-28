@@ -18,6 +18,7 @@ import noPackageInit from 'lanekeep/no-package-init'
 import noUnwrap from 'lanekeep/no-unwrap'
 
 import duplicateImplementation from 'lanekeep/duplicate-implementation'
+import noAssertionlessTest from 'lanekeep/no-assertionless-test'
 import noBroadExcept from 'lanekeep/no-broad-except'
 import noCircularImports from 'lanekeep/no-circular-imports'
 import noDefaultExport from 'lanekeep/no-default-export'
@@ -27,6 +28,7 @@ import noRestrictedImports from 'lanekeep/no-restricted-imports'
 import noUnusedExports from 'lanekeep/no-unused-exports'
 
 void duplicateImplementation
+void noAssertionlessTest
 void noBroadExcept
 void noCircularImports
 void noDefaultExport
