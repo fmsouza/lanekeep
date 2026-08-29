@@ -138,6 +138,21 @@ check "the language registry precedes its grammars" "yes" \
 check "the testkit precedes the rules that dev-depend on it" "yes" \
   "$(before lanekeep-testkit lanekeep-rules)"
 
+# --- the component-carrying crate publishes from an injected-artifact tree -------------------
+#
+# `crates/lanekeep-rules/components/` is not committed: the release workflow builds the
+# components and drops them in just before publishing, and the crate's `include` list is what
+# packages them. cargo's dirty check extends to include'd-but-ignored files, so publishing
+# that one crate from an otherwise pristine tag checkout was refused with "11 files ... not
+# yet committed" — the failure that stalled v0.7.0 after seventeen crates were already up.
+# The waiver is scoped to that crate alone, so real dirt anywhere else still fails a publish.
+allow_dirty_for() {
+  grep "^publish -p $1 " "${CARGO_LOG}" | grep -c -- "--allow-dirty" | tr -d ' '
+}
+check "the rules crate carries the dirty waiver its injected components need" "1" \
+  "$(allow_dirty_for lanekeep-rules)"
+check "no other crate gets the waiver" "0" "$(allow_dirty_for lanekeep-core)"
+
 # The general form, and the one that will still hold after someone adds a crate: no crate is
 # published before something it depends on. Named edges pin the cases we already know about;
 # this pins the ones nobody has thought of. Both are worth having — a failure here says the
