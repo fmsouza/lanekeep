@@ -4,12 +4,6 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> **Status: early development.** Nothing is released yet and the CLI described below is not
-> usable. The architecture is settled — see [`docs/architecture.md`](docs/architecture.md) — and
-> the work is tracked as a sequence of milestones. Do not depend on this yet.
-
----
-
 ## What it is
 
 lanekeep is not a linter in the ESLint sense. ESLint enforces language-level correctness.
@@ -97,15 +91,12 @@ A warm run with no changes executes no JavaScript at all — every file is a cac
 
 ## Installation
 
-Not yet published. The distribution is built and tested — one npm package per platform plus a
-launcher that resolves the right one, and every crate publishable to crates.io — but no
-version has been released yet.
-
-When it ships:
-
 ```bash
 npm install --save-dev lanekeep    # or: cargo install lanekeep-cli
 ```
+
+One npm package per platform plus this launcher: npm installs only the package matching your
+platform, and the launcher execs its binary.
 
 A single static binary with the JavaScript engine and wasmtime compiled in. **Node.js is not
 required to run lanekeep**, even where rules are written in TypeScript — it is required only to

@@ -47,7 +47,7 @@ component before that form was reverted for cost). The Rust and Go
 ones are written in the language they check and have no TypeScript at all. Which form a rule
 takes is not part of its interface: the specifier, the id, the options and the output are the
 same either way, and a rule that changes form does not change your config — the two Go rules
-were TypeScript modules until this release, and every case in their test suites passed
+were TypeScript modules until v0.7.0, and every case in their test suites passed
 unchanged across the move. Their `.ts` sources are recoverable with
 `git log --diff-filter=D -- crates/lanekeep-rules/rules/`, which is where a reader who wants
 to compare the two implementations should start.
@@ -298,6 +298,11 @@ except Exception as err:   # reported — binding it does not narrow it
 
 try:
     parse(raw)
+except BaseException:      # reported — broader still: Ctrl-C and SystemExit too
+    return None
+
+try:
+    parse(raw)
 except ValueError:         # fine — names what this block raises
     return None
 ```
@@ -386,19 +391,20 @@ the tree, so each needs its own query pattern.
 `ctx.bindingKind` is what keeps this from being a text match: it says whether the qualifier is
 an import at all, so a package-level name that happens to read `context` does not fire.
 
-### What it cannot tell apart
+### Aliases resolve by import, not by spelling
 
-`ctx.bindingKind` says whether a name is an import; it does not say *which module*. A package
-aliased to `context` and exposing a `Context` is therefore reported like the real one:
+`ctx.resolvesToImport` asks whether a name binds to a given module, so the qualifier's local
+spelling is irrelevant in both directions:
 
 ```go
-import context "example.com/app/context"   // reported, though it is a different package
+import ctxpkg "context"                     // ctxpkg.Context in a struct is reported — it is the standard library
+import context "example.com/app/context"    // fine — a different package, whatever it calls itself
 ```
 
-Distinguishing them needs the host API to expose an import's module, which bumps the host API
-version and so the cache key — a larger change than this rule justifies on its own. The case
-is narrow, and where it occurs it is usually the same mistake under a different import path.
-A test pins the behavior, so tightening the rule later fails loudly rather than silently.
+An earlier version of this rule matched the qualifier by name and reported the second case
+too. Both directions are pinned in `crates/lanekeep-rules/tests/no_context_in_struct.rs` —
+including a case whose name still says `_is_also_reported` while asserting the opposite,
+kept as the historical marker of the fix.
 
 ## `lanekeep/no-package-init`
 
@@ -477,25 +483,19 @@ default. `allow` takes patterns to widen that, matched against the wildcard's *f
 `super::*` also matches `use super::inner::*;`, and there is no escape for a literal `*`, so an
 exact "only this one path" match is not expressible.
 
-This rule is a **factory** — a function you call with options, which returns a rule. Calling it
-with no options keeps the default `allow`.
+The rule is a WebAssembly component, so its options cross as data: name it in a
+`lanekeep.json`, bare to keep the default `allow` — which is what `lanekeep init` writes into
+a Rust project — or configured to widen it. There is no function to call and nothing to
+import; a TypeScript config that tries is refused at load with
+`` `lanekeep/no-glob-import` is a rule component; name it in a `lanekeep.json` ``.
 
-```ts
-import noGlobImport from 'lanekeep/no-glob-import'
-
-export default defineConfig({
-  rules: [noGlobImport({ allow: ['*prelude*', 'super::*'] })],
-})
+```json
+"lanekeep/no-glob-import"
 ```
 
 ```json
 { "rule": "lanekeep/no-glob-import", "options": { "allow": ["*prelude*", "super::*"] } }
 ```
-
-**Two spellings fail to load.** A bare `"lanekeep/no-glob-import"` in a JSON config, and an
-uncalled `noGlobImport` reference in a TypeScript config (`rules: [noGlobImport]` rather than
-`rules: [noGlobImport({...})]`), both fail with `missing 'id'` — a factory function has no `id`
-of its own; only the rule it returns does.
 
 ## `lanekeep/no-unwrap`
 
@@ -516,25 +516,18 @@ are not reported — panicking *is* the failure mechanism there, and reporting i
 either a rule nobody turns on or a suppression on every assertion. `allow` takes path patterns
 for anything else, `src/main.rs` being the usual one.
 
-This rule is a **factory** — a function you call with options, which returns a rule. Calling it
-with no options keeps the default, empty `allow`.
+The rule is a WebAssembly component, so its options cross as data: name it in a
+`lanekeep.json`, bare to keep the default, empty `allow`, or configured. There is no function
+to call and nothing to import; a TypeScript config that tries is refused at load with
+`` `lanekeep/no-unwrap` is a rule component; name it in a `lanekeep.json` ``.
 
-```ts
-import noUnwrap from 'lanekeep/no-unwrap'
-
-export default defineConfig({
-  rules: [noUnwrap({ allow: ['src/main.rs'] })],
-})
+```json
+"lanekeep/no-unwrap"
 ```
 
 ```json
 { "rule": "lanekeep/no-unwrap", "options": { "allow": ["src/main.rs"] } }
 ```
-
-**Two spellings fail to load.** A bare `"lanekeep/no-unwrap"` in a JSON config, and an uncalled
-`noUnwrap` reference in a TypeScript config (`rules: [noUnwrap]` rather than
-`rules: [noUnwrap({...})]`), both fail with `missing 'id'` — a factory function has no `id` of
-its own; only the rule it returns does.
 
 ### What it cannot tell apart
 
@@ -831,23 +824,12 @@ things about TinyGo that are not preferences — four of which fail silently, an
 stop the build and say so. Step 3 uses `RuleTester::for_built_in` rather than `for_component`,
 for the reason the note below gives about a shared artifact.
 
-To ship a TypeScript rule as a component instead of a module, step 1 is unchanged — it is the
-same file, importing only from `lanekeep` — and steps 2 and 3 gain a build. List it in
-`crates/lanekeep-rules/typescript/entry.ts`, whose order *is* the index the component is
-dispatched on, record it in `COMPONENT_RULES` rather than `BUILT_IN_RULES`, and run
-`just typescript-builtins` to rebuild the shared artifact and re-record its source digests. The
-rule's own tests do not change, which is the point and was the acceptance test for the four that
-moved: same source, same expectations, different engine.
-
-**Add a test that runs the component, because "the tests do not change" does not mean they cover
-it.** A test built on `lanekeep_rules::source(name)` runs the TypeScript in QuickJS whatever form
-the rule ships in, so for two of the four the unchanged file went on testing the source and said
-nothing about the artifact. `RuleTester::for_built_in` names the rule by its specifier —
-`"lanekeep/no-default-export"` — which resolves through the embedded table to one rule of the
-shared component; `RuleTester::for_component` cannot do this, because it writes the artifact to a
-path and a path reference contributes every rule in it.
-`crates/lanekeep-rules/tests/typescript_builtins_as_components.rs` is the worked example, and its
-header explains why it is deliberately a subset: every case there compiles a 12.4 MiB artifact.
+There is no component step for a TypeScript built-in. The four TypeScript-inspecting rules
+shipped as one compiled component for a release cycle and were reverted to QuickJS modules by
+measurement — architecture §16 M5 tells that story, and §5.2's compiled form remains available
+to a project that builds a component itself; nothing compiles one on demand. A TypeScript built-in goes in `BUILT_IN_RULES`, never `COMPONENT_RULES`,
+and its `RuleTester` suite runs the same source the binary embeds, so there is no second
+artifact left for the tests to miss.
 
 Cover the forms that do not look like the obvious one. Every gap found while writing these
 two rules was a form that read differently in source but meant the same thing.

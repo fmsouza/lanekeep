@@ -105,8 +105,8 @@ commit_parsers = [
 # The binary is what users install, so its release is the one the whole workspace rides on.
 # Every other crate ships as part of it rather than announcing its own.
 #
-# The eleven without tags are still tracked: release-plz works out a crate's previous version
-# from the registry rather than from a tag, and all twelve are on crates.io.
+# The eighteen without tags are still tracked: release-plz works out a crate's previous
+# version from the registry rather than from a tag, and all nineteen are on crates.io.
 [[package]]
 name = "lanekeep-cli"
 # The tag still comes from here; the GitHub release deliberately does not. Releases are

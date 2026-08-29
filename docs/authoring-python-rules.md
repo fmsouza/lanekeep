@@ -55,6 +55,8 @@ is the authority on: `rules`, `metadata`, `configure`, `has-check`, `has-reduce`
 RULESET = [
     (nobroadexcept.ID, nobroadexcept.handlers()),
     (nomutabledefaultargument.ID, nomutabledefaultargument.handlers()),
+    (pyexplicitencoding.ID, pyexplicitencoding.handlers()),
+    (pystdoutbuffer.ID, pystdoutbuffer.handlers()),
 ]
 ```
 
