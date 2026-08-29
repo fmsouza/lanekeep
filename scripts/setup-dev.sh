@@ -63,8 +63,9 @@ TOOLS=(
     "cargo-insta:cargo-insta"
     "cargo-audit:cargo-audit"
     "typos:typos-cli"
-    # Builds the WebAssembly rule components. Not needed by any gate — the built
-    # fixtures are committed — but needed by `just wasm-fixtures` to rebuild one.
+    # Builds the WebAssembly rule components. `crates/lanekeep-rules/build.rs` reaches for
+    # it on a fresh checkout, where the shipped Rust components are not built yet, and
+    # `just wasm-fixtures` needs it to rebuild a committed fixture.
     "cargo-component:cargo-component"
     # `tinygo build` shells out to this for `component embed` and `component new`, so
     # `just go-rules` needs it and nothing else here does. Installed rather than merely

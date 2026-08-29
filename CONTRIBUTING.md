@@ -2,6 +2,7 @@
 
 Contributions are welcome. This document covers setup and process; if you are looking for
 how the tool works, start with [`docs/architecture.md`](docs/architecture.md).
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 If you are a coding agent, or directing one, read [`AGENTS.md`](AGENTS.md) — it has the
 same process plus the invariants and the traps.
@@ -25,12 +26,17 @@ and verifies the result by running the fast gate. Installing
 [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) first makes it much
 quicker — the script uses it when present and falls back to compiling from source.
 
-**Two toolchains are outside that and stay outside it deliberately**, because neither gate
-needs them: the artifacts they build are committed. Go and TinyGo, for the rule SDK in
-[`go-rules/`](go-rules) — `just test-go` skips its checks where `go` is absent, and
-`just go-rules` is a maintainer's recipe that requires TinyGo, which cannot be installed
-from cargo. Node, for the JavaScript component and the authoring package's own tests. See
-[`docs/authoring-go-rules.md`](docs/authoring-go-rules.md) if you are changing a Go rule.
+**The WebAssembly rule components are build products, not committed files**, so the *first*
+build of `lanekeep-rules` on a fresh checkout produces them into
+`crates/lanekeep-rules/components/` — and reaches for the component toolchains to do it.
+`cargo component`, installed by the setup script, covers the two Rust rules; the Go component
+additionally needs Go, TinyGo and `wasm-tools` (which TinyGo shells out to — the setup script
+installs `wasm-tools`, but TinyGo cannot be installed from cargo:
+[`docs/authoring-go-rules.md`](docs/authoring-go-rules.md) says what to install) —
+and the test-only TypeScript component needs Node. Every build after the first finds the
+artifacts present and is a strict no-op, `just test-go` still skips its checks where `go`
+is absent, and in CI a dedicated `components` job builds once for every other job to
+download.
 
 ## Commands
 
@@ -46,6 +52,7 @@ Every check is defined once, in the `justfile`. CI runs the same recipes, so a g
 | `just test-scripts` | The repository's own shell tooling |
 | `just test-go` | The Go launcher and the Go rule SDK, skipped where Go is absent |
 | `just fmt` | Apply formatting |
+| `just msrv` | Verify the declared MSRV still builds |
 | `just snapshot` | Review pending snapshot changes |
 
 The git hooks run these for you. `--no-verify` exists, but the gate will catch it later
@@ -79,6 +86,9 @@ feat(js)!: replace the node handle representation
 
 Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`,
 `chore`, `revert`. A `!` or a `BREAKING CHANGE:` footer marks a breaking change.
+The subject line — type, scope and all — must be **72 characters or fewer**, and the
+description after the colon starts lowercase. `./scripts/lint-commit-msg.sh --message
+"your title"` answers before CI does.
 
 `feat`, `fix`, `perf` and `revert` propose a release; everything else does not. So if your
 change affects users, do not file it as a `chore` — see the `release_commits` note in
@@ -112,13 +122,14 @@ same script, so they cannot disagree.
 ## Adding a rule
 
 Start from a working example: `lanekeep init` scaffolds a runnable rule, and
-[`docs/built-in-rules.md`](docs/built-in-rules.md) walks through the eight that ship, including
+[`docs/built-in-rules.md`](docs/built-in-rules.md) walks through the thirteen that ship, including
 what each one deliberately does *not* catch. [`docs/cross-file-rules.md`](docs/cross-file-rules.md)
 covers rules needing a whole-corpus view.
 
 The reference is §4 of [`docs/architecture.md`](docs/architecture.md) for the rule format and §6
-for the host API. §6 is where to look for `ctx` today, since the package that will carry the
-TypeScript definitions is not built yet.
+for the host API. The TypeScript definitions in [`packages/lanekeep`](packages/lanekeep) are
+generated from the same WIT world the engine implements, so your editor's autocomplete for
+`ctx` and §6 cannot disagree.
 
 A new built-in rule needs a `RuleTester` suite driven through the real engine — see
 `crates/lanekeep-rules/tests/` — and an entry in `docs/built-in-rules.md` in the same pull

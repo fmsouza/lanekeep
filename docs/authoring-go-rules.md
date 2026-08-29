@@ -382,8 +382,8 @@ kept in order, exactly as for Rust:
   `ruleset`.
 
 A rule name belongs to exactly one of `BUILT_IN_RULES` and `COMPONENT_RULES`; a name in both
-would be two programs answering to one id. There is **no** `COMPONENT_SOURCES` entry — that table
-is the TypeScript `just typescript-builtins` compiles, and a Go rule has none.
+would be two programs answering to one id. There is no source-review artifact to record
+either — a Go rule has no TypeScript at all, exactly as a Rust one has none.
 
 Add both rows in one change. A component listed only in the first table is bytes embedded in
 every shipped binary and reachable by no specifier, and `every_component_is_a_rule_that_ships`
@@ -407,9 +407,11 @@ Two things that survived the two migrations here and are worth copying. Compare 
 `metadata` against the original **mechanically** rather than by eye — a script that pulls the JS
 literals out, decodes their escapes and compares them against what the committed component
 answers through the ABI, with a control that capitalizes one character and watches the comparison
-fail. And keep a deliberately preserved false positive as a case rather than fixing it in
-passing: `a_different_package_aliased_to_context_is_also_reported` is the only place that would
-have shown a port quietly changing what a rule means.
+fail. And carry a rule's known limitations across as cases rather than fixing them in
+passing: `a_different_package_aliased_to_context_is_also_reported` was a deliberately preserved
+false positive at migration time and the only place that would have shown the port quietly
+changing what the rule means. (It was later fixed on purpose — the case now asserts the alias
+is accepted, under its original name, so the history stays greppable.)
 
 ## Authoring a Go rule outside this repository
 

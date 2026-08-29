@@ -8,14 +8,18 @@ description: How lanekeep's WebAssembly rule components are built, embedded, and
 on 2026-08-22: the `.wasm` components under `crates/lanekeep-rules/components/` were un-committed
 (PR #126's committed binaries became build-time artifacts). Key facts to remember:
 
-- **Two categories.** (a) Shipped built-ins — `go-builtins`, `no-glob-import`, `no-unwrap`,
-  `typescript-builtins`(+`.map`) — embedded into the published binary via
-  `include_bytes!("../components/…")` in `crates/lanekeep-rules/src/lib.rs`. (b) Self-check
-  components — 8 Rust + 2 Python rules — validate lanekeep's *own* source, loaded by path from
-  `lanekeep.json` and `tests/*.rs`; never ship.
-- **`crates/lanekeep-rules/build.rs` builds the 4 shipped components from source when missing**,
-  and is a strict no-op when present (so `cargo publish`'s verify build and a fresh clone with the
-  files present never reach for cargo-component/Node/TinyGo). It reproduces `just rust-rules` /
+- **Two categories.** (a) Shipped built-ins — `go-builtins`, `no-glob-import`, `no-unwrap` —
+  embedded into the published binary via `include_bytes!("../components/…")` in
+  `crates/lanekeep-rules/src/lib.rs`. (`typescript-builtins.wasm`(+`.map`) is NOT shipped since
+  #147's revert: built when missing for tests/benches only, excluded from the `.crate`.)
+  (b) Self-check components — 6 Rust rules, loaded by path from `lanekeep.json` and
+  `tests/*.rs` — plus the 4-rule Python component (2 self-check rules and Python ports of 2
+  shipped built-ins) exercised only by `crates/lanekeep-rules/tests/python_rules.rs`, never
+  wired into the config; none ship.
+- **`crates/lanekeep-rules/build.rs` builds the 3 shipped components from source when missing**
+  (and `typescript-builtins` best-effort, for the tests that read it), and is a strict no-op
+  when present (so `cargo publish`'s verify build and a fresh clone with the files present
+  never reach for cargo-component/Node/TinyGo). It reproduces `just rust-rules` /
   `just go-rules` / `just typescript-builtins` exactly.
 - **`build.rs` must emit `cargo:rerun-if-changed` on the OUTPUT `.wasm` paths too**, not only on
   sources. Otherwise deleting a `.wasm` (as `git checkout` of this change does) leaves cargo's
@@ -27,8 +31,9 @@ on 2026-08-22: the `.wasm` components under `crates/lanekeep-rules/components/` 
   download it before `just check`. `release.yml` has the same `components` job feeding `build`
   (embed) and `publish` (package).
 - **Reproducibility**: Rust (`cargo component`) and Go (TinyGo) components are byte-reproducible on
-  pinned toolchains; `componentize-js` (typescript-builtins) is NOT (~10 bytes differ between
-  builds). The Go `go-maporder.wasm` fixture is still committed and keeps a digest currency check in
+  pinned toolchains; `componentize-js` (typescript-builtins) is NOT — three builds of one tree gave three
+  distinct sizes with ~2.9 MB of content differing between two of them (the `wizer` heap
+  image; AGENTS.md has the dated measurement). The Go `go-maporder.wasm` fixture is still committed and keeps a digest currency check in
   `fixture_currency.rs` (`go-component-digests.txt`).
 - **`lanekeep.json`** allows `crates/lanekeep-rules/build.rs` in `no-unwrap` and
   `no-ambient-authority` (a build script legitimately shells out / unwraps).

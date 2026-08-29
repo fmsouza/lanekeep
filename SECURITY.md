@@ -20,8 +20,8 @@ you unless you prefer otherwise.
 
 ## Supported versions
 
-lanekeep is in early development and has not had its first release. Until v1.0, only the latest
-published version receives security fixes.
+lanekeep is released and pre-1.0. Until v1.0, only the latest published version receives
+security fixes.
 
 ## Threat model
 
@@ -83,6 +83,8 @@ therefore about **confinement**, not absence:
 - Dependencies are audited in CI with `cargo-audit` and `cargo-deny`, on every pull request and
   daily on a schedule.
 - GitHub Actions are pinned to commit SHAs, never to floating tags.
-- Releases carry SLSA provenance attestations; npm packages publish with provenance.
+- npm packages publish with provenance (`npm publish --provenance`, a sigstore attestation);
+  release archives ship beside a `SHA256SUMS` that the Go launcher verifies before running
+  anything it fetched.
 - The dependency surface is kept deliberately small — see §11 of
   [`docs/architecture.md`](docs/architecture.md).

@@ -7,6 +7,7 @@
 [![PyPI](https://img.shields.io/pypi/v/lanekeep?label=pypi)](https://pypi.org/project/lanekeep/)
 [![CI](https://github.com/fmsouza/lanekeep/actions/workflows/ci.yml/badge.svg)](https://github.com/fmsouza/lanekeep/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](Cargo.toml)
 
 lanekeep enforces the conventions that live in your team's heads and your reviewers' comments —
 the ones a language model cannot infer from the code it is shown. Every rule is a codified answer
@@ -67,20 +68,18 @@ Three things follow from who reads the output:
   the sandbox withholds the clock and randomness, so two runs over identical input produce
   byte-identical output. An agent reading it twice must not see reordering as change.
 - **It runs in the inner loop.** Agents and developers invoke it after every edit, so a warm run
-  is measured in tens of milliseconds — for a config whose rules are all TypeScript modules. A
-  rule that ships as a compiled component has to be loaded first, and the four TypeScript
-  built-ins share a 12.4 MiB one: a config naming all four of them costs **about 6.5 seconds on a
-  project's first run** and **about 0.2 seconds on every run after it** — the component is
-  deserialized once per run, not once per rule — and leaves 33 MiB in `.lanekeep`.
-  `lanekeep init` scaffolds one of those four, so that is what a new TypeScript project meets
-  first. [`docs/architecture.md`](docs/architecture.md) §15 has the table and what is owed.
+  is measured in tens of milliseconds. The built-ins that ship as WebAssembly components are all
+  under 115 KB, so loading them is noise — a 12.4 MiB compiled-TypeScript component that once
+  cost new TypeScript projects ~6.5 seconds on their first run was reverted for exactly that
+  reason.
+  [`docs/architecture.md`](docs/architecture.md) §15 has the ledger.
 
 **Rules are authored in TypeScript whatever language they check** — that is the form to start
 from, and it is the one most teams already have someone who writes. A rule may also be a
-WebAssembly component, which is how eight of the ten built-ins ship — two written in Rust, two
-written in Go, and four compiled ahead of time from the same TypeScript they were already
-written in. Every form reaches the same host API and is held to the same limits, and a config
-names a rule rather than its implementation. **Configuration is neither** — `lanekeep.json` is
+WebAssembly component, which is how four of the thirteen built-ins ship — two written in Rust
+and two written in Go; the other nine run as QuickJS modules, three of them checking five of
+the six supported languages from a single source (every one but JavaScript). Every form reaches the same host API and is held to
+the same limits, and a config names a rule rather than its implementation. **Configuration is neither** — `lanekeep.json` is
 plain data, so a Go, Python or Rust team never writes a `.ts` file except when authoring an
 actual rule.
 
@@ -204,7 +203,9 @@ In-repo, versioned with the code:
 | [`docs/architecture.md`](docs/architecture.md) | The full design: execution model, host API, cache, milestones |
 | [`docs/built-in-rules.md`](docs/built-in-rules.md) | The rules lanekeep ships with, and their options |
 | [`docs/cross-file-rules.md`](docs/cross-file-rules.md) | Writing a rule that needs a whole-corpus view |
-| [`docs/adr/`](docs/adr/) | Decision records: why the design is the way it is |
+| [`docs/authoring-rust-rules.md`](docs/authoring-rust-rules.md) | Writing a rule in Rust, shipped as a WebAssembly component |
+| [`docs/authoring-go-rules.md`](docs/authoring-go-rules.md) | Writing a rule in Go |
+| [`docs/authoring-python-rules.md`](docs/authoring-python-rules.md) | Writing a rule in Python |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Setup, commands, and the pull request process |
 | [`AGENTS.md`](AGENTS.md) | How to work in this repository — for coding agents and humans alike |
 | [`SECURITY.md`](SECURITY.md) | Threat model and how to report a vulnerability |

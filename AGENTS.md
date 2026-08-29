@@ -24,7 +24,7 @@ passes here it passes there.
 | --- | --- |
 | `just` | List every recipe |
 | `just setup` | One-time: install tooling, activate git hooks |
-| `just check-fast` | Format, clippy, tests. What pre-commit runs. |
+| `just check-fast` | Format, clippy, tests, the SDK suites, the shell tooling and the self-check. What pre-commit runs. |
 | `just check` | The full gate. What pre-push and CI run. |
 | `just test` | Rust tests via nextest |
 | `just test-go` | Both Go modules — the launcher and the rule SDK — skipped where Go is absent |
@@ -126,7 +126,8 @@ grammar. Workflow pinning stays with `scripts/test-workflows.sh`, bash portabili
 
 ```
 crates/
-  lanekeep-core      engine: walker, query evaluation, facts, violations, Rule trait
+  lanekeep-core      types, discovery, gates, facts, violations, the ordering contract, Rule trait
+  lanekeep-engine    rule execution: the walker — gates, parsing, query matching, handler invocation
   lanekeep-js        the sandbox: QuickJS, host API, TS stripping, module loader
   lanekeep-query     tree-sitter query parsing and compilation
   lanekeep-nodes     the node arena: parsed-tree handles shared by every rule-execution engine
@@ -140,6 +141,8 @@ crates/
   lanekeep-cache     content-addressed store with dependency tracking
   lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring
   lanekeep-rules     built-in rules: TypeScript sources, plus the components built at build time
+  lanekeep-types-gen    renders packages/lanekeep's definitions from the WIT world
+  lanekeep-package-gen  renders the built-in subpath map and its type gate from the rule tables
   lanekeep-report    human, json, sarif, agent reporters
   lanekeep-server    LSP and MCP over stdio, JSON-RPC by hand
   lanekeep-testkit   RuleTester
@@ -818,15 +821,16 @@ as a function where a rule object is expected.
 
 **That fix is retired rather than still running, and the split it served has moved twice since
 — so read the split from the tables, not from this paragraph.** `BUILT_IN_RULES` and
-`COMPONENT_RULES` in `crates/lanekeep-rules/src/lib.rs` are the source of truth. As of #167
-twelve built-ins ship, four as WebAssembly components — `no-unwrap` and `no-glob-import` from
-Rust crates, `no-package-init` and `no-context-in-struct` sharing the Go component — and eight
+`COMPONENT_RULES` in `crates/lanekeep-rules/src/lib.rs` are the source of truth. As of #172
+thirteen built-ins ship, four as WebAssembly components — `no-unwrap` and `no-glob-import` from
+Rust crates, `no-package-init` and `no-context-in-struct` sharing the Go component — and nine
 as QuickJS modules: the four TypeScript-inspecting rules went into a StarlingMonkey component
 and came back in #147 (13 MB of binary and 110× per host-API crossing for no speed benefit,
-architecture §15.1), and `no-restricted-calls` and `duplicate-implementation` arrived as modules
-after them. Three of the eight are genuine factories — `no-restricted-imports`,
-`no-restricted-calls`, `duplicate-implementation` — and none carries the `for (const key in …)`
-copy: the dual shape is gone, not restored. The one surviving instance of it is
+architecture §15.1), and `no-restricted-calls`, `duplicate-implementation` and
+`no-assertionless-test` arrived as modules after them. Six of the nine are genuine factories —
+every module except the three plain `defineRule` objects, `no-broad-except`,
+`no-default-export` and `no-mutable-default-argument` — and none carries the
+`for (const key in …)` copy: the dual shape is gone, not restored. The one surviving instance of it is
 `crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy that ships to nobody.
 
 What stands in the dual shape's place is `rules_module` in `crates/lanekeep-config/src/json.rs`,
@@ -844,11 +848,12 @@ mattered most: a rule declaring `check(ctx, m, options)` and exporting a plain o
 every option it documents, and no shipped built-in demonstrates the mistake — the factories
 close over their options, and the plain objects take none.
 
-**This section has now been stale twice, in the file that exists to stop that**, and the
-mechanism was the same both times: the text described the built-ins by shape and count — "the
+**This section has now been stale three times, in the file that exists to stop that**, and the
+mechanism was the same each time: the text described the built-ins by shape and count — "the
 three genuine factories", "eight of the ten are components" — and the changes that moved them
-(#147's revert, then two new factory modules in #166 and #167) swept for names, which no count
-written in prose matches. That is the entry below about grepping a formula rather than a claim,
+(#147's revert, two new factory modules in #166 and #167, then a third in #172) swept for
+names, which no count written in prose matches. The factory tally was also miscounted at
+authoring — five of the eight were factory-shaped the day "three" was written. That is the entry below about grepping a formula rather than a claim,
 arriving again. A count written out in prose is the spelling no pattern matches and no test
 covers — hence the opening instruction: derive the split from the tables, and treat any number
 this section states as a claim to recompute rather than to trust.

@@ -109,7 +109,7 @@ would teach it to.
 So a release-tooling change that alters the shipped artifacts needs a version bump written by
 hand:
 
-1. `[workspace.package] version` in `Cargo.toml`, and the fifteen internal dependency lines
+1. `[workspace.package] version` in `Cargo.toml`, and the nineteen internal dependency lines
    beneath it — they carry the version too.
 2. `cargo update --workspace` to refresh `Cargo.lock`.
 3. A `CHANGELOG.md` entry, since release-plz is not writing one.
@@ -207,6 +207,26 @@ workspace trips every time, so a 429 is waited out. Nothing else is retried.
 `cargo publish` runs **without** `--no-verify`. A crate that cannot build from its own
 published form is a crate nobody can use, and the only moment that is cheap to discover is
 before it is published.
+
+### Re-driving a publish that failed for a tooling reason
+
+A rerun of the tag's own workflow cannot repair a broken publish, because it re-executes the
+tag's scripts — which are exactly what failed. `release.yml` therefore takes a
+`workflow_dispatch` with a `tag` input:
+
+```sh
+gh workflow run release.yml --ref main -f tag=v0.7.0 -f version=0.7.0
+```
+
+That builds everything from the **tag's** sources but publishes with the **dispatched ref's**
+`scripts/` and `crates/lanekeep-rules/build.rs` — so the sequence after a publish-tooling
+failure is: fix the tooling on `main`, then dispatch against the stranded tag. Every publish
+skips what its registry already has, so the redrive finishes the release rather than fighting
+it, and a redrive that finds the GitHub release already existing leaves it alone. v0.7.0 is
+the case that forced this: seventeen crates published, then the tag's `publish-crates.sh`
+refused the component-carrying crate, and no rerun of the tag could ever see the fix.
+Dispatching with only `version` and no `tag` is the other mode — a dry run that builds and
+publishes nothing.
 
 ## What a release attaches
 

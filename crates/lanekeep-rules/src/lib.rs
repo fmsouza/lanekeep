@@ -1,8 +1,8 @@
 //! Built-in rules shipped with lanekeep.
 //!
 //! The rules shipping with lanekeep, authored against the same host API that project-authored
-//! rules use and embedded into the binary at build time. Eight are TypeScript modules evaluated
-//! in QuickJS — the two Python-targeting rules and the six TypeScript-targeting rules, four of
+//! rules use and embedded into the binary at build time. Nine are TypeScript modules evaluated
+//! in QuickJS — the two Python-targeting rules and the seven TypeScript-targeting rules, four of
 //! which were briefly compiled to a StarlingMonkey component and reverted, because that form cost
 //! 13 MB and 110× per host-API crossing for no speed benefit. The rest are WebAssembly
 //! components —
@@ -65,10 +65,11 @@
 
 /// The rules this build runs as TypeScript modules, as `(name, source)`.
 ///
-/// Evaluated in QuickJS, from source, on every run. Eight rules ship this way: the two
-/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the six
-/// TypeScript-targeting rules (`duplicate-implementation`, `no-circular-imports`, `no-default-export`,
-/// `no-restricted-calls`, `no-restricted-imports`, `no-unused-exports`). Four of them were
+/// Evaluated in QuickJS, from source, on every run. Nine rules ship this way: the two
+/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the seven
+/// TypeScript-targeting rules (`duplicate-implementation`, `no-assertionless-test`,
+/// `no-circular-imports`, `no-default-export`, `no-restricted-calls`, `no-restricted-imports`,
+/// `no-unused-exports`). Four of them were
 /// briefly compiled ahead of time into a shared StarlingMonkey component and reverted, because
 /// the compiled form cost 13 MB of binary and 110× per host-API crossing for no speed benefit —
 /// see `docs/architecture.md` §15.1 for the measurement.
@@ -141,8 +142,8 @@ type BuiltInComponent = (&'static str, &'static [u8], Option<&'static [u8]>);
 /// Go all fail by panicking, which traps, and a trap arrives at the host with no stack at all.
 /// There is nothing to remap. `go-rules/` builds with `-panic=trap` and `-no-debug`, so there is
 /// not even a name inside the artifact to map back to. A source map would only be needed for a
-/// component compiled from TypeScript, and none ships today — the six TypeScript built-ins
-/// run as QuickJS modules (see [`BUILT_IN_RULES`]).
+/// component compiled from TypeScript, and none ships today — the seven TypeScript-targeting
+/// built-ins run as QuickJS modules (see [`BUILT_IN_RULES`]).
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
 const BUILT_IN_COMPONENTS: &[BuiltInComponent] = &[
