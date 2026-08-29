@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/fmsouza/lanekeep/compare/v0.8.0...v0.8.1) - 2026-08-29
+
+### Fixed
+
+- *(rules)* stop requiring typescript-builtins in a package verify — the tag's `build.rs` failed every consumer build without the jco toolchain ([#176](https://github.com/fmsouza/lanekeep/pull/176))
+- *(release)* create the GitHub release with its archives, never before — releases are immutable, so one created empty at tag time can never receive its binaries ([#178](https://github.com/fmsouza/lanekeep/pull/178))
+
+v0.8.0's own release page was lost to that immutability (the empty release was deleted to retry, which retires the tag for releases permanently); its binaries live on the [`archives-v0.8.0`](https://github.com/fmsouza/lanekeep/releases/tag/archives-v0.8.0) release, same commit and checksums. This release is the first through the corrected flow.
+
 ## [0.8.0](https://github.com/fmsouza/lanekeep/compare/v0.7.0...v0.8.0) - 2026-08-29
 
 ### Added
