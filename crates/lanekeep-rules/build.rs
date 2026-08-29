@@ -146,14 +146,34 @@ fn main() {
         &|| build_rust_component(&repo_root, &components_dir, "no-unwrap"),
         "just rust-rules",
     );
-    // The TypeScript component ships with its source map sidecar, and `lib.rs` embeds both — so
-    // either missing is a missing artifact, and the check must match what `include_bytes!` reads.
-    refreshed_all &= refresh(
-        components_dir.join("typescript-builtins.wasm").exists()
-            && components_dir.join("typescript-builtins.wasm.map").exists(),
-        &|| build_typescript_builtins(&repo_root, &components_dir),
-        "just typescript-builtins",
-    );
+    // The TypeScript component is a *test and bench* input, not a shipped byte: nothing in
+    // `lib.rs` embeds it since the four TypeScript built-ins reverted to QuickJS modules —
+    // `tests/source_maps.rs` is what reads it, and test crates are not built by `cargo
+    // publish`'s verify. So a missing artifact here must not abort the build: the verify
+    // runs this script inside the packaged tarball, where the component is deliberately not
+    // included (13 MB against crates.io's cap) and jco cannot exist — which is exactly where
+    // die-on-missing killed the v0.8.0 publish. A failed build is a warning either way, and
+    // the failure it defers to is the honest one: the tests that read the artifact.
+    {
+        let present = components_dir.join("typescript-builtins.wasm").exists()
+            && components_dir.join("typescript-builtins.wasm.map").exists();
+        if !present || stale {
+            match build_typescript_builtins(&repo_root, &components_dir) {
+                Ok(()) => {}
+                Err(message) => {
+                    stdout(&format!(
+                        "cargo:warning=`typescript-builtins.wasm` could not be {}: {message}",
+                        if present { "rebuilt" } else { "built" }
+                    ));
+                    stdout(
+                        "cargo:warning=nothing shipped embeds it; the tests and benches \
+                         that read it will fail until `just typescript-builtins` succeeds",
+                    );
+                    refreshed_all = false;
+                }
+            }
+        }
+    }
 
     // Recorded only once every artifact is current, so a kept-stale artifact leaves the
     // stamp stale and the warning firing on every build until a rebuild lands.
