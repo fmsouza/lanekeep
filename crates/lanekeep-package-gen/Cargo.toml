@@ -18,8 +18,9 @@ workspace = true
 # `lanekeep-rules` is the authoritative table: `names()` lists every built-in rule and
 # `is_declared_component` distinguishes the ones that ship as WebAssembly components (which
 # have no module to import) from the ones that still run as TypeScript modules.
-# Path-only on purpose: this crate is never published, so the dependency needs no
-# registry version — and a hand-written one here is invisible to every version bump.
-# The `0.7.0` this replaced is what broke both release-plz's 0.8.0 proposal and the
-# manual bump: everything else moved and this line still required `^0.7.0`.
-lanekeep-rules = { path = "../lanekeep-rules" }
+# Inherited from `[workspace.dependencies]` on purpose. A version hand-written here is
+# invisible to every version bump — the `0.7.0` this replaced is what broke both
+# release-plz's 0.8.0 proposal and the manual bump, still requiring `^0.7.0` after
+# everything else moved. (Path-only would also work for a never-published crate, but
+# `deny.toml` bans wildcard requirements, and a versionless path dependency is one.)
+lanekeep-rules = { workspace = true }
