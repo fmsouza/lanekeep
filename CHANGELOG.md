@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/fmsouza/lanekeep/compare/v0.7.0...v0.8.0) - 2026-08-29
+
+### Added
+
+- *(config)* suppression policy — requireExpiry, maxExpiryDays, forbidFileScope ([#161](https://github.com/fmsouza/lanekeep/pull/161))
+- *(query)* reject general predicates tree-sitter never applies ([#162](https://github.com/fmsouza/lanekeep/pull/162))
+- *(types)* render all four pre-parse gates in index.d.ts ([#163](https://github.com/fmsouza/lanekeep/pull/163))
+- *(host)* add ctx.structureFingerprint subtree-shape hash ([#164](https://github.com/fmsouza/lanekeep/pull/164))
+- *(rule)* one query per grammar a rule declares ([#165](https://github.com/fmsouza/lanekeep/pull/165))
+- *(rules)* add no-restricted-calls, sharing import helpers ([#166](https://github.com/fmsouza/lanekeep/pull/166))
+- *(rules)* add duplicate-implementation rule ([#167](https://github.com/fmsouza/lanekeep/pull/167))
+- *(rules)* extend duplicate-implementation to Python, Go and Rust ([#170](https://github.com/fmsouza/lanekeep/pull/170))
+- *(rules)* extend no-restricted-calls to Python, Go and Rust ([#171](https://github.com/fmsouza/lanekeep/pull/171))
+- *(rules)* add no-assertionless-test across all supported languages ([#172](https://github.com/fmsouza/lanekeep/pull/172))
+
+### Fixed
+
+- *(ci)* match the bench's actual JS-component label in bench-js assert ([#148](https://github.com/fmsouza/lanekeep/pull/148))
+- *(release)* waive the dirty check for the injected-components crate ([#173](https://github.com/fmsouza/lanekeep/pull/173))
+- *(release)* a hand-written dependency version in lanekeep-package-gen no longer blocks a bump
+
+### Documentation
+
+- *(cache)* name both dated-key triggers in for_dated_file's comment ([#168](https://github.com/fmsouza/lanekeep/pull/168))
+- rewrite AGENTS.md's component-split section ([#169](https://github.com/fmsouza/lanekeep/pull/169))
+
+### Other
+
+- *(release)* re-drive an existing tag with current publish scripts ([#174](https://github.com/fmsouza/lanekeep/pull/174))
+
 ## [0.7.0](https://github.com/fmsouza/lanekeep/compare/v0.6.1...v0.7.0) - 2026-08-25
 
 ### Added
