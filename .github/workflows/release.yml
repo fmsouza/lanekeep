@@ -408,16 +408,23 @@ jobs:
 
       # A redrive exists because the tag's own publish tooling failed, so the tag's copy of
       # it cannot be what runs. This checks out the ref the dispatch ran on — no `ref:`, so
-      # it is the workflow's own commit — and overlays only `scripts/` onto the tag's tree.
-      # Crate sources, manifests and everything the registries receive stay the tag's.
+      # it is the workflow's own commit — and overlays the publish tooling onto the tag's
+      # tree: `scripts/`, and the one build script that both drives packaging *and* ships
+      # inside a crate. `crates/lanekeep-rules/build.rs` is in the overlay deliberately: a
+      # tag whose build script cannot run in a consumer's build must not be published as it
+      # is, the tag cannot be moved, and the v0.8.0 redrive is the case that proved it —
+      # the tag's build.rs demanded an artifact `cargo publish`'s verify tarball cannot
+      # build. Everything else the registries receive stays the tag's.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: inputs.tag != ''
         with:
           persist-credentials: false
           path: .redrive
-      - name: Publish a re-driven tag with this ref's scripts
+      - name: Publish a re-driven tag with this ref's publish tooling
         if: inputs.tag != ''
-        run: cp -R .redrive/scripts/. scripts/
+        run: |
+          cp -R .redrive/scripts/. scripts/
+          cp .redrive/crates/lanekeep-rules/build.rs crates/lanekeep-rules/build.rs
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
