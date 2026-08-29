@@ -109,7 +109,13 @@ commit_parsers = [
 # from the registry rather than from a tag, and all twelve are on crates.io.
 [[package]]
 name = "lanekeep-cli"
-git_release_enable = true
+# The tag still comes from here; the GitHub release deliberately does not. Releases are
+# immutable: the asset list freezes the moment a release is published, so one created here —
+# at tag time, before any binary exists — can never receive the archives, and `release.yml`'s
+# attach step dies with `HTTP 422: Cannot upload assets to an immutable release`. That is
+# what stranded v0.8.0's release page. The release is created by `release.yml` instead, in
+# one call *with* the archives, once they exist.
+git_release_enable = false
 git_tag_enable = true
 
 # The one crate that writes a changelog, and it writes the workspace's — to the root, which

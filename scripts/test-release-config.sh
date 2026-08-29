@@ -120,10 +120,16 @@ PY
 
 value() { grep "^$1=" "${work}/report" | cut -d= -f2-; }
 
-# Exactly one crate tags, and exactly one releases. Two would mean two tags per release and
-# the duplicates are back; zero would mean release.yml is never triggered at all.
+# Exactly one crate tags — two would mean two tags per release and the duplicates are back;
+# zero would mean release.yml is never triggered at all.
 check "exactly one crate is tagged" "lanekeep-cli" "$(value tagging)"
-check "exactly one crate is released" "lanekeep-cli" "$(value releasing)"
+
+# And *no* crate creates the GitHub release. Releases are immutable — the asset list freezes
+# at publication — so a release created at tag time can never receive the archives, and
+# release.yml's final step died on exactly that (`HTTP 422`, v0.8.0). The release is created
+# by release.yml instead, with the archives in one call; a crate turning this back on
+# reintroduces the empty immutable release that stranded v0.8.0's page.
+check "no crate creates the GitHub release" "" "$(value releasing)"
 
 # The defaults have to be off, or a crate added later inherits tagging without anyone saying
 # so — which is precisely how twelve tags appeared.
