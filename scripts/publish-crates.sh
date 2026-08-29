@@ -147,10 +147,20 @@ publish_one() {
   local crate="$1" attempt=1 log
   log="$(mktemp)"
 
+  # `crates/lanekeep-rules/components/` is not committed: the release workflow builds the
+  # components and drops them in just before publishing, and the crate's `include` list is
+  # what packages them. cargo's dirty check extends to include'd-but-ignored files, so
+  # publishing that crate from an otherwise pristine tag checkout is refused with "changes
+  # not yet committed" — which is what stalled v0.7.0 after seventeen crates were already
+  # up. The waiver is scoped to the one crate that packages injected artifacts; everything
+  # else keeps the check, so real dirt still fails a publish.
+  local dirty=()
+  [ "${crate}" = "lanekeep-rules" ] && dirty=(--allow-dirty)
+
   while :; do
     # Streamed as it happens and captured at the same time: `cargo publish` compiles before it
     # uploads, and a step that prints nothing for minutes reads like a hang.
-    if "${cargo_command}" publish -p "${crate}" ${extra[@]+"${extra[@]}"} 2>&1 | tee "${log}"; then
+    if "${cargo_command}" publish -p "${crate}" ${dirty[@]+"${dirty[@]}"} ${extra[@]+"${extra[@]}"} 2>&1 | tee "${log}"; then
       rm -f "${log}"
       return 0
     fi
