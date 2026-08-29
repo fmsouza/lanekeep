@@ -568,21 +568,39 @@ jobs:
       # Last, because a releases page advertising a version that is on neither registry is
       # worse than one that appears a minute later.
       #
-      # release-plz normally creates the release when it tags; this creates one if it is
-      # absent, so a tag pushed by hand — which is how every release so far has happened —
-      # still gets its binaries. `--clobber` makes a re-run replace assets rather than fail on
-      # the ones already there, which is the same resumability the registry publishes have.
+      # Created HERE, with the archives, in one call — never earlier and never empty.
+      # Releases are immutable: the asset list freezes when a release is published, so a
+      # release created at tag time (as release-plz used to; `release-plz.toml` now says
+      # why not) can never receive these files — v0.8.0 died on exactly that `HTTP 422`.
+      # And an immutable release must never be deleted to retry: deletion retires the tag
+      # name for releases permanently, which is why v0.8.0's binaries live on the sibling
+      # tag `archives-v0.8.0`. If the release already exists, this run is a redrive of a
+      # publish that got this far before; its assets are frozen and there is nothing left
+      # to do but say so.
       #
-      # The tag goes through `env:`. A ref name is attacker-controllable in the general case
-      # and `${{ }}` is substituted before bash sees the script.
-      - name: Attach the archives to the GitHub release
+      # The body is the tag's own CHANGELOG section, extracted here because nothing else
+      # creates the release any more. The tag goes through `env:` — a ref name is
+      # attacker-controllable in the general case, and `${{ }}` is substituted before bash
+      # sees the script.
+      - name: Create the GitHub release with its archives
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          if ! gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "no release for ${TAG} yet — creating one"
-            gh release create "${TAG}" --title "${TAG}" --generate-notes
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "the release for ${TAG} already exists and its assets are immutable — nothing to do"
+            exit 0
           fi
-          gh release upload "${TAG}" dist-archives/* --clobber
-          echo "attached $(find dist-archives -type f | wc -l | tr -d ' ') file(s) to ${TAG}"
+          version="${TAG#v}"
+          awk -v v="${version}" '
+            index($0, "## [" v "]") == 1 { in_section = 1; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > "${RUNNER_TEMP}/release-notes.md"
+          if ! [ -s "${RUNNER_TEMP}/release-notes.md" ]; then
+            echo "no CHANGELOG section for ${version} — the release body will name the tag alone"
+            printf 'Release %s.\n' "${TAG}" > "${RUNNER_TEMP}/release-notes.md"
+          fi
+          gh release create "${TAG}" --title "${TAG}" \
+            --notes-file "${RUNNER_TEMP}/release-notes.md" dist-archives/*
+          echo "created ${TAG} with $(find dist-archives -type f | wc -l | tr -d ' ') asset(s)"

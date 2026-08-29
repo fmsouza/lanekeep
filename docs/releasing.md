@@ -61,8 +61,9 @@ repository setting.
 
 **It cannot trigger `release.yml` from the tag it pushes.** GitHub suppresses that so a
 workflow cannot set itself off forever. So even with the setting enabled and the release pull
-request merged, the tag lands, the GitHub release appears, and nothing publishes — a releases
-page advertising a version that is on neither registry.
+request merged, the tag lands and nothing publishes — and since the GitHub release is now
+created by `release.yml` itself (see the archives section), nothing appears on the releases
+page either until that workflow runs.
 
 A fine-grained PAT in `RELEASE_PLZ_TOKEN`, with contents and pull-requests write, is the one
 fix for both. `release-plz.yml` prints which token it used on every run and spells out both
@@ -218,9 +219,23 @@ has no other copy of either.
 `SHA256SUMS` sits beside them with plain filenames, so `sha256sum -c SHA256SUMS` works in the
 directory the files were downloaded into.
 
-The upload creates the release if release-plz has not already — which is what makes a
-hand-pushed tag produce a complete release — and uses `--clobber`, so re-running replaces
-assets rather than failing on the ones already there.
+**The release is created by this step, with the archives, in one call — nothing creates it
+earlier, and nothing may.** GitHub releases are immutable: the asset list freezes the moment a
+release is published, so a release created at tag time — which is what release-plz used to do —
+can never receive these files, and the attach died with `HTTP 422: Cannot upload assets to an
+immutable release`. That is what stranded v0.8.0's release page. `release-plz.toml` therefore
+sets `git_release_enable = false` for `lanekeep-cli` (the tag still comes from release-plz), and
+this step extracts the version's CHANGELOG section for the release body, titles the release
+exactly after the tag, and publishes it with the assets already in place. A redrive that finds
+the release existing leaves it alone — its assets are frozen and correct.
+
+**Never delete an immutable release to retry anything.** Deletion permanently retires the tag
+name for releases: nothing can ever be published at that tag again, no draft can leave draft
+state under it, and GitHub support is the only appeal. v0.8.0's slot was lost exactly this way
+while repairing the empty release the old flow created; its binaries live on the sibling tag
+`archives-v0.8.0` (same commit, same checksums), with the tap pointed there. Recovery from a
+release-shaped failure goes through a sibling tag or through support — never through
+delete-and-recreate.
 
 ## Homebrew
 
