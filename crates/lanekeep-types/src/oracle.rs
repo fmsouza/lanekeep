@@ -22,6 +22,7 @@ const REQUIRED_KINDS: &[&str] = &[
     "union_type",
     "literal_type",
     "type_alias_declaration",
+    "identifier",
     "required_parameter",
     "optional_parameter",
     "variable_declarator",
@@ -167,6 +168,47 @@ impl<'t> TypeScriptOracle<'t> {
                 self.annotation_type(node, depth)
             }
 
+            "identifier" => {
+                let declaration = self.resolver.declaration_of(self.tree, self.source, node)?;
+                self.declaration_type(declaration, depth.saturating_add(1))
+            }
+
+            _ => None,
+        }
+    }
+
+    /// The type a declaration gives the name it declares.
+    ///
+    /// An annotation is preferred over an initializer wherever both are present, because
+    /// the annotation is what the program means: `const x: string = parseFloat(s)` is a
+    /// type error, and answering `number` for it would describe the mistake rather than the
+    /// declaration.
+    fn declaration_type(&self, declaration: Node<'t>, depth: u32) -> Option<Type> {
+        if depth >= MAX_DEPTH {
+            return None;
+        }
+        let next = depth.saturating_add(1);
+
+        match declaration.kind() {
+            "required_parameter" | "optional_parameter" => {
+                // The `type` field is the `type_annotation` wrapper; the parameter node
+                // itself is not one, so it has to be read before unwrapping. An unannotated
+                // parameter has no `type` field and gives nothing, which is correct — this
+                // milestone does not infer a parameter's type from its call sites.
+                let annotation = declaration.child_by_field_name("type")?;
+                self.annotation_type(annotation_child(annotation)?, next)
+            }
+
+            "variable_declarator" => {
+                if let Some(annotation) = declaration.child_by_field_name("type") {
+                    return self.annotation_type(annotation_child(annotation)?, next);
+                }
+                self.type_of_at(declaration.child_by_field_name("value")?, next)
+            }
+
+            // An import's declaration is in another file, which this oracle does not open.
+            // A function or class declaration names a callable or a constructor rather than
+            // a value with a type this milestone reasons about.
             _ => None,
         }
     }
@@ -300,5 +342,18 @@ impl<'t> TypeScriptOracle<'t> {
     /// The source text of a node.
     fn text(&self, node: Node<'t>) -> &'t str {
         self.source.get(node.byte_range()).unwrap_or("")
+    }
+}
+
+/// The type inside a `type_annotation` wrapper.
+///
+/// A parameter's `type` field is the `type_annotation` node, not the type itself, so every
+/// caller reading an annotation has to step through it. One place to get that wrong is
+/// better than four.
+fn annotation_child(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "type_annotation" {
+        node.named_child(0)
+    } else {
+        Some(node)
     }
 }

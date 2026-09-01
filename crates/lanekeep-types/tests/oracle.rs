@@ -346,3 +346,105 @@ fn a_locally_declared_bigint_shadows_the_primitive() {
         })
     );
 }
+
+/// Type the last `identifier` whose text is `name`.
+fn type_of_use(source: &str, name: &str) -> Option<Type> {
+    let tree = parse(source);
+    let oracle =
+        TypeScriptOracle::for_file(&TypeScript, &tree, source).expect("TypeScript is supported");
+
+    let found = nodes(&tree)
+        .into_iter()
+        .rfind(|node| node.kind() == "identifier" && source.get(node.byte_range()) == Some(name));
+    oracle.type_of(found.unwrap_or_else(|| panic!("no use of `{name}`")))
+}
+
+#[test]
+fn an_annotated_parameter_has_its_annotated_type() {
+    assert_eq!(
+        type_of_use(
+            "function credit(amount: number) { return amount; }",
+            "amount"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+#[test]
+fn an_annotated_optional_parameter_has_its_annotated_type() {
+    assert_eq!(
+        type_of_use(
+            "function credit(amount?: number) { return amount; }",
+            "amount"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// The headline: a local whose type comes from what it was initialized with.
+#[test]
+fn a_local_takes_the_type_of_its_initializer() {
+    assert_eq!(
+        type_of_use(
+            "const amount = parseFloat(raw);\nconst y = amount;",
+            "amount"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// The annotation wins over the initializer, and this is the half that denies a real bug.
+///
+/// An implementation reading the initializer first would answer `number` here. The
+/// declared type is what the program means.
+#[test]
+fn an_annotation_beats_the_initializer_it_sits_beside() {
+    assert_eq!(
+        type_of_use(
+            "const amount: string = parseFloat(raw);\nconst y = amount;",
+            "amount"
+        ),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+#[test]
+fn a_local_annotated_with_a_named_type_is_nominal() {
+    assert_eq!(
+        type_of_use(
+            "import { Decimal } from 'decimal.js';\nfunction f(x: Decimal) { return x; }",
+            "x"
+        ),
+        Some(Type::Nominal {
+            name: "Decimal".to_owned(),
+            symbol: Some(lanekeep_types::Symbol {
+                name: "Decimal".to_owned(),
+                module: Some("decimal.js".to_owned()),
+            }),
+        })
+    );
+}
+
+/// An imported *value* has no type this milestone can read.
+///
+/// Its declaration is in another file, which this oracle does not open. Cross-file
+/// resolution is a later milestone; answering anything here would be a guess.
+#[test]
+fn an_imported_value_has_no_type_yet() {
+    assert_eq!(
+        type_of_use("import { total } from './m';\nconst y = total;", "total"),
+        None
+    );
+}
+
+#[test]
+fn an_undeclared_name_has_no_type() {
+    assert_eq!(type_of_use("const y = missing;", "missing"), None);
+}
+
+/// An initializer chain terminates rather than running away.
+#[test]
+fn a_chain_of_initializers_terminates() {
+    let source = "const a = b;\nconst b = a;\nconst c = a;\n";
+    assert_eq!(type_of_use(source, "c"), None);
+}
