@@ -347,6 +347,21 @@ fn a_locally_declared_bigint_shadows_the_primitive() {
     );
 }
 
+/// The same guard, reached through an alias rather than a class.
+///
+/// `type bigint = string` shadows the primitive exactly as `class bigint {}` does above —
+/// the resolver sees a local declaration either way, so the text-matched shortcut still
+/// defers. What differs is where deferring leads: a class has nothing further to read and
+/// stops at nominal, but an alias is followed to what it names. The right answer here is
+/// the alias's target, not the primitive the name happens to spell.
+#[test]
+fn a_locally_aliased_bigint_resolves_through_the_alias() {
+    assert_eq!(
+        type_of_last("type bigint = string;\nlet x: bigint;", "type_annotation"),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
 /// Type the last `identifier` whose text is `name`.
 fn type_of_use(source: &str, name: &str) -> Option<Type> {
     let tree = parse(source);
@@ -447,4 +462,44 @@ fn an_undeclared_name_has_no_type() {
 fn a_chain_of_initializers_terminates() {
     let source = "const a = b;\nconst b = a;\nconst c = a;\n";
     assert_eq!(type_of_use(source, "c"), None);
+}
+
+#[test]
+fn a_same_file_type_alias_resolves_to_what_it_aliases() {
+    assert_eq!(
+        type_of_last("type Amount = number;\nlet x: Amount;", "type_annotation"),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+#[test]
+fn an_alias_chain_resolves_through_every_link() {
+    assert_eq!(
+        type_of_last(
+            "type A = number;\ntype B = A;\ntype C = B;\nlet x: C;",
+            "type_annotation"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// A cycle terminates instead of running away.
+///
+/// `type A = B; type B = A` is accepted by the parser and is meaningless. The bound is what
+/// makes this return rather than recurse until the stack ends.
+#[test]
+fn an_alias_cycle_terminates_without_an_answer() {
+    assert_eq!(
+        type_of_last("type A = B;\ntype B = A;\nlet x: A;", "type_annotation"),
+        None
+    );
+}
+
+/// An alias to something the oracle cannot type is not itself an answer.
+#[test]
+fn an_alias_to_an_untyped_type_is_untyped() {
+    assert_eq!(
+        type_of_last("type A = () => void;\nlet x: A;", "type_annotation"),
+        None
+    );
 }

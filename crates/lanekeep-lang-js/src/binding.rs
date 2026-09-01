@@ -146,6 +146,18 @@ fn declaration_entry_of<'t>(
             named_as(node, source, name).then_some((node, Binding::Local(BindingKind::Class)))
         }
 
+        // A type alias binds a name in the type namespace. `BindingKind::Type` already
+        // exists for exactly this construct — its own doc comment names `type T = U`
+        // aliases directly, Rust's resolver already maps `type Alias = u8;` to it, and the
+        // WIT `binding-kind` enum and host conversion already carry it end to end, so
+        // there is no new variant and no host-API change to make here. Reusing `Class`
+        // would misreport a type alias as a class to any rule asking `bindingKind` — the
+        // exact failure the `Type`/`Receiver`/`TypeParam` kinds above were added to avoid:
+        // "the nearest existing kind would be a lie".
+        "type_alias_declaration" => {
+            named_as(node, source, name).then_some((node, Binding::Local(BindingKind::Type)))
+        }
+
         // `export const x = 1`, `export function f() {}` — the declaration is inside.
         "export_statement" => node
             .child_by_field_name("declaration")
@@ -358,10 +370,16 @@ mod tests {
         // The last occurrence *by position*, not by traversal order — the traversal is
         // depth-first over a stack, so "last visited" is not "last in the file", and the
         // tests mean the latter.
+        //
+        // `type_identifier` alongside `identifier`: a name that lives only in the type
+        // namespace, like a type alias, never appears as a plain `identifier` node — the
+        // grammar tokenizes both its declaration and its uses as `type_identifier` instead.
+        // `resolve`/`declaration_of` read a node's text and walk its parents without caring
+        // which of the two kinds it is, so the test helper matches that indifference.
         let mut found: Option<Node<'_>> = None;
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
-            if node.kind() == "identifier"
+            if matches!(node.kind(), "identifier" | "type_identifier")
                 && node_text(node, source) == name
                 && found.is_none_or(|best| node.start_byte() > best.start_byte())
             {
@@ -472,6 +490,19 @@ mod tests {
         assert_eq!(
             resolve_use("class C {}\nnew C();", "C"),
             Some(Binding::Local(BindingKind::Class))
+        );
+    }
+
+    /// A type alias is its own kind, not the nearest lookalike.
+    ///
+    /// `type Alias = number;` binds like a declaration, but it is not a class — a rule
+    /// doing `ctx.bindingKind(n) === "class"` to find real classes must not also match
+    /// every type alias in the file.
+    #[test]
+    fn a_type_alias_resolves_as_the_type_kind_not_class() {
+        assert_eq!(
+            resolve_use("type Alias = number;\nlet x: Alias;", "Alias"),
+            Some(Binding::Local(BindingKind::Type))
         );
     }
 
@@ -627,6 +658,14 @@ mod tests {
         assert_eq!(
             declaration_use("function f(amount?: number) { return amount; }", "amount"),
             Some("optional_parameter".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_type_alias_is_reached_as_its_declaration() {
+        assert_eq!(
+            declaration_use("type Amount = number;\nlet x: Amount;", "Amount"),
+            Some("type_alias_declaration".to_owned())
         );
     }
 

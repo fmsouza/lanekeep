@@ -292,15 +292,22 @@ impl<'t> TypeScriptOracle<'t> {
         }
     }
 
-    /// A type named by an identifier.
+    /// A type named by an identifier: a same-file alias followed, or a nominal type.
     ///
-    /// Nominal for now. Task 8 gives this the alias-following arm that makes `depth`
-    /// load-bearing; until then it is threaded through and unused, which the underscore
-    /// records rather than hides.
-    fn named_type(&self, node: Node<'t>, _depth: u32) -> Option<Type> {
+    /// An alias is followed because `type Amount = number` means a rule asking "is this a
+    /// number" should hear yes. Nothing follows it across a file boundary — an imported
+    /// alias is nominal here, and stays that way until cross-file resolution lands.
+    fn named_type(&self, node: Node<'t>, depth: u32) -> Option<Type> {
         let name = self.text(node);
         if name.is_empty() {
             return None;
+        }
+
+        if let Some(declaration) = self.resolver.declaration_of(self.tree, self.source, node)
+            && declaration.kind() == "type_alias_declaration"
+            && let Some(value) = declaration.child_by_field_name("value")
+        {
+            return self.annotation_type(value, depth.saturating_add(1));
         }
 
         Some(Type::Nominal {
