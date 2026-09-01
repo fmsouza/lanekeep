@@ -1,0 +1,26 @@
+[package]
+name = "lanekeep-types"
+description = "The type oracle: what a node's type is, answered from one parsed file."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+lanekeep-lang = { workspace = true }
+tree-sitter = { workspace = true }
+
+[build-dependencies]
+blake3 = { workspace = true }
+
+[dev-dependencies]
+lanekeep-lang-js = { workspace = true }
+lanekeep-lang-python = { workspace = true }
+
+[lints]
+workspace = true

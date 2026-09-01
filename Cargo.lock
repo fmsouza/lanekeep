@@ -1021,6 +1021,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lanekeep-types"
+version = "0.8.1"
+dependencies = [
+ "blake3",
+ "lanekeep-lang",
+ "lanekeep-lang-js",
+ "lanekeep-lang-python",
+ "tree-sitter",
+]
+
+[[package]]
 name = "lanekeep-types-gen"
 version = "0.0.0"
 dependencies = [
