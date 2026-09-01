@@ -111,6 +111,18 @@ impl<'t> TypeScriptOracle<'t> {
         self.type_of_at(node, 0)
     }
 
+    /// Where the name at `node` came from, or `None` if nothing in this file declares it.
+    ///
+    /// Distinct from [`Self::type_of`] and useful where that returns nothing: an imported
+    /// value has no type this oracle can read, and still has a name and a module — which is
+    /// exactly what a rule distinguishing one library's `Decimal` from a local class needs.
+    ///
+    /// Answers in type position as well as expression position, because the resolver does.
+    #[must_use]
+    pub fn symbol_of(&self, node: Node<'t>) -> Option<Symbol> {
+        self.symbol_at(node)
+    }
+
     fn type_of_at(&self, node: Node<'t>, depth: u32) -> Option<Type> {
         if depth >= MAX_DEPTH {
             return None;

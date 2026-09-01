@@ -28,6 +28,7 @@
         "allow": [
           "crates/lanekeep-engine/benches/*",
           "crates/lanekeep-rules/tests/*",
+          "crates/lanekeep-types/tests/*",
           "crates/lanekeep-wasm/tests/*"
         ]
       }
@@ -99,7 +100,8 @@
           "crates/lanekeep-lang-rust/src/lib.rs",
           "crates/lanekeep-languages/src/lib.rs",
           "crates/lanekeep-rules/build.rs",
-          "crates/lanekeep-types-gen/src/lib.rs"
+          "crates/lanekeep-types-gen/src/lib.rs",
+          "crates/lanekeep-types/build.rs"
         ]
       }
     }

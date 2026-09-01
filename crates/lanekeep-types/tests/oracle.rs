@@ -503,3 +503,65 @@ fn an_alias_to_an_untyped_type_is_untyped() {
         None
     );
 }
+
+/// The symbol of the last use of `name`.
+fn symbol_of_use(source: &str, name: &str) -> Option<lanekeep_types::Symbol> {
+    let tree = parse(source);
+    let oracle =
+        TypeScriptOracle::for_file(&TypeScript, &tree, source).expect("TypeScript is supported");
+
+    let found = nodes(&tree).into_iter().rfind(|node| {
+        matches!(node.kind(), "identifier" | "type_identifier")
+            && source.get(node.byte_range()) == Some(name)
+    });
+    oracle.symbol_of(found.unwrap_or_else(|| panic!("no use of `{name}`")))
+}
+
+#[test]
+fn an_imported_name_carries_the_module_it_came_from() {
+    assert_eq!(
+        symbol_of_use(
+            "import { Decimal } from 'decimal.js';\nconst x = Decimal;",
+            "Decimal"
+        ),
+        Some(lanekeep_types::Symbol {
+            name: "Decimal".to_owned(),
+            module: Some("decimal.js".to_owned()),
+        })
+    );
+}
+
+/// The shadow pair: the same name, locally declared, carries no module.
+#[test]
+fn a_locally_declared_name_carries_no_module() {
+    assert_eq!(
+        symbol_of_use("class Decimal {}\nconst x = Decimal;", "Decimal"),
+        Some(lanekeep_types::Symbol {
+            name: "Decimal".to_owned(),
+            module: None,
+        })
+    );
+}
+
+#[test]
+fn a_name_nothing_declares_has_no_symbol() {
+    assert_eq!(symbol_of_use("const x = missing;", "missing"), None);
+}
+
+/// Two runs over one input agree, byte for byte.
+///
+/// The ordering guarantee's own test shape. Nothing here reads a clock or iterates a hash
+/// map, and this is what would notice if that stopped being true.
+#[test]
+fn two_runs_over_one_input_agree() {
+    let source = "import { Decimal } from 'decimal.js';\n\
+                  type Amount = number | string;\n\
+                  function f(a: Amount, b: Decimal) { const c = parseFloat('1'); return c; }\n";
+    let first = format!("{:?}", type_of_use(source, "c"));
+    let second = format!("{:?}", type_of_use(source, "c"));
+    assert_eq!(first, second);
+
+    let one = format!("{:?}", type_of_last(source, "union_type"));
+    let other = format!("{:?}", type_of_last(source, "union_type"));
+    assert_eq!(one, other);
+}
