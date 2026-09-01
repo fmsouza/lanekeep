@@ -19,9 +19,11 @@
 //! by this oracle must still be valid, so nothing here may observe anything outside the
 //! bytes it was handed.
 
+mod oracle;
 mod table;
 mod types;
 
+pub use oracle::TypeScriptOracle;
 pub use types::{Primitive, Symbol, Type};
 
 /// What this oracle *is*, as a digest of every source file that decides an answer.

@@ -1,0 +1,146 @@
+//! The oracle, against real parse trees.
+//!
+//! Integration rather than unit tests because the oracle's whole job is reading a grammar's
+//! output, and a hand-built tree would be a second opinion about node shapes rather than a
+//! test of the first.
+#![expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "the lint's grant covers `#[test]` functions and `#[cfg(test)]` modules, and a \
+              helper in an integration-test crate is neither — see AGENTS.md"
+)]
+
+use lanekeep_lang::Language;
+use lanekeep_lang_js::TypeScript;
+use lanekeep_types::{Primitive, Type, TypeScriptOracle};
+use tree_sitter::{Node, Tree};
+
+/// Parse `source` with the TypeScript grammar.
+fn parse(source: &str) -> Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&TypeScript.grammar())
+        .expect("the TypeScript grammar loads");
+    parser.parse(source, None).expect("the source parses")
+}
+
+/// Every node in the tree, in source order.
+///
+/// A cursor walk rather than indexing: `child_count` is a `usize` and `child` takes a
+/// `u32`, and the cast between them trips `clippy::cast_possible_truncation`, which this
+/// workspace denies.
+fn nodes(tree: &Tree) -> Vec<Node<'_>> {
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        out.push(node);
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    out
+}
+
+/// The last node of `kind` in the tree, in source order.
+///
+/// The *last* one, because a test writes the interesting expression after whatever sets it
+/// up — and because resolving a use rather than a declaration is what a rule does.
+fn last_of<'t>(tree: &'t Tree, kind: &str) -> Node<'t> {
+    nodes(tree)
+        .into_iter()
+        .rfind(|node| node.kind() == kind)
+        .unwrap_or_else(|| panic!("no `{kind}` node in the tree"))
+}
+
+/// Type the last node of `kind` in `source`.
+fn type_of_last(source: &str, kind: &str) -> Option<Type> {
+    let tree = parse(source);
+    let oracle =
+        TypeScriptOracle::for_file(&TypeScript, &tree, source).expect("TypeScript is supported");
+    oracle.type_of(last_of(&tree, kind))
+}
+
+#[test]
+fn a_number_literal_is_a_number() {
+    assert_eq!(
+        type_of_last("const x = 42;", "number"),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// The pair that matters: `1n` parses as `(number)` too.
+///
+/// There is no distinct bigint literal node, so a trailing `n` in the source text is the
+/// only thing separating the two. An oracle dispatching on kind alone types every bigint as
+/// a number, silently — which is precisely the confusion a bigint rule exists to catch.
+#[test]
+fn a_bigint_literal_is_a_bigint_despite_parsing_as_a_number() {
+    assert_eq!(
+        type_of_last("const x = 42n;", "number"),
+        Some(Type::Primitive(Primitive::BigInt))
+    );
+}
+
+#[test]
+fn a_string_literal_is_a_string() {
+    assert_eq!(
+        type_of_last("const x = 'a';", "string"),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+#[test]
+fn a_template_string_is_a_string() {
+    assert_eq!(
+        type_of_last("const x = `a${b}`;", "template_string"),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+#[test]
+fn the_boolean_literals_are_booleans() {
+    assert_eq!(
+        type_of_last("const x = true;", "true"),
+        Some(Type::Primitive(Primitive::Boolean))
+    );
+    assert_eq!(
+        type_of_last("const x = false;", "false"),
+        Some(Type::Primitive(Primitive::Boolean))
+    );
+}
+
+#[test]
+fn null_and_undefined_are_their_own_primitives() {
+    assert_eq!(
+        type_of_last("const x = null;", "null"),
+        Some(Type::Primitive(Primitive::Null))
+    );
+    assert_eq!(
+        type_of_last("const x = undefined;", "undefined"),
+        Some(Type::Primitive(Primitive::Undefined))
+    );
+}
+
+#[test]
+fn a_parenthesized_expression_is_its_inner_expression() {
+    assert_eq!(
+        type_of_last("const x = (42);", "parenthesized_expression"),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// The oracle refuses a grammar whose vocabulary it does not share.
+///
+/// Handed a Python tree it would ask TypeScript questions and get confident nonsense, so
+/// the constructor is where that is stopped rather than at whatever call site forgot.
+#[test]
+fn a_grammar_that_does_not_speak_typescript_gets_no_oracle() {
+    let source = "x = 1\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&lanekeep_lang_python::Python.grammar())
+        .expect("the Python grammar loads");
+    let tree = parser.parse(source, None).expect("the source parses");
+
+    assert!(TypeScriptOracle::for_file(&lanekeep_lang_python::Python, &tree, source).is_none());
+}
