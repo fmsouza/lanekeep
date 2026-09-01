@@ -144,3 +144,82 @@ fn a_grammar_that_does_not_speak_typescript_gets_no_oracle() {
 
     assert!(TypeScriptOracle::for_file(&lanekeep_lang_python::Python, &tree, source).is_none());
 }
+
+#[test]
+fn arithmetic_on_numbers_is_a_number() {
+    assert_eq!(
+        type_of_last("const x = 1 * 2;", "binary_expression"),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+#[test]
+fn a_comparison_is_a_boolean() {
+    assert_eq!(
+        type_of_last("const x = 1 < 2;", "binary_expression"),
+        Some(Type::Primitive(Primitive::Boolean))
+    );
+}
+
+#[test]
+fn concatenation_with_a_string_is_a_string() {
+    assert_eq!(
+        type_of_last("const x = 'a' + 1;", "binary_expression"),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+#[test]
+fn mixing_a_number_and_a_bigint_is_not_typed() {
+    assert_eq!(type_of_last("const x = 1 + 1n;", "binary_expression"), None);
+}
+
+/// `??` is deliberately outside the table, asserted as expected rather than incidental.
+#[test]
+fn an_operator_outside_the_table_is_not_typed() {
+    assert_eq!(type_of_last("const x = a ?? b;", "binary_expression"), None);
+}
+
+#[test]
+fn typeof_is_a_string() {
+    assert_eq!(
+        type_of_last("const x = typeof y;", "unary_expression"),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+#[test]
+fn a_builtin_conversion_has_the_type_it_converts_to() {
+    assert_eq!(
+        type_of_last("const x = parseFloat(s);", "call_expression"),
+        Some(Type::Primitive(Primitive::Number))
+    );
+    assert_eq!(
+        type_of_last("const x = String(v);", "call_expression"),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+/// The other half of the pair, and the one that denies a real bug.
+///
+/// A file declaring its own `parseFloat` must not be typed by the builtin table. Matching
+/// on the name alone would type this as a number, and the rule reading it would report
+/// about a value that is a `Decimal`.
+#[test]
+fn a_shadowed_builtin_is_not_typed_by_the_builtin_table() {
+    assert_eq!(
+        type_of_last(
+            "function parseFloat(s: string) { return s; }\nconst x = parseFloat('1');",
+            "call_expression"
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_call_to_an_ordinary_function_is_not_typed() {
+    assert_eq!(
+        type_of_last("const x = myHelper(1);", "call_expression"),
+        None
+    );
+}

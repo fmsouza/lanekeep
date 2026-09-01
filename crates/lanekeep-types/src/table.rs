@@ -11,7 +11,6 @@ use crate::Primitive;
 ///
 /// `left` and `right` are `None` when the oracle could not type that side. Every operator
 /// except `+` ignores them, because its result is a property of the operator alone.
-#[allow(dead_code)]
 pub(crate) fn binary(
     operator: &str,
     left: Option<Primitive>,
@@ -44,7 +43,6 @@ pub(crate) fn binary(
 /// anything else is refused rather than guessed at — `1 + 1n` is a `TypeError` at run time,
 /// and an oracle answering `number` for it would have a rule report about a value that
 /// never exists.
-#[allow(dead_code)]
 fn plus(left: Option<Primitive>, right: Option<Primitive>) -> Option<Primitive> {
     match (left?, right?) {
         (Primitive::String, _) | (_, Primitive::String) => Some(Primitive::String),
@@ -60,7 +58,6 @@ fn plus(left: Option<Primitive>, right: Option<Primitive>) -> Option<Primitive> 
 /// in practice and is left out because nothing needs it yet; `-` on a `bigint` is a
 /// `bigint` and on anything else a `number`, which is the `+` problem in miniature and is
 /// not worth the arm until a rule wants it.
-#[allow(dead_code)]
 pub(crate) fn unary(operator: &str) -> Option<Primitive> {
     match operator {
         "typeof" => Some(Primitive::String),
@@ -73,7 +70,6 @@ pub(crate) fn unary(operator: &str) -> Option<Primitive> {
 /// The caller is responsible for having established that the name resolves to no local
 /// binding. A file declaring its own `parseFloat` must not be typed by this table, and this
 /// function cannot tell — it is handed a name.
-#[allow(dead_code)]
 pub(crate) fn builtin_call(callee: &str) -> Option<Primitive> {
     match callee {
         "parseFloat" | "parseInt" | "Number" => Some(Primitive::Number),

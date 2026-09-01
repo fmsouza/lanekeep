@@ -7,6 +7,7 @@ use lanekeep_lang::Language;
 use lanekeep_lang::binding::BindingResolver;
 use tree_sitter::{Node, Tree};
 
+use crate::table;
 use crate::types::{Primitive, Type};
 
 /// Node kinds the dispatch below reads, which the constructor requires the grammar to know.
@@ -32,6 +33,9 @@ const REQUIRED_KINDS: &[&str] = &[
     "undefined",
     "number",
     "parenthesized_expression",
+    "binary_expression",
+    "unary_expression",
+    "call_expression",
 ];
 
 /// How far the oracle will follow a chain before giving up.
@@ -46,17 +50,8 @@ const MAX_DEPTH: u32 = 16;
 
 /// A type oracle for one parsed TypeScript file.
 pub struct TypeScriptOracle<'t> {
-    /// Read from Task 5 onward, by everything that asks the resolver a question.
-    #[expect(
-        dead_code,
-        reason = "read once call expressions are dispatched, in the next task"
-    )]
     tree: &'t Tree,
     source: &'t str,
-    #[expect(
-        dead_code,
-        reason = "read once call expressions are dispatched, in the next task"
-    )]
     resolver: Arc<dyn BindingResolver>,
 }
 
@@ -65,12 +60,13 @@ pub struct TypeScriptOracle<'t> {
 /// to add one for the sake of this impl is not worth it. The same reasoning, and the same
 /// fix, as `LanguageRegistry` in `lanekeep-lang`.
 ///
-/// `tree` is left out too, deliberately rather than incidentally: printing it would read
-/// `self.tree`, which would satisfy `dead_code` for a field this task's `#[expect]` says
-/// must still be unread.
+/// `tree` has no such problem — `Tree`'s own `Debug` delegates to the root `Node`'s,
+/// which prints one line (measured: `{Tree {Node program (0, 0) - (0, 16)}}`) rather than
+/// the whole parse tree, so it costs nothing to include.
 impl fmt::Debug for TypeScriptOracle<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TypeScriptOracle")
+            .field("tree", &self.tree)
             .field("source", &self.source)
             .finish_non_exhaustive()
     }
@@ -137,8 +133,58 @@ impl<'t> TypeScriptOracle<'t> {
                 self.type_of_at(node.named_child(0)?, depth.saturating_add(1))
             }
 
+            "binary_expression" => {
+                let next = depth.saturating_add(1);
+                let left = self.primitive_of(node.child_by_field_name("left")?, next);
+                let right = self.primitive_of(node.child_by_field_name("right")?, next);
+                table::binary(self.operator_of(node)?, left, right).map(Type::Primitive)
+            }
+
+            "unary_expression" => table::unary(self.operator_of(node)?).map(Type::Primitive),
+
+            "call_expression" => {
+                let callee = node.child_by_field_name("function")?;
+                // Only a *bare* global counts. A member call like `Number.parseFloat(x)`
+                // is not in the table, and a callee that resolves to a local binding is
+                // somebody's own function that happens to share a name.
+                if callee.kind() != "identifier" {
+                    return None;
+                }
+                if self
+                    .resolver
+                    .resolve(self.tree, self.source, callee)
+                    .is_some()
+                {
+                    return None;
+                }
+                table::builtin_call(self.text(callee)).map(Type::Primitive)
+            }
+
             _ => None,
         }
+    }
+
+    /// A node's type, when it is a primitive and nothing else.
+    ///
+    /// The operator table reasons about primitives, and a nominal or a union on either side
+    /// of an arithmetic operator is something it has no row for.
+    fn primitive_of(&self, node: Node<'t>, depth: u32) -> Option<Primitive> {
+        match self.type_of_at(node, depth)? {
+            Type::Primitive(primitive) => Some(primitive),
+            Type::Nominal { .. } | Type::Union(_) => None,
+        }
+    }
+
+    /// The operator token of a binary or unary expression.
+    ///
+    /// `operator` is a real field on both node kinds, same as `left`, `right` and
+    /// `function` beside it — the token it points to is an anonymous *node* (there is no
+    /// dedicated `+` or `typeof` kind), but anonymous-ness is a property of the node, not
+    /// of whether a field names it. The two are independent, and it is only the former that
+    /// is true here.
+    fn operator_of(&self, node: Node<'t>) -> Option<&'t str> {
+        node.child_by_field_name("operator")
+            .map(|child| self.text(child))
     }
 
     /// The source text of a node.
