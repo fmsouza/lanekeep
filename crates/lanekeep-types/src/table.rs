@@ -9,8 +9,11 @@ use crate::Primitive;
 
 /// What a binary operator produces, given whatever is known about its operands.
 ///
-/// `left` and `right` are `None` when the oracle could not type that side. Every operator
-/// except `+` ignores them, because its result is a property of the operator alone.
+/// `left` and `right` are `None` when the oracle could not type that side. Only the
+/// comparisons ignore them — a comparison is boolean whatever it compares. Every
+/// arithmetic operator reads both, because TypeScript's arithmetic is not one type: the
+/// same `*` is `number` between numbers and `bigint` between bigints, and is a type error
+/// across the two.
 pub(crate) fn binary(
     operator: &str,
     left: Option<Primitive>,
@@ -21,11 +24,18 @@ pub(crate) fn binary(
         // not type at all. This is the one place unknown operands still give an answer.
         "<" | ">" | "<=" | ">=" | "==" | "!=" | "===" | "!==" => Some(Primitive::Boolean),
 
-        // Arithmetic other than `+` coerces to a number in every case TypeScript accepts,
-        // with `bigint` the exception that keeps its own type.
-        "-" | "*" | "/" | "%" | "**" => match (left, right) {
-            (Some(Primitive::BigInt), Some(Primitive::BigInt)) => Some(Primitive::BigInt),
-            _ => Some(Primitive::Number),
+        // Arithmetic other than `+` is `plus` without the string case: `number` between
+        // numbers, `bigint` between bigints, and nothing at all otherwise.
+        //
+        // The `_ => Some(Number)` this replaces was the same guess `plus` refuses one arm
+        // below, made where nothing had been established. It answered `number` for
+        // `total * 2n` with `total` imported, and for `new D() * new D()` — the first a
+        // bigint and the second a `TypeError`, and both reported to a rule as a plain
+        // number with nothing to say the operands were never typed.
+        "-" | "*" | "/" | "%" | "**" => match (left?, right?) {
+            (Primitive::Number, Primitive::Number) => Some(Primitive::Number),
+            (Primitive::BigInt, Primitive::BigInt) => Some(Primitive::BigInt),
+            _ => None,
         },
 
         "+" => plus(left, right),
@@ -96,13 +106,70 @@ mod tests {
     }
 
     #[test]
-    fn the_arithmetic_operators_other_than_plus_are_number() {
+    fn the_arithmetic_operators_other_than_plus_are_number_between_numbers() {
         for operator in ["-", "*", "/", "%", "**"] {
             assert_eq!(
                 binary(operator, Some(Primitive::Number), Some(Primitive::Number)),
                 Some(Primitive::Number),
                 "{operator}"
             );
+        }
+    }
+
+    #[test]
+    fn the_arithmetic_operators_other_than_plus_are_bigint_between_bigints() {
+        for operator in ["-", "*", "/", "%", "**"] {
+            assert_eq!(
+                binary(operator, Some(Primitive::BigInt), Some(Primitive::BigInt)),
+                Some(Primitive::BigInt),
+                "{operator}"
+            );
+        }
+    }
+
+    /// The half that denies the bug: an operand nothing established is not a number.
+    ///
+    /// This arm used to fall through to `Some(Number)` whatever the operands were, which
+    /// answered `number` for an expression whose sides had never been typed at all. A rule
+    /// reading that reports about a value it has no evidence for, which is the one failure
+    /// this oracle is arranged against.
+    #[test]
+    fn arithmetic_with_an_unknown_operand_is_unknown() {
+        for operator in ["-", "*", "/", "%", "**"] {
+            assert_eq!(binary(operator, None, None), None, "{operator}");
+            assert_eq!(
+                binary(operator, None, Some(Primitive::Number)),
+                None,
+                "{operator}"
+            );
+            assert_eq!(
+                binary(operator, Some(Primitive::Number), None),
+                None,
+                "{operator}"
+            );
+        }
+    }
+
+    /// The same refusal `plus` makes, one operator family over.
+    ///
+    /// `1 * 1n` is a `TypeError` at run time, exactly as `1 + 1n` is. Mixing anything else
+    /// in — a string, a boolean — is a type error TypeScript rejects, so there is no result
+    /// to name.
+    #[test]
+    fn arithmetic_refuses_a_mixed_pair() {
+        for operator in ["-", "*", "/", "%", "**"] {
+            for (left, right) in [
+                (Primitive::Number, Primitive::BigInt),
+                (Primitive::BigInt, Primitive::Number),
+                (Primitive::String, Primitive::Number),
+                (Primitive::Boolean, Primitive::Boolean),
+            ] {
+                assert_eq!(
+                    binary(operator, Some(left), Some(right)),
+                    None,
+                    "{operator}"
+                );
+            }
         }
     }
 

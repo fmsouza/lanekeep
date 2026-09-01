@@ -22,10 +22,14 @@ const REQUIRED_KINDS: &[&str] = &[
     "union_type",
     "literal_type",
     "type_alias_declaration",
+    "type_parameter",
     "identifier",
     "required_parameter",
     "optional_parameter",
     "variable_declarator",
+    // Not a type node, and read all the same: a `comment` is a *named* child of a
+    // `union_type`, so the union arm has to name it in order to skip it. See there.
+    "comment",
     "string",
     "template_string",
     "true",
@@ -62,13 +66,19 @@ pub struct TypeScriptOracle<'t> {
 /// fix, as `LanguageRegistry` in `lanekeep-lang`.
 ///
 /// `tree` has no such problem — `Tree`'s own `Debug` delegates to the root `Node`'s,
-/// which prints one line (measured: `{Tree {Node program (0, 0) - (0, 16)}}`) rather than
+/// which prints one line (measured: `{Tree {Node program (0, 0) - (0, 12)}}`) rather than
 /// the whole parse tree, so it costs nothing to include.
+///
+/// `source` is the one field deliberately summarized rather than printed. It is a whole
+/// file, and a `Debug` that puts a file into every line it appears in is not one anybody
+/// can read; its length identifies which file this is for as well as the bytes would.
+/// Same call as `LanguageRegistry`, which prints its keys and not the languages behind
+/// them.
 impl fmt::Debug for TypeScriptOracle<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TypeScriptOracle")
             .field("tree", &self.tree)
-            .field("source", &self.source)
+            .field("source_len", &self.source.len())
             .finish_non_exhaustive()
     }
 }
@@ -195,6 +205,11 @@ impl<'t> TypeScriptOracle<'t> {
     /// the annotation is what the program means: `const x: string = parseFloat(s)` is a
     /// type error, and answering `number` for it would describe the mistake rather than the
     /// declaration.
+    ///
+    /// A declaration that binds through a *pattern* gives nothing at all. Both arms below
+    /// hold a type for the thing being destructured and none for the names taken out of
+    /// it, and the two are not the same type — reading either the annotation or the
+    /// initializer would hand every name the whole thing's type. See [`binds_one_name`].
     fn declaration_type(&self, declaration: Node<'t>, depth: u32) -> Option<Type> {
         if depth >= MAX_DEPTH {
             return None;
@@ -203,6 +218,9 @@ impl<'t> TypeScriptOracle<'t> {
 
         match declaration.kind() {
             "required_parameter" | "optional_parameter" => {
+                if !binds_one_name(declaration, "pattern") {
+                    return None;
+                }
                 // The `type` field is the `type_annotation` wrapper; the parameter node
                 // itself is not one, so it has to be read before unwrapping. An unannotated
                 // parameter has no `type` field and gives nothing, which is correct — this
@@ -212,6 +230,9 @@ impl<'t> TypeScriptOracle<'t> {
             }
 
             "variable_declarator" => {
+                if !binds_one_name(declaration, "name") {
+                    return None;
+                }
                 if let Some(annotation) = declaration.child_by_field_name("type") {
                     return self.annotation_type(annotation_child(annotation)?, next);
                 }
@@ -220,7 +241,8 @@ impl<'t> TypeScriptOracle<'t> {
 
             // An import's declaration is in another file, which this oracle does not open.
             // A function or class declaration names a callable or a constructor rather than
-            // a value with a type this milestone reasons about.
+            // a value with a type this milestone reasons about. A `type_parameter` is
+            // whatever the call site chose, which this oracle does not see.
             _ => None,
         }
     }
@@ -251,26 +273,42 @@ impl<'t> TypeScriptOracle<'t> {
             // Matched on text, not kind: `any` and `unknown` parse identically to `number`.
             // Both give nothing, deliberately — `any` is the absence of a claim, and
             // `void` and `never` are types no rule built on this oracle asks about.
+            //
+            // There is no `bigint` row, and its absence is the measurement rather than an
+            // oversight: this grammar does not lex `bigint` as a `predefined_type` at all.
+            // The `type_identifier` arm below is where it is answered, and
+            // `each_predefined_type_annotation_is_its_primitive` is what would redden if a
+            // grammar bump moved it here.
             "predefined_type" => match self.text(node) {
                 "number" => Some(Type::Primitive(Primitive::Number)),
                 "string" => Some(Type::Primitive(Primitive::String)),
                 "boolean" => Some(Type::Primitive(Primitive::Boolean)),
-                "bigint" => Some(Type::Primitive(Primitive::BigInt)),
                 "symbol" => Some(Type::Primitive(Primitive::Symbol)),
                 _ => None,
             },
 
+            // Every member or none.
+            //
+            // A member the oracle cannot type used to be dropped, on the reasoning that
+            // `number | Foo<T>` still tells a rule asking "can this be a number" something
+            // true. It does not: what came back was a bare `Primitive(Number)`, identical
+            // in every byte to a declared `number`, with nothing left to say a member had
+            // been lost. A rule reporting "this is typed `number`" then fires on
+            // `amount: number | Decimal` and accuses correct code.
+            //
+            // A `comment` is a *named* child of a `union_type` — measured:
+            // `number /* c */ | string` gives `(union_type (predefined_type) (comment)
+            // (predefined_type))` — so it has to be skipped by name. Left in, it would be
+            // an untypeable member, and a comment written inside an annotation would
+            // silence the whole union.
             "union_type" => {
                 let next = depth.saturating_add(1);
                 let mut cursor = node.walk();
                 let members: Vec<Type> = node
                     .children(&mut cursor)
-                    .filter(Node::is_named)
-                    .filter_map(|member| self.annotation_type(member, next))
-                    .collect();
-                // A member the oracle could not type is dropped rather than making the
-                // whole union unknown. `number | SomeGeneric<T>` still tells a rule asking
-                // "can this be a number" something true.
+                    .filter(|child| child.is_named() && child.kind() != "comment")
+                    .map(|member| self.annotation_type(member, next))
+                    .collect::<Option<Vec<Type>>>()?;
                 Type::union(members)
             }
 
@@ -309,17 +347,27 @@ impl<'t> TypeScriptOracle<'t> {
     /// An alias is followed because `type Amount = number` means a rule asking "is this a
     /// number" should hear yes. Nothing follows it across a file boundary — an imported
     /// alias is nominal here, and stays that way until cross-file resolution lands.
+    ///
+    /// A *type parameter* is the one declaration that is neither. `Nominal` is a claim —
+    /// that this is a distinct named type — and `f<number>(1)` makes it false, so the `T`
+    /// in `function f<T>(x: T)` gives nothing at all. Which is also why the resolver has to
+    /// see type parameters in the first place: before it did, the scope walk escaped
+    /// outward and `type A = number; function f<A>(x: A)` typed `x` as `number`.
     fn named_type(&self, node: Node<'t>, depth: u32) -> Option<Type> {
         let name = self.text(node);
         if name.is_empty() {
             return None;
         }
 
-        if let Some(declaration) = self.resolver.declaration_of(self.tree, self.source, node)
-            && declaration.kind() == "type_alias_declaration"
-            && let Some(value) = declaration.child_by_field_name("value")
-        {
-            return self.annotation_type(value, depth.saturating_add(1));
+        if let Some(declaration) = self.resolver.declaration_of(self.tree, self.source, node) {
+            if declaration.kind() == "type_parameter" {
+                return None;
+            }
+            if declaration.kind() == "type_alias_declaration"
+                && let Some(value) = declaration.child_by_field_name("value")
+            {
+                return self.annotation_type(value, depth.saturating_add(1));
+            }
         }
 
         Some(Type::Nominal {
@@ -362,6 +410,31 @@ impl<'t> TypeScriptOracle<'t> {
     fn text(&self, node: Node<'t>) -> &'t str {
         self.source.get(node.byte_range()).unwrap_or("")
     }
+}
+
+/// Whether a declaration binds exactly one name, rather than destructuring.
+///
+/// The resolver answers `declaration_of` with the whole declaration for every name a
+/// pattern binds, so `const { rate }: Money = order` hands back the same declarator for
+/// `rate` that `const order: Money = row` hands back for `order`. Nothing further down
+/// distinguishes them, and both the annotation and the initializer describe the thing
+/// being taken apart rather than any name taken out of it: without this guard,
+/// `const s = String(q); const { length } = s` types `length` as `string`, and
+/// `function f({ rate }: Money)` types `rate` as `Money`. Both are confidently wrong,
+/// which is worse than the `None` this produces instead.
+///
+/// Measured against tree-sitter-typescript: the named field is an `identifier` for a plain
+/// binding — including `let a!: number`, whose definite-assignment `!` does not change the
+/// kind — and an `object_pattern`, `array_pattern` or `rest_pattern` for the rest. So the
+/// test is for the one shape that is not a pattern, not against a list of the ones that
+/// are; a pattern kind this file has never heard of still fails it.
+///
+/// Typing a destructured name needs property lookup on the pattern's type, which is a
+/// later milestone's capability rather than a gap here.
+fn binds_one_name(declaration: Node<'_>, field: &str) -> bool {
+    declaration
+        .child_by_field_name(field)
+        .is_some_and(|bound| bound.kind() == "identifier")
 }
 
 /// The type inside a `type_annotation` wrapper.
