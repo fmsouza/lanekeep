@@ -52,74 +52,104 @@ impl JsBindingResolver {
 
     /// What `name` is bound to in this scope, ignoring nested scopes.
     fn declaration_in(scope: Node<'_>, source: &str, name: &str) -> Option<Binding> {
+        Self::declaration_entry(scope, source, name).map(|(_, binding)| binding)
+    }
+
+    /// The node that declares `name` in this scope, ignoring nested scopes.
+    fn declaration_node_in<'t>(scope: Node<'t>, source: &str, name: &str) -> Option<Node<'t>> {
+        Self::declaration_entry(scope, source, name).map(|(node, _)| node)
+    }
+
+    /// The declaration of `name` in this scope: the node, and what it binds.
+    ///
+    /// One walk with two projections above it, rather than two walks. Two would be free to
+    /// disagree about whether a name is declared at all, and the disagreement would be
+    /// silent — the binding half decides whether a rule matches, the node half decides
+    /// whether a type can be read, and a file where they differ answers one question and
+    /// not the other with nothing to say so.
+    fn declaration_entry<'t>(
+        scope: Node<'t>,
+        source: &str,
+        name: &str,
+    ) -> Option<(Node<'t>, Binding)> {
         let mut cursor = scope.walk();
 
-        // Written with `is_some_and` rather than a let-chain. That was originally because
-        // let-chains needed Rust 1.88 and the declared MSRV was 1.87; the floor has since
-        // moved to 1.94 for `wasmtime`, so the syntax is available now. It stays as it is
-        // because rewriting working code to use newly-available syntax is not a reason to
-        // touch it — an MSRV moves when a dependency forces it, never for syntax, and the
-        // same logic applies in reverse.
-        //
-        // Parameters belong to the function, not to its body block.
-        if scope
-            .child_by_field_name("parameters")
-            .is_some_and(|params| pattern_binds(params, source, name))
-        {
-            return Some(Binding::Local(BindingKind::Param));
+        // Parameters belong to the function, not to its body block. The *parameter* is
+        // returned rather than the list holding it, because an annotation belongs to one
+        // parameter and a caller handed the list would have to search it again.
+        if let Some(params) = scope.child_by_field_name("parameters") {
+            let mut params_cursor = params.walk();
+            if let Some(parameter) = params
+                .children(&mut params_cursor)
+                .find(|child| child.is_named() && pattern_binds(*child, source, name))
+            {
+                return Some((parameter, Binding::Local(BindingKind::Param)));
+            }
         }
+        // Let-chains from here down, where this used to read `is_some_and`: the old comment
+        // explained they were unavailable at the declared MSRV and that working code is not
+        // rewritten just because new syntax becomes legal — both still true. What changed is
+        // the shape, not the syntax budget: this walk now hands back the bound *node*, and
+        // `is_some_and` collapses the `Some` it matched down to a `bool`, which has nowhere
+        // to keep a node for the caller. A let-chain keeps `parameter` alive to return.
+        //
         // An arrow function with a single unparenthesized parameter.
         if scope.kind() == "arrow_function"
-            && scope
-                .child_by_field_name("parameter")
-                .is_some_and(|parameter| node_text(parameter, source) == name)
+            && let Some(parameter) = scope.child_by_field_name("parameter")
+            && node_text(parameter, source) == name
         {
-            return Some(Binding::Local(BindingKind::Param));
+            return Some((parameter, Binding::Local(BindingKind::Param)));
         }
         if scope.kind() == "catch_clause"
-            && scope
-                .child_by_field_name("parameter")
-                .is_some_and(|parameter| pattern_binds(parameter, source, name))
+            && let Some(parameter) = scope.child_by_field_name("parameter")
+            && pattern_binds(parameter, source, name)
         {
-            return Some(Binding::Local(BindingKind::CatchParam));
+            return Some((parameter, Binding::Local(BindingKind::CatchParam)));
         }
 
         for child in scope.children(&mut cursor) {
-            if let Some(binding) = declaration_binding(child, source, name) {
-                return Some(binding);
+            if let Some(entry) = declaration_entry_of(child, source, name) {
+                return Some(entry);
             }
         }
         None
     }
 }
 
-/// What `name` is bound to by this statement, if anything.
-fn declaration_binding(node: Node<'_>, source: &str, name: &str) -> Option<Binding> {
+/// The declaration of `name` by this statement: the node, and what it binds.
+fn declaration_entry_of<'t>(
+    node: Node<'t>,
+    source: &str,
+    name: &str,
+) -> Option<(Node<'t>, Binding)> {
     match node.kind() {
-        "import_statement" => import_binding(node, source, name),
+        "import_statement" => import_binding(node, source, name).map(|binding| (node, binding)),
 
         "lexical_declaration" | "variable_declaration" => {
             let kind = declaration_kind(node, source);
             let mut cursor = node.walk();
             node.children(&mut cursor)
                 .filter(|child| child.kind() == "variable_declarator")
-                .filter_map(|declarator| declarator.child_by_field_name("name"))
-                .any(|pattern| pattern_binds(pattern, source, name))
-                .then_some(Binding::Local(kind))
+                .find(|declarator| {
+                    declarator
+                        .child_by_field_name("name")
+                        .is_some_and(|pattern| pattern_binds(pattern, source, name))
+                })
+                .map(|declarator| (declarator, Binding::Local(kind)))
         }
 
         "function_declaration" | "generator_function_declaration" => {
-            named_as(node, source, name).then_some(Binding::Local(BindingKind::Function))
+            named_as(node, source, name).then_some((node, Binding::Local(BindingKind::Function)))
         }
 
         "class_declaration" => {
-            named_as(node, source, name).then_some(Binding::Local(BindingKind::Class))
+            named_as(node, source, name).then_some((node, Binding::Local(BindingKind::Class)))
         }
 
         // `export const x = 1`, `export function f() {}` — the declaration is inside.
         "export_statement" => node
             .child_by_field_name("declaration")
-            .and_then(|inner| declaration_binding(inner, source, name)),
+            .and_then(|inner| declaration_entry_of(inner, source, name)),
 
         _ => None,
     }
@@ -268,6 +298,22 @@ impl BindingResolver for JsBindingResolver {
             .count()
             > 1
     }
+
+    fn declaration_of<'t>(
+        &self,
+        _tree: &'t Tree,
+        source: &str,
+        node: Node<'t>,
+    ) -> Option<Node<'t>> {
+        let name = node_text(node, source);
+        if name.is_empty() {
+            return None;
+        }
+
+        Self::scopes(node)
+            .into_iter()
+            .find_map(|scope| Self::declaration_node_in(scope, source, name))
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +336,15 @@ mod tests {
     fn shadowed(source: &str, name: &str) -> bool {
         with_use(source, name, |tree, node| {
             JsBindingResolver.is_shadowed(tree, source, node)
+        })
+    }
+
+    /// The node-returning twin of `resolve_use`.
+    fn declaration_use(source: &str, name: &str) -> Option<String> {
+        with_use(source, name, |tree, node| {
+            JsBindingResolver
+                .declaration_of(tree, source, node)
+                .map(|declaration| declaration.kind().to_owned())
         })
     }
 
@@ -545,5 +600,67 @@ mod tests {
             "function a() { const t = 1; return t; }\nfunction b() { const t = 2; return t; }",
             "t"
         ));
+    }
+
+    // --- declaration_of ----------------------------------------------------------------
+
+    #[test]
+    fn a_use_reaches_the_declarator_that_declares_it() {
+        assert_eq!(
+            declaration_use("const amount = 1;\nconst b = amount;\n", "amount"),
+            Some("variable_declarator".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_use_reaches_its_parameter_rather_than_the_parameter_list() {
+        // The whole `formal_parameters` node would be useless to a caller reading a
+        // `type` annotation: the annotation belongs to one parameter, not to the list.
+        assert_eq!(
+            declaration_use("function f(amount: number) { return amount; }", "amount"),
+            Some("required_parameter".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_optional_parameter_is_reached_as_itself() {
+        assert_eq!(
+            declaration_use("function f(amount?: number) { return amount; }", "amount"),
+            Some("optional_parameter".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_use_reaches_the_import_that_bound_it() {
+        assert_eq!(
+            declaration_use("import { D } from 'd';\nconst x = D;\n", "D"),
+            Some("import_statement".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_name_nothing_declares_reaches_no_declaration() {
+        assert_eq!(declaration_use("const x = missing;\n", "missing"), None);
+    }
+
+    /// The two projections agree about *whether* a name is declared.
+    ///
+    /// They share one walk, so this is a guard against that stopping being true — a
+    /// node-returning path that silently found nothing would make every type answer
+    /// `None`, which reads exactly like a file with nothing to say.
+    #[test]
+    fn the_two_projections_agree_on_presence() {
+        for (source, name) in [
+            ("const a = 1;\nconst b = a;\n", "a"),
+            ("function f(p: number) { return p; }", "p"),
+            ("import { D } from 'd';\nconst x = D;\n", "D"),
+            ("const x = missing;\n", "missing"),
+        ] {
+            assert_eq!(
+                resolve_use(source, name).is_some(),
+                declaration_use(source, name).is_some(),
+                "disagreement for `{name}` in `{source}`"
+            );
+        }
     }
 }
