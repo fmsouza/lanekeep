@@ -223,3 +223,126 @@ fn a_call_to_an_ordinary_function_is_not_typed() {
         None
     );
 }
+
+#[test]
+fn each_predefined_type_annotation_is_its_primitive() {
+    for (written, expected) in [
+        ("number", Primitive::Number),
+        ("string", Primitive::String),
+        ("boolean", Primitive::Boolean),
+        ("bigint", Primitive::BigInt),
+        ("symbol", Primitive::Symbol),
+    ] {
+        assert_eq!(
+            type_of_last(&format!("let x: {written};"), "type_annotation"),
+            Some(Type::Primitive(expected)),
+            "{written}"
+        );
+    }
+}
+
+/// `any` and `unknown` parse identically to `number`, and both must give nothing.
+///
+/// Asserted as *expected* rather than left to fall out. `any` is the absence of a claim,
+/// and an oracle returning a type for it would assert something TypeScript does not.
+#[test]
+fn any_and_unknown_are_not_types_the_oracle_will_assert() {
+    assert_eq!(type_of_last("let x: any;", "type_annotation"), None);
+    assert_eq!(type_of_last("let x: unknown;", "type_annotation"), None);
+}
+
+#[test]
+fn a_union_annotation_is_a_union_of_its_members() {
+    let Some(Type::Union(members)) = type_of_last("let x: number | string;", "type_annotation")
+    else {
+        panic!("a two-member union");
+    };
+    assert_eq!(
+        members,
+        vec![
+            Type::Primitive(Primitive::Number),
+            Type::Primitive(Primitive::String),
+        ]
+    );
+}
+
+/// The canonical ordering, asserted through the grammar rather than only through `union`.
+#[test]
+fn a_union_annotation_does_not_depend_on_the_order_written() {
+    assert_eq!(
+        type_of_last("let x: number | string;", "type_annotation"),
+        type_of_last("let x: string | number;", "type_annotation")
+    );
+}
+
+#[test]
+fn a_literal_type_takes_its_literal_primitive() {
+    assert_eq!(
+        type_of_last("let x: 42;", "type_annotation"),
+        Some(Type::Primitive(Primitive::Number))
+    );
+    assert_eq!(
+        type_of_last("let x: 'a';", "type_annotation"),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+#[test]
+fn a_named_type_is_nominal() {
+    assert_eq!(
+        type_of_last(
+            "import { Decimal } from 'decimal.js';\nlet x: Decimal;",
+            "type_annotation"
+        ),
+        Some(Type::Nominal {
+            name: "Decimal".to_owned(),
+            symbol: Some(lanekeep_types::Symbol {
+                name: "Decimal".to_owned(),
+                module: Some("decimal.js".to_owned()),
+            }),
+        })
+    );
+}
+
+/// The shadow pair for nominals: a local class shares the name and not the module.
+#[test]
+fn a_locally_declared_type_is_nominal_with_no_module() {
+    assert_eq!(
+        type_of_last("class Decimal {}\nlet x: Decimal;", "type_annotation"),
+        Some(Type::Nominal {
+            name: "Decimal".to_owned(),
+            symbol: Some(lanekeep_types::Symbol {
+                name: "Decimal".to_owned(),
+                module: None,
+            }),
+        })
+    );
+}
+
+#[test]
+fn a_function_type_annotation_is_not_typed() {
+    assert_eq!(
+        type_of_last("let x: () => number;", "type_annotation"),
+        None
+    );
+}
+
+/// The pair for `bigint`'s text-matched shortcut, same shape as
+/// `a_shadowed_builtin_is_not_typed_by_the_builtin_table` one level up in the vocabulary.
+///
+/// A file declaring its own `bigint` must resolve to that declaration, not to the
+/// primitive. Matching on text alone, before the resolver has a say, would silently type
+/// this as `Primitive::BigInt` instead of the class the annotation actually names.
+#[test]
+fn a_locally_declared_bigint_shadows_the_primitive() {
+    assert_eq!(
+        type_of_last("class bigint {}\nlet x: bigint;", "type_annotation"),
+        Some(Type::Nominal {
+            name: "bigint".to_owned(),
+            symbol: Some(lanekeep_types::Symbol {
+                name: "bigint".to_owned(),
+                module: None,
+            }),
+        })
+    );
+}

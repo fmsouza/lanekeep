@@ -8,7 +8,7 @@ use lanekeep_lang::binding::BindingResolver;
 use tree_sitter::{Node, Tree};
 
 use crate::table;
-use crate::types::{Primitive, Type};
+use crate::types::{Primitive, Symbol, Type};
 
 /// Node kinds the dispatch below reads, which the constructor requires the grammar to know.
 ///
@@ -160,6 +160,13 @@ impl<'t> TypeScriptOracle<'t> {
                 table::builtin_call(self.text(callee)).map(Type::Primitive)
             }
 
+            "type_annotation" => {
+                self.annotation_type(node.named_child(0)?, depth.saturating_add(1))
+            }
+            "predefined_type" | "union_type" | "literal_type" | "type_identifier" => {
+                self.annotation_type(node, depth)
+            }
+
             _ => None,
         }
     }
@@ -173,6 +180,109 @@ impl<'t> TypeScriptOracle<'t> {
             Type::Primitive(primitive) => Some(primitive),
             Type::Nominal { .. } | Type::Union(_) => None,
         }
+    }
+
+    /// The type a type-level node denotes.
+    ///
+    /// Separate from [`Self::type_of_at`] because the two vocabularies barely overlap: a
+    /// `number` in expression position is a literal and in type position is a keyword. One
+    /// match arm handling both would have to disambiguate by parent, which is the kind of
+    /// thing that is right until somebody nests it.
+    fn annotation_type(&self, node: Node<'t>, depth: u32) -> Option<Type> {
+        if depth >= MAX_DEPTH {
+            return None;
+        }
+
+        match node.kind() {
+            // Matched on text, not kind: `any` and `unknown` parse identically to `number`.
+            // Both give nothing, deliberately — `any` is the absence of a claim, and
+            // `void` and `never` are types no rule built on this oracle asks about.
+            "predefined_type" => match self.text(node) {
+                "number" => Some(Type::Primitive(Primitive::Number)),
+                "string" => Some(Type::Primitive(Primitive::String)),
+                "boolean" => Some(Type::Primitive(Primitive::Boolean)),
+                "bigint" => Some(Type::Primitive(Primitive::BigInt)),
+                "symbol" => Some(Type::Primitive(Primitive::Symbol)),
+                _ => None,
+            },
+
+            "union_type" => {
+                let next = depth.saturating_add(1);
+                let mut cursor = node.walk();
+                let members: Vec<Type> = node
+                    .children(&mut cursor)
+                    .filter(Node::is_named)
+                    .filter_map(|member| self.annotation_type(member, next))
+                    .collect();
+                // A member the oracle could not type is dropped rather than making the
+                // whole union unknown. `number | SomeGeneric<T>` still tells a rule asking
+                // "can this be a number" something true.
+                Type::union(members)
+            }
+
+            // A literal type wraps the literal itself, so the expression side answers it.
+            "literal_type" => self.type_of_at(node.named_child(0)?, depth.saturating_add(1)),
+
+            // `bigint` is the one primitive-type keyword this grammar does not lex as a
+            // `predefined_type` — verified against tree-sitter-typescript 0.23 with a parse
+            // probe: `let x: bigint;` produces a `type_identifier` node reading "bigint",
+            // where `number`, `string`, `boolean`, `symbol`, `any` and `unknown` all produce
+            // `predefined_type`. Matched on text for the same reason the arm above matches
+            // on text rather than kind — but the resolver gets first say: `class bigint {}`
+            // shadows the primitive exactly as a local `parseFloat` shadows the builtin
+            // conversion in `type_of_at`, so the check has to run before the shortcut, not
+            // after `named_type` would have caught it anyway.
+            "type_identifier" => {
+                if self.text(node) == "bigint"
+                    && self
+                        .resolver
+                        .resolve(self.tree, self.source, node)
+                        .is_none()
+                {
+                    return Some(Type::Primitive(Primitive::BigInt));
+                }
+                self.named_type(node, depth)
+            }
+
+            // Generic, conditional, mapped, function and object types. Each would need an
+            // abstraction this oracle does not have, and guessing is worse than silence.
+            _ => None,
+        }
+    }
+
+    /// A type named by an identifier.
+    ///
+    /// Nominal for now. Task 8 gives this the alias-following arm that makes `depth`
+    /// load-bearing; until then it is threaded through and unused, which the underscore
+    /// records rather than hides.
+    fn named_type(&self, node: Node<'t>, _depth: u32) -> Option<Type> {
+        let name = self.text(node);
+        if name.is_empty() {
+            return None;
+        }
+
+        Some(Type::Nominal {
+            name: name.to_owned(),
+            symbol: self.symbol_at(node),
+        })
+    }
+
+    /// Where the name at `node` came from, when the resolver can say.
+    fn symbol_at(&self, node: Node<'t>) -> Option<Symbol> {
+        use lanekeep_lang::binding::Binding;
+
+        let name = self.text(node);
+        if name.is_empty() {
+            return None;
+        }
+        let module = match self.resolver.resolve(self.tree, self.source, node)? {
+            Binding::Import { module, .. } => Some(module),
+            Binding::Local(_) => None,
+        };
+        Some(Symbol {
+            name: name.to_owned(),
+            module,
+        })
     }
 
     /// The operator token of a binary or unary expression.
