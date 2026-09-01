@@ -409,6 +409,14 @@ struct RawRule {
     #[serde(default)]
     gates: Gates,
     timeout: Option<u64>,
+    /// Host analyses the rule declared, still as the JSON it was written as.
+    ///
+    /// Deliberately not `Option<Vec<String>>`, which would move the refusal for a
+    /// wrong-shaped value into serde and report it as a malformed *config* — a message
+    /// carrying a line and column and naming neither the rule nor the field. Kept as data so
+    /// [`check_requires`] can refuse it the way every other rule-level mistake is refused,
+    /// with the position and the id. The same reasoning made [`RawQueries`] hand-written.
+    requires: Option<serde_json::Value>,
     has_check: bool,
     has_reduce: bool,
 }
@@ -491,6 +499,87 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// The host analyses a rule may name in `requires`.
+///
+/// In the order the authoring type spells them, so the refusal below reads like the union an
+/// author is looking at rather than like an internal set. **Neither is implemented**, which is
+/// what makes `check_requires` a refusal for every value rather than a lookup.
+const KNOWN_CAPABILITIES: &[&str] = &["types", "dataflow"];
+
+/// The capability list, for a message that ends by saying what is valid.
+fn known_capabilities() -> String {
+    KNOWN_CAPABILITIES
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Refuse a `requires` the engine cannot honor — which today is every non-empty one.
+///
+/// # Why a rule declaring a real capability is refused rather than run without it
+///
+/// Because the alternative is silent. An analysis that goes missing does not make a rule
+/// fail; it makes the rule stop finding things, and a rule that reports nothing looks exactly
+/// like a codebase with nothing to report. The author's next reading of a clean run is "this
+/// is fixed" rather than "this never ran". This is the same reasoning that has the host refuse
+/// a component whose `languages` list is empty instead of admitting a rule that can never
+/// match a file.
+///
+/// # Why the shape is refused here and not by serde
+///
+/// `requires: 'types'` is the mistake this field invites, and coercing it — reading only an
+/// array and treating anything else as "none" — reproduces exactly the silence above, with
+/// the rule's own declaration as the thing discarded. So a wrong shape is as loud as a wrong
+/// value, and both name the rule.
+fn check_requires(requires: Option<&serde_json::Value>, id: &RuleId) -> Result<(), String> {
+    // Absence is handled here rather than at the call site, because an absent `requires` and
+    // an empty one say the same thing and there is one place to say so.
+    let Some(requires) = requires else {
+        return Ok(());
+    };
+
+    let Some(entries) = requires.as_array() else {
+        return Err(format!(
+            "`{id}` has a `requires` that is {} — it must be an array of capability names \
+             ({})",
+            json_kind(requires),
+            known_capabilities(),
+        ));
+    };
+
+    // Every entry is checked before any is refused for being unimplemented, so a config
+    // carrying both a typo and a real capability reports the typo. It is the one the author
+    // can do something about.
+    let mut named = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(name) = entry.as_str() else {
+            return Err(format!(
+                "`{id}` has a `requires` entry that is {} — every entry must be one of {}",
+                json_kind(entry),
+                known_capabilities(),
+            ));
+        };
+        if !KNOWN_CAPABILITIES.contains(&name) {
+            return Err(format!(
+                "`{id}` requires an unknown capability `{name}` — valid capabilities are {}",
+                known_capabilities(),
+            ));
+        }
+        named.push(name);
+    }
+
+    match named.first() {
+        Some(name) => Err(format!(
+            "`{id}` requires the `{name}` analysis, which this build does not provide — \
+             no host analysis is implemented yet, so no rule may declare one"
+        )),
+        // Declaring nothing is not declaring badly. An empty list and an absent one say the
+        // same thing, and refusing on presence rather than on content would reject both.
+        None => Ok(()),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawCard {
     message: Option<String>,
@@ -535,6 +624,7 @@ const EXTRACT: &str = r"
                 query: r?.query ?? null,
                 gates: r?.gates ?? {},
                 timeout: r?.timeout ?? null,
+                requires: r?.requires ?? null,
                 has_check: typeof r?.check === 'function',
                 has_reduce: typeof r?.reduce === 'function',
             })),
@@ -1713,6 +1803,12 @@ fn raw_rule_from(
             file_not_contains: metadata.gates.file_not_contains,
         },
         timeout: metadata.timeout,
+        // A component cannot declare one, because `rule-metadata` has no such field: the
+        // world is deliberately unchanged, since no component rule targets a language either
+        // analysis will support. This is an exhaustive struct literal, so the field arriving
+        // in the world later is a compile error here rather than a component whose
+        // declaration is silently dropped.
+        requires: None,
         has_check,
         has_reduce,
     }
@@ -1763,6 +1859,10 @@ fn build_rule(
             "`{id}` has no `check` function — a rule without one can never report anything"
         )));
     }
+
+    // Before the card and the query, because this refusal is about whether the rule can run
+    // at all rather than about whether it is well written.
+    check_requires(raw.requires.as_ref(), &id).map_err(fail)?;
 
     let card = raw
         .card
@@ -5020,6 +5120,140 @@ mod tests {
             .load_config()
             .expect_err("a zero horizon is refused");
         assert!(format!("{error}").contains("maxExpiryDays"), "{error}");
+    }
+
+    /// A rule declaring `requires`, spelled the way an author writes it.
+    ///
+    /// `requires` is raw JavaScript rather than a list, so a test can hand it a value of the
+    /// wrong shape — which is half of what this field has to refuse.
+    fn rule_requiring(id: &str, requires: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               requires: {requires},\n\
+               query: '(identifier) @id',\n\
+               card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.id); }},\n\
+             }});\n"
+        )
+    }
+
+    /// Load a config whose single rule declares `requires`, and return what happened.
+    fn load_requiring(name: &str, requires: &str) -> Result<Config, ConfigError> {
+        let fixture = Fixture::new(
+            name,
+            &[
+                ("rule.ts", &rule_requiring("local/example", requires)),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        fixture.load_config()
+    }
+
+    /// A capability name nothing could ever provide is a typo, and only this layer can say so.
+    ///
+    /// The refusal lists what is valid, because the alternative is an author guessing at the
+    /// spelling of a field whose whole purpose is to be explicit.
+    #[test]
+    fn an_unknown_capability_in_requires_is_refused() {
+        let error = load_requiring("requires-unknown", "['speed']")
+            .expect_err("an unknown capability is refused");
+        let text = format!("{error}");
+        assert!(text.contains("local/example"), "{text}");
+        assert!(text.contains("speed"), "{text}");
+        assert!(
+            text.contains("types") && text.contains("dataflow"),
+            "{text}"
+        );
+    }
+
+    /// A *known* capability is refused too, for as long as nothing implements it.
+    ///
+    /// This is the whole runtime behavior of the field today, and the alternative is the
+    /// failure it exists to prevent: a rule that declares an analysis, silently does not get
+    /// it, and reports nothing — which reads as "the code is clean" rather than as "the rule
+    /// never ran". Same reasoning as the host refusing an empty `languages` list.
+    #[test]
+    fn a_known_capability_in_requires_is_refused_while_unimplemented() {
+        for capability in ["types", "dataflow"] {
+            let error = load_requiring(
+                &format!("requires-unimplemented-{capability}"),
+                &format!("['{capability}']"),
+            )
+            .expect_err("an unimplemented capability is refused");
+            let text = format!("{error}");
+            assert!(text.contains("local/example"), "{text}");
+            assert!(text.contains(capability), "{text}");
+        }
+    }
+
+    /// Declaring nothing is not an error, in either spelling.
+    ///
+    /// The pair matters: an implementation that refused on presence rather than on content
+    /// would pass the refusal tests above and reject every rule that wrote `requires: []`.
+    #[test]
+    fn an_empty_or_absent_requires_loads() {
+        let empty = load_requiring("requires-empty", "[]").expect("an empty list is not a refusal");
+        assert_eq!(empty.rules.len(), 1);
+
+        let fixture = Fixture::new(
+            "requires-absent",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let absent = fixture
+            .load_config()
+            .expect("no `requires` is the status quo");
+        assert_eq!(absent.rules.len(), 1);
+    }
+
+    /// A `requires` of the wrong shape is refused by name, never coerced to "none".
+    ///
+    /// The obvious extraction — `Array.isArray(r?.requires) ? r.requires : []` — turns
+    /// `requires: 'types'` into a rule that declared a capability and is treated as having
+    /// declared nothing. That is exactly the silent-ignore this field exists to prevent, so
+    /// the wrong shape has to be as loud as the wrong value.
+    #[test]
+    fn a_requires_of_the_wrong_shape_is_refused_rather_than_ignored() {
+        for (name, written) in [
+            ("requires-string", "'types'"),
+            ("requires-object", "{ types: true }"),
+            ("requires-number-element", "[1]"),
+        ] {
+            let error =
+                load_requiring(name, written).expect_err("a malformed `requires` is refused");
+            let text = format!("{error}");
+            assert!(text.contains("requires"), "{text}");
+            assert!(text.contains("local/example"), "{text}");
+        }
+    }
+
+    /// The same refusal through a `lanekeep.json`.
+    ///
+    /// `build_rule` is reached from `build`, the one place both formats construct a `Config`,
+    /// so the tests above already prove the validation for both — the reasoning
+    /// `a_zero_max_expiry_days_is_refused` states. This is asserted anyway because `requires`
+    /// is read off the rule *module*, which the two formats reach through different entry
+    /// modules, and because the design records a bug that survived precisely by letting one
+    /// format's fixture stand in for both.
+    #[test]
+    fn the_requires_refusal_reaches_a_json_config_too() {
+        let fixture = Fixture::new(
+            "requires-json",
+            &[
+                ("rule.ts", &rule_requiring("local/example", "['types']")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+        let error = fixture
+            .load_json()
+            .expect_err("a JSON config reaches the same refusal");
+        let text = format!("{error}");
+        assert!(text.contains("local/example"), "{text}");
+        assert!(text.contains("types"), "{text}");
     }
 
     /// A JSON rule's options are a cache-key input, and were reaching neither hash.
