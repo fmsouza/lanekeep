@@ -256,6 +256,15 @@ export interface Rule {
    * or Rust rule means it silently never fires.
    */
   language?: LanguageId | LanguageId[]
+  /**
+   * Host analyses this rule needs before it can run.
+   *
+   * Absent means none, which is every rule today. A rule declaring one the engine cannot
+   * provide is refused at load rather than run without it: an analysis that silently goes
+   * missing makes the rule report nothing, and a rule reporting nothing is indistinguishable
+   * from a codebase with nothing to report.
+   */
+  requires?: Array<'types' | 'dataflow'>
   /** How serious a violation is, before any config override. */
   severity: Severity
   /** What the rule tells whoever has to act on it. */
