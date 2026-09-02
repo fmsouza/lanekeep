@@ -9,6 +9,7 @@
   },
   "include": [
     "builtin.d.ts",
+    "ctx-types.test-d.ts",
     "gates.test-d.ts",
     "index.d.ts",
     "requires.test-d.ts",

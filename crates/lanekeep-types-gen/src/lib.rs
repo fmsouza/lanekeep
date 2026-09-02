@@ -76,6 +76,9 @@ pub fn render_index_dts(wit: &str) -> String {
         render_emitted_fact(),
         render_node_location(),
         render_structure_fingerprint(),
+        render_symbol_info(),
+        render_type_info(),
+        render_type_api(),
         render_context(&resolve, "RuleContext", &check_context, true),
         render_reduce_location(),
         render_context(&resolve, "ReduceContext", &reduce_context, false),
@@ -262,9 +265,11 @@ fn render_param(resolve: &Resolve, name: &str, ty: &Type) -> String {
 
 /// Render one context interface from the resource it names.
 ///
-/// `quickjs_only` controls whether the `facts` method — which QuickJS gives a per-file rule
-/// and the WIT world does not — is appended. It is present on `RuleContext` and absent from
-/// `ReduceContext`, because the world puts `facts` only on the cross-file context.
+/// `quickjs_only` controls whether the two members QuickJS adds beyond what the world itself
+/// declares are appended: `facts`, which QuickJS gives a per-file rule and the world keeps only
+/// on the cross-file resource; and `types`, the bounded type oracle, which has no presence in
+/// the world at all — no component rule can declare `requires`, so there is nothing there to
+/// derive from. Both are present on `RuleContext` and absent from `ReduceContext`.
 fn render_context(
     resolve: &Resolve,
     name: &str,
@@ -288,10 +293,42 @@ fn render_context(
     }
     if quickjs_only {
         // QuickJS hands a per-file rule `facts`, which the world keeps on the cross-file context
-        // alone. It is the one member this renderer adds that the world does not declare, and it
-        // is added so the published surface keeps describing what a TypeScript rule can call.
+        // alone. It is one of the two members this renderer adds that the world does not
+        // declare, added so the published surface keeps describing what a TypeScript rule can
+        // call.
         out.push_str("  /** Facts emitted so far, optionally filtered by `kind`. */\n");
         out.push_str("  facts(kind?: string): EmittedFact[]\n");
+
+        // `types` is the other. Typed as always present rather than optional: TypeScript has
+        // no way to see that a rule's own `requires: ['types']` is what makes it so — `Rule`
+        // and `RuleContext` are not linked generically — so typing it optional would only force
+        // every declaring rule to write a narrowing check that always succeeds. The cost lands
+        // on a rule that forgets the declaration instead: it still compiles, and finds out at
+        // the first call, when `ctx.types` is `undefined` at run time and QuickJS throws rather
+        // than answering quietly wrong. The doc comment below is what tells a rule author that
+        // before they discover it that way.
+        out.push_str("  /**\n");
+        out.push_str(
+            "   * The bounded within-file type oracle, present only for a rule that declared\n",
+        );
+        out.push_str("   * `requires: ['types']`.\n");
+        out.push_str("   *\n");
+        out.push_str(
+            "   * Typed as always present because there is no way to spell \"present when\n",
+        );
+        out.push_str(
+            "   * this rule's own `requires` says so\" as a type — so a rule that forgets the\n",
+        );
+        out.push_str("   * declaration still compiles. It finds out at the first call instead:\n");
+        out.push_str(
+            "   * `ctx.types` is `undefined` at run time, and `ctx.types.typeOf(...)` throws a\n",
+        );
+        out.push_str(
+            "   * `TypeError` rather than returning a quietly wrong answer. That loudness is\n",
+        );
+        out.push_str("   * deliberate.\n");
+        out.push_str("   */\n");
+        out.push_str("  types: TypeApi\n");
     }
     out.push_str("}\n");
     out
@@ -357,11 +394,14 @@ const HEADER: &str = "\
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
  * The world is the single source of truth for every member the renderer emits straight from it.
- * Two members deviate from the world on purpose, and both are QuickJS-shaped: `today` is omitted
- * from `RuleContext` because QuickJS exposes it as a conditional property rather than a callable,
- * a shape this renderer cannot state honestly from the world; and `facts` is added to
+ * Three members deviate from the world on purpose, and all three are QuickJS-shaped: `today` is
+ * omitted from `RuleContext` because QuickJS exposes it as a conditional property rather than a
+ * callable, a shape this renderer cannot state honestly from the world; `facts` is added to
  * `RuleContext` because QuickJS hands a per-file rule `facts` that the world declares only on
- * `reduce-context`. Nothing else is added or omitted by hand.
+ * `reduce-context`; and `types` is added to `RuleContext` because `ctx.types` — the bounded
+ * type oracle — is QuickJS-only and has no presence in `world.wit` at all: a component rule
+ * cannot declare `requires`, so there is nothing for the world to say about it. Nothing else is
+ * added or omitted by hand.
  */
 ";
 
@@ -542,6 +582,79 @@ export interface StructureFingerprint {
   hash: string
   /** How many nodes the fold covered — the thresholding input. */
   nodes: number
+}
+";
+
+const SYMBOL_INFO: &str = "\
+/**
+ * Where a name came from. Returned by {@link TypeApi.symbolOf} directly, and nested under a
+ * {@link TypeInfo} whose `symbol` field is set.
+ */
+export interface SymbolInfo {
+  /** The name as written at its declaration. */
+  name: string
+  /**
+   * The module it was imported from. Absent for a local declaration — that absence is what
+   * distinguishes an imported `Decimal` from a local class that happens to share the name.
+   */
+  module?: string
+}
+";
+
+const TYPE_INFO: &str = "\
+/**
+ * What the oracle established about an expression, from {@link TypeApi.typeOf}.
+ *
+ * At most one of `primitive`, `symbol` or `union` is set, matching which kind of type this
+ * is — a `union`'s members are already flattened one level and in canonical order. `text` is
+ * set alongside whichever it is, but it is **display-only**: what TypeScript itself would
+ * call the type, for a message a rule builds. Branch on `primitive` and `symbol`, never on
+ * `text`'s wording.
+ *
+ * All three can be unset at once: a *nominal* type whose name the resolver could not
+ * attribute — an unresolvable, global or ambient type such as `Date` used with no local
+ * declaration or import — carries only `text`. That is not a gap to code around; it is
+ * another shape of the same \"I could not be sure\" answer this whole surface is built on,
+ * the same posture `typeOf` itself takes by returning `undefined` rather than guessing. Do
+ * not assume the final branch of `if (primitive) … else if (symbol) … else` is unreachable
+ * — for this shape, it is not.
+ *
+ * There is deliberately no `complete` field. Nothing in this milestone can make the oracle's
+ * answer partial, and a field that never varies would only teach a rule to stop checking it.
+ */
+export interface TypeInfo {
+  /** What TypeScript would call this type. Display-only — branch on the fields below instead. */
+  text: string
+  /** Set when this is a primitive — exactly the set TypeScript itself recognizes as one. */
+  primitive?: 'number' | 'string' | 'boolean' | 'bigint' | 'symbol' | 'null' | 'undefined'
+  /**
+   * Set when this is a named type and the oracle could resolve where the name came from.
+   * Absent on an unresolvable, global or ambient nominal type — see the interface doc above.
+   */
+  symbol?: SymbolInfo
+  /** Set when this is a union. */
+  union?: TypeInfo[]
+}
+";
+
+const TYPE_API: &str = "\
+/**
+ * The bounded within-file type oracle, reached through `ctx.types`.
+ *
+ * Every question can come back with no answer, and no answer is a first-class result rather
+ * than a failure to work around: the oracle is conservative on purpose, and it would rather
+ * say nothing than say something wrong, because a rule reporting on a wrong type accuses
+ * correct code. A rule is expected to check for `undefined` and quietly stay silent, the same
+ * posture the rest of the navigation surface already takes on a dead handle.
+ */
+export interface TypeApi {
+  /**
+   * The type of the expression at `n`. `undefined` is that first-class no-answer, not a
+   * failure.
+   */
+  typeOf(n: Node): TypeInfo | undefined
+  /** Where the identifier at `n` was declared. `undefined` on the same terms as `typeOf`. */
+  symbolOf(n: Node): SymbolInfo | undefined
 }
 ";
 
@@ -729,6 +842,18 @@ fn render_node_location() -> String {
 
 fn render_structure_fingerprint() -> String {
     STRUCTURE_FINGERPRINT.to_owned()
+}
+
+fn render_symbol_info() -> String {
+    SYMBOL_INFO.to_owned()
+}
+
+fn render_type_info() -> String {
+    TYPE_INFO.to_owned()
+}
+
+fn render_type_api() -> String {
+    TYPE_API.to_owned()
 }
 
 fn render_reduce_location() -> String {
