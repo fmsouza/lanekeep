@@ -26,64 +26,87 @@ const MONEY: &str = "{ restrictions: [{ \
      forbid: ['number'], \
      reason: 'construct a Decimal from a string, not a float' }] }";
 
-/// #185 §A.1's own example, verbatim, carrying both the inline form it named and the named
-/// form #203 measured as also uncaught by `no-restricted-types`. Both report under this rule:
-/// the inline `parseFloat(row.amount)` types as `number` directly, and `amount` in the second
-/// function resolves — through the oracle's declarator path — to a declarator whose initializer
-/// is the same `parseFloat(row.amount)` call, so it types as `number` too. Asserting only one
-/// of the two would let a rule that stopped resolving identifiers back to their declarators
-/// pass this test while silently losing the case the brief measured.
+/// #185 §A.1's own example, split across two files rather than kept in one — `src/load.ts` and
+/// `src/named.ts`, whose names sort in the same order as the reported violations — so this
+/// asserts the *file* half of `(ruleId, file, line, column)` and not only the line half.
+/// `load.ts` carries the inline form #185 §A.1 named, and `named.ts` carries the form #203
+/// measured as also uncaught by `no-restricted-types`: `amount` resolves — through the oracle's
+/// declarator path — to a declarator whose initializer is the same `parseFloat(row.amount)`
+/// call, so it types as `number` too. Asserting only one of the two files would let a rule that
+/// stopped resolving identifiers back to their declarators pass this test while silently
+/// losing the case the brief measured.
 #[test]
 fn the_inline_and_named_forms_are_both_reported() {
     let corpus = Corpus::new(
         "no-restricted-arguments",
         MONEY,
-        &[(
-            "src/money.ts",
-            "import { Decimal } from 'decimal.js';\n\
-             \n\
-             export function load(row: { amount: string }) {\n\
-             \x20 return new Decimal(parseFloat(row.amount));\n\
-             }\n\
-             \n\
-             export function named(row: { amount: string }) {\n\
-             \x20 const amount = parseFloat(row.amount);\n\
-             \x20 return new Decimal(amount);\n\
-             }\n",
-        )],
+        &[
+            (
+                "src/load.ts",
+                "import { Decimal } from 'decimal.js';\n\
+                 \n\
+                 export function load(row: { amount: string }) {\n\
+                 \x20 return new Decimal(parseFloat(row.amount));\n\
+                 }\n",
+            ),
+            (
+                "src/named.ts",
+                "import { Decimal } from 'decimal.js';\n\
+                 \n\
+                 export function named(row: { amount: string }) {\n\
+                 \x20 const amount = parseFloat(row.amount);\n\
+                 \x20 return new Decimal(amount);\n\
+                 }\n",
+            ),
+        ],
     );
 
     assert_eq!(
         corpus.run(),
         vec![
-            "src/money.ts:4:22 construct a Decimal from a string, not a float",
-            "src/money.ts:9:22 construct a Decimal from a string, not a float",
+            "src/load.ts:4:22 construct a Decimal from a string, not a float",
+            "src/named.ts:5:22 construct a Decimal from a string, not a float",
         ],
     );
 }
 
-/// The pair the fixture above needs: the same two call sites, with `row.amount` passed
-/// directly instead of through `parseFloat`. `row.amount` is a member expression the oracle
-/// cannot type, so both calls are silent. Without this, a rule that reported on every call to
-/// a matching callee regardless of its argument's type would pass the test above just as well.
+/// The pair the fixture above needs, and proof against a rule that ignores `forbid` entirely —
+/// not only against one that reports on every callee regardless of type.
+///
+/// `load`'s `row.amount` is a member expression the oracle cannot type at all, kept for
+/// coverage of that untypeable path. `named`'s `amount` resolves, through the oracle's
+/// declarator path, to `String(row.amount)` — a builtin call the oracle types by name alone,
+/// as `string`, without inspecting its own argument
+/// (`crates/lanekeep-types/src/oracle.rs:196-211`). `string` is a real, *typeable* answer that
+/// MONEY's `forbid: ['number']` does not name, so a rule that deleted the
+/// `if (!isForbidden(type, forbid)) continue` guard and reported on every typed argument
+/// regardless of the forbid list would flag this site and fail here — where a fixture built
+/// entirely from untypeable arguments could not have told the two apart, since both would be
+/// silent whether or not that guard exists.
 #[test]
 fn the_same_shape_with_no_forbidden_conversion_is_a_clean_run() {
     let corpus = Corpus::new(
         "no-restricted-arguments",
         MONEY,
-        &[(
-            "src/money.ts",
-            "import { Decimal } from 'decimal.js';\n\
-             \n\
-             export function load(row: { amount: string }) {\n\
-             \x20 return new Decimal(row.amount);\n\
-             }\n\
-             \n\
-             export function named(row: { amount: string }) {\n\
-             \x20 const amount = row.amount;\n\
-             \x20 return new Decimal(amount);\n\
-             }\n",
-        )],
+        &[
+            (
+                "src/load.ts",
+                "import { Decimal } from 'decimal.js';\n\
+                 \n\
+                 export function load(row: { amount: string }) {\n\
+                 \x20 return new Decimal(row.amount);\n\
+                 }\n",
+            ),
+            (
+                "src/named.ts",
+                "import { Decimal } from 'decimal.js';\n\
+                 \n\
+                 export function named(row: { amount: string }) {\n\
+                 \x20 const amount = String(row.amount);\n\
+                 \x20 return new Decimal(amount);\n\
+                 }\n",
+            ),
+        ],
     );
 
     assert_eq!(corpus.run(), Vec::<String>::new());

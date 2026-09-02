@@ -128,27 +128,22 @@ fn a_different_export_of_the_required_module_is_accepted_too() {
 }
 
 /// The oracle's initializer path, reached from a declaration-site identifier.
+///
+/// This is also the pin for #203's *named* form: `no-restricted-types` reaches
+/// `new Decimal(parseFloat(row.amount))`'s inline argument only by following `amount` back to
+/// its declarator, never at the call site itself — the case `lanekeep/no-restricted-arguments`
+/// exists to catch the *inline* form this rule cannot. Removing this test would silently drop
+/// the coverage the new rule was required to add to, never replace: mutation testing found no
+/// way to distinguish a differently-scoped or differently-named copy of this fixture from this
+/// one, because neither the declarator path nor the call-typing path branches on scope or on
+/// the parenthesized argument's own text — `crates/lanekeep-types/src/oracle.rs:196-211` types
+/// a builtin call by name alone, without inspecting its argument — so a second fixture in this
+/// shape would only duplicate this one, not add to it.
 #[test]
 fn a_local_typed_through_its_initializer_is_reported() {
     tester(MONEY)
         .reports_at("const amount = parseFloat(raw);\n", &[(1, 7)])
         .expect("parseFloat gives a number and the name says money");
-}
-
-/// The named half of #203's measurement, pinned here so that `no-restricted-arguments` — which
-/// catches the inline form this rule cannot — is only ever additive. This is the violation a
-/// project loses if the declarator arm of the query is ever narrowed.
-#[test]
-fn a_declarator_whose_initializer_types_as_a_forbidden_primitive_is_reported() {
-    tester(MONEY)
-        .reports_at(
-            "function use(row) {\n\
-             \x20 const amount = parseFloat(row.amount);\n\
-             \x20 return amount;\n\
-             }\n",
-            &[(2, 9)],
-        )
-        .expect("amount resolves to a declarator whose initializer types as number");
 }
 
 /// `undefined` is a first-class answer and the rule stays silent on it.
