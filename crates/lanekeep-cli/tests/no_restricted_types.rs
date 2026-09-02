@@ -30,20 +30,33 @@ const MONEY: &str = "{ conventions: [{ \
      reason: 'number loses precision past 2^53' }] }";
 
 /// A bare `number` on a name the convention governs is reported, at the parameter itself.
+///
+/// Both casings are in the corpus, because both are in `MONEY` and until now neither file used
+/// the capitalized one — so `'*Amount*'` was a pattern the comment above justified and no test
+/// exercised. Deleting it from `MONEY` now costs the second violation.
 #[test]
 fn a_bare_number_on_a_governed_name_is_reported() {
     let corpus = Corpus::new(
         "no-restricted-types",
         MONEY,
-        &[(
-            "src/money.ts",
-            "function credit(amount: number) { return amount; }\n",
-        )],
+        &[
+            (
+                "src/money.ts",
+                "function credit(amount: number) { return amount; }\n",
+            ),
+            (
+                "src/ledger.ts",
+                "function settle(totalAmount: number) { return totalAmount; }\n",
+            ),
+        ],
     );
 
     assert_eq!(
         corpus.run(),
-        vec!["src/money.ts:1:17 number loses precision past 2^53"],
+        vec![
+            "src/ledger.ts:1:17 number loses precision past 2^53",
+            "src/money.ts:1:17 number loses precision past 2^53",
+        ],
     );
 }
 

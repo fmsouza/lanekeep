@@ -52,6 +52,37 @@ fn a_forbidden_primitive_on_a_name_outside_the_convention_is_accepted() {
         .expect("`retries` is not money");
 }
 
+// --- the casing trap, as a pair ---
+//
+// `names` is matched with `lanekeep/patterns`' case-sensitive glob, and `docs/built-in-rules.md`
+// calls a pattern that silently matches nothing the worst outcome this rule has: nothing throws,
+// nothing warns, and the run reads exactly like a conforming codebase. `totalAmount` is the
+// spelling a real project writes, and neither fixture file exercised it in either direction.
+//
+// Neither half means anything alone. On its own the silent one passes against a rule that
+// reports nothing at all, and the reporting one passes against a rule whose matching is
+// case-*insensitive*. Together they say the casing is what decided it.
+
+/// The trap itself: one casing in the convention, the other in the code, and silence.
+#[test]
+fn a_lowercase_only_convention_silently_misses_a_camel_case_name() {
+    tester("{ conventions: [{ names: ['*amount*'], forbid: ['number'], reason: 'money' }] }")
+        .accepts("function report(totalAmount: number) { return totalAmount; }\n")
+        .expect("`*amount*`'s lowercase `a` never matches the capital one in `totalAmount`");
+}
+
+/// The half that makes the one above an assertion rather than a coincidence: the identical
+/// source, reported the moment the convention lists the casing the code actually uses.
+#[test]
+fn a_convention_listing_the_camel_case_spelling_reports_it() {
+    tester("{ conventions: [{ names: ['*Amount*'], forbid: ['number'], reason: 'money' }] }")
+        .reports_at(
+            "function report(totalAmount: number) { return totalAmount; }\n",
+            &[(1, 17)],
+        )
+        .expect("`*Amount*` is the spelling that catches `totalAmount`");
+}
+
 /// The shadow case. `require` matches on the module a symbol came from, never on its name,
 /// so a local class sharing the name is not the imported type and is still a violation.
 #[test]
@@ -224,6 +255,39 @@ fn the_reported_message_is_the_conventions_reason_with_no_required_type() {
             &["ids are opaque"],
         )
         .expect("the reason is carried even when the convention has nothing to require");
+}
+
+// --- `reasonFor`'s two fallbacks ---
+//
+// Every convention in this file and in the CLI's supplies a `reason`, so only the first of
+// `reasonFor`'s three branches was reached. Both fallbacks worked and neither was pinned, which
+// is the shape a refactor deletes without turning anything red: `reason` is optional in the
+// options schema, so a project that omits it is on one of these two lines.
+
+/// No `reason`, but something to require: the message names the replacement type.
+#[test]
+fn a_convention_with_no_reason_falls_back_to_naming_the_required_type() {
+    tester(
+        "{ conventions: [{ names: ['*amount*'], forbid: ['number'], \
+         require: { module: 'decimal.js', name: 'Decimal' } }] }",
+    )
+    .reports_messages(
+        "function credit(amount: number) { return amount; }\n",
+        &["use Decimal from decimal.js"],
+    )
+    .expect("with no reason of its own the convention's `require` is what there is to say");
+}
+
+/// Neither `reason` nor `require` — the last resort, and the only message the rule can build
+/// with nothing at all to go on.
+#[test]
+fn a_convention_with_neither_reason_nor_required_type_falls_back_to_a_generic_message() {
+    tester("{ conventions: [{ names: ['*amount*'], forbid: ['number'] }] }")
+        .reports_messages(
+            "function credit(amount: number) { return amount; }\n",
+            &["this type is restricted on a value the convention governs"],
+        )
+        .expect("nothing to quote and nothing to require leaves the generic line");
 }
 
 /// The `optional_parameter` query clause, pinned on its own. Without it an offending optional
