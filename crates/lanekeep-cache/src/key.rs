@@ -73,12 +73,14 @@ impl RunKey {
     /// would leave a test unable to tell which of the two the key covers, which is the reason
     /// this module already keeps the host surface and the compilation environment apart.
     ///
-    /// # Both are digests, and that is the caller's promise rather than this encoding's
+    /// # All three are digests, and that is the caller's promise rather than this encoding's
     ///
-    /// Every field here is length-prefixed, so nothing depends on the two being any particular
-    /// width. But they are both 32-byte `blake3` digests in practice, which is worth knowing
-    /// because it is what makes a *caller* mixing them up the only realistic way to get this
-    /// pair wrong — and this is public API, so a future caller could pass something else.
+    /// Every field here is length-prefixed, so nothing depends on the three being any
+    /// particular width. But all three are 32-byte `blake3` digests in practice, which is
+    /// worth knowing because it is what makes a *caller* mixing them up the only realistic way
+    /// to get this group wrong — three same-shaped `&[u8]` arguments in a row, which no
+    /// signature can tell apart — and this is public API, so a future caller could pass
+    /// something else.
     #[must_use]
     pub fn new(
         engine_version: &str,
