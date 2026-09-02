@@ -86,7 +86,13 @@ fn an_aliased_import_of_the_restricted_callee_is_reported() {
         .expect("Money resolves to decimal.js's Decimal through the import, not through its text");
 }
 
-/// The radix is silent by default: only position 0 is checked absent `argument`.
+/// A regression pin for the reported position on this source, not a proof that position 1 is
+/// never examined: `check` returns after its first report, so a broken implementation that
+/// defaulted to checking *every* position (`args.map((_, i) => i)`) would still report here, at
+/// this same position 0, and this test alone cannot tell the two apart — confirmed, that
+/// mutation fails `argument_all_reaches_a_position_the_default_misses` and
+/// `argument_one_reaches_it_alone` and not this test. Those two tests are what actually deny
+/// "every position is checked by default"; this one only pins where the report lands.
 #[test]
 fn the_radix_is_silent_by_default() {
     tester(MONEY)
@@ -95,23 +101,29 @@ fn the_radix_is_silent_by_default() {
              new Decimal(parseFloat(a), 10);\n",
             &[(2, 13)],
         )
-        .expect("the default position is 0; the 10 at position 1 is never asked about");
+        .expect("position 0 is reported; the 10 at position 1 is not what fired this report");
 }
 
 /// `argument: 'all'` reaches a position the default misses. One source, two configurations,
 /// opposite outcomes — this pair is the only thing that shows `argument` is read at all.
 ///
-/// `row.amount` (position 0) is a member expression the oracle answers `undefined` about; `10`
-/// (position 1) types as `number`. Under MONEY's default position this source is accepted, and
-/// under `argument: 'all'` it is reported at the `10`.
+/// `row.amount` (position 0, an *annotated* member expression — `row: { amount: string }`) is a
+/// member expression the oracle answers `undefined` about even though the surrounding parameter
+/// carries a type; `10` (position 1) types as `number`. Under MONEY's default position this
+/// source is accepted, and under `argument: 'all'` it is reported at the `10`.
+///
+/// The annotation matters: without it the fixture would only show "the oracle cannot type an
+/// undeclared identifier's member", which stays true even if binding resolution later improves
+/// and starts answering unannotated members. With it, the property under test is the real one —
+/// the oracle stays silent on a member expression's type even when the base is declared.
 #[test]
 fn argument_all_reaches_a_position_the_default_misses() {
     let source = "import { Decimal } from 'decimal.js';\n\
-                  new Decimal(row.amount, 10);\n";
+                  function use(row: { amount: string }) { new Decimal(row.amount, 10); }\n";
 
-    tester(MONEY)
-        .accepts(source)
-        .expect("position 0, row.amount, types as undefined under the default");
+    tester(MONEY).accepts(source).expect(
+        "position 0, row.amount, types as undefined under the default even though row is annotated",
+    );
 
     let all = "{ restrictions: [{ \
          call: { module: 'decimal.js', name: 'Decimal' }, \
@@ -119,7 +131,7 @@ fn argument_all_reaches_a_position_the_default_misses() {
          argument: 'all', \
          reason: 'construct a Decimal from a string, not a float' }] }";
     tester(all)
-        .reports_at(source, &[(2, 25)])
+        .reports_at(source, &[(2, 65)])
         .expect("'all' reaches position 1, the 10, which types as number");
 }
 
@@ -137,8 +149,8 @@ fn argument_one_reaches_it_alone() {
     tester(named_position)
         .reports_at(
             "import { Decimal } from 'decimal.js';\n\
-             new Decimal(row.amount, 10);\n",
-            &[(2, 25)],
+             function use(row: { amount: string }) { new Decimal(row.amount, 10); }\n",
+            &[(2, 65)],
         )
         .expect("argument: 1 reaches the 10 even though position 0 is untypeable");
 
@@ -169,7 +181,12 @@ fn a_leading_comment_does_not_shift_the_check() {
         .expect("the comment filter keeps parseFloat(x) at position 0");
 }
 
-/// A trailing comment likewise does not disturb the position.
+/// A trailing comment does not disturb position 0 — but note this is a weaker claim than the
+/// leading-comment test above. Deleting the `filter` fails
+/// `a_leading_comment_does_not_shift_the_check` but **not** this test: an unfiltered rule still
+/// reads `parseFloat(x)` at index 0 here, because the comment trails it at index 1, so this
+/// fixture cannot show the filter matters — it only pins that a trailing comment does not
+/// disturb the report.
 #[test]
 fn a_trailing_comment_does_not_shift_the_check() {
     tester(MONEY)
@@ -178,7 +195,7 @@ fn a_trailing_comment_does_not_shift_the_check() {
              new Decimal(parseFloat(x) /* rounded */);\n",
             &[(2, 13)],
         )
-        .expect("a trailing comment is filtered out and does not become position 1");
+        .expect("a trailing comment does not move position 0's report");
 }
 
 /// A nested conversion is judged on its immediate type, not on the value that fed it — a
@@ -267,6 +284,74 @@ fn an_empty_restrictions_list_reports_nothing() {
              new Decimal(parseFloat(row.amount));\n",
         )
         .expect("a restriction nobody wrote forbids nothing");
+}
+
+/// A nominal-typed argument is accepted: `isForbidden`'s fallthrough (neither `primitive` nor
+/// `union` is set) must stay `false`, never `true`. Nothing else in this file reaches that
+/// branch — the union tests return before it, and the untypeable-argument test short-circuits
+/// on `undefined` before `isForbidden` is even called — so without this test a rule that
+/// treated every nominal type as forbidden would accuse its own `card.examples.good` shape
+/// (`new Decimal(row.amount)` typed through a `Decimal`-annotated parameter) and nothing here
+/// would notice.
+#[test]
+fn a_nominal_typed_argument_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             function use(v: Decimal) { new Decimal(v); }\n",
+        )
+        .expect("a nominal type is neither a forbidden primitive nor a union carrying one");
+}
+
+/// A restriction with no `forbid` list forbids nothing. `restriction.forbid ?? []` is what
+/// keeps a `forbid`-less restriction from being read as "forbid everything" — without the `??
+/// []` default (e.g. a stray `?? ['number']`), this exact restriction would report on
+/// `parseFloat(x)` and this test is the only thing that would notice.
+#[test]
+fn a_restriction_with_no_forbid_list_reports_nothing() {
+    tester("{ restrictions: [{ call: { module: 'decimal.js', name: 'Decimal' } }] }")
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             new Decimal(parseFloat(x));\n",
+        )
+        .expect("an absent forbid list is an empty one, not an implicit forbid-all");
+}
+
+/// A restriction naming no `call` at all is silent — the `if (call === undefined) continue`
+/// guard, pinned on its own. Nothing else in this file omits `call`, so nothing else would
+/// notice this guard being deleted; without it, reading `call.module` on the next line would
+/// throw instead of skipping the restriction.
+#[test]
+fn a_restriction_with_no_call_is_silent() {
+    tester("{ restrictions: [{ forbid: ['number'] }] }")
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             new Decimal(parseFloat(x));\n",
+        )
+        .expect("a restriction with nothing to match against matches nothing");
+}
+
+/// `argument: 'all'` still reports only once per call, even when two positions are both
+/// forbidden — `check` returns after its first report. Deleting that early `return` is
+/// invisible to every other test here, because none of them gives a matching call two
+/// forbidden positions to find; this fixture does, and asserts exactly one violation rather
+/// than two.
+#[test]
+fn argument_all_reports_once_even_with_two_forbidden_positions() {
+    let all = "{ restrictions: [{ \
+         call: { module: 'decimal.js', name: 'Decimal' }, \
+         forbid: ['number'], \
+         argument: 'all', \
+         reason: 'r' }] }";
+    tester(all)
+        .reports_at(
+            "import { Decimal } from 'decimal.js';\n\
+             new Decimal(parseFloat(a), parseFloat(b));\n",
+            &[(2, 13)],
+        )
+        .expect(
+            "both positions are forbidden, but the rule reports once and returns, at the first",
+        );
 }
 
 /// The message falls back to the generic line when `reason` is absent.
