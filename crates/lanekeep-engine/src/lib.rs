@@ -620,13 +620,16 @@ impl std::fmt::Debug for Engine {
 /// one total would leave an author guessing which, and the two have nothing in common as
 /// fixes.
 ///
-/// **`path_gated`, `unread`, `cached`, `content_gated` and `parsed` reconcile.** Their sum
-/// equals [`Outcome::files_discovered`] for this rule, on every run, warm or cold — a file
-/// this rule saw always lands in exactly one of the five, because they are the five
-/// mutually exclusive points at which a file's fate for this rule is decided. That is what
-/// makes the table trustworthy: an author whose rule reports nothing can tell whether a
-/// gate excluded every file it would have caught, rather than guessing between "the gate is
-/// too narrow" and "the handler is wrong."
+/// **`path_gated`, `unread`, `cached`, `content_gated`, `language_gated` and `parsed`
+/// reconcile.** Their sum equals [`Outcome::files_discovered`] for this rule, on every run,
+/// warm or cold — a file this rule saw always lands in exactly one of the six, because they
+/// are the six mutually exclusive points at which a file's fate for this rule is decided.
+/// That is what makes the table trustworthy: an author whose rule reports nothing can tell
+/// whether a gate excluded every file it would have caught, or its own `language`
+/// declaration did, rather than guessing between that and "the handler is wrong." `parsed`
+/// counts only files this rule actually ran against — a rule whose declared language does
+/// not match a file's counts as `language_gated` there instead, never as `parsed`, however
+/// gate configuration says nothing about which files a query gets to run against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
@@ -647,7 +650,18 @@ pub struct RuleTiming {
     pub cached: u64,
     /// Files this rule's content gates rejected, after the read and before the parse.
     pub content_gated: u64,
-    /// Files this rule actually saw parsed.
+    /// Files this rule was admitted to whose language it does not declare, so it never ran.
+    ///
+    /// Distinct from `parsed`: a file can be parsed — by whichever grammar the file itself
+    /// selects — while this rule never runs against it, because the language a rule
+    /// declares narrows which parsed files it sees exactly the way a gate narrows which
+    /// files it is even offered. Counting such a file as `parsed` would tell an author with
+    /// `parsed: N, matches: 0` to narrow their query, when the real cause is the `language`
+    /// declaration — the failure mode `AGENTS.md` records costing 2218 false positives on a
+    /// React Native codebase, arriving here from the diagnostic rather than the engine side.
+    pub language_gated: u64,
+    /// Files this rule actually saw run: both gates passed, and its declared language
+    /// matched the file's.
     pub parsed: u64,
 }
 
@@ -661,7 +675,7 @@ impl RuleTiming {
     /// Fold `other` into `self` — every field summed, the two durations saturating like
     /// `total` above. Named rather than inlined at its one call site in
     /// [`Engine::run_files`] because that function is otherwise a line away from clippy's
-    /// limit, and the reduction is exactly the eight-field repetition this hides.
+    /// limit, and the reduction is exactly the field-by-field repetition this hides.
     fn accumulate(&mut self, other: &Self) {
         self.query = self.query.saturating_add(other.query);
         self.handler = self.handler.saturating_add(other.handler);
@@ -670,16 +684,18 @@ impl RuleTiming {
         self.unread += other.unread;
         self.cached += other.cached;
         self.content_gated += other.content_gated;
+        self.language_gated += other.language_gated;
         self.parsed += other.parsed;
     }
 }
 
-/// One increment per rule, for whichever of the four gate/cache/parse buckets counted it.
+/// One increment per rule, for whichever [`RuleTiming`] bucket counted it.
 ///
-/// The four counting sites in [`Engine::check_file`] share this exact shape — take a rule,
-/// pair its id with a [`RuleTiming`] carrying a single `1` in one field — and a free
-/// function is what keeps repeating it inline from pushing that function over clippy's line
-/// limit.
+/// Every counting site in [`Engine::check_file`] that sets exactly one field to `1` shares
+/// this exact shape — take a rule, pair its id with a [`RuleTiming`] carrying that single
+/// increment — and a free function is what keeps repeating it inline from pushing that
+/// function over clippy's line limit. Not used for `parsed`/`language_gated`, which choose
+/// their field per rule rather than setting the same one for every rule in the iterator.
 fn bucket_timings<'a>(
     rules: impl Iterator<Item = &'a Prepared>,
     set: impl Fn(&mut RuleTiming),
@@ -693,8 +709,8 @@ fn bucket_timings<'a>(
         .collect()
 }
 
-/// [`bucket_timings`], but empty when `profiling` is off — the shape every one of the four
-/// counting sites in [`Engine::check_file`] needs, kept out of that function's line count.
+/// [`bucket_timings`], but empty when `profiling` is off — the shape every uniform
+/// counting site in [`Engine::check_file`] needs, kept out of that function's line count.
 fn gate_timings<'a>(
     profiling: bool,
     rules: impl Iterator<Item = &'a Prepared>,
@@ -1603,16 +1619,14 @@ impl Engine {
         let mut outcome = FileOutcome::parsed(path.clone());
         outcome.timings.extend(path_gate_timings);
         outcome.timings.extend(content_gate_timings);
-        if self.profiling {
-            // Every rule that survived both gates counts as parsed here, whether or not the
-            // parse below actually succeeds — `parsed` means "this rule actually saw
-            // parsed", i.e. reached this point, not "the parse came back clean."
-            outcome
-                .timings
-                .extend(bucket_timings(admitted.iter().copied(), |timing| {
-                    timing.parsed = 1;
-                }));
-        }
+        // Every rule that survived both gates lands here, whether or not the parse below
+        // actually succeeds — computed and pushed *before* `parse_once` runs, which is
+        // load-bearing: the early return just below, when no admitted rule targets this
+        // file's language at all, must still hand back an `outcome` that already carries
+        // every rule's count.
+        outcome
+            .timings
+            .extend(self.parsed_or_language_gated_timings(path, &admitted));
         let Some((language, tree)) = self.parse_once(path, &source, &admitted) else {
             return Ok(outcome);
         };
@@ -1673,6 +1687,40 @@ impl Engine {
         });
 
         Ok(outcome)
+    }
+
+    /// `parsed: 1` for a rule whose declared language matches this file's, `language_gated:
+    /// 1` for one that does not — split out of [`Self::check_file`] only to keep that
+    /// function under clippy's line limit.
+    ///
+    /// A rule only ever runs against a file whose language it declares — [`Prepared::
+    /// for_language`] is the same check [`Self::run_rule`] and [`Self::run_component_rule`]
+    /// make before dispatching — so a rule that does not declare this file's language can
+    /// never be dispatched here no matter what the parse below does with these bytes.
+    /// Lumping it in with `parsed` would tell an author with `parsed: N, matches: 0` to
+    /// narrow their query, when the real cause is the `language` declaration.
+    fn parsed_or_language_gated_timings(
+        &self,
+        path: &FilePath,
+        admitted: &[&Prepared],
+    ) -> Vec<(RuleId, RuleTiming)> {
+        if !self.profiling {
+            return Vec::new();
+        }
+        let language_id = self.language_of(path);
+        admitted
+            .iter()
+            .copied()
+            .map(|rule| {
+                let mut timing = RuleTiming::default();
+                if language_id.is_some_and(|id| rule.for_language(id).is_some()) {
+                    timing.parsed = 1;
+                } else {
+                    timing.language_gated = 1;
+                }
+                (rule.spec.id.clone(), timing)
+            })
+            .collect()
     }
 
     /// The cache-hit half of [`Self::check_file`], split out only to keep that function
@@ -3546,6 +3594,43 @@ mod tests {
         )
     }
 
+    /// A rule admitted only under `src/only/**` *and* only in files containing `debugger`
+    /// — both gates declared on one rule, for the mutant that reads the content gate's
+    /// source from `self.rules` instead of the path gate's survivors.
+    fn both_gated_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               query: '(debugger_statement) @stmt',\n\
+               gates: {{ pathMatches: ['src/only/**'], fileContains: ['debugger'] }},\n\
+               card: {{ message: 'debugger statement', remediation: 'remove it',\n\
+                 examples: {{ bad: 'debugger;', good: 'x;' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.stmt); }},\n\
+             }});\n"
+        )
+    }
+
+    /// A rule declaring only `javascript`, over a corpus of `.ts` files it therefore never
+    /// runs against — for the `language_gated` counter, and for the ordering mutant that
+    /// moves its push below `parse_once`'s early return. Every admitted rule here fails to
+    /// declare the file's language, so `parse_once` finds none of them a match and returns
+    /// `None` for every file, which is exactly the early return the ordering has to survive.
+    fn wrong_language_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';
+             export default defineRule({{
+               id: '{id}',
+               language: ['javascript'],
+               query: '(debugger_statement) @stmt',
+               card: {{ message: 'debugger statement', remediation: 'remove it',
+                 examples: {{ bad: 'debugger;', good: 'x;' }} }},
+               check(ctx, m) {{ ctx.report(m.stmt); }},
+             }});
+"
+        )
+    }
+
     /// A config importing several rule modules by path, each bound to a distinct name.
     fn multi_rule_config(rule_paths: &[&str]) -> String {
         use std::fmt::Write as _;
@@ -3574,27 +3659,42 @@ mod tests {
     }
 
     #[test]
-    fn the_five_gate_counters_reconcile_for_every_rule() {
+    fn the_six_gate_counters_reconcile_for_every_rule() {
         // The load-bearing test. For every rule, `path_gated + unread + cached +
-        // content_gated + parsed` must equal `files_discovered` — over a corpus where
-        // every one of the five actually occurs, on both a cold run and a warm one. A
-        // single rule with a single outcome (the tests below) would pass against almost
-        // any bug that swaps or drops one of the five; this one needs all of them present
-        // at once, twice, to fail for the reason it should.
+        // content_gated + language_gated + parsed` must equal `files_discovered` — over a
+        // corpus where every one of the six actually occurs, on both a cold run and a warm
+        // one. A single rule with a single outcome (the tests below) would pass against
+        // almost any bug that swaps or drops one of the six; this one needs all of them
+        // present at once, twice, to fail for the reason it should. `language_gated` is not
+        // driven to nonzero here — a dedicated test does that, because it is also the test
+        // for an ordering bug `parsed`'s own push has to survive — but every rule below
+        // declares no `language` of its own, so it stays at zero and the six-term sum still
+        // has to hold.
         //
         // `unread` used to be missing entirely: a file that vanished, or failed to decode
         // as UTF-8, after a gate admitted a rule to it, left that rule's row one short of
         // `files_discovered` — a hole in the exact invariant this diagnostic exists to
         // guarantee. Deleting the `unread` counting at either `skipped()` call site that
         // follows the path gate reintroduces that hole and fails this test.
+        //
+        // `local/both-gated` declares *both* a path gate and a content gate, which none of
+        // the other two rules here do. Reading the content gate's source rules from
+        // `self.rules` instead of the path gate's own survivors re-evaluates a rule the
+        // path gate already excluded — `d.ts` is outside `src/only` (excluding
+        // `local/both-gated` from `admitted` there) and contains no `debugger` (so its
+        // content gate would also reject it, if wrongly asked) — producing a spurious
+        // second rejection for the same file and breaking this rule's reconciliation
+        // without touching `local/path-gated` or `local/content-gated`, neither of which
+        // declares both gates on one rule.
         let project = Project::new(
             "gate-counters-reconcile",
             &[
                 ("rule-a.ts", &path_gated_rule("local/path-gated")),
                 ("rule-b.ts", &content_gated_rule("local/content-gated")),
+                ("rule-c.ts", &both_gated_rule("local/both-gated")),
                 (
                     "lanekeep.config.ts",
-                    &multi_rule_config(&["./rule-a", "./rule-b"]),
+                    &multi_rule_config(&["./rule-a", "./rule-b", "./rule-c"]),
                 ),
                 ("src/only/a.ts", "debugger;\n"),
                 ("src/only/b.ts", "const b = 1;\n"),
@@ -3603,10 +3703,16 @@ mod tests {
             ],
         );
         // Not valid UTF-8 (a lone continuation byte, 0x80), but under `src/only` and
-        // containing `debugger` as ASCII — so both rules' path and content gates admit it
-        // on the strength of its bytes, and both learn it is unreadable only once they try
-        // to decode it as source.
+        // containing `debugger` as ASCII — so all three rules' path and content gates admit
+        // it on the strength of its bytes, and each learns it is unreadable only once it
+        // tries to decode it as source.
         fs::write(project.dir.join("src/only/e.ts"), b"debugger;\x80").expect("writes raw bytes");
+
+        let ids = [
+            "local/path-gated",
+            "local/content-gated",
+            "local/both-gated",
+        ];
 
         let cold = project
             .prepare_with("lanekeep.config.ts")
@@ -3617,20 +3723,21 @@ mod tests {
         assert_eq!(cold.files_discovered, 5);
 
         let discovered = u64::try_from(cold.files_discovered).expect("small count");
-        for id in ["local/path-gated", "local/content-gated"] {
+        for id in ids {
             let timing = timing_for(&cold, id);
             assert_eq!(
                 timing.path_gated
                     + timing.unread
                     + timing.cached
                     + timing.content_gated
+                    + timing.language_gated
                     + timing.parsed,
                 discovered,
                 "`{id}` does not reconcile cold: {timing:?}"
             );
             assert_eq!(
                 timing.unread, 1,
-                "the non-UTF-8 file must count as `unread`, for both rules: {timing:?}"
+                "the non-UTF-8 file must count as `unread`, for every rule: {timing:?}"
             );
             assert_eq!(
                 timing.cached, 0,
@@ -3648,13 +3755,14 @@ mod tests {
             .run()
             .expect("runs warm");
         assert_eq!(warm.files_discovered, 5);
-        for id in ["local/path-gated", "local/content-gated"] {
+        for id in ids {
             let timing = timing_for(&warm, id);
             assert_eq!(
                 timing.path_gated
                     + timing.unread
                     + timing.cached
                     + timing.content_gated
+                    + timing.language_gated
                     + timing.parsed,
                 discovered,
                 "`{id}` does not reconcile warm: {timing:?}"
@@ -3673,9 +3781,9 @@ mod tests {
     #[test]
     fn a_path_gates_rejects_land_only_in_path_gated() {
         // Folding a path-gate reject into `content_gated`, or dropping it, would leave this
-        // failing without touching `the_five_gate_counters_reconcile_for_every_rule` — that
-        // test only checks the sum, and a bug that moves a count between two of the four
-        // buckets leaves the sum untouched.
+        // failing without touching `the_six_gate_counters_reconcile_for_every_rule` — that
+        // test only checks the sum, and a bug that moves a count between two of the buckets
+        // leaves the sum untouched.
         let project = Project::new(
             "gate-counters-path",
             &[
@@ -3742,6 +3850,76 @@ mod tests {
         assert_eq!(
             timing.parsed, 1,
             "the one file containing the needle still parses: {timing:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_whose_language_does_not_match_counts_as_language_gated_not_parsed() {
+        // The gap the reviewer measured directly: a rule declaring `language: ['javascript']`
+        // over a `.ts` corpus used to report `parsed: 2, matches: 0` — indistinguishable from
+        // a query that is simply too narrow, the exact trap `AGENTS.md` records costing 2218
+        // false positives on a real migration, now arriving from the diagnostic side rather
+        // than the engine's own dispatch.
+        //
+        // This is also the fixture for the ordering bug in `check_file`: because this rule
+        // matches neither `.ts` file's language, `parse_once` finds no admitted rule for
+        // either file and returns `None` for both — the early return the `parsed`/
+        // `language_gated` push has to survive. Moving that push below the `let Some(…) =
+        // self.parse_once(…) else { return Ok(outcome); }` passes every other test in this
+        // module (none of them reaches that `None` arm with a nonempty `admitted`) and fails
+        // this one: with no push before the early return, this rule gets no timing entry at
+        // all for either file, and `timing_for` panics rather than reading a wrong bucket.
+        let project = Project::new(
+            "gate-counters-language",
+            &[
+                ("rule.ts", &wrong_language_rule("local/wrong-language")),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "debugger;
+",
+                ),
+                (
+                    "src/b.ts",
+                    "const b = 1;
+",
+                ),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        assert!(
+            outcome.violations.is_empty(),
+            "a rule whose language never matches must not report on these files: {:?}",
+            outcome.violations
+        );
+
+        let timing = timing_for(&outcome, "local/wrong-language");
+        assert_eq!(
+            timing.language_gated, 2,
+            "both `.ts` files must count as `language_gated` for a `javascript`-only rule: \
+             {timing:?}"
+        );
+        assert_eq!(
+            timing.parsed, 0,
+            "a rule whose language never matches must never count as `parsed`: {timing:?}"
+        );
+        assert_eq!(
+            timing.path_gated
+                + timing.unread
+                + timing.cached
+                + timing.content_gated
+                + timing.language_gated
+                + timing.parsed,
+            2,
+            "{timing:?}"
         );
     }
 
@@ -3826,9 +4004,71 @@ mod tests {
                 + warm_timing.unread
                 + warm_timing.cached
                 + warm_timing.content_gated
+                + warm_timing.language_gated
                 + warm_timing.parsed,
             2,
             "{warm_timing:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_counts_as_unread_not_path_gated() {
+        // The one `unread` site the non-UTF-8 fixture (in the reconciliation test) cannot
+        // reach on its own. Deleting the `unread_timings` call at *this* branch specifically
+        // — as opposed to gutting `unread_timings`'s own body, which kills both call sites
+        // at once and says nothing about which caller's test actually covers which site,
+        // per AGENTS.md's note that a shared helper reported "caught" by mutation testing
+        // does not say which caller caught it — passes every other test in this module.
+        // Mode 000 gives a deterministic `fs::read` failure without racing discovery for a
+        // file that vanishes mid-run.
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = Project::new(
+            "gate-counters-unreadable",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "debugger;
+",
+                ),
+                (
+                    "src/b.ts",
+                    "debugger;
+",
+                ),
+            ],
+        );
+        let unreadable = project.dir.join("src/b.ts");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("makes it unreadable");
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        // Left readable, or the fixture's own cleanup cannot remove it.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).expect("restores");
+
+        let timing = timing_for(&outcome, "local/no-debugger");
+        assert_eq!(
+            timing.unread, 1,
+            "the unreadable file must count as `unread`, not go uncounted: {timing:?}"
+        );
+        assert_eq!(
+            timing.path_gated, 0,
+            "the path gate admitted this file — it must not also be counted rejected: \
+             {timing:?}"
+        );
+        assert_eq!(
+            timing.parsed, 1,
+            "the readable file must still parse: {timing:?}"
         );
     }
 

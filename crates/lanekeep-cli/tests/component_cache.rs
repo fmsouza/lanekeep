@@ -74,10 +74,9 @@ impl Project {
     /// scenario; it is the observable — the engine counts a cache hit against the rule it
     /// would have consulted, so a rule's row still appears in stderr on a warm run, with
     /// `query`, `handler` and `matches` all at zero. `zero_work_row` builds that exact row,
-    /// which is what distinguishes "the cache was read" from "the rule ran again and matched
-    /// nothing" (both would leave `matches` at zero) and from "the rule was never admitted"
-    /// (which the row's *presence* now rules out, where its *absence* used to be this test's
-    /// whole claim).
+    /// which distinguishes "the cache was read" from "the rule ran again and matched
+    /// nothing" (both would leave `matches` at zero) — see its own doc for what it does not
+    /// yet distinguish.
     fn check_profiled(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_lanekeep"))
             .arg("check")
@@ -155,10 +154,13 @@ fn describe(output: &Output) -> String {
 /// this exact row rather than on mere presence of the rule's id is what tells "the cache was
 /// read" apart from "the rule ran again and happened to match nothing" — a re-run rule's
 /// query and handler durations are not reliably nonzero on a fast, tiny fixture, so `matches
-/// == 0` alone would not distinguish the two. And asserting on this exact row rather than on
-/// *absence* of the id — the property this test asserted before the engine started counting
-/// cache hits — is what tells "cached" apart from "gated out and never admitted": both used
-/// to look identical from stderr, and only one of them is the cache being read.
+/// == 0` alone would not distinguish the two.
+///
+/// It does **not** yet tell "cached" apart from "gated out and never admitted": `write_profile`
+/// prints only `query`/`handler`/`total`/`matches`, so a rule the path or content gate rejected
+/// outright would render this identical row too — verified against the real binary. That
+/// distinction needs a rendered `cached` column, which is a later task's work; this is the
+/// strongest claim available from the counters this one adds, not a claim about gating.
 fn zero_work_row(id: &str) -> String {
     format!(
         "  {:<40} {:>9.1?} {:>9.1?} {:>9.1?} {:>9}",
@@ -234,9 +236,12 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
     );
 
     // Both rules ran on the cold pass: neither file could have been a cache hit before either
-    // rule's query had a chance to run once. `matches` is not asserted as a number — only that
-    // the row exists at all, which `a_rule_that_never_matched_still_appears`
-    // (`lanekeep-engine`) already establishes does not require a match, only that the query ran.
+    // rule's query had a chance to run once. `matches` is not asserted as a number — only
+    // that the row exists at all. That no longer shows "the query ran" by itself — a gated-
+    // out or otherwise-never-reached rule now gets a row too, per `write_profile`'s own
+    // table having no column yet for which of those a row's zeros mean — so this pair of
+    // assertions establishes only that this run did not silently drop either rule's row
+    // entirely, which the warm half below narrows further with `zero_work_row`.
     assert!(
         cold_stderr.contains("lanekeep/no-broad-except"),
         "the TypeScript rule's row is missing from a cold profile: {combined}"
@@ -338,13 +343,20 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     // The one assertion this test exists for. `caching` is a per-*run* flag — see
     // `Engine::caching`'s doc on why there is no finer granularity that is sound — so a moved
     // `ruleset_hash` invalidates every file's entry in this run, whether or not that file's own
-    // rule is the component that changed. Both rows have to reappear, not just the component's.
+    // rule is the component that changed. Both rows have to show real work, not just reappear:
+    // every rule now gets a row on every profiled run regardless of caching, so `contains(id)`
+    // alone would also pass a run that was actually a full cache hit — reverting the fold that
+    // puts a configured component's bytes into `ruleset_hash` is exactly that failure, and both
+    // `contains(id)` checks below would still pass against it. `!zero_work_row(id)` is the
+    // check that cannot: a genuine cache hit renders precisely that zero row (see
+    // `zero_work_row`'s doc), so its absence is what a real recompute — nonzero query, handler
+    // or matches — actually requires.
     assert!(
-        recomputed_stderr.contains("fixture/metadata"),
+        !recomputed_stderr.contains(&zero_work_row("fixture/metadata")),
         "the component did not run again after its own bytes changed: {combined}"
     );
     assert!(
-        recomputed_stderr.contains("lanekeep/no-broad-except"),
+        !recomputed_stderr.contains(&zero_work_row("lanekeep/no-broad-except")),
         "the TypeScript rule did not run again after the component's bytes changed — the \
          whole run's key should have moved, not just the changed rule's: {combined}"
     );
