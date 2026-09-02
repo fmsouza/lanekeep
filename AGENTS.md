@@ -830,9 +830,10 @@ nine as QuickJS modules: the four TypeScript-inspecting rules went into a Starli
 component and came back in #147 (13 MB of binary and 110× per host-API crossing for no speed
 benefit, architecture §15.1), and `no-restricted-calls`, `duplicate-implementation` and
 `no-assertionless-test` arrived as modules after them. `no-restricted-types` arrived as a
-tenth module after that, so fourteen built-ins ship today. Seven of the ten modules are
-genuine factories — every module except the three plain `defineRule` objects,
-`no-broad-except`, `no-default-export` and `no-mutable-default-argument` — and none carries
+tenth module after that, and `no-restricted-arguments` as an eleventh, so fifteen built-ins ship
+today. Eight of the eleven modules are genuine factories — every module except the three plain
+`defineRule` objects, `no-broad-except`, `no-default-export` and
+`no-mutable-default-argument` — and none carries
 the `for (const key in …)` copy: the dual shape is gone, not restored. The one surviving
 instance of it is `crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy
 that ships to nobody.
@@ -852,11 +853,13 @@ mattered most: a rule declaring `check(ctx, m, options)` and exporting a plain o
 every option it documents, and no shipped built-in demonstrates the mistake — the factories
 close over their options, and the plain objects take none.
 
-**This section has now been stale three times, in the file that exists to stop that**, and the
+**This section has now been stale four times, in the file that exists to stop that**, and the
 mechanism was the same each time: the text described the built-ins by shape and count — "the
-three genuine factories", "eight of the ten are components" — and the changes that moved them
-(#147's revert, two new factory modules in #166 and #167, then a third in #172) swept for
-names, which no count written in prose matches. The factory tally was also miscounted at
+three genuine factories", "eight of the ten are components", "`no-restricted-types` arrived as a
+tenth module" — and the changes that moved them (#147's revert, two new factory modules in #166
+and #167, a third in #172, and `no-restricted-arguments` arriving straight after the sentence
+that had just finished counting `no-restricted-types` as the tenth) swept for names, which no
+count written in prose matches. The factory tally was also miscounted at
 authoring — five of the eight were factory-shaped the day "three" was written. That is the entry below about grepping a formula rather than a claim,
 arriving again. A count written out in prose is the spelling no pattern matches and no test
 covers — hence the opening instruction: derive the split from the tables, and treat any number
