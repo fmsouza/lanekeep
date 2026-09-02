@@ -37,6 +37,7 @@ use lanekeep_core::files::FileAccess;
 use lanekeep_core::fix::Fix;
 use lanekeep_nodes::{Handle, NodeArena};
 use lanekeep_query::CompiledQuery;
+use lanekeep_types::{Symbol, Type, TypeScriptOracle, TypeScriptSupport};
 
 /// The version of the `ctx` surface this build exposes.
 ///
@@ -59,7 +60,9 @@ use lanekeep_query::CompiledQuery;
 /// - `1` — reporting, navigation, binding resolution, `emitFact`, `readFile`, `fileExists`.
 /// - `2` — `structureFingerprint`: the structural-summary primitive (normalized subtree
 ///   hash plus exact node count), computed host-side in one walk.
-pub const HOST_API_VERSION: u32 = 2;
+/// - `3` — `ctx.types`: the bounded within-file type oracle, present only for a rule that
+///   declared `requires: ['types']`.
+pub const HOST_API_VERSION: u32 = 3;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +114,13 @@ pub struct HostContext {
     files: Option<Arc<FileAccess>>,
     /// The grammar `querySubtree` and `closestAncestor` compile against.
     language: Option<Arc<dyn lanekeep_lang::Language>>,
+    /// The probe token behind `ctx.types`, present only for a rule that declared
+    /// `requires: ['types']`.
+    ///
+    /// Cloning this is cheap — see [`TypeScriptSupport`] — which is what lets
+    /// `install_types` build a fresh oracle inside every closure call rather than storing
+    /// one beside the tree it would have to borrow.
+    types: Option<TypeScriptSupport>,
     /// The date a rule sees as `ctx.today`, if the host supplied one.
     today: Option<Rc<str>>,
     /// Whether anything actually read `ctx.today` while checking this file.
@@ -145,6 +155,7 @@ impl std::fmt::Debug for HostContext {
             .field("has_resolver", &self.resolver.is_some())
             .field("has_file_access", &self.files.is_some())
             .field("has_language", &self.language.is_some())
+            .field("has_types", &self.types.is_some())
             .field("has_today", &self.today.is_some())
             .field("date_read", &self.date_read.get())
             .field("compiled_queries", &self.queries.borrow().len())
@@ -164,6 +175,7 @@ impl HostContext {
             resolver: None,
             files: None,
             language: None,
+            types: None,
             today: None,
             date_read: Rc::new(Cell::new(false)),
             queries: Rc::new(RefCell::new(BTreeMap::new())),
@@ -207,6 +219,24 @@ impl HostContext {
     #[must_use]
     pub fn with_language(mut self, language: Arc<dyn lanekeep_lang::Language>) -> Self {
         self.language = Some(language);
+        self
+    }
+
+    /// Attach the type oracle's probe token, enabling `ctx.types`.
+    ///
+    /// Without one, `ctx.types` is absent rather than present-and-empty: reaching for it
+    /// undeclared is a `TypeError` at the first call, not a silent `undefined` that would
+    /// make a rule which forgot `requires: ['types']` read as a clean file. This deliberately
+    /// differs from `with_language` and `with_file_access` beside it, which leave their
+    /// functions present but degraded — silence is exactly the failure mode this surface is
+    /// arranged against, so the caller finds out immediately rather than from a clean report.
+    ///
+    /// Takes the already-probed [`TypeScriptSupport`] rather than a language: probing is
+    /// 8.4 µs of the 9.2 µs a fresh oracle costs, and the caller is expected to pay that
+    /// once per run, not once per file.
+    #[must_use]
+    pub fn with_types(mut self, support: TypeScriptSupport) -> Self {
+        self.types = Some(support);
         self
     }
 
@@ -279,6 +309,7 @@ impl HostContext {
         self.install_facts(ctx, &object)?;
         self.install_reads(ctx, &object)?;
         self.install_queries(ctx, &object)?;
+        self.install_types(ctx, &object)?;
 
         // `ctx.today` is a property backed by a getter, so reading it can be *observed*. A
         // plain value would be indistinguishable from an unread one, and the cache would
@@ -732,6 +763,65 @@ impl HostContext {
 
         Ok(())
     }
+
+    /// The type surface, present only for a rule that declared `requires: ['types']`.
+    ///
+    /// Each closure builds its own oracle: `TypeScriptOracle` borrows the tree, which lives
+    /// behind this context's `RefCell`, so it cannot be stored beside it. That is affordable
+    /// only because the grammar probe was hoisted into `TypeScriptSupport` — before that split
+    /// a construction cost 9.2 µs, about thirty host crossings, to serve one call.
+    ///
+    /// Answers cross as data rather than as handles, for the reason `structureFingerprint`
+    /// does: a type handle would be one crossing per question about a type, which is the cost
+    /// invariant 3 exists to prevent.
+    fn install_types<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
+        let Some(support) = self.types.clone() else {
+            return Ok(());
+        };
+        let types = Object::new(ctx.clone())?;
+
+        let arena = Rc::clone(&self.arena);
+        let type_support = support.clone();
+        types.set(
+            "typeOf",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
+                    let arena = arena.borrow();
+                    let Some(node) = arena.node(handle) else {
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+                    let oracle = TypeScriptOracle::new(&type_support, arena.tree(), arena.source());
+                    let Some(ty) = oracle.type_of(node) else {
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+                    Ok(render_type(&ctx, &ty)?.into_value())
+                },
+            )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        types.set(
+            "symbolOf",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
+                    let arena = arena.borrow();
+                    let Some(node) = arena.node(handle) else {
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+                    let oracle = TypeScriptOracle::new(&support, arena.tree(), arena.source());
+                    let Some(symbol) = oracle.symbol_of(node) else {
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+                    Ok(render_symbol(&ctx, &symbol)?.into_value())
+                },
+            )?,
+        )?;
+
+        object.set("types", types)?;
+        Ok(())
+    }
 }
 
 /// A violation a reduce phase asked for.
@@ -1015,6 +1105,67 @@ fn captures_to_js<'js>(
 /// and nonsense when the host is the one that threw. It would also lose the message.
 fn throw(ctx: &Ctx<'_>, message: &str) -> rquickjs::Error {
     rquickjs::Exception::throw_type(ctx, message)
+}
+
+/// Render a `Type` into the object `ctx.types.typeOf` hands back.
+///
+/// `text` is computed here and never stored on `Type` itself — it is display-only, and
+/// storing it would invite a rule to branch on a string rendering instead of on
+/// `primitive`/`symbol`/`union`. The other three are set only for the variant they
+/// describe, the same "absent rather than present-and-empty" posture the rest of this
+/// module takes. A union's members are already in canonical order from the oracle, so this
+/// preserves that order rather than establishing it.
+fn render_type<'js>(ctx: &Ctx<'js>, ty: &Type) -> rquickjs::Result<Object<'js>> {
+    let object = Object::new(ctx.clone())?;
+    object.set("text", type_text(ty))?;
+
+    match ty {
+        Type::Primitive(primitive) => {
+            object.set("primitive", primitive.as_str())?;
+        }
+        Type::Nominal { symbol, .. } => {
+            if let Some(symbol) = symbol {
+                object.set("symbol", render_symbol(ctx, symbol)?)?;
+            }
+        }
+        Type::Union(members) => {
+            let array = rquickjs::Array::new(ctx.clone())?;
+            for (index, member) in members.iter().enumerate() {
+                array.set(index, render_type(ctx, member)?)?;
+            }
+            object.set("union", array)?;
+        }
+    }
+
+    Ok(object)
+}
+
+/// What TypeScript itself would call this type, for a rule building a message.
+fn type_text(ty: &Type) -> String {
+    match ty {
+        Type::Primitive(primitive) => primitive.as_str().to_owned(),
+        Type::Nominal { name, .. } => name.clone(),
+        Type::Union(members) => members
+            .iter()
+            .map(type_text)
+            .collect::<Vec<_>>()
+            .join(" | "),
+    }
+}
+
+/// Render a `Symbol` into the object `ctx.types.symbolOf` hands back, and the one nested
+/// under a rendered `Type`'s `symbol` field.
+///
+/// `module` is absent for a local declaration rather than `null` — the same posture
+/// `Symbol`'s own doc comment describes: that absence is what distinguishes an imported
+/// `Decimal` from a local class that happens to share the name.
+fn render_symbol<'js>(ctx: &Ctx<'js>, symbol: &Symbol) -> rquickjs::Result<Object<'js>> {
+    let object = Object::new(ctx.clone())?;
+    object.set("name", symbol.name.clone())?;
+    if let Some(module) = &symbol.module {
+        object.set("module", module.clone())?;
+    }
+    Ok(object)
 }
 
 /// Merge a `file` into a fact's serialized payload.
@@ -2095,5 +2246,120 @@ mod tests {
                 .expect("evaluates");
             assert!(!present, "`{absent}` must not exist");
         }
+    }
+
+    // --- ctx.types ---------------------------------------------------------------------
+
+    /// A rule that did not declare the capability has no `types` namespace at all.
+    ///
+    /// Absent rather than present-and-empty on purpose: reaching for it undeclared is a
+    /// `TypeError` at the first call, not a silent `undefined` that makes the rule report
+    /// nothing and read as a clean file.
+    #[test]
+    fn types_is_absent_without_the_capability() {
+        let host = HostContext::new(
+            parse("const a: number = 1;"),
+            "const a: number = 1;".to_owned(),
+            "src/a.ts",
+        );
+
+        // Present-and-empty would still pass a `typeof ctx.types === 'undefined'` check if
+        // the property existed and merely held `undefined` — `in` is the one operator that
+        // tells "no such property" apart from "a property holding nothing".
+        assert!(!run::<bool>(&host, "'types' in ctx"));
+
+        // The loudness the whole design rests on: reaching for it undeclared throws, and
+        // throws specifically a `TypeError` — not a message string asserted by substring,
+        // since a thrown error's `.message` here is QuickJS's own wording for "read a
+        // property off `undefined`" and never mentions the word "TypeError" at all.
+        assert!(run::<bool>(
+            &host,
+            "try { ctx.types.typeOf(ctx.root); false } catch (e) { e instanceof TypeError }"
+        ));
+    }
+
+    /// A host with the capability granted, built on this module's existing `host` helper.
+    fn host_with_types(source: &str) -> HostContext {
+        host(source)
+            .with_types(TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported"))
+    }
+
+    #[test]
+    fn types_answers_a_primitive_annotation() {
+        let host = host_with_types("function credit(amount: number) { return amount; }");
+        let handle = handle_of(&host, "amount");
+        assert_eq!(
+            run::<String>(&host, &format!("ctx.types.typeOf({handle}).primitive")),
+            "number"
+        );
+    }
+
+    #[test]
+    fn types_answers_a_symbol_with_its_module() {
+        let host = host_with_types("import { Decimal } from 'decimal.js';\nconst x = Decimal;");
+        let handle = handle_of(&host, "Decimal");
+        assert_eq!(
+            run::<String>(&host, &format!("ctx.types.symbolOf({handle}).module")),
+            "decimal.js"
+        );
+    }
+
+    /// A union renders in the canonical order PR 1 already established, with `text` giving
+    /// what TypeScript itself would call it.
+    ///
+    /// Regression coverage for `render_type`'s `Union` arm and `type_text`: deleting the
+    /// `Union`/`Nominal` arms and gutting `type_text` to `String::new()` left every test
+    /// committed before this one green, because none of them read `.text` or `.union` —
+    /// only `.primitive`, and, through `symbolOf`, a bare `Symbol` that never passes through
+    /// `render_type` at all.
+    #[test]
+    fn types_renders_a_union_with_canonical_order_and_display_text() {
+        let host = host_with_types("function g(x: number | string) { return x; }");
+        let handle = handle_of(&host, "x");
+        assert_eq!(
+            run::<String>(&host, &format!("ctx.types.typeOf({handle}).text")),
+            "number | string"
+        );
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("JSON.stringify(ctx.types.typeOf({handle}).union.map(m => m.primitive))")
+            ),
+            "[\"number\",\"string\"]"
+        );
+    }
+
+    /// A nominal type's `symbol` nests a rendered `Symbol` — the same shape `symbolOf`
+    /// returns directly — and a local declaration's `module` is absent rather than `null`.
+    /// Regression coverage for `render_type`'s `Nominal` arm; see the union test above for
+    /// why this needs its own assertion rather than trusting `.primitive` coverage for it.
+    #[test]
+    fn types_renders_a_nominal_with_its_symbol_and_display_text() {
+        let host = host_with_types("class Account {}");
+        let result: String = run(
+            &host,
+            "const name = ctx.namedChildren(ctx.namedChildren(ctx.root)[0])[0];
+             const t = ctx.types.typeOf(name);
+             JSON.stringify({ text: t.text, symbol: t.symbol })",
+        );
+        assert_eq!(
+            result,
+            "{\"text\":\"Account\",\"symbol\":{\"name\":\"Account\"}}"
+        );
+    }
+
+    /// `??` is deliberately outside the operator table, and a rule stays silent on it.
+    ///
+    /// Asserted as *expected* rather than left to fall out: `undefined` is this oracle's
+    /// first-class answer, and a test that did not name it would not notice the day it
+    /// started returning a guess instead.
+    #[test]
+    fn type_of_an_untypeable_node_is_undefined() {
+        let host = host_with_types("const q = b ?? a;");
+        let handle = handle_of(&host, "q");
+        assert_eq!(
+            run::<String>(&host, &format!("typeof ctx.types.typeOf({handle})")),
+            "undefined"
+        );
     }
 }

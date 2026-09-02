@@ -879,6 +879,7 @@ dependencies = [
  "lanekeep-lang-js",
  "lanekeep-nodes",
  "lanekeep-query",
+ "lanekeep-types",
  "rquickjs",
  "thiserror",
  "tree-sitter",

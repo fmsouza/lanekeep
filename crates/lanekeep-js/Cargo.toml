@@ -16,6 +16,7 @@ lanekeep-core = { workspace = true }
 lanekeep-lang = { workspace = true }
 lanekeep-nodes = { workspace = true }
 lanekeep-query = { workspace = true }
+lanekeep-types = { workspace = true }
 rquickjs = { workspace = true }
 thiserror = { workspace = true }
 tree-sitter = { workspace = true }
