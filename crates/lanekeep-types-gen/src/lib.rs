@@ -591,7 +591,13 @@ const SYMBOL_INFO: &str = "\
  * {@link TypeInfo} whose `symbol` field is set.
  */
 export interface SymbolInfo {
-  /** The name as written at its declaration. */
+  /**
+   * The name as it appears at the use site, not at the declaration. For a renamed import —
+   * `import { Decimal as Money }` — this is the local alias `Money`, never the exported
+   * name `Decimal`. Comparing this field against an expected export name therefore rejects
+   * a renamed import of the right type; `module` is the reliable field for \"did this come
+   * from there\".
+   */
   name: string
   /**
    * The module it was imported from. Absent for a local declaration — that absence is what
