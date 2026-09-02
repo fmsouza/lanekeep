@@ -115,11 +115,14 @@ fn a_built_in_rule_can_be_imported_by_specifier() {
 /// factory to its options and uses a rule object as it comes. This is the factory half, end to
 /// end, from JSON on disk to a message carrying the configured reason.
 ///
-/// It was a `lanekeep.config.ts` calling `noRestrictedImports({...})` until this rule became a
-/// component, and there is no remaining built-in factory that a `.config.ts` can import — the
-/// four modules that are left all export a rule object. So the capability being covered here is
-/// "a built-in factory can be configured", and the format it is covered through moved because
-/// the rule did.
+/// `no-restricted-imports` was briefly compiled into a component and reverted (see
+/// `crates/lanekeep-rules/src/lib.rs`'s `BUILT_IN_RULES` doc comment) — it ships as a TypeScript
+/// module today, one of eleven, and a `lanekeep.config.ts` can still call it directly. Eight of
+/// those eleven modules are genuine factories a `.config.ts` can import and call, this one
+/// included, so the capability being covered here — "a built-in factory can be configured" —
+/// has more than one built-in that could stand in for it; this one is kept because its JSON
+/// path (`configure` applying a factory to its options) is the one this test exists to drive
+/// end to end.
 #[test]
 fn a_built_in_factory_rule_can_be_configured() {
     let project = Project::new(

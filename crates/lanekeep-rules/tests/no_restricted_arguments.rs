@@ -59,6 +59,23 @@ fn a_forbidden_argument_on_an_unmatched_callee_is_accepted() {
         .expect("`Other` does not resolve to decimal.js's Decimal");
 }
 
+/// The half that gives `call.name` meaning: naming `Decimal` does not govern `Big`, a sibling
+/// export of the identical module. Every other fixture in this file that sets `name: 'Decimal'`
+/// also imports `Decimal`, so none of them can tell a rule that reads `call.name` from one that
+/// drops it and matches on `call.module` alone — dropping `call.name` from the
+/// `ctx.resolvesToImport` call would widen MONEY to every export of `decimal.js` and pass every
+/// other test in this file unchanged. This is the one direction the design forbids: a
+/// conforming file, accused.
+#[test]
+fn a_different_export_of_the_named_module_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Big } from 'decimal.js';\n\
+             new Big(parseFloat(x));\n",
+        )
+        .expect("MONEY names Decimal specifically; Big is a different export of the same module");
+}
+
 /// A plain call, no `new` — the `call_expression` half of the query, pinned on its own.
 #[test]
 fn a_plain_call_is_reported_too() {
@@ -329,6 +346,21 @@ fn a_restriction_with_no_call_is_silent() {
              new Decimal(parseFloat(x));\n",
         )
         .expect("a restriction with nothing to match against matches nothing");
+}
+
+/// A `call` naming a `name` but no `module` is silent too — the same crash as an omitted `call`
+/// entirely, one field over: `call.module === undefined` is read unconditionally by
+/// `ctx.resolvesToImport`'s second parameter, and without this half of the guard the rule
+/// threw `Error converting from js 'undefined' into type 'string'` and aborted the whole run
+/// instead of skipping the restriction.
+#[test]
+fn a_call_with_no_module_is_silent() {
+    tester("{ restrictions: [{ call: { name: 'Decimal' }, forbid: ['number'], reason: 'R' }] }")
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             new Decimal(parseFloat(x));\n",
+        )
+        .expect("a call with nothing to match a module against matches nothing");
 }
 
 /// A `call` naming a `module` but no `name` governs every export of that module. This is the

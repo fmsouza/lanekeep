@@ -50,6 +50,13 @@ import { defineRule } from 'lanekeep'
  * two-argument and three-argument calls are branched on explicitly here rather than always
  * passing three.
  *
+ * **`call.module` is not optional, and the guard above checks for its absence too.** Unlike
+ * `call.name`, there is no meaning for "match every module" — `ctx.resolvesToImport`'s second
+ * parameter is a plain required `String` on the host side, and a restriction whose `call` omits
+ * `module` (or omits `call` entirely) is simply not one this rule can act on. Skipping it is a
+ * config-authoring mistake, not a governed shape, so it is treated the same as an absent `call`:
+ * silently skipped rather than passed through to a call that would throw.
+ *
  * **A union reports iff one of its members is a forbidden primitive**, decided the same way as
  * `no-restricted-types`'s union branch: `number | Decimal` can still be a bare `number` at run
  * time and reports, `Decimal | undefined` is optional money and stays silent. A nominal type
@@ -101,7 +108,7 @@ export default function noRestrictedArguments(options) {
     check(ctx, m) {
       for (const restriction of restrictions) {
         const call = restriction.call
-        if (call === undefined) continue
+        if (call === undefined || call.module === undefined) continue
 
         const resolved =
           call.name === undefined
