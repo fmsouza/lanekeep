@@ -619,6 +619,14 @@ impl std::fmt::Debug for Engine {
 /// needs and wants narrowing; a rule that is slow in `handler` has code to look at. Reporting
 /// one total would leave an author guessing which, and the two have nothing in common as
 /// fixes.
+///
+/// **`path_gated`, `cached`, `content_gated` and `parsed` reconcile.** Their sum equals
+/// [`Outcome::files_discovered`] for this rule, on every run, warm or cold — a file this
+/// rule saw always lands in exactly one of the four, because they are the four mutually
+/// exclusive points at which a file's fate for this rule is decided. That is what makes the
+/// table trustworthy: an author whose rule reports nothing can tell whether a gate excluded
+/// every file it would have caught, rather than guessing between "the gate is too narrow"
+/// and "the handler is wrong."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
@@ -630,6 +638,14 @@ pub struct RuleTiming {
     /// The number the query gate exists to keep small — §7.2 — so it belongs beside the
     /// times rather than being inferred from them.
     pub matches: u64,
+    /// Files this rule's path gates rejected, before any read.
+    pub path_gated: u64,
+    /// Files served from cache before this rule's content gates were consulted.
+    pub cached: u64,
+    /// Files this rule's content gates rejected, after the read and before the parse.
+    pub content_gated: u64,
+    /// Files this rule actually saw parsed.
+    pub parsed: u64,
 }
 
 impl RuleTiming {
@@ -638,6 +654,49 @@ impl RuleTiming {
     pub const fn total(&self) -> Duration {
         self.query.saturating_add(self.handler)
     }
+}
+
+/// One increment per rule, for whichever of the four gate/cache/parse buckets counted it.
+///
+/// The four counting sites in [`Engine::check_file`] share this exact shape — take a rule,
+/// pair its id with a [`RuleTiming`] carrying a single `1` in one field — and a free
+/// function is what keeps repeating it inline from pushing that function over clippy's line
+/// limit.
+fn bucket_timings<'a>(
+    rules: impl Iterator<Item = &'a Prepared>,
+    set: impl Fn(&mut RuleTiming),
+) -> Vec<(RuleId, RuleTiming)> {
+    rules
+        .map(|rule| {
+            let mut timing = RuleTiming::default();
+            set(&mut timing);
+            (rule.spec.id.clone(), timing)
+        })
+        .collect()
+}
+
+/// [`bucket_timings`], but empty when `profiling` is off — the shape every one of the four
+/// counting sites in [`Engine::check_file`] needs, kept out of that function's line count.
+fn gate_timings<'a>(
+    profiling: bool,
+    rules: impl Iterator<Item = &'a Prepared>,
+    set: impl Fn(&mut RuleTiming),
+) -> Vec<(RuleId, RuleTiming)> {
+    if profiling {
+        bucket_timings(rules, set)
+    } else {
+        Vec::new()
+    }
+}
+
+/// `a` with `b` appended — named at the two call sites in [`Engine::check_file`] that carry
+/// gate-rejection timings from one early return to the next, to keep each to one line.
+fn extend_timings(
+    mut a: Vec<(RuleId, RuleTiming)>,
+    b: Vec<(RuleId, RuleTiming)>,
+) -> Vec<(RuleId, RuleTiming)> {
+    a.extend(b);
+    a
 }
 
 /// What a run produced.
@@ -1029,6 +1088,10 @@ impl Engine {
                 entry.query = entry.query.saturating_add(timing.query);
                 entry.handler = entry.handler.saturating_add(timing.handler);
                 entry.matches += timing.matches;
+                entry.path_gated += timing.path_gated;
+                entry.cached += timing.cached;
+                entry.content_gated += timing.content_gated;
+                entry.parsed += timing.parsed;
             }
             if !outcome.suppressions.is_empty() {
                 directives.insert(
@@ -1408,8 +1471,22 @@ impl Engine {
             .iter()
             .filter(|rule| rule.gates.admits_path(path))
             .collect();
+        // Counted only when profiling — a corpus of ten thousand files times ten rules is a
+        // hundred thousand increments nobody asked for on the path a warm run takes.
+        //
+        // Re-evaluating `admits_path` here rather than partitioning the filter above keeps
+        // the non-profiling path exactly what it always was: one filter, one allocation. The
+        // predicate is pure, so calling it twice cannot change which files are admitted —
+        // only how much bookkeeping profiling pays for.
+        let path_gate_timings = gate_timings(
+            self.profiling,
+            self.rules
+                .iter()
+                .filter(|rule| !rule.gates.admits_path(path)),
+            |timing| timing.path_gated = 1,
+        );
         if admitted.is_empty() {
-            return Ok(FileOutcome::skipped(path.clone()));
+            return Ok(FileOutcome::skipped(path.clone(), path_gate_timings));
         }
 
         let absolute = self.discovery.root().join(path.as_str());
@@ -1418,7 +1495,7 @@ impl Engine {
             // tree is allowed to change under a run; what must not happen is a partial
             // result being reported as complete, and a missing file contributes nothing
             // either way.
-            return Ok(FileOutcome::skipped(path.clone()));
+            return Ok(FileOutcome::skipped(path.clone(), path_gate_timings));
         };
 
         // The cache is consulted after the path gates and the read, because the key needs
@@ -1448,24 +1525,25 @@ impl Engine {
         });
         let has_expiry = memchr::memmem::find(&bytes, b"expires:").is_some();
 
-        if let Some((plain, dated)) = keys {
-            // Dated first. A file with an expiring suppression is *only* ever stored dated,
-            // so trying the plain key for it would be a lookup that can never hit.
-            let candidates: &[CacheKey] = if has_expiry {
-                &[dated]
-            } else {
-                &[dated, plain]
+        let path_gate_timings =
+            match self.cache_hit(cache, path, keys, has_expiry, &admitted, path_gate_timings) {
+                Ok(outcome) => return Ok(outcome),
+                Err(timings) => timings,
             };
-            for key in candidates {
-                if let Some(entry) = cache.get(key)
-                    && lanekeep_cache::validate(entry, &self.root)
-                {
-                    return Ok(FileOutcome::cached(path.clone(), *key, entry.clone()));
-                }
-            }
-        }
 
         // Content gates: one read, a substring scan, and a parse saved.
+        //
+        // Computed from the still-intact path-gate survivors before they are consumed below,
+        // for the same reason as the path gate above: re-evaluating a pure predicate only
+        // under `--profile` keeps the non-profiling path unchanged.
+        let content_gate_timings = gate_timings(
+            self.profiling,
+            admitted
+                .iter()
+                .filter(|rule| !rule.gates.admits_content(&bytes))
+                .copied(),
+            |timing| timing.content_gated = 1,
+        );
         let admitted: Vec<&Prepared> = admitted
             .into_iter()
             .filter(|rule| rule.gates.admits_content(&bytes))
@@ -1478,12 +1556,16 @@ impl Engine {
             return Ok(FileOutcome::empty_entry(
                 path.clone(),
                 keys.map(|(plain, dated)| if has_expiry { dated } else { plain }),
+                extend_timings(path_gate_timings, content_gate_timings),
             ));
         }
 
         let Ok(source) = String::from_utf8(bytes) else {
             // Not valid UTF-8, so not source this tool can reason about.
-            return Ok(FileOutcome::skipped(path.clone()));
+            return Ok(FileOutcome::skipped(
+                path.clone(),
+                extend_timings(path_gate_timings, content_gate_timings),
+            ));
         };
 
         // Parsed once per file, whatever rules ran: a directive is a property of the file,
@@ -1491,6 +1573,18 @@ impl Engine {
         let directives = suppression::parse(&source);
 
         let mut outcome = FileOutcome::parsed(path.clone());
+        outcome.timings.extend(path_gate_timings);
+        outcome.timings.extend(content_gate_timings);
+        if self.profiling {
+            // Every rule that survived both gates counts as parsed here, whether or not the
+            // parse below actually succeeds — `parsed` means "this rule actually saw
+            // parsed", i.e. reached this point, not "the parse came back clean."
+            outcome
+                .timings
+                .extend(bucket_timings(admitted.iter().copied(), |timing| {
+                    timing.parsed = 1;
+                }));
+        }
         let Some((language, tree)) = self.parse_once(path, &source, &admitted) else {
             return Ok(outcome);
         };
@@ -1504,10 +1598,35 @@ impl Engine {
             tree: &tree,
             language: &language,
         };
-        self.dispatch(worker, &files, &admitted, &file, &mut outcome)?;
-        self.apply_directives(&mut outcome, &directives, path);
+        self.finish_parsed(
+            (worker, &files),
+            &admitted,
+            &file,
+            outcome,
+            &directives,
+            (keys, has_expiry),
+        )
+    }
 
-        outcome.suppressions = directives.valid;
+    /// The rest of [`Self::check_file`] once a file has actually parsed: dispatch, apply
+    /// directives, and build the cache entry. Split out only to keep that function under
+    /// clippy's line limit. `path` is read off `file`; `worker` and `files` travel as one
+    /// pair and so do the cache key and its expiry flag, to keep this under clippy's
+    /// argument-count limit too.
+    fn finish_parsed(
+        &self,
+        (worker, files): (&mut Worker<'_>, &Arc<FileAccess>),
+        admitted: &[&Prepared],
+        file: &FileUnderCheck<'_>,
+        mut outcome: FileOutcome,
+        directives: &Suppressions,
+        (keys, has_expiry): (Option<(CacheKey, CacheKey)>, bool),
+    ) -> Result<FileOutcome, RunError> {
+        let path = file.path;
+        self.dispatch(worker, files, admitted, file, &mut outcome)?;
+        self.apply_directives(&mut outcome, directives, path);
+
+        outcome.suppressions.clone_from(&directives.valid);
         outcome.reads = files.dependencies();
         // Dated if anything about this file's result depended on the date: an expiring
         // directive, or a rule that read `ctx.today`.
@@ -1526,6 +1645,55 @@ impl Engine {
         });
 
         Ok(outcome)
+    }
+
+    /// The cache-hit half of [`Self::check_file`], split out only to keep that function
+    /// under clippy's line limit — it is not a reusable step, just a large one.
+    ///
+    /// Returns the finished outcome on a hit. On a miss, hands `path_gate_timings` back
+    /// unchanged as the `Err` so the caller can carry it into whichever constructor runs
+    /// next — this is bookkeeping ownership, not a real error.
+    fn cache_hit(
+        &self,
+        cache: &Store,
+        path: &FilePath,
+        keys: Option<(CacheKey, CacheKey)>,
+        has_expiry: bool,
+        admitted: &[&Prepared],
+        path_gate_timings: Vec<(RuleId, RuleTiming)>,
+    ) -> Result<FileOutcome, Vec<(RuleId, RuleTiming)>> {
+        let Some((plain, dated)) = keys else {
+            return Err(path_gate_timings);
+        };
+        // Dated first. A file with an expiring suppression is *only* ever stored dated,
+        // so trying the plain key for it would be a lookup that can never hit.
+        let candidates: &[CacheKey] = if has_expiry {
+            &[dated]
+        } else {
+            &[dated, plain]
+        };
+        for key in candidates {
+            if let Some(entry) = cache.get(key)
+                && lanekeep_cache::validate(entry, &self.root)
+            {
+                // Every rule still admitted at this point — the cache is consulted
+                // before the content gates run at all — is served from the cache,
+                // whatever its own content gates would have made of these bytes.
+                let mut timings = path_gate_timings;
+                if self.profiling {
+                    timings.extend(bucket_timings(admitted.iter().copied(), |timing| {
+                        timing.cached = 1;
+                    }));
+                }
+                return Ok(FileOutcome::cached(
+                    path.clone(),
+                    *key,
+                    entry.clone(),
+                    timings,
+                ));
+            }
+        }
+        Err(path_gate_timings)
     }
 
     /// Run every admitted rule over one parsed file, through whichever engine backs it.
@@ -2440,7 +2608,11 @@ struct FileOutcome {
 
 impl FileOutcome {
     /// A file that never reached a parser — gated out, unreadable, or not UTF-8.
-    const fn skipped(path: FilePath) -> Self {
+    ///
+    /// `timings` carries whichever gate rejections this file already produced for rules
+    /// that never reach a later constructor — the path gate's, always, and the content
+    /// gate's when the file failed to decode as UTF-8 after surviving it.
+    fn skipped(path: FilePath, timings: Vec<(RuleId, RuleTiming)>) -> Self {
         Self {
             path,
             violations: Vec::new(),
@@ -2449,7 +2621,7 @@ impl FileOutcome {
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
             read_the_date: false,
-            timings: Vec::new(),
+            timings,
             entry: None,
             parsed: false,
         }
@@ -2473,8 +2645,15 @@ impl FileOutcome {
     /// A file whose result came back from the cache.
     ///
     /// Counted as parsed, because from outside the run it was checked — reporting a warm
-    /// run as having checked nothing would make the number useless.
-    fn cached(path: FilePath, key: CacheKey, entry: CacheEntry) -> Self {
+    /// run as having checked nothing would make the number useless. `timings` carries the
+    /// path gate's rejections plus a `cached` count for every rule still admitted when the
+    /// cache was consulted.
+    fn cached(
+        path: FilePath,
+        key: CacheKey,
+        entry: CacheEntry,
+        timings: Vec<(RuleId, RuleTiming)>,
+    ) -> Self {
         Self {
             path,
             violations: entry.violations.clone(),
@@ -2485,14 +2664,22 @@ impl FileOutcome {
             // A cache hit ran no rules, so nothing read the date this time. Whether the
             // entry was dated is already settled by the key it was found under.
             read_the_date: false,
-            timings: Vec::new(),
+            timings,
             entry: Some((key, entry)),
             parsed: true,
         }
     }
 
     /// A file that no rule's content gates admitted.
-    fn empty_entry(path: FilePath, key: Option<CacheKey>) -> Self {
+    ///
+    /// `timings` carries the path gate's rejections plus a `content_gated` count for every
+    /// rule that survived it — which, for this constructor, is every rule that reached the
+    /// content gate at all.
+    fn empty_entry(
+        path: FilePath,
+        key: Option<CacheKey>,
+        timings: Vec<(RuleId, RuleTiming)>,
+    ) -> Self {
         Self {
             path,
             violations: Vec::new(),
@@ -2501,7 +2688,7 @@ impl FileOutcome {
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
             read_the_date: false,
-            timings: Vec::new(),
+            timings,
             entry: key.map(|key| (key, CacheEntry::default())),
             parsed: false,
         }
@@ -3294,6 +3481,333 @@ mod tests {
             "only the file containing the needle should parse"
         );
         assert_eq!(outcome.violations.len(), 1);
+    }
+
+    /// A rule admitted only under `src/only/**`, for the path-gate counters.
+    fn path_gated_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               query: '(debugger_statement) @stmt',\n\
+               gates: {{ pathMatches: ['src/only/**'] }},\n\
+               card: {{ message: 'debugger statement', remediation: 'remove it',\n\
+                 examples: {{ bad: 'debugger;', good: 'x;' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.stmt); }},\n\
+             }});\n"
+        )
+    }
+
+    /// A rule admitted only in files whose bytes contain `debugger`, for the content-gate
+    /// counters.
+    fn content_gated_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               query: '(debugger_statement) @stmt',\n\
+               gates: {{ fileContains: ['debugger'] }},\n\
+               card: {{ message: 'debugger statement', remediation: 'remove it',\n\
+                 examples: {{ bad: 'debugger;', good: 'x;' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.stmt); }},\n\
+             }});\n"
+        )
+    }
+
+    /// A config importing several rule modules by path, each bound to a distinct name.
+    fn multi_rule_config(rule_paths: &[&str]) -> String {
+        use std::fmt::Write as _;
+
+        let mut imports = String::new();
+        for (i, path) in rule_paths.iter().enumerate() {
+            let _ = writeln!(imports, "import r{i} from '{path}';");
+        }
+        let names: Vec<String> = (0..rule_paths.len()).map(|i| format!("r{i}")).collect();
+        format!(
+            "import {{ defineConfig }} from 'lanekeep';\n\
+             {imports}\
+             export default defineConfig({{ include: ['src/**/*.ts'], rules: [{}] }});\n",
+            names.join(", ")
+        )
+    }
+
+    /// A rule's timing row from a profiled run, or a panic naming which rule was missing.
+    fn timing_for<'a>(outcome: &'a Outcome, id: &str) -> &'a RuleTiming {
+        outcome
+            .timings
+            .as_ref()
+            .expect("profiling collects timings")
+            .get(&id.parse::<RuleId>().expect("a well-formed rule id"))
+            .unwrap_or_else(|| panic!("no timing recorded for `{id}`"))
+    }
+
+    #[test]
+    fn the_four_gate_counters_reconcile_for_every_rule() {
+        // The load-bearing test. For every rule, `path_gated + cached + content_gated +
+        // parsed` must equal `files_discovered` — over a corpus where every one of the four
+        // actually occurs. A single rule with a single outcome (the tests below) would pass
+        // against almost any bug that swaps or drops one of the four; this one needs all of
+        // them present at once to fail for the reason it should.
+        let project = Project::new(
+            "gate-counters-reconcile",
+            &[
+                ("rule-a.ts", &path_gated_rule("local/path-gated")),
+                ("rule-b.ts", &content_gated_rule("local/content-gated")),
+                (
+                    "lanekeep.config.ts",
+                    &multi_rule_config(&["./rule-a", "./rule-b"]),
+                ),
+                ("src/only/a.ts", "debugger;\n"),
+                ("src/only/b.ts", "const b = 1;\n"),
+                ("src/other/c.ts", "debugger;\n"),
+                ("src/other/d.ts", "const d = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+        assert_eq!(outcome.files_discovered, 4);
+
+        let discovered = u64::try_from(outcome.files_discovered).expect("small count");
+        for id in ["local/path-gated", "local/content-gated"] {
+            let timing = timing_for(&outcome, id);
+            assert_eq!(
+                timing.path_gated + timing.cached + timing.content_gated + timing.parsed,
+                discovered,
+                "`{id}` does not reconcile: {timing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_gates_rejects_land_only_in_path_gated() {
+        // Folding a path-gate reject into `content_gated`, or dropping it, would leave this
+        // failing without touching `the_four_gate_counters_reconcile_for_every_rule` — that
+        // test only checks the sum, and a bug that moves a count between two of the four
+        // buckets leaves the sum untouched.
+        let project = Project::new(
+            "gate-counters-path",
+            &[
+                ("rule.ts", &path_gated_rule("local/path-gated")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/only/a.ts", "const a = 1;\n"),
+                ("src/other/b.ts", "const b = 1;\n"),
+                ("src/other/c.ts", "const c = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        let timing = timing_for(&outcome, "local/path-gated");
+        assert_eq!(
+            timing.path_gated, 2,
+            "the two files outside `src/only` are path-gated: {timing:?}"
+        );
+        assert_eq!(timing.content_gated, 0, "{timing:?}");
+        assert_eq!(timing.cached, 0, "run cold, nothing is cached: {timing:?}");
+        assert_eq!(
+            timing.parsed, 1,
+            "the one admitted file still parses: {timing:?}"
+        );
+    }
+
+    #[test]
+    fn a_content_gates_rejects_land_only_in_content_gated() {
+        let project = Project::new(
+            "gate-counters-content",
+            &[
+                ("rule.ts", &content_gated_rule("local/content-gated")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+                ("src/b.ts", "const b = 1;\n"),
+                ("src/c.ts", "const c = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        let timing = timing_for(&outcome, "local/content-gated");
+        assert_eq!(
+            timing.path_gated, 0,
+            "this rule declares no path gate: {timing:?}"
+        );
+        assert_eq!(
+            timing.content_gated, 2,
+            "the two files without `debugger` are content-gated: {timing:?}"
+        );
+        assert_eq!(timing.cached, 0, "run cold, nothing is cached: {timing:?}");
+        assert_eq!(
+            timing.parsed, 1,
+            "the one file containing the needle still parses: {timing:?}"
+        );
+    }
+
+    #[test]
+    fn path_gated_and_content_gated_counts_are_not_interchangeable() {
+        // One file, rejected by two different rules for two different reasons. Swapping
+        // which counter each rule's rejection lands in — or counting both rules the same
+        // way — would pass the two tests above (each only ever exercises one bucket) and
+        // still be wrong.
+        let project = Project::new(
+            "gate-counters-distinguished",
+            &[
+                ("rule-a.ts", &path_gated_rule("local/path-gated")),
+                ("rule-b.ts", &content_gated_rule("local/content-gated")),
+                (
+                    "lanekeep.config.ts",
+                    &multi_rule_config(&["./rule-a", "./rule-b"]),
+                ),
+                // Outside `src/only`, so the path-gated rule rejects it before any read;
+                // no `debugger`, so the content-gated rule reads it and rejects it after.
+                ("src/other/a.ts", "const a = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        let path_gated = timing_for(&outcome, "local/path-gated");
+        assert_eq!(path_gated.path_gated, 1, "{path_gated:?}");
+        assert_eq!(path_gated.content_gated, 0, "{path_gated:?}");
+
+        let content_gated = timing_for(&outcome, "local/content-gated");
+        assert_eq!(content_gated.path_gated, 0, "{content_gated:?}");
+        assert_eq!(content_gated.content_gated, 1, "{content_gated:?}");
+    }
+
+    #[test]
+    fn a_warm_run_counts_files_as_cached_and_still_reconciles() {
+        // The test the whole four-column decision exists for. Deleting the `cached`
+        // counting at the cache-hit site — or, worse, not carrying `path_gate_timings`
+        // through that early return at all — would leave a warm run's per-rule sum short
+        // by however many files hit the cache. Every test above runs cold and cannot catch
+        // that: `FileOutcome::cached` is the one constructor none of them exercise.
+        let project = Project::new(
+            "gate-counters-warm",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+                ("src/b.ts", "debugger;\n"),
+            ],
+        );
+
+        let cold = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs cold");
+        let cold_timing = timing_for(&cold, "local/no-debugger");
+        assert_eq!(cold_timing.parsed, 2, "{cold_timing:?}");
+        assert_eq!(cold_timing.cached, 0, "{cold_timing:?}");
+
+        let warm = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs warm");
+        let warm_timing = timing_for(&warm, "local/no-debugger");
+        assert_eq!(
+            warm_timing.cached, 2,
+            "the second run must serve both files from the cache: {warm_timing:?}"
+        );
+        assert_eq!(
+            warm_timing.path_gated
+                + warm_timing.cached
+                + warm_timing.content_gated
+                + warm_timing.parsed,
+            2,
+            "{warm_timing:?}"
+        );
+    }
+
+    #[test]
+    fn the_counters_are_absent_without_profiling() {
+        // Deleting `self.profiling.then_some(timings)` in favor of always returning `Some`
+        // would make this fail: a caller who never asked for `--profile` must see `None`,
+        // exactly as before this change.
+        let project = Project::new(
+            "gate-counters-off",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert!(outcome.timings.is_none(), "profiling was never asked for");
+    }
+
+    #[test]
+    fn gate_counting_does_not_change_which_violations_are_reported() {
+        // Acceptance item 3, at the unit level. The counting added beside the `.filter()`
+        // predicates at the path and content gates must leave those predicates' behavior
+        // exactly alone — this asserts on violations, not on any counter, so a change that
+        // narrowed or widened a gate while counting it correctly would still be caught here.
+        let project = Project::new(
+            "gate-counters-unaffected",
+            &[
+                ("rule-a.ts", &path_gated_rule("local/path-gated")),
+                ("rule-b.ts", &content_gated_rule("local/content-gated")),
+                (
+                    "lanekeep.config.ts",
+                    &multi_rule_config(&["./rule-a", "./rule-b"]),
+                ),
+                ("src/only/a.ts", "debugger;\n"),
+                ("src/only/b.ts", "const b = 1;\n"),
+                ("src/other/c.ts", "debugger;\n"),
+                ("src/other/d.ts", "const d = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .run()
+            .expect("runs");
+
+        assert!(outcome.timings.is_none(), "not profiling");
+
+        let mut files: Vec<&str> = outcome
+            .violations
+            .iter()
+            .map(|v| v.location.file.as_str())
+            .collect();
+        files.sort_unstable();
+        assert_eq!(
+            files,
+            // `src/only/a.ts` twice: it satisfies both rules' gates — under `src/only` for
+            // the path-gated rule and containing `debugger` for the content-gated one — so
+            // both report on it. `src/other/c.ts` only satisfies the content-gated rule's.
+            vec!["src/only/a.ts", "src/only/a.ts", "src/other/c.ts"],
+            "both rules must still admit exactly the files containing `debugger`"
+        );
     }
 
     #[test]
