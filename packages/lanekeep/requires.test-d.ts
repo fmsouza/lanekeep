@@ -40,20 +40,20 @@ defineRule({
   requires: [],
 })
 
-// @ts-expect-error a capability outside the union
 defineRule({
   id: 'local/unknown',
   severity: 'error',
   query: '(identifier) @id',
   card,
+  // @ts-expect-error a capability outside the union
   requires: ['speed'],
 })
 
-// @ts-expect-error the array is the only shape; a bare string is the mistake this invites
 defineRule({
   id: 'local/scalar',
   severity: 'error',
   query: '(identifier) @id',
   card,
+  // @ts-expect-error the array is the only shape; a bare string is the mistake this invites
   requires: 'types',
 })
