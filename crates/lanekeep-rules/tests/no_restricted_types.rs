@@ -135,6 +135,22 @@ fn a_local_typed_through_its_initializer_is_reported() {
         .expect("parseFloat gives a number and the name says money");
 }
 
+/// The named half of #203's measurement, pinned here so that `no-restricted-arguments` — which
+/// catches the inline form this rule cannot — is only ever additive. This is the violation a
+/// project loses if the declarator arm of the query is ever narrowed.
+#[test]
+fn a_declarator_whose_initializer_types_as_a_forbidden_primitive_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "function use(row) {\n\
+             \x20 const amount = parseFloat(row.amount);\n\
+             \x20 return amount;\n\
+             }\n",
+            &[(2, 9)],
+        )
+        .expect("amount resolves to a declarator whose initializer types as number");
+}
+
 /// `undefined` is a first-class answer and the rule stays silent on it.
 ///
 /// Asserted as *expected* rather than left to fall out: a rule that reported on `undefined`
