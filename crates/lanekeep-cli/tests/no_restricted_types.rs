@@ -51,16 +51,28 @@ fn a_bare_number_on_a_governed_name_is_reported() {
 /// convention matches — whatever its type — would pass the first test just as well: nothing
 /// would have shown that the violation depends on the *type* of `amount`, rather than only
 /// on its name.
+///
+/// The aliased import is here rather than only in the engine's fixtures because that is where
+/// this was found: measured through this binary, `Decimal as Money` on a governed name was
+/// reported with a message about `number`. The oracle hands the rule the *use-site* name, so a
+/// `require` that compared the type's name rejected an alias of exactly the required type.
 #[test]
 fn a_decimal_on_the_same_governed_name_is_a_clean_run() {
     let corpus = Corpus::new(
         "no-restricted-types",
         MONEY,
-        &[(
-            "src/money.ts",
-            "import { Decimal } from 'decimal.js';\n\
-             function credit(amount: Decimal) { return amount; }\n",
-        )],
+        &[
+            (
+                "src/money.ts",
+                "import { Decimal } from 'decimal.js';\n\
+                 function credit(amount: Decimal) { return amount; }\n",
+            ),
+            (
+                "src/aliased.ts",
+                "import { Decimal as Money } from 'decimal.js';\n\
+                 function settle(totalAmount: Money) { return totalAmount; }\n",
+            ),
+        ],
     );
 
     assert_eq!(corpus.run(), Vec::<String>::new());

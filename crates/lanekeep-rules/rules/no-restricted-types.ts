@@ -28,6 +28,13 @@ import { matches } from 'lanekeep/patterns'
  * is optional money and none of its members is a forbidden primitive, so it stays silent;
  * `number | Decimal` can still be a bare `number` at run time, so it reports.
  *
+ * **`require` is matched on the module a type came from and on nothing else, so a different
+ * export of that module is accepted.** `import { Big } from 'decimal.js'` satisfies a
+ * convention requiring `Decimal`. That is a false negative and it is the deliberate trade:
+ * the type's name as the oracle reports it is the *use-site* name, so comparing it would
+ * report `import { Decimal as Money } from 'decimal.js'` — conforming code — as a violation,
+ * and a rule that accuses conforming code is the one failure this design forbids.
+ *
  * @example
  * ```ts
  * import noRestrictedTypes from 'lanekeep/no-restricted-types'
@@ -113,18 +120,29 @@ export default function noRestrictedTypes(options) {
         }
 
         // A named type. It satisfies the convention only when it is the *required* one,
-        // matched on the module its symbol came from rather than on its name — a local
-        // `class Decimal {}` is not `decimal.js`'s, and matching by name would accept it.
+        // matched on the module its symbol came from and **never on the type's name** — a
+        // local `class Decimal {}` carries no module at all, so the module comparison alone
+        // is what keeps the shadow out.
+        //
+        // Comparing `symbol.name` too is the false positive this design is arranged against.
+        // The oracle's `symbol_at` fills `name` from the node's own text, discarding the
+        // `ImportedName::Named` the resolver carries, so it is the *use-site* name: with the
+        // name compared, `import { Decimal as Money } from 'decimal.js'` — conforming code —
+        // was reported with a message about `number`.
+        //
+        // The trade is a false negative, and it is the right one here: matching the module
+        // alone accepts a *different* export of the required module, so `import { Big } from
+        // 'decimal.js'` passes a convention requiring `Decimal`. False negatives are the
+        // price this rule pays; false positives are the thing it forbids. The better fix is
+        // for the oracle to carry the *exported* name alongside the use-site one, which
+        // belongs in `lanekeep-types` rather than here.
         //
         // A nominal type the oracle could not attribute carries no symbol at all, so it
         // cannot match and is reported: a governed value whose type cannot be established
         // is not evidence the convention is met.
         if (convention.require === undefined) continue
         const symbol = type.symbol
-        const satisfied =
-          symbol !== undefined &&
-          symbol.module === convention.require.module &&
-          symbol.name === convention.require.name
+        const satisfied = symbol !== undefined && symbol.module === convention.require.module
         if (!satisfied) {
           ctx.report(m.name, { message: reasonFor(convention) })
           return

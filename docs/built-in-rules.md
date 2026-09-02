@@ -249,7 +249,7 @@ Each convention:
 | --- | --- | --- |
 | `names` | `string[]` | Glob patterns a parameter's or variable's name must match to be governed. |
 | `forbid` | `string[]` | Primitive type names that are a violation on a governed value — `number`, `string`, `boolean`, `bigint`, `symbol`, `null` or `undefined`, the set the type oracle itself recognizes. |
-| `require` | `{ module: string, name: string }` | Optional. The type that satisfies the convention: a governed value's type must have a symbol imported from `module` under exactly this `name`. |
+| `require` | `{ module: string, name: string }` | Optional. The type that satisfies the convention. Only `module` is matched — a governed value's type must have a symbol imported from it. `name` is what the message says to use instead, and is not checked; see below for why. |
 | `reason` | `string` | What to tell the reader. Carried into the violation message; falls back to naming `require`, then to a generic message, when it is absent. |
 
 `require` is optional on its own terms: a convention may forbid a primitive without naming a
@@ -311,8 +311,8 @@ Every governed name is asked what its type is:
 | a union with a member whose primitive is in `forbid` | reports |
 | a union with no such member | silent |
 | a named type, when the convention sets no `require` | silent — nothing to check it against |
-| a named type whose symbol matches `require`'s module and name | silent |
-| a named type whose symbol does not match, or has none at all | reports — a wrong or unresolved domain type is still wrong |
+| a named type whose symbol was imported from `require`'s module | silent |
+| a named type from a different module, or with no symbol at all | reports — a wrong or unresolved domain type is still wrong |
 | the oracle could not type it at all (`undefined`) | silent |
 
 A union is judged member-wise, decided on its own terms rather than falling into the nominal
@@ -321,11 +321,31 @@ forbidden primitive, so it stays silent; `amount: number | Decimal` can still be
 at run time, so it reports.
 
 A local `class Decimal {}` sharing the required name is still reported: `require` is matched on
-where a symbol came from together with what it is called there, never on a name alone, so a type
-that merely looks right is not accepted as if it were imported. A type the oracle cannot attribute
-to any symbol at all — an ambient or global type such as `Date`, used with no local declaration or
-import — is reported on the same terms: a governed value whose type cannot be established is not
-evidence the convention is met.
+where a symbol came from, so a type that merely looks right is not accepted as if it were
+imported — a local declaration has no module at all, and cannot match one. A type the oracle
+cannot attribute to any symbol at all — an ambient or global type such as `Date`, used with no
+local declaration or import — is reported on the same terms: a governed value whose type cannot be
+established is not evidence the convention is met.
+
+### `require` is matched on the module and nothing else
+
+`require.name` is not compared against the type. `import { Big } from 'decimal.js'` satisfies a
+convention requiring `Decimal`, because it came from the required module — a false negative, and a
+deliberate one.
+
+The alternative is worse. The type oracle reports a type's name as it is written *at the use site*,
+not as the module exported it, so comparing that name rejects an alias of exactly the required
+type: `import { Decimal as Money } from 'decimal.js'` is conforming code, and a rule that compared
+names reported it with a message about `number`. **A rule that accuses conforming code is the one
+failure this design forbids**, and the whole posture of the type oracle is the same trade — say
+nothing rather than say something wrong. Matching the module alone is the version of the check that
+cannot produce that failure.
+
+Two consequences to hold. Enabling this rule against a module that exports several types treats
+them as interchangeable, so it is worth pointing `require.module` at the narrowest module that
+exports the type you mean. And `require.name` is still load-bearing for the *message* — with no
+`reason` set it is what the violation says to use instead — so it is worth spelling correctly even
+though nothing checks it.
 
 **`undefined` produces false negatives and never false positives.** The oracle would rather say
 nothing than accuse code it could not read, so a value it cannot type is never reported — even

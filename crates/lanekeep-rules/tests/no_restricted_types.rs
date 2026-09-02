@@ -64,6 +64,38 @@ fn a_local_type_sharing_the_required_name_is_still_reported() {
         .expect("a local Decimal is not decimal.js's");
 }
 
+/// The other half of "matched on the module, never on the name", and the one the shadow case
+/// above cannot stand in for: it is killed by the module comparison alone, so it stayed green
+/// for the whole life of a rule that also compared `symbol.name` and reported this.
+///
+/// `symbol.name` is the *use-site* name — the oracle fills it from the node's own text and
+/// discards the exported one — so an aliased import of exactly the required type read as a
+/// different type and was accused with a message about `number`. Conforming code, reported.
+/// Pinned here because it is the one failure this rule's whole design forbids.
+#[test]
+fn a_renamed_import_of_the_required_type_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal as Money } from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n",
+        )
+        .expect("an alias of decimal.js's Decimal is still decimal.js's Decimal");
+}
+
+/// The cost of the fixture above, asserted so nobody discovers it as a surprise: matching on
+/// the module alone accepts *any* export of that module, so a convention requiring `Decimal`
+/// takes a `Big` from the same package. A false negative, and the deliberate trade — the
+/// alternative is the false positive the test above pins.
+#[test]
+fn a_different_export_of_the_required_module_is_accepted_too() {
+    tester(MONEY)
+        .accepts(
+            "import { Big } from 'decimal.js';\n\
+             function credit(amount: Big) { return amount; }\n",
+        )
+        .expect("the module is all that is matched, so a sibling export passes");
+}
+
 /// The oracle's initializer path, reached from a declaration-site identifier.
 #[test]
 fn a_local_typed_through_its_initializer_is_reported() {
