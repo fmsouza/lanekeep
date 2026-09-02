@@ -7,10 +7,15 @@
 //! A gate is **declared, not derived**. Nothing here is computed from the rule's query and
 //! nothing checks the two against each other, so a gate that rejects a file the handler
 //! would have reported on hides a violation — a bug in the rule, and one that presents as a
-//! rule reporting nothing while looking healthy. Gates are neutral exactly when the author
-//! keeps each one wider than its own rule's query; architecture §7.1 states that as the
-//! discipline it is. What the tests below hold is the weaker property they can hold on their
-//! own: gating only ever narrows, so *removing* a gate can hide nothing.
+//! rule reporting nothing while looking healthy.
+//!
+//! A gate is neutral when it admits every file the rule would have reported on. That is a
+//! condition on the author, and nothing in this file can check it: the reporting set is
+//! whatever the handler decides, and a rule whose handler filters may gate far narrower and
+//! still be neutral. Architecture §7.1 gives the checkable proxy — keep each gate wider than
+//! the query it guards, which is sufficient rather than necessary. What the tests below hold
+//! is the one direction that is a property rather than a discipline: gating only ever
+//! narrows, so *removing* a gate can hide nothing.
 //!
 //! They are evaluated in cost order:
 //!

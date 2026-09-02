@@ -464,10 +464,14 @@ const GATES: &str = "\
  *
  * A gate is declared, not derived: nothing here is computed from the rule's `query`, and
  * nothing checks the two against each other. So a gate can change what the rule reports — a
- * file it rejects is a file the query never runs on, and a violation there is never found.
- * Keeping every gate wider than the query it guards is the author's job, not something the
- * engine can check. `--profile` prints, per rule, how many files each gate rejected and how
- * many the rule actually parsed, which is where a suspected gate is settled.
+ * file it rejects is a file the rule never runs on, and a violation there is never found.
+ *
+ * A gate is neutral when it admits every file the rule would have reported on — yours to
+ * keep, and not something the engine can check. The safe way to keep it is to gate wider
+ * than the query, which is sufficient rather than necessary: a rule whose handler filters
+ * may gate far narrower and still be neutral. `--profile` prints, per rule, how many files
+ * each gate rejected and how many the rule actually parsed, which is where a suspected gate
+ * is settled.
  */
 export interface Gates {
   /**

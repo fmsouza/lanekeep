@@ -187,8 +187,9 @@ export default defineRule({
     },
   },
 
-  // Evaluated in Rust before the file is read or parsed. Nothing derives them from the
-  // query, so keeping them wider than it is the author's job — §7.1.
+  // Evaluated in Rust before the file is read or parsed, and narrower than the query
+  // below — neutral anyway, because nothing the handler reports can occur in a file
+  // without `makeStyles` in it. Keeping that true is the author's job — §7.1.
   gates: {
     pathMatches: ['**/*.{ts,tsx}'],
     fileContains: ['makeStyles'],
@@ -554,7 +555,11 @@ Declared per rule under `gates`, evaluated in Rust:
 
 The single largest lever available. A rule scoped to `makeStyles` skips parsing every file whose bytes do not contain that string.
 
-**A gate is declared, not derived.** Nothing computes it from the rule's query and nothing checks the two against each other, so a file a gate rejects is a file the query never runs on, and a violation there is never found. A gate is neutral exactly when it over-approximates its own rule's query — a discipline the author keeps, not a property the engine guarantees. `fileContains` is where that is easiest to get wrong, because it is an *and*: a rule matching either of two tokens cannot express its gate as a list of both, since that rejects every file carrying only one, and the rule then reports nothing while looking perfectly healthy. When a gate is the suspect, `--profile`'s second table (§15) is where it is settled — it reports, per rule, how many of the discovered files each gate rejected and how many the rule actually parsed.
+**A gate is declared, not derived.** Nothing computes it from the rule's query and nothing checks the two against each other, so a file a gate rejects is a file the rule never runs on, and a violation there is never found.
+
+A gate is neutral when it admits every file the rule would have reported on. That is a condition on the author rather than a property the engine guarantees, and nothing here can check it — the reporting set is whatever the handler decides. The way to keep it safely is to keep each gate wider than the query it guards, which is **sufficient rather than necessary** and, unlike the condition itself, can be settled by reading. A rule whose handler filters may gate far narrower and still be neutral: §4's sample gates on `makeStyles` under a query matching a numeric property in *any* object literal, and is neutral because nothing it reports can occur in a file whose bytes lack that string.
+
+`fileContains` is where this is easiest to get wrong, because it is an *and*: a rule matching either of two tokens cannot express its gate as a list of both, since that rejects every file carrying only one, and the rule then reports nothing while looking perfectly healthy. When a gate is the suspect, `--profile`'s second table (§15) is where it is settled — it reports, per rule, how many of the discovered files each gate rejected and how many the rule actually parsed.
 
 ### 7.2 The query gate
 
@@ -1092,7 +1097,7 @@ The first is the cache's entire purpose, and it is the check that caught a warm 
 
 Instrumentation behind `--profile` only, printing two tables. The first reports per-rule time split between query matching and handler execution — the split that tells an author whether their query or their code is the problem — plus the match count, which is the number §7.2's gate exists to keep small. The second reports, per rule, what became of every file discovery selected: how many its path gates rejected, how many went unread, how many the cache served, how many its content gates rejected, how many its `language` declaration excluded, and how many it actually parsed. Those six are mutually exclusive and sum to the discovered file count, which the table prints beneath them, so a row that fails to reconcile is visible rather than merely wrong.
 
-Both go to stderr, so `--profile --format json` still pipes a clean document. The time table is sorted by total cost with the rule id breaking ties; the gate table is sorted by rule id alone, because "what did this rule look at" is not a time question and ordering it by elapsed time would move rows for a reason unrelated to what they show. Neither reorders between runs over one corpus for reasons nobody can see. A rule that matched nothing still appears, and there are two ways to be that rule: its query ran on every file and found nothing — expensive *and* fruitless, the worst case there is — or its query never ran at all, because a gate, the cache or its own `language` declaration took every file first. The time table cannot tell those apart, since both spell zero matches. The second is what does: a row whose `content-gated` accounts for every discovered file while `parsed` reads `0` is the second case, and it is a gate question rather than a query one.
+Both go to stderr, so `--profile --format json` still pipes a clean document. The time table is sorted by total cost with the rule id breaking ties; the gate table is sorted by rule id alone, because "what did this rule look at" is not a time question and ordering it by elapsed time would move rows for a reason unrelated to what they show. Neither reorders between runs over one corpus for reasons nobody can see. A rule that matched nothing still appears, and the gate table is what says why. Its query may have run on every file and found nothing — expensive *and* fruitless, the worst case there is. It may never have run at all, because a gate, the cache or its own `language` declaration took every file first. Or it ran on whatever survived and found nothing there, which is the ordinary shape for any gated rule. The time table cannot tell these apart, since all of them spell zero matches; `parsed` is the column that does.
 
 Off by default, because measuring costs a clock read per handler invocation and the warm path is the one place that matters most.
 
