@@ -10,6 +10,7 @@
       "no-circular-imports": ["builtin.d.ts"],
       "no-default-export": ["builtin.d.ts"],
       "no-mutable-default-argument": ["builtin.d.ts"],
+      "no-restricted-arguments": ["builtin.d.ts"],
       "no-restricted-calls": ["builtin.d.ts"],
       "no-restricted-imports": ["builtin.d.ts"],
       "no-restricted-types": ["builtin.d.ts"],
@@ -43,6 +44,9 @@
       "types": "./builtin.d.ts"
     },
     "./no-mutable-default-argument": {
+      "types": "./builtin.d.ts"
+    },
+    "./no-restricted-arguments": {
       "types": "./builtin.d.ts"
     },
     "./no-restricted-calls": {

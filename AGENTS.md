@@ -830,9 +830,10 @@ nine as QuickJS modules: the four TypeScript-inspecting rules went into a Starli
 component and came back in #147 (13 MB of binary and 110× per host-API crossing for no speed
 benefit, architecture §15.1), and `no-restricted-calls`, `duplicate-implementation` and
 `no-assertionless-test` arrived as modules after them. `no-restricted-types` arrived as a
-tenth module after that, so fourteen built-ins ship today. Seven of the ten modules are
-genuine factories — every module except the three plain `defineRule` objects,
-`no-broad-except`, `no-default-export` and `no-mutable-default-argument` — and none carries
+tenth module after that, and `no-restricted-arguments` as an eleventh, so fifteen built-ins ship
+today. Eight of the eleven modules are genuine factories — every module except the three plain
+`defineRule` objects, `no-broad-except`, `no-default-export` and
+`no-mutable-default-argument` — and none carries
 the `for (const key in …)` copy: the dual shape is gone, not restored. The one surviving
 instance of it is `crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy
 that ships to nobody.
@@ -861,6 +862,13 @@ authoring — five of the eight were factory-shaped the day "three" was written.
 arriving again. A count written out in prose is the spelling no pattern matches and no test
 covers — hence the opening instruction: derive the split from the tables, and treat any number
 this section states as a claim to recompute rather than to trust.
+
+A near miss, not a fourth instance: a draft of this entry claimed `no-restricted-arguments`
+landing right after `no-restricted-types` had made it stale a fourth time. It had not — the
+change that added `no-restricted-arguments` updated this section's counts in the same commit,
+which is the opposite of going stale — and review caught the false claim before it shipped.
+Worth naming precisely because the two read alike from a distance: a section going stale and a
+section being updated incorrectly are different failures, and only the second happened here.
 
 **`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
 `ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a

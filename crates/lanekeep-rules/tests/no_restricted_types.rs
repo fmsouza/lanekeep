@@ -128,6 +128,17 @@ fn a_different_export_of_the_required_module_is_accepted_too() {
 }
 
 /// The oracle's initializer path, reached from a declaration-site identifier.
+///
+/// This is also the pin for #203's *named* form: `no-restricted-types` reaches
+/// `new Decimal(parseFloat(row.amount))`'s inline argument only by following `amount` back to
+/// its declarator, never at the call site itself — the case `lanekeep/no-restricted-arguments`
+/// exists to catch the *inline* form this rule cannot. Removing this test would silently drop
+/// the coverage the new rule was required to add to, never replace: mutation testing found no
+/// way to distinguish a differently-scoped or differently-named copy of this fixture from this
+/// one, because neither the declarator path nor the call-typing path branches on scope or on
+/// the parenthesized argument's own text — `crates/lanekeep-types/src/oracle.rs:196-211` types
+/// a builtin call by name alone, without inspecting its argument — so a second fixture in this
+/// shape would only duplicate this one, not add to it.
 #[test]
 fn a_local_typed_through_its_initializer_is_reported() {
     tester(MONEY)
