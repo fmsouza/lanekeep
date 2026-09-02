@@ -544,31 +544,45 @@ print('x')
         ],
     );
 
-    let output = project.run(&["check", "--profile", "--no-cache"]);
-    let combined = describe(&output);
-    assert_eq!(output.status.code(), Some(0), "{combined}");
+    // No `--no-cache` on purpose: the cold pass below has to actually populate the cache, or
+    // the "warm" pass after it is cold too and `cached` never becomes distinguishable from
+    // `unread`. Caching does not change which violations are reported (both rules stay silent
+    // either way), only how each file's row is attributed.
+    let cold_output = project.run(&["check", "--profile"]);
+    let cold_combined = describe(&cold_output);
+    assert_eq!(cold_output.status.code(), Some(0), "{cold_combined}");
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let cold_stderr = String::from_utf8_lossy(&cold_output.stderr);
 
     // The header's column *labels* are asserted verbatim: nothing about the row values below
     // would notice `content-gated` and `lang-gated` swapped in the header alone, since neither
     // row parser reads it.
     assert!(
-        stderr.contains(&gate_table_header()),
-        "gate table header missing or changed: {stderr}"
+        cold_stderr.contains(&gate_table_header()),
+        "gate table header missing or changed: {cold_stderr}"
     );
 
-    let gated = gate_row(&stderr, "local/gate-excludes-everything");
-    let empty = gate_row(&stderr, "local/nothing-to-find");
+    let cold_gated = gate_row(&cold_stderr, "local/gate-excludes-everything");
+    let cold_empty = gate_row(&cold_stderr, "local/nothing-to-find");
 
     // [path_gated, unread, cached, content_gated, language_gated, parsed]
     //
-    // Swapping any two columns in `write_gate_profile`'s row `writeln!` — `path_gated` and
-    // `unread`, or `content_gated` and `language_gated`, for instance — now produces a
-    // different tuple than the one asserted here, because this corpus does not leave those
-    // pairs both at zero the way a single-file, single-gate corpus would.
-    assert_eq!(gated, [1, 0, 0, 1, 1, 0], "gated row: {stderr}");
-    assert_eq!(empty, [0, 0, 0, 0, 1, 2], "empty row: {stderr}");
+    // Swapping `path_gated` and `unread`, or `content_gated` and `language_gated`, now produces
+    // a different tuple than the one asserted here, because this corpus does not leave those
+    // pairs both at zero the way a single-file, single-gate corpus would. It does *not* catch
+    // `unread` swapped with `cached` — both are genuinely zero on every cold row, no matter what
+    // the corpus contains, because nothing is ever unread here and nothing can be cached before
+    // a first run has written anything. That pair is only separated below, by the warm pass.
+    assert_eq!(
+        cold_gated,
+        [1, 0, 0, 1, 1, 0],
+        "cold gated row: {cold_stderr}"
+    );
+    assert_eq!(
+        cold_empty,
+        [0, 0, 0, 0, 1, 2],
+        "cold empty row: {cold_stderr}"
+    );
 
     // The trailing line is the reconciliation check for a reader — three files discovered, and
     // every rule's six counters must sum to it. This corpus cannot tell "the printed figure is
@@ -576,19 +590,62 @@ print('x')
     // from" — both are 3 here too — so this line is right by construction (see `main.rs`'s own
     // call site), not proven by this assertion.
     assert!(
-        stderr.contains("each row sums to 3 files discovered"),
-        "{stderr}"
+        cold_stderr.contains("each row sums to 3 files discovered"),
+        "{cold_stderr}"
     );
 
     // The explanatory paragraph has to be printed, not left as a comment in `main.rs` — a
     // comment reaches nobody running `--profile`. Both halves are asserted so a future edit
     // cannot drop one without a coordinator noticing.
     assert!(
-        stderr.contains("content-gated is a gate question"),
-        "the content-gated explanation is missing: {stderr}"
+        cold_stderr.contains("content-gated is a gate question"),
+        "the content-gated explanation is missing: {cold_stderr}"
     );
     assert!(
-        stderr.contains("lang-gated is a `language` declaration"),
-        "the lang-gated explanation is missing: {stderr}"
+        cold_stderr.contains("lang-gated is a `language` declaration"),
+        "the lang-gated explanation is missing: {cold_stderr}"
+    );
+
+    // The warm pass: same project, same files, cache now populated by the run above. This is
+    // the one case `RuleTiming` grew a `cached` counter for in the first place — a cache hit
+    // returns before a rule's own content gate runs at all, so a rule that was `content_gated`
+    // or `language_gated` cold can become `cached` warm, and an implementation that forgot to
+    // carry that counter through the cache-hit path would silently undercount a warm run. No
+    // column but this pass can give `cached` a nonzero value, and none but this pass can put
+    // `unread` and `cached` at different values in the same row — cold, both are always zero.
+    let warm_output = project.run(&["check", "--profile"]);
+    let warm_combined = describe(&warm_output);
+    assert_eq!(warm_output.status.code(), Some(0), "{warm_combined}");
+
+    let warm_stderr = String::from_utf8_lossy(&warm_output.stderr);
+    let warm_gated = gate_row(&warm_stderr, "local/gate-excludes-everything");
+    let warm_empty = gate_row(&warm_stderr, "local/nothing-to-find");
+
+    // `src/excluded/skip.ts` stays `path_gated` for `gate-excludes-everything` warm or cold —
+    // the path gate runs before the cache is ever consulted, so a file a rule's own path gate
+    // excludes never reaches the cache lookup that would let it become `cached` for that rule.
+    // `src/util.py` stays `language_gated` warm or cold too, and for a different reason: a
+    // file no admitted rule's declared language matches is never parsed at all, so nothing
+    // about it is ever written to the cache in the first place — there is no entry for a
+    // second run to hit, cache or no cache. `src/a.ts` — admitted, not excluded by path, and
+    // actually parsed on the cold pass — is the one file either rule can serve from the cache,
+    // and `nothing-to-find` also serves `skip.ts` from it, since that file isn't excluded from
+    // that rule at all.
+    assert_eq!(
+        warm_gated,
+        [1, 0, 1, 0, 1, 0],
+        "warm gated row: {warm_stderr}"
+    );
+    assert_eq!(
+        warm_empty,
+        [0, 0, 2, 0, 1, 0],
+        "warm empty row: {warm_stderr}"
+    );
+
+    // The reconciliation line still holds after the cold-to-warm transition — the property the
+    // six-column split exists to protect, not merely a number that happens to still add up.
+    assert!(
+        warm_stderr.contains("each row sums to 3 files discovered"),
+        "{warm_stderr}"
     );
 }
