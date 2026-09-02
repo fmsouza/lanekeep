@@ -413,6 +413,27 @@ fn a_locally_declared_type_is_nominal_with_no_module() {
     );
 }
 
+/// The third case, and the one nothing else here covers: a nominal type with **no** symbol.
+///
+/// `Date` is an ambient global — declared in a lib the oracle does not open, imported from
+/// nowhere, shadowed by nothing — so the resolver has nothing to say and the symbol is absent.
+/// Ordinary rather than a corner case: every global and every ambient declaration lands here.
+///
+/// The two tests above cannot stand in for it. Both assert `symbol: Some(..)`, so an oracle
+/// that fabricated a symbol from the type's own name whenever the resolver came back empty
+/// would leave them green — and a rule branching on `symbol` would then read an unattributed
+/// global as a resolved local declaration, which is the wrong answer rather than no answer.
+#[test]
+fn an_ambient_type_is_nominal_with_no_symbol() {
+    assert_eq!(
+        type_of_last("let x: Date;", "type_annotation"),
+        Some(Type::Nominal {
+            name: "Date".to_owned(),
+            symbol: None,
+        })
+    );
+}
+
 #[test]
 fn a_function_type_annotation_is_not_typed() {
     assert_eq!(

@@ -7,7 +7,9 @@
 //!
 //! # What is here so far
 //!
-//! Reporting, tree navigation, binding resolution, facts, and tracked file reads.
+//! Reporting, tree navigation, binding resolution, facts, tracked file reads, and — for a
+//! rule that declared `requires: ['types']` and only for one — the within-file type oracle
+//! behind `ctx.types`.
 //!
 //! # Two contexts, not one
 //!
@@ -117,9 +119,10 @@ pub struct HostContext {
     /// The probe token behind `ctx.types`, present only for a rule that declared
     /// `requires: ['types']`.
     ///
-    /// Cloning this is cheap — see [`TypeScriptSupport`] — which is what lets
-    /// `install_types` build a fresh oracle inside every closure call rather than storing
-    /// one beside the tree it would have to borrow.
+    /// Cloning this is cheap: `TypeScriptSupport` is one `Arc<dyn BindingResolver>`, so a
+    /// clone is a refcount bump and carries none of the grammar probe that built it. That is
+    /// what lets `install_types` build a fresh oracle inside every closure call rather than
+    /// storing one beside the tree it would have to borrow.
     types: Option<TypeScriptSupport>,
     /// The date a rule sees as `ctx.today`, if the host supplied one.
     today: Option<Rc<str>>,
@@ -2345,6 +2348,32 @@ mod tests {
         assert_eq!(
             result,
             "{\"text\":\"Account\",\"symbol\":{\"name\":\"Account\"}}"
+        );
+    }
+
+    /// An ambient or global type renders with **no** `symbol` at all, and that absence is the
+    /// answer.
+    ///
+    /// The pair for the test above, and the one that discriminates. For `class Account {}` a
+    /// symbol fabricated from the type's own name is byte-identical to the real one, so that
+    /// test passes against a `Nominal` arm that ignores `symbol` and always builds
+    /// `{ name, module: None }`. `Date` is declared nowhere in the file, the resolver says so,
+    /// and the rendered object must carry nothing but `text` — a rule branching on `symbol`
+    /// would otherwise read an unresolved ambient type as a resolved declaration, which is the
+    /// wrong-answer failure this whole surface is arranged against.
+    ///
+    /// `JSON.stringify` of the whole object rather than a field read, because the bug to catch
+    /// is a field being *present*, and no assertion about a field's value can see that.
+    #[test]
+    fn types_renders_an_ambient_nominal_with_no_symbol_at_all() {
+        let host = host_with_types("let x: Date;\nconst y = x;");
+        let handle = handle_of(&host, "x");
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("JSON.stringify(ctx.types.typeOf({handle}))")
+            ),
+            "{\"text\":\"Date\"}"
         );
     }
 

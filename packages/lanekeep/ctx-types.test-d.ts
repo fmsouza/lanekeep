@@ -67,7 +67,16 @@ const noCompleteField: TypeInfo = { text: 'number', primitive: 'number', complet
 // any one of the three required would fail here. What a `.test-d.ts` file cannot do is assert
 // *when* a real `ctx.types.typeOf(...)` call produces this shape — that a nominal type the
 // resolver could not attribute (an unresolvable, global or ambient type, `Date` being the
-// ordinary example) renders this way is runtime behavior, checked by tsc not at all. That
-// half is `crates/lanekeep-js/src/host.rs`'s `render_type` and `crates/lanekeep-types`'s own
-// oracle tests to cover, not this file.
+// ordinary example) renders this way is runtime behavior, checked by tsc not at all.
+//
+// That half is covered by exactly two tests, named rather than gestured at because the
+// earlier version of this comment gestured at `render_type` and the oracle tests while
+// neither of them actually asserted this shape — every `Nominal` assertion in both carried a
+// `symbol`:
+// `types_renders_an_ambient_nominal_with_no_symbol_at_all` in `crates/lanekeep-js/src/host.rs`
+// asserts the rendered object is `{"text":"Date"}` and carries no `symbol` at all, and
+// `an_ambient_type_is_nominal_with_no_symbol` in `crates/lanekeep-types/tests/oracle.rs`
+// asserts the `Type` underneath it. Both use `Date` for the reason above, and both had to be
+// written as whole-value assertions: the bug they exist to catch is a `symbol` being
+// *present*, which no assertion about a field's value can see.
 const unresolvableNominal: TypeInfo = { text: 'Date' }
