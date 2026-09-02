@@ -599,26 +599,40 @@ print('x')
     // edit cannot drop one without a coordinator noticing.
     //
     // Each is matched on the fragment that carries the *conditional*, not on the verdict
-    // alone, because the verdicts stated flat are false of healthy rules: a Python rule over
-    // a Rust corpus has a large `content-gated` and a perfectly correct gate, and a rule
-    // whose `lang-gated` counts files no grammar claims at all has a perfectly correct
-    // `language`. Asserting only "narrow or drop the gate" would let the conditionals be
-    // deleted and stay green.
+    // alone, because every verdict here is false of some healthy rule when stated flat.
+    // `parsed: 0` is the load-bearing condition and two earlier drafts of this paragraph
+    // shipped without it, each keyed on "a counter covering most of the corpus" instead and
+    // each accusing a rule that had run: against this repository `lanekeep/no-circular-
+    // imports` sits at `lang-gated 156 / parsed 26` with a correct `language`, and
+    // `local/one-parser-per-file` at `content-gated 148 / parsed 34` with a correct gate.
+    // Pinning the literal `parsed 0` is what makes deleting the condition go red.
     assert!(
-        cold_stderr.contains("a rule reporting nothing whose content-gated"),
-        "the content-gated explanation is missing its conditional: {cold_stderr}"
+        cold_stderr.contains("a rule reporting nothing with parsed 0 never ran"),
+        "the parsed-0 condition is missing from the explanation: {cold_stderr}"
     );
     assert!(
-        cold_stderr.contains("a rule reporting nothing whose lang-gated")
-            && cold_stderr.contains("`include`"),
-        "the lang-gated explanation is missing its conditional or its second cause: \
-         {cold_stderr}"
+        cold_stderr.contains("content-gated is a gate narrower than the query"),
+        "the content-gated explanation is missing: {cold_stderr}"
     );
-    // The one that matters on the default path: warm, the columns after `cached` are zero
-    // for every rule alike, so the table settles no gate question until `cached` is zero.
+    assert!(
+        cold_stderr.contains("lang-gated is a `language`") && cold_stderr.contains("`include`"),
+        "the lang-gated explanation is missing, or is missing its second cause: {cold_stderr}"
+    );
+    assert!(
+        cold_stderr.contains("a rule reporting nothing with parsed above 0 did run"),
+        "the ran-and-found-nothing case is missing: {cold_stderr}"
+    );
+    // The one that matters on the default path: warm, the three columns after `cached` are
+    // zero for every rule alike, so they settle no gate question until `cached` is zero.
+    // `path-gated` is the exception and the text has to say so — a path gate runs before the
+    // cache is consulted, so that column stays readable warm.
     assert!(
         cold_stderr.contains("a nonzero cached") && cold_stderr.contains("--no-cache"),
         "the cached caveat is missing: {cold_stderr}"
+    );
+    assert!(
+        cold_stderr.contains("path-gated still speaks"),
+        "the cached caveat overreaches — it must exempt the path-gate column: {cold_stderr}"
     );
 
     // The warm pass: same project, same files, cache now populated by the run above. This is

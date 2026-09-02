@@ -93,9 +93,11 @@ export interface RuleCard {
  * than the query, which is sufficient rather than necessary: a rule whose handler filters
  * may gate far narrower and still be neutral. `--profile` prints, per rule, how many files
  * each gate rejected and how many the rule actually parsed, which is where a suspected gate
- * is settled — on a *cold* run. A cache hit returns before the content gates are consulted,
- * so on a warm run every readable file lands in the `cached` column and the gate columns
- * after it read zero whatever the gates did. Pair `--profile` with `--no-cache` whenever
+ * is settled — on a *cold* run, and for the `fileContains` gates only. A cache hit returns
+ * before those are consulted, so on a warm run every file the path gates admitted and the
+ * read succeeded on lands in the `cached` column, leaving `content-gated`, `lang-gated` and
+ * `parsed` at zero whatever the content gates did. `path-gated` is unaffected: a path gate
+ * runs before the cache is consulted at all. Pair `--profile` with `--no-cache` whenever
  * `cached` is not zero.
  */
 export interface Gates {

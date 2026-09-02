@@ -632,12 +632,20 @@ impl std::fmt::Debug for Engine {
 /// gate configuration says nothing about which files a query gets to run against.
 ///
 /// **`cached` comes first, so on a warm run the columns after it answer nothing.** A cache
-/// hit returns before the content gates are consulted and before anything is parsed, so a
-/// file served from cache lands in `cached` and leaves `content_gated` and `language_gated`
-/// at zero whatever those gates would have done with it — two rules with completely
-/// different gates render byte-identical rows on the default warm path. The gate columns
-/// speak only for files the cache did not answer, which makes a nonzero `cached` the signal
-/// to re-run with `--no-cache` before reading them.
+/// hit returns before the *content* gates are consulted and before anything is parsed, so a
+/// file served from cache lands in `cached` and leaves `content_gated`, `language_gated` and
+/// `parsed` at zero whatever those gates would have done with it — two rules differing only
+/// in their content gates render byte-identical rows on the default warm path. Those three
+/// columns speak only for files the cache did not answer, which makes a nonzero `cached` the
+/// signal to re-run with `--no-cache` before reading them.
+///
+/// `path_gated` is the exception, and it stays readable warm: `Engine::check_file` applies
+/// the path gates and records the counter before the read and before the cache is consulted
+/// at all, so two rules differing only in `pathMatches` render different rows on a warm run
+/// and the difference is exactly the gate. `unread` sits between the two and has one of its
+/// two sites on each side: a file gone between discovery and the read is counted before the
+/// cache is consulted, since the key needs the bytes, while a file that read as invalid
+/// UTF-8 is counted past the content gates and so cannot be reached warm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
