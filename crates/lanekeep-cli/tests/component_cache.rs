@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -70,9 +71,13 @@ impl Project {
     }
 
     /// Run `check --profile` and return the result. `--profile` is not the point of the
-    /// scenario; it is the observable, because a rule's id appears in its stderr table only for
-    /// a file whose gates and query actually ran this run — a cache hit returns before either,
-    /// so a component that never left `--profile`'s report is a component that did not execute.
+    /// scenario; it is the observable — the engine counts a cache hit against the rule it
+    /// would have consulted, so a rule's row still appears in stderr on a warm run, with
+    /// `query`, `handler` and `matches` all at zero. `zero_work_row` builds that exact row,
+    /// which is what distinguishes "the cache was read" from "the rule ran again and matched
+    /// nothing" (both would leave `matches` at zero) and from "the rule was never admitted"
+    /// (which the row's *presence* now rules out, where its *absence* used to be this test's
+    /// whole claim).
     fn check_profiled(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_lanekeep"))
             .arg("check")
@@ -138,6 +143,30 @@ fn describe(output: &Output) -> String {
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// The exact row `write_profile` (`crates/lanekeep-cli/src/main.rs`) prints for a rule that
+/// did no work this run: zero query time, zero handler time, zero matches.
+///
+/// A cache hit returns before either gate is consulted a second time, so a cache-hit rule's
+/// `RuleTiming` for this run is `RuleTiming::default()` apart from the counters this crate
+/// cannot see from stderr — `query`, `handler` and `matches` are exactly zero. Asserting on
+/// this exact row rather than on mere presence of the rule's id is what tells "the cache was
+/// read" apart from "the rule ran again and happened to match nothing" — a re-run rule's
+/// query and handler durations are not reliably nonzero on a fast, tiny fixture, so `matches
+/// == 0` alone would not distinguish the two. And asserting on this exact row rather than on
+/// *absence* of the id — the property this test asserted before the engine started counting
+/// cache hits — is what tells "cached" apart from "gated out and never admitted": both used
+/// to look identical from stderr, and only one of them is the cache being read.
+fn zero_work_row(id: &str) -> String {
+    format!(
+        "  {:<40} {:>9.1?} {:>9.1?} {:>9.1?} {:>9}",
+        id,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        0
     )
 }
 
@@ -230,16 +259,17 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
     // The proof that the second run actually *read* the cache rather than recomputing an
     // identical answer — which a correct uncached run would also produce, and which is exactly
     // the assertion the brief warns passes against this bug. `check_file` returns a cache hit
-    // before either rule's gates are consulted a second time, so neither rule's query ran, so
-    // neither rule's id was ever handed to `--profile` to report. Absence here is the whole
-    // claim; it cannot be produced by a slower recompute that happens to agree.
+    // before either rule's gates are consulted a second time, so neither rule's query ran and
+    // neither did any matching — but the engine now counts the hit itself, so each rule's row
+    // still appears, showing zero work rather than being absent. See `zero_work_row`'s doc for
+    // why a zero-work row is the stronger and more specific claim.
     assert!(
-        !warm_stderr.contains("fixture/metadata"),
-        "the component rule ran again on a warm pass — the cache was not read: {combined}"
+        warm_stderr.contains(&zero_work_row("fixture/metadata")),
+        "a cache hit must still show the component rule's row, with zero work: {combined}"
     );
     assert!(
-        !warm_stderr.contains("lanekeep/no-broad-except"),
-        "the TypeScript rule ran again on a warm pass — the cache was not read: {combined}"
+        warm_stderr.contains(&zero_work_row("lanekeep/no-broad-except")),
+        "a cache hit must still show the TypeScript rule's row, with zero work: {combined}"
     );
 }
 
@@ -285,9 +315,9 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     let warm = project.check_profiled();
     let warm_stderr = String::from_utf8_lossy(&warm.stderr).into_owned();
     assert!(
-        !warm_stderr.contains("fixture/metadata")
-            && !warm_stderr.contains("lanekeep/no-broad-except"),
-        "the second run over unchanged input should have been a full cache hit: {}",
+        warm_stderr.contains(&zero_work_row("fixture/metadata"))
+            && warm_stderr.contains(&zero_work_row("lanekeep/no-broad-except")),
+        "the second run over unchanged input should have been a full cache hit — both rows          should show zero work rather than being absent or re-run: {}",
         describe(&warm)
     );
 
@@ -327,8 +357,8 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     let combined = describe(&warm_again);
     let warm_again_stderr = String::from_utf8_lossy(&warm_again.stderr).into_owned();
     assert!(
-        !warm_again_stderr.contains("fixture/metadata")
-            && !warm_again_stderr.contains("lanekeep/no-broad-except"),
-        "the run after the recompute should have warmed on the new bytes: {combined}"
+        warm_again_stderr.contains(&zero_work_row("fixture/metadata"))
+            && warm_again_stderr.contains(&zero_work_row("lanekeep/no-broad-except")),
+        "the run after the recompute should have warmed on the new bytes — both rows should          show zero work: {combined}"
     );
 }

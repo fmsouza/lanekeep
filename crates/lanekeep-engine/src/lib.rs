@@ -620,13 +620,13 @@ impl std::fmt::Debug for Engine {
 /// one total would leave an author guessing which, and the two have nothing in common as
 /// fixes.
 ///
-/// **`path_gated`, `cached`, `content_gated` and `parsed` reconcile.** Their sum equals
-/// [`Outcome::files_discovered`] for this rule, on every run, warm or cold — a file this
-/// rule saw always lands in exactly one of the four, because they are the four mutually
-/// exclusive points at which a file's fate for this rule is decided. That is what makes the
-/// table trustworthy: an author whose rule reports nothing can tell whether a gate excluded
-/// every file it would have caught, rather than guessing between "the gate is too narrow"
-/// and "the handler is wrong."
+/// **`path_gated`, `unread`, `cached`, `content_gated` and `parsed` reconcile.** Their sum
+/// equals [`Outcome::files_discovered`] for this rule, on every run, warm or cold — a file
+/// this rule saw always lands in exactly one of the five, because they are the five
+/// mutually exclusive points at which a file's fate for this rule is decided. That is what
+/// makes the table trustworthy: an author whose rule reports nothing can tell whether a
+/// gate excluded every file it would have caught, rather than guessing between "the gate is
+/// too narrow" and "the handler is wrong."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
@@ -640,6 +640,9 @@ pub struct RuleTiming {
     pub matches: u64,
     /// Files this rule's path gates rejected, before any read.
     pub path_gated: u64,
+    /// Files this rule was admitted to that never reached a parser: gone between discovery
+    /// and the read, or not valid UTF-8.
+    pub unread: u64,
     /// Files served from cache before this rule's content gates were consulted.
     pub cached: u64,
     /// Files this rule's content gates rejected, after the read and before the parse.
@@ -653,6 +656,21 @@ impl RuleTiming {
     #[must_use]
     pub const fn total(&self) -> Duration {
         self.query.saturating_add(self.handler)
+    }
+
+    /// Fold `other` into `self` — every field summed, the two durations saturating like
+    /// `total` above. Named rather than inlined at its one call site in
+    /// [`Engine::run_files`] because that function is otherwise a line away from clippy's
+    /// limit, and the reduction is exactly the eight-field repetition this hides.
+    fn accumulate(&mut self, other: &Self) {
+        self.query = self.query.saturating_add(other.query);
+        self.handler = self.handler.saturating_add(other.handler);
+        self.matches += other.matches;
+        self.path_gated += other.path_gated;
+        self.unread += other.unread;
+        self.cached += other.cached;
+        self.content_gated += other.content_gated;
+        self.parsed += other.parsed;
     }
 }
 
@@ -689,14 +707,25 @@ fn gate_timings<'a>(
     }
 }
 
-/// `a` with `b` appended — named at the two call sites in [`Engine::check_file`] that carry
-/// gate-rejection timings from one early return to the next, to keep each to one line.
+/// `a` with `b` appended — named at the call sites in [`Engine::check_file`] that carry
+/// gate-rejection and `unread` timings from one early return to the next, to keep each to
+/// one line.
 fn extend_timings(
     mut a: Vec<(RuleId, RuleTiming)>,
     b: Vec<(RuleId, RuleTiming)>,
 ) -> Vec<(RuleId, RuleTiming)> {
     a.extend(b);
     a
+}
+
+/// `unread: 1` for every rule in `admitted` — the two `skipped()` sites in
+/// [`Engine::check_file`] that follow the path gate share this exact shape: a rule that was
+/// never rejected by any gate, but whose file turned out to be unreadable or not UTF-8.
+fn unread_timings<'a>(
+    profiling: bool,
+    admitted: impl Iterator<Item = &'a Prepared>,
+) -> Vec<(RuleId, RuleTiming)> {
+    gate_timings(profiling, admitted, |timing| timing.unread = 1)
 }
 
 /// What a run produced.
@@ -1084,14 +1113,7 @@ impl Engine {
                 fresh.insert(entry.0, entry.1);
             }
             for (rule, timing) in outcome.timings {
-                let entry = timings.entry(rule).or_default();
-                entry.query = entry.query.saturating_add(timing.query);
-                entry.handler = entry.handler.saturating_add(timing.handler);
-                entry.matches += timing.matches;
-                entry.path_gated += timing.path_gated;
-                entry.cached += timing.cached;
-                entry.content_gated += timing.content_gated;
-                entry.parsed += timing.parsed;
+                timings.entry(rule).or_default().accumulate(&timing);
             }
             if !outcome.suppressions.is_empty() {
                 directives.insert(
@@ -1494,8 +1516,13 @@ impl Engine {
             // A file that vanished between discovery and reading is not a failure. The
             // tree is allowed to change under a run; what must not happen is a partial
             // result being reported as complete, and a missing file contributes nothing
-            // either way.
-            return Ok(FileOutcome::skipped(path.clone(), path_gate_timings));
+            // either way. Every rule the path gate admitted is `unread`, not `path_gated` —
+            // the path gate already let it through.
+            let unread = unread_timings(self.profiling, admitted.iter().copied());
+            return Ok(FileOutcome::skipped(
+                path.clone(),
+                extend_timings(path_gate_timings, unread),
+            ));
         };
 
         // The cache is consulted after the path gates and the read, because the key needs
@@ -1561,11 +1588,12 @@ impl Engine {
         }
 
         let Ok(source) = String::from_utf8(bytes) else {
-            // Not valid UTF-8, so not source this tool can reason about.
-            return Ok(FileOutcome::skipped(
-                path.clone(),
-                extend_timings(path_gate_timings, content_gate_timings),
-            ));
+            // Not valid UTF-8, so not source this tool can reason about. Every rule that
+            // survived both gates is `unread`, not `parsed` — nothing of this file's
+            // content ever reached a parser.
+            let mut timings = extend_timings(path_gate_timings, content_gate_timings);
+            timings.extend(unread_timings(self.profiling, admitted.iter().copied()));
+            return Ok(FileOutcome::skipped(path.clone(), timings));
         };
 
         // Parsed once per file, whatever rules ran: a directive is a property of the file,
@@ -2609,9 +2637,13 @@ struct FileOutcome {
 impl FileOutcome {
     /// A file that never reached a parser — gated out, unreadable, or not UTF-8.
     ///
-    /// `timings` carries whichever gate rejections this file already produced for rules
-    /// that never reach a later constructor — the path gate's, always, and the content
-    /// gate's when the file failed to decode as UTF-8 after surviving it.
+    /// `timings` carries whichever gate rejections and `unread` counts this file already
+    /// produced for rules that never reach a later constructor: the path gate's rejections,
+    /// always; the content gate's, when the file failed to decode as UTF-8 after surviving
+    /// it; and an `unread` count for every rule that was admitted (by the path gate alone,
+    /// or by both gates) when the file turned out to be unreadable or not UTF-8 — those
+    /// rules were never rejected by any gate, so they must not be counted as `path_gated`
+    /// or `content_gated`, and they never reached a parser, so they must not be `parsed`.
     fn skipped(path: FilePath, timings: Vec<(RuleId, RuleTiming)>) -> Self {
         Self {
             path,
@@ -3542,12 +3574,19 @@ mod tests {
     }
 
     #[test]
-    fn the_four_gate_counters_reconcile_for_every_rule() {
-        // The load-bearing test. For every rule, `path_gated + cached + content_gated +
-        // parsed` must equal `files_discovered` — over a corpus where every one of the four
-        // actually occurs. A single rule with a single outcome (the tests below) would pass
-        // against almost any bug that swaps or drops one of the four; this one needs all of
-        // them present at once to fail for the reason it should.
+    fn the_five_gate_counters_reconcile_for_every_rule() {
+        // The load-bearing test. For every rule, `path_gated + unread + cached +
+        // content_gated + parsed` must equal `files_discovered` — over a corpus where
+        // every one of the five actually occurs, on both a cold run and a warm one. A
+        // single rule with a single outcome (the tests below) would pass against almost
+        // any bug that swaps or drops one of the five; this one needs all of them present
+        // at once, twice, to fail for the reason it should.
+        //
+        // `unread` used to be missing entirely: a file that vanished, or failed to decode
+        // as UTF-8, after a gate admitted a rule to it, left that rule's row one short of
+        // `files_discovered` — a hole in the exact invariant this diagnostic exists to
+        // guarantee. Deleting the `unread` counting at either `skipped()` call site that
+        // follows the path gate reintroduces that hole and fails this test.
         let project = Project::new(
             "gate-counters-reconcile",
             &[
@@ -3563,23 +3602,70 @@ mod tests {
                 ("src/other/d.ts", "const d = 1;\n"),
             ],
         );
+        // Not valid UTF-8 (a lone continuation byte, 0x80), but under `src/only` and
+        // containing `debugger` as ASCII — so both rules' path and content gates admit it
+        // on the strength of its bytes, and both learn it is unreadable only once they try
+        // to decode it as source.
+        fs::write(project.dir.join("src/only/e.ts"), b"debugger;\x80").expect("writes raw bytes");
 
-        let outcome = project
+        let cold = project
             .prepare_with("lanekeep.config.ts")
             .expect("prepares")
-            .without_cache()
             .profiling()
             .run()
-            .expect("runs");
-        assert_eq!(outcome.files_discovered, 4);
+            .expect("runs cold");
+        assert_eq!(cold.files_discovered, 5);
 
-        let discovered = u64::try_from(outcome.files_discovered).expect("small count");
+        let discovered = u64::try_from(cold.files_discovered).expect("small count");
         for id in ["local/path-gated", "local/content-gated"] {
-            let timing = timing_for(&outcome, id);
+            let timing = timing_for(&cold, id);
             assert_eq!(
-                timing.path_gated + timing.cached + timing.content_gated + timing.parsed,
+                timing.path_gated
+                    + timing.unread
+                    + timing.cached
+                    + timing.content_gated
+                    + timing.parsed,
                 discovered,
-                "`{id}` does not reconcile: {timing:?}"
+                "`{id}` does not reconcile cold: {timing:?}"
+            );
+            assert_eq!(
+                timing.unread, 1,
+                "the non-UTF-8 file must count as `unread`, for both rules: {timing:?}"
+            );
+            assert_eq!(
+                timing.cached, 0,
+                "nothing is cached on a cold run: {timing:?}"
+            );
+        }
+
+        // Warm: the four readable files now hit the cache (an unreadable file's
+        // `FileOutcome` never carries a cache entry, so `e.ts` is recomputed identically
+        // every run and stays `unread` rather than becoming `cached`).
+        let warm = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs warm");
+        assert_eq!(warm.files_discovered, 5);
+        for id in ["local/path-gated", "local/content-gated"] {
+            let timing = timing_for(&warm, id);
+            assert_eq!(
+                timing.path_gated
+                    + timing.unread
+                    + timing.cached
+                    + timing.content_gated
+                    + timing.parsed,
+                discovered,
+                "`{id}` does not reconcile warm: {timing:?}"
+            );
+            assert!(
+                timing.cached > 0,
+                "a warm run must serve at least one readable file from cache: {timing:?}"
+            );
+            assert_eq!(
+                timing.unread, 1,
+                "the non-UTF-8 file is never cached, so it must still count as `unread` warm: {timing:?}"
             );
         }
     }
@@ -3587,7 +3673,7 @@ mod tests {
     #[test]
     fn a_path_gates_rejects_land_only_in_path_gated() {
         // Folding a path-gate reject into `content_gated`, or dropping it, would leave this
-        // failing without touching `the_four_gate_counters_reconcile_for_every_rule` — that
+        // failing without touching `the_five_gate_counters_reconcile_for_every_rule` — that
         // test only checks the sum, and a bug that moves a count between two of the four
         // buckets leaves the sum untouched.
         let project = Project::new(
@@ -3699,7 +3785,7 @@ mod tests {
 
     #[test]
     fn a_warm_run_counts_files_as_cached_and_still_reconciles() {
-        // The test the whole four-column decision exists for. Deleting the `cached`
+        // The test the whole five-column decision exists for. Deleting the `cached`
         // counting at the cache-hit site — or, worse, not carrying `path_gate_timings`
         // through that early return at all — would leave a warm run's per-rule sum short
         // by however many files hit the cache. Every test above runs cold and cannot catch
@@ -3737,6 +3823,7 @@ mod tests {
         );
         assert_eq!(
             warm_timing.path_gated
+                + warm_timing.unread
                 + warm_timing.cached
                 + warm_timing.content_gated
                 + warm_timing.parsed,
