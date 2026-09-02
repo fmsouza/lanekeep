@@ -821,19 +821,21 @@ intrinsics are an allowlist and `Object` is not on it), which is what `builtin.d
 along. The mirror image is a genuine factory referenced *bare* from a JSON config, which renders
 as a function where a rule object is expected.
 
-**That fix is retired rather than still running, and the split it served has moved twice since
-— so read the split from the tables, not from this paragraph.** `BUILT_IN_RULES` and
+**That fix is retired rather than still running, and the split it served has moved since — so
+read the split from the tables, not from this paragraph.** `BUILT_IN_RULES` and
 `COMPONENT_RULES` in `crates/lanekeep-rules/src/lib.rs` are the source of truth. As of #172
-thirteen built-ins ship, four as WebAssembly components — `no-unwrap` and `no-glob-import` from
-Rust crates, `no-package-init` and `no-context-in-struct` sharing the Go component — and nine
-as QuickJS modules: the four TypeScript-inspecting rules went into a StarlingMonkey component
-and came back in #147 (13 MB of binary and 110× per host-API crossing for no speed benefit,
-architecture §15.1), and `no-restricted-calls`, `duplicate-implementation` and
-`no-assertionless-test` arrived as modules after them. Six of the nine are genuine factories —
-every module except the three plain `defineRule` objects, `no-broad-except`,
-`no-default-export` and `no-mutable-default-argument` — and none carries the
-`for (const key in …)` copy: the dual shape is gone, not restored. The one surviving instance of it is
-`crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy that ships to nobody.
+thirteen built-ins shipped, four as WebAssembly components — `no-unwrap` and `no-glob-import`
+from Rust crates, `no-package-init` and `no-context-in-struct` sharing the Go component — and
+nine as QuickJS modules: the four TypeScript-inspecting rules went into a StarlingMonkey
+component and came back in #147 (13 MB of binary and 110× per host-API crossing for no speed
+benefit, architecture §15.1), and `no-restricted-calls`, `duplicate-implementation` and
+`no-assertionless-test` arrived as modules after them. `no-restricted-types` arrived as a
+tenth module after that, so fourteen built-ins ship today. Seven of the ten modules are
+genuine factories — every module except the three plain `defineRule` objects,
+`no-broad-except`, `no-default-export` and `no-mutable-default-argument` — and none carries
+the `for (const key in …)` copy: the dual shape is gone, not restored. The one surviving
+instance of it is `crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy
+that ships to nobody.
 
 What stands in the dual shape's place is `rules_module` in `crates/lanekeep-config/src/json.rs`,
 and it treats the two kinds differently. A component's options travel as JSON data to

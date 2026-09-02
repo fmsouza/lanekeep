@@ -369,7 +369,7 @@ mod tests {
         // these quietly revert with nothing red.
         //
         // Two shapes, deliberately together. The four rules ported to another language have no
-        // source at all and ship as components; the seven TypeScript rules ship as modules,
+        // source at all and ship as components; the eight TypeScript rules ship as modules,
         // evaluated in QuickJS, because the compiled-component form (StarlingMonkey in WASM)
         // costs 13 MB and 110× per crossing for no speed benefit.
         for name in [
@@ -393,6 +393,7 @@ mod tests {
 
         for name in [
             "duplicate-implementation",
+            "no-assertionless-test",
             "no-circular-imports",
             "no-default-export",
             "no-restricted-calls",

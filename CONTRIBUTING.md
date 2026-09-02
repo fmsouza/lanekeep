@@ -122,7 +122,7 @@ same script, so they cannot disagree.
 ## Adding a rule
 
 Start from a working example: `lanekeep init` scaffolds a runnable rule, and
-[`docs/built-in-rules.md`](docs/built-in-rules.md) walks through the thirteen that ship, including
+[`docs/built-in-rules.md`](docs/built-in-rules.md) walks through the fourteen that ship, including
 what each one deliberately does *not* catch. [`docs/cross-file-rules.md`](docs/cross-file-rules.md)
 covers rules needing a whole-corpus view.
 
