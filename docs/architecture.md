@@ -522,6 +522,21 @@ The world's bytes are a cache-key input (§8.1, `host_api_hash`), so widening th
 
 `docs/authoring-rust-rules.md` is the playbook for writing one.
 
+### 6.10 `ctx.types`
+
+The one part of this host API a rule has to ask for by name. Declaring `requires: ['types']` on `RuleSpec` is what makes `ctx.types` exist at all; declaring `requires: ['dataflow']` is refused at config load instead, because this build has no analysis to serve it yet. The engine probes each registered language once per run — never per file, never per rule — and hands a rule the resulting token only when its own `requires` names the capability.
+
+| Function | Notes |
+|---|---|
+| `ctx.types.typeOf(node)` | The type of the expression at `node`, from the bounded within-file type oracle |
+| `ctx.types.symbolOf(node)` | Where the identifier at `node` was declared |
+
+Both answer from the parsed file alone — no `tsconfig.json`, no declaration files, no cross-file resolution — and both return `undefined` freely. **`undefined` is the oracle's first-class answer, not a failure to work around.** It would rather say nothing than say something wrong: a rule reporting on a wrong type accuses correct code, which is a worse failure than reporting on nothing. A rule is expected to check for `undefined` and quietly stay silent, the same posture the rest of this section already takes on a dead handle (§6.2).
+
+**Reaching for `ctx.types` without declaring it fails differently, and on purpose.** The namespace itself is absent rather than present-and-empty, so an undeclared access is a `TypeError` at the first call, not the quiet `undefined` `typeOf` returns for an ordinary "I don't know." The two are not the same failure: one is the oracle's considered answer about a piece of code, the other is an author who forgot a line finding out immediately rather than by reading a clean report that never looked. The identical absence reaches a rule that declared the capability but runs against a language with no TypeScript-shaped grammar — declaring `requires: ['types']` and having a usable oracle underneath are two separate conditions, and either missing is loud rather than silently degraded.
+
+`ctx.types` has no component form. A component's `rule-metadata` has no `requires` field to carry the declaration — `world.wit` is untouched by this surface entirely — so unlike everything else in this section, it lives in the JavaScript host alone.
+
 ---
 
 ## 7. Making it fast
@@ -566,6 +581,8 @@ key = blake3(
                                   //   and anything bound beside that world
     wasm_compile_env_hash,        // how a component is compiled: wasmtime's own
                                   //   precompile-compatibility hash
+    analysis_hash,                // what the host analyses compute: the type
+                                  //   oracle's own identity
     ruleset_hash,                 // rule module sources in the graph, and component bytes
     config_hash,                  // severity, include/exclude, options
     every (grammar_id, grammar_abi) in the registry, sorted and count-prefixed
@@ -585,6 +602,8 @@ Grammars enter the key as the **whole registry**, not the one language a given f
 `wasm_compile_env_hash` is `wasmtime`'s own `Engine::precompile_compatibility_hash`, read off an engine built from `lanekeep-wasm`'s one configuration. A precompiled `.cwasm` records the tunables it was compiled under and `wasmtime` refuses one that disagrees, so those tunables decide whether a component runs at all; the ones that survive that check still decide what the guest computes, because `MEMORY_RESERVATION` and `MEMORY_GUARD_SIZE` together decide whether Cranelift elides bounds checks. It is taken from `wasmtime` rather than listed here because `check_tunables` compares twenty-six fields, three of which are lanekeep's constants and twenty-three of which move with the `wasmtime` version, the target triple *and the resolved feature set* — Cargo's feature unification can move `concurrency_support`, `recording`, `memory_reservation` or `memory_init_cow` without the version moving.
 
 It is a compilation environment and **not** a runtime, which is why it is not named one. Settings that live entirely host-side are outside it on purpose: the memory ceiling is enforced by a resource limiter the compiled code knows nothing about, and the epoch tick interval only changes *when* a breach is noticed. Those are budgets, and §6.8 already says a budget cancels a run rather than changing its answer — so neither belongs in a key.
+
+`analysis_hash` is what the host analyses compute — a third question with the same failure mode as the two above. It carries `lanekeep_types::oracle_identity()`, a digest over that crate's own sources taken at build time rather than hand-maintained: an oracle whose operator table, shadow check or recursion bound changes moves this field without anyone having to remember to bump anything, unlike `HOST_API_VERSION` beside it. Separate from `host_api_hash` for the same reason `wasm_compile_env_hash` already is: that field answers what a rule may *reach* — whether `ctx.types` exists at all — this one answers what it *says*, and folding the two together would leave a test unable to tell which one the key actually covers.
 
 Value: `{ violations, facts, suppressions, deps }`.
 
