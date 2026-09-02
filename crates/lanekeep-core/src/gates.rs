@@ -4,10 +4,13 @@
 //! scoped to `makeStyles` skips parsing every file whose bytes do not contain that string,
 //! and parsing is the dominant cost.
 //!
-//! Gates are **purely an optimization**. Removing one changes which files get parsed, never
-//! which violations get reported — a gate that rejects a file the handler would have
-//! reported on is a bug in the rule, not a feature of the gate. The tests hold that line by
-//! checking gates only ever narrow.
+//! A gate is **declared, not derived**. Nothing here is computed from the rule's query and
+//! nothing checks the two against each other, so a gate that rejects a file the handler
+//! would have reported on hides a violation — a bug in the rule, and one that presents as a
+//! rule reporting nothing while looking healthy. Gates are neutral exactly when the author
+//! keeps each one wider than its own rule's query; architecture §7.1 states that as the
+//! discipline it is. What the tests below hold is the weaker property they can hold on their
+//! own: gating only ever narrows, so *removing* a gate can hide nothing.
 //!
 //! They are evaluated in cost order:
 //!
@@ -223,9 +226,11 @@ mod tests {
 
     #[test]
     fn gates_only_ever_narrow() {
-        // The property that keeps gates an optimization rather than a semantic. Whatever a
-        // gated rule admits, an ungated one admits too — so removing a gate can never hide
-        // a violation, only slow the run down.
+        // The one direction that is a property rather than a discipline. Whatever a gated
+        // rule admits, an ungated one admits too — so removing a gate can never hide a
+        // violation, only slow the run down. The other direction, that adding one hides
+        // nothing, is the author's to keep and is not checkable here; see this module's
+        // opening.
         let ungated = gates(&[], &[], &[], &[]);
         let gated = gates(&["src/**"], &["**/gen/**"], &["needle"], &["skip"]);
 

@@ -459,7 +459,16 @@ export interface RuleCard {
 ";
 
 const GATES: &str = "\
-/** Cheap rejections applied before a file is read or parsed. */
+/**
+ * Cheap rejections applied before a file is read or parsed.
+ *
+ * A gate is declared, not derived: nothing here is computed from the rule's `query`, and
+ * nothing checks the two against each other. So a gate can change what the rule reports — a
+ * file it rejects is a file the query never runs on, and a violation there is never found.
+ * Keeping every gate wider than the query it guards is the author's job, not something the
+ * engine can check. `--profile` prints, per rule, how many files each gate rejected and how
+ * many the rule actually parsed, which is where a suspected gate is settled.
+ */
 export interface Gates {
   /**
    * Glob patterns a file's path must match for the rule to consider it.
