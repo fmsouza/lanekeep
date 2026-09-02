@@ -441,6 +441,59 @@ fn write_profile(
     Ok(())
 }
 
+/// Print what each rule's gates let through, per rule.
+///
+/// A second table rather than four more columns on [`write_profile`]'s: that one answers "which
+/// rule is expensive", so it sorts by total elapsed time; this one answers "what did each rule
+/// even look at", which is not a time question, so sorting it by elapsed time would reorder rows
+/// for a reason unrelated to what they show. Sorted by rule id instead, which is stable across
+/// runs over the same corpus.
+///
+/// `files_discovered` is threaded through rather than derived from a row's own sum, on purpose:
+/// the trailing line is the reader's reconciliation check, and computing it from the same
+/// numbers it is meant to check would make a miscount invisible instead of visible.
+fn write_gate_profile(
+    timings: &BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming>,
+    files_discovered: usize,
+) -> anyhow::Result<()> {
+    let mut ranked: Vec<_> = timings.iter().collect();
+    ranked.sort_by_key(|(id, _)| (*id).clone());
+
+    let mut stderr = std::io::stderr();
+    writeln!(stderr, "\nprofile — what each rule looked at\n")?;
+    writeln!(
+        stderr,
+        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
+        "rule", "path-gated", "unread", "cached", "content-gated", "lang-gated", "parsed"
+    )?;
+
+    for (id, timing) in ranked {
+        writeln!(
+            stderr,
+            "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
+            id.to_string(),
+            timing.path_gated,
+            timing.unread,
+            timing.cached,
+            timing.content_gated,
+            timing.language_gated,
+            timing.parsed
+        )?;
+    }
+
+    // Each row's six counters reconcile to this figure — see `RuleTiming`'s doc in
+    // `lanekeep-engine` for why. A rule silent behind a large `content-gated` is a gate
+    // question; one silent behind a large `lang-gated` is a `language` declaration that does
+    // not name the grammar its files actually parse with — the failure `AGENTS.md` records as
+    // 2218 false positives in the mirror direction, arriving here as the opposite symptom.
+    writeln!(
+        stderr,
+        "\n  each row sums to {files_discovered} files discovered\n"
+    )?;
+    stderr.flush()?;
+    Ok(())
+}
+
 /// The config a fresh project starts with.
 ///
 /// A built-in rule and a local one, because the second is the thing worth showing: lanekeep
@@ -1214,6 +1267,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     if let Some(timings) = &outcome.timings {
         // To stderr, so `--profile --format json` still pipes a clean document.
         write_profile(timings)?;
+        write_gate_profile(timings, outcome.files_discovered)?;
     }
 
     let code = lanekeep_report::exit_code(&outcome.violations, warn_only);

@@ -2,6 +2,7 @@
 
 #![expect(
     clippy::expect_used,
+    clippy::panic,
     reason = "`clippy.toml`'s allow-*-in-tests only reaches `#[test]` functions and \
               `#[cfg(test)]` modules. The helpers below are neither, so the grant it \
               already makes for unit tests has to be restated for them."
@@ -399,5 +400,113 @@ fn a_rule_that_never_matched_still_appears() {
     assert!(
         stderr.contains("lanekeep/no-restricted-imports"),
         "a rule with no matches was omitted: {stderr}"
+    );
+}
+
+// --- the gate table: two silences, told apart -----------------------------------------------
+
+/// Matches every identifier the corpus has, so if this rule ever reported anything it would be
+/// the gate that stopped it, not the query.
+const RULE_GATED: &str = r"import { defineRule } from 'lanekeep'
+
+export default defineRule({
+  id: 'local/gate-excludes-everything',
+  severity: 'error',
+  card: { message: 'x', remediation: 'n/a', examples: { bad: 'a', good: 'b' } },
+  // Names a substring the corpus never contains, so every file is rejected before a parser
+  // ever sees it.
+  gates: { fileContains: ['THIS_SUBSTRING_NEVER_APPEARS'] },
+  query: '(identifier) @id',
+  check(ctx, m) { ctx.report(m.id) },
+})
+";
+
+/// No gate at all — every file reaches its query — and the query names a construct the corpus
+/// does not contain, so this rule is silent for a completely different reason than
+/// [`RULE_GATED`].
+const RULE_EMPTY: &str = r"import { defineRule } from 'lanekeep'
+
+export default defineRule({
+  id: 'local/nothing-to-find',
+  severity: 'error',
+  card: { message: 'x', remediation: 'n/a', examples: { bad: 'a', good: 'b' } },
+  query: '(debugger_statement) @stmt',
+  check(ctx, m) { ctx.report(m.stmt) },
+})
+";
+
+const TWO_SILENT_RULES_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
+    "rules": ["./lanekeep/rules/gate-excludes-everything.ts", "./lanekeep/rules/nothing-to-find.ts"]}"#;
+
+/// The six gate-table counters for one rule's row, in `RuleTiming`'s field order: `path_gated`,
+/// `unread`, `cached`, `content_gated`, `language_gated`, `parsed`.
+///
+/// Parsed from the *second* table — `stderr` split on its own heading first — because the rule
+/// id also appears in the query/handler table above it, and a naive whole-stderr search for the
+/// id's line would just as happily match that row.
+fn gate_row(stderr: &str, id: &str) -> [u64; 6] {
+    let table = stderr
+        .split("what each rule looked at")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no gate profile table in stderr: {stderr}"));
+    let line = table
+        .lines()
+        .find(|line| line.trim_start().starts_with(id))
+        .unwrap_or_else(|| panic!("no row for {id} in the gate table: {stderr}"));
+
+    let mut numbers = line.split_whitespace().skip(1).map(|token| {
+        token
+            .parse::<u64>()
+            .unwrap_or_else(|e| panic!("not a number ({e}) in row: {line}"))
+    });
+    std::array::from_fn(|_| {
+        numbers
+            .next()
+            .unwrap_or_else(|| panic!("row is short of six counters: {line}"))
+    })
+}
+
+#[test]
+fn the_profile_tells_a_gated_silence_from_an_empty_one() {
+    // Both rules below report zero violations. That is exactly the case the old profile could
+    // not speak to: `query`/`handler`/`matches` all read the same — near-zero query time, no
+    // matches — whether a rule's gate ate every file or its query found nothing among files it
+    // fully read. Telling those two silences apart is the entire point of the six new
+    // counters, so asserting only "both are silent" would assert nothing about this change.
+    //
+    // Swapping `content_gated` and `parsed` in `write_profile`'s column order, or dropping
+    // either counter from the row, makes this fail: `gate-excludes-everything` would show
+    // `parsed: 1` instead of `content_gated: 1`, or `nothing-to-find` would show
+    // `content_gated: 1` instead of `parsed: 1`.
+    let project = Project::new(
+        "profile-gate-distinction",
+        &[
+            ("lanekeep.json", TWO_SILENT_RULES_CONFIG),
+            ("lanekeep/rules/gate-excludes-everything.ts", RULE_GATED),
+            ("lanekeep/rules/nothing-to-find.ts", RULE_EMPTY),
+            // Has identifiers (so RULE_GATED's query would match if ever admitted), no
+            // `debugger` statement (so RULE_EMPTY's query has nothing to find), and none of
+            // RULE_GATED's excluded substring.
+            ("src/a.ts", "export const x = 1;\n"),
+        ],
+    );
+
+    let output = project.run(&["check", "--profile", "--no-cache"]);
+    let combined = describe(&output);
+    assert_eq!(output.status.code(), Some(0), "{combined}");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let gated = gate_row(&stderr, "local/gate-excludes-everything");
+    let empty = gate_row(&stderr, "local/nothing-to-find");
+
+    // [path_gated, unread, cached, content_gated, language_gated, parsed]
+    assert_eq!(gated, [0, 0, 0, 1, 0, 0], "gated row: {stderr}");
+    assert_eq!(empty, [0, 0, 0, 0, 0, 1], "empty row: {stderr}");
+
+    // The trailing line is the reconciliation check for a reader — one file discovered, and
+    // every rule's six counters must sum to it.
+    assert!(
+        stderr.contains("each row sums to 1 files discovered"),
+        "{stderr}"
     );
 }
