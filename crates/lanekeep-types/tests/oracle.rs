@@ -12,7 +12,7 @@
 
 use lanekeep_lang::Language;
 use lanekeep_lang_js::TypeScript;
-use lanekeep_types::{Primitive, Type, TypeScriptOracle};
+use lanekeep_types::{Primitive, Type, TypeScriptOracle, TypeScriptSupport};
 use tree_sitter::{Node, Tree};
 
 /// Parse `source` with the TypeScript grammar.
@@ -55,8 +55,8 @@ fn last_of<'t>(tree: &'t Tree, kind: &str) -> Node<'t> {
 /// Type the last node of `kind` in `source`.
 fn type_of_last(source: &str, kind: &str) -> Option<Type> {
     let tree = parse(source);
-    let oracle =
-        TypeScriptOracle::for_file(&TypeScript, &tree, source).expect("TypeScript is supported");
+    let support = TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported");
+    let oracle = TypeScriptOracle::new(&support, &tree, source);
     oracle.type_of(last_of(&tree, kind))
 }
 
@@ -129,20 +129,42 @@ fn a_parenthesized_expression_is_its_inner_expression() {
     );
 }
 
-/// The oracle refuses a grammar whose vocabulary it does not share.
-///
-/// Handed a Python tree it would ask TypeScript questions and get confident nonsense, so
-/// the constructor is where that is stopped rather than at whatever call site forgot.
 #[test]
-fn a_grammar_that_does_not_speak_typescript_gets_no_oracle() {
-    let source = "x = 1\n";
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&lanekeep_lang_python::Python.grammar())
-        .expect("the Python grammar loads");
-    let tree = parser.parse(source, None).expect("the source parses");
+fn a_grammar_that_speaks_typescript_yields_support() {
+    assert!(TypeScriptSupport::probe(&TypeScript).is_some());
+}
 
-    assert!(TypeScriptOracle::for_file(&lanekeep_lang_python::Python, &tree, source).is_none());
+/// The guard PR 1 established, now living on the probe.
+#[test]
+fn a_grammar_that_does_not_speak_typescript_yields_no_support() {
+    assert!(TypeScriptSupport::probe(&lanekeep_lang_python::Python).is_none());
+}
+
+/// One token serves many files, which is the entire point of the split.
+#[test]
+fn one_probe_serves_many_files() {
+    let support = TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported");
+    for (source, kind, expected) in [
+        ("const a = 1;", "number", Type::Primitive(Primitive::Number)),
+        (
+            "const b = 'x';",
+            "string",
+            Type::Primitive(Primitive::String),
+        ),
+        (
+            "const c = 1n;",
+            "number",
+            Type::Primitive(Primitive::BigInt),
+        ),
+    ] {
+        let tree = parse(source);
+        let oracle = TypeScriptOracle::new(&support, &tree, source);
+        assert_eq!(
+            oracle.type_of(last_of(&tree, kind)),
+            Some(expected),
+            "{source}"
+        );
+    }
 }
 
 #[test]
@@ -391,6 +413,27 @@ fn a_locally_declared_type_is_nominal_with_no_module() {
     );
 }
 
+/// The third case, and the one nothing else here covers: a nominal type with **no** symbol.
+///
+/// `Date` is an ambient global — declared in a lib the oracle does not open, imported from
+/// nowhere, shadowed by nothing — so the resolver has nothing to say and the symbol is absent.
+/// Ordinary rather than a corner case: every global and every ambient declaration lands here.
+///
+/// The two tests above cannot stand in for it. Both assert `symbol: Some(..)`, so an oracle
+/// that fabricated a symbol from the type's own name whenever the resolver came back empty
+/// would leave them green — and a rule branching on `symbol` would then read an unattributed
+/// global as a resolved local declaration, which is the wrong answer rather than no answer.
+#[test]
+fn an_ambient_type_is_nominal_with_no_symbol() {
+    assert_eq!(
+        type_of_last("let x: Date;", "type_annotation"),
+        Some(Type::Nominal {
+            name: "Date".to_owned(),
+            symbol: None,
+        })
+    );
+}
+
 #[test]
 fn a_function_type_annotation_is_not_typed() {
     assert_eq!(
@@ -437,8 +480,8 @@ fn a_locally_aliased_bigint_resolves_through_the_alias() {
 /// Type the last `identifier` whose text is `name`.
 fn type_of_use(source: &str, name: &str) -> Option<Type> {
     let tree = parse(source);
-    let oracle =
-        TypeScriptOracle::for_file(&TypeScript, &tree, source).expect("TypeScript is supported");
+    let support = TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported");
+    let oracle = TypeScriptOracle::new(&support, &tree, source);
 
     let found = nodes(&tree)
         .into_iter()
@@ -708,8 +751,8 @@ fn a_loop_head_that_declares_nothing_leaves_the_outer_binding_reachable() {
 fn the_debug_impl_does_not_print_the_whole_source() {
     let source = "const aNameThatMustNotReachALogLine = 1;";
     let tree = parse(source);
-    let oracle =
-        TypeScriptOracle::for_file(&TypeScript, &tree, source).expect("TypeScript is supported");
+    let support = TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported");
+    let oracle = TypeScriptOracle::new(&support, &tree, source);
 
     let rendered = format!("{oracle:?}");
     assert!(
@@ -722,8 +765,8 @@ fn the_debug_impl_does_not_print_the_whole_source() {
 /// The symbol of the last use of `name`.
 fn symbol_of_use(source: &str, name: &str) -> Option<lanekeep_types::Symbol> {
     let tree = parse(source);
-    let oracle =
-        TypeScriptOracle::for_file(&TypeScript, &tree, source).expect("TypeScript is supported");
+    let support = TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported");
+    let oracle = TypeScriptOracle::new(&support, &tree, source);
 
     let found = nodes(&tree).into_iter().rfind(|node| {
         matches!(node.kind(), "identifier" | "type_identifier")

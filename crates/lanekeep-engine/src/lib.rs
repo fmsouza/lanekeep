@@ -39,15 +39,16 @@ use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
 use lanekeep_config::{ComponentBytes, Config, ConfigError, RuleSpec};
 use lanekeep_core::suppression::{self, Date, Scope, Suppressions};
 use lanekeep_core::{
-    CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, RuleId, Severity,
-    TrackedRead, Violation,
+    Capability, CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position,
+    RuleId, Severity, TrackedRead, Violation,
 };
 use lanekeep_js::{
     FileAccess, HOST_API_VERSION, HostContext, Limits, ReduceContext, ReduceFact, RuleRoot,
     RunClock, Sandbox, SandboxError,
 };
-use lanekeep_lang::{Language, LanguageRegistry};
+use lanekeep_lang::{Language, LanguageId, LanguageRegistry};
 use lanekeep_query::{CompileError, CompiledQuery};
+use lanekeep_types::TypeScriptSupport;
 use lanekeep_wasm::bindings::types;
 use lanekeep_wasm::host::{CheckContext, ReduceContext as ComponentReduceContext};
 use lanekeep_wasm::{
@@ -525,6 +526,23 @@ pub struct Engine {
     /// Lowercased keys, because the registry lowercases too — whether `Button.TSX` gets
     /// checked should not depend on how someone typed it.
     languages_by_extension: BTreeMap<String, String>,
+    /// Which registered languages speak TypeScript, probed once here rather than once per
+    /// file or per rule.
+    ///
+    /// [`TypeScriptSupport::probe`] is the expensive part of building an oracle — probing
+    /// dominates construction — so paying it per query match rather than per run would add
+    /// that cost on top of a host crossing already measured at ~302 ns (architecture §15.1).
+    /// Nothing at the engine level rests on the exact split; the oracle's own documentation
+    /// carries the measured figures.
+    ///
+    /// `BTreeMap`, not `HashMap`, per the ordering invariant: nothing here iterates this map
+    /// today, but a `HashMap` field is the one a later change reaches for without noticing it
+    /// would put hash-seed order in front of output.
+    ///
+    /// A missing entry means this language's grammar does not speak TypeScript — `probe`
+    /// returned `None` for it — which [`Self::run_rule`] tells apart from "the rule did not
+    /// declare `requires: ['types']`": both have to hold before `ctx.types` is installed.
+    type_support: BTreeMap<LanguageId, TypeScriptSupport>,
 }
 
 /// The component half of a run, walled off so its one constructor cannot be gone around.
@@ -680,10 +698,16 @@ impl Engine {
             .join(", ");
 
         let mut languages_by_extension = BTreeMap::new();
+        // Probed here, once per registered language for the whole run — never inside the
+        // per-file walk below, and never per rule. See the field.
+        let mut type_support = BTreeMap::new();
         for language in registry.languages() {
             for extension in language.extensions() {
                 languages_by_extension
                     .insert(extension.to_ascii_lowercase(), language.id().to_string());
+            }
+            if let Some(support) = TypeScriptSupport::probe(language.as_ref()) {
+                type_support.insert(language.id(), support);
             }
         }
 
@@ -832,6 +856,7 @@ impl Engine {
             typescript,
             javascript,
             languages_by_extension,
+            type_support,
         })
     }
 
@@ -2003,6 +2028,33 @@ impl Engine {
             .collect()
     }
 
+    /// Turn a QuickJS rule's reports into violations, under the rule's own identity.
+    ///
+    /// Mirrors [`Self::violations_from`] immediately above, which does the identical job for
+    /// a component's own `lanekeep_wasm::host::Report`. Kept as a separate function rather
+    /// than a shared generic one because the two engines' report types are not the same
+    /// type, even though the shape they carry — a position, an optional message, an optional
+    /// fix — is.
+    fn violations_from_js(
+        rule: &Prepared,
+        path: &FilePath,
+        reports: Vec<lanekeep_js::Report>,
+    ) -> Vec<Violation> {
+        reports
+            .into_iter()
+            .map(|report| Violation {
+                rule_id: rule.spec.id.clone(),
+                location: Location::new(path.clone(), Position::new(report.line, report.column)),
+                message: report
+                    .message
+                    .unwrap_or_else(|| rule.spec.card.message.clone()),
+                remediation: rule.spec.card.remediation.clone(),
+                severity: rule.spec.severity,
+                fix: report.fix,
+            })
+            .collect()
+    }
+
     /// Open the file's component context, if this is the first rule that needs one.
     ///
     /// The resource stays in the caller's `Option` rather than being handed back by value:
@@ -2051,6 +2103,24 @@ impl Engine {
         }
     }
 
+    /// The type oracle token to attach for this rule and language, if any.
+    ///
+    /// Both conditions have to hold: the rule declared `requires: ['types']`, and this
+    /// language actually has a probed oracle. A rule that declares the capability against a
+    /// language with no TypeScript-shaped grammar (Python, say) gets no `ctx.types` either —
+    /// it stays absent, which is loud rather than silently wrong the moment such a rule
+    /// reaches for it. See [`HostContext::with_types`].
+    fn types_for(
+        &self,
+        rule: &Prepared,
+        language: &Arc<dyn Language>,
+    ) -> Option<TypeScriptSupport> {
+        if !rule.spec.requires.contains(&Capability::Types) {
+            return None;
+        }
+        self.type_support.get(&language.id()).cloned()
+    }
+
     fn run_rule(
         &self,
         worker: &mut Worker<'_>,
@@ -2094,11 +2164,14 @@ impl Engine {
         // has ended — the two-phase shape the arena's ownership of the tree forces.
         let mut matches: RuleMatches = Vec::new();
 
-        let host = HostContext::new(tree, source.to_owned(), path.as_str())
+        let mut host = HostContext::new(tree, source.to_owned(), path.as_str())
             .with_resolver_from(language.as_ref())
             .with_language(Arc::clone(language))
             .with_today(&self.today.to_string())
             .with_file_access(Arc::clone(files));
+        if let Some(support) = self.types_for(rule, language) {
+            host = host.with_types(support);
+        }
 
         let query_started = clock(self.profiling);
         if let Some(found) = precollected {
@@ -2134,7 +2207,6 @@ impl Engine {
         let sandbox = worker.sandbox()?;
 
         let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
-        let mut violations = Vec::new();
 
         for captures in matches {
             let handles: Vec<(String, u32)> = {
@@ -2187,18 +2259,7 @@ impl Engine {
             })
             .collect();
 
-        for report in host.take_reports() {
-            violations.push(Violation {
-                rule_id: rule.spec.id.clone(),
-                location: Location::new(path.clone(), Position::new(report.line, report.column)),
-                message: report
-                    .message
-                    .unwrap_or_else(|| rule.spec.card.message.clone()),
-                remediation: rule.spec.card.remediation.clone(),
-                severity: rule.spec.severity,
-                fix: report.fix,
-            });
-        }
+        let violations = Self::violations_from_js(rule, path, host.take_reports());
 
         Ok((violations, facts, host.date_was_read(), timing))
     }
@@ -2692,6 +2753,7 @@ fn run_key(
         engine_version(),
         &host_api_hash(),
         &compile_env,
+        &lanekeep_types::oracle_identity(),
         ruleset_hash,
         config_hash,
         grammars,
@@ -2834,6 +2896,7 @@ mod tests {
                 engine_version(),
                 &host_api,
                 &compile_env,
+                &lanekeep_types::oracle_identity(),
                 b"ruleset",
                 b"config",
                 &grammars,
@@ -3293,6 +3356,87 @@ mod tests {
         assert!(rendered.contains("local/throws"), "{rendered}");
         assert!(rendered.contains("src/a.ts"), "{rendered}");
         assert!(rendered.contains("rule bug"), "{rendered}");
+    }
+
+    /// A rule reading its parameter's type, checked against a nominal and a primitive
+    /// annotation in one project — the first test in the corpus where `ctx.types` decides a
+    /// violation.
+    ///
+    /// The pair matters: the `number` fixture alone would also pass against an oracle that
+    /// answered `number` for every node, having never actually consulted the annotation. The
+    /// `Decimal` fixture, present and unreported, is what rules that out.
+    const NUMBER_AMOUNT_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+        export default defineRule({\n\
+          id: 'local/number-amount',\n\
+          requires: ['types'],\n\
+          severity: 'error',\n\
+          query: '(required_parameter pattern: (identifier) @p)',\n\
+          card: { message: 'no', remediation: 'use Decimal', examples: { bad: 'a', good: 'b' } },\n\
+          check(ctx, m) {\n\
+            const t = ctx.types.typeOf(m.p);\n\
+            if (t !== undefined && t.primitive === 'number') ctx.report(m.p);\n\
+          },\n\
+        });\n";
+
+    #[test]
+    fn a_rule_declaring_types_reports_the_number_parameter_and_not_the_decimal_one() {
+        let project = Project::new(
+            "ctx-types-primitive",
+            &[
+                ("rule.ts", NUMBER_AMOUNT_RULE),
+                ("lanekeep.config.ts", &config_for("src/**/*.ts")),
+                ("src/number.ts", "function credit(amount: number) {}\n"),
+                (
+                    "src/decimal.ts",
+                    "import { Decimal } from 'decimal.js';\n\
+                     function credit(amount: Decimal) {}\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+
+        assert_eq!(outcome.violations.len(), 1, "{:?}", outcome.violations);
+        assert_eq!(
+            outcome.violations[0].location.file.as_str(),
+            "src/number.ts",
+            "{:?}",
+            outcome.violations
+        );
+    }
+
+    /// The matched half of the test above: delete `requires: ['types']` and the identical
+    /// handler reaches for `ctx.types` on a context that never installed it. The run must
+    /// abort naming the rule — silence here (a clean report with no violations) would be
+    /// exactly the failure mode capability declarations exist to rule out.
+    #[test]
+    fn a_rule_reading_ctx_types_without_declaring_it_aborts_the_run_naming_itself() {
+        let undeclared = NUMBER_AMOUNT_RULE.replace("requires: ['types'],\n", "");
+        assert_ne!(
+            undeclared, NUMBER_AMOUNT_RULE,
+            "the replace must actually remove the `requires` line"
+        );
+
+        let project = Project::new(
+            "ctx-types-undeclared",
+            &[
+                ("rule.ts", &undeclared),
+                ("lanekeep.config.ts", &config_for("src/**/*.ts")),
+                ("src/number.ts", "function credit(amount: number) {}\n"),
+            ],
+        );
+
+        let err = project
+            .run()
+            .expect_err("ctx.types must be absent without `requires: ['types']`");
+        let rendered = err.to_string();
+        assert!(rendered.contains("local/number-amount"), "{rendered}");
+        assert!(rendered.contains("src/number.ts"), "{rendered}");
+        // Six `RunError` variants all name a rule, so the assertion above alone would pass
+        // against a completely different failure — an invalid query, an unknown language, a
+        // missing component. This is what pins the failure to the one this test is about:
+        // `ctx.types` reached on a context that never installed it.
+        assert!(rendered.contains("typeOf"), "{rendered}");
     }
 
     #[test]
@@ -5958,6 +6102,10 @@ export default defineRule({
                 timeout: None,
                 has_reduce,
                 component: Some(backed_by(fixture())),
+                // A component cannot declare `requires` — `rule-metadata` has no such field —
+                // so every component-backed `RuleSpec` carries an empty list, exactly as
+                // `lanekeep-config`'s `build_rule` produces for one.
+                requires: Vec::new(),
             }
         }
 
@@ -7346,6 +7494,54 @@ export default defineRule({
             let rendered = err.to_string();
             assert!(rendered.contains("for `python`"), "{rendered}");
             assert!(rendered.contains("call_expression"), "{rendered}");
+        }
+
+        /// `requires: ['types']` is the author's half of the decision; the file's own
+        /// language having a probed oracle is the other half, and this is where a rule can
+        /// declare the capability and still not get it.
+        ///
+        /// Down here, beside the query test above, for the same reason: only this module's
+        /// runner knows a language with no TypeScript-shaped grammar at all. Every fixture
+        /// above this in the file is TypeScript-family, so none of them can tell
+        /// `Engine::types_for` apart from a version that handed back whichever oracle
+        /// happened to exist regardless of which language the file is — this test is what
+        /// tells them apart.
+        #[test]
+        fn types_for_reads_the_files_own_language_not_whichever_oracle_exists() {
+            let project = Project::new(
+                "cross-language-types",
+                &[
+                    (
+                        "rule.ts",
+                        "import { defineRule } from 'lanekeep';\n\
+                        export default defineRule({\n\
+                          id: 'local/cross-language',\n\
+                          language: ['typescript', 'python'],\n\
+                          requires: ['types'],\n\
+                          query: {\n\
+                            typescript: '(identifier) @id',\n\
+                            python: '(identifier) @id',\n\
+                          },\n\
+                          card: { message: 'm', remediation: 'r', \
+                            examples: { bad: 'a', good: 'b' } },\n\
+                          check(ctx, m) { ctx.types.typeOf(m.id); },\n\
+                        });\n",
+                    ),
+                    (
+                        "lanekeep.json",
+                        r#"{"include": ["src/**/*.py"],
+                        "namespaces": ["local"], "rules": ["./rule"]}"#,
+                    ),
+                    ("src/a.py", "x = 1\n"),
+                ],
+            );
+
+            let err = project.run_json().expect_err(
+                "python has no TypeScript-shaped grammar, so ctx.types must stay absent",
+            );
+            let rendered = err.to_string();
+            assert!(rendered.contains("local/cross-language"), "{rendered}");
+            assert!(rendered.contains("typeOf"), "{rendered}");
         }
 
         #[test]

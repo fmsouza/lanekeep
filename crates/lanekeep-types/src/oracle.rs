@@ -83,19 +83,35 @@ impl fmt::Debug for TypeScriptOracle<'_> {
     }
 }
 
-impl<'t> TypeScriptOracle<'t> {
-    /// Build an oracle for one parsed file, or `None` if it cannot serve this one.
+/// A grammar confirmed to speak TypeScript, and the resolver that goes with it.
+///
+/// Separate from the oracle because probing is 8.4 µs of a 9.2 µs construction — 23
+/// `id_for_node_kind` calls, each a linear scan over a 383-kind table. Paying that once per
+/// run rather than once per query is what keeps the type surface from costing thirty host
+/// crossings on every call, against a crossing §15.1 measures at ~302 ns.
+#[derive(Clone)]
+pub struct TypeScriptSupport {
+    resolver: Arc<dyn BindingResolver>,
+}
+
+impl fmt::Debug for TypeScriptSupport {
+    /// Hand-written because `Arc<dyn BindingResolver>` is not `Debug`, the same reason and
+    /// the same shape as `LanguageRegistry`'s.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypeScriptSupport").finish_non_exhaustive()
+    }
+}
+
+impl TypeScriptSupport {
+    /// Confirm a grammar has the vocabulary the oracle reads, and take its resolver.
     ///
-    /// Refused in two cases, both of which would otherwise produce confident nonsense
-    /// rather than an error. A grammar that does not know the node kinds this oracle reads
-    /// is not TypeScript, whatever it calls itself. And a language with no resolver cannot
-    /// answer where a name was declared, so the oracle could type no identifier at all —
-    /// which would look exactly like a file with nothing to say about it.
-    ///
-    /// The resolver is taken from the language rather than passed separately, so a caller
-    /// cannot pair one language's grammar with another's resolver.
+    /// `None` in two cases, both of which would otherwise produce confident nonsense rather
+    /// than an error. A grammar that does not know the node kinds this oracle reads is not
+    /// TypeScript, whatever it calls itself. And a language with no resolver cannot say where
+    /// a name was declared, so the oracle could type no identifier at all — which would look
+    /// exactly like a file with nothing to say about it.
     #[must_use]
-    pub fn for_file(language: &dyn Language, tree: &'t Tree, source: &'t str) -> Option<Self> {
+    pub fn probe(language: &dyn Language) -> Option<Self> {
         let grammar = language.grammar();
         if !REQUIRED_KINDS
             .iter()
@@ -103,12 +119,24 @@ impl<'t> TypeScriptOracle<'t> {
         {
             return None;
         }
-
         Some(Self {
-            tree,
-            source,
             resolver: language.resolver()?,
         })
+    }
+}
+
+impl<'t> TypeScriptOracle<'t> {
+    /// Build an oracle for one parsed file.
+    ///
+    /// Cheap by construction: everything expensive happened in [`TypeScriptSupport::probe`].
+    /// That is what lets a caller build one of these per query rather than per run.
+    #[must_use]
+    pub fn new(support: &TypeScriptSupport, tree: &'t Tree, source: &'t str) -> Self {
+        Self {
+            tree,
+            source,
+            resolver: Arc::clone(&support.resolver),
+        }
     }
 
     /// The type of the expression at `node`, or `None` when the oracle cannot be sure.

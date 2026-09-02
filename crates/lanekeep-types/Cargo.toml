@@ -22,6 +22,12 @@ blake3 = { workspace = true }
 lanekeep-lang-js = { workspace = true }
 lanekeep-lang-python = { workspace = true }
 
+[[bench]]
+name = "construction"
+# No harness, matching `crates/lanekeep-engine/benches/`: this reports absolute nanosecond
+# figures a human reads once, not a statistical comparison against a stored baseline.
+harness = false
+
 [lints]
 workspace = true
 

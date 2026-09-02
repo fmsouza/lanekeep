@@ -61,3 +61,47 @@ pub use severity::{ParseSeverityError, Severity};
 pub use suppression::{Suppression, Suppressions};
 pub use tracked::{ContentHash, TrackedRead};
 pub use violation::{Violation, any_failing, sort};
+
+/// A host analysis a rule can declare it needs.
+///
+/// Closed, and small on purpose. A capability exists here only once something implements it
+/// or refuses it by name — the alternative is a rule declaring a dependency on an analysis
+/// nothing will ever provide, which reads as configuration rather than as the error it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Capability {
+    /// Type answers about a node — `ctx.types`.
+    Types,
+    /// Dataflow answers about a value's movement. Declared, not yet implemented.
+    Dataflow,
+}
+
+impl Capability {
+    /// The name a rule writes, which is the name the refusal prints.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Types => "types",
+            Self::Dataflow => "dataflow",
+        }
+    }
+
+    /// The capability that name denotes, if any.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "types" => Some(Self::Types),
+            "dataflow" => Some(Self::Dataflow),
+            _ => None,
+        }
+    }
+
+    /// Every capability, in the order `as_str` and `parse` agree on.
+    ///
+    /// For a refusal that lists what a rule may name — mirrors [`Namespace::built_ins`] for
+    /// the same reason: one place naming every variant, so a message enumerating them cannot
+    /// name a different set than `parse` recognizes.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[Self::Types, Self::Dataflow]
+    }
+}

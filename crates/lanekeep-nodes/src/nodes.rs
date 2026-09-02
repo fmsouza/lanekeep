@@ -123,7 +123,24 @@ impl NodeArena {
     }
 
     /// Resolve a handle to its node.
-    fn node(&self, handle: Handle) -> Option<Node<'_>> {
+    ///
+    /// The module doc's actual rule is narrower than "hands back owned data": no *other*
+    /// method here returns a borrowed `Node` — `tree()` and `source()` return `&Tree` and
+    /// `&str`, which are borrowed too, just not a `Node`. This one is the deliberate
+    /// exception to the `Node`-specific rule: the type oracle in `lanekeep-types` takes a
+    /// `tree_sitter::Node` directly, and duplicating its dispatch inside this crate would
+    /// need `lanekeep-nodes` to depend on it — the wrong direction, since the oracle stays
+    /// language-neutral by depending on `lanekeep-lang` alone.
+    ///
+    /// This adds less than it looks like: `tree()` is already public, so a caller could
+    /// already walk to an arbitrary `Node` by hand from the root — this only adds the
+    /// handle-to-node lookup, not new access to the tree itself. And it is safe on the same
+    /// terms as [`Self::resolve_binding`]: a caller takes the arena borrow for one call,
+    /// resolves a node, feeds it to an oracle that returns an owned answer, and lets the
+    /// borrow end — the borrow checker enforces that shape regardless of what the caller
+    /// intends, since this node cannot outlive the `Ref` that produced it.
+    #[must_use]
+    pub fn node(&self, handle: Handle) -> Option<Node<'_>> {
         let path = self.paths.get(handle as usize)?;
         self.node_at(path)
     }

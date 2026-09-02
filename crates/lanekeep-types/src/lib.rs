@@ -23,7 +23,7 @@ mod oracle;
 mod table;
 mod types;
 
-pub use oracle::TypeScriptOracle;
+pub use oracle::{TypeScriptOracle, TypeScriptSupport};
 pub use types::{Primitive, Symbol, Type};
 
 /// What this oracle *is*, as a digest of every source file that decides an answer.
