@@ -1827,9 +1827,20 @@ fn raw_rule_from(
         timeout: metadata.timeout,
         // A component cannot declare one, because `rule-metadata` has no such field: the
         // world is deliberately unchanged, since no component rule targets a language either
-        // analysis will support. This is an exhaustive struct literal, so the field arriving
-        // in the world later is a compile error here rather than a component whose
-        // declaration is silently dropped.
+        // analysis will support.
+        //
+        // **Nothing here notices the day it grows one.** The exhaustive struct literal below
+        // is exhaustive over its *destination* — a field added to `RawRule` is `E0063` at
+        // this initializer, which is a real guard and the one that put this very line here:
+        // #196 added `requires` to `RawRule` and could not compile until it did.
+        // Its *source* is read field by field, so a `requires` added to `rule-metadata`
+        // in `wit/world.wit` compiles clean here and is silently dropped: a component would
+        // declare an analysis, be handed none, report nothing, and read as a clean codebase.
+        // Both halves measured — growing the record left `cargo check -p lanekeep-config`
+        // green.
+        //
+        // So whoever adds that field to the world adds the read here in the same change.
+        // There is no compile error waiting to remind them.
         requires: None,
         has_check,
         has_reduce,
@@ -5198,6 +5209,11 @@ mod tests {
     /// clean" rather than as "the rule never ran". Same reasoning as the host refusing an
     /// empty `languages` list. `types` no longer belongs in this list — it has an
     /// implementation now, and `a_rule_requiring_types_now_loads` is its test.
+    ///
+    /// Implementing one capability must not lift the refusal on the other, which is what
+    /// makes this worth keeping beside that one. The list `['types', 'dataflow']` is the case
+    /// neither of them reaches; `an_unimplemented_capability_is_refused_beside_an_implemented_one`
+    /// is where it lives.
     #[test]
     fn a_known_capability_in_requires_is_refused_while_unimplemented() {
         let error = load_requiring("requires-unimplemented-dataflow", "['dataflow']")
@@ -5286,16 +5302,32 @@ mod tests {
         assert_eq!(config.rules[0].requires, vec![Capability::Types]);
     }
 
-    /// The matched half. Lifting one capability must not lift the other — `dataflow` has no
-    /// implementation, and a rule declaring it must still be refused rather than silently
-    /// running without the analysis.
+    /// The matched half, and the one a single-capability list cannot assert: lifting one
+    /// capability must not lift the other, *whichever position* the unimplemented one is in.
+    ///
+    /// `['types', 'dataflow']` is the ordering that discriminates. The refusal walks every
+    /// parsed capability rather than stopping at the first, and nothing else here notices the
+    /// difference — replacing that walk with `capabilities.iter().take(1)` leaves every other
+    /// test in this crate green, because no other fixture declares more than one. What it
+    /// would permit is the failure the whole field exists to prevent: a rule declaring both
+    /// loads, runs with no dataflow analysis, and reports nothing, which reads as a clean
+    /// codebase rather than as a rule that never ran.
+    ///
+    /// Both orderings, because "the position does not decide" is the property. The reversed
+    /// one is the case a `take(1)` implementation happens to get right, so asserting only it
+    /// would be asserting the bug.
     #[test]
-    fn a_rule_requiring_dataflow_is_still_refused() {
-        let error = load_requiring("requires-dataflow-still", "['dataflow']")
-            .expect_err("`dataflow` is not implemented");
-        let text = format!("{error}");
-        assert!(text.contains("dataflow"), "{text}");
-        assert!(text.contains("local/example"), "{text}");
+    fn an_unimplemented_capability_is_refused_beside_an_implemented_one() {
+        for (name, written) in [
+            ("requires-types-then-dataflow", "['types', 'dataflow']"),
+            ("requires-dataflow-then-types", "['dataflow', 'types']"),
+        ] {
+            let error = load_requiring(name, written)
+                .expect_err("`dataflow` is not implemented, whatever it is declared beside");
+            let text = format!("{error}");
+            assert!(text.contains("dataflow"), "{text}");
+            assert!(text.contains("local/example"), "{text}");
+        }
     }
 
     #[test]
