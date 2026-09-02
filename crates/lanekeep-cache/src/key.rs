@@ -34,7 +34,7 @@ impl RunKey {
     /// behavior a rule can observe, and invalidating every cache on it would make patch
     /// upgrades expensive for no benefit.
     ///
-    /// # The two host inputs, and why they are separate
+    /// # The three host-side inputs, and why they are separate
     ///
     /// `host_api_hash` is **what a rule may reach**: the `ctx` surface QuickJS installs and
     /// the WIT world a component is linked against, plus anything the host binds beside that
@@ -63,6 +63,16 @@ impl RunKey {
     /// trust boundary and the compiler — and because a test that can only move both at once
     /// cannot tell which of them the key actually covers.
     ///
+    /// `analysis_hash` is **what the host analyses compute**, which is a third question with
+    /// the same failure mode as the two above. A type oracle's operator table, its shadow
+    /// checks and its recursion bound decide what a rule was told; a result computed by an
+    /// oracle that no longer exists is not a valid result for a run that has a different one.
+    ///
+    /// Separate from `host_api_hash` deliberately. That field answers what a rule may *reach*
+    /// — whether `ctx.types` exists at all — and this one answers what it *says*. Folding them
+    /// would leave a test unable to tell which of the two the key covers, which is the reason
+    /// this module already keeps the host surface and the compilation environment apart.
+    ///
     /// # Both are digests, and that is the caller's promise rather than this encoding's
     ///
     /// Every field here is length-prefixed, so nothing depends on the two being any particular
@@ -74,6 +84,7 @@ impl RunKey {
         engine_version: &str,
         host_api_hash: &[u8],
         wasm_compile_env_hash: &[u8],
+        analysis_hash: &[u8],
         ruleset_hash: &[u8],
         config_hash: &[u8],
         grammars: &[GrammarKey],
@@ -88,6 +99,7 @@ impl RunKey {
         write_field(&mut prefix, engine_version.as_bytes());
         write_field(&mut prefix, host_api_hash);
         write_field(&mut prefix, wasm_compile_env_hash);
+        write_field(&mut prefix, analysis_hash);
         write_field(&mut prefix, ruleset_hash);
         write_field(&mut prefix, config_hash);
 
@@ -189,6 +201,7 @@ mod tests {
             "0.1",
             b"host-api",
             b"runtime",
+            b"analysis",
             b"ruleset",
             b"config",
             &[grammar()],
@@ -237,6 +250,7 @@ mod tests {
             "0.1",
             b"host-api",
             b"runtime",
+            b"analysis",
             b"different",
             b"config",
             &[grammar()],
@@ -250,6 +264,7 @@ mod tests {
             "0.1",
             b"host-api",
             b"runtime",
+            b"analysis",
             b"ruleset",
             b"different",
             &[grammar()],
@@ -263,6 +278,7 @@ mod tests {
             "0.2",
             b"host-api",
             b"runtime",
+            b"analysis",
             b"ruleset",
             b"config",
             &[grammar()],
@@ -281,6 +297,7 @@ mod tests {
             "0.1",
             b"host-api-with-one-more-function",
             b"runtime",
+            b"analysis",
             b"ruleset",
             b"config",
             &[grammar()],
@@ -298,6 +315,27 @@ mod tests {
             "0.1",
             b"host-api",
             b"a-different-compilation-environment",
+            b"analysis",
+            b"ruleset",
+            b"config",
+            &[grammar()],
+        );
+        assert_ne!(key_of(&run(), "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
+    }
+
+    /// The oracle's identity is its own term.
+    ///
+    /// Its own field rather than folded into `host_api_hash`, because that one answers what a
+    /// rule may *reach* while this answers what the answers *are* — the same distinction that
+    /// keeps `wasm_compile_env_hash` separate, and for the same stated reason: a test that can
+    /// only move both at once cannot tell which of them the key actually covers.
+    #[test]
+    fn changing_the_analysis_hash_changes_the_key() {
+        let other = RunKey::new(
+            "0.1",
+            b"host-api",
+            b"runtime",
+            b"different-oracle",
             b"ruleset",
             b"config",
             &[grammar()],
@@ -314,6 +352,7 @@ mod tests {
             "0.1",
             b"runtime",
             b"host-api",
+            b"analysis",
             b"ruleset",
             b"config",
             &[grammar()],
@@ -330,6 +369,7 @@ mod tests {
             "0.1",
             b"host-api",
             b"runtime",
+            b"analysis",
             b"ruleset",
             b"config",
             &[
@@ -350,6 +390,7 @@ mod tests {
             "0.1",
             b"host-api",
             b"runtime",
+            b"analysis",
             b"ruleset",
             b"config",
             &[GrammarKey {
@@ -369,6 +410,7 @@ mod tests {
             "0.1",
             b"host-api",
             b"runtime",
+            b"analysis",
             b"ruleset",
             b"config",
             &[GrammarKey {
@@ -384,14 +426,46 @@ mod tests {
         // The reason every field is length-prefixed. Without it `("ab", "c")` and
         // `("a", "bc")` hash alike, and two genuinely different runs share a key — which is
         // the one failure mode a cache must not have.
-        let one = RunKey::new("0.1", b"host-api", b"runtime", b"ab", b"c", &[grammar()]);
-        let other = RunKey::new("0.1", b"host-api", b"runtime", b"a", b"bc", &[grammar()]);
+        let one = RunKey::new(
+            "0.1",
+            b"host-api",
+            b"runtime",
+            b"analysis",
+            b"ab",
+            b"c",
+            &[grammar()],
+        );
+        let other = RunKey::new(
+            "0.1",
+            b"host-api",
+            b"runtime",
+            b"analysis",
+            b"a",
+            b"bc",
+            &[grammar()],
+        );
         assert_ne!(key_of(&one, "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
 
         // And the same on the pair this change added, which are the two fields most likely
         // to be built by concatenating something.
-        let one = RunKey::new("0.1", b"ab", b"c", b"ruleset", b"config", &[grammar()]);
-        let other = RunKey::new("0.1", b"a", b"bc", b"ruleset", b"config", &[grammar()]);
+        let one = RunKey::new(
+            "0.1",
+            b"ab",
+            b"c",
+            b"analysis",
+            b"ruleset",
+            b"config",
+            &[grammar()],
+        );
+        let other = RunKey::new(
+            "0.1",
+            b"a",
+            b"bc",
+            b"analysis",
+            b"ruleset",
+            b"config",
+            &[grammar()],
+        );
         assert_ne!(key_of(&one, "src/a.ts", 1), key_of(&other, "src/a.ts", 1));
 
         // And on the per-file side: a path and a content digest must not be able to run
