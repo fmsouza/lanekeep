@@ -96,6 +96,9 @@ lanekeep/
     lanekeep-lang-go/    # Go grammar + binding resolution
     lanekeep-lang-rust/  # Rust grammar + binding resolution
     lanekeep-languages/  # the set of supported languages, assembled in one place
+    lanekeep-types/      # the bounded type oracle: a node's type and symbol, from one
+                         #   parsed file. Not lanekeep-types-gen below, which renders
+                         #   TypeScript definitions and shares nothing but the word
     lanekeep-config/     # schema, config loading, canonicalization + hashing
     lanekeep-cache/      # content-addressed store with dependency tracking
     lanekeep-wasm/       # component execution: the WIT host API, wasmtime wiring

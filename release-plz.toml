@@ -105,8 +105,13 @@ commit_parsers = [
 # The binary is what users install, so its release is the one the whole workspace rides on.
 # Every other crate ships as part of it rather than announcing its own.
 #
-# The eighteen without tags are still tracked: release-plz works out a crate's previous
-# version from the registry rather than from a tag, and all nineteen are on crates.io.
+# The nineteen without tags are still tracked: release-plz works out a crate's previous
+# version from the registry rather than from a tag, and nineteen of the twenty are on
+# crates.io. `lanekeep-types` is the twentieth and is not, having been added since the last
+# release — which is not a special case to handle but the ordinary one for a new crate: with
+# no version on the registry to compare against, release-plz treats it as new and publishes
+# it with the rest. This sentence is the thing that goes stale, so it is worth rereading
+# after the first release that carries it.
 [[package]]
 name = "lanekeep-cli"
 # The tag still comes from here; the GitHub release deliberately does not. Releases are
@@ -147,5 +152,6 @@ changelog_include = [
   "lanekeep-server",
   "lanekeep-rules",
   "lanekeep-testkit",
+  "lanekeep-types",
   "lanekeep-wasm",
 ]

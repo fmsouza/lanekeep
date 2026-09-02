@@ -137,6 +137,8 @@ crates/
   lanekeep-lang-go      Go grammar, binding resolution
   lanekeep-lang-rust    Rust grammar, binding resolution
   lanekeep-languages    the set of supported languages, assembled in one place
+  lanekeep-types     the bounded type oracle: a node's type and symbol, from one parsed file
+                     — not lanekeep-types-gen, which renders TypeScript definitions
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
   lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring

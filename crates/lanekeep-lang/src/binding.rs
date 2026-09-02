@@ -229,6 +229,26 @@ pub trait BindingResolver: Send + Sync {
     /// not shadowing anything. This is specifically "there is more than one, and you got
     /// the inner one".
     fn is_shadowed(&self, tree: &Tree, source: &str, node: Node<'_>) -> bool;
+
+    /// The node that declares what the identifier at `node` refers to.
+    ///
+    /// [`resolve`](Self::resolve) answers *what kind* of thing a name is; this answers
+    /// *where it came from*, which is what lets a caller read an initializer or follow an
+    /// annotation to its alias. The node returned is the declaring construct — a
+    /// `variable_declarator`, a parameter, a function, a class, or the `import_statement`
+    /// that bound the name — not the identifier inside it.
+    ///
+    /// Defaults to `None` for a language whose resolver cannot yet say. That is honest
+    /// rather than a placeholder, on the same terms as `Language::resolver`: a caller gets
+    /// nothing back instead of a confidently wrong answer.
+    fn declaration_of<'t>(
+        &self,
+        _tree: &'t Tree,
+        _source: &str,
+        _node: Node<'t>,
+    ) -> Option<Node<'t>> {
+        None
+    }
 }
 
 #[cfg(test)]
