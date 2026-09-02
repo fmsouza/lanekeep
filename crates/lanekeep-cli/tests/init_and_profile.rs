@@ -493,6 +493,17 @@ fn gate_row(stderr: &str, id: &str) -> [u64; 6] {
     })
 }
 
+/// `text` with every run of whitespace collapsed to one space.
+///
+/// The explanatory paragraph below the gate table is hard-wrapped to the table's width, so a
+/// phrase asserted verbatim can straddle a line break and a pin that was checking *content*
+/// silently becomes a pin on *layout* — rewrapping the paragraph then reddens the test while
+/// every claim in it is intact, and, worse, an edit that rewraps around a deleted clause can
+/// go green. Collapsing first makes these assertions insensitive to where the wrap falls.
+fn squeeze(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[test]
 fn the_profile_tells_a_gated_silence_from_an_empty_one() {
     // Both rules below report zero violations. That is exactly the case the old profile could
@@ -606,32 +617,41 @@ print('x')
     // imports` sits at `lang-gated 156 / parsed 26` with a correct `language`, and
     // `local/one-parser-per-file` at `content-gated 148 / parsed 34` with a correct gate.
     // Pinning the literal `parsed 0` is what makes deleting the condition go red.
+    let cold_prose = squeeze(&cold_stderr);
     assert!(
-        cold_stderr.contains("a rule reporting nothing with parsed 0 never ran"),
-        "the parsed-0 condition is missing from the explanation: {cold_stderr}"
+        cold_prose.contains("a rule reporting nothing with cached 0 and parsed 0 never ran"),
+        "the cached-0/parsed-0 condition is missing from the explanation: {cold_stderr}"
     );
     assert!(
-        cold_stderr.contains("content-gated is a gate narrower than the query"),
+        cold_prose.contains("content-gated is a gate narrower than the query"),
         "the content-gated explanation is missing: {cold_stderr}"
     );
     assert!(
-        cold_stderr.contains("lang-gated is a `language`") && cold_stderr.contains("`include`"),
+        cold_prose.contains("lang-gated is a `language`") && cold_prose.contains("`include`"),
         "the lang-gated explanation is missing, or is missing its second cause: {cold_stderr}"
     );
     assert!(
-        cold_stderr.contains("a rule reporting nothing with parsed above 0 did run"),
+        cold_prose.contains("a rule reporting nothing with parsed above 0 did run"),
         "the ran-and-found-nothing case is missing: {cold_stderr}"
     );
-    // The one that matters on the default path: warm, the three columns after `cached` are
-    // zero for every rule alike, so they settle no gate question until `cached` is zero.
-    // `path-gated` is the exception and the text has to say so — a path gate runs before the
-    // cache is consulted, so that column stays readable warm.
+    // The one that matters on the default path. It claims only that the columns right of
+    // `cached` are *incomplete* warm — never that they go to zero, and never that two rules
+    // render alike, both of which this very function disproves twenty lines down: `warm_gated`
+    // and `warm_empty` each assert `lang-gated 1`, because `src/util.py` is never parsed and
+    // so never cached, and the two rows are not the same shape. Five drafts of a stronger
+    // sentence shipped and all five were false. `path-gated` is the one genuine exemption —
+    // a path gate runs before the cache is consulted — and the text has to say so.
     assert!(
-        cold_stderr.contains("a nonzero cached") && cold_stderr.contains("--no-cache"),
+        cold_prose.contains("a nonzero cached") && cold_prose.contains("--no-cache"),
         "the cached caveat is missing: {cold_stderr}"
     );
     assert!(
-        cold_stderr.contains("path-gated still speaks"),
+        cold_prose.contains("incomplete for this run"),
+        "the cached caveat must say the columns are incomplete, not that they are zero: \
+         {cold_stderr}"
+    );
+    assert!(
+        cold_prose.contains("path-gated is unaffected"),
         "the cached caveat overreaches — it must exempt the path-gate column: {cold_stderr}"
     );
 

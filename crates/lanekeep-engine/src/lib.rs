@@ -631,21 +631,21 @@ impl std::fmt::Debug for Engine {
 /// not match a file's counts as `language_gated` there instead, never as `parsed`, however
 /// gate configuration says nothing about which files a query gets to run against.
 ///
-/// **`cached` comes first, so on a warm run the columns after it answer nothing.** A cache
-/// hit returns before the *content* gates are consulted and before anything is parsed, so a
-/// file served from cache lands in `cached` and leaves `content_gated`, `language_gated` and
-/// `parsed` at zero whatever those gates would have done with it — two rules differing only
-/// in their content gates render byte-identical rows on the default warm path. Those three
-/// columns speak only for files the cache did not answer, which makes a nonzero `cached` the
-/// signal to re-run with `--no-cache` before reading them.
+/// **A nonzero `cached` means the columns to its right are incomplete for this run** — a
+/// cache hit returns before those counters are reached, so what they hold describes only the
+/// files the cache did not answer. Re-run with `--no-cache` to read them. `path_gated` is
+/// unaffected, since `Engine::check_file` applies the path gates and records the counter
+/// before the read and before the cache is consulted at all.
 ///
-/// `path_gated` is the exception, and it stays readable warm: `Engine::check_file` applies
-/// the path gates and records the counter before the read and before the cache is consulted
-/// at all, so two rules differing only in `pathMatches` render different rows on a warm run
-/// and the difference is exactly the gate. `unread` sits between the two and has one of its
-/// two sites on each side: a file gone between discovery and the read is counted before the
-/// cache is consulted, since the key needs the bytes, while a file that read as invalid
-/// UTF-8 is counted past the content gates and so cannot be reached warm.
+/// Deliberately no stronger claim than "incomplete". Saying *which* columns go to zero warm
+/// has been tried and falsified five times, each time by a different one of `check_file`'s
+/// return paths: a file no grammar claims, a file whose language no rule surviving the
+/// content gates declares, and a file that is not valid UTF-8 are all `skipped` rather than
+/// given a cache entry, so every warm run re-attributes them for as long as the corpus holds
+/// them. Against this repository the second warm pass puts a `2` in `content_gated` or
+/// `language_gated` in all seventeen rows — and which of the two it lands in differs by rule,
+/// so "identical rows warm" is false as well. The reconciliation above is what still holds
+/// warm: the six counters sum to `files_discovered` in every state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.

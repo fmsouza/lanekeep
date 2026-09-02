@@ -463,8 +463,10 @@ fn write_profile(
 /// author staring at `--profile` output is the reader it is for, and a comment in `main.rs`
 /// never reaches them.
 ///
-/// **Every sentence in it is conditioned on `parsed: 0`, and that condition is the whole
-/// difficulty.** Two earlier drafts keyed on "a large counter" instead and both accused a
+/// **Every sentence in it is conditioned on `cached: 0` and `parsed: 0`, and those
+/// conditions are the whole difficulty.** `cached: 0` because a warm row has `parsed: 0` for
+/// every rule alike and its largest other counter is `cached` itself, which the caveat above
+/// already explains; the cause-naming sentence must not fire there. Two earlier drafts keyed on "a large counter" instead and both accused a
 /// healthy rule, each time a rule that had *run*: this repository's own output has
 /// `lanekeep/no-circular-imports` at `lang-gated 156 / parsed 26`, reporting nothing with a
 /// correct `language` declaration, and `local/one-parser-per-file` at `content-gated 148 /
@@ -476,15 +478,20 @@ fn write_profile(
 /// mirror direction) *and* an `include` admitting files no grammar claims at all, which no
 /// declaration can fix.
 ///
-/// The `cached` caveat is printed because it is the default path: a cache hit returns before
-/// the **content** gates, so on a warm run every file the path gates admitted lands in
-/// `cached` and `content_gated`, `language_gated` and `parsed` are zero whatever those gates
-/// would have done. `path_gated` is the exception and stays readable warm, because
-/// `Engine::check_file` applies the path gates before it consults the cache at all — two
-/// rules differing only in `pathMatches` render different rows on a warm run, and the
-/// difference is exactly the gate. A reader who has just been told the table settles a gate
-/// question has to be told, in the same breath, which columns settle nothing until `cached`
-/// is zero.
+/// The `cached` caveat is printed because it is the default path, and it says only that the
+/// columns right of `cached` are **incomplete** — never which of them go to zero, and never
+/// that two rules render alike. Five drafts tried to characterize the warm path and all five
+/// were false, each falsified by a different one of `check_file`'s return paths: a file no
+/// grammar claims, a file whose language no rule surviving the content gates declares, and a
+/// file that is not valid UTF-8 all get no cache entry, so they are re-attributed on every
+/// warm run forever. This repository's own second warm pass puts a `2` in `content-gated` or
+/// `lang-gated` in all seventeen rows, and which of the two differs by rule. "Incomplete" is
+/// the claim that survives every corner, and it is the whole of what the reader has to act
+/// on: re-run with `--no-cache`.
+///
+/// `path_gated` is exempted because it genuinely is unaffected — `Engine::check_file` applies
+/// the path gates and records the counter before the read and before the cache is consulted
+/// at all, so two rules differing only in `pathMatches` render different rows warm.
 fn write_gate_profile(
     timings: &BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming>,
     files_discovered: usize,
@@ -517,15 +524,15 @@ fn write_gate_profile(
     )?;
     writeln!(
         stderr,
-        "  a nonzero cached is the cache answering before the content gates ran, so \
-         content-gated,\n  lang-gated and parsed say nothing about this run — re-run with \
-         `--no-cache` to read them;\n  path-gated still speaks, since a path gate runs \
-         before the cache is consulted\n  a rule reporting nothing with parsed 0 never ran, \
-         and its largest other counter says\n  what took the files: content-gated is a gate \
-         narrower than the query, or no candidate\n  files here; lang-gated is a `language` \
-         naming a grammar other than the one its files\n  parse with, or an `include` \
-         admitting files no grammar claims at all\n  a rule reporting nothing with parsed \
-         above 0 did run — some files reached its query\n  and it found nothing in them\n"
+        "  a nonzero cached means the columns to its right are incomplete for this run — \
+         re-run\n  with `--no-cache` to read them; path-gated is unaffected, since a path \
+         gate runs\n  before the cache is consulted\n  a rule reporting nothing with \
+         cached 0 and parsed 0 never ran, and its largest\n  other counter says what took \
+         the files: content-gated is a gate narrower than the\n  query, or no candidate \
+         files here; lang-gated is a `language` naming a grammar\n  other than the one its \
+         files parse with, or an `include` admitting files no\n  grammar claims at all\n  \
+         a rule reporting nothing with parsed above 0 did run — some files reached its\n  \
+         query and it found nothing in them\n"
     )?;
     stderr.flush()?;
     Ok(())

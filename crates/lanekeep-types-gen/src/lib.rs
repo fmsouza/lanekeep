@@ -471,12 +471,10 @@ const GATES: &str = "\
  * than the query, which is sufficient rather than necessary: a rule whose handler filters
  * may gate far narrower and still be neutral. `--profile` prints, per rule, how many files
  * each gate rejected and how many the rule actually parsed, which is where a suspected gate
- * is settled — on a *cold* run, and for the `fileContains` gates only. A cache hit returns
- * before those are consulted, so on a warm run every file the path gates admitted and the
- * read succeeded on lands in the `cached` column, leaving `content-gated`, `lang-gated` and
- * `parsed` at zero whatever the content gates did. `path-gated` is unaffected: a path gate
- * runs before the cache is consulted at all. Pair `--profile` with `--no-cache` whenever
- * `cached` is not zero.
+ * is settled — on a *cold* run. A nonzero `cached` means the columns to its right are
+ * incomplete for that run, since a cache hit returns before the content gates are consulted;
+ * pair `--profile` with `--no-cache` to read them. `path-gated` is unaffected, because a path
+ * gate runs before the cache is consulted at all.
  */
 export interface Gates {
   /**
