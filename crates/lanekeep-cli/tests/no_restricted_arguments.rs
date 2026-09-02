@@ -137,3 +137,33 @@ fn an_aliased_import_is_reported_through_the_binary() {
         vec!["src/alias.ts:4:20 construct a Decimal from a string, not a float"],
     );
 }
+
+/// A `call` naming a `module` but no `name` — through the real binary, because that is the
+/// only place the actual failure mode showed up. `ctx.resolvesToImport`'s third parameter is
+/// *arity*-optional on the host side, not `undefined`-tolerant: a rule that always passed three
+/// arguments threw `Error converting from js 'undefined' into type 'string'` on the first file
+/// with any bare-identifier call or `new`, which cancels the whole run and exits `2` — not a
+/// missed violation, a crash naming neither the rule's option nor the file. `Corpus::run`
+/// itself asserts the exit code is not `2`, so this test would fail on the old behavior even
+/// before reaching the violation assertion below.
+#[test]
+fn a_call_with_no_name_reports_through_the_binary_instead_of_crashing_the_run() {
+    let corpus = Corpus::new(
+        "no-restricted-arguments",
+        "{ restrictions: [{ call: { module: 'decimal.js' }, forbid: ['number'], \
+         reason: 'construct a Decimal from a string, not a float' }] }",
+        &[(
+            "src/a.ts",
+            "import { Decimal } from 'decimal.js';\n\
+             \n\
+             export function convert(x: string) {\n\
+             \x20 return new Decimal(parseFloat(x));\n\
+             }\n",
+        )],
+    );
+
+    assert_eq!(
+        corpus.run(),
+        vec!["src/a.ts:4:22 construct a Decimal from a string, not a float"],
+    );
+}

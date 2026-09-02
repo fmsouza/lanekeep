@@ -206,7 +206,7 @@ export default defineRule({
 
     const call = ctx.closestAncestor(m.match, '(call_expression function: (identifier) @f)')
     if (!call) return
-    if (!ctx.resolvesToImport(call.f, { module: '@rneui/themed', name: 'makeStyles' })) return
+    if (!ctx.resolvesToImport(call.f, '@rneui/themed', 'makeStyles')) return
 
     ctx.report(m.match)
   },
@@ -415,7 +415,7 @@ The light semantic layer that pure syntactic matching gets wrong. Implemented in
 
 | Function | Notes |
 |---|---|
-| `ctx.resolvesToImport(node, { module, name })` | Handles aliasing: `import { makeStyles as ms }` |
+| `ctx.resolvesToImport(node, module, name?)` | Handles aliasing: `import { makeStyles as ms }` |
 | `ctx.isImportedFrom(node, moduleGlob)` | |
 | `ctx.bindingKind(node)` | `const \| let \| var \| param \| function \| class \| import` |
 | `ctx.isShadowed(node)` | Locally rebound identifier |

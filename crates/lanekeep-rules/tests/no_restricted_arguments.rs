@@ -331,6 +331,50 @@ fn a_restriction_with_no_call_is_silent() {
         .expect("a restriction with nothing to match against matches nothing");
 }
 
+/// A `call` naming a `module` but no `name` governs every export of that module. This is the
+/// crash this fix exists for: `ctx.resolvesToImport`'s third parameter is *arity*-optional on
+/// the host side, not `undefined`-tolerant, so calling it with three arguments whenever `name`
+/// is absent throws `Error converting from js 'undefined' into type 'string'` and aborts the
+/// whole run. Without the branch in `check`, this test does not fail an assertion — the rule
+/// throws.
+#[test]
+fn a_call_with_no_name_reports_on_the_module_s_default_export_shaped_call() {
+    tester("{ restrictions: [{ call: { module: 'decimal.js' }, forbid: ['number'] }] }")
+        .reports_at(
+            "import { Decimal } from 'decimal.js';\n\
+             new Decimal(parseFloat(x));\n",
+            &[(2, 13)],
+        )
+        .expect("a name-less call restriction still matches an import of that module");
+}
+
+/// The half that gives the fixture above meaning: the same name-less restriction reports on a
+/// *different* export of the identical module too, where a restriction naming `Decimal`
+/// specifically would stay silent. Without this pair, "omit `name`" is indistinguishable from
+/// "name it" — both would pass the test above alone.
+#[test]
+fn a_call_with_no_name_reports_on_a_different_export_of_the_same_module() {
+    tester("{ restrictions: [{ call: { module: 'decimal.js' }, forbid: ['number'] }] }")
+        .reports_at(
+            "import { Big } from 'decimal.js';\n\
+             new Big(parseFloat(x));\n",
+            &[(2, 9)],
+        )
+        .expect("no name to compare against means every export of decimal.js is governed");
+}
+
+/// A `call` naming no `name` is still scoped to its `module` — it is "every export of this
+/// module," not "every call anywhere." A callee imported from a different module stays silent.
+#[test]
+fn a_call_with_no_name_is_silent_on_a_different_module() {
+    tester("{ restrictions: [{ call: { module: 'decimal.js' }, forbid: ['number'] }] }")
+        .accepts(
+            "import { Big } from 'somewhere-else';\n\
+             new Big(parseFloat(x));\n",
+        )
+        .expect("the module still has to match; omitting name does not omit the module check");
+}
+
 /// `argument: 'all'` still reports only once per call, even when two positions are both
 /// forbidden — `check` returns after its first report. Deleting that early `return` is
 /// invisible to every other test here, because none of them gives a matching call two

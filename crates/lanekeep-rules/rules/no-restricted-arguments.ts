@@ -42,6 +42,14 @@ import { defineRule } from 'lanekeep'
  * resolves to `decimal.js`'s `Decimal`, because the check follows the binding rather than the
  * text at the call site.
  *
+ * **`call.name` is optional, and calling `ctx.resolvesToImport` with three arguments when it is
+ * absent throws.** The host binding's third parameter is *arity*-optional, not
+ * `undefined`-tolerant — passing an explicit `undefined` fails argument conversion at the
+ * boundary, aborting the whole run rather than reporting or staying silent. `call.name` naming
+ * nothing at all is the documented spelling for "govern every export of this module," so the
+ * two-argument and three-argument calls are branched on explicitly here rather than always
+ * passing three.
+ *
  * **A union reports iff one of its members is a forbidden primitive**, decided the same way as
  * `no-restricted-types`'s union branch: `number | Decimal` can still be a bare `number` at run
  * time and reports, `Decimal | undefined` is optional money and stays silent. A nominal type
@@ -94,7 +102,12 @@ export default function noRestrictedArguments(options) {
       for (const restriction of restrictions) {
         const call = restriction.call
         if (call === undefined) continue
-        if (!ctx.resolvesToImport(m.callee, call.module, call.name)) continue
+
+        const resolved =
+          call.name === undefined
+            ? ctx.resolvesToImport(m.callee, call.module)
+            : ctx.resolvesToImport(m.callee, call.module, call.name)
+        if (!resolved) continue
 
         const args = ctx
           .namedChildren(m.args)
