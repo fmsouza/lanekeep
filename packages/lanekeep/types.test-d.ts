@@ -25,6 +25,7 @@ import noDefaultExport from 'lanekeep/no-default-export'
 import noMutableDefaultArgument from 'lanekeep/no-mutable-default-argument'
 import noRestrictedCalls from 'lanekeep/no-restricted-calls'
 import noRestrictedImports from 'lanekeep/no-restricted-imports'
+import noRestrictedTypes from 'lanekeep/no-restricted-types'
 import noUnusedExports from 'lanekeep/no-unused-exports'
 
 void duplicateImplementation
@@ -35,4 +36,5 @@ void noDefaultExport
 void noMutableDefaultArgument
 void noRestrictedCalls
 void noRestrictedImports
+void noRestrictedTypes
 void noUnusedExports

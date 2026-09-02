@@ -166,6 +166,193 @@ every other directory, which would rot the first time someone adds one.
 know what to do instead, not merely that something is banned — the reason is the part of the
 message that tells it.
 
+---
+
+## `lanekeep/no-restricted-types`
+
+Forbid a primitive type, or the wrong domain type, on a value whose name matches a naming
+convention.
+
+The first built-in where a *type*, not just syntax, decides the violation. The convention it
+exists for: "every monetary value is a `Decimal` from `decimal.js`, and never a `number`, because
+a `number` loses precision past 2^53" — that is not something a language model can infer from the
+code it is shown, and it is the worked example through this section. `decimal-for-money` is not
+hardcoded here: it ships as a *configuration* of this rule rather than as a rule of its own, on
+the same reasoning `no-restricted-imports` already settled — the mechanism belongs in the tool,
+the policy stays the project's.
+
+A **factory**, for the same reason `no-restricted-imports` is one: the convention is the entire
+content of the rule, so an empty `conventions` list reports nothing at all. It looks at function
+parameters — required or optional — and variable declarations, and asks whether each one's name
+matches a convention's `names`.
+
+```json
+{
+  "rules": [
+    {
+      "rule": "lanekeep/no-restricted-types",
+      "options": {
+        "conventions": [
+          {
+            "names": ["*amount*", "*Amount*", "*balance*", "*price*"],
+            "forbid": ["number", "string"],
+            "require": { "module": "decimal.js", "name": "Decimal" },
+            "reason": "number loses precision past 2^53"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+Or from a `lanekeep.config.ts`:
+
+```ts
+import noRestrictedTypes from 'lanekeep/no-restricted-types'
+
+export default defineConfig({
+  rules: [
+    noRestrictedTypes({
+      conventions: [
+        {
+          names: ['*amount*', '*Amount*', '*balance*', '*price*'],
+          forbid: ['number', 'string'],
+          require: { module: 'decimal.js', name: 'Decimal' },
+          reason: 'number loses precision past 2^53',
+        },
+      ],
+    }),
+  ],
+})
+```
+
+Its card: **message** `restricted type on a value the convention governs`, **remediation** "give
+it the type the convention requires, or rename it if it is not what the name says", with the
+example pair `function credit(amount: number)` (reported) and `function credit(amount: Decimal)`
+(fine). The violation is anchored at the name, not at the type annotation.
+
+**Two spellings fail to load.** A bare `"lanekeep/no-restricted-types"` in a JSON config, and an
+uncalled `noRestrictedTypes` reference in a TypeScript config (`rules: [noRestrictedTypes]`
+rather than `rules: [noRestrictedTypes({...})]`), both fail with ``missing `id` `` — a factory
+function has no `id` of its own; only the rule it returns does.
+
+### Options
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `conventions` | `Convention[]` | What is governed. Defaults to `[]`. |
+
+Each convention:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `names` | `string[]` | Glob patterns a parameter's or variable's name must match to be governed. |
+| `forbid` | `string[]` | Primitive type names that are a violation on a governed value — `number`, `string`, `boolean`, `bigint`, `symbol`, `null` or `undefined`, the set the type oracle itself recognizes. |
+| `require` | `{ module: string, name: string }` | Optional. The type that satisfies the convention. Only `module` is matched — a governed value's type must have a symbol imported from it. `name` is what the message says to use instead, and is not checked; see below for why. |
+| `reason` | `string` | What to tell the reader. Carried into the violation message; falls back to naming `require`, then to a generic message, when it is absent. |
+
+`require` is optional on its own terms: a convention may forbid a primitive without naming a
+replacement — "never a raw `number` here" is a legitimate thing to say without saying what to use
+instead. With no `require` to check against, a named type is accepted whatever it is; only a
+listed primitive, or a union containing one, is still a violation.
+
+### Values are selected by name, and the rule is only as good as that name
+
+There is no inference here, and none is claimed: the rule cannot see that a value is money, only
+that its name matches a convention's pattern. A monetary value called `total` slips past
+`names: ['*amount*']` entirely, and a `maxRetryAmount` is caught as if it were money, because its
+name happens to contain `Amount`. **A clean report from this rule is evidence the project's
+naming held, not that its money is safe** — a reader who takes it as the latter is trusting a
+report that means nothing.
+
+### The match is case-sensitive, and here that is sharp
+
+`names` is matched with `lanekeep/patterns`' `matches`, the same case-sensitive glob every other
+built-in restriction list uses: `'*amount*'` does not match `totalAmount`, because the pattern's
+lowercase `a` never matches the capital one a camelCase name puts there — and `totalAmount` is the
+spelling a real codebase uses most. A convention meaning to catch every casing has to list both,
+as the worked example above does (`'*amount*'` and `'*Amount*'` together). **A pattern that
+silently matches nothing is the worst outcome this rule has**: nothing throws, nothing warns, and
+the run reports clean exactly as if the convention were being enforced.
+
+### It looks at parameters and variable declarations, and nothing else
+
+The query matches a plain identifier bound by a parameter or a `const`/`let`/`var` declarator —
+no wider. A class field, an interface or type-alias member, an object-literal property and a
+destructured parameter are different grammar shapes, and none of them is a candidate at all:
+
+```ts
+class Order {
+  amount: number // never a candidate — not a parameter, not a variable declarator
+}
+```
+
+This is not the naming weakness above wearing a different hat, and it is not bounded by the type
+oracle either: perfect naming and a perfect oracle still would not catch it, because the value is
+never asked about in the first place. **If a project's money lives in a class field, this rule's
+clean report means nothing** — a reader who has only been told that name matching is imperfect
+will draw the wrong conclusion about why. Reaching these shapes would be a wider query, not a fix
+to this one.
+
+### What it checks, and what it stays silent on
+
+The rule declares `requires: ['types']`, which is what puts `ctx.types` on its context at all —
+see [`architecture.md`](architecture.md) §6.10. A rule that does not declare it pays nothing;
+reading `ctx.types` without declaring it throws a `TypeError` at the first call instead of
+quietly returning `undefined`, so an author who forgets the line finds out immediately rather than
+shipping a rule that never reports.
+
+Every governed name is asked what its type is:
+
+| The oracle says | The rule does |
+| --- | --- |
+| a primitive listed in `forbid` | reports |
+| a union with a member whose primitive is in `forbid` | reports |
+| a union with no such member | silent |
+| a named type, when the convention sets no `require` | silent — nothing to check it against |
+| a named type whose symbol was imported from `require`'s module | silent |
+| a named type from a different module, or with no symbol at all | reports — a wrong or unresolved domain type is still wrong |
+| the oracle could not type it at all (`undefined`) | silent |
+
+A union is judged member-wise, decided on its own terms rather than falling into the nominal
+rows above: `amount: Decimal | undefined` is optional money, and no member of the union is a
+forbidden primitive, so it stays silent; `amount: number | Decimal` can still be a bare `number`
+at run time, so it reports.
+
+A local `class Decimal {}` sharing the required name is still reported: `require` is matched on
+where a symbol came from, so a type that merely looks right is not accepted as if it were
+imported — a local declaration has no module at all, and cannot match one. A type the oracle
+cannot attribute to any symbol at all — an ambient or global type such as `Date`, used with no
+local declaration or import — is reported on the same terms: a governed value whose type cannot be
+established is not evidence the convention is met.
+
+### `require` is matched on the module and nothing else
+
+`require.name` is not compared against the type. `import { Big } from 'decimal.js'` satisfies a
+convention requiring `Decimal`, because it came from the required module — a false negative, and a
+deliberate one.
+
+The alternative is worse. The type oracle reports a type's name as it is written *at the use site*,
+not as the module exported it, so comparing that name rejects an alias of exactly the required
+type: `import { Decimal as Money } from 'decimal.js'` is conforming code, and a rule that compared
+names reported it with a message about `number`. **A rule that accuses conforming code is the one
+failure this design forbids**, and the whole posture of the type oracle is the same trade — say
+nothing rather than say something wrong. Matching the module alone is the version of the check that
+cannot produce that failure.
+
+Two consequences to hold. Enabling this rule against a module that exports several types treats
+them as interchangeable, so it is worth pointing `require.module` at the narrowest module that
+exports the type you mean. And `require.name` is still load-bearing for the *message* — with no
+`reason` set it is what the violation says to use instead — so it is worth spelling correctly even
+though nothing checks it.
+
+**`undefined` produces false negatives and never false positives.** The oracle would rather say
+nothing than accuse code it could not read, so a value it cannot type is never reported — even
+when the name matches and the value really is a raw `number`. That silence is bounded by what the
+oracle can see from the parsed file alone: no `tsconfig.json`, no declaration files, no cross-file
+resolution. "No violations" from this rule is a narrower claim than "every governed value
+conforms," and a reader who conflates the two is trusting a report that never looked.
 
 ---
 
@@ -579,7 +766,7 @@ Rust test under `#[should_panic]` legitimately assert nothing and are never repo
 
 This rule is a **factory** on the same terms as `no-restricted-calls`: a `lanekeep.config.ts`
 calls it, and both a bare JSON reference and an uncalled TypeScript reference fail to load
-with `missing 'id'`. Unlike its neighbors, it is useful *without* options — every default
+with ``missing `id` ``. Unlike its neighbors, it is useful *without* options — every default
 above applies when it is configured with `{}`.
 
 ### Options
@@ -667,7 +854,7 @@ export default defineConfig({
 
 **Two spellings fail to load.** A bare `"lanekeep/no-restricted-calls"` in a JSON config, and an
 uncalled `noRestrictedCalls` reference in a TypeScript config (`rules: [noRestrictedCalls]`
-rather than `rules: [noRestrictedCalls({...})]`), both fail with `missing 'id'` — a factory
+rather than `rules: [noRestrictedCalls({...})]`), both fail with ``missing `id` `` — a factory
 function has no `id` of its own; only the rule it returns does.
 
 ### Options

@@ -46,7 +46,13 @@ impl Primitive {
 /// Where a name came from.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Symbol {
-    /// The name as written at its declaration.
+    /// The name as it appears at the use site the oracle read, not at the declaration.
+    ///
+    /// For a renamed import — `import { Decimal as Money }` — this is the local alias
+    /// `Money`, never the exported name `Decimal`. A caller comparing this field against an
+    /// expected export name therefore rejects a renamed import of the very type it wants,
+    /// which is the false positive `lanekeep/no-restricted-types` avoids by matching
+    /// `module` alone rather than `name` too.
     pub name: String,
     /// The module it was imported from, when it was imported. `None` for a local
     /// declaration, which is what distinguishes an imported `Decimal` from a local class

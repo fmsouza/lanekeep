@@ -398,6 +398,30 @@ fn a_named_type_is_nominal() {
     );
 }
 
+/// A renamed import's `Symbol.name` is the local alias, not the exported name.
+///
+/// `Symbol::name` is filled from the reference's own text, and the resolver's
+/// `ImportedName::Named` — which does carry `Decimal` — is never consulted for it. Nothing
+/// above catches this: `a_named_type_is_nominal` imports `Decimal` under its own name, so
+/// the use site and the export happen to read identically and the two provenances are
+/// indistinguishable from that test alone.
+#[test]
+fn a_renamed_import_s_symbol_name_is_the_local_alias() {
+    assert_eq!(
+        type_of_last(
+            "import { Decimal as Money } from 'decimal.js';\nlet x: Money;",
+            "type_annotation"
+        ),
+        Some(Type::Nominal {
+            name: "Money".to_owned(),
+            symbol: Some(lanekeep_types::Symbol {
+                name: "Money".to_owned(),
+                module: Some("decimal.js".to_owned()),
+            }),
+        })
+    );
+}
+
 /// The shadow pair for nominals: a local class shares the name and not the module.
 #[test]
 fn a_locally_declared_type_is_nominal_with_no_module() {
