@@ -625,11 +625,19 @@ impl std::fmt::Debug for Engine {
 /// warm or cold — a file this rule saw always lands in exactly one of the six, because they
 /// are the six mutually exclusive points at which a file's fate for this rule is decided.
 /// That is what makes the table trustworthy: an author whose rule reports nothing can tell
-/// whether a gate excluded every file it would have caught, or its own `language`
-/// declaration did, rather than guessing between that and "the handler is wrong." `parsed`
+/// whether a gate excluded every file it would have caught, or no grammar the rule declares
+/// parses them, rather than guessing between that and "the handler is wrong." `parsed`
 /// counts only files this rule actually ran against — a rule whose declared language does
 /// not match a file's counts as `language_gated` there instead, never as `parsed`, however
 /// gate configuration says nothing about which files a query gets to run against.
+///
+/// **`cached` comes first, so on a warm run the columns after it answer nothing.** A cache
+/// hit returns before the content gates are consulted and before anything is parsed, so a
+/// file served from cache lands in `cached` and leaves `content_gated` and `language_gated`
+/// at zero whatever those gates would have done with it — two rules with completely
+/// different gates render byte-identical rows on the default warm path. The gate columns
+/// speak only for files the cache did not answer, which makes a nonzero `cached` the signal
+/// to re-run with `--no-cache` before reading them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
@@ -650,7 +658,15 @@ pub struct RuleTiming {
     pub cached: u64,
     /// Files this rule's content gates rejected, after the read and before the parse.
     pub content_gated: u64,
-    /// Files this rule was admitted to whose language it does not declare, so it never ran.
+    /// Files this rule never ran against because no grammar it declares parses them.
+    ///
+    /// Two causes, not one, and only the first is the author's `language` declaration: the
+    /// file parses with some grammar this rule does not name, or **no grammar claims the
+    /// file's extension at all** — an `include` of `src/**/*` sweeping up Markdown and plain
+    /// text puts every such file here for every rule, and no `language` declaration could
+    /// move it, since lanekeep has no grammar to offer. A message naming only the first
+    /// cause sends an author to edit a declaration that was never wrong; the `include` is
+    /// the other half of what to check.
     ///
     /// Distinct from `parsed`: a file can be parsed — by whichever grammar the file itself
     /// selects — while this rule never runs against it, because the language a rule
@@ -1697,6 +1713,11 @@ impl Engine {
     /// for_language`] is the same check [`Self::run_rule`] and [`Self::run_component_rule`]
     /// make before dispatching — so a rule that does not declare this file's language can
     /// never be dispatched here no matter what the parse below does with these bytes.
+    /// `language_of` returning `None` lands in the same arm and for the same reason: a file
+    /// no grammar claims is one no rule can run against, so it is `language_gated` for every
+    /// admitted rule rather than for any rule in particular. Both causes reach one counter
+    /// deliberately — the alternative is a seventh column carrying a corpus-wide fact
+    /// identical in every row — and every message that names the counter has to name both.
     /// Lumping it in with `parsed` would tell an author with `parsed: N, matches: 0` to
     /// narrow their query, when the real cause is the `language` declaration.
     fn parsed_or_language_gated_timings(

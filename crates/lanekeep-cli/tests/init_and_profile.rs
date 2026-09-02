@@ -595,15 +595,30 @@ print('x')
     );
 
     // The explanatory paragraph has to be printed, not left as a comment in `main.rs` — a
-    // comment reaches nobody running `--profile`. Both halves are asserted so a future edit
-    // cannot drop one without a coordinator noticing.
+    // comment reaches nobody running `--profile`. All three halves are asserted so a future
+    // edit cannot drop one without a coordinator noticing.
+    //
+    // Each is matched on the fragment that carries the *conditional*, not on the verdict
+    // alone, because the verdicts stated flat are false of healthy rules: a Python rule over
+    // a Rust corpus has a large `content-gated` and a perfectly correct gate, and a rule
+    // whose `lang-gated` counts files no grammar claims at all has a perfectly correct
+    // `language`. Asserting only "narrow or drop the gate" would let the conditionals be
+    // deleted and stay green.
     assert!(
-        cold_stderr.contains("content-gated is a gate question"),
-        "the content-gated explanation is missing: {cold_stderr}"
+        cold_stderr.contains("a rule reporting nothing whose content-gated"),
+        "the content-gated explanation is missing its conditional: {cold_stderr}"
     );
     assert!(
-        cold_stderr.contains("lang-gated is a `language` declaration"),
-        "the lang-gated explanation is missing: {cold_stderr}"
+        cold_stderr.contains("a rule reporting nothing whose lang-gated")
+            && cold_stderr.contains("`include`"),
+        "the lang-gated explanation is missing its conditional or its second cause: \
+         {cold_stderr}"
+    );
+    // The one that matters on the default path: warm, the columns after `cached` are zero
+    // for every rule alike, so the table settles no gate question until `cached` is zero.
+    assert!(
+        cold_stderr.contains("a nonzero cached") && cold_stderr.contains("--no-cache"),
+        "the cached caveat is missing: {cold_stderr}"
     );
 
     // The warm pass: same project, same files, cache now populated by the run above. This is

@@ -85,10 +85,15 @@ enum Command {
         #[arg(long)]
         staged: bool,
 
-        /// Report where the run spent its time, per rule.
+        /// Report where the run spent its time and what each rule looked at, per rule.
         ///
-        /// The split between query matching and handler execution is what tells an author
-        /// whether their query or their code is the problem.
+        /// Two tables on stderr. The first splits time between query matching and handler
+        /// execution, which is what tells an author whether their query or their code is
+        /// the problem. The second accounts for every discovered file: what each rule's
+        /// gates rejected, what the cache served, and what the rule actually parsed — the
+        /// table to read when a rule reports nothing. A warm run answers the first and not
+        /// the second, since a cache hit precedes the content gates; pair it with
+        /// `--no-cache` when the gate columns are the question.
         #[arg(long)]
         profile: bool,
 
@@ -454,12 +459,23 @@ fn write_profile(
 /// the trailing line is the reader's reconciliation check, and computing it from the same
 /// numbers it is meant to check would make a miscount invisible instead of visible.
 ///
-/// The paragraph after the reconciliation line is printed, not left as a source comment — a
-/// rule reporting nothing with a large `content-gated` is a gate question, and one with a
-/// large `lang-gated` is a `language` declaration that does not name the grammar its files
-/// actually parse with (`AGENTS.md` records that failure costing 2218 false positives in the
-/// mirror direction). An author staring at `--profile` output is the reader this is for, and a
-/// comment in `main.rs` never reaches them.
+/// The paragraph after the reconciliation line is printed, not left as a source comment — an
+/// author staring at `--profile` output is the reader it is for, and a comment in `main.rs`
+/// never reaches them. It carries its conditionals rather than asserting them of every row,
+/// because both readings are wrong of a healthy rule stated flat: `lanekeep/no-broad-except`
+/// is a Python rule over a mostly-Rust corpus, so its `content-gated: 150` against this
+/// repository is exactly right and "narrow or drop the gate" would buy 150 pointless parses.
+/// And the `lang-gated` line names both of that counter's causes — a `language` declaration
+/// naming the wrong grammar (`AGENTS.md` records that costing 2218 false positives in the
+/// mirror direction) *and* an `include` admitting files no grammar claims at all, which no
+/// declaration can fix.
+///
+/// The `cached` caveat is printed for the same reason and matters more, because it is the
+/// default path: a cache hit returns before the content gates, so on a warm run every
+/// readable file lands in `cached` and the columns after it are zero whatever the gates
+/// would have done. Two rules with opposite gates render identical rows there. A reader who
+/// has just been told the table settles a gate question has to be told, in the same breath,
+/// that it settles nothing until `cached` is zero.
 fn write_gate_profile(
     timings: &BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming>,
     files_discovered: usize,
@@ -492,8 +508,13 @@ fn write_gate_profile(
     )?;
     writeln!(
         stderr,
-        "  content-gated is a gate question — narrow or drop the gate\n  lang-gated is a \
-         `language` declaration that does not name the grammar its files parse with\n"
+        "  a nonzero cached is the cache answering before the content gates ran, so the\n  \
+         columns after it say nothing about this run — re-run with `--no-cache` to read \
+         them\n  a rule reporting nothing whose content-gated covers most of the corpus is \
+         either\n  gated narrower than its query, or simply has no files here — check the \
+         gate first\n  a rule reporting nothing whose lang-gated covers most of the corpus \
+         never ran: its\n  `language` names a grammar other than the one its files parse \
+         with, or `include`\n  admits files no grammar claims at all\n"
     )?;
     stderr.flush()?;
     Ok(())
