@@ -443,22 +443,27 @@ fn write_profile(
 
 /// Print what each rule's gates let through, per rule.
 ///
-/// A second table rather than four more columns on [`write_profile`]'s: that one answers "which
+/// A second table rather than more columns on [`write_profile`]'s: that one answers "which
 /// rule is expensive", so it sorts by total elapsed time; this one answers "what did each rule
 /// even look at", which is not a time question, so sorting it by elapsed time would reorder rows
-/// for a reason unrelated to what they show. Sorted by rule id instead, which is stable across
-/// runs over the same corpus.
+/// for a reason unrelated to what they show. `timings` is a `BTreeMap<RuleId, _>`, and its own
+/// comparator is rule id (`RuleId`'s hand-written `Ord`), so iterating it already yields rows in
+/// ascending rule-id order — nothing here needs to re-sort.
 ///
 /// `files_discovered` is threaded through rather than derived from a row's own sum, on purpose:
 /// the trailing line is the reader's reconciliation check, and computing it from the same
 /// numbers it is meant to check would make a miscount invisible instead of visible.
+///
+/// The paragraph after the reconciliation line is printed, not left as a source comment — a
+/// rule reporting nothing with a large `content-gated` is a gate question, and one with a
+/// large `lang-gated` is a `language` declaration that does not name the grammar its files
+/// actually parse with (`AGENTS.md` records that failure costing 2218 false positives in the
+/// mirror direction). An author staring at `--profile` output is the reader this is for, and a
+/// comment in `main.rs` never reaches them.
 fn write_gate_profile(
     timings: &BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming>,
     files_discovered: usize,
 ) -> anyhow::Result<()> {
-    let mut ranked: Vec<_> = timings.iter().collect();
-    ranked.sort_by_key(|(id, _)| (*id).clone());
-
     let mut stderr = std::io::stderr();
     writeln!(stderr, "\nprofile — what each rule looked at\n")?;
     writeln!(
@@ -467,7 +472,7 @@ fn write_gate_profile(
         "rule", "path-gated", "unread", "cached", "content-gated", "lang-gated", "parsed"
     )?;
 
-    for (id, timing) in ranked {
+    for (id, timing) in timings {
         writeln!(
             stderr,
             "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
@@ -481,14 +486,14 @@ fn write_gate_profile(
         )?;
     }
 
-    // Each row's six counters reconcile to this figure — see `RuleTiming`'s doc in
-    // `lanekeep-engine` for why. A rule silent behind a large `content-gated` is a gate
-    // question; one silent behind a large `lang-gated` is a `language` declaration that does
-    // not name the grammar its files actually parse with — the failure `AGENTS.md` records as
-    // 2218 false positives in the mirror direction, arriving here as the opposite symptom.
     writeln!(
         stderr,
         "\n  each row sums to {files_discovered} files discovered\n"
+    )?;
+    writeln!(
+        stderr,
+        "  content-gated is a gate question — narrow or drop the gate\n  lang-gated is a \
+         `language` declaration that does not name the grammar its files parse with\n"
     )?;
     stderr.flush()?;
     Ok(())

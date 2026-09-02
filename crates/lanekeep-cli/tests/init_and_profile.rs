@@ -407,15 +407,23 @@ fn a_rule_that_never_matched_still_appears() {
 
 /// Matches every identifier the corpus has, so if this rule ever reported anything it would be
 /// the gate that stopped it, not the query.
+///
+/// Two gates, not one: `fileContains` demonstrates `content_gated`, and `pathNotMatches`
+/// demonstrates `path_gated` — a corpus with only the first leaves `path_gated` and `unread`
+/// both at zero for every row, which is indistinguishable from a render that swapped them.
 const RULE_GATED: &str = r"import { defineRule } from 'lanekeep'
 
 export default defineRule({
   id: 'local/gate-excludes-everything',
   severity: 'error',
   card: { message: 'x', remediation: 'n/a', examples: { bad: 'a', good: 'b' } },
-  // Names a substring the corpus never contains, so every file is rejected before a parser
-  // ever sees it.
-  gates: { fileContains: ['THIS_SUBSTRING_NEVER_APPEARS'] },
+  // Names a substring the plain corpus file never contains, so it is rejected before a parser
+  // ever sees it, and excludes `src/excluded/**` outright, so that file never reaches even the
+  // content gate.
+  gates: {
+    fileContains: ['THIS_SUBSTRING_NEVER_APPEARS'],
+    pathNotMatches: ['src/excluded/**'],
+  },
   query: '(identifier) @id',
   check(ctx, m) { ctx.report(m.id) },
 })
@@ -438,12 +446,31 @@ export default defineRule({
 const TWO_SILENT_RULES_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"rule": 600000, "global": 600000},
     "rules": ["./lanekeep/rules/gate-excludes-everything.ts", "./lanekeep/rules/nothing-to-find.ts"]}"#;
 
+/// The exact header `write_gate_profile` (`crates/lanekeep-cli/src/main.rs`) prints for the
+/// gate table, built with the same widths rather than typed out by eye, so a change to either
+/// side has to be deliberate.
+///
+/// Asserted verbatim in the test below: nothing else pins the column *labels* to their
+/// positions, so a scrambled header (`lang-gated` and `content-gated` swapped, say) would
+/// otherwise ship green as long as the numeric columns still lined up with what a row parser
+/// expects.
+fn gate_table_header() -> String {
+    format!(
+        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
+        "rule", "path-gated", "unread", "cached", "content-gated", "lang-gated", "parsed"
+    )
+}
+
 /// The six gate-table counters for one rule's row, in `RuleTiming`'s field order: `path_gated`,
 /// `unread`, `cached`, `content_gated`, `language_gated`, `parsed`.
 ///
 /// Parsed from the *second* table — `stderr` split on its own heading first — because the rule
 /// id also appears in the query/handler table above it, and a naive whole-stderr search for the
 /// id's line would just as happily match that row.
+///
+/// Matched by the whole first whitespace-separated token rather than a prefix: `starts_with`
+/// would let a rule id that is a prefix of another (`local/nothing-to-find` and a hypothetical
+/// `local/nothing-to-find-2`) silently read the wrong row.
 fn gate_row(stderr: &str, id: &str) -> [u64; 6] {
     let table = stderr
         .split("what each rule looked at")
@@ -451,7 +478,7 @@ fn gate_row(stderr: &str, id: &str) -> [u64; 6] {
         .unwrap_or_else(|| panic!("no gate profile table in stderr: {stderr}"));
     let line = table
         .lines()
-        .find(|line| line.trim_start().starts_with(id))
+        .find(|line| line.split_whitespace().next() == Some(id))
         .unwrap_or_else(|| panic!("no row for {id} in the gate table: {stderr}"));
 
     let mut numbers = line.split_whitespace().skip(1).map(|token| {
@@ -474,10 +501,13 @@ fn the_profile_tells_a_gated_silence_from_an_empty_one() {
     // fully read. Telling those two silences apart is the entire point of the six new
     // counters, so asserting only "both are silent" would assert nothing about this change.
     //
-    // Swapping `content_gated` and `parsed` in `write_profile`'s column order, or dropping
-    // either counter from the row, makes this fail: `gate-excludes-everything` would show
-    // `parsed: 1` instead of `content_gated: 1`, or `nothing-to-find` would show
-    // `content_gated: 1` instead of `parsed: 1`.
+    // The corpus gives each rule a *distinct*, nonzero reading in more than one bucket, on
+    // purpose: with only one file and one gate, every bucket but one reads zero for both rows,
+    // and a render that swaps two always-zero columns (`path_gated` and `unread`, say) or two
+    // always-zero labels in the header ships identically. `src/excluded/skip.ts` is excluded by
+    // path for `gate-excludes-everything` only, so its row's `path_gated` is nonzero and
+    // distinct from its `unread`; `src/util.py` is a Python file neither rule declares as its
+    // language, so both rows carry a nonzero, distinguishable `language_gated` too.
     let project = Project::new(
         "profile-gate-distinction",
         &[
@@ -486,8 +516,31 @@ fn the_profile_tells_a_gated_silence_from_an_empty_one() {
             ("lanekeep/rules/nothing-to-find.ts", RULE_EMPTY),
             // Has identifiers (so RULE_GATED's query would match if ever admitted), no
             // `debugger` statement (so RULE_EMPTY's query has nothing to find), and none of
-            // RULE_GATED's excluded substring.
-            ("src/a.ts", "export const x = 1;\n"),
+            // RULE_GATED's excluded substring, and not under `src/excluded/`.
+            (
+                "src/a.ts",
+                "export const x = 1;
+",
+            ),
+            // Excluded from `gate-excludes-everything` by `pathNotMatches`, so it counts as
+            // that rule's `path_gated` rather than its `content_gated` — it never reaches the
+            // content gate at all. Ordinary otherwise: `nothing-to-find` sees it in full.
+            (
+                "src/excluded/skip.ts",
+                "export const skip = true;
+",
+            ),
+            // A Python file, so neither rule's default `language: ['typescript', 'tsx']`
+            // matches it — both rows pick up a `language_gated` count here. It carries
+            // RULE_GATED's excluded substring so that rule's content gate does not reject it
+            // first: the point of this file is to demonstrate the *language* bucket, and a
+            // content-gate rejection would attribute it to the wrong column instead.
+            (
+                "src/util.py",
+                "# THIS_SUBSTRING_NEVER_APPEARS
+print('x')
+",
+            ),
         ],
     );
 
@@ -496,17 +549,46 @@ fn the_profile_tells_a_gated_silence_from_an_empty_one() {
     assert_eq!(output.status.code(), Some(0), "{combined}");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The header's column *labels* are asserted verbatim: nothing about the row values below
+    // would notice `content-gated` and `lang-gated` swapped in the header alone, since neither
+    // row parser reads it.
+    assert!(
+        stderr.contains(&gate_table_header()),
+        "gate table header missing or changed: {stderr}"
+    );
+
     let gated = gate_row(&stderr, "local/gate-excludes-everything");
     let empty = gate_row(&stderr, "local/nothing-to-find");
 
     // [path_gated, unread, cached, content_gated, language_gated, parsed]
-    assert_eq!(gated, [0, 0, 0, 1, 0, 0], "gated row: {stderr}");
-    assert_eq!(empty, [0, 0, 0, 0, 0, 1], "empty row: {stderr}");
+    //
+    // Swapping any two columns in `write_gate_profile`'s row `writeln!` — `path_gated` and
+    // `unread`, or `content_gated` and `language_gated`, for instance — now produces a
+    // different tuple than the one asserted here, because this corpus does not leave those
+    // pairs both at zero the way a single-file, single-gate corpus would.
+    assert_eq!(gated, [1, 0, 0, 1, 1, 0], "gated row: {stderr}");
+    assert_eq!(empty, [0, 0, 0, 0, 1, 2], "empty row: {stderr}");
 
-    // The trailing line is the reconciliation check for a reader — one file discovered, and
-    // every rule's six counters must sum to it.
+    // The trailing line is the reconciliation check for a reader — three files discovered, and
+    // every rule's six counters must sum to it. This corpus cannot tell "the printed figure is
+    // `Outcome::files_discovered`" apart from "the printed figure is a sum of the row it came
+    // from" — both are 3 here too — so this line is right by construction (see `main.rs`'s own
+    // call site), not proven by this assertion.
     assert!(
-        stderr.contains("each row sums to 1 files discovered"),
+        stderr.contains("each row sums to 3 files discovered"),
         "{stderr}"
+    );
+
+    // The explanatory paragraph has to be printed, not left as a comment in `main.rs` — a
+    // comment reaches nobody running `--profile`. Both halves are asserted so a future edit
+    // cannot drop one without a coordinator noticing.
+    assert!(
+        stderr.contains("content-gated is a gate question"),
+        "the content-gated explanation is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("lang-gated is a `language` declaration"),
+        "the lang-gated explanation is missing: {stderr}"
     );
 }
