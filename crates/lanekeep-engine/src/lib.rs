@@ -5958,6 +5958,10 @@ export default defineRule({
                 timeout: None,
                 has_reduce,
                 component: Some(backed_by(fixture())),
+                // A component cannot declare `requires` — `rule-metadata` has no such field —
+                // so every component-backed `RuleSpec` carries an empty list, exactly as
+                // `lanekeep-config`'s `build_rule` produces for one.
+                requires: Vec::new(),
             }
         }
 
