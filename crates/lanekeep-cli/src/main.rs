@@ -467,7 +467,7 @@ struct Scaffold {
     /// specifier, or the `{ "rule": ..., "options": {} }` object form a factory rule needs.
     ///
     /// `lanekeep/no-unwrap` is a factory — it is how its `allow` option is reached at all —
-    /// so a bare quoted string for it would fail config load with `missing 'id'` the moment a
+    /// so a bare quoted string for it would fail config load with ``missing `id` `` the moment a
     /// Rust project ran `init`. Formatting each entry here rather than quoting a bare
     /// specifier in `starter_config` is what lets the two forms coexist without
     /// `starter_config` having to know which built-ins are factories.

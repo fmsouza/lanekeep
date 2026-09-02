@@ -234,7 +234,7 @@ example pair `function credit(amount: number)` (reported) and `function credit(a
 
 **Two spellings fail to load.** A bare `"lanekeep/no-restricted-types"` in a JSON config, and an
 uncalled `noRestrictedTypes` reference in a TypeScript config (`rules: [noRestrictedTypes]`
-rather than `rules: [noRestrictedTypes({...})]`), both fail with `missing 'id'` — a factory
+rather than `rules: [noRestrictedTypes({...})]`), both fail with ``missing `id` `` — a factory
 function has no `id` of its own; only the rule it returns does.
 
 ### Options
@@ -746,7 +746,7 @@ Rust test under `#[should_panic]` legitimately assert nothing and are never repo
 
 This rule is a **factory** on the same terms as `no-restricted-calls`: a `lanekeep.config.ts`
 calls it, and both a bare JSON reference and an uncalled TypeScript reference fail to load
-with `missing 'id'`. Unlike its neighbors, it is useful *without* options — every default
+with ``missing `id` ``. Unlike its neighbors, it is useful *without* options — every default
 above applies when it is configured with `{}`.
 
 ### Options
@@ -834,7 +834,7 @@ export default defineConfig({
 
 **Two spellings fail to load.** A bare `"lanekeep/no-restricted-calls"` in a JSON config, and an
 uncalled `noRestrictedCalls` reference in a TypeScript config (`rules: [noRestrictedCalls]`
-rather than `rules: [noRestrictedCalls({...})]`), both fail with `missing 'id'` — a factory
+rather than `rules: [noRestrictedCalls({...})]`), both fail with ``missing `id` `` — a factory
 function has no `id` of its own; only the rule it returns does.
 
 ### Options
