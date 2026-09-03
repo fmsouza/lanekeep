@@ -20,6 +20,14 @@
 //! every field name and all three counts. Hashing the grammar's bytes would catch it, and the
 //! tree-sitter Rust API does not expose them. This is strictly better than the bare ABI
 //! version it replaces, under which no change within one ABI moved anything at all.
+//!
+//! Two of the five terms carry no information at all for `typescript` and `tsx`, which is
+//! exactly the pair this module exists for. `ts_language_supertypes` returns length zero for
+//! any grammar below ABI 15, and ABI-14 parser output carries no supertype metadata — so
+//! `supertypes` is always empty and every `kind.supertype` flag is always `false` there. What
+//! still moves for those two grammars is the node-kind names, the field names and the
+//! parse-state count, which is enough to be strictly better than the bare ABI version, not
+//! enough to make every term here informative.
 
 use tree_sitter::Language;
 
@@ -64,7 +72,7 @@ impl GrammarShape {
             .map(|id| {
                 // Node kind ids are `u16` in tree-sitter's C API and `node_kind_count` counts
                 // them, so this cannot truncate. Saturating rather than panicking, matching
-                // how `lanekeep-engine` already narrows `grammar_abi`.
+                // `counted()` below.
                 let id = u16::try_from(id).unwrap_or(u16::MAX);
                 NodeKind {
                     name: language.node_kind_for_id(id).unwrap_or("").to_owned(),

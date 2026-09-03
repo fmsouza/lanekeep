@@ -937,8 +937,6 @@ impl Engine {
         let components = load_components(&mut rules, &loader)?;
 
         // Every registered grammar, so a tree-sitter bump invalidates rather than silently
-        // reusing results computed against different node shapes.
-        // Every registered grammar, so a tree-sitter bump invalidates rather than silently
         // reusing results computed against different node shapes. The digest covers the ABI
         // and the node kinds and fields a query is compiled against, so a regeneration at an
         // unchanged ABI invalidates too — which the bare ABI version this used to carry could
@@ -3207,6 +3205,43 @@ mod tests {
                 "{label} must reach the key a run actually files results under"
             );
         }
+    }
+
+    #[test]
+    fn a_grammars_real_digest_reaches_a_real_runs_key() {
+        // Denies exactly the gap the comment above names for the other two run-wide inputs: a
+        // digest computed correctly by `GrammarShape::digest` and then not passed into
+        // `RunKey` would leave every test here green, because `the_two_wasm_inputs_reach_a_real_runs_key`
+        // and `every_registered_grammar_has_its_own_digest` (in `lanekeep-languages`) both stop
+        // short of asserting that the *engine's own* assembly consumes the digest it computes.
+        // A `grammars` literal hardcoding `[0; 32]` in place of `grammar_digest(&language.grammar())`
+        // would pass both of those and only fail here.
+        let real_grammars: Vec<GrammarKey> = lanekeep_languages::registry()
+            .languages()
+            .map(|language| GrammarKey {
+                id: language.id().to_string(),
+                digest: lanekeep_lang::grammar_digest(&language.grammar()),
+            })
+            .collect();
+        let zeroed_grammars: Vec<GrammarKey> = real_grammars
+            .iter()
+            .map(|grammar| GrammarKey {
+                id: grammar.id.clone(),
+                digest: [0; 32],
+            })
+            .collect();
+
+        let content = lanekeep_core::ContentHash::new([7; 32]);
+        let real =
+            run_key(b"ruleset", b"config", &real_grammars).expect("the runtime describes itself");
+        let zeroed = run_key(b"ruleset", b"config", &zeroed_grammars)
+            .expect("the runtime describes itself");
+
+        assert_ne!(
+            real.for_file("src/a.ts", &content),
+            zeroed.for_file("src/a.ts", &content),
+            "a grammar's real digest must reach the key a run actually files results under"
+        );
     }
 
     #[test]
