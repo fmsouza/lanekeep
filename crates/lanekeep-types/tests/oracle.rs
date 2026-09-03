@@ -863,7 +863,7 @@ fn a_type_parameter_on_any_declaration_kind_gives_nothing() {
         "interface O<T> { x: T }",
         "type O<T> = { x: T };",
         "abstract class C<T> { abstract x: T }",
-        "declare function f<T>(x: T): void;",
+        "declare function f<T>(x: T): T;",
     ] {
         assert_eq!(type_of_last(source, "type_annotation"), None, "{source}");
     }
@@ -881,7 +881,7 @@ fn a_type_parameter_shadowing_an_alias_does_not_answer_with_the_alias() {
         "type A = number;\ninterface O<A> { x: A }",
         "type A = number;\ntype O<A> = { x: A };",
         "type A = number;\nabstract class C<A> { abstract x: A }",
-        "type A = number;\ndeclare function f<A>(x: A): void;",
+        "type A = number;\ndeclare function f<A>(x: A): A;",
     ] {
         assert_eq!(type_of_last(source, "type_annotation"), None, "{source}");
     }

@@ -322,22 +322,35 @@ you chose.
 the error is exactly that, "this pattern can never match", which is easy to read as "this
 node type does not exist". Check the grammar's child order before rewriting the node names.
 
-**Four of the twelve node kinds that carry `type_parameters` were not scopes, and the wrong
+**Four of the eighteen node kinds that carry `type_parameters` were not scopes, and the wrong
 answer they produced was a confident one.** `SCOPE_KINDS` in `crates/lanekeep-lang-js/src/binding.rs`
-decides which nodes `declaration_entry` asks for that field. `abstract_class_declaration`,
-`interface_declaration`, `type_alias_declaration` and `function_signature` were missing, so a type
-parameter declared on any of them was invisible, the scope walk escaped outward, and
-`type Amount = number; interface O<Amount> { x: Amount }` typed `x` as **`number`** — identical in
-every byte to a declared `number`, with nothing to say a type parameter had been passed over.
-`lanekeep/no-restricted-types` reported conforming code because of it, while the same program
-spelled `class` rather than `abstract class` was correctly silent.
+decides which nodes `declaration_entry` asks for that field. `tree-sitter-typescript` 0.23.2's
+`typescript/src/node-types.json` declares the field on eighteen kinds; eight were already scopes.
+`abstract_class_declaration`, `interface_declaration`, `type_alias_declaration` and
+`function_signature` were missing, so a type parameter declared on any of them was invisible, the
+scope walk escaped outward, and `type Amount = number; interface O<Amount> { x: Amount }` typed
+`x` as **`number`** — identical in every byte to a declared `number`, with nothing to say a type
+parameter had been passed over. `lanekeep/no-restricted-types` reported conforming code because of
+it, while the same program spelled `class` rather than `abstract class` was correctly silent.
 
-The measurement is the part worth copying. Collect the carriers by walking a parse of a sample
-containing every generic construct and **assert the sample produces zero `ERROR` nodes** — the
-first attempt wrote `function<T>(a: T)` and `class<T> { }` without the space each needs, the
-grammar rejected both, three kinds silently vanished, and the count came back nine instead of
-twelve. The set of missing kinds was the same either way, which is exactly why the wrong total
-would have survived review.
+Six carriers are still missing: `abstract_method_signature`, `call_signature`,
+`construct_signature`, `constructor_type`, `function_type`, `method_signature`. A follow-up covers
+them — four also carry `parameters` and each needs its own before/after measurement the way
+`function_signature` got, and the other two are type-level and untested territory here. Until
+then, `type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`, because
+`method_signature` carries the type parameters and `interface_declaration` does not.
+
+The measurement is the part worth copying, and it is also where the first pass at this entry went
+wrong: it counted the carriers by walking a parse of a hand-written sample and asserting the
+sample produces zero `ERROR` nodes — the first attempt wrote `function<T>(a: T)` and
+`class<T> { }` without the space each needs, the grammar rejected both, three kinds silently
+vanished, and the count came back nine instead of the true eighteen. A later pass wrote a fuller
+sample and still landed on twelve, because it omitted every signature-shaped and type-shaped
+generic construct — the sample looked complete and was not, and nothing about a parse with zero
+`ERROR` nodes says the sample covers every construct. The set of missing kinds differs with the
+sample either way, which is exactly why a wrong total survives review. Read `node-types.json`,
+where the field is *declared*, instead: a source-of-truth listing cannot omit a kind by accident
+the way a hand-written sample can.
 
 **A raw control character in a rule's source reports a parse failure somewhere else.** A NUL
 written into a template literal made the stripper report an error at the enclosing

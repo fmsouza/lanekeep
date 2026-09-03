@@ -31,15 +31,30 @@ const SCOPE_KINDS: &[&str] = &[
     "method_definition",
     "class_declaration",
     "class",
-    // Four more kinds that carry a `type_parameters` field. Measured against
-    // tree-sitter-typescript: twelve node kinds carry one and eight are above, so a type
-    // parameter declared on any of these was invisible and the walk escaped outward —
-    // exactly the failure the `type_parameters` arm below was written to fix for functions,
-    // still live for these. `type A = number; interface O<A> { x: A }` answered `number`.
+    // Four more kinds that carry a `type_parameters` field. `tree-sitter-typescript`
+    // 0.23.2's `typescript/src/node-types.json` declares the field on eighteen node kinds
+    // (that is the count to read, not to measure from a hand sample — see below); eight
+    // were already above, and these four were not, so a type parameter declared on any of
+    // them was invisible and the walk escaped outward — exactly the failure the
+    // `type_parameters` arm below was written to fix for functions, still live for these.
+    // `type A = number; interface O<A> { x: A }` answered `number`.
     //
-    // Take the measurement rather than reading the list: a probe whose sample does not parse
-    // silently subtracts a kind, and the first one written for this returned nine because
-    // `function<T>` and `class<T>` were spelled without the space each needs.
+    // Six carriers remain missing: `abstract_method_signature`, `call_signature`,
+    // `construct_signature`, `constructor_type`, `function_type`, `method_signature`. A
+    // follow-up covers them; four also carry `parameters` and each needs its own
+    // before/after measurement the way `function_signature` got one below, and the other
+    // two are type-level and untested territory here. Until then,
+    // `type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`,
+    // because `method_signature` carries the type parameters and `interface_declaration`
+    // does not.
+    //
+    // Do not derive this list from a hand-written parse sample: the first attempt at this
+    // fix did exactly that and reported twelve carriers, because the sample omitted every
+    // signature-shaped and type-shaped generic construct — a probe whose sample does not
+    // parse, or simply does not cover a construct, silently subtracts a kind, and there is
+    // no way to tell the difference between "not a carrier" and "not exercised" from the
+    // count alone. Reading `node-types.json`, where the field is declared, is the correct
+    // method; a sample can always be incomplete.
     //
     // `function_signature` is the one of the four that also carries `parameters`, so adding
     // it makes an ambient function's parameters resolvable for the first time as well. That
@@ -789,11 +804,12 @@ mod tests {
 
     // --- the four declaration kinds that carry `type_parameters` and were not scopes -----
     //
-    // Measured against tree-sitter-typescript with a probe that asserts its own sample
-    // produces zero `ERROR` nodes: twelve node kinds carry a `type_parameters` field, and
-    // eight of them were already in `SCOPE_KINDS`. The four below were not, so a type
-    // parameter declared on any of them was invisible and the scope walk escaped outward —
-    // the exact failure the `type_parameters` arm was written to fix for functions.
+    // `tree-sitter-typescript` 0.23.2's `typescript/src/node-types.json` declares
+    // `type_parameters` on eighteen node kinds; eight were already in `SCOPE_KINDS`, and
+    // these four were not, so a type parameter declared on any of them was invisible and
+    // the scope walk escaped outward — the exact failure the `type_parameters` arm was
+    // written to fix for functions. Six carriers remain missing (see `SCOPE_KINDS`'s own
+    // comment for the names and why); this task covers only the four below.
     //
     // The sources are the same four in all three tests, deliberately. Splitting them across
     // tests would let one kind be covered in one direction and not the other, which is how
