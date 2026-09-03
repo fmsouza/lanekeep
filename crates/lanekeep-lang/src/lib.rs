@@ -274,6 +274,24 @@ impl LanguageRegistry {
     }
 }
 
+/// What this crate's own resolution code *is*, as a digest of its sources.
+///
+/// A cache key input, and a separate question from any language's
+/// [`Language::analysis_identity`]. Those cover a language crate's own resolver; this covers the
+/// code every one of them answers *through* — `glob_matches`, [`binding::Binding::is_import_of`]
+/// and [`binding::BindingKind::as_str`] are what `ctx.resolvesToImport` and `ctx.bindingKind`
+/// report with, and editing any of them changes what every language says.
+///
+/// A free function rather than a trait method, because this crate registers no language of its
+/// own. Whoever assembles the key folds it once, beside the type oracle's identity, rather than
+/// per language.
+#[must_use]
+pub fn crate_identity() -> [u8; 32] {
+    // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot be a
+    // silent gap.
+    decode_hex32(env!("LANEKEEP_LANG_ANALYSIS_HASH"))
+}
+
 /// Decode the 64-character lowercase hex a build script emitted into 32 bytes.
 ///
 /// Every language crate's `build.rs` writes its digest as hex, because that is what a
@@ -511,5 +529,13 @@ mod tests {
     fn a_malformed_hex_string_decodes_to_zeros() {
         assert_eq!(decode_hex32(""), [0; 32]);
         assert_eq!(decode_hex32("zz"), [0; 32]);
+    }
+
+    /// A digest that is always zero is indistinguishable from a crate with no build script.
+    #[test]
+    fn the_crate_identity_is_populated_and_stable() {
+        let once = crate_identity();
+        assert_ne!(once, [0_u8; 32], "the build script did not write a digest");
+        assert_eq!(once, crate_identity());
     }
 }

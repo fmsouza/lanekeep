@@ -15,5 +15,15 @@ categories.workspace = true
 thiserror = { workspace = true }
 tree-sitter = { workspace = true }
 
+[build-dependencies]
+blake3 = { workspace = true }
+
 [lints]
 workspace = true
+
+# `blake3` is used only by `build.rs`, which hashes this crate's own `src/` into
+# `crate_identity`. cargo-machete does not scan build scripts, so it sees a
+# `[build-dependencies]` entry nothing in `src/` or `tests/` references and calls it unused.
+# `crates/lanekeep-types/Cargo.toml` carries the same stanza for the same reason.
+[package.metadata.cargo-machete]
+ignored = ["blake3"]
