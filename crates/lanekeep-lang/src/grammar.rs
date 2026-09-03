@@ -21,13 +21,21 @@
 //! tree-sitter Rust API does not expose them. This is strictly better than the bare ABI
 //! version it replaces, under which no change within one ABI moved anything at all.
 //!
-//! Two of the five terms carry no information at all for `typescript` and `tsx`, which is
-//! exactly the pair this module exists for. `ts_language_supertypes` returns length zero for
-//! any grammar below ABI 15, and ABI-14 parser output carries no supertype metadata — so
-//! `supertypes` is always empty and every `kind.supertype` flag is always `false` there. What
-//! still moves for those two grammars is the node-kind names, the field names and the
-//! parse-state count, which is enough to be strictly better than the bare ABI version, not
-//! enough to make every term here informative.
+//! One of the five terms carries no information for `typescript` and `tsx`, which is exactly
+//! the pair this module exists for. `ts_language_supertypes` is gated on
+//! `abi_version >= LANGUAGE_VERSION_WITH_RESERVED_WORDS` and returns length zero below it, so
+//! the `supertypes` list is always empty for those two.
+//!
+//! The per-node `supertype` flag beside it is **not** gated, and it would be easy to assume it
+//! was. `ts_language_symbol_type` reads `symbol_metadata[symbol].supertype` with no version
+//! check at all, and tree-sitter-typescript 0.23.2 — `LANGUAGE_VERSION 14` — sets
+//! `.supertype = true` on seven symbols, each with `.visible = false` and `.named = true`,
+//! which is the combination that makes `node_kind_is_supertype` answer `true`. So that flag is
+//! live on ABI 14 and carries real information.
+//!
+//! Four of the five terms therefore move for those grammars: the node-kind names, their flags,
+//! the field names and the parse-state count. Enough to be strictly better than the bare ABI
+//! version this replaces; not enough to make every term here informative.
 
 use tree_sitter::Language;
 
