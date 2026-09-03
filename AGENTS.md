@@ -1319,6 +1319,16 @@ fixture built by the same recipe, is byte-identical through 116 and 131, so **a 
 stand in for this check** — only the real artifact is large enough for two optimizers to disagree
 about.
 
+**A grammar's declared version cannot identify it, because `metadata()` is `None` on the two
+grammars this repository reads most.** `tree_sitter::Language::metadata()` returns the version a
+grammar was generated with, and it is present only from ABI 15. Measured 2026-09-03 over the six
+registered languages: `go`, `javascript`, `python` and `rust` are ABI 15 and answer
+`Some((0, 25, 0))` or `Some((0, 24, 1))`; **`typescript` and `tsx` are ABI 14 and answer `None`**,
+as does `name()`. A cache term keyed on it would therefore be constant for TypeScript, which is
+the language every shipped rule targets. `crates/lanekeep-lang/src/grammar.rs` folds the shape the
+grammar exposes instead — node kinds, field names, supertypes and the three counts — which every
+ABI answers.
+
 ## What not to do
 
 - Do not add a dependency without checking `deny.toml`. Network crates are banned

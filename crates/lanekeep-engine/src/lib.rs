@@ -938,11 +938,16 @@ impl Engine {
 
         // Every registered grammar, so a tree-sitter bump invalidates rather than silently
         // reusing results computed against different node shapes.
+        // Every registered grammar, so a tree-sitter bump invalidates rather than silently
+        // reusing results computed against different node shapes. The digest covers the ABI
+        // and the node kinds and fields a query is compiled against, so a regeneration at an
+        // unchanged ABI invalidates too — which the bare ABI version this used to carry could
+        // not see.
         let mut grammars: Vec<GrammarKey> = registry
             .languages()
             .map(|language| GrammarKey {
                 id: language.id().to_string(),
-                abi: u32::try_from(language.grammar_abi()).unwrap_or(u32::MAX),
+                digest: lanekeep_lang::grammar_digest(&language.grammar()),
             })
             .collect();
         grammars.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3168,7 +3173,7 @@ mod tests {
         // pass against exactly that.
         let grammars = [GrammarKey {
             id: "typescript".to_owned(),
-            abi: 15,
+            digest: [15; 32],
         }];
         let content = lanekeep_core::ContentHash::new([7; 32]);
         let real = run_key(b"ruleset", b"config", &grammars).expect("the runtime describes itself");

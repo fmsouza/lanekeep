@@ -113,7 +113,7 @@ impl RunKey {
         write_field(&mut prefix, &(grammars.len() as u64).to_le_bytes());
         for grammar in grammars {
             write_field(&mut prefix, grammar.id.as_bytes());
-            write_field(&mut prefix, &grammar.abi.to_le_bytes());
+            write_field(&mut prefix, &grammar.digest);
         }
 
         Self { prefix }
@@ -154,8 +154,14 @@ impl RunKey {
 pub struct GrammarKey {
     /// The language's identifier.
     pub id: String,
-    /// The tree-sitter ABI version the grammar was built against.
-    pub abi: u32,
+    /// A digest of the shape the grammar exposes: its ABI, its node kinds and its fields.
+    ///
+    /// Replaces the bare ABI version this carried. An ABI bump moves the digest, because the
+    /// ABI is one of its inputs — and so does a grammar regeneration at an unchanged ABI,
+    /// which the ABI alone could not see. Keeping both would be two fields that cannot move
+    /// independently, which is the shape this module's own documentation argues against: no
+    /// test could then tell which of the two the key covers.
+    pub digest: [u8; 32],
 }
 
 /// A cache key: what an entry is stored under.
@@ -213,7 +219,7 @@ mod tests {
     fn grammar() -> GrammarKey {
         GrammarKey {
             id: "typescript".to_owned(),
-            abi: 15,
+            digest: [15; 32],
         }
     }
 
@@ -378,7 +384,7 @@ mod tests {
                 grammar(),
                 GrammarKey {
                     id: "javascript".to_owned(),
-                    abi: 15,
+                    digest: [15; 32],
                 },
             ],
         );
@@ -386,8 +392,11 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_grammar_abi_changes_the_key() {
-        // A grammar bump changes node shapes and therefore what a query matches.
+    fn changing_the_grammar_digest_changes_the_key() {
+        // A grammar change moves node kinds, field names or the parse table, and therefore
+        // what a query matches. The ABI version this field used to hold is folded into the
+        // digest rather than sitting beside it: two fields that can only ever move together
+        // leave no test able to say which of them the key covers.
         let bumped = RunKey::new(
             "0.1",
             b"host-api",
@@ -397,7 +406,7 @@ mod tests {
             b"config",
             &[GrammarKey {
                 id: "typescript".to_owned(),
-                abi: 16,
+                digest: [9; 32],
             }],
         );
         assert_ne!(
@@ -417,7 +426,7 @@ mod tests {
             b"config",
             &[GrammarKey {
                 id: "javascript".to_owned(),
-                abi: 15,
+                digest: [15; 32],
             }],
         );
         assert_ne!(key_of(&run(), "src/a.ts", 1), key_of(&other, "src/a.ts", 1));

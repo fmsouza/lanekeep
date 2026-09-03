@@ -12,6 +12,9 @@
 //! after a second language arrives is the expensive version of the same work.
 
 pub mod binding;
+pub mod grammar;
+
+pub use grammar::grammar_digest;
 
 use std::collections::BTreeMap;
 use std::fmt;

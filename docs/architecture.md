@@ -593,7 +593,7 @@ key = blake3(
                                   //   oracle's own identity
     ruleset_hash,                 // rule module sources in the graph, and component bytes
     config_hash,                  // severity, include/exclude, options
-    every (grammar_id, grammar_abi) in the registry, sorted and count-prefixed
+    every (grammar_id, grammar_digest) in the registry, sorted and count-prefixed
     file_relative_path,           // path gates exist — path is an input
     file_content_hash,            // blake3 of bytes
 )
@@ -635,7 +635,15 @@ Three things people get wrong here, all of which are silent-staleness bugs:
 
   **A rule's options reach the key as data, on the path that knows them.** That reads as obvious and was not true once: a `lanekeep.json` rule's options were interpolated into the generated entry module as a factory-call argument, and `Sandbox::eval_module` hands that module straight to the engine without going through the loader — so the loader, which is what `ruleset_hash` folds, never saw them. Editing `{"rule": "x", "options": {"limit": 1}}` to `{"limit": 2}` produced two identical keys and a warm run kept answering the previous configuration. The general fact is worth more than the instance: **a value that exists only in generated entry-module source is in neither hash.** A `lanekeep.config.ts` was unaffected, because its options live in the config module's own source, which the loader did read — which is also why every test of this property passed against the bug.
 - **Relative path belongs in the key.** Path gates make results path-sensitive; a moved file with identical bytes is not a cache hit.
-- **Grammar ABI belongs in the key.** A tree-sitter grammar bump changes node shapes and therefore query results.
+- **A grammar's shape belongs in the key.** A tree-sitter bump changes node kinds and field
+  names and therefore query results. The term is a digest of the shape the grammar exposes —
+  its ABI version, its node kinds with their named / visible / supertype flags, its field
+  names, its supertype list and its parse-state count — rather than the ABI version alone,
+  which could not see a regeneration within one ABI. Not the grammar's *declared* version:
+  `Language::metadata()` is `None` on any grammar built for an ABI below 15, which today is
+  both `typescript` and `tsx`. Not its bytes either, which tree-sitter's Rust API does not
+  expose — so a regeneration preserving every name and count is the one change this term
+  still cannot see.
 
 Suppressions live in the entry because directives are parsed during the per-file pass, and a reduce-phase violation may be reported at a site in a file that was not reprocessed this run. An entry without them would drop the directive and report a suppressed violation on the warm path.
 

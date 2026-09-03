@@ -128,4 +128,22 @@ mod tests {
             "four language crates ship a resolver; js registers three of the six languages"
         );
     }
+
+    /// Six registered grammars, six digests.
+    ///
+    /// The complement of the per-field test in `lanekeep-lang`: that one proves each input
+    /// reaches the hash, this one proves the real grammars differ in at least one of them.
+    /// Neither is enough alone — a digest that ignored every input would pass the first if it
+    /// were written against a constant, and would fail here.
+    #[test]
+    fn every_registered_grammar_has_its_own_digest() {
+        let mut digests: Vec<[u8; 32]> = registry()
+            .languages()
+            .map(|language| lanekeep_lang::grammar_digest(&language.grammar()))
+            .collect();
+        assert_eq!(digests.len(), 6, "six languages are registered");
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(digests.len(), 6, "two grammars share a digest");
+    }
 }
