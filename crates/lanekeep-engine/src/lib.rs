@@ -3238,8 +3238,8 @@ mod tests {
         let content = lanekeep_core::ContentHash::new([7; 32]);
         let real =
             run_key(b"ruleset", b"config", &real_grammars).expect("the runtime describes itself");
-        let zeroed = run_key(b"ruleset", b"config", &zeroed_grammars)
-            .expect("the runtime describes itself");
+        let zeroed =
+            run_key(b"ruleset", b"config", &zeroed_grammars).expect("the runtime describes itself");
 
         assert_ne!(
             real.for_file("src/a.ts", &content),
