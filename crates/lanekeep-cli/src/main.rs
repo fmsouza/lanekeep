@@ -91,9 +91,8 @@ enum Command {
         /// execution, which is what tells an author whether their query or their code is
         /// the problem. The second accounts for every discovered file: what each rule's
         /// gates rejected, what the cache served, and what the rule actually parsed — the
-        /// table to read when a rule reports nothing. A warm run answers the first and not
-        /// the second, since a cache hit precedes the content gates; pair it with
-        /// `--no-cache` when the gate columns are the question.
+        /// table to read when a rule reports nothing. Pair it with `--no-cache` when the
+        /// gate columns are the question.
         #[arg(long)]
         profile: bool,
 
@@ -464,10 +463,9 @@ fn write_profile(
 /// never reaches them.
 ///
 /// **Every sentence in it is conditioned on `cached: 0` and `parsed: 0`, and those
-/// conditions are the whole difficulty.** `cached: 0` because a warm row has `parsed: 0` for
-/// every rule alike and its largest other counter is `cached` itself, which the caveat above
-/// already explains; the cause-naming sentence must not fire there. Two earlier drafts keyed on "a large counter" instead and both accused a
-/// healthy rule, each time a rule that had *run*: this repository's own output has
+/// conditions are the whole difficulty.** Two earlier drafts keyed on "a large counter"
+/// instead and both accused a healthy rule, each time a rule that had *run*: this
+/// repository's own output has
 /// `lanekeep/no-circular-imports` at `lang-gated 156 / parsed 26`, reporting nothing with a
 /// correct `language` declaration, and `local/one-parser-per-file` at `content-gated 148 /
 /// parsed 34`, reporting nothing with a correct gate and thirty-four candidate files it
@@ -481,11 +479,11 @@ fn write_profile(
 /// The `cached` caveat is printed because it is the default path, and it says only that the
 /// columns right of `cached` are **incomplete** — never which of them go to zero, and never
 /// that two rules render alike. Five drafts tried to characterize the warm path and all five
-/// were false, each falsified by a different one of `check_file`'s return paths: a file no
-/// grammar claims, a file whose language no rule surviving the content gates declares, and a
-/// file that is not valid UTF-8 all get no cache entry, so they are re-attributed on every
-/// warm run forever. This repository's own second warm pass puts a `2` in `content-gated` or
-/// `lang-gated` in all seventeen rows, and which of the two differs by rule. "Incomplete" is
+/// were false: a file no grammar claims, a file whose language no rule surviving the content
+/// gates declares, and a file that is not valid UTF-8 all get no cache entry, so they are
+/// re-attributed on every warm run forever. This repository's own second warm pass puts a
+/// `2` in `content-gated` or `lang-gated` in all seventeen rows, and which of the two
+/// differs by rule. "Incomplete" is
 /// the claim that survives every corner, and it is the whole of what the reader has to act
 /// on: re-run with `--no-cache`.
 ///

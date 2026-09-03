@@ -638,14 +638,13 @@ impl std::fmt::Debug for Engine {
 /// before the read and before the cache is consulted at all.
 ///
 /// Deliberately no stronger claim than "incomplete". Saying *which* columns go to zero warm
-/// has been tried and falsified five times, each time by a different one of `check_file`'s
-/// return paths: a file no grammar claims, a file whose language no rule surviving the
-/// content gates declares, and a file that is not valid UTF-8 are all `skipped` rather than
-/// given a cache entry, so every warm run re-attributes them for as long as the corpus holds
-/// them. Against this repository the second warm pass puts a `2` in `content_gated` or
-/// `language_gated` in all seventeen rows — and which of the two it lands in differs by rule,
-/// so "identical rows warm" is false as well. The reconciliation above is what still holds
-/// warm: the six counters sum to `files_discovered` in every state.
+/// has been tried and falsified five times: a file no grammar claims, a file whose language
+/// no rule surviving the content gates declares, and a file that is not valid UTF-8 are all
+/// `skipped` rather than given a cache entry, so every warm run re-attributes them for as
+/// long as the corpus holds them. Against this repository the second warm pass puts a `2` in
+/// `content_gated` or `language_gated` in all seventeen rows — and which of the two it lands
+/// in differs by rule, so "identical rows warm" is false as well. The reconciliation above
+/// is what still holds warm: the six counters sum to `files_discovered` in every state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.

@@ -471,7 +471,7 @@ const GATES: &str = "\
  * than the query, which is sufficient rather than necessary: a rule whose handler filters
  * may gate far narrower and still be neutral. `--profile` prints, per rule, how many files
  * each gate rejected and how many the rule actually parsed, which is where a suspected gate
- * is settled — on a *cold* run. A nonzero `cached` means the columns to its right are
+ * is settled. A nonzero `cached` means the columns to its right are
  * incomplete for that run, since a cache hit returns before the content gates are consulted;
  * pair `--profile` with `--no-cache` to read them. `path-gated` is unaffected, because a path
  * gate runs before the cache is consulted at all.
