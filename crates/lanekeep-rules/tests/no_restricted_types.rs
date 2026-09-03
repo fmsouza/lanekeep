@@ -363,3 +363,204 @@ fn an_abstract_class_parameter_typed_number_is_still_reported() {
         )
         .expect("`amount` is money and money is not a number");
 }
+
+// --- typed members ---------------------------------------------------------------------
+//
+// Each shape is a matched pair, and the *reporting* half is the guard #201 asks for. A
+// regression to `ctx.types.typeOf(m.name)` — asking about the property identifier rather
+// than its annotation — makes the oracle answer `undefined`, which this rule turns into
+// silence. So every reporting test below fails on that regression and no separate fixture
+// would be stronger. The accepting halves alone would all pass against it.
+
+/// A class field, which is where money lives in most codebases.
+#[test]
+fn a_forbidden_primitive_on_a_class_field_is_reported() {
+    tester(MONEY)
+        .reports_at("class Order { amount: number }\n", &[(1, 15)])
+        .expect("a field is a governed value like any other");
+}
+
+#[test]
+fn the_required_type_on_a_class_field_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             class Order { amount: Decimal }\n",
+        )
+        .expect("a Decimal amount is what the convention asks for");
+}
+
+/// An interface member.
+#[test]
+fn a_forbidden_primitive_on_an_interface_member_is_reported() {
+    tester(MONEY)
+        .reports_at("interface Order { amount: number }\n", &[(1, 19)])
+        .expect("an interface member is a governed value");
+}
+
+#[test]
+fn the_required_type_on_an_interface_member_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             interface Order { amount: Decimal }\n",
+        )
+        .expect("a Decimal amount is what the convention asks for");
+}
+
+/// A type-alias member. The same grammar node as an interface member —
+/// `property_signature` — which is why one query clause covers both.
+#[test]
+fn a_forbidden_primitive_on_a_type_alias_member_is_reported() {
+    tester(MONEY)
+        .reports_at("type Order = { amount: number }\n", &[(1, 16)])
+        .expect("a type-alias member is a governed value");
+}
+
+#[test]
+fn the_required_type_on_a_type_alias_member_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             type Order = { amount: Decimal }\n",
+        )
+        .expect("a Decimal amount is what the convention asks for");
+}
+
+/// Modifiers do not change the node kind, so none of them hides a field.
+#[test]
+fn a_modifier_does_not_hide_a_class_field() {
+    for (source, column) in [
+        ("class Order { readonly amount: number }\n", 24_u32),
+        ("class Order { private amount: number }\n", 23),
+        ("class Order { static amount: number }\n", 22),
+        ("abstract class Order { abstract amount: number }\n", 33),
+        ("declare class Order { amount: number }\n", 23),
+        ("class Order { amount: number = 1 }\n", 15),
+    ] {
+        tester(MONEY)
+            .reports_at(source, &[(1, column)])
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+}
+
+/// An optional member is still a member.
+#[test]
+fn an_optional_interface_member_is_reported() {
+    tester(MONEY)
+        .reports_at("interface Order { amount?: number }\n", &[(1, 19)])
+        .expect("optional money is still money");
+}
+
+/// A union on a member is judged member-wise, the same as on a parameter.
+#[test]
+fn a_union_member_containing_a_forbidden_primitive_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "import { Decimal } from 'decimal.js';\n\
+             interface Order { amount: number | Decimal }\n",
+            &[(2, 19)],
+        )
+        .expect("`number | Decimal` can still be a bare number at run time");
+}
+
+/// And the silent half of that pair, which denies a rule reporting every union.
+#[test]
+fn a_union_member_with_no_forbidden_primitive_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             interface Order { amount: Decimal | undefined }\n",
+        )
+        .expect("optional money is not a forbidden primitive");
+}
+
+/// An inline object type is a `property_signature` wherever it appears, so this clause
+/// reaches further than interfaces. Asserted rather than left as a surprise.
+#[test]
+fn a_member_of_an_inline_object_type_is_reported() {
+    for (source, line, column) in [
+        ("function f(o: { amount: number }) { return o; }\n", 1_u32, 17_u32),
+        ("const o: { amount: number } = { amount: 1 };\n", 1, 12),
+        ("interface Order { inner: { amount: number } }\n", 1, 28),
+    ] {
+        tester(MONEY)
+            .reports_at(source, &[(line, column)])
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+}
+
+/// The destructured parameter from #201's list, covered only through its *annotation*.
+///
+/// The violation is anchored at the `amount` inside `{ amount: number }`, not at the binding
+/// in `{ amount }`. That is a true statement about the type literal and it is not the same
+/// thing as understanding destructuring, which is why the docs say which one it is.
+#[test]
+fn a_destructured_parameters_annotation_is_reported_at_the_type() {
+    tester(MONEY)
+        .reports_at(
+            "function f({ amount }: { amount: number }) { return amount; }\n",
+            &[(1, 26)],
+        )
+        .expect("the annotation declares a member named `amount` typed `number`");
+}
+
+// --- the boundary, asserted rather than only written down -------------------------------
+
+/// An unannotated field has no `type:` field for the query to capture.
+///
+/// Silent by construction rather than by the oracle's `undefined`. Typing it would mean
+/// reading the initializer, which is a capability the member path does not have.
+#[test]
+fn an_unannotated_class_field_is_not_a_candidate() {
+    tester(MONEY)
+        .accepts("class Order { amount = 1 }\n")
+        .expect("no annotation, no candidate");
+}
+
+/// An object literal's property is a `pair`, not a `property_signature`.
+#[test]
+fn an_object_literal_property_is_not_a_candidate() {
+    tester(MONEY)
+        .accepts("const o = { amount: 1 };\n")
+        .expect("an object literal types its initializer, which is a different claim");
+}
+
+/// A method signature and a function-typed property are both out of reach — the first is a
+/// different node kind, the second is a type the oracle says nothing about.
+#[test]
+fn a_method_or_function_typed_member_is_not_reported() {
+    for source in [
+        "interface Order { amount(): number }\n",
+        "interface Order { amount: () => number }\n",
+        "interface Order { [k: string]: number }\n",
+        "class Order { get amount(): number { return 1; } }\n",
+        "enum Order { amount = 1 }\n",
+    ] {
+        tester(MONEY)
+            .accepts(source)
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+}
+
+/// A string-literal key is a `string` node, not a `property_identifier`.
+#[test]
+fn a_string_literal_key_is_not_a_candidate() {
+    tester(MONEY)
+        .accepts("interface Order { 'amount': number }\n")
+        .expect("the query captures a property_identifier, which a string key is not");
+}
+
+/// And the generic members, which depend on Task 1's resolver fix.
+#[test]
+fn a_type_parameter_on_a_member_is_not_a_violation() {
+    for source in [
+        "interface Order<T> { amount: T }\n",
+        "type Order<T> = { amount: T };\n",
+        "abstract class Order<T> { abstract amount: T }\n",
+    ] {
+        tester(MONEY)
+            .accepts(source)
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+}

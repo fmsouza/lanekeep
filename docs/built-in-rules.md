@@ -276,24 +276,45 @@ as the worked example above does (`'*amount*'` and `'*Amount*'` together). **A p
 silently matches nothing is the worst outcome this rule has**: nothing throws, nothing warns, and
 the run reports clean exactly as if the convention were being enforced.
 
-### It looks at parameters and variable declarations, and nothing else
+### What counts as a governed value
 
-The query matches a plain identifier bound by a parameter or a `const`/`let`/`var` declarator —
-no wider. A class field, an interface or type-alias member, an object-literal property and a
-destructured parameter are different grammar shapes, and none of them is a candidate at all:
+Five grammar shapes are candidates: a required or optional function parameter, a
+`const`/`let`/`var` declarator, a class field, and a member of an interface, a type alias or an
+inline object type. The last three are one node kind — `property_signature` — so a member of
+`interface Order { … }`, of `type Order = { … }` and of an inline `{ amount: number }` written as
+a parameter's or a declarator's annotation are all governed on the same terms.
 
-```ts
-class Order {
-  amount: number // never a candidate — not a parameter, not a variable declarator
-}
-```
+Modifiers do not hide a field: `readonly`, `private`, `static`, `abstract` and a `declare class`
+body all report, as does a field carrying both an annotation and an initializer.
 
-This is not the naming weakness above wearing a different hat, and it is not bounded by the type
-oracle either: perfect naming and a perfect oracle still would not catch it, because the value is
-never asked about in the first place. **If a project's money lives in a class field, this rule's
-clean report means nothing** — a reader who has only been told that name matching is imperfect
-will draw the wrong conclusion about why. Reaching these shapes would be a wider query, not a fix
-to this one.
+A member is a candidate only when it is *annotated*. A class field written `amount = 1` has no
+type annotation to read, and typing it would mean reading the initializer — a different claim,
+and one the member path does not make.
+
+**Still not candidates**, each for its own reason:
+
+| Shape | Why not |
+| --- | --- |
+| `const o = { amount: 1 }` | an object literal's property types its *initializer*, not a declaration; whether a convention governs one at all is a separate question |
+| `function f({ amount }: { amount: number })` | the destructured *binding* is not read — see below |
+| `interface O { amount(): number }` | a method signature is a different node kind |
+| `interface O { amount: () => number }` | a function type is one the oracle says nothing about |
+| `interface O { [k: string]: number }` | an index signature names no property |
+| `interface O { 'amount': number }` | a string-literal key is not a `property_identifier` |
+| `enum O { amount = 1 }` | an enum member is a different node kind |
+| `class O { get amount(): number }` | a getter is a method, not a field |
+
+The destructured-parameter row deserves its exact statement, because it is half covered.
+`function f({ amount }: { amount: number })` **is** reported — but through its *annotation*, which
+is an inline object type, so the violation is anchored at the `amount` inside `{ amount: number }`
+rather than at the binding in `{ amount }`. That is a true statement about the type literal and it
+is not the same thing as understanding destructuring: `function f({ amount }: Money)` names its
+type elsewhere and is not reported at all.
+
+**A type parameter is not a forbidden primitive.** `interface Order<T> { amount: T }` is silent,
+because `T` is whatever the call site chose. That was not always true — the resolver did not see a
+type parameter declared on an interface, a type alias or an abstract class, so an outer
+`type Amount = number` answered instead and conforming code was reported.
 
 ### What it checks, and what it stays silent on
 
