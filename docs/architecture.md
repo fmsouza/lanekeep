@@ -148,7 +148,8 @@ pub trait Language {
     fn id(&self) -> &'static str;
     fn extensions(&self) -> &[&'static str];
     fn grammar(&self) -> tree_sitter::Language;
-    fn grammar_abi(&self) -> u16;
+    fn grammar_abi(&self) -> usize;
+    fn analysis_identity(&self) -> [u8; 32];
 
     /// Language-specific light semantics. JS resolves imports and
     /// local bindings; other languages may return Unsupported.
@@ -588,11 +589,12 @@ key = blake3(
                                   //   and anything bound beside that world
     wasm_compile_env_hash,        // how a component is compiled: wasmtime's own
                                   //   precompile-compatibility hash
-    analysis_hash,                // what the host analyses compute: the type
-                                  //   oracle's own identity
+    analysis_hash,                // what the host analyses compute: the type oracle's
+                                  //   own identity, the resolver core's, and every
+                                  //   registered language's
     ruleset_hash,                 // rule module sources in the graph, and component bytes
     config_hash,                  // severity, include/exclude, options
-    every (grammar_id, grammar_abi) in the registry, sorted and count-prefixed
+    every (grammar_id, grammar_digest) in the registry, sorted and count-prefixed
     file_relative_path,           // path gates exist — path is an input
     file_content_hash,            // blake3 of bytes
 )
@@ -610,7 +612,11 @@ Grammars enter the key as the **whole registry**, not the one language a given f
 
 It is a compilation environment and **not** a runtime, which is why it is not named one. Settings that live entirely host-side are outside it on purpose: the memory ceiling is enforced by a resource limiter the compiled code knows nothing about, and the epoch tick interval only changes *when* a breach is noticed. Those are budgets, and §6.8 already says a budget cancels a run rather than changing its answer — so neither belongs in a key.
 
-`analysis_hash` is what the host analyses compute — a third question with the same failure mode as the two above. It carries `lanekeep_types::oracle_identity()`, a digest over that crate's own sources taken at build time rather than hand-maintained: an oracle whose operator table, shadow check or recursion bound changes moves this field without anyone having to remember to bump anything, unlike `HOST_API_VERSION` beside it. Separate from `host_api_hash` for the same reason `wasm_compile_env_hash` already is: that field answers what a rule may *reach* — whether `ctx.types` exists at all — this one answers what it *says*, and folding the two together would leave a test unable to tell which one the key actually covers.
+`analysis_hash` is what the host analyses compute — a third question with the same failure mode as the two above. It carries `lanekeep_types::oracle_identity()` and every registered language's `analysis_identity()`, each a digest over that crate's own sources taken at build time rather than hand-maintained: an oracle whose operator table, shadow check or recursion bound changes moves this field, and so does a resolver whose scope list changes, without anyone having to remember to bump anything — unlike `HOST_API_VERSION` beside it. Separate from `host_api_hash` for the same reason `wasm_compile_env_hash` already is: that field answers what a rule may *reach* — whether `ctx.types` exists at all — this one answers what it *says*, and folding the two together would leave a test unable to tell which one the key actually covers.
+
+**The languages are in it because leaving them out was a real gap, not a hypothetical one.** For a while this field carried the oracle alone, and a language crate's `BindingResolver` — which decides where a name was declared, and which the oracle reads before it can type anything — reached no hash at all. Correcting `lanekeep-lang-js`'s scope list so that a type parameter declared on an interface, a type alias or an abstract class is visible changed what the oracle answered, from a confident `number` to nothing, with every cache key identical either way. `engine_version` is no backstop: it is major.minor deliberately, and a resolver fix is a patch release.
+
+Beside the per-language identities sits one fixed term, `lanekeep_lang::crate_identity()`: a digest over `crates/lanekeep-lang`'s own sources — `glob_matches`, `Binding::is_import_of`, `is_imported_from` and `BindingKind::as_str` — which is the code every language's resolver answers *through*, not a per-language concern. It has no `Language` impl to hang a method on and does not vary with which languages are registered, so it is folded once, beside the oracle's identity, rather than per language.
 
 Value: `{ violations, facts, suppressions, deps }`.
 
@@ -634,7 +640,15 @@ Three things people get wrong here, all of which are silent-staleness bugs:
 
   **A rule's options reach the key as data, on the path that knows them.** That reads as obvious and was not true once: a `lanekeep.json` rule's options were interpolated into the generated entry module as a factory-call argument, and `Sandbox::eval_module` hands that module straight to the engine without going through the loader — so the loader, which is what `ruleset_hash` folds, never saw them. Editing `{"rule": "x", "options": {"limit": 1}}` to `{"limit": 2}` produced two identical keys and a warm run kept answering the previous configuration. The general fact is worth more than the instance: **a value that exists only in generated entry-module source is in neither hash.** A `lanekeep.config.ts` was unaffected, because its options live in the config module's own source, which the loader did read — which is also why every test of this property passed against the bug.
 - **Relative path belongs in the key.** Path gates make results path-sensitive; a moved file with identical bytes is not a cache hit.
-- **Grammar ABI belongs in the key.** A tree-sitter grammar bump changes node shapes and therefore query results.
+- **A grammar's shape belongs in the key.** A tree-sitter bump changes node kinds and field
+  names and therefore query results. The term is a digest of the shape the grammar exposes —
+  its ABI version, its node kinds with their named / visible / supertype flags, its field
+  names, its supertype list and its parse-state count — rather than the ABI version alone,
+  which could not see a regeneration within one ABI. Not the grammar's *declared* version:
+  `Language::metadata()` is `None` on any grammar built for an ABI below 15, which today is
+  both `typescript` and `tsx`. Not its bytes either, which tree-sitter's Rust API does not
+  expose — so a regeneration preserving every name and count is the one change this term
+  still cannot see.
 
 Suppressions live in the entry because directives are parsed during the per-file pass, and a reduce-phase violation may be reported at a site in a file that was not reprocessed this run. An entry without them would drop the directive and report a suppressed violation on the warm path.
 

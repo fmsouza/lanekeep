@@ -31,6 +31,39 @@ const SCOPE_KINDS: &[&str] = &[
     "method_definition",
     "class_declaration",
     "class",
+    // Four more kinds that carry a `type_parameters` field. `tree-sitter-typescript`
+    // 0.23.2's `typescript/src/node-types.json` declares the field on eighteen node kinds
+    // (that is the count to read, not to measure from a hand sample — see below); eight
+    // were already above, and these four were not, so a type parameter declared on any of
+    // them was invisible and the walk escaped outward — exactly the failure the
+    // `type_parameters` arm below was written to fix for functions, still live for these.
+    // `type A = number; interface O<A> { x: A }` answered `number`.
+    //
+    // Six carriers remain missing: `abstract_method_signature`, `call_signature`,
+    // `construct_signature`, `constructor_type`, `function_type`, `method_signature`, tracked
+    // as lanekeep#208. All six also carry `parameters`, so each would widen
+    // parameter resolution the way `function_signature` does below, and each needs its own
+    // before/after measurement. Until then,
+    // `type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`,
+    // because `method_signature` carries the type parameters and `interface_declaration`
+    // does not.
+    //
+    // Do not derive this list from a hand-written parse sample: the first attempt at this
+    // fix did exactly that and reported twelve carriers, because the sample omitted every
+    // signature-shaped and type-shaped generic construct — a probe whose sample does not
+    // parse, or simply does not cover a construct, silently subtracts a kind, and there is
+    // no way to tell the difference between "not a carrier" and "not exercised" from the
+    // count alone. Reading `node-types.json`, where the field is declared, is the correct
+    // method; a sample can always be incomplete.
+    //
+    // `function_signature` is the one of the four that also carries `parameters`, so adding
+    // it makes an ambient function's parameters resolvable for the first time as well. That
+    // is a widening beyond the fix and it is wanted: `declare function credit(amount:
+    // number)` declares money as a number exactly as the non-ambient form does.
+    "abstract_class_declaration",
+    "interface_declaration",
+    "type_alias_declaration",
+    "function_signature",
     "catch_clause",
     "for_statement",
     "for_in_statement",
@@ -767,6 +800,75 @@ mod tests {
             "type A = number;\nfunction f(x: A) { return x; }",
             "A"
         ));
+    }
+
+    // --- the four declaration kinds that carry `type_parameters` and were not scopes -----
+    //
+    // `tree-sitter-typescript` 0.23.2's `typescript/src/node-types.json` declares
+    // `type_parameters` on eighteen node kinds; eight were already in `SCOPE_KINDS`, and
+    // these four were not, so a type parameter declared on any of them was invisible and
+    // the scope walk escaped outward — the exact failure the `type_parameters` arm was
+    // written to fix for functions. Six carriers remain missing (see `SCOPE_KINDS`'s own
+    // comment for the names and why); this task covers only the four below.
+    //
+    // The sources are the same four in all three tests, deliberately. Splitting them across
+    // tests would let one kind be covered in one direction and not the other, which is how
+    // `class` came to be right and `abstract class` wrong in the first place.
+
+    /// Each of the four binds its type parameter rather than letting the walk escape.
+    #[test]
+    fn a_type_parameter_binds_on_every_declaration_kind_that_can_declare_one() {
+        for source in [
+            "type A = number;\ninterface O<A> { x: A }",
+            "type A = number;\ntype O<A> = { x: A };",
+            "type A = number;\nabstract class C<A> { m(x: A) { return x; } }",
+            "type A = number;\ndeclare function f<A>(x: A): void;",
+        ] {
+            assert_eq!(
+                resolve_use(source, "A"),
+                Some(Binding::Local(BindingKind::TypeParam)),
+                "{source}"
+            );
+            assert_eq!(
+                declaration_use(source, "A"),
+                Some("type_parameter".to_owned()),
+                "{source}"
+            );
+        }
+    }
+
+    /// And shadows the outer alias rather than merely coexisting with it.
+    #[test]
+    fn a_type_parameter_on_those_kinds_shadows_an_outer_alias() {
+        for source in [
+            "type A = number;\ninterface O<A> { x: A }",
+            "type A = number;\ntype O<A> = { x: A };",
+            "type A = number;\nabstract class C<A> { m(x: A) { return x; } }",
+            "type A = number;\ndeclare function f<A>(x: A): void;",
+        ] {
+            assert!(shadowed(source, "A"), "{source}");
+        }
+    }
+
+    /// The half that keeps the fix from over-reaching.
+    ///
+    /// With no type parameter to shadow it, an outer alias is still what the annotation
+    /// resolves to. Without this, a fix that made these kinds swallow every name would pass
+    /// both tests above.
+    #[test]
+    fn without_a_type_parameter_the_outer_alias_still_answers() {
+        for source in [
+            "type A = number;\ninterface O { x: A }",
+            "type A = number;\ntype O = { x: A };",
+            "type A = number;\nabstract class C { m(x: A) { return x; } }",
+            "type A = number;\ndeclare function f(x: A): void;",
+        ] {
+            assert_eq!(
+                declaration_use(source, "A"),
+                Some("type_alias_declaration".to_owned()),
+                "{source}"
+            );
+        }
     }
 
     #[test]

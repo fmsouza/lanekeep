@@ -26,6 +26,21 @@ use crate::binding::GoBindingResolver;
 static RESOLVER: std::sync::LazyLock<Arc<dyn BindingResolver>> =
     std::sync::LazyLock::new(|| Arc::new(GoBindingResolver));
 
+/// What this crate's analysis *is*, as a digest of every source file that decides an answer.
+///
+/// A cache key input, returned by every [`Language`] this crate registers. Derived by
+/// `build.rs` from a walk over `src/` rather than hand-maintained: the alternative is a list
+/// of files somebody has to remember to extend, and nothing detects a missed entry.
+///
+/// Shared by every language this crate registers, which is correct — they share one resolver,
+/// so a change to it changes what all of them answer.
+#[must_use]
+pub fn analysis_identity() -> [u8; 32] {
+    // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot be
+    // a silent gap.
+    lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_GO_ANALYSIS_HASH"))
+}
+
 /// Go: `.go`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Go;
@@ -47,6 +62,10 @@ impl Language for Go {
 
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_go::LANGUAGE.into()
+    }
+
+    fn analysis_identity(&self) -> [u8; 32] {
+        analysis_identity()
     }
 }
 

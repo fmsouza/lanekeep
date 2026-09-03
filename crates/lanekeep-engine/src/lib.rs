@@ -805,7 +805,10 @@ impl Engine {
         clippy::too_many_lines,
         reason = "the per-language query compile loop belongs here — a broken query surfaces \
                   at prepare time, naming its rule — and extracting it would move that \
-                  diagnostic away from the place it is reported"
+                  diagnostic away from the place it is reported. Briefly unfulfilled while \
+                  `grammar_keys` and `analysis_keys` were extracted out of this function and \
+                  before the cache-key terms they serve were wired in; the loop is what keeps \
+                  it long, and that has not changed"
     )]
     pub fn prepare(
         config: &Config,
@@ -936,18 +939,15 @@ impl Engine {
         let loader = ComponentLoader::for_project_root(project_root);
         let components = load_components(&mut rules, &loader)?;
 
-        // Every registered grammar, so a tree-sitter bump invalidates rather than silently
-        // reusing results computed against different node shapes.
-        let mut grammars: Vec<GrammarKey> = registry
-            .languages()
-            .map(|language| GrammarKey {
-                id: language.id().to_string(),
-                abi: u32::try_from(language.grammar_abi()).unwrap_or(u32::MAX),
-            })
-            .collect();
-        grammars.sort_by(|a, b| a.id.cmp(&b.id));
+        let grammars = grammar_keys(registry);
+        let languages = analysis_keys(registry);
 
-        let run_key = run_key(&config.ruleset_hash, &config.config_hash, &grammars)?;
+        let run_key = run_key(
+            &config.ruleset_hash,
+            &config.config_hash,
+            &grammars,
+            &languages,
+        )?;
 
         // On unless some rule's component carries bytes `ruleset_hash` never saw — see the
         // field. Vacuously true when there is no component at all, which keeps a TypeScript-only
@@ -3037,6 +3037,7 @@ fn run_key(
     ruleset_hash: &[u8],
     config_hash: &[u8],
     grammars: &[GrammarKey],
+    languages: &[(String, [u8; 32])],
 ) -> Result<RunKey, RunError> {
     let compile_env = lanekeep_wasm::compile_env_hash().map_err(|e| RunError::WasmRuntime {
         detail: e.to_string(),
@@ -3048,11 +3049,53 @@ fn run_key(
         engine_version(),
         &host_api_hash(),
         &compile_env,
-        &lanekeep_types::oracle_identity(),
+        &analysis_hash(languages),
         ruleset_hash,
         config_hash,
         grammars,
     ))
+}
+
+/// Every registered grammar, as the cache key sees it.
+///
+/// A function rather than an inline `map` so that a test can call the assembly the run actually
+/// uses. Built inline, a mutation putting `[0; 32]` here in place of the real digest was invisible:
+/// the key-level tests construct their own `GrammarKey`s, so they pass whatever this does.
+///
+/// The digest covers the ABI and the node kinds and fields a query is compiled against, so a
+/// tree-sitter bump invalidates — and so does a regeneration at an unchanged ABI, which the bare
+/// ABI version this used to carry could not see.
+///
+/// Sorted by id, so the key does not depend on registration order.
+fn grammar_keys(registry: &LanguageRegistry) -> Vec<GrammarKey> {
+    let mut grammars: Vec<GrammarKey> = registry
+        .languages()
+        .map(|language| GrammarKey {
+            id: language.id().to_string(),
+            digest: lanekeep_lang::grammar_digest(&language.grammar()),
+        })
+        .collect();
+    grammars.sort_by(|a, b| a.id.cmp(&b.id));
+    grammars
+}
+
+/// Every registered language's own analysis identity, as the cache key sees it.
+///
+/// A function rather than an inline `map`, symmetric with `grammar_keys` above and for the same
+/// reason: built inline beside its call site, a mutation putting `[0; 32]` here in place of the
+/// real identity was invisible, because the key-level tests construct their own
+/// `(String, [u8; 32])` pairs and pass whatever this does regardless.
+///
+/// `languages()` iterates a `BTreeMap` and is already documented as ordered by id, so this sort
+/// is not doing any work today — it is asserted rather than relied upon, the same insurance
+/// `grammar_keys` takes against a registration-order dependency.
+fn analysis_keys(registry: &LanguageRegistry) -> Vec<(String, [u8; 32])> {
+    let mut languages: Vec<(String, [u8; 32])> = registry
+        .languages()
+        .map(|language| (language.id().to_string(), language.analysis_identity()))
+        .collect();
+    languages.sort_by(|a, b| a.0.cmp(&b.0));
+    languages
 }
 
 /// Everything a rule may reach, from both engines, in one cache-key field.
@@ -3084,6 +3127,79 @@ fn fold_host_api(ctx_version: u32, wasm_world: &[u8]) -> [u8; 32] {
     hasher.update(&ctx_version.to_le_bytes());
     hasher.update(wasm_world);
     *hasher.finalize().as_bytes()
+}
+
+/// Everything the host analyses compute, in one cache-key field.
+///
+/// The type oracle's own identity, the language-resolution crate's own identity, and every
+/// registered language's. A language's resolver decides where a name was declared, which is
+/// what `ctx.bindingKind` and `ctx.resolvesToImport` answer with and what the oracle reads
+/// before it can type anything — so a result computed by a resolver that no longer exists is
+/// not a valid result for a run that has a different one.
+///
+/// **The oracle alone was the whole of this field until now, and the gap was not theoretical.**
+/// `oracle_identity` digests `crates/lanekeep-types/src/`, and the scope list deciding which
+/// nodes carry type parameters lives in `lanekeep-lang-js`. Correcting it changed what the
+/// oracle answered — `type Amount = number; interface O<Amount> { x: Amount }` went from
+/// `number` to nothing at all — while every hash stayed identical. `engine_version` is no
+/// backstop either: it is major.minor on purpose, and a resolver fix ships as a patch.
+///
+/// `lanekeep_lang::crate_identity()` is the resolver-core term: it digests
+/// `crates/lanekeep-lang`'s own sources — `glob_matches`, `Binding::is_import_of`,
+/// `is_imported_from` and `BindingKind::as_str` — which is the code every language's resolver
+/// answers *through*, not a per-language concern. It has no `Language` impl to hang a method
+/// on, and it does not vary with which languages are registered, so it is folded once, fixed,
+/// beside the oracle's identity, rather than per language.
+///
+/// Per language rather than per crate, because the registry is what knows which languages a run
+/// has. Three of the six share one identity, since `typescript`, `tsx` and `javascript` come
+/// from one crate and one resolver; the ids are what keep those three from folding to the same
+/// bytes as one.
+fn analysis_hash(languages: &[(String, [u8; 32])]) -> [u8; 32] {
+    fold_analysis(
+        &lanekeep_types::oracle_identity(),
+        &lanekeep_lang::crate_identity(),
+        languages,
+    )
+}
+
+/// The fold, separated from its inputs so a test can vary them.
+///
+/// `oracle_identity()`, `crate_identity()` and every `analysis_identity()` are derived at build
+/// time, so none of them can be moved in a test against the real function — and "every
+/// language's identity is in the key" is exactly the claim that is worth nothing unasserted.
+/// Same reasoning, and the same shape, as `fold_host_api` above.
+fn fold_analysis(
+    oracle: &[u8],
+    resolver_core: &[u8],
+    languages: &[(String, [u8; 32])],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lanekeep-analysis");
+    // Length-prefixed throughout. `oracle` and `resolver_core` are the only two adjacent
+    // variable-length fields in this fold — every other field is either a fixed 32-byte
+    // identity or itself the count prefix — so they are the one adjacency an unprefixed
+    // concatenation could actually collide on: `"oracle"` + `"resolver-core"` and
+    // `"oracleresolver"` + `"-core"` concatenate to the identical `"oracleresolver-core"`.
+    analysis_field(&mut hasher, oracle);
+    analysis_field(&mut hasher, resolver_core);
+    analysis_field(
+        &mut hasher,
+        &u64::try_from(languages.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for (id, identity) in languages {
+        analysis_field(&mut hasher, id.as_bytes());
+        analysis_field(&mut hasher, identity);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// One length-prefixed field of the analysis fold.
+fn analysis_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
 }
 
 /// The engine version a cache key uses: major.minor only.
@@ -3161,6 +3277,120 @@ mod tests {
     }
 
     #[test]
+    fn a_languages_analysis_identity_reaches_the_analysis_fold() {
+        // The claim the whole term exists for: change a resolver, get a different key. It
+        // cannot be asserted against the real function, because `oracle_identity` and every
+        // `analysis_identity` are derived at build time and none of them can be moved from a
+        // test — which is exactly why the fold is separated from its inputs, the same
+        // reasoning `fold_host_api` beside it already uses.
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [2; 32])],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn the_oracle_identity_reaches_the_analysis_fold() {
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"different-oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn a_resolver_cores_identity_reaches_the_analysis_fold() {
+        // `lanekeep_lang::crate_identity()` covers the code every language's resolver answers
+        // through — `glob_matches`, `is_import_of`, `is_imported_from`, `BindingKind::as_str` —
+        // and it is fixed rather than per language, so it needs its own discriminating case.
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core-one",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"oracle",
+            b"resolver-core-two",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn a_languages_id_reaches_the_analysis_fold() {
+        // Two languages with one shared identity is the ordinary case — `typescript`, `tsx`
+        // and `javascript` all come from one crate — so the ids are what distinguish a
+        // registry of three from a registry of two.
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(b"oracle", b"resolver-core", &[("tsx".to_owned(), [1; 32])]);
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn adding_a_language_changes_the_analysis_fold() {
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[
+                ("typescript".to_owned(), [1; 32]),
+                ("tsx".to_owned(), [1; 32]),
+            ],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn analysis_fold_fields_cannot_run_together() {
+        // The reason every field is length-prefixed. `oracle` and `resolver_core` are the only
+        // two adjacent variable-length fields in this fold — every language entry's identity is
+        // a fixed 32 bytes, so an id/identity boundary cannot shift the way two arbitrary byte
+        // strings can. Unprefixed, `"oracle"` + `"resolver-core"` and `"oracleresolver"` +
+        // `"-core"` concatenate to the identical `"oracleresolver-core"`; prefixed, they must
+        // differ.
+        let one = fold_analysis(b"oracle", b"resolver-core", &[]);
+        let two = fold_analysis(b"oracleresolver", b"-core", &[]);
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn the_analysis_fold_reads_the_real_oracle_and_the_real_languages() {
+        // The fold is only worth testing if the shipped call feeds it the shipped values. A
+        // hash derived correctly and then not passed is the same stale-answer bug as one that
+        // is never derived.
+        let languages = [("typescript".to_owned(), [3; 32])];
+        assert_eq!(
+            analysis_hash(&languages),
+            fold_analysis(
+                &lanekeep_types::oracle_identity(),
+                &lanekeep_lang::crate_identity(),
+                &languages
+            )
+        );
+    }
+
+    #[test]
     fn the_two_wasm_inputs_reach_a_real_runs_key() {
         // Both of the new fields, asserted at the place they are assembled rather than at
         // `RunKey`'s door. A hash that is derived correctly and then not passed is the same
@@ -3168,10 +3398,12 @@ mod tests {
         // pass against exactly that.
         let grammars = [GrammarKey {
             id: "typescript".to_owned(),
-            abi: 15,
+            digest: [15; 32],
         }];
+        let languages = [("typescript".to_owned(), [3; 32])];
         let content = lanekeep_core::ContentHash::new([7; 32]);
-        let real = run_key(b"ruleset", b"config", &grammars).expect("the runtime describes itself");
+        let real = run_key(b"ruleset", b"config", &grammars, &languages)
+            .expect("the runtime describes itself");
 
         for (label, host_api, compile_env) in [
             (
@@ -3191,7 +3423,7 @@ mod tests {
                 engine_version(),
                 &host_api,
                 &compile_env,
-                &lanekeep_types::oracle_identity(),
+                &analysis_hash(&languages),
                 b"ruleset",
                 b"config",
                 &grammars,
@@ -3202,6 +3434,65 @@ mod tests {
                 "{label} must reach the key a run actually files results under"
             );
         }
+    }
+
+    #[test]
+    fn a_grammars_real_digest_reaches_a_real_runs_key() {
+        // Denies a digest computed correctly by `GrammarShape::digest` and then not passed into
+        // the key. `grammar_keys` is called here rather than reconstructed, which is the whole
+        // point: a version of it returning `[0; 32]` leaves `the_two_wasm_inputs_reach_a_real_runs_key`
+        // and `every_registered_grammar_has_its_own_digest` (in `lanekeep-languages`) both green,
+        // because both construct their own `GrammarKey`s rather than calling this assembly, and
+        // fails only here.
+        let real_grammars = grammar_keys(&lanekeep_languages::registry());
+        let zeroed_grammars: Vec<GrammarKey> = real_grammars
+            .iter()
+            .map(|grammar| GrammarKey {
+                id: grammar.id.clone(),
+                digest: [0; 32],
+            })
+            .collect();
+
+        let languages = [("typescript".to_owned(), [3; 32])];
+        let content = lanekeep_core::ContentHash::new([7; 32]);
+        let real = run_key(b"ruleset", b"config", &real_grammars, &languages)
+            .expect("the runtime describes itself");
+        let zeroed = run_key(b"ruleset", b"config", &zeroed_grammars, &languages)
+            .expect("the runtime describes itself");
+
+        assert_ne!(
+            real.for_file("src/a.ts", &content),
+            zeroed.for_file("src/a.ts", &content),
+            "a grammar's real digest must reach the key a run actually files results under"
+        );
+    }
+
+    #[test]
+    fn a_languages_real_analysis_identity_reaches_a_real_runs_key() {
+        // The mirror of the test above, for `analysis_keys` rather than `grammar_keys`. Built
+        // inline at the call site, a mutation returning `[0; 32]` in place of
+        // `language.analysis_identity()` was invisible: every other test here constructs its
+        // own `(String, [u8; 32])` pairs rather than calling this assembly, so none of them
+        // would have caught it. `analysis_keys` is called here, not reconstructed, for the same
+        // reason `grammar_keys` is called above rather than rebuilt.
+        let real_grammars = grammar_keys(&lanekeep_languages::registry());
+        let real_languages = analysis_keys(&lanekeep_languages::registry());
+        let zeroed_languages: Vec<(String, [u8; 32])> = real_languages
+            .iter()
+            .map(|(id, _)| (id.clone(), [0; 32]))
+            .collect();
+
+        let content = lanekeep_core::ContentHash::new([7; 32]);
+        let real = run_key(b"ruleset", b"config", &real_grammars, &real_languages)
+            .expect("the runtime describes itself");
+        let zeroed = run_key(b"ruleset", b"config", &real_grammars, &zeroed_languages)
+            .expect("the runtime describes itself");
+
+        assert_ne!(
+            real.for_file("src/a.ts", &content),
+            zeroed.for_file("src/a.ts", &content),
+            "a language's real analysis identity must reach the key a run actually files results under"
+        );
     }
 
     #[test]

@@ -322,6 +322,49 @@ you chose.
 the error is exactly that, "this pattern can never match", which is easy to read as "this
 node type does not exist". Check the grammar's child order before rewriting the node names.
 
+**Four of the eighteen node kinds that carry `type_parameters` were not scopes, and the wrong
+answer they produced was a confident one.** `SCOPE_KINDS` in `crates/lanekeep-lang-js/src/binding.rs`
+decides which nodes `declaration_entry` asks for that field. `tree-sitter-typescript` 0.23.2's
+`typescript/src/node-types.json` declares the field on eighteen kinds; eight were already scopes.
+`abstract_class_declaration`, `interface_declaration`, `type_alias_declaration` and
+`function_signature` were missing, so a type parameter declared on any of them was invisible, the
+scope walk escaped outward, and `type Amount = number; interface O<Amount> { x: Amount }` typed
+`x` as **`number`** — identical in every byte to a declared `number`, with nothing to say a type
+parameter had been passed over. `lanekeep/no-restricted-types` reported conforming code because of
+it, while the same program spelled `class` rather than `abstract class` was correctly silent.
+
+Six carriers are still missing: `abstract_method_signature`, `call_signature`,
+`construct_signature`, `constructor_type`, `function_type`, `method_signature`, tracked as
+[#208](https://github.com/fmsouza/lanekeep/issues/208). **All six also carry `parameters`**, so
+each would widen parameter resolution as `function_signature` did, and each needs its own
+before/after measurement. Until then,
+`type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`, because
+`method_signature` carries the type parameters and `interface_declaration` does not.
+
+This entry has now carried four wrong claims about its own subject, and they are worth listing
+because the shape repeats: nine carriers, then twelve, then "four of the six carry `parameters`",
+then a sentence grouping the six by where they appear. The first two came from parse samples that
+did not parse everything; the second two were simply asserted. Every one was caught by someone
+reading `node-types.json`, which is where the field is declared and where no sample can be
+incomplete.
+
+The fourth was deleted rather than corrected, and that is the remedy worth copying. Each wrong
+claim was a *characterization* — a grouping, a proportion, a total — that nothing depended on. What
+the entry needs is three facts: six remain, all six carry `parameters`, and the reproducer above.
+When a replacement for a false claim keeps coming back false, stop replacing it and cut it.
+
+The measurement is the part worth copying, and it is also where the first pass at this entry went
+wrong: it counted the carriers by walking a parse of a hand-written sample and asserting the
+sample produces zero `ERROR` nodes — the first attempt wrote `function<T>(a: T)` and
+`class<T> { }` without the space each needs, the grammar rejected both, three kinds silently
+vanished, and the count came back nine instead of the true eighteen. A later pass wrote a fuller
+sample and still landed on twelve, because it omitted every signature-shaped and type-shaped
+generic construct — the sample looked complete and was not, and nothing about a parse with zero
+`ERROR` nodes says the sample covers every construct. The set of missing kinds differs with the
+sample either way, which is exactly why a wrong total survives review. Read `node-types.json`,
+where the field is *declared*, instead: a source-of-truth listing cannot omit a kind by accident
+the way a hand-written sample can.
+
 **A raw control character in a rule's source reports a parse failure somewhere else.** A NUL
 written into a template literal made the stripper report an error at the enclosing
 `return`, twenty lines earlier, because that is where the outermost `ERROR` node starts.
@@ -1276,6 +1319,16 @@ that job pins four versions rather than one. And the warning: `go-maporder.wasm`
 fixture built by the same recipe, is byte-identical through 116 and 131, so **a fixture cannot
 stand in for this check** — only the real artifact is large enough for two optimizers to disagree
 about.
+
+**A grammar's declared version cannot identify it, because `metadata()` is `None` on the two
+grammars this repository reads most.** `tree_sitter::Language::metadata()` returns the version a
+grammar was generated with, and it is present only from ABI 15. Measured 2026-09-03 over the six
+registered languages: `go`, `javascript`, `python` and `rust` are ABI 15 and answer
+`Some((0, 25, 0))` or `Some((0, 24, 1))`; **`typescript` and `tsx` are ABI 14 and answer `None`**,
+as does `name()`. A cache term keyed on it would therefore be constant for TypeScript, which is
+the language every shipped rule targets. `crates/lanekeep-lang/src/grammar.rs` folds the shape the
+grammar exposes instead — node kinds, field names, supertypes and the three counts — which every
+ABI answers.
 
 ## What not to do
 

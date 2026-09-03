@@ -77,20 +77,37 @@ export default function noRestrictedTypes(options) {
       },
     },
 
+    // The three binding shapes ask about the *name*, because that path resolves through
+    // `declaration_of` and reads an initializer where there is no annotation — `const amount
+    // = 1` types as `number`. The two member shapes cannot: a property is not a binding, so
+    // the oracle has nothing to resolve and `typeOf` on the name answers `undefined`, which
+    // this rule turns into silence. They capture the annotation as well and ask about that.
+    //
+    // `property_signature` is the node kind for an interface member, a type-alias member and
+    // an inline object type alike, so one clause covers all three. A member with no `type:`
+    // field — `class Order { amount = 1 }` — matches neither clause and is not a candidate.
     query: `[
       (required_parameter pattern: (identifier) @name)
       (optional_parameter pattern: (identifier) @name)
       (variable_declarator name: (identifier) @name)
+      (public_field_definition name: (property_identifier) @name type: (type_annotation) @type)
+      (property_signature name: (property_identifier) @name type: (type_annotation) @type)
     ]`,
 
     check(ctx, m) {
       const name = ctx.text(m.name)
 
+      // `??` and never `||`. A node handle is an integer and the root's is `0`, so the
+      // ordinary JavaScript spelling would discard a legitimate handle. Nothing here can
+      // capture the root, and the operator is still the one that is correct for the type
+      // rather than for this instance.
+      const subject = m.type ?? m.name
+
       for (const convention of conventions) {
         const names = convention.names ?? []
         if (!names.some((pattern) => matches(pattern, name))) continue
 
-        const type = ctx.types.typeOf(m.name)
+        const type = ctx.types.typeOf(subject)
 
         // The contract this rule exists to demonstrate. `undefined` means the oracle could
         // not be sure, and reporting on it would accuse code it could not read. Silence
