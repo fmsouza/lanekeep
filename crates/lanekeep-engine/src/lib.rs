@@ -931,14 +931,7 @@ impl Engine {
         let components = load_components(&mut rules, &loader)?;
 
         let grammars = grammar_keys(registry);
-
-        // Every registered language's own analysis identity, beside its grammar. The grammar
-        // says what the parse tree looks like; this says what this build concludes about it.
-        let mut languages: Vec<(String, [u8; 32])> = registry
-            .languages()
-            .map(|language| (language.id().to_string(), language.analysis_identity()))
-            .collect();
-        languages.sort_by(|a, b| a.0.cmp(&b.0));
+        let languages = analysis_keys(registry);
 
         let run_key = run_key(
             &config.ruleset_hash,
@@ -3077,6 +3070,25 @@ fn grammar_keys(registry: &LanguageRegistry) -> Vec<GrammarKey> {
     grammars
 }
 
+/// Every registered language's own analysis identity, as the cache key sees it.
+///
+/// A function rather than an inline `map`, symmetric with `grammar_keys` above and for the same
+/// reason: built inline beside its call site, a mutation putting `[0; 32]` here in place of the
+/// real identity was invisible, because the key-level tests construct their own
+/// `(String, [u8; 32])` pairs and pass whatever this does regardless.
+///
+/// `languages()` iterates a `BTreeMap` and is already documented as ordered by id, so this sort
+/// is not doing any work today — it is asserted rather than relied upon, the same insurance
+/// `grammar_keys` takes against a registration-order dependency.
+fn analysis_keys(registry: &LanguageRegistry) -> Vec<(String, [u8; 32])> {
+    let mut languages: Vec<(String, [u8; 32])> = registry
+        .languages()
+        .map(|language| (language.id().to_string(), language.analysis_identity()))
+        .collect();
+    languages.sort_by(|a, b| a.0.cmp(&b.0));
+    languages
+}
+
 /// Everything a rule may reach, from both engines, in one cache-key field.
 ///
 /// This crate is where the two host surfaces meet, so it is where they are folded. QuickJS's
@@ -3155,8 +3167,11 @@ fn fold_analysis(
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-analysis");
-    // Length-prefixed throughout, so a registry of `("ab", d)` cannot fold to the same bytes
-    // as one of `("a", …)` followed by `("b", …)`.
+    // Length-prefixed throughout. `oracle` and `resolver_core` are the only two adjacent
+    // variable-length fields in this fold — every other field is either a fixed 32-byte
+    // identity or itself the count prefix — so they are the one adjacency an unprefixed
+    // concatenation could actually collide on: `"oracle"` + `"resolver-core"` and
+    // `"oracleresolver"` + `"-core"` concatenate to the identical `"oracleresolver-core"`.
     analysis_field(&mut hasher, oracle);
     analysis_field(&mut hasher, resolver_core);
     analysis_field(
@@ -3339,18 +3354,14 @@ mod tests {
 
     #[test]
     fn analysis_fold_fields_cannot_run_together() {
-        // The reason every part is length-prefixed. Without it an id of `ab` beside the next
-        // entry's `c` folds to the same bytes as `a` beside `bc`.
-        let one = fold_analysis(
-            b"oracle",
-            b"resolver-core",
-            &[("ab".to_owned(), [1; 32]), ("c".to_owned(), [1; 32])],
-        );
-        let two = fold_analysis(
-            b"oracle",
-            b"resolver-core",
-            &[("a".to_owned(), [1; 32]), ("bc".to_owned(), [1; 32])],
-        );
+        // The reason every field is length-prefixed. `oracle` and `resolver_core` are the only
+        // two adjacent variable-length fields in this fold — every language entry's identity is
+        // a fixed 32 bytes, so an id/identity boundary cannot shift the way two arbitrary byte
+        // strings can. Unprefixed, `"oracle"` + `"resolver-core"` and `"oracleresolver"` +
+        // `"-core"` concatenate to the identical `"oracleresolver-core"`; prefixed, they must
+        // differ.
+        let one = fold_analysis(b"oracle", b"resolver-core", &[]);
+        let two = fold_analysis(b"oracleresolver", b"-core", &[]);
         assert_ne!(one, two);
     }
 
@@ -3444,6 +3455,34 @@ mod tests {
             real.for_file("src/a.ts", &content),
             zeroed.for_file("src/a.ts", &content),
             "a grammar's real digest must reach the key a run actually files results under"
+        );
+    }
+
+    #[test]
+    fn a_languages_real_analysis_identity_reaches_a_real_runs_key() {
+        // The mirror of the test above, for `analysis_keys` rather than `grammar_keys`. Built
+        // inline at the call site, a mutation returning `[0; 32]` in place of
+        // `language.analysis_identity()` was invisible: every other test here constructs its
+        // own `(String, [u8; 32])` pairs rather than calling this assembly, so none of them
+        // would have caught it. `analysis_keys` is called here, not reconstructed, for the same
+        // reason `grammar_keys` is called above rather than rebuilt.
+        let real_grammars = grammar_keys(&lanekeep_languages::registry());
+        let real_languages = analysis_keys(&lanekeep_languages::registry());
+        let zeroed_languages: Vec<(String, [u8; 32])> = real_languages
+            .iter()
+            .map(|(id, _)| (id.clone(), [0; 32]))
+            .collect();
+
+        let content = lanekeep_core::ContentHash::new([7; 32]);
+        let real = run_key(b"ruleset", b"config", &real_grammars, &real_languages)
+            .expect("the runtime describes itself");
+        let zeroed = run_key(b"ruleset", b"config", &real_grammars, &zeroed_languages)
+            .expect("the runtime describes itself");
+
+        assert_ne!(
+            real.for_file("src/a.ts", &content),
+            zeroed.for_file("src/a.ts", &content),
+            "a language's real analysis identity must reach the key a run actually files results under"
         );
     }
 

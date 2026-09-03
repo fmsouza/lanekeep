@@ -590,7 +590,8 @@ key = blake3(
     wasm_compile_env_hash,        // how a component is compiled: wasmtime's own
                                   //   precompile-compatibility hash
     analysis_hash,                // what the host analyses compute: the type oracle's
-                                  //   own identity, and every registered language's
+                                  //   own identity, the resolver core's, and every
+                                  //   registered language's
     ruleset_hash,                 // rule module sources in the graph, and component bytes
     config_hash,                  // severity, include/exclude, options
     every (grammar_id, grammar_digest) in the registry, sorted and count-prefixed
