@@ -801,12 +801,6 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`RunError`] for an invalid query, gate, or language reference.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the per-language query compile loop belongs here — a broken query surfaces \
-                  at prepare time, naming its rule — and extracting it would move that \
-                  diagnostic away from the place it is reported"
-    )]
     pub fn prepare(
         config: &Config,
         project_root: &Path,
