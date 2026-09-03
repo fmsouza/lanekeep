@@ -91,7 +91,7 @@ lanekeep check --staged         # only what is about to be committed
 lanekeep check --since main     # only what changed against a ref
 lanekeep check --watch          # re-check on every change, until Ctrl-C
 lanekeep check --fix            # apply the safe fixes, report what is left
-lanekeep check --profile        # where the run spent its time, per rule
+lanekeep check --profile        # per rule: where the time went, and what it looked at
 lanekeep rules                  # what this project has configured
 lanekeep explain <rule-id>      # one rule's card, without opening its source
 lanekeep server                 # LSP for an editor, or --protocol mcp for an agent host

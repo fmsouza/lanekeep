@@ -187,8 +187,9 @@ export default defineRule({
     },
   },
 
-  // Evaluated in Rust before the file is read or parsed. Purely an optimization —
-  // omitting them changes nothing but speed.
+  // Evaluated in Rust before the file is read or parsed, and narrower than the query
+  // below — neutral anyway, because nothing the handler reports can occur in a file
+  // without `makeStyles` in it. Keeping that true is the author's job — §7.1.
   gates: {
     pathMatches: ['**/*.{ts,tsx}'],
     fileContains: ['makeStyles'],
@@ -552,7 +553,13 @@ Declared per rule under `gates`, evaluated in Rust:
 | `pathMatches` / `pathNotMatches` | No file read at all |
 | `fileContains` / `fileNotContains` | One read, substring scan via memchr. No parse. |
 
-The single largest lever available. A rule scoped to `makeStyles` skips parsing every file whose bytes do not contain that string. Gates are pure optimization — removing one changes results not at all, only speed.
+The single largest lever available. A rule scoped to `makeStyles` skips parsing every file whose bytes do not contain that string.
+
+**A gate is declared, not derived.** Nothing computes it from the rule's query and nothing checks the two against each other, so a file a gate rejects is a file the rule never runs on, and a violation there is never found.
+
+A gate is neutral when it admits every file the rule would have reported on. That is a condition on the author rather than a property the engine guarantees, and nothing here can check it — the reporting set is whatever the handler decides. The way to keep it safely is to keep each gate wider than the query it guards, which is **sufficient rather than necessary** and, unlike the condition itself, can be settled by reading. A rule whose handler filters may gate far narrower and still be neutral: §4's sample gates on `makeStyles` under a query matching a numeric property in *any* object literal, and is neutral because nothing it reports can occur in a file whose bytes lack that string.
+
+`fileContains` is where this is easiest to get wrong, because it is an *and*: a rule matching either of two tokens cannot express its gate as a list of both, since that rejects every file carrying only one, and the rule then reports nothing while looking perfectly healthy. When a gate is the suspect, `--profile`'s second table (§15) is where it is settled — it reports, per rule, how many of the discovered files each gate rejected and how many the rule actually parsed. A nonzero `cached` means the columns to its right are incomplete for that run, since a cache hit returns before the content gates are consulted — re-run with `--no-cache` to read them. `path-gated` is unaffected, because a path gate runs before the cache is consulted at all.
 
 ### 7.2 The query gate
 
@@ -1088,9 +1095,13 @@ So the two jobs are separated. The report prints every scenario against its budg
 
 The first is the cache's entire purpose, and it is the check that caught a warm run starting a QuickJS engine per worker. The second says a file selection must not cost more than no selection. The ceiling is not a budget — it is 75× the budget — and exists so an infinite loop or a quadratic blowup fails the job instead of running until the runner gives up.
 
-Instrumentation behind `--profile` only, reporting per-rule time split between query matching and handler execution — the split that tells an author whether their query or their code is the problem — plus the match count, which is the number §7.2's gate exists to keep small.
+Instrumentation behind `--profile` only, printing two tables. The first reports per-rule time split between query matching and handler execution — the split that tells an author whether their query or their code is the problem — plus the match count, which is the number §7.2's gate exists to keep small. The second reports, per rule, what became of every file discovery selected: how many its path gates rejected, how many went unread, how many the cache served, how many its content gates rejected, how many it never ran against because no grammar it declares parses them, and how many it actually parsed. Those six are mutually exclusive and sum to the discovered file count, which the table prints beneath them, so a row that fails to reconcile is visible rather than merely wrong. The fifth counter has two causes and the printed text names both: the file parses with a grammar the rule does not declare, or **no grammar claims its extension at all** — an `include` of `src/**/*` sweeping up Markdown puts every such file there for every rule, and no `language` declaration could move it. They share one counter because the second is a corpus-wide fact identical in every row, so a column for it would carry no per-rule signal.
 
-It goes to stderr, so `--profile --format json` still pipes a clean document, and it is sorted by total cost with the rule id breaking ties, so the table does not reorder between runs for reasons nobody can see. A rule that matched nothing still appears: its query ran on every file, and the rule whose query is expensive *and* matches nothing is the worst case there is.
+Both go to stderr, so `--profile --format json` still pipes a clean document. The time table is sorted by total cost with the rule id breaking ties; the gate table is sorted by rule id alone, because "what did this rule look at" is not a time question and ordering it by elapsed time would move rows for a reason unrelated to what they show. Neither reorders between runs over one corpus for reasons nobody can see. A rule that matched nothing still appears, and the gate table is what says why — on a cold run, since `cached` precedes the last three columns and a nonzero `cached` leaves them incomplete. Its query may have run on every file and found nothing — expensive *and* fruitless, the worst case there is. It may never have run at all, because a gate, the cache, or the absence of any grammar it declares took every file first. Or it ran on whatever survived and found nothing there, which is the ordinary shape for any gated rule. The time table cannot tell these apart, since all of them spell zero matches; `parsed` is the column that does.
+
+`parsed` is the column that carries the question: `parsed: 0` says the rule never ran, and only then does the largest of its other counters name what took the files. A counter covering most of the corpus beside a nonzero `parsed` is ordinary — measured at `d0e15fe`, `lanekeep/no-circular-imports` checks this repository at `lang-gated 156 / parsed 26` with a correct `language`, and `local/one-parser-per-file` at `content-gated 148 / parsed 34` with a correct gate.
+
+What the warm path leaves in those columns is deliberately *not* characterized beyond "incomplete". Files receive no cache entry — one no grammar claims, one whose language no rule surviving the content gates declares, one that is not valid UTF-8 — so each is re-attributed on every warm run for as long as it is in the corpus. Measured at `d0e15fe`, this repository's second consecutive warm pass carries a `2` in `content-gated` or `lang-gated` in all seventeen rows, and which of the two differs by rule.
 
 Off by default, because measuring costs a clock read per handler invocation and the warm path is the one place that matters most.
 

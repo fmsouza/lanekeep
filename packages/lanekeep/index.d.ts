@@ -81,7 +81,23 @@ export interface RuleCard {
   }
 }
 
-/** Cheap rejections applied before a file is read or parsed. */
+/**
+ * Cheap rejections applied before a file is read or parsed.
+ *
+ * A gate is declared, not derived: nothing here is computed from the rule's `query`, and
+ * nothing checks the two against each other. So a gate can change what the rule reports — a
+ * file it rejects is a file the rule never runs on, and a violation there is never found.
+ *
+ * A gate is neutral when it admits every file the rule would have reported on — yours to
+ * keep, and not something the engine can check. The safe way to keep it is to gate wider
+ * than the query, which is sufficient rather than necessary: a rule whose handler filters
+ * may gate far narrower and still be neutral. `--profile` prints, per rule, how many files
+ * each gate rejected and how many the rule actually parsed, which is where a suspected gate
+ * is settled. A nonzero `cached` means the columns to its right are
+ * incomplete for that run, since a cache hit returns before the content gates are consulted;
+ * pair `--profile` with `--no-cache` to read them. `path-gated` is unaffected, because a path
+ * gate runs before the cache is consulted at all.
+ */
 export interface Gates {
   /**
    * Glob patterns a file's path must match for the rule to consider it.

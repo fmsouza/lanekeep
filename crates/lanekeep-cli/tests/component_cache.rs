@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -70,9 +71,12 @@ impl Project {
     }
 
     /// Run `check --profile` and return the result. `--profile` is not the point of the
-    /// scenario; it is the observable, because a rule's id appears in its stderr table only for
-    /// a file whose gates and query actually ran this run — a cache hit returns before either,
-    /// so a component that never left `--profile`'s report is a component that did not execute.
+    /// scenario; it is the observable — the engine counts a cache hit against the rule it
+    /// would have consulted, so a rule's row still appears in stderr on a warm run, with
+    /// `query`, `handler` and `matches` all at zero. `zero_work_row` builds that exact row,
+    /// which distinguishes "the cache was read" from "the rule ran again and matched
+    /// nothing" (both would leave `matches` at zero) — see its own doc for what it does not
+    /// yet distinguish.
     fn check_profiled(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_lanekeep"))
             .arg("check")
@@ -141,6 +145,59 @@ fn describe(output: &Output) -> String {
     )
 }
 
+/// The exact row `write_profile` (`crates/lanekeep-cli/src/main.rs`) prints for a rule that
+/// did no work this run: zero query time, zero handler time, zero matches.
+///
+/// A cache hit returns before either gate is consulted a second time, so a cache-hit rule's
+/// `RuleTiming` for this run is `RuleTiming::default()` apart from the gate counters, which
+/// the *second* table renders and this one does not — `query`, `handler` and `matches` are
+/// exactly zero. Asserting on this exact row rather than on mere presence of the rule's id
+/// is what tells "the cache was read" apart from "the rule ran again and happened to match
+/// nothing" — a re-run rule's query and handler durations are not reliably nonzero on a
+/// fast, tiny fixture, so `matches == 0` alone would not distinguish the two.
+///
+/// It does **not**, on its own, tell "cached" apart from "gated out and never admitted":
+/// `write_profile` prints only `query`/`handler`/`total`/`matches`, so a rule the path or
+/// content gate rejected outright renders this identical row too — verified against the real
+/// binary. [`cached_count`] closes that gap by reading the gate table's `cached` column, and
+/// every warm assertion below pairs the two.
+fn zero_work_row(id: &str) -> String {
+    format!(
+        "  {:<40} {:>9.1?} {:>9.1?} {:>9.1?} {:>9}",
+        id,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        0
+    )
+}
+
+/// The `cached` counter for one rule, read from `write_gate_profile`'s table.
+///
+/// The gate table's third counter. Split on that table's own heading first, because the rule
+/// id also heads a row in the time table above it, and matched on the whole first token
+/// rather than a prefix so that one rule id being a prefix of another cannot read the wrong
+/// row — the same two hazards `gate_row` in `init_and_profile.rs` documents.
+///
+/// This is what makes a warm assertion here a claim about the *cache* rather than about idle
+/// work: [`zero_work_row`] renders identically for a rule the gates rejected outright, and
+/// only a nonzero `cached` says the file reached this rule and the cache answered for it.
+fn cached_count(stderr: &str, id: &str) -> u64 {
+    let table = stderr
+        .split("what each rule looked at")
+        .nth(1)
+        .expect("a gate profile table in stderr");
+    let line = table
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(id))
+        .expect("a gate-table row for the rule");
+    line.split_whitespace()
+        .nth(3)
+        .expect("a third counter in the row")
+        .parse()
+        .expect("a number")
+}
+
 /// A config naming one built-in TypeScript rule and one compiled component, in the one array a
 /// real `lanekeep.json` mixes them in — `lanekeep-config`'s `json::rules_module` doc calls this
 /// out as the case a placeholder index exists to keep sound.
@@ -205,9 +262,12 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
     );
 
     // Both rules ran on the cold pass: neither file could have been a cache hit before either
-    // rule's query had a chance to run once. `matches` is not asserted as a number — only that
-    // the row exists at all, which `a_rule_that_never_matched_still_appears`
-    // (`lanekeep-engine`) already establishes does not require a match, only that the query ran.
+    // rule's query had a chance to run once. `matches` is not asserted as a number — only
+    // that the row exists at all. That no longer shows "the query ran" by itself — a gated-
+    // out or otherwise-never-reached rule now gets a row too, per `write_profile`'s own
+    // table having no column yet for which of those a row's zeros mean — so this pair of
+    // assertions establishes only that this run did not silently drop either rule's row
+    // entirely, which the warm half below narrows further with `zero_work_row`.
     assert!(
         cold_stderr.contains("lanekeep/no-broad-except"),
         "the TypeScript rule's row is missing from a cold profile: {combined}"
@@ -230,16 +290,17 @@ fn a_component_backed_run_writes_and_reuses_its_cache() {
     // The proof that the second run actually *read* the cache rather than recomputing an
     // identical answer — which a correct uncached run would also produce, and which is exactly
     // the assertion the brief warns passes against this bug. `check_file` returns a cache hit
-    // before either rule's gates are consulted a second time, so neither rule's query ran, so
-    // neither rule's id was ever handed to `--profile` to report. Absence here is the whole
-    // claim; it cannot be produced by a slower recompute that happens to agree.
+    // before either rule's gates are consulted a second time, so neither rule's query ran and
+    // neither did any matching — but the engine now counts the hit itself, so each rule's row
+    // still appears, showing zero work rather than being absent. See `zero_work_row`'s doc for
+    // why a zero-work row is the stronger and more specific claim.
     assert!(
-        !warm_stderr.contains("fixture/metadata"),
-        "the component rule ran again on a warm pass — the cache was not read: {combined}"
+        warm_stderr.contains(&zero_work_row("fixture/metadata")),
+        "a cache hit must still show the component rule's row, with zero work: {combined}"
     );
     assert!(
-        !warm_stderr.contains("lanekeep/no-broad-except"),
-        "the TypeScript rule ran again on a warm pass — the cache was not read: {combined}"
+        warm_stderr.contains(&zero_work_row("lanekeep/no-broad-except")),
+        "a cache hit must still show the TypeScript rule's row, with zero work: {combined}"
     );
 }
 
@@ -285,9 +346,17 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     let warm = project.check_profiled();
     let warm_stderr = String::from_utf8_lossy(&warm.stderr).into_owned();
     assert!(
-        !warm_stderr.contains("fixture/metadata")
-            && !warm_stderr.contains("lanekeep/no-broad-except"),
-        "the second run over unchanged input should have been a full cache hit: {}",
+        cached_count(&warm_stderr, "fixture/metadata") > 0
+            && cached_count(&warm_stderr, "lanekeep/no-broad-except") > 0,
+        "the second run should have been served from the cache, not merely gated out — the \
+         zero rows below cannot tell those apart: {}",
+        describe(&warm)
+    );
+    assert!(
+        warm_stderr.contains(&zero_work_row("fixture/metadata"))
+            && warm_stderr.contains(&zero_work_row("lanekeep/no-broad-except")),
+        "the second run over unchanged input should have been a full cache hit — both rows \
+         should show zero work rather than being absent or re-run: {}",
         describe(&warm)
     );
 
@@ -308,13 +377,20 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     // The one assertion this test exists for. `caching` is a per-*run* flag — see
     // `Engine::caching`'s doc on why there is no finer granularity that is sound — so a moved
     // `ruleset_hash` invalidates every file's entry in this run, whether or not that file's own
-    // rule is the component that changed. Both rows have to reappear, not just the component's.
+    // rule is the component that changed. Both rows have to show real work, not just reappear:
+    // every rule now gets a row on every profiled run regardless of caching, so `contains(id)`
+    // alone would also pass a run that was actually a full cache hit — reverting the fold that
+    // puts a configured component's bytes into `ruleset_hash` is exactly that failure, and both
+    // `contains(id)` checks below would still pass against it. `!zero_work_row(id)` is the
+    // check that cannot: a genuine cache hit renders precisely that zero row (see
+    // `zero_work_row`'s doc), so its absence is what a real recompute — nonzero query, handler
+    // or matches — actually requires.
     assert!(
-        recomputed_stderr.contains("fixture/metadata"),
+        !recomputed_stderr.contains(&zero_work_row("fixture/metadata")),
         "the component did not run again after its own bytes changed: {combined}"
     );
     assert!(
-        recomputed_stderr.contains("lanekeep/no-broad-except"),
+        !recomputed_stderr.contains(&zero_work_row("lanekeep/no-broad-except")),
         "the TypeScript rule did not run again after the component's bytes changed — the \
          whole run's key should have moved, not just the changed rule's: {combined}"
     );
@@ -327,8 +403,14 @@ fn a_configured_components_bytes_changing_forces_a_recompute() {
     let combined = describe(&warm_again);
     let warm_again_stderr = String::from_utf8_lossy(&warm_again.stderr).into_owned();
     assert!(
-        !warm_again_stderr.contains("fixture/metadata")
-            && !warm_again_stderr.contains("lanekeep/no-broad-except"),
-        "the run after the recompute should have warmed on the new bytes: {combined}"
+        cached_count(&warm_again_stderr, "fixture/metadata") > 0
+            && cached_count(&warm_again_stderr, "lanekeep/no-broad-except") > 0,
+        "the run after the recompute should have been served from the cache: {combined}"
+    );
+    assert!(
+        warm_again_stderr.contains(&zero_work_row("fixture/metadata"))
+            && warm_again_stderr.contains(&zero_work_row("lanekeep/no-broad-except")),
+        "the run after the recompute should have warmed on the new bytes — both rows should \
+         show zero work: {combined}"
     );
 }
