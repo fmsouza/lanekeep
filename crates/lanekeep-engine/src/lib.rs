@@ -936,19 +936,7 @@ impl Engine {
         let loader = ComponentLoader::for_project_root(project_root);
         let components = load_components(&mut rules, &loader)?;
 
-        // Every registered grammar, so a tree-sitter bump invalidates rather than silently
-        // reusing results computed against different node shapes. The digest covers the ABI
-        // and the node kinds and fields a query is compiled against, so a regeneration at an
-        // unchanged ABI invalidates too — which the bare ABI version this used to carry could
-        // not see.
-        let mut grammars: Vec<GrammarKey> = registry
-            .languages()
-            .map(|language| GrammarKey {
-                id: language.id().to_string(),
-                digest: lanekeep_lang::grammar_digest(&language.grammar()),
-            })
-            .collect();
-        grammars.sort_by(|a, b| a.id.cmp(&b.id));
+        let grammars = grammar_keys(registry);
 
         let run_key = run_key(&config.ruleset_hash, &config.config_hash, &grammars)?;
 
@@ -3058,6 +3046,29 @@ fn run_key(
     ))
 }
 
+/// Every registered grammar, as the cache key sees it.
+///
+/// A function rather than an inline `map` so that a test can call the assembly the run actually
+/// uses. Built inline, a mutation putting `[0; 32]` here in place of the real digest was invisible:
+/// the key-level tests construct their own `GrammarKey`s, so they pass whatever this does.
+///
+/// The digest covers the ABI and the node kinds and fields a query is compiled against, so a
+/// tree-sitter bump invalidates — and so does a regeneration at an unchanged ABI, which the bare
+/// ABI version this used to carry could not see.
+///
+/// Sorted by id, so the key does not depend on registration order.
+fn grammar_keys(registry: &LanguageRegistry) -> Vec<GrammarKey> {
+    let mut grammars: Vec<GrammarKey> = registry
+        .languages()
+        .map(|language| GrammarKey {
+            id: language.id().to_string(),
+            digest: lanekeep_lang::grammar_digest(&language.grammar()),
+        })
+        .collect();
+    grammars.sort_by(|a, b| a.id.cmp(&b.id));
+    grammars
+}
+
 /// Everything a rule may reach, from both engines, in one cache-key field.
 ///
 /// This crate is where the two host surfaces meet, so it is where they are folded. QuickJS's
@@ -3209,20 +3220,13 @@ mod tests {
 
     #[test]
     fn a_grammars_real_digest_reaches_a_real_runs_key() {
-        // Denies exactly the gap the comment above names for the other two run-wide inputs: a
-        // digest computed correctly by `GrammarShape::digest` and then not passed into
-        // `RunKey` would leave every test here green, because `the_two_wasm_inputs_reach_a_real_runs_key`
-        // and `every_registered_grammar_has_its_own_digest` (in `lanekeep-languages`) both stop
-        // short of asserting that the *engine's own* assembly consumes the digest it computes.
-        // A `grammars` literal hardcoding `[0; 32]` in place of `grammar_digest(&language.grammar())`
-        // would pass both of those and only fail here.
-        let real_grammars: Vec<GrammarKey> = lanekeep_languages::registry()
-            .languages()
-            .map(|language| GrammarKey {
-                id: language.id().to_string(),
-                digest: lanekeep_lang::grammar_digest(&language.grammar()),
-            })
-            .collect();
+        // Denies a digest computed correctly by `GrammarShape::digest` and then not passed into
+        // the key. `grammar_keys` is called here rather than reconstructed, which is the whole
+        // point: a version of it returning `[0; 32]` leaves `the_two_wasm_inputs_reach_a_real_runs_key`
+        // and `every_registered_grammar_has_its_own_digest` (in `lanekeep-languages`) both green,
+        // because both construct their own `GrammarKey`s rather than calling this assembly, and
+        // fails only here.
+        let real_grammars = grammar_keys(&lanekeep_languages::registry());
         let zeroed_grammars: Vec<GrammarKey> = real_grammars
             .iter()
             .map(|grammar| GrammarKey {
