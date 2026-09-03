@@ -898,6 +898,7 @@ dependencies = [
 name = "lanekeep-lang-go"
 version = "0.8.1"
 dependencies = [
+ "blake3",
  "lanekeep-lang",
  "tree-sitter",
  "tree-sitter-go",
@@ -907,6 +908,7 @@ dependencies = [
 name = "lanekeep-lang-js"
 version = "0.8.1"
 dependencies = [
+ "blake3",
  "lanekeep-lang",
  "tree-sitter",
  "tree-sitter-javascript",
@@ -917,6 +919,7 @@ dependencies = [
 name = "lanekeep-lang-python"
 version = "0.8.1"
 dependencies = [
+ "blake3",
  "lanekeep-lang",
  "tree-sitter",
  "tree-sitter-python",
@@ -926,6 +929,7 @@ dependencies = [
 name = "lanekeep-lang-rust"
 version = "0.8.1"
 dependencies = [
+ "blake3",
  "lanekeep-lang",
  "tree-sitter",
  "tree-sitter-rust",
