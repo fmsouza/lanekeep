@@ -1,4 +1,8 @@
-//! Fold this crate's own sources into the digest `analysis_identity` returns.
+//! Fold this crate's own sources into the digest `crate_identity` returns.
+//!
+//! `crate_identity` and not `analysis_identity`, which is what the four language crates'
+//! copies of this script feed. This crate registers no language of its own, so its digest is
+//! a free function the key folds once rather than a trait method answered per language.
 //!
 //! A directory walk rather than a list of `include_str!` calls, for the reason
 //! `crates/lanekeep-types/build.rs` gives: a list is hand-maintained, and a file added but
@@ -6,8 +10,8 @@
 //! remove.
 //!
 //! Over-invalidating on purpose. Editing a comment in this crate discards every cached result
-//! that used its resolver, which costs a recompute; the opposite error serves an answer
-//! computed by code that no longer exists and gives no sign that it did.
+//! that used it, which costs a recompute; the opposite error serves an answer computed by
+//! code that no longer exists and gives no sign that it did.
 
 #![expect(
     clippy::expect_used,
