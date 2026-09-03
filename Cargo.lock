@@ -890,6 +890,7 @@ dependencies = [
 name = "lanekeep-lang"
 version = "0.8.1"
 dependencies = [
+ "blake3",
  "thiserror",
  "tree-sitter",
 ]
