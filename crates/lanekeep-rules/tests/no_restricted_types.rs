@@ -312,3 +312,54 @@ fn an_optional_parameter_is_reported_too() {
         )
         .expect("the optional_parameter clause captures amount just like the required one");
 }
+
+// --- the false positive this rule shipped with -----------------------------------------
+//
+// `abstract class` was not a scope in the JavaScript resolver, so a type parameter declared
+// on one was invisible and the walk escaped outward. The rule then reported conforming code,
+// and the plain-`class` spelling of the same program was correctly silent — a difference of
+// one keyword.
+//
+// Both halves are needed. The `accepts` half alone passes against a rule that reports
+// nothing at all; the `class` half is what says the abstract answer is the same answer and
+// not an accident.
+
+/// A type parameter is whatever the call site chose, so it is not a forbidden primitive.
+#[test]
+fn a_type_parameter_on_an_abstract_class_is_not_a_violation() {
+    tester(MONEY)
+        .accepts("abstract class O<T> { m(amount: T) { return amount; } }\n")
+        .expect("`T` is whatever the call site chose, not a number");
+}
+
+/// The same program in a plain class, which was always right.
+#[test]
+fn a_type_parameter_on_a_plain_class_is_not_a_violation() {
+    tester(MONEY)
+        .accepts("class O<T> { m(amount: T) { return amount; } }\n")
+        .expect("`T` is whatever the call site chose, not a number");
+}
+
+/// The shadowing spelling, where the wrong answer was a confident `number` rather than an
+/// unresolved nominal type.
+#[test]
+fn a_type_parameter_shadowing_an_alias_is_not_a_violation() {
+    tester(MONEY)
+        .accepts(
+            "type Amount = number;\n\
+             abstract class O<Amount> { m(amount: Amount) { return amount; } }\n",
+        )
+        .expect("the type parameter shadows the alias; the alias is not this value's type");
+}
+
+/// And the half that denies a rule which simply stopped reporting: the identical abstract
+/// class with no type parameter, whose `number` really is a `number`.
+#[test]
+fn an_abstract_class_parameter_typed_number_is_still_reported() {
+    tester(MONEY)
+        .reports_at(
+            "abstract class O { m(amount: number) { return amount; } }\n",
+            &[(1, 22)],
+        )
+        .expect("`amount` is money and money is not a number");
+}

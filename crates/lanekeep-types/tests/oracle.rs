@@ -847,3 +847,73 @@ fn two_runs_over_one_input_agree() {
     let other = format!("{:?}", type_of_last(source, "union_type"));
     assert_eq!(one, other);
 }
+
+// --- type parameters on declaration kinds that were not scopes ------------------------
+//
+// The oracle's half of the resolver fix in `lanekeep-lang-js`. These four kinds carry a
+// `type_parameters` field and were not in `SCOPE_KINDS`, so the walk escaped outward and an
+// outer alias of the same name answered instead. The result is worse than a missing answer:
+// it is a *confident* one, identical in every byte to a declared `number`, with nothing
+// anywhere to say a type parameter was passed over.
+
+/// A type parameter is whatever the call site chose, so the oracle says nothing about it.
+#[test]
+fn a_type_parameter_on_any_declaration_kind_gives_nothing() {
+    for source in [
+        "interface O<T> { x: T }",
+        "type O<T> = { x: T };",
+        "abstract class C<T> { abstract x: T }",
+        "declare function f<T>(x: T): void;",
+    ] {
+        assert_eq!(type_of_last(source, "type_annotation"), None, "{source}");
+    }
+}
+
+/// And it shadows an outer alias, which is the case that used to answer wrongly.
+///
+/// Distinct from the test above rather than a restatement of it. Without an alias in scope
+/// the old behavior produced `Nominal { name: "T", symbol: None }`, which a rule checking a
+/// `require` reports; with one it produced `Some(Primitive(Number))`, which a rule checking
+/// `forbid` reports. Two different wrong answers, and only the second is visible here.
+#[test]
+fn a_type_parameter_shadowing_an_alias_does_not_answer_with_the_alias() {
+    for source in [
+        "type A = number;\ninterface O<A> { x: A }",
+        "type A = number;\ntype O<A> = { x: A };",
+        "type A = number;\nabstract class C<A> { abstract x: A }",
+        "type A = number;\ndeclare function f<A>(x: A): void;",
+    ] {
+        assert_eq!(type_of_last(source, "type_annotation"), None, "{source}");
+    }
+}
+
+/// The must-not-move half: with no type parameter shadowing it, the alias still answers.
+#[test]
+fn without_a_type_parameter_a_member_still_reads_the_outer_alias() {
+    for source in [
+        "type A = number;\ninterface O { x: A }",
+        "type A = number;\ntype O = { x: A };",
+        "type A = number;\nabstract class C { abstract x: A }",
+    ] {
+        assert_eq!(
+            type_of_last(source, "type_annotation"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}
+
+/// `function_signature` also carries `parameters`, so making it a scope makes an ambient
+/// function's parameters resolvable for the first time.
+///
+/// A widening beyond the false-positive fix, and a deliberate one: `declare function
+/// credit(amount: number)` declares money as a `number` exactly as the non-ambient form
+/// does. Asserted here rather than left to be discovered by whoever notices
+/// `no-restricted-types` reporting a shape it used to pass over.
+#[test]
+fn an_ambient_functions_parameter_is_typed() {
+    assert_eq!(
+        type_of_last("declare function f(a: number): void;", "identifier"),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
