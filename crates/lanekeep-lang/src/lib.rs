@@ -92,6 +92,33 @@ pub trait Language: Send + Sync {
     fn grammar_abi(&self) -> usize {
         self.grammar().abi_version()
     }
+
+    /// What this language's own analysis code *is*, as a digest of the sources that decide
+    /// an answer.
+    ///
+    /// A cache key input, and a different question from [`Self::grammar_abi`] beside it: that
+    /// one says what the parse tree looks like, this one says what this crate concludes about
+    /// it. A language's [`binding::BindingResolver`] decides where a name was declared, which
+    /// is what `ctx.bindingKind` and `ctx.resolvesToImport` answer with and what the type
+    /// oracle reads — so a result computed by a resolver that no longer exists is not a valid
+    /// result for a run that has a different one.
+    ///
+    /// The gap this closes was not theoretical. `lanekeep_types::oracle_identity` was the
+    /// whole of the key's analysis term, and it digests `crates/lanekeep-types/src/` alone;
+    /// the scope list deciding which nodes carry type parameters lives in
+    /// `lanekeep-lang-js`, and correcting it moved what the oracle answered while every hash
+    /// stayed identical.
+    ///
+    /// Defaulted rather than required, matching [`Self::resolver`] and [`Self::grammar_abi`]:
+    /// this is published API and a required method would break every external implementor.
+    /// The gap that leaves — a language crate with a resolver and no build script — is closed
+    /// by a test in `lanekeep-languages` rather than by the compiler.
+    ///
+    /// Implementors derive this rather than writing it down. See any language crate's
+    /// `build.rs`.
+    fn analysis_identity(&self) -> [u8; 32] {
+        [0; 32]
+    }
 }
 
 /// Why a language could not be registered.
@@ -244,6 +271,41 @@ impl LanguageRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
+    }
+}
+
+/// Decode the 64-character lowercase hex a build script emitted into 32 bytes.
+///
+/// Every language crate's `build.rs` writes its digest as hex, because that is what a
+/// `cargo:rustc-env` value can carry. One decoder rather than one per crate: they would be
+/// identical, and a copy that drifts would produce a digest that is stable, wrong, and
+/// indistinguishable from a correct one.
+///
+/// Total rather than fallible. The only inputs are constants this workspace's own build
+/// scripts wrote, so there is no caller input to reject and nothing a caller could do about a
+/// malformed one; a digit outside `0-9a-f` reads as zero, and a string shorter than 64
+/// characters leaves the remaining bytes zero.
+#[must_use]
+pub fn decode_hex32(hex: &str) -> [u8; 32] {
+    let bytes = hex.as_bytes();
+    let mut out = [0_u8; 32];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let hi = index * 2;
+        let lo = hi + 1;
+        if lo >= bytes.len() {
+            break;
+        }
+        *slot = (hex_value(bytes[hi]) << 4) | hex_value(bytes[lo]);
+    }
+    out
+}
+
+/// One lowercase hex digit as a nibble, or zero for anything else.
+const fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => 0,
     }
 }
 
@@ -431,5 +493,23 @@ mod tests {
         assert_eq!(registry.len(), 0);
         assert!(registry.for_path("src/x.ts").is_none());
         assert!(registry.by_id("typescript").is_none());
+    }
+
+    #[test]
+    fn hex_decodes_to_the_bytes_it_spells() {
+        let mut expected = [0_u8; 32];
+        expected[0] = 0x0a;
+        expected[1] = 0xff;
+        expected[31] = 0x10;
+        let hex = format!("0aff{}10", "00".repeat(29));
+        assert_eq!(decode_hex32(&hex), expected);
+    }
+
+    /// A short or malformed string leaves zeros rather than panicking, which is what makes
+    /// this safe to call on a constant no caller supplied.
+    #[test]
+    fn a_malformed_hex_string_decodes_to_zeros() {
+        assert_eq!(decode_hex32(""), [0; 32]);
+        assert_eq!(decode_hex32("zz"), [0; 32]);
     }
 }

@@ -87,4 +87,45 @@ mod tests {
             );
         }
     }
+
+    /// Every registered language carries an identity, and it is derived rather than defaulted.
+    ///
+    /// This test is what stands in for a required trait method. `analysis_identity` has a
+    /// default of `[0; 32]`, because `Language` is published and `resolver` and `grammar_abi`
+    /// both set the precedent of a defaulted method — so nothing in the type system catches a
+    /// language crate that ships a resolver and no `build.rs`. This does, at the one place
+    /// that knows which languages exist.
+    #[test]
+    fn every_registered_language_has_a_derived_analysis_identity() {
+        for language in registry().languages() {
+            assert_ne!(
+                language.analysis_identity(),
+                [0; 32],
+                "{} returns the trait default, so its crate has no build script",
+                language.id().as_str()
+            );
+        }
+    }
+
+    /// And the identity is per *crate*, not per language.
+    ///
+    /// `typescript`, `tsx` and `javascript` all come from `lanekeep-lang-js` and share one
+    /// resolver, so they must share one identity; the other three crates contribute one each.
+    /// Asserting the count rather than only "nonzero" is what would catch every language
+    /// returning the same constant.
+    #[test]
+    fn the_analysis_identities_are_one_per_crate() {
+        let mut identities: Vec<[u8; 32]> = registry()
+            .languages()
+            .map(|language| language.analysis_identity())
+            .collect();
+        assert_eq!(identities.len(), 6, "six languages are registered");
+        identities.sort_unstable();
+        identities.dedup();
+        assert_eq!(
+            identities.len(),
+            4,
+            "four language crates ship a resolver; js registers three of the six languages"
+        );
+    }
 }

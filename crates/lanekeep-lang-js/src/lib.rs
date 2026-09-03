@@ -23,6 +23,21 @@ use crate::binding::JsBindingResolver;
 static RESOLVER: std::sync::LazyLock<Arc<dyn BindingResolver>> =
     std::sync::LazyLock::new(|| Arc::new(JsBindingResolver));
 
+/// What this crate's analysis *is*, as a digest of every source file that decides an answer.
+///
+/// A cache key input, returned by every [`Language`] this crate registers. Derived by
+/// `build.rs` from a walk over `src/` rather than hand-maintained: the alternative is a list
+/// of files somebody has to remember to extend, and nothing detects a missed entry.
+///
+/// Shared by every language this crate registers, which is correct — they share one resolver,
+/// so a change to it changes what all of them answer.
+#[must_use]
+pub fn analysis_identity() -> [u8; 32] {
+    // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot be
+    // a silent gap.
+    lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_JS_ANALYSIS_HASH"))
+}
+
 /// TypeScript without JSX: `.ts`, `.mts`, `.cts`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TypeScript;
@@ -52,6 +67,10 @@ impl Language for TypeScript {
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     }
+
+    fn analysis_identity(&self) -> [u8; 32] {
+        analysis_identity()
+    }
 }
 
 impl Language for Tsx {
@@ -69,6 +88,10 @@ impl Language for Tsx {
 
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_typescript::LANGUAGE_TSX.into()
+    }
+
+    fn analysis_identity(&self) -> [u8; 32] {
+        analysis_identity()
     }
 }
 
@@ -88,6 +111,10 @@ impl Language for JavaScript {
 
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_javascript::LANGUAGE.into()
+    }
+
+    fn analysis_identity(&self) -> [u8; 32] {
+        analysis_identity()
     }
 }
 

@@ -148,7 +148,8 @@ pub trait Language {
     fn id(&self) -> &'static str;
     fn extensions(&self) -> &[&'static str];
     fn grammar(&self) -> tree_sitter::Language;
-    fn grammar_abi(&self) -> u16;
+    fn grammar_abi(&self) -> usize;
+    fn analysis_identity(&self) -> [u8; 32];
 
     /// Language-specific light semantics. JS resolves imports and
     /// local bindings; other languages may return Unsupported.
