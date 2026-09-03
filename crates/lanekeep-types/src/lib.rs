@@ -51,30 +51,5 @@ pub use types::{Primitive, Symbol, Type};
 pub fn oracle_identity() -> [u8; 32] {
     // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot
     // be a silent gap.
-    const HEX: &str = env!("LANEKEEP_TYPES_ORACLE_HASH");
-
-    let mut out = [0_u8; 32];
-    let bytes = HEX.as_bytes();
-    for (index, slot) in out.iter_mut().enumerate() {
-        // `build.rs` emits exactly 64 lowercase hex characters, so the arithmetic below
-        // cannot go out of range and every digit parses. A malformed value would be a
-        // broken build rather than anything about a user's input.
-        let hi = hex_value(bytes[index * 2]);
-        let lo = hex_value(bytes[index * 2 + 1]);
-        *slot = (hi << 4) | lo;
-    }
-    out
-}
-
-/// One lowercase hex digit as a nibble, or zero for anything else.
-///
-/// Total rather than fallible on purpose: this reads a constant this crate's own build
-/// script wrote, so there is no input to reject and nothing a caller could do about a
-/// malformed one.
-const fn hex_value(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        _ => 0,
-    }
+    lanekeep_lang::decode_hex32(env!("LANEKEEP_TYPES_ORACLE_HASH"))
 }
