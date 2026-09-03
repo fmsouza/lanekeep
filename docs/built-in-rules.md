@@ -306,7 +306,7 @@ than from the shape being out of scope. Which of the two it is matters, because 
 | `class O { get amount(): number }` | a getter is a method, not a field | out of scope |
 | `class O { amount = 1 }` | no `type:` annotation for the query to capture | out of scope |
 | `interface O { amount: () => number }` | a function type is one the oracle says nothing about | **matched** — the handler runs and `typeOf` answers `undefined` |
-| `function f({ amount }: Money)` | the destructured *binding* is not read, and `Money` is named elsewhere | **matched** on the parameter — see below |
+| `function f({ amount }: Money)` | the destructured *binding* is not read, and `Money` is named elsewhere | out of scope — `{ amount }` is an `object_pattern`, not the `identifier` the parameter clause requires, and a bare `Money` holds no `property_signature` |
 
 The destructured parameter deserves its exact statement, because it is half covered.
 `function f({ amount }: { amount: number })` **is** reported — but through its *annotation*, which
