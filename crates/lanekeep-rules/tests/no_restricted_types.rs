@@ -480,7 +480,11 @@ fn a_union_member_with_no_forbidden_primitive_is_accepted() {
 #[test]
 fn a_member_of_an_inline_object_type_is_reported() {
     for (source, line, column) in [
-        ("function f(o: { amount: number }) { return o; }\n", 1_u32, 17_u32),
+        (
+            "function f(o: { amount: number }) { return o; }\n",
+            1_u32,
+            17_u32,
+        ),
         ("const o: { amount: number } = { amount: 1 };\n", 1, 12),
         ("interface Order { inner: { amount: number } }\n", 1, 28),
     ] {
