@@ -183,8 +183,8 @@ the policy stays the project's.
 
 A **factory**, for the same reason `no-restricted-imports` is one: the convention is the entire
 content of the rule, so an empty `conventions` list reports nothing at all. It looks at function
-parameters — required or optional — and variable declarations, and asks whether each one's name
-matches a convention's `names`.
+parameters — required or optional — variable declarations, class fields and typed members, and
+asks whether each one's name matches a convention's `names`.
 
 ```json
 {
@@ -291,25 +291,33 @@ A member is a candidate only when it is *annotated*. A class field written `amou
 type annotation to read, and typing it would mean reading the initializer — a different claim,
 and one the member path does not make.
 
-**Still not candidates**, each for its own reason:
+**Not reported**, each for its own reason. The heading is deliberately not "not candidates": two
+of these rows *are* candidates the query matches, and the silence comes from the oracle rather
+than from the shape being out of scope. Which of the two it is matters, because this rule treats
+`undefined` as a distinct and weaker guarantee everywhere else.
 
-| Shape | Why not |
-| --- | --- |
-| `const o = { amount: 1 }` | an object literal's property types its *initializer*, not a declaration; whether a convention governs one at all is a separate question |
-| `function f({ amount }: { amount: number })` | the destructured *binding* is not read — see below |
-| `interface O { amount(): number }` | a method signature is a different node kind |
-| `interface O { amount: () => number }` | a function type is one the oracle says nothing about |
-| `interface O { [k: string]: number }` | an index signature names no property |
-| `interface O { 'amount': number }` | a string-literal key is not a `property_identifier` |
-| `enum O { amount = 1 }` | an enum member is a different node kind |
-| `class O { get amount(): number }` | a getter is a method, not a field |
+| Shape | Why not | Out of scope, or silent? |
+| --- | --- | --- |
+| `const o = { amount: 1 }` | an object literal's property types its *initializer*, not a declaration; whether a convention governs one at all is a separate question | out of scope — a `pair`, not a `property_signature` |
+| `interface O { amount(): number }` | a method signature is a different node kind | out of scope |
+| `interface O { [k: string]: number }` | an index signature names no property | out of scope |
+| `interface O { 'amount': number }` | a string-literal key is not a `property_identifier` | out of scope |
+| `enum O { amount = 1 }` | an enum member is a different node kind | out of scope |
+| `class O { get amount(): number }` | a getter is a method, not a field | out of scope |
+| `class O { amount = 1 }` | no `type:` annotation for the query to capture | out of scope |
+| `interface O { amount: () => number }` | a function type is one the oracle says nothing about | **matched** — the handler runs and `typeOf` answers `undefined` |
+| `function f({ amount }: Money)` | the destructured *binding* is not read, and `Money` is named elsewhere | **matched** on the parameter — see below |
 
-The destructured-parameter row deserves its exact statement, because it is half covered.
+The destructured parameter deserves its exact statement, because it is half covered.
 `function f({ amount }: { amount: number })` **is** reported — but through its *annotation*, which
 is an inline object type, so the violation is anchored at the `amount` inside `{ amount: number }`
 rather than at the binding in `{ amount }`. That is a true statement about the type literal and it
-is not the same thing as understanding destructuring: `function f({ amount }: Money)` names its
-type elsewhere and is not reported at all.
+is not the same thing as understanding destructuring.
+
+`function f({ amount }: Money)` names its type elsewhere, so *that parameter* is not reported.
+The claim stops there and does not extend to the program: if `Money` is declared in the same file
+as `interface Money { amount: number }` or `type Money = { amount: number }`, that declaration is
+a candidate and does report — which is the whole point of covering members.
 
 **A type parameter is not a forbidden primitive.** `interface Order<T> { amount: T }` is silent,
 because `T` is whatever the call site chose. That was not always true — the resolver did not see a
@@ -377,9 +385,9 @@ conforms," and a reader who conflates the two is trusting a report that never lo
 
 ### It is one half of a pair
 
-`no-restricted-types` catches a *named* value — a parameter or a declarator whose name the
-convention governs. It cannot catch `new Decimal(parseFloat(row.amount))`, where nothing is
-named at all. `lanekeep/no-restricted-arguments`, below, selects by callee instead and catches
+`no-restricted-types` catches a *named* value — a parameter, a declarator, a class field or a
+typed member whose name the convention governs. It cannot catch
+`new Decimal(parseFloat(row.amount))`, where nothing is named at all. `lanekeep/no-restricted-arguments`, below, selects by callee instead and catches
 exactly that shape. Neither rule subsumes the other, and a project enforcing a convention like
 the money one above usually wants both.
 
@@ -524,9 +532,9 @@ which is a narrower claim than "no forbidden value reaches that callee".
 
 ### It is one half of a pair
 
-`no-restricted-types` catches a *named* value — a parameter or a declarator whose name the
-convention governs — and cannot see `new Decimal(parseFloat(row.amount))`, where nothing is
-named. This rule selects by callee and catches exactly that shape, and in return says nothing
+`no-restricted-types` catches a *named* value — a parameter, a declarator, a class field or a
+typed member whose name the convention governs — and cannot see
+`new Decimal(parseFloat(row.amount))`, where nothing is named. This rule selects by callee and catches exactly that shape, and in return says nothing
 about a `function credit(amount: number)` that never calls anything. Neither is a subset of the
 other, and a project enforcing a convention like the money one usually configures both, from the
 same `forbid` list.
