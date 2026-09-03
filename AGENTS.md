@@ -336,16 +336,21 @@ it, while the same program spelled `class` rather than `abstract class` was corr
 Six carriers are still missing: `abstract_method_signature`, `call_signature`,
 `construct_signature`, `constructor_type`, `function_type`, `method_signature`. A follow-up covers
 them. **All six also carry `parameters`**, so each would widen parameter resolution as
-`function_signature` did and each needs its own before/after measurement; four are members of a
-declaration or an interface body and two — `constructor_type` and `function_type` — appear only in
-type position. Until then, `type A = number; interface I { m<A>(x: A): void }` still types `x` as
-`number`, because `method_signature` carries the type parameters and `interface_declaration` does
-not.
+`function_signature` did, and each needs its own before/after measurement. Until then,
+`type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`, because
+`method_signature` carries the type parameters and `interface_declaration` does not.
 
-That "all six" is itself the third instance of this entry's own lesson, and the most embarrassing:
-the claim written here first said *four*, which was assumed rather than read, and the review that
-caught it read `node-types.json`. A parse sample undercounted the carriers, then an assumption
-undercounted the field — in the entry warning against exactly that.
+This entry has now carried four wrong claims about its own subject, and they are worth listing
+because the shape repeats: nine carriers, then twelve, then "four of the six carry `parameters`",
+then a sentence grouping the six by where they appear. The first two came from parse samples that
+did not parse everything; the second two were simply asserted. Every one was caught by someone
+reading `node-types.json`, which is where the field is declared and where no sample can be
+incomplete.
+
+The fourth was deleted rather than corrected, and that is the remedy worth copying. Each wrong
+claim was a *characterization* — a grouping, a proportion, a total — that nothing depended on. What
+the entry needs is three facts: six remain, all six carry `parameters`, and the reproducer above.
+When a replacement for a false claim keeps coming back false, stop replacing it and cut it.
 
 The measurement is the part worth copying, and it is also where the first pass at this entry went
 wrong: it counted the carriers by walking a parse of a hand-written sample and asserting the
