@@ -335,10 +335,17 @@ it, while the same program spelled `class` rather than `abstract class` was corr
 
 Six carriers are still missing: `abstract_method_signature`, `call_signature`,
 `construct_signature`, `constructor_type`, `function_type`, `method_signature`. A follow-up covers
-them — four also carry `parameters` and each needs its own before/after measurement the way
-`function_signature` got, and the other two are type-level and untested territory here. Until
-then, `type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`, because
-`method_signature` carries the type parameters and `interface_declaration` does not.
+them. **All six also carry `parameters`**, so each would widen parameter resolution as
+`function_signature` did and each needs its own before/after measurement; four are members of a
+declaration or an interface body and two — `constructor_type` and `function_type` — appear only in
+type position. Until then, `type A = number; interface I { m<A>(x: A): void }` still types `x` as
+`number`, because `method_signature` carries the type parameters and `interface_declaration` does
+not.
+
+That "all six" is itself the third instance of this entry's own lesson, and the most embarrassing:
+the claim written here first said *four*, which was assumed rather than read, and the review that
+caught it read `node-types.json`. A parse sample undercounted the carriers, then an assumption
+undercounted the field — in the entry warning against exactly that.
 
 The measurement is the part worth copying, and it is also where the first pass at this entry went
 wrong: it counted the carriers by walking a parse of a hand-written sample and asserting the

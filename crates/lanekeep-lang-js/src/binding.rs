@@ -41,12 +41,13 @@ const SCOPE_KINDS: &[&str] = &[
     //
     // Six carriers remain missing: `abstract_method_signature`, `call_signature`,
     // `construct_signature`, `constructor_type`, `function_type`, `method_signature`. A
-    // follow-up covers them; four also carry `parameters` and each needs its own
-    // before/after measurement the way `function_signature` got one below, and the other
-    // two are type-level and untested territory here. Until then,
-    // `type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`,
-    // because `method_signature` carries the type parameters and `interface_declaration`
-    // does not.
+    // follow-up covers them. All six also carry `parameters`, so each would widen
+    // parameter resolution the way `function_signature` does below, and each needs its own
+    // before/after measurement; four are members of a declaration or an interface body and
+    // two — `constructor_type` and `function_type` — appear only in type position. Until
+    // then, `type A = number; interface I { m<A>(x: A): void }` still types `x` as
+    // `number`, because `method_signature` carries the type parameters and
+    // `interface_declaration` does not.
     //
     // Do not derive this list from a hand-written parse sample: the first attempt at this
     // fix did exactly that and reported twelve carriers, because the sample omitted every
