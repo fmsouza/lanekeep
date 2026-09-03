@@ -33,9 +33,8 @@
 //! which is the combination that makes `node_kind_is_supertype` answer `true`. So that flag is
 //! live on ABI 14 and carries real information.
 //!
-//! Four of the five terms therefore move for those grammars: the node-kind names, their flags,
-//! the field names and the parse-state count. Enough to be strictly better than the bare ABI
-//! version this replaces; not enough to make every term here informative.
+//! Strictly better than the bare ABI version this replaces, then, and not every term here is
+//! informative for every grammar.
 
 use tree_sitter::Language;
 

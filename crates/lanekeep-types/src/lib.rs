@@ -44,9 +44,9 @@ pub use types::{Primitive, Symbol, Type};
 /// for the same reason — over-invalidation costs a recompute, under-invalidation reports a
 /// wrong answer and gives no sign that it did.
 ///
-/// The grammar is not folded in here. A run's cache key already carries every registered
-/// grammar and its ABI, so a TypeScript grammar bump invalidates through that term; hashing
-/// it twice would be one place too many.
+/// The grammar is not folded in here. A run's cache key already carries a structural digest of
+/// every registered grammar, so a TypeScript grammar bump invalidates through that term;
+/// hashing it twice would be one place too many.
 #[must_use]
 pub fn oracle_identity() -> [u8; 32] {
     // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot

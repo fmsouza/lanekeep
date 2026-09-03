@@ -84,9 +84,13 @@ pub trait Language: Send + Sync {
 
     /// The grammar's ABI version.
     ///
-    /// This is a cache key input. A grammar bump changes node shapes and therefore query
-    /// results, so an entry computed under a different ABI is not a valid entry — it would
-    /// serve results derived from a tree that no longer exists.
+    /// **No longer the cache key's term for the grammar**, and the doc said otherwise for a
+    /// while. The key folds [`grammar::grammar_digest`], which reads `abi_version()` off the
+    /// grammar itself along with the node kinds and fields — so the ABI still reaches the key,
+    /// through that digest rather than through this accessor. A grammar bump changes node
+    /// shapes and therefore query results, and the digest is what catches it.
+    ///
+    /// Kept because it is published API and answers a question callers legitimately ask.
     ///
     /// Read from the grammar rather than written down, or it stops tracking the thing it
     /// exists to track the first time someone forgets to update it. Note that bundled
@@ -99,9 +103,9 @@ pub trait Language: Send + Sync {
     /// What this language's own analysis code *is*, as a digest of the sources that decide
     /// an answer.
     ///
-    /// A cache key input, and a different question from [`Self::grammar_abi`] beside it: that
-    /// one says what the parse tree looks like, this one says what this crate concludes about
-    /// it. A language's [`binding::BindingResolver`] decides where a name was declared, which
+    /// A cache key input, and a different question from [`grammar::grammar_digest`]: that one
+    /// says what the parse tree looks like, this one says what this crate concludes about it.
+    /// A language's [`binding::BindingResolver`] decides where a name was declared, which
     /// is what `ctx.bindingKind` and `ctx.resolvesToImport` answer with and what the type
     /// oracle reads — so a result computed by a resolver that no longer exists is not a valid
     /// result for a run that has a different one.

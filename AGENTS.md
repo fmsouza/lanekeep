@@ -334,7 +334,7 @@ parameter had been passed over. `lanekeep/no-restricted-types` reported conformi
 it, while the same program spelled `class` rather than `abstract class` was correctly silent.
 
 Six carriers are still missing: `abstract_method_signature`, `call_signature`,
-`construct_signature`, `constructor_type`, `function_type`, `method_signature`. A follow-up covers
+`construct_signature`, `constructor_type`, `function_type`, `method_signature`. Nothing yet covers
 them. **All six also carry `parameters`**, so each would widen parameter resolution as
 `function_signature` did, and each needs its own before/after measurement. Until then,
 `type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`, because

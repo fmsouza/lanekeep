@@ -387,7 +387,8 @@ conforms," and a reader who conflates the two is trusting a report that never lo
 
 `no-restricted-types` catches a *named* value — a parameter, a declarator, a class field or a
 typed member whose name the convention governs. It cannot catch
-`new Decimal(parseFloat(row.amount))`, where nothing is named at all. `lanekeep/no-restricted-arguments`, below, selects by callee instead and catches
+`new Decimal(parseFloat(row.amount))`, where nothing is named at all.
+`lanekeep/no-restricted-arguments`, below, selects by callee instead and catches
 exactly that shape. Neither rule subsumes the other, and a project enforcing a convention like
 the money one above usually wants both.
 
@@ -534,7 +535,8 @@ which is a narrower claim than "no forbidden value reaches that callee".
 
 `no-restricted-types` catches a *named* value — a parameter, a declarator, a class field or a
 typed member whose name the convention governs — and cannot see
-`new Decimal(parseFloat(row.amount))`, where nothing is named. This rule selects by callee and catches exactly that shape, and in return says nothing
+`new Decimal(parseFloat(row.amount))`, where nothing is named. This rule selects by callee and
+catches exactly that shape, and in return says nothing
 about a `function credit(amount: number)` that never calls anything. Neither is a subset of the
 other, and a project enforcing a convention like the money one usually configures both, from the
 same `forbid` list.
