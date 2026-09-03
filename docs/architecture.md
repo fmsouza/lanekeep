@@ -589,8 +589,8 @@ key = blake3(
                                   //   and anything bound beside that world
     wasm_compile_env_hash,        // how a component is compiled: wasmtime's own
                                   //   precompile-compatibility hash
-    analysis_hash,                // what the host analyses compute: the type
-                                  //   oracle's own identity
+    analysis_hash,                // what the host analyses compute: the type oracle's
+                                  //   own identity, and every registered language's
     ruleset_hash,                 // rule module sources in the graph, and component bytes
     config_hash,                  // severity, include/exclude, options
     every (grammar_id, grammar_digest) in the registry, sorted and count-prefixed
@@ -611,7 +611,11 @@ Grammars enter the key as the **whole registry**, not the one language a given f
 
 It is a compilation environment and **not** a runtime, which is why it is not named one. Settings that live entirely host-side are outside it on purpose: the memory ceiling is enforced by a resource limiter the compiled code knows nothing about, and the epoch tick interval only changes *when* a breach is noticed. Those are budgets, and §6.8 already says a budget cancels a run rather than changing its answer — so neither belongs in a key.
 
-`analysis_hash` is what the host analyses compute — a third question with the same failure mode as the two above. It carries `lanekeep_types::oracle_identity()`, a digest over that crate's own sources taken at build time rather than hand-maintained: an oracle whose operator table, shadow check or recursion bound changes moves this field without anyone having to remember to bump anything, unlike `HOST_API_VERSION` beside it. Separate from `host_api_hash` for the same reason `wasm_compile_env_hash` already is: that field answers what a rule may *reach* — whether `ctx.types` exists at all — this one answers what it *says*, and folding the two together would leave a test unable to tell which one the key actually covers.
+`analysis_hash` is what the host analyses compute — a third question with the same failure mode as the two above. It carries `lanekeep_types::oracle_identity()` and every registered language's `analysis_identity()`, each a digest over that crate's own sources taken at build time rather than hand-maintained: an oracle whose operator table, shadow check or recursion bound changes moves this field, and so does a resolver whose scope list changes, without anyone having to remember to bump anything — unlike `HOST_API_VERSION` beside it. Separate from `host_api_hash` for the same reason `wasm_compile_env_hash` already is: that field answers what a rule may *reach* — whether `ctx.types` exists at all — this one answers what it *says*, and folding the two together would leave a test unable to tell which one the key actually covers.
+
+**The languages are in it because leaving them out was a real gap, not a hypothetical one.** For a while this field carried the oracle alone, and a language crate's `BindingResolver` — which decides where a name was declared, and which the oracle reads before it can type anything — reached no hash at all. Correcting `lanekeep-lang-js`'s scope list so that a type parameter declared on an interface, a type alias or an abstract class is visible changed what the oracle answered, from a confident `number` to nothing, with every cache key identical either way. `engine_version` is no backstop: it is major.minor deliberately, and a resolver fix is a patch release.
+
+Beside the per-language identities sits one fixed term, `lanekeep_lang::crate_identity()`: a digest over `crates/lanekeep-lang`'s own sources — `glob_matches`, `Binding::is_import_of`, `is_imported_from` and `BindingKind::as_str` — which is the code every language's resolver answers *through*, not a per-language concern. It has no `Language` impl to hang a method on and does not vary with which languages are registered, so it is folded once, beside the oracle's identity, rather than per language.
 
 Value: `{ violations, facts, suppressions, deps }`.
 
