@@ -3259,21 +3259,33 @@ function f() {
             let edges: usize = cfg.blocks().map(|(_, b)| b.successors.len()).sum();
             measurements.push((n, blocks, edges));
         }
+        // Measured against this fixture with the un-mutated builder: blocks(n) = 1.75n + 3
+        // and edges(n) = 2.5n + 2, both exact affine fits (checked at n=100/200/400, not
+        // approximated). The multipliers below are chosen against those fits rather than
+        // picked round: 3x and 4x leave ~1.6-1.7x headroom over the observed max ratio
+        // (1.78, 2.52) — room for `synthetic`'s statement mix to shift a little without
+        // flaking, not room to hide a regression that doubles the per-statement cost.
         for &(n, blocks, edges) in &measurements {
             assert!(
-                blocks < n * 8,
+                blocks < n * 3,
                 "blocks must stay linear: {blocks} for {n} statements ({measurements:?})",
             );
             assert!(
-                edges < n * 12,
+                edges < n * 4,
                 "edges must stay linear: {edges} for {n} statements ({measurements:?})",
             );
         }
-        // Doubling the input must not more than roughly double the graph.
+        // Doubling the input must not more than roughly double the graph. The real ratio
+        // at 4x is 3.95 against this 5x limit — 26% headroom, which would be uncomfortably
+        // tight for a timing assertion but is fine here: construction is deterministic, so
+        // the ratio is exact and cannot drift under load. 5x is loose enough to pass
+        // genuine linear growth and tight enough to catch what 6x would not: an
+        // `O(n log n)` regression measures ~5.2x at this input ratio, under the old limit
+        // and over this one.
         let (_, small, _) = measurements[0];
         let (_, large, _) = measurements[2];
         assert!(
-            large < small * 6,
+            large < small * 5,
             "4x the statements gave {large} blocks against {small} — superlinear",
         );
     }
