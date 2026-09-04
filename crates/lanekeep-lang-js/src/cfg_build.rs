@@ -91,13 +91,7 @@ struct Handler {
 
 struct Builder<'t, 's> {
     cfg: Cfg<'t>,
-    /// Read only by `text`, which nothing calls yet either. Same unconditional-`expect`
-    /// reasoning as `Target` above.
-    #[expect(
-        dead_code,
-        reason = "lanekeep#192 task 4 (labeled statements) is the first construct that \
-                  calls `text`, the only reader. Remove once task 4 calls it."
-    )]
+    /// Read only by `text`.
     source: &'s str,
     #[expect(
         dead_code,
@@ -192,12 +186,6 @@ impl<'t, 's> Builder<'t, 's> {
     /// inline borrows `*self`, so the result cannot then be pushed into `self.targets` —
     /// the borrow checker refuses it, and the diagnostic is about `self` rather than about
     /// the string. Copying the `&'s str` out first decouples the two.
-    #[expect(
-        dead_code,
-        reason = "lanekeep#192 task 4 (labeled statements) is the first construct that \
-                  needs a label's text; nothing calls this until then. Remove once task \
-                  4 calls it."
-    )]
     fn text(&self, node: Node<'_>) -> &'s str {
         let source: &'s str = self.source;
         &source[node.byte_range()]
@@ -265,15 +253,58 @@ impl<'t, 's> Builder<'t, 's> {
         }
     }
 
-    /// Walk an expression, returning the block where its evaluation completes.
+    /// Operators that branch. `in` and `instanceof` are in `binary_expression`'s operator
+    /// set and are not among them.
+    fn short_circuit_edges(operator: &str) -> Option<(EdgeKind, EdgeKind)> {
+        // (kind of the edge to the right operand, kind of the edge to the join)
+        match operator {
+            "&&" => Some((EdgeKind::True, EdgeKind::False)),
+            // `||` and `??` both continue to the right operand when the left did not
+            // satisfy the test — falsy for `||`, nullish for `??`.
+            "||" | "??" => Some((EdgeKind::False, EdgeKind::True)),
+            _ => None,
+        }
+    }
+
+    /// Whether this node opens an optional chain.
     ///
-    /// Task 3 replaces the body with the splitting version. Until then it descends only
-    /// far enough to stop at a nested function, which must not be walked.
+    /// `member_expression` and `subscript_expression` declare `optional_chain` as a
+    /// field; `call_expression` carries it as a child instead.
+    fn is_optional(node: Node<'_>) -> bool {
+        if node.child_by_field_name("optional_chain").is_some() {
+            return true;
+        }
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .any(|child| child.kind() == "optional_chain")
+    }
+
     fn expression(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
         if NESTED_FUNCTION_KINDS.contains(&node.kind()) {
             self.cfg.attribute(current, node);
             return current;
         }
+
+        match node.kind() {
+            "binary_expression" => {
+                let operator = node.child_by_field_name("operator").map(|op| self.text(op));
+                match operator.and_then(Self::short_circuit_edges) {
+                    Some((to_right, to_join)) => self.split(node, current, to_right, to_join),
+                    None => self.children(node, current),
+                }
+            }
+            "ternary_expression" => self.ternary(node, current),
+            "member_expression" | "subscript_expression" | "call_expression"
+                if Self::is_optional(node) =>
+            {
+                self.optional_chain(node, current)
+            }
+            _ => self.children(node, current),
+        }
+    }
+
+    /// Evaluate every named child in order, with no branch of this node's own.
+    fn children(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
         let mut cursor = node.walk();
         let children: Vec<Node<'t>> = node.named_children(&mut cursor).collect();
         let mut block = current;
@@ -281,6 +312,90 @@ impl<'t, 's> Builder<'t, 's> {
             block = self.expression(child, block);
         }
         block
+    }
+
+    /// `left <op> right`, where `<op>` decides whether `right` is evaluated.
+    fn split(
+        &mut self,
+        node: Node<'t>,
+        current: BlockId,
+        to_right: EdgeKind,
+        to_join: EdgeKind,
+    ) -> BlockId {
+        let Some(left) = node.child_by_field_name("left") else {
+            return self.children(node, current);
+        };
+        let Some(right) = node.child_by_field_name("right") else {
+            return self.children(node, current);
+        };
+        let test = self.expression(left, current);
+        self.cfg.attribute(test, left);
+
+        let right_entry = self.cfg.alloc(right.start_byte());
+        let join = self.cfg.alloc(node.end_byte());
+        self.cfg.edge(test, right_entry, to_right, false);
+        self.cfg.edge(test, join, to_join, false);
+
+        let right_end = self.expression(right, right_entry);
+        self.cfg.attribute(right_end, right);
+        self.cfg.edge(right_end, join, EdgeKind::Normal, false);
+        join
+    }
+
+    fn ternary(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
+        let (Some(condition), Some(consequence), Some(alternative)) = (
+            node.child_by_field_name("condition"),
+            node.child_by_field_name("consequence"),
+            node.child_by_field_name("alternative"),
+        ) else {
+            return self.children(node, current);
+        };
+        let test = self.expression(condition, current);
+        self.cfg.attribute(test, condition);
+
+        let join = self.cfg.alloc(node.end_byte());
+        for (arm, kind) in [
+            (consequence, EdgeKind::True),
+            (alternative, EdgeKind::False),
+        ] {
+            let entry = self.cfg.alloc(arm.start_byte());
+            self.cfg.edge(test, entry, kind, false);
+            let end = self.expression(arm, entry);
+            self.cfg.attribute(end, arm);
+            self.cfg.edge(end, join, EdgeKind::Normal, false);
+        }
+        join
+    }
+
+    /// `a?.b` — when `a` is nullish the whole chain is `undefined` and the rest is skipped.
+    fn optional_chain(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
+        let Some(object) = node
+            .child_by_field_name("object")
+            .or_else(|| node.child_by_field_name("function"))
+        else {
+            return self.children(node, current);
+        };
+        let test = self.expression(object, current);
+        self.cfg.attribute(test, object);
+
+        let rest_entry = self.cfg.alloc(object.end_byte());
+        let join = self.cfg.alloc(node.end_byte());
+        self.cfg.edge(test, rest_entry, EdgeKind::True, false);
+        self.cfg.edge(test, join, EdgeKind::False, false);
+
+        // Everything but the object: the property, the index, the arguments.
+        let mut cursor = node.walk();
+        let rest: Vec<Node<'t>> = node
+            .named_children(&mut cursor)
+            .filter(|c| c.id() != object.id())
+            .collect();
+        let mut block = rest_entry;
+        for child in rest {
+            block = self.expression(child, block);
+            self.cfg.attribute(block, child);
+        }
+        self.cfg.edge(block, join, EdgeKind::Normal, false);
+        join
     }
 
     fn if_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
@@ -597,5 +712,118 @@ mod tests {
                 .collect()
         };
         assert_eq!(edges(&a), edges(&b));
+    }
+
+    /// Whether any path from `from` to `to` avoids every block attributed `kind`.
+    fn skips(cfg: &Cfg<'_>, from: BlockId, to: BlockId, avoided: tree_sitter::Node<'_>) -> bool {
+        let banned = cfg.block_of(avoided);
+        let mut seen = vec![false; cfg.blocks().count()];
+        let mut stack = vec![from];
+        while let Some(id) = stack.pop() {
+            if id == to {
+                return true;
+            }
+            for edge in &cfg.block(id).successors {
+                if Some(edge.target) == banned || seen[edge.target.index()] {
+                    continue;
+                }
+                seen[edge.target.index()] = true;
+                stack.push(edge.target);
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn and_short_circuits_past_its_right_operand() {
+        let source = "function f() { const x = a && b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let right = find_all(&tree, "identifier")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "b")
+            .unwrap();
+        assert!(
+            skips(&cfg, cfg.entry(), cfg.exit(), right),
+            "`b` must be skippable when `a` is falsy",
+        );
+    }
+
+    #[test]
+    fn and_labels_true_toward_the_right_operand() {
+        let source = "function f() { const x = a && b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let left = find_all(&tree, "identifier")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "a")
+            .unwrap();
+        let test = cfg.block_of(left).unwrap();
+        let kinds: Vec<EdgeKind> = cfg.block(test).successors.iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&EdgeKind::True) && kinds.contains(&EdgeKind::False));
+    }
+
+    #[test]
+    fn nullish_coalescing_short_circuits_past_its_right_operand() {
+        let source = "function f() { const x = a ?? b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let right = find_all(&tree, "identifier")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "b")
+            .unwrap();
+        assert!(skips(&cfg, cfg.entry(), cfg.exit(), right));
+    }
+
+    #[test]
+    fn a_non_short_circuiting_binary_operator_does_not_split() {
+        // `in` and `instanceof` are in the same operator set and must not branch.
+        let source = "function f() { const x = a instanceof b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let right = find_all(&tree, "identifier")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "b")
+            .unwrap();
+        assert!(
+            !skips(&cfg, cfg.entry(), cfg.exit(), right),
+            "`instanceof` must not branch"
+        );
+    }
+
+    #[test]
+    fn a_ternary_branches_like_an_if() {
+        let source = "function f() { const x = c ? a : b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        assert!(skips(&cfg, cfg.entry(), cfg.exit(), ident("a")));
+        assert!(skips(&cfg, cfg.entry(), cfg.exit(), ident("b")));
+    }
+
+    #[test]
+    fn an_optional_chain_short_circuits_past_the_rest_of_the_chain() {
+        let source = "function f() { const x = a?.b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let member = find(&tree, "member_expression");
+        let property = member.child_by_field_name("property").unwrap();
+        assert!(skips(&cfg, cfg.entry(), cfg.exit(), property));
+    }
+
+    #[test]
+    fn a_plain_member_access_does_not_split() {
+        let source = "function f() { const x = a.b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let property = find(&tree, "member_expression")
+            .child_by_field_name("property")
+            .unwrap();
+        assert!(!skips(&cfg, cfg.entry(), cfg.exit(), property));
     }
 }
