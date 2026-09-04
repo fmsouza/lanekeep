@@ -1909,7 +1909,15 @@ function f() {
         // `latch` (where the condition starts), so the loop's own True (back to the body)
         // and False (to `after`) must come from the join instead, or `latch` would carry
         // a second, conflicting pair of edges from the condition's own internal branch.
-        let source = "function f() { do { a(); } while (x && y); }";
+        //
+        // Direction, not membership, on its fourth appearance in this task: the original
+        // version of this test asserted only `back_edges()[0].0 == join`, the edge's
+        // *source*. A mutation swapping the join's two edge targets — the loop runs while
+        // its condition is *false* and exits when it is *true* — leaves that assertion
+        // unchanged, since the back edge (`back: true`) still leaves the join; only its
+        // destination is wrong. Checked directly below instead, with the same
+        // `to(from, kind)` idiom the rewritten compound-`while` test above uses.
+        let source = "function f() { do { a(); } while (x && y); after(); }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
         let ident = |name: &str| {
@@ -1920,6 +1928,9 @@ function f() {
         };
         let latch = cfg.block_of(ident("x")).unwrap();
         let join = cfg.block_of(find(&tree, "do_statement")).unwrap();
+        let statements = find_all(&tree, "expression_statement");
+        let body_entry = cfg.block_of(statements[0]).unwrap();
+        let after = cfg.block_of(statements[1]).unwrap();
         assert_ne!(
             latch, join,
             "a compound condition's latch and join must differ"
@@ -1938,7 +1949,26 @@ function f() {
         assert_eq!(
             edges[0].0,
             join.index(),
-            "the back edge must leave the join, where the whole condition's evaluation completes, not the latch",
+            "the back edge must leave the join, not the latch"
+        );
+
+        let to = |from: BlockId, kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(from)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(join, EdgeKind::True),
+            vec![body_entry],
+            "the back edge must target the body entry, not the code after the loop"
+        );
+        assert_eq!(
+            to(join, EdgeKind::False),
+            vec![after],
+            "the join's False edge must reach the code after the loop, not the body"
         );
     }
 
