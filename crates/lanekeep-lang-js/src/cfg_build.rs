@@ -150,9 +150,21 @@ impl<'t> Cfg<'t> {
     /// Takes no `&Tree`, unlike `BindingResolver::resolve` beside it. That method walks to
     /// the root and needs one; `root` is given here, and it already carries `'t`. A
     /// parameter that is never read reads as an oversight in a published signature.
+    ///
+    /// **The two parameters can disagree, and the caller is what pairs them.** `root` must
+    /// be a node of the tree `source` was parsed from: construction slices `source` by node
+    /// byte range, so a `source` shorter than the tree indexes out of bounds. Also `None`
+    /// for that, which closes the loud half — a `root` past the end of `source` — and only
+    /// that half. Two *different* strings of the same length still slice successfully and
+    /// answer about text nobody parsed, and no cheap check distinguishes them; a mismatched
+    /// pair remains a caller error, one that is now refused rather than a panic wherever the
+    /// walk first reads text.
     #[must_use]
     pub fn build(source: &str, root: Node<'t>) -> Option<Self> {
         if !ROOT_KINDS.contains(&root.kind()) {
+            return None;
+        }
+        if root.end_byte() > source.len() {
             return None;
         }
         let mut builder = Builder {
@@ -1210,6 +1222,21 @@ mod tests {
         let tree = parse(source);
         let call = find(&tree, "call_expression");
         assert!(Cfg::build(source, call).is_none());
+    }
+
+    #[test]
+    fn a_root_that_runs_past_the_source_is_refused() {
+        // The two parameters are paired by the caller and nothing checks the pairing, so a
+        // `source` that is not what `root` was parsed from reaches `text`, which slices
+        // `source[node.byte_range()]`. The fixture uses `a && b` on purpose: `binary_expression`
+        // is the first arm to read an operator's text, so without the guard this panics inside
+        // the walk — "byte index 24 is out of bounds" — rather than answering.
+        let long = "function f() { a && b; }";
+        let tree = parse(long);
+        let function = find(&tree, "function_declaration");
+        assert!(Cfg::build("f()", function).is_none());
+        // And the honest pairing still builds, so the guard is not refusing everything.
+        assert!(Cfg::build(long, function).is_some());
     }
 
     #[test]
