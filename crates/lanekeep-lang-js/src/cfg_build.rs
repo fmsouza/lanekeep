@@ -47,6 +47,16 @@ const NESTED_FUNCTION_KINDS: &[&str] = &[
 /// `member_expression(object: member_expression(a ?. b), property: c)` — and evaluated
 /// inside-out. `new_expression` is deliberately absent: its operand is a `constructor`
 /// field and `new a?.b()` is not legal syntax, so it never continues a chain.
+///
+/// Any other node standing between two links ends the chain. That is required for
+/// `(a?.b).c` and for the index in `x[a?.b]`, where a `parenthesized_expression` or a
+/// sibling field genuinely does end it — and it is **wrong for `a?.b!.c`**, a known and
+/// accepted gap. TypeScript erases `!` at run time, so that expression is `a?.b.c` and
+/// `.c` should be skipped when `a` is nullish. Measured: it is not. `non_null_expression`
+/// stops the walk, `a?.b` becomes a chain of its own, and `.c` lands in the join block,
+/// which is on every path. Taken deliberately — the remedy is a pass-through for that one
+/// kind rather than a general widening, and the error direction is over-reachability,
+/// which surfaces downstream as a visible false positive rather than as silence.
 const POSTFIX_KINDS: &[&str] = &[
     "member_expression",
     "subscript_expression",
@@ -476,7 +486,14 @@ impl<'t, 's> Builder<'t, 's> {
                 block = self.expression(operand, block);
                 self.cfg.attribute(block, operand);
             }
-            self.cfg.attribute(block, link);
+            // An inner link genuinely completes where it is; the chain as a whole completes
+            // at the join, where the short-circuited and the completed paths meet. "Where
+            // does this expression complete?" is the question a consumer asks most often,
+            // and it has to have one answer — attributing the outermost link to the block
+            // its own evaluation reached would put it in two blocks the moment the chain is
+            // an operand of an enclosing split, which attributes it to the join as well.
+            let completes_at = if link.id() == node.id() { join } else { block };
+            self.cfg.attribute(completes_at, link);
         }
 
         self.cfg.edge(block, join, EdgeKind::Normal, false);
@@ -982,9 +999,10 @@ mod tests {
             // starts where its callee does, and `block_of` resolves by range containment,
             // so it would answer with the callee's block rather than the call's.
             let arguments = find(&tree, "arguments");
-            assert!(
-                attributed(&cfg, arguments).contains(&"call_expression"),
-                "{source}: the arguments must resolve to the block holding the call",
+            assert_eq!(
+                attributed(&cfg, arguments),
+                vec!["arguments"],
+                "{source}: the arguments belong to the chain's continuation block",
             );
             assert!(
                 skips(&cfg, cfg.entry(), cfg.exit(), arguments),
@@ -1013,10 +1031,9 @@ mod tests {
             vec![
                 "property_identifier",
                 "member_expression",
-                "property_identifier",
-                "member_expression",
+                "property_identifier"
             ],
-            "both links belong to the one block the chain continues into",
+            "`c` is read in the one block the chain continues into, past the `?.`",
         );
         assert!(
             skips(&cfg, cfg.entry(), cfg.exit(), property("c")),
@@ -1038,9 +1055,16 @@ mod tests {
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
         let arguments = find(&tree, "arguments");
-        assert!(
-            attributed(&cfg, arguments).contains(&"call_expression"),
-            "the arguments must resolve to the block holding the call",
+        assert_eq!(
+            attributed(&cfg, arguments),
+            vec![
+                "property_identifier",
+                "member_expression",
+                "property_identifier",
+                "member_expression",
+                "arguments",
+            ],
+            "the call's arguments belong to the chain's continuation block",
         );
         assert!(
             skips(&cfg, cfg.entry(), cfg.exit(), arguments),
@@ -1066,7 +1090,7 @@ mod tests {
         );
         assert_eq!(
             attributed(&cfg, property),
-            vec!["property_identifier", "member_expression"],
+            vec!["property_identifier"],
             "`b` belongs to the block the chain continues into",
         );
         let test = cfg.block_of(object).unwrap();
@@ -1096,6 +1120,51 @@ mod tests {
             to(EdgeKind::False),
             vec![join],
             "`?.` yields `undefined` and skips to the join when it is nullish",
+        );
+    }
+
+    #[test]
+    fn a_chain_completes_at_its_join() {
+        // "Where does this expression complete?" has to have one answer, and for a chain
+        // it is the join — the merge point both the short-circuited and the completed
+        // path reach. `??` attributes its left operand to the block that operand's
+        // evaluation returned, so attributing the outermost link where its *own*
+        // evaluation ended would put the chain in two blocks at once.
+        let source = "function f() { const x = a?.b ?? c; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let chain = find(&tree, "member_expression");
+        let object = chain.child_by_field_name("object").unwrap();
+        let property = chain.child_by_field_name("property").unwrap();
+
+        let rest = cfg.block_of(property).unwrap();
+        let join = cfg
+            .block(rest)
+            .successors
+            .iter()
+            .find(|e| e.kind == EdgeKind::Normal)
+            .map(|e| e.target)
+            .expect("the rest of the chain rejoins");
+        let holding: Vec<BlockId> = cfg
+            .blocks()
+            .filter(|(_, block)| block.nodes.iter().any(|n| n.id() == chain.id()))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            holding,
+            vec![join],
+            "`a?.b` belongs to its join and to no other block",
+        );
+
+        // And `block_of` is not the way to ask this, before or after the change. A chain
+        // starts where its base starts, so range containment answers with the *base's*
+        // block — `identifier("a")` is the narrowest attribution over that offset, and it
+        // always outranks the chain's own. Pinned so nobody reads the line above as a
+        // promise `block_of` does not make.
+        assert_eq!(
+            cfg.block_of(chain),
+            cfg.block_of(object),
+            "a chain resolves to its base's block, not to its join",
         );
     }
 
