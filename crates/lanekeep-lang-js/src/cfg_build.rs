@@ -92,11 +92,6 @@ struct Target<'s> {
 }
 
 /// A `finally` clause still in scope, and the copies already emitted for it.
-#[expect(
-    dead_code,
-    reason = "lanekeep#192 task 6 (try/finally) is the first construct that pushes one; \
-              until then nothing constructs a `Pending`. Remove once task 6 does."
-)]
 struct Pending<'t> {
     /// The `statement_block` that is the clause's body.
     body: Node<'t>,
@@ -107,14 +102,13 @@ struct Pending<'t> {
 }
 
 /// Where a `throw` goes.
-#[expect(
-    dead_code,
-    reason = "lanekeep#192 task 6 (try/catch) is the first construct that pushes one; \
-              until then nothing constructs a `Handler`. Remove once task 6 does."
-)]
 struct Handler {
     to: BlockId,
     /// Finally levels to unwind before reaching `to`.
+    ///
+    /// Recorded *after* the enclosing `try`'s own finalizer is pushed, so that finalizer
+    /// is above this depth and does not run on the body-to-`catch` path: `finally` runs
+    /// after `catch`, not instead of it.
     finally_depth: usize,
 }
 
@@ -123,16 +117,13 @@ struct Builder<'t, 's> {
     /// Read only by `text`.
     source: &'s str,
     targets: Vec<Target<'s>>,
-    /// Read here only for its length, to stamp `Target::finally_depth`. Empty until Task 6
-    /// pushes to it, so every depth recorded today is `0`; Task 6 is the first to read a
-    /// `Pending` back out of it.
+    /// The `finally` clauses enclosing the statement being walked, outermost first.
+    ///
+    /// Read for its length, to stamp `Target::finally_depth` and `Handler::finally_depth`,
+    /// and read back by [`Builder::unwind`], which copies every level from a jump's
+    /// recorded depth outward.
     finallys: Vec<Pending<'t>>,
-    #[expect(
-        dead_code,
-        reason = "lanekeep#192 task 6 (try/catch) is the first construct that reads this \
-                  stack; populated from this task so later tasks add no struct churn. \
-                  Remove once task 6 reads it."
-    )]
+    /// The `catch` clauses enclosing the statement being walked, outermost first.
     handlers: Vec<Handler>,
     /// Labels stacked above the construct they belong to, outermost first.
     ///
@@ -245,13 +236,9 @@ impl<'t, 's> Builder<'t, 's> {
                     None => Some(block),
                 }
             }
-            // A minimal placeholder ahead of Task 6, which owns `return_statement` for real
-            // and replaces this arm wholesale once `finallys` unwinding exists. Declared no
-            // fields; the operand is `named_child(0)`. Without this arm `return` falls to
-            // the catch-all, which always returns `Some` — so nothing in this file could
-            // ever produce the "does not fall through" `None` this module's own top-level
-            // doc comment promises, and a `return` would never reach `exit` except by the
-            // coincidence of being a function's literal last statement.
+            // Declared no fields; the operand is `named_child(0)`. The edge to the exit
+            // goes through every pending `finally`, which is the whole of "a `return`
+            // inside a `try` runs the finalizer first" — there is no case for `try` here.
             "return_statement" => {
                 let end = match node.named_child(0) {
                     Some(operand) => self.expression(operand, current),
@@ -259,9 +246,27 @@ impl<'t, 's> Builder<'t, 's> {
                 };
                 self.cfg.attribute(end, node);
                 let exit = self.cfg.exit();
-                self.cfg.edge(end, exit, EdgeKind::Normal, false);
+                let target = self.unwind(0, exit);
+                self.cfg.edge(end, target, EdgeKind::Normal, false);
                 None
             }
+            // The only kind that emits an `Exception` edge. A call that may throw
+            // deliberately gets none (#192's design, §4.8): edges from every
+            // `call_expression` would report `acquire(); doWork(); release()` in every
+            // function that does not wrap it, which is true and unusable. Widening it is
+            // #195's decision, and this is the one place that would change.
+            "throw_statement" => {
+                let end = match node.named_child(0) {
+                    Some(operand) => self.expression(operand, current),
+                    None => current,
+                };
+                self.cfg.attribute(end, node);
+                let (to, depth) = self.innermost_handler();
+                let target = self.unwind(depth, to);
+                self.cfg.edge(end, target, EdgeKind::Exception, false);
+                None
+            }
+            "try_statement" => self.try_statement(node, current),
             "while_statement" => Some(self.while_statement(node, current)),
             "do_statement" => self.do_statement(node, current),
             "for_statement" => Some(self.for_statement(node, current)),
@@ -270,8 +275,8 @@ impl<'t, 's> Builder<'t, 's> {
             "break_statement" => self.jump(node, current, false),
             "continue_statement" => self.jump(node, current, true),
             "switch_statement" => self.switch_statement(node, current),
-            // Task 6 (`try`/`catch`/`finally`, `throw`) adds arms here. Everything
-            // unlisted is a statement whose only flow is through its own expressions.
+            // Everything unlisted is a statement whose only flow is through its own
+            // expressions.
             _ => {
                 let end = self.expression(node, current);
                 self.cfg.attribute(end, node);
@@ -574,9 +579,11 @@ impl<'t, 's> Builder<'t, 's> {
     fn jump(&mut self, node: Node<'t>, current: BlockId, is_continue: bool) -> Option<BlockId> {
         self.cfg.attribute(current, node);
         let label = node.child_by_field_name("label").map(|n| self.text(n));
-        // Task 6 replaces `to` with `self.unwind(depth, to)`. Until then the depth is
-        // unused and every finally stack is empty.
-        let (to, _depth) = self.jump_target(label, is_continue)?;
+        // A jump out of a `try` runs every `finally` it leaves, and none of the ones it
+        // stays inside: `depth` is how many were already pending when the target was
+        // pushed, so `unwind` copies exactly the levels opened since.
+        let (to, depth) = self.jump_target(label, is_continue)?;
+        let to = self.unwind(depth, to);
         // A `continue` is a back edge and a `break` is not. Comparing ids here would read
         // *allocation* order, since `finish` has not renumbered anything yet.
         self.cfg.edge(current, to, EdgeKind::Normal, is_continue);
@@ -930,6 +937,166 @@ impl<'t, 's> Builder<'t, 's> {
         self.targets.pop();
 
         Some(after)
+    }
+
+    /// Where an uncaught `throw` goes, and how many finally levels to unwind first.
+    ///
+    /// With no enclosing `catch` it leaves the function, and *every* pending finalizer is
+    /// on the way — hence depth `0` rather than the current stack height.
+    fn innermost_handler(&self) -> (BlockId, usize) {
+        self.handlers
+            .last()
+            .map_or((self.cfg.exit(), 0), |handler| {
+                (handler.to, handler.finally_depth)
+            })
+    }
+
+    /// Run every `finally` from `from_depth` outward, ending at `continuation`.
+    ///
+    /// Returns the entry of the innermost copy, which is where the jump goes — or
+    /// `continuation` itself when there is nothing to unwind, which is every jump outside
+    /// a `try`. Iterating outward-first means each copy is built pointing at the chain
+    /// already built for the levels outside it, so the innermost copy — the last one
+    /// built — is the entry.
+    fn unwind(&mut self, from_depth: usize, continuation: BlockId) -> BlockId {
+        let mut target = continuation;
+        for level in from_depth..self.finallys.len() {
+            target = self.emit_finally_copy(level, target);
+        }
+        target
+    }
+
+    /// One copy of `finallys[level]` whose normal exit flows to `continuation`.
+    ///
+    /// Memoized on `continuation`, which is the whole of the "once per distinct
+    /// continuation" rule: every `return` in the guarded region shares one copy because
+    /// they all continue to the exit.
+    fn emit_finally_copy(&mut self, level: usize, continuation: BlockId) -> BlockId {
+        if let Some(&(_, entry)) = self.finallys[level]
+            .memo
+            .iter()
+            .find(|(seen, _)| *seen == continuation)
+        {
+            return entry;
+        }
+        let body = self.finallys[level].body;
+        let entry = self.cfg.alloc(body.start_byte());
+        // Recorded before the walk, so a jump inside the copy that shares this
+        // continuation reuses it instead of recursing without bound.
+        self.finallys[level].memo.push((continuation, entry));
+
+        // A copy of level N must not see levels N and inward as pending: a `return`
+        // inside it unwinds only what encloses it. `split_off` leaves `self.finallys`
+        // holding exactly the outer levels, and the levels moved out carry their own
+        // memos back in with them.
+        let inner = self.finallys.split_off(level);
+        if let Some(tail) = self.statement(body, entry) {
+            self.cfg.edge(tail, continuation, EdgeKind::Normal, false);
+        }
+        self.finallys.extend(inner);
+        entry
+    }
+
+    /// `try`/`catch`/`finally`, with the finalizer emitted once per distinct continuation.
+    ///
+    /// #192's design, §4.8. Every `return` in the guarded region shares one copy, because
+    /// they all continue to the exit; normal completion gets its own; a propagating
+    /// `throw` another; each `break`/`continue` target that escapes one more. After
+    /// construction, "the finalizer is on every path out of the `try`" is a fact about the
+    /// edge set — there is no flag to read and no keyword to match, which is what #192
+    /// asks for.
+    ///
+    /// The rejected alternative was one shared copy whose exit lists every continuation as
+    /// a successor. It invents paths that cannot happen — enter by normal completion,
+    /// leave by the `return` continuation — and an invented path is a false positive in a
+    /// must-analysis.
+    ///
+    /// Like [`Self::loop_statement`], this can return `Some(after)` for an `after` that
+    /// nothing reaches: `try { a(); } finally { return 1; }` completes normally as far as
+    /// the body is concerned, and the finalizer's own `return` is what cuts the edge.
+    /// Reachability is a fact about `after`'s predecessor count, here as there.
+    fn try_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
+        let body = node.child_by_field_name("body")?;
+        let handler = node.child_by_field_name("handler");
+        let finalizer = node
+            .child_by_field_name("finalizer")
+            .and_then(|clause| clause.child_by_field_name("body"));
+
+        // Same reasoning as `if_statement`: without this, `block_of(try_statement)`
+        // answers `None`, since the node's own start byte (the `try` keyword) precedes
+        // everything attributed inside it. `current` rather than a block of its own — a
+        // `try` evaluates nothing before its body, so control is still where it was.
+        self.cfg.attribute(current, node);
+
+        let after = self.cfg.alloc(node.end_byte());
+
+        // Order is load-bearing. The finalizer is pushed *before* the handler, so the
+        // handler records a depth above it: a `throw` in the body then reaches the
+        // `catch` without running the finalizer, which is correct — `finally` runs after
+        // `catch`, not instead of it. Pushing them the other way round would run the
+        // finalizer twice on that path.
+        if let Some(finalizer) = finalizer {
+            self.finallys.push(Pending {
+                body: finalizer,
+                memo: Vec::new(),
+            });
+        }
+
+        let catch_entry = handler.map(|clause| self.cfg.alloc(clause.start_byte()));
+        if let Some(catch_entry) = catch_entry {
+            self.handlers.push(Handler {
+                to: catch_entry,
+                finally_depth: self.finallys.len(),
+            });
+        }
+
+        let body_entry = self.cfg.alloc(body.start_byte());
+        self.cfg.edge(current, body_entry, EdgeKind::Normal, false);
+        let body_tail = self.statement(body, body_entry);
+
+        if catch_entry.is_some() {
+            self.handlers.pop();
+        }
+
+        // The catch runs with the finalizer still pending, so a `throw` inside it unwinds
+        // that finalizer on its way to the outer handler.
+        let catch_tail = match (handler, catch_entry) {
+            (Some(clause), Some(entry)) => match clause.child_by_field_name("body") {
+                Some(catch_body) => self.statement(catch_body, entry),
+                None => Some(entry),
+            },
+            _ => None,
+        };
+
+        if finalizer.is_some() {
+            self.finallys.pop();
+        }
+
+        // Normal completion of the body and of the catch both continue to `after`,
+        // through their own copy of the finalizer. Their own, because the `Pending` — and
+        // with it the memo — does not survive the pop: one copy more than the minimum,
+        // left as is rather than hoisting the `Pending` out of the loop, since the count
+        // that matters is several `return`s sharing one copy, and that one is exact.
+        let mut reachable = false;
+        for tail in [body_tail, catch_tail].into_iter().flatten() {
+            let target = match finalizer {
+                Some(finalizer_body) => {
+                    self.finallys.push(Pending {
+                        body: finalizer_body,
+                        memo: Vec::new(),
+                    });
+                    let depth = self.finallys.len() - 1;
+                    let entry = self.unwind(depth, after);
+                    self.finallys.pop();
+                    entry
+                }
+                None => after,
+            };
+            self.cfg.edge(tail, target, EdgeKind::Normal, false);
+            reachable = true;
+        }
+
+        reachable.then_some(after)
     }
 }
 
@@ -2474,6 +2641,356 @@ function f() {
             targets,
             vec![increment],
             "continue inside a switch must pass through to the for loop's increment",
+        );
+    }
+
+    /// How many blocks are attributed a node whose trimmed text is exactly `text`.
+    ///
+    /// The count of `finally` copies, in other words, which is the one question about this
+    /// construction that `block_of` cannot answer: several copies hold an equally narrow
+    /// attribution of the same node, and `block_of` would quietly pick the lowest id.
+    ///
+    /// The text to match is a *statement* — `c();`, not `c()`. `children` attributes
+    /// neither a `call_expression` nor its operands, so the narrowest thing attributed
+    /// inside a finalizer body is the `expression_statement` around the call.
+    fn blocks_with_text(cfg: &Cfg<'_>, source: &str, text: &str) -> usize {
+        cfg.blocks()
+            .filter(|(_, b)| {
+                b.nodes
+                    .iter()
+                    .any(|n| source[n.byte_range()].trim() == text)
+            })
+            .count()
+    }
+
+    /// The first block, in source order, attributed a node whose trimmed text is `text`.
+    ///
+    /// For anything that is *not* copied there is exactly one, and this says which without
+    /// going through `block_of`'s containment fallback.
+    fn block_with_text(cfg: &Cfg<'_>, source: &str, text: &str) -> BlockId {
+        let (id, _) = cfg
+            .blocks()
+            .find(|(_, b)| {
+                b.nodes
+                    .iter()
+                    .any(|n| source[n.byte_range()].trim() == text)
+            })
+            .unwrap_or_else(|| panic!("no block attributed `{text}`"));
+        id
+    }
+
+    #[test]
+    fn a_return_inside_try_runs_the_finally_before_the_exit() {
+        let source = "function f() { try { return 1; } finally { c(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        // Deleting the cleanup must disconnect the return from the exit.
+        let ret = cfg.block_of(find(&tree, "return_statement")).unwrap();
+        assert!(!skips(
+            &cfg,
+            ret,
+            cfg.exit(),
+            find(&tree, "call_expression")
+        ));
+    }
+
+    #[test]
+    fn normal_completion_also_runs_the_finally() {
+        let source = "function f() { try { a(); } finally { c(); } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let after = block_with_text(&cfg, source, "after();");
+        let body = block_with_text(&cfg, source, "a();");
+        let cleanup_call = find_all(&tree, "call_expression")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "c()")
+            .unwrap();
+        assert!(!skips(&cfg, body, after, cleanup_call));
+    }
+
+    #[test]
+    fn the_finally_is_copied_once_per_continuation_not_once_per_exit() {
+        let source = "\
+function f() {
+  try {
+    if (a) { return 1; }
+    if (b) { return 2; }
+  } finally { c(); }
+}";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let copies = blocks_with_text(&cfg, source, "c();");
+        // Two returns share one copy (both continue to the exit); normal completion has
+        // its own. Never one per `return`.
+        assert_eq!(
+            copies, 2,
+            "expected one copy per continuation, got {copies}"
+        );
+    }
+
+    #[test]
+    fn a_throw_reaches_its_catch() {
+        let source = "function f() { try { throw e; } catch (x) { h(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let thrown = cfg.block_of(find(&tree, "throw_statement")).unwrap();
+        let kinds: Vec<EdgeKind> = cfg
+            .block(thrown)
+            .successors
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec![EdgeKind::Exception]);
+        let handler = block_with_text(&cfg, source, "h();");
+        assert!(
+            skips(&cfg, thrown, handler, find(&tree, "function_declaration")),
+            "the throw must reach the catch body",
+        );
+    }
+
+    #[test]
+    fn a_throw_enters_the_catch_before_the_finally() {
+        // `finally` runs *after* `catch`, not instead of it, so the throw's own successor
+        // is the catch entry and not a copy of the finalizer. The fixture in
+        // `a_throw_reaches_its_catch` has no `finally` at all, so it cannot see the
+        // difference; asserting the successor rather than reachability is what makes this
+        // one see it, since a second copy on the normal-completion path leaves the catch
+        // body reachable either way.
+        let source = "function f() { try { throw e; } catch (x) { h(); } finally { c(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let thrown = cfg.block_of(find(&tree, "throw_statement")).unwrap();
+        let handler = block_with_text(&cfg, source, "h();");
+        let targets: Vec<BlockId> = cfg
+            .block(thrown)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![handler],
+            "the throw must enter the catch directly, not through the finalizer",
+        );
+    }
+
+    #[test]
+    fn a_throw_in_catch_reaches_the_function_exit() {
+        let source = "function f() { try { a(); } catch (x) { throw x; } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        // The attribution is asserted first because the rest of this test passes without
+        // it: with no `throw_statement` arm at all, `block_of` falls back to containment,
+        // answers with the block holding the whole `try`, and *that* block's one successor
+        // is the function's own tail edge to the exit — the right answer for the wrong
+        // reason. The kind check is what pins the block to the throw itself.
+        assert!(attributed(&cfg, find(&tree, "throw_statement")).contains(&"throw_statement"));
+        let thrown = cfg.block_of(find(&tree, "throw_statement")).unwrap();
+        let kinds: Vec<EdgeKind> = cfg
+            .block(thrown)
+            .successors
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(kinds, vec![EdgeKind::Exception]);
+        let targets: Vec<BlockId> = cfg
+            .block(thrown)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![cfg.exit()],
+            "an uncaught rethrow leaves the function"
+        );
+    }
+
+    #[test]
+    fn a_return_leaves_from_where_its_operand_completes() {
+        // The convention `if_statement` states and the catch-all arm follows: a statement
+        // is attributed to the block where its own evaluation completes, not to the one
+        // control was in when it started. For `return a && b;` the two differ — `a` is
+        // evaluated before the split, and the exit edge leaves the join — so attributing
+        // the earlier block would answer "which block is this return in?" with one whose
+        // successors are the operand's own True/False pair and which has no edge out of
+        // the function at all.
+        let source = "function f() { return a && b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ret = cfg.block_of(find(&tree, "return_statement")).unwrap();
+        let targets: Vec<BlockId> = cfg.block(ret).successors.iter().map(|e| e.target).collect();
+        assert_eq!(targets, vec![cfg.exit()]);
+    }
+
+    #[test]
+    fn a_throw_in_a_catch_runs_the_finally_on_its_way_out() {
+        // The catch is walked with the finalizer still pending, which is what puts a copy
+        // between a rethrow and the exit. `a_throw_in_catch_reaches_the_function_exit`
+        // has no `finally`, so popping the finalizer too early is invisible to it.
+        // Asserted on the rethrow's own successor: two copies of `c();` exist here — one
+        // on this path, one for the body's normal completion — so a `skips` assertion
+        // could ban the wrong one and pass regardless.
+        let source = "function f() { try { a(); } catch (x) { throw x; } finally { c(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let thrown = cfg.block_of(find(&tree, "throw_statement")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(thrown)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(targets.len(), 1, "a rethrow has exactly one successor");
+        let cleanup = cfg.block(targets[0]);
+        assert!(
+            cleanup
+                .nodes
+                .iter()
+                .any(|n| source[n.byte_range()].trim() == "c();"),
+            "a rethrow must run the finalizer before leaving the function",
+        );
+        let onward: Vec<BlockId> = cleanup.successors.iter().map(|e| e.target).collect();
+        assert_eq!(
+            onward,
+            vec![cfg.exit()],
+            "and that copy continues out of the function"
+        );
+    }
+
+    #[test]
+    fn a_throw_in_a_try_without_a_catch_still_runs_the_finally() {
+        let source = "function f() { try { throw e; } finally { c(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let thrown = cfg.block_of(find(&tree, "throw_statement")).unwrap();
+        let cleanup = find_all(&tree, "call_expression")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "c()")
+            .unwrap();
+        assert!(
+            !skips(&cfg, thrown, cfg.exit(), cleanup),
+            "the finalizer is on every path"
+        );
+    }
+
+    #[test]
+    fn a_return_inside_try_with_no_finally_skips_the_code_after_the_try() {
+        let source = "function f() { try { return 1; } catch (x) { h(); } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ret = cfg.block_of(find(&tree, "return_statement")).unwrap();
+        let after = block_with_text(&cfg, source, "after();");
+        let targets: Vec<BlockId> = cfg.block(ret).successors.iter().map(|e| e.target).collect();
+        assert_eq!(targets, vec![cfg.exit()], "a return goes straight out");
+        assert!(!skips(
+            &cfg,
+            ret,
+            after,
+            find(&tree, "function_declaration")
+        ));
+    }
+
+    #[test]
+    fn a_nested_try_runs_the_inner_finalizer_before_the_outer_one() {
+        let source = "\
+function f() {
+  try {
+    try { return 1; } finally { inner(); }
+  } finally { outer(); }
+}";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let call = |text: &str| {
+            find_all(&tree, "call_expression")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == text)
+                .unwrap()
+        };
+        let ret = cfg.block_of(find(&tree, "return_statement")).unwrap();
+        let inner_block = cfg.block_of(call("inner()")).unwrap();
+        // Reaching the outer finalizer from the return must pass through the inner one.
+        assert!(!skips(
+            &cfg,
+            ret,
+            cfg.block_of(call("outer()")).unwrap(),
+            call("inner()")
+        ));
+        assert!(skips(&cfg, ret, inner_block, call("outer()")));
+    }
+
+    #[test]
+    fn a_return_inside_a_finalizer_copy_does_not_re_enter_that_finalizer() {
+        // A copy of level N is walked with level N and everything inward split off the
+        // pending stack, so a `return` inside it unwinds only what *encloses* the `try`.
+        // Without that split the return unwinds this very level again: the memo is keyed
+        // on the continuation, and the exit is not the continuation this copy was built
+        // for, so a second copy is allocated whose own return then memo-hits into a
+        // self-loop — and the function exit stops being reachable from the body at all.
+        // `a_nested_try_runs_the_inner_finalizer_before_the_outer_one` cannot see this:
+        // neither of its finalizer bodies contains a jump, so nothing inside a copy ever
+        // consults the stack the split protects.
+        let source = "function f() { try { a(); } finally { return 1; } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        assert_eq!(
+            blocks_with_text(&cfg, source, "return 1;"),
+            1,
+            "one continuation, one copy",
+        );
+        let body = block_with_text(&cfg, source, "a();");
+        assert!(
+            skips(&cfg, body, cfg.exit(), find(&tree, "function_declaration")),
+            "the finalizer's own return must leave the function",
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_throw_gets_an_exception_edge() {
+        // A call may throw and deliberately gets no edge (#192's design, §4.8). Widening
+        // this is #195's decision, not a silent one.
+        let source = "function f() { try { risky(); } catch (x) { h(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let exceptions = cfg
+            .blocks()
+            .flat_map(|(_, b)| b.successors.iter())
+            .filter(|e| e.kind == EdgeKind::Exception)
+            .count();
+        assert_eq!(exceptions, 0, "a call must not get an exception edge in v1");
+    }
+
+    #[test]
+    fn a_break_out_of_a_try_runs_the_finally() {
+        let source = "function f() { while (c) { try { break; } finally { z(); } } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "break_statement")).unwrap();
+        let cleanup = find_all(&tree, "call_expression")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "z()")
+            .unwrap();
+        let after = block_with_text(&cfg, source, "after();");
+        assert!(!skips(&cfg, jump, after, cleanup));
+    }
+
+    #[test]
+    fn a_try_statement_is_attributed_to_the_block_it_starts_in() {
+        // Same reasoning as every other construct here: without an attribution of its own,
+        // `block_of(try_statement)` answers with whatever wider node happens to contain
+        // the `try` keyword — or `None`. Asserting the attributed *kind* rather than
+        // `is_some()` is what distinguishes the two, since `block_of`'s containment
+        // fallback answers `Some` for a too-wide attribution as readily as for the right
+        // one.
+        let source = "function f() { before(); try { a(); } finally { c(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let node = find(&tree, "try_statement");
+        assert!(attributed(&cfg, node).contains(&"try_statement"));
+        assert_eq!(
+            cfg.block_of(node),
+            Some(block_with_text(&cfg, source, "before();")),
+            "the try belongs to the block control was in when it started",
         );
     }
 }
