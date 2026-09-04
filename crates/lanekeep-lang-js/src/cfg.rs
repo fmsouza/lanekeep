@@ -159,8 +159,13 @@ impl<'t> Cfg<'t> {
     /// source order without having to remember to ask for it.
     pub(crate) fn finish(&mut self) {
         let mut order: Vec<usize> = (0..self.blocks.len()).collect();
-        // Stable, so allocation order is the tie-break without being written down.
-        order.sort_by_key(|&index| self.blocks[index].start);
+        // Allocation order is part of the sort key, not an inherited property of a stable
+        // sort: `sort_unstable_by_key` would be tempting and is not equivalent for these
+        // sizes. `Vec::sort_by_key` is stable, and pdqsort's own small-slice fallback
+        // (insertion sort, under 21 elements) happens to preserve ties too, so a fixture
+        // this small cannot distinguish the two — the tie-break has to be data, not an
+        // implementation accident of whichever sort is called.
+        order.sort_by_key(|&index| (self.blocks[index].start, index));
 
         let mut new_of = vec![0usize; self.blocks.len()];
         for (new, &old) in order.iter().enumerate() {
@@ -238,6 +243,15 @@ impl<'t> Cfg<'t> {
     /// makes this correct given that a split statement is attributed to its own join
     /// block: a plain containment lookup would answer with the enclosing statement's
     /// block for every fragment of it.
+    ///
+    /// The `root`-containment check below is an early-out, not a correctness gate.
+    /// `attribute` is crate-internal, and every caller in this crate only ever attributes
+    /// a node drawn from within `root` — so no attributed range can contain an offset
+    /// outside it, and the loop that follows would already answer `None` on its own. The
+    /// check earns its place anyway (one comparison against walking every block for
+    /// nothing), but no mutation of it is observable while that invariant holds. It
+    /// becomes load-bearing, rather than merely cheap, the moment a caller attributes a
+    /// node from outside `root`.
     #[must_use]
     pub fn block_of(&self, node: Node<'_>) -> Option<BlockId> {
         let offset = node.start_byte();
@@ -382,14 +396,19 @@ mod tests {
     #[test]
     fn finish_remaps_every_edge_target() {
         let cfg = out_of_order();
-        // entry(0) -> the block at 60, which renumbers to id 2.
+        // Not entry's own edge: the block at 60 keeps id 2 after renumbering by
+        // coincidence of these particular `start` values, so entry(0) -> 60's edge stays
+        // `BlockId(2)` whether or not the remap runs, and cannot tell the two cases apart.
+        // The block at 60's edge to the block at 10 does move (allocation index 3 -> id
+        // 1), which is what actually exercises the remap: skipping it would leave the
+        // stale allocation id, 3 — and after renumbering, id 3 is the exit.
         let targets: Vec<BlockId> = cfg
-            .block(cfg.entry())
+            .block(BlockId(2))
             .successors
             .iter()
             .map(|e| e.target)
             .collect();
-        assert_eq!(targets, vec![BlockId(2)]);
+        assert_eq!(targets, vec![BlockId(1)]);
     }
 
     #[test]
@@ -416,7 +435,16 @@ mod tests {
     fn block_of_finds_the_innermost_attribution() {
         let tree = super::testing::parse("function f() { const a = 1; }");
         let statement = super::testing::find(&tree, "lexical_declaration");
-        let name = super::testing::find(&tree, "identifier");
+        // Not `find(&tree, "identifier")`: the *first* identifier in source order is `f`,
+        // the function's own name, whose range sits entirely outside `statement` and so
+        // never nests inside it. Picking that one would leave the two attributed ranges
+        // disjoint, and `assert_ne!` below would pass for the wrong reason — two unrelated
+        // matches, not narrowest-wins. Filter to the identifier actually inside the
+        // declaration instead.
+        let name = super::testing::find_all(&tree, "identifier")
+            .into_iter()
+            .find(|node| statement.byte_range().contains(&node.start_byte()))
+            .expect("an identifier inside the declaration");
 
         let mut cfg = Cfg::new_empty(tree.root_node().byte_range());
         let outer = cfg.alloc(statement.start_byte());
