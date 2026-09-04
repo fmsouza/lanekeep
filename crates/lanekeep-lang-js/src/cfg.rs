@@ -82,7 +82,11 @@ pub struct Block<'t> {
     pub nodes: Vec<Node<'t>>,
     /// Edges out, in the order construction added them.
     pub successors: Vec<Edge>,
-    /// Blocks with an edge into this one, ascending. Derived by [`Cfg::finish`].
+    /// Blocks with an edge into this one, ascending. Derived by `Cfg::finish`.
+    ///
+    /// A code span rather than an intra-doc link: `finish` is crate-internal, and
+    /// `rustdoc::private_intra_doc_links` is denied by `just docs`'s `-D warnings`, so
+    /// linking a public item to it fails the gate.
     pub predecessors: Vec<BlockId>,
     /// The first byte this block covers, and its ordering key.
     pub start: usize,
