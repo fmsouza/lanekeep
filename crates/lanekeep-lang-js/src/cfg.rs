@@ -361,8 +361,20 @@ impl<'t> Cfg<'t> {
     /// block its operand's evaluation completes in, and — because control cannot fall
     /// through either one — nothing is attributed to that block afterward, so the
     /// attribution left standing is always the terminating statement itself. A
-    /// predecessor reaching exit by falling off the end of the function carries no such
-    /// attribution and is `ImplicitEnd` with no node.
+    /// predecessor reaching exit by falling off the end of the function carries no
+    /// return/throw attribution and is `ImplicitEnd` with no node.
+    ///
+    /// # Limitation
+    ///
+    /// A `return`/`throw` that unwinds through an enclosing `finally` is misclassified.
+    /// `cfg_build`'s `unwind`/`emit_finally_copy` route that exit edge through a fresh
+    /// copy of the `finally` body rather than directly to [`Self::exit`], so the
+    /// predecessor this method sees is the finally-copy's *tail* block, not the block
+    /// the original `return`/`throw` was attributed to. The exit is classified — and its
+    /// node chosen or withheld — by how that copy ends: typically `ImplicitEnd` with no
+    /// node, or whichever `return`/`throw` the `finally` body itself terminates with. The
+    /// witness for such a path therefore describes the `finally`'s own terminating
+    /// behavior, not the `return`/`throw` that triggered the unwind.
     #[must_use = "exits() has no side effect; discarding its result visits nothing"]
     pub fn exits(&self) -> Vec<Exit<'t>> {
         let mut out = Vec::new();
@@ -834,11 +846,23 @@ mod tests {
         let source = "function f(c) { if (c) { return 1; } if (!c) { throw e; } }";
         let tree = super::testing::parse(source);
         let cfg = Cfg::build(source, super::testing::find(&tree, "function_declaration")).unwrap();
-        let kinds: Vec<_> = cfg.exits().into_iter().map(|e| e.kind).collect();
+        let exits = cfg.exits();
+        let kinds: Vec<_> = exits.iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&ExitKind::Return));
         assert!(kinds.contains(&ExitKind::Throw));
         // falling off the end after the second `if` reaches the exit with no return/throw
         assert!(kinds.contains(&ExitKind::ImplicitEnd));
+
+        // Pin the witness *node* for each kind, not just the kind label — Return's is
+        // pinned separately, by `a_return_exit_carries_its_node`.
+        let throw = exits.iter().find(|e| e.kind == ExitKind::Throw).unwrap();
+        assert_eq!(throw.node.unwrap().kind(), "throw_statement");
+
+        let implicit_end = exits
+            .iter()
+            .find(|e| e.kind == ExitKind::ImplicitEnd)
+            .unwrap();
+        assert!(implicit_end.node.is_none());
     }
 
     #[test]
