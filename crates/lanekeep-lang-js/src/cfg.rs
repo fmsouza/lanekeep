@@ -454,6 +454,32 @@ mod tests {
     }
 
     #[test]
+    fn exit_sorts_last_only_when_nothing_ties_with_it() {
+        // The half of the name above that does not generalize, pinned so nobody reads
+        // "exit is last" as an invariant. `exit.start` is `root.end`, which ties with any
+        // block a construct allocates at its own `end_byte()` when the construct ends where
+        // the root does — reachable for a `program` root, whose end *is* its last
+        // statement's end, and not for a function-like one, which always has a closing brace
+        // beyond every inner block. Exit is allocated second, so it loses every such tie.
+        //
+        // Nothing depends on the ordering: `exit()` is addressed by identity everywhere. A
+        // consumer treating the highest `BlockId` as the exit is what this rules out.
+        let mut cfg = Cfg::new_empty(0..10);
+        let entry = cfg.entry();
+        let exit = cfg.exit();
+        let ties_with_exit = cfg.alloc(10);
+        cfg.edge(entry, ties_with_exit, EdgeKind::Normal, false);
+        cfg.edge(ties_with_exit, exit, EdgeKind::Normal, false);
+        cfg.finish();
+        assert_eq!(
+            cfg.exit(),
+            BlockId(1),
+            "exit loses the tie it did not create"
+        );
+        assert_eq!(cfg.blocks().count(), 3);
+    }
+
+    #[test]
     fn a_tie_on_start_resolves_to_allocation_order() {
         // A `program` whose first statement begins at byte 0 ties with the synthetic entry.
         // Entry is allocated first, so it must still sort first.
