@@ -22,6 +22,9 @@ lanekeep-core = { workspace = true }
 lanekeep-js = { workspace = true }
 lanekeep-lang = { workspace = true }
 lanekeep-query = { workspace = true }
+# For `oracle_identity`, the type oracle's own digest and a cache-key input: a result computed
+# by an oracle that no longer exists is not a valid result for a run with a different one.
+lanekeep-types = { workspace = true }
 # For the two cache-key inputs a component run depends on: the hash of the WIT host API and
 # whatever is bound beside it, and the hash of the compilation environment `wasmtime` checks a
 # precompiled artifact against. Both are read from where they are defined rather than restated

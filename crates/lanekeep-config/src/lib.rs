@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use lanekeep_core::{Examples, Gates, Namespace, RuleCard, RuleId, Severity};
+use lanekeep_core::{Capability, Examples, Gates, Namespace, RuleCard, RuleId, Severity};
 use lanekeep_js::{Limits, ResolveError, RuleRoot, RunClock, Sandbox};
 use lanekeep_wasm::{RuleSet, WasmEngine, WasmRuntime};
 use serde::Deserialize;
@@ -111,6 +111,12 @@ pub struct RuleSpec {
     /// `query` or a card beside a `.wasm` reference, and there deliberately never was: a second
     /// description of a rule is drift that has to be kept in step with the first.
     pub component: Option<ComponentRule>,
+    /// Host analyses this rule declared, parsed and confirmed available.
+    ///
+    /// Empty for every rule that declared nothing, which is nearly all of them. A rule
+    /// reaching this point with a non-empty list has had each entry confirmed implemented by
+    /// `check_requires`, so the engine can act on it without re-checking.
+    pub requires: Vec<Capability>,
 }
 
 /// Where a component-backed rule's code is, and what it is configured with.
@@ -409,6 +415,14 @@ struct RawRule {
     #[serde(default)]
     gates: Gates,
     timeout: Option<u64>,
+    /// Host analyses the rule declared, still as the JSON it was written as.
+    ///
+    /// Deliberately not `Option<Vec<String>>`, which would move the refusal for a
+    /// wrong-shaped value into serde and report it as a malformed *config* — a message
+    /// carrying a line and column and naming neither the rule nor the field. Kept as data so
+    /// [`check_requires`] can refuse it the way every other rule-level mistake is refused,
+    /// with the position and the id. The same reasoning made [`RawQueries`] hand-written.
+    requires: Option<serde_json::Value>,
     has_check: bool,
     has_reduce: bool,
 }
@@ -491,6 +505,103 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Capabilities this build actually provides an analysis for.
+///
+/// Which capabilities are implemented is a property of this build, not of the config, so it
+/// is expressed as a fact about [`Capability`] rather than read from anything a project
+/// writes. `Dataflow` joins this list at #193.
+const IMPLEMENTED: &[Capability] = &[Capability::Types];
+
+/// Render a set of capabilities as backtick-quoted names, comma separated.
+///
+/// For a refusal that lists what is valid — built from [`Capability`]'s own variants rather
+/// than a second, hand-maintained string table (the `KNOWN_CAPABILITIES` this replaced), so a
+/// name is listed exactly when `Capability` has a variant for it and cannot silently disagree
+/// with what [`Capability::parse`] recognizes.
+fn describe(capabilities: &[Capability]) -> String {
+    capabilities
+        .iter()
+        .map(|capability| format!("`{}`", capability.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse `requires`, refuse whatever this build cannot honor, and return the rest.
+///
+/// # Why a rule declaring a real but unimplemented capability is refused rather than run without it
+///
+/// Because the alternative is silent. An analysis that goes missing does not make a rule
+/// fail; it makes the rule stop finding things, and a rule that reports nothing looks exactly
+/// like a codebase with nothing to report. The author's next reading of a clean run is "this
+/// is fixed" rather than "this never ran". This is the same reasoning that has the host refuse
+/// a component whose `languages` list is empty instead of admitting a rule that can never
+/// match a file.
+///
+/// # Why the shape is refused here and not by serde
+///
+/// `requires: 'types'` is the mistake this field invites, and coercing it — reading only an
+/// array and treating anything else as "none" — reproduces exactly the silence above, with
+/// the rule's own declaration as the thing discarded. So a wrong shape is as loud as a wrong
+/// value, and both name the rule.
+fn check_requires(
+    requires: Option<&serde_json::Value>,
+    id: &RuleId,
+) -> Result<Vec<Capability>, String> {
+    // Absence is handled here rather than at the call site, because an absent `requires` and
+    // an empty one say the same thing and there is one place to say so.
+    let Some(requires) = requires else {
+        return Ok(Vec::new());
+    };
+
+    let Some(entries) = requires.as_array() else {
+        return Err(format!(
+            "`{id}` has a `requires` that is {} — it must be an array of capability names \
+             ({})",
+            json_kind(requires),
+            describe(Capability::all()),
+        ));
+    };
+
+    // Every entry is parsed before any is refused for being unimplemented, so a config
+    // carrying both a typo and a real capability reports the typo. It is the one the author
+    // can do something about.
+    let mut capabilities = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(name) = entry.as_str() else {
+            return Err(format!(
+                "`{id}` has a `requires` entry that is {} — every entry must be one of {}",
+                json_kind(entry),
+                describe(Capability::all()),
+            ));
+        };
+        let Some(capability) = Capability::parse(name) else {
+            return Err(format!(
+                "`{id}` requires an unknown capability `{name}` — valid capabilities are {}",
+                describe(Capability::all()),
+            ));
+        };
+        capabilities.push(capability);
+    }
+
+    // Only after every name is confirmed real does an unimplemented one get to speak for
+    // itself — the same ordering as before, kept so a config carrying both a typo and a real
+    // capability still reports the typo.
+    for capability in &capabilities {
+        if !IMPLEMENTED.contains(capability) {
+            return Err(format!(
+                "`{id}` requires the `{}` analysis, which this build does not provide — the \
+                 implemented capabilities are {}",
+                capability.as_str(),
+                describe(IMPLEMENTED),
+            ));
+        }
+    }
+
+    // Declaring nothing is not declaring badly. An empty list and an absent one say the same
+    // thing, and refusing on presence rather than on content would reject both.
+    Ok(capabilities)
+}
+
 #[derive(Debug, Deserialize)]
 struct RawCard {
     message: Option<String>,
@@ -535,6 +646,7 @@ const EXTRACT: &str = r"
                 query: r?.query ?? null,
                 gates: r?.gates ?? {},
                 timeout: r?.timeout ?? null,
+                requires: r?.requires ?? null,
                 has_check: typeof r?.check === 'function',
                 has_reduce: typeof r?.reduce === 'function',
             })),
@@ -1713,6 +1825,23 @@ fn raw_rule_from(
             file_not_contains: metadata.gates.file_not_contains,
         },
         timeout: metadata.timeout,
+        // A component cannot declare one, because `rule-metadata` has no such field: the
+        // world is deliberately unchanged, since no component rule targets a language either
+        // analysis will support.
+        //
+        // **Nothing here notices the day it grows one.** The exhaustive struct literal below
+        // is exhaustive over its *destination* — a field added to `RawRule` is `E0063` at
+        // this initializer, which is a real guard and the one that put this very line here:
+        // #196 added `requires` to `RawRule` and could not compile until it did.
+        // Its *source* is read field by field, so a `requires` added to `rule-metadata`
+        // in `wit/world.wit` compiles clean here and is silently dropped: a component would
+        // declare an analysis, be handed none, report nothing, and read as a clean codebase.
+        // Both halves measured — growing the record left `cargo check -p lanekeep-config`
+        // green.
+        //
+        // So whoever adds that field to the world adds the read here in the same change.
+        // There is no compile error waiting to remind them.
+        requires: None,
         has_check,
         has_reduce,
     }
@@ -1763,6 +1892,10 @@ fn build_rule(
             "`{id}` has no `check` function — a rule without one can never report anything"
         )));
     }
+
+    // Before the card and the query, because this refusal is about whether the rule can run
+    // at all rather than about whether it is well written.
+    let requires = check_requires(raw.requires.as_ref(), &id).map_err(fail)?;
 
     let card = raw
         .card
@@ -1855,6 +1988,7 @@ fn build_rule(
         timeout: raw.timeout.map(Duration::from_millis),
         has_reduce: raw.has_reduce,
         component,
+        requires,
     })
 }
 
@@ -5020,6 +5154,200 @@ mod tests {
             .load_config()
             .expect_err("a zero horizon is refused");
         assert!(format!("{error}").contains("maxExpiryDays"), "{error}");
+    }
+
+    /// A rule declaring `requires`, spelled the way an author writes it.
+    ///
+    /// `requires` is raw JavaScript rather than a list, so a test can hand it a value of the
+    /// wrong shape — which is half of what this field has to refuse.
+    fn rule_requiring(id: &str, requires: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               requires: {requires},\n\
+               query: '(identifier) @id',\n\
+               card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.id); }},\n\
+             }});\n"
+        )
+    }
+
+    /// Load a config whose single rule declares `requires`, and return what happened.
+    fn load_requiring(name: &str, requires: &str) -> Result<Config, ConfigError> {
+        let fixture = Fixture::new(
+            name,
+            &[
+                ("rule.ts", &rule_requiring("local/example", requires)),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        fixture.load_config()
+    }
+
+    /// A capability name nothing could ever provide is a typo, and only this layer can say so.
+    ///
+    /// The refusal lists what is valid, because the alternative is an author guessing at the
+    /// spelling of a field whose whole purpose is to be explicit.
+    #[test]
+    fn an_unknown_capability_in_requires_is_refused() {
+        let error = load_requiring("requires-unknown", "['speed']")
+            .expect_err("an unknown capability is refused");
+        let text = format!("{error}");
+        assert!(text.contains("local/example"), "{text}");
+        assert!(text.contains("speed"), "{text}");
+        assert!(
+            text.contains("types") && text.contains("dataflow"),
+            "{text}"
+        );
+    }
+
+    /// A *known but unimplemented* capability is refused, for as long as nothing implements it.
+    ///
+    /// The alternative is the failure this field exists to prevent: a rule that declares an
+    /// analysis, silently does not get it, and reports nothing — which reads as "the code is
+    /// clean" rather than as "the rule never ran". Same reasoning as the host refusing an
+    /// empty `languages` list. `types` no longer belongs in this list — it has an
+    /// implementation now, and `a_rule_requiring_types_now_loads` is its test.
+    ///
+    /// Implementing one capability must not lift the refusal on the other, which is what
+    /// makes this worth keeping beside that one. The list `['types', 'dataflow']` is the case
+    /// neither of them reaches; `an_unimplemented_capability_is_refused_beside_an_implemented_one`
+    /// is where it lives.
+    #[test]
+    fn a_known_capability_in_requires_is_refused_while_unimplemented() {
+        let error = load_requiring("requires-unimplemented-dataflow", "['dataflow']")
+            .expect_err("an unimplemented capability is refused");
+        let text = format!("{error}");
+        assert!(text.contains("local/example"), "{text}");
+        assert!(text.contains("dataflow"), "{text}");
+    }
+
+    /// Declaring nothing is not an error, in either spelling.
+    ///
+    /// The pair matters: an implementation that refused on presence rather than on content
+    /// would pass the refusal tests above and reject every rule that wrote `requires: []`.
+    #[test]
+    fn an_empty_or_absent_requires_loads() {
+        let empty = load_requiring("requires-empty", "[]").expect("an empty list is not a refusal");
+        assert_eq!(empty.rules.len(), 1);
+
+        let fixture = Fixture::new(
+            "requires-absent",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let absent = fixture
+            .load_config()
+            .expect("no `requires` is the status quo");
+        assert_eq!(absent.rules.len(), 1);
+    }
+
+    /// A `requires` of the wrong shape is refused by name, never coerced to "none".
+    ///
+    /// The obvious extraction — `Array.isArray(r?.requires) ? r.requires : []` — turns
+    /// `requires: 'types'` into a rule that declared a capability and is treated as having
+    /// declared nothing. That is exactly the silent-ignore this field exists to prevent, so
+    /// the wrong shape has to be as loud as the wrong value.
+    #[test]
+    fn a_requires_of_the_wrong_shape_is_refused_rather_than_ignored() {
+        for (name, written) in [
+            ("requires-string", "'types'"),
+            ("requires-object", "{ types: true }"),
+            ("requires-number-element", "[1]"),
+        ] {
+            let error =
+                load_requiring(name, written).expect_err("a malformed `requires` is refused");
+            let text = format!("{error}");
+            assert!(text.contains("requires"), "{text}");
+            assert!(text.contains("local/example"), "{text}");
+        }
+    }
+
+    /// The same refusal through a `lanekeep.json`.
+    ///
+    /// `build_rule` is reached from `build`, the one place both formats construct a `Config`,
+    /// so the tests above already prove the validation for both — the reasoning
+    /// `a_zero_max_expiry_days_is_refused` states. This is asserted anyway because `requires`
+    /// is read off the rule *module*, which the two formats reach through different entry
+    /// modules, and because the design records a bug that survived precisely by letting one
+    /// format's fixture stand in for both.
+    ///
+    /// Declares `dataflow` rather than `types`: this has to still be a refusal, and `types`
+    /// stopped being one.
+    #[test]
+    fn the_requires_refusal_reaches_a_json_config_too() {
+        let fixture = Fixture::new(
+            "requires-json",
+            &[
+                ("rule.ts", &rule_requiring("local/example", "['dataflow']")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+        let error = fixture
+            .load_json()
+            .expect_err("a JSON config reaches the same refusal");
+        let text = format!("{error}");
+        assert!(text.contains("local/example"), "{text}");
+        assert!(text.contains("dataflow"), "{text}");
+    }
+
+    /// The capability this pull request implements now loads.
+    #[test]
+    fn a_rule_requiring_types_now_loads() {
+        let config = load_requiring("requires-types-ok", "['types']")
+            .expect("`types` is implemented and must load");
+        assert_eq!(config.rules[0].requires, vec![Capability::Types]);
+    }
+
+    /// The matched half, and the one a single-capability list cannot assert: lifting one
+    /// capability must not lift the other, *whichever position* the unimplemented one is in.
+    ///
+    /// `['types', 'dataflow']` is the ordering that discriminates. The refusal walks every
+    /// parsed capability rather than stopping at the first, and nothing else here notices the
+    /// difference — replacing that walk with `capabilities.iter().take(1)` leaves every other
+    /// test in this crate green, because no other fixture declares more than one. What it
+    /// would permit is the failure the whole field exists to prevent: a rule declaring both
+    /// loads, runs with no dataflow analysis, and reports nothing, which reads as a clean
+    /// codebase rather than as a rule that never ran.
+    ///
+    /// Both orderings, because "the position does not decide" is the property. The reversed
+    /// one is the case a `take(1)` implementation happens to get right, so asserting only it
+    /// would be asserting the bug.
+    #[test]
+    fn an_unimplemented_capability_is_refused_beside_an_implemented_one() {
+        for (name, written) in [
+            ("requires-types-then-dataflow", "['types', 'dataflow']"),
+            ("requires-dataflow-then-types", "['dataflow', 'types']"),
+        ] {
+            let error = load_requiring(name, written)
+                .expect_err("`dataflow` is not implemented, whatever it is declared beside");
+            let text = format!("{error}");
+            assert!(text.contains("dataflow"), "{text}");
+            assert!(text.contains("local/example"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_capability_is_still_refused() {
+        let error = load_requiring("requires-unknown-still", "['speed']")
+            .expect_err("an unknown capability is refused");
+        assert!(format!("{error}").contains("speed"));
+    }
+
+    #[test]
+    fn a_rule_declaring_nothing_requires_nothing() {
+        let fixture = Fixture::new(
+            "requires-none-spec",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let config = fixture.load_config().expect("loads");
+        assert!(config.rules[0].requires.is_empty());
     }
 
     /// A JSON rule's options are a cache-key input, and were reaching neither hash.

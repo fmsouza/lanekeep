@@ -12,6 +12,9 @@
 //! after a second language arrives is the expensive version of the same work.
 
 pub mod binding;
+pub mod grammar;
+
+pub use grammar::grammar_digest;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -81,9 +84,13 @@ pub trait Language: Send + Sync {
 
     /// The grammar's ABI version.
     ///
-    /// This is a cache key input. A grammar bump changes node shapes and therefore query
-    /// results, so an entry computed under a different ABI is not a valid entry — it would
-    /// serve results derived from a tree that no longer exists.
+    /// **No longer the cache key's term for the grammar**, and the doc said otherwise for a
+    /// while. The key folds [`grammar::grammar_digest`], which reads `abi_version()` off the
+    /// grammar itself along with the node kinds and fields — so the ABI still reaches the key,
+    /// through that digest rather than through this accessor. A grammar bump changes node
+    /// shapes and therefore query results, and the digest is what catches it.
+    ///
+    /// Kept because it is published API and answers a question callers legitimately ask.
     ///
     /// Read from the grammar rather than written down, or it stops tracking the thing it
     /// exists to track the first time someone forgets to update it. Note that bundled
@@ -91,6 +98,33 @@ pub trait Language: Send + Sync {
     /// is why this is per-language rather than one global constant.
     fn grammar_abi(&self) -> usize {
         self.grammar().abi_version()
+    }
+
+    /// What this language's own analysis code *is*, as a digest of the sources that decide
+    /// an answer.
+    ///
+    /// A cache key input, and a different question from [`grammar::grammar_digest`]: that one
+    /// says what the parse tree looks like, this one says what this crate concludes about it.
+    /// A language's [`binding::BindingResolver`] decides where a name was declared, which
+    /// is what `ctx.bindingKind` and `ctx.resolvesToImport` answer with and what the type
+    /// oracle reads — so a result computed by a resolver that no longer exists is not a valid
+    /// result for a run that has a different one.
+    ///
+    /// The gap this closes was not theoretical. `lanekeep_types::oracle_identity` was the
+    /// whole of the key's analysis term, and it digests `crates/lanekeep-types/src/` alone;
+    /// the scope list deciding which nodes carry type parameters lives in
+    /// `lanekeep-lang-js`, and correcting it moved what the oracle answered while every hash
+    /// stayed identical.
+    ///
+    /// Defaulted rather than required, matching [`Self::resolver`] and [`Self::grammar_abi`]:
+    /// this is published API and a required method would break every external implementor.
+    /// The gap that leaves — a language crate with a resolver and no build script — is closed
+    /// by a test in `lanekeep-languages` rather than by the compiler.
+    ///
+    /// Implementors derive this rather than writing it down. See any language crate's
+    /// `build.rs`.
+    fn analysis_identity(&self) -> [u8; 32] {
+        [0; 32]
     }
 }
 
@@ -244,6 +278,59 @@ impl LanguageRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
+    }
+}
+
+/// What this crate's own resolution code *is*, as a digest of its sources.
+///
+/// A cache key input, and a separate question from any language's
+/// [`Language::analysis_identity`]. Those cover a language crate's own resolver; this covers the
+/// code every one of them answers *through* — `glob_matches`, [`binding::Binding::is_import_of`]
+/// and [`binding::BindingKind::as_str`] are what `ctx.resolvesToImport` and `ctx.bindingKind`
+/// report with, and editing any of them changes what every language says.
+///
+/// A free function rather than a trait method, because this crate registers no language of its
+/// own. Whoever assembles the key folds it once, beside the type oracle's identity, rather than
+/// per language.
+#[must_use]
+pub fn crate_identity() -> [u8; 32] {
+    // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot be a
+    // silent gap.
+    decode_hex32(env!("LANEKEEP_LANG_ANALYSIS_HASH"))
+}
+
+/// Decode the 64-character lowercase hex a build script emitted into 32 bytes.
+///
+/// Every language crate's `build.rs` writes its digest as hex, because that is what a
+/// `cargo:rustc-env` value can carry. One decoder rather than one per crate: they would be
+/// identical, and a copy that drifts would produce a digest that is stable, wrong, and
+/// indistinguishable from a correct one.
+///
+/// Total rather than fallible. The only inputs are constants this workspace's own build
+/// scripts wrote, so there is no caller input to reject and nothing a caller could do about a
+/// malformed one; a digit outside `0-9a-f` reads as zero, and a string shorter than 64
+/// characters leaves the remaining bytes zero.
+#[must_use]
+pub fn decode_hex32(hex: &str) -> [u8; 32] {
+    let bytes = hex.as_bytes();
+    let mut out = [0_u8; 32];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let hi = index * 2;
+        let lo = hi + 1;
+        if lo >= bytes.len() {
+            break;
+        }
+        *slot = (hex_value(bytes[hi]) << 4) | hex_value(bytes[lo]);
+    }
+    out
+}
+
+/// One lowercase hex digit as a nibble, or zero for anything else.
+const fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => 0,
     }
 }
 
@@ -431,5 +518,31 @@ mod tests {
         assert_eq!(registry.len(), 0);
         assert!(registry.for_path("src/x.ts").is_none());
         assert!(registry.by_id("typescript").is_none());
+    }
+
+    #[test]
+    fn hex_decodes_to_the_bytes_it_spells() {
+        let mut expected = [0_u8; 32];
+        expected[0] = 0x0a;
+        expected[1] = 0xff;
+        expected[31] = 0x10;
+        let hex = format!("0aff{}10", "00".repeat(29));
+        assert_eq!(decode_hex32(&hex), expected);
+    }
+
+    /// A short or malformed string leaves zeros rather than panicking, which is what makes
+    /// this safe to call on a constant no caller supplied.
+    #[test]
+    fn a_malformed_hex_string_decodes_to_zeros() {
+        assert_eq!(decode_hex32(""), [0; 32]);
+        assert_eq!(decode_hex32("zz"), [0; 32]);
+    }
+
+    /// A digest that is always zero is indistinguishable from a crate with no build script.
+    #[test]
+    fn the_crate_identity_is_populated_and_stable() {
+        let once = crate_identity();
+        assert_ne!(once, [0_u8; 32], "the build script did not write a digest");
+        assert_eq!(once, crate_identity());
     }
 }

@@ -39,15 +39,16 @@ use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
 use lanekeep_config::{ComponentBytes, Config, ConfigError, RuleSpec};
 use lanekeep_core::suppression::{self, Date, Scope, Suppressions};
 use lanekeep_core::{
-    CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position, RuleId, Severity,
-    TrackedRead, Violation,
+    Capability, CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location, Position,
+    RuleId, Severity, TrackedRead, Violation,
 };
 use lanekeep_js::{
     FileAccess, HOST_API_VERSION, HostContext, Limits, ReduceContext, ReduceFact, RuleRoot,
     RunClock, Sandbox, SandboxError,
 };
-use lanekeep_lang::{Language, LanguageRegistry};
+use lanekeep_lang::{Language, LanguageId, LanguageRegistry};
 use lanekeep_query::{CompileError, CompiledQuery};
+use lanekeep_types::TypeScriptSupport;
 use lanekeep_wasm::bindings::types;
 use lanekeep_wasm::host::{CheckContext, ReduceContext as ComponentReduceContext};
 use lanekeep_wasm::{
@@ -525,6 +526,23 @@ pub struct Engine {
     /// Lowercased keys, because the registry lowercases too — whether `Button.TSX` gets
     /// checked should not depend on how someone typed it.
     languages_by_extension: BTreeMap<String, String>,
+    /// Which registered languages speak TypeScript, probed once here rather than once per
+    /// file or per rule.
+    ///
+    /// [`TypeScriptSupport::probe`] is the expensive part of building an oracle — probing
+    /// dominates construction — so paying it per query match rather than per run would add
+    /// that cost on top of a host crossing already measured at ~302 ns (architecture §15.1).
+    /// Nothing at the engine level rests on the exact split; the oracle's own documentation
+    /// carries the measured figures.
+    ///
+    /// `BTreeMap`, not `HashMap`, per the ordering invariant: nothing here iterates this map
+    /// today, but a `HashMap` field is the one a later change reaches for without noticing it
+    /// would put hash-seed order in front of output.
+    ///
+    /// A missing entry means this language's grammar does not speak TypeScript — `probe`
+    /// returned `None` for it — which [`Self::run_rule`] tells apart from "the rule did not
+    /// declare `requires: ['types']`": both have to hold before `ctx.types` is installed.
+    type_support: BTreeMap<LanguageId, TypeScriptSupport>,
 }
 
 /// The component half of a run, walled off so its one constructor cannot be gone around.
@@ -601,6 +619,32 @@ impl std::fmt::Debug for Engine {
 /// needs and wants narrowing; a rule that is slow in `handler` has code to look at. Reporting
 /// one total would leave an author guessing which, and the two have nothing in common as
 /// fixes.
+///
+/// **`path_gated`, `unread`, `cached`, `content_gated`, `language_gated` and `parsed`
+/// reconcile.** Their sum equals [`Outcome::files_discovered`] for this rule, on every run,
+/// warm or cold — a file this rule saw always lands in exactly one of the six, because they
+/// are the six mutually exclusive points at which a file's fate for this rule is decided.
+/// That is what makes the table trustworthy: an author whose rule reports nothing can tell
+/// whether a gate excluded every file it would have caught, or no grammar the rule declares
+/// parses them, rather than guessing between that and "the handler is wrong." `parsed`
+/// counts only files this rule actually ran against — a rule whose declared language does
+/// not match a file's counts as `language_gated` there instead, never as `parsed`, however
+/// gate configuration says nothing about which files a query gets to run against.
+///
+/// **A nonzero `cached` means the columns to its right are incomplete for this run** — a
+/// cache hit returns before those counters are reached, so what they hold describes only the
+/// files the cache did not answer. Re-run with `--no-cache` to read them. `path_gated` is
+/// unaffected, since `Engine::check_file` applies the path gates and records the counter
+/// before the read and before the cache is consulted at all.
+///
+/// Deliberately no stronger claim than "incomplete". Saying *which* columns go to zero warm
+/// has been tried and falsified five times: a file no grammar claims, a file whose language
+/// no rule surviving the content gates declares, and a file that is not valid UTF-8 are all
+/// `skipped` rather than given a cache entry, so every warm run re-attributes them for as
+/// long as the corpus holds them. Against this repository the second warm pass puts a `2` in
+/// `content_gated` or `language_gated` in all seventeen rows — and which of the two it lands
+/// in differs by rule, so "identical rows warm" is false as well. The reconciliation above
+/// is what still holds warm: the six counters sum to `files_discovered` in every state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
@@ -612,6 +656,36 @@ pub struct RuleTiming {
     /// The number the query gate exists to keep small — §7.2 — so it belongs beside the
     /// times rather than being inferred from them.
     pub matches: u64,
+    /// Files this rule's path gates rejected, before any read.
+    pub path_gated: u64,
+    /// Files this rule was admitted to that never reached a parser: gone between discovery
+    /// and the read, or not valid UTF-8.
+    pub unread: u64,
+    /// Files served from cache before this rule's content gates were consulted.
+    pub cached: u64,
+    /// Files this rule's content gates rejected, after the read and before the parse.
+    pub content_gated: u64,
+    /// Files this rule never ran against because no grammar it declares parses them.
+    ///
+    /// Two causes, not one, and only the first is the author's `language` declaration: the
+    /// file parses with some grammar this rule does not name, or **no grammar claims the
+    /// file's extension at all** — an `include` of `src/**/*` sweeping up Markdown and plain
+    /// text puts every such file here for every rule, and no `language` declaration could
+    /// move it, since lanekeep has no grammar to offer. A message naming only the first
+    /// cause sends an author to edit a declaration that was never wrong; the `include` is
+    /// the other half of what to check.
+    ///
+    /// Distinct from `parsed`: a file can be parsed — by whichever grammar the file itself
+    /// selects — while this rule never runs against it, because the language a rule
+    /// declares narrows which parsed files it sees exactly the way a gate narrows which
+    /// files it is even offered. Counting such a file as `parsed` would tell an author with
+    /// `parsed: N, matches: 0` to narrow their query, when the real cause is the `language`
+    /// declaration — the failure mode `AGENTS.md` records costing 2218 false positives on a
+    /// React Native codebase, arriving here from the diagnostic rather than the engine side.
+    pub language_gated: u64,
+    /// Files this rule actually saw run: both gates passed, and its declared language
+    /// matched the file's.
+    pub parsed: u64,
 }
 
 impl RuleTiming {
@@ -620,6 +694,77 @@ impl RuleTiming {
     pub const fn total(&self) -> Duration {
         self.query.saturating_add(self.handler)
     }
+
+    /// Fold `other` into `self` — every field summed, the two durations saturating like
+    /// `total` above. Named rather than inlined at its one call site in
+    /// [`Engine::run_files`] because that function is otherwise a line away from clippy's
+    /// limit, and the reduction is exactly the field-by-field repetition this hides.
+    fn accumulate(&mut self, other: &Self) {
+        self.query = self.query.saturating_add(other.query);
+        self.handler = self.handler.saturating_add(other.handler);
+        self.matches += other.matches;
+        self.path_gated += other.path_gated;
+        self.unread += other.unread;
+        self.cached += other.cached;
+        self.content_gated += other.content_gated;
+        self.language_gated += other.language_gated;
+        self.parsed += other.parsed;
+    }
+}
+
+/// One increment per rule, for whichever [`RuleTiming`] bucket counted it.
+///
+/// Every counting site in [`Engine::check_file`] that sets exactly one field to `1` shares
+/// this exact shape — take a rule, pair its id with a [`RuleTiming`] carrying that single
+/// increment — and a free function is what keeps repeating it inline from pushing that
+/// function over clippy's line limit. Not used for `parsed`/`language_gated`, which choose
+/// their field per rule rather than setting the same one for every rule in the iterator.
+fn bucket_timings<'a>(
+    rules: impl Iterator<Item = &'a Prepared>,
+    set: impl Fn(&mut RuleTiming),
+) -> Vec<(RuleId, RuleTiming)> {
+    rules
+        .map(|rule| {
+            let mut timing = RuleTiming::default();
+            set(&mut timing);
+            (rule.spec.id.clone(), timing)
+        })
+        .collect()
+}
+
+/// [`bucket_timings`], but empty when `profiling` is off — the shape every uniform
+/// counting site in [`Engine::check_file`] needs, kept out of that function's line count.
+fn gate_timings<'a>(
+    profiling: bool,
+    rules: impl Iterator<Item = &'a Prepared>,
+    set: impl Fn(&mut RuleTiming),
+) -> Vec<(RuleId, RuleTiming)> {
+    if profiling {
+        bucket_timings(rules, set)
+    } else {
+        Vec::new()
+    }
+}
+
+/// `a` with `b` appended — named at the call sites in [`Engine::check_file`] that carry
+/// gate-rejection and `unread` timings from one early return to the next, to keep each to
+/// one line.
+fn extend_timings(
+    mut a: Vec<(RuleId, RuleTiming)>,
+    b: Vec<(RuleId, RuleTiming)>,
+) -> Vec<(RuleId, RuleTiming)> {
+    a.extend(b);
+    a
+}
+
+/// `unread: 1` for every rule in `admitted` — the two `skipped()` sites in
+/// [`Engine::check_file`] that follow the path gate share this exact shape: a rule that was
+/// never rejected by any gate, but whose file turned out to be unreadable or not UTF-8.
+fn unread_timings<'a>(
+    profiling: bool,
+    admitted: impl Iterator<Item = &'a Prepared>,
+) -> Vec<(RuleId, RuleTiming)> {
+    gate_timings(profiling, admitted, |timing| timing.unread = 1)
 }
 
 /// What a run produced.
@@ -660,7 +805,10 @@ impl Engine {
         clippy::too_many_lines,
         reason = "the per-language query compile loop belongs here — a broken query surfaces \
                   at prepare time, naming its rule — and extracting it would move that \
-                  diagnostic away from the place it is reported"
+                  diagnostic away from the place it is reported. Briefly unfulfilled while \
+                  `grammar_keys` and `analysis_keys` were extracted out of this function and \
+                  before the cache-key terms they serve were wired in; the loop is what keeps \
+                  it long, and that has not changed"
     )]
     pub fn prepare(
         config: &Config,
@@ -680,10 +828,16 @@ impl Engine {
             .join(", ");
 
         let mut languages_by_extension = BTreeMap::new();
+        // Probed here, once per registered language for the whole run — never inside the
+        // per-file walk below, and never per rule. See the field.
+        let mut type_support = BTreeMap::new();
         for language in registry.languages() {
             for extension in language.extensions() {
                 languages_by_extension
                     .insert(extension.to_ascii_lowercase(), language.id().to_string());
+            }
+            if let Some(support) = TypeScriptSupport::probe(language.as_ref()) {
+                type_support.insert(language.id(), support);
             }
         }
 
@@ -785,18 +939,15 @@ impl Engine {
         let loader = ComponentLoader::for_project_root(project_root);
         let components = load_components(&mut rules, &loader)?;
 
-        // Every registered grammar, so a tree-sitter bump invalidates rather than silently
-        // reusing results computed against different node shapes.
-        let mut grammars: Vec<GrammarKey> = registry
-            .languages()
-            .map(|language| GrammarKey {
-                id: language.id().to_string(),
-                abi: u32::try_from(language.grammar_abi()).unwrap_or(u32::MAX),
-            })
-            .collect();
-        grammars.sort_by(|a, b| a.id.cmp(&b.id));
+        let grammars = grammar_keys(registry);
+        let languages = analysis_keys(registry);
 
-        let run_key = run_key(&config.ruleset_hash, &config.config_hash, &grammars)?;
+        let run_key = run_key(
+            &config.ruleset_hash,
+            &config.config_hash,
+            &grammars,
+            &languages,
+        )?;
 
         // On unless some rule's component carries bytes `ruleset_hash` never saw — see the
         // field. Vacuously true when there is no component at all, which keeps a TypeScript-only
@@ -832,6 +983,7 @@ impl Engine {
             typescript,
             javascript,
             languages_by_extension,
+            type_support,
         })
     }
 
@@ -1000,10 +1152,7 @@ impl Engine {
                 fresh.insert(entry.0, entry.1);
             }
             for (rule, timing) in outcome.timings {
-                let entry = timings.entry(rule).or_default();
-                entry.query = entry.query.saturating_add(timing.query);
-                entry.handler = entry.handler.saturating_add(timing.handler);
-                entry.matches += timing.matches;
+                timings.entry(rule).or_default().accumulate(&timing);
             }
             if !outcome.suppressions.is_empty() {
                 directives.insert(
@@ -1383,8 +1532,22 @@ impl Engine {
             .iter()
             .filter(|rule| rule.gates.admits_path(path))
             .collect();
+        // Counted only when profiling — a corpus of ten thousand files times ten rules is a
+        // hundred thousand increments nobody asked for on the path a warm run takes.
+        //
+        // Re-evaluating `admits_path` here rather than partitioning the filter above keeps
+        // the non-profiling path exactly what it always was: one filter, one allocation. The
+        // predicate is pure, so calling it twice cannot change which files are admitted —
+        // only how much bookkeeping profiling pays for.
+        let path_gate_timings = gate_timings(
+            self.profiling,
+            self.rules
+                .iter()
+                .filter(|rule| !rule.gates.admits_path(path)),
+            |timing| timing.path_gated = 1,
+        );
         if admitted.is_empty() {
-            return Ok(FileOutcome::skipped(path.clone()));
+            return Ok(FileOutcome::skipped(path.clone(), path_gate_timings));
         }
 
         let absolute = self.discovery.root().join(path.as_str());
@@ -1392,8 +1555,13 @@ impl Engine {
             // A file that vanished between discovery and reading is not a failure. The
             // tree is allowed to change under a run; what must not happen is a partial
             // result being reported as complete, and a missing file contributes nothing
-            // either way.
-            return Ok(FileOutcome::skipped(path.clone()));
+            // either way. Every rule the path gate admitted is `unread`, not `path_gated` —
+            // the path gate already let it through.
+            let unread = unread_timings(self.profiling, admitted.iter().copied());
+            return Ok(FileOutcome::skipped(
+                path.clone(),
+                extend_timings(path_gate_timings, unread),
+            ));
         };
 
         // The cache is consulted after the path gates and the read, because the key needs
@@ -1423,24 +1591,25 @@ impl Engine {
         });
         let has_expiry = memchr::memmem::find(&bytes, b"expires:").is_some();
 
-        if let Some((plain, dated)) = keys {
-            // Dated first. A file with an expiring suppression is *only* ever stored dated,
-            // so trying the plain key for it would be a lookup that can never hit.
-            let candidates: &[CacheKey] = if has_expiry {
-                &[dated]
-            } else {
-                &[dated, plain]
+        let path_gate_timings =
+            match self.cache_hit(cache, path, keys, has_expiry, &admitted, path_gate_timings) {
+                Ok(outcome) => return Ok(outcome),
+                Err(timings) => timings,
             };
-            for key in candidates {
-                if let Some(entry) = cache.get(key)
-                    && lanekeep_cache::validate(entry, &self.root)
-                {
-                    return Ok(FileOutcome::cached(path.clone(), *key, entry.clone()));
-                }
-            }
-        }
 
         // Content gates: one read, a substring scan, and a parse saved.
+        //
+        // Computed from the still-intact path-gate survivors before they are consumed below,
+        // for the same reason as the path gate above: re-evaluating a pure predicate only
+        // under `--profile` keeps the non-profiling path unchanged.
+        let content_gate_timings = gate_timings(
+            self.profiling,
+            admitted
+                .iter()
+                .filter(|rule| !rule.gates.admits_content(&bytes))
+                .copied(),
+            |timing| timing.content_gated = 1,
+        );
         let admitted: Vec<&Prepared> = admitted
             .into_iter()
             .filter(|rule| rule.gates.admits_content(&bytes))
@@ -1453,12 +1622,17 @@ impl Engine {
             return Ok(FileOutcome::empty_entry(
                 path.clone(),
                 keys.map(|(plain, dated)| if has_expiry { dated } else { plain }),
+                extend_timings(path_gate_timings, content_gate_timings),
             ));
         }
 
         let Ok(source) = String::from_utf8(bytes) else {
-            // Not valid UTF-8, so not source this tool can reason about.
-            return Ok(FileOutcome::skipped(path.clone()));
+            // Not valid UTF-8, so not source this tool can reason about. Every rule that
+            // survived both gates is `unread`, not `parsed` — nothing of this file's
+            // content ever reached a parser.
+            let mut timings = extend_timings(path_gate_timings, content_gate_timings);
+            timings.extend(unread_timings(self.profiling, admitted.iter().copied()));
+            return Ok(FileOutcome::skipped(path.clone(), timings));
         };
 
         // Parsed once per file, whatever rules ran: a directive is a property of the file,
@@ -1466,6 +1640,16 @@ impl Engine {
         let directives = suppression::parse(&source);
 
         let mut outcome = FileOutcome::parsed(path.clone());
+        outcome.timings.extend(path_gate_timings);
+        outcome.timings.extend(content_gate_timings);
+        // Every rule that survived both gates lands here, whether or not the parse below
+        // actually succeeds — computed and pushed *before* `parse_once` runs, which is
+        // load-bearing: the early return just below, when no admitted rule targets this
+        // file's language at all, must still hand back an `outcome` that already carries
+        // every rule's count.
+        outcome
+            .timings
+            .extend(self.parsed_or_language_gated_timings(path, &admitted));
         let Some((language, tree)) = self.parse_once(path, &source, &admitted) else {
             return Ok(outcome);
         };
@@ -1479,10 +1663,35 @@ impl Engine {
             tree: &tree,
             language: &language,
         };
-        self.dispatch(worker, &files, &admitted, &file, &mut outcome)?;
-        self.apply_directives(&mut outcome, &directives, path);
+        self.finish_parsed(
+            (worker, &files),
+            &admitted,
+            &file,
+            outcome,
+            &directives,
+            (keys, has_expiry),
+        )
+    }
 
-        outcome.suppressions = directives.valid;
+    /// The rest of [`Self::check_file`] once a file has actually parsed: dispatch, apply
+    /// directives, and build the cache entry. Split out only to keep that function under
+    /// clippy's line limit. `path` is read off `file`; `worker` and `files` travel as one
+    /// pair and so do the cache key and its expiry flag, to keep this under clippy's
+    /// argument-count limit too.
+    fn finish_parsed(
+        &self,
+        (worker, files): (&mut Worker<'_>, &Arc<FileAccess>),
+        admitted: &[&Prepared],
+        file: &FileUnderCheck<'_>,
+        mut outcome: FileOutcome,
+        directives: &Suppressions,
+        (keys, has_expiry): (Option<(CacheKey, CacheKey)>, bool),
+    ) -> Result<FileOutcome, RunError> {
+        let path = file.path;
+        self.dispatch(worker, files, admitted, file, &mut outcome)?;
+        self.apply_directives(&mut outcome, directives, path);
+
+        outcome.suppressions.clone_from(&directives.valid);
         outcome.reads = files.dependencies();
         // Dated if anything about this file's result depended on the date: an expiring
         // directive, or a rule that read `ctx.today`.
@@ -1501,6 +1710,94 @@ impl Engine {
         });
 
         Ok(outcome)
+    }
+
+    /// `parsed: 1` for a rule whose declared language matches this file's, `language_gated:
+    /// 1` for one that does not — split out of [`Self::check_file`] only to keep that
+    /// function under clippy's line limit.
+    ///
+    /// A rule only ever runs against a file whose language it declares — [`Prepared::
+    /// for_language`] is the same check [`Self::run_rule`] and [`Self::run_component_rule`]
+    /// make before dispatching — so a rule that does not declare this file's language can
+    /// never be dispatched here no matter what the parse below does with these bytes.
+    /// `language_of` returning `None` lands in the same arm and for the same reason: a file
+    /// no grammar claims is one no rule can run against, so it is `language_gated` for every
+    /// admitted rule rather than for any rule in particular. Both causes reach one counter
+    /// deliberately — the alternative is a seventh column carrying a corpus-wide fact
+    /// identical in every row — and every message that names the counter has to name both.
+    /// Lumping it in with `parsed` would tell an author with `parsed: N, matches: 0` to
+    /// narrow their query, when the real cause is the `language` declaration.
+    fn parsed_or_language_gated_timings(
+        &self,
+        path: &FilePath,
+        admitted: &[&Prepared],
+    ) -> Vec<(RuleId, RuleTiming)> {
+        if !self.profiling {
+            return Vec::new();
+        }
+        let language_id = self.language_of(path);
+        admitted
+            .iter()
+            .copied()
+            .map(|rule| {
+                let mut timing = RuleTiming::default();
+                if language_id.is_some_and(|id| rule.for_language(id).is_some()) {
+                    timing.parsed = 1;
+                } else {
+                    timing.language_gated = 1;
+                }
+                (rule.spec.id.clone(), timing)
+            })
+            .collect()
+    }
+
+    /// The cache-hit half of [`Self::check_file`], split out only to keep that function
+    /// under clippy's line limit — it is not a reusable step, just a large one.
+    ///
+    /// Returns the finished outcome on a hit. On a miss, hands `path_gate_timings` back
+    /// unchanged as the `Err` so the caller can carry it into whichever constructor runs
+    /// next — this is bookkeeping ownership, not a real error.
+    fn cache_hit(
+        &self,
+        cache: &Store,
+        path: &FilePath,
+        keys: Option<(CacheKey, CacheKey)>,
+        has_expiry: bool,
+        admitted: &[&Prepared],
+        path_gate_timings: Vec<(RuleId, RuleTiming)>,
+    ) -> Result<FileOutcome, Vec<(RuleId, RuleTiming)>> {
+        let Some((plain, dated)) = keys else {
+            return Err(path_gate_timings);
+        };
+        // Dated first. A file with an expiring suppression is *only* ever stored dated,
+        // so trying the plain key for it would be a lookup that can never hit.
+        let candidates: &[CacheKey] = if has_expiry {
+            &[dated]
+        } else {
+            &[dated, plain]
+        };
+        for key in candidates {
+            if let Some(entry) = cache.get(key)
+                && lanekeep_cache::validate(entry, &self.root)
+            {
+                // Every rule still admitted at this point — the cache is consulted
+                // before the content gates run at all — is served from the cache,
+                // whatever its own content gates would have made of these bytes.
+                let mut timings = path_gate_timings;
+                if self.profiling {
+                    timings.extend(bucket_timings(admitted.iter().copied(), |timing| {
+                        timing.cached = 1;
+                    }));
+                }
+                return Ok(FileOutcome::cached(
+                    path.clone(),
+                    *key,
+                    entry.clone(),
+                    timings,
+                ));
+            }
+        }
+        Err(path_gate_timings)
     }
 
     /// Run every admitted rule over one parsed file, through whichever engine backs it.
@@ -2003,6 +2300,33 @@ impl Engine {
             .collect()
     }
 
+    /// Turn a QuickJS rule's reports into violations, under the rule's own identity.
+    ///
+    /// Mirrors [`Self::violations_from`] immediately above, which does the identical job for
+    /// a component's own `lanekeep_wasm::host::Report`. Kept as a separate function rather
+    /// than a shared generic one because the two engines' report types are not the same
+    /// type, even though the shape they carry — a position, an optional message, an optional
+    /// fix — is.
+    fn violations_from_js(
+        rule: &Prepared,
+        path: &FilePath,
+        reports: Vec<lanekeep_js::Report>,
+    ) -> Vec<Violation> {
+        reports
+            .into_iter()
+            .map(|report| Violation {
+                rule_id: rule.spec.id.clone(),
+                location: Location::new(path.clone(), Position::new(report.line, report.column)),
+                message: report
+                    .message
+                    .unwrap_or_else(|| rule.spec.card.message.clone()),
+                remediation: rule.spec.card.remediation.clone(),
+                severity: rule.spec.severity,
+                fix: report.fix,
+            })
+            .collect()
+    }
+
     /// Open the file's component context, if this is the first rule that needs one.
     ///
     /// The resource stays in the caller's `Option` rather than being handed back by value:
@@ -2051,6 +2375,24 @@ impl Engine {
         }
     }
 
+    /// The type oracle token to attach for this rule and language, if any.
+    ///
+    /// Both conditions have to hold: the rule declared `requires: ['types']`, and this
+    /// language actually has a probed oracle. A rule that declares the capability against a
+    /// language with no TypeScript-shaped grammar (Python, say) gets no `ctx.types` either —
+    /// it stays absent, which is loud rather than silently wrong the moment such a rule
+    /// reaches for it. See [`HostContext::with_types`].
+    fn types_for(
+        &self,
+        rule: &Prepared,
+        language: &Arc<dyn Language>,
+    ) -> Option<TypeScriptSupport> {
+        if !rule.spec.requires.contains(&Capability::Types) {
+            return None;
+        }
+        self.type_support.get(&language.id()).cloned()
+    }
+
     fn run_rule(
         &self,
         worker: &mut Worker<'_>,
@@ -2094,11 +2436,14 @@ impl Engine {
         // has ended — the two-phase shape the arena's ownership of the tree forces.
         let mut matches: RuleMatches = Vec::new();
 
-        let host = HostContext::new(tree, source.to_owned(), path.as_str())
+        let mut host = HostContext::new(tree, source.to_owned(), path.as_str())
             .with_resolver_from(language.as_ref())
             .with_language(Arc::clone(language))
             .with_today(&self.today.to_string())
             .with_file_access(Arc::clone(files));
+        if let Some(support) = self.types_for(rule, language) {
+            host = host.with_types(support);
+        }
 
         let query_started = clock(self.profiling);
         if let Some(found) = precollected {
@@ -2134,7 +2479,6 @@ impl Engine {
         let sandbox = worker.sandbox()?;
 
         let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
-        let mut violations = Vec::new();
 
         for captures in matches {
             let handles: Vec<(String, u32)> = {
@@ -2187,18 +2531,7 @@ impl Engine {
             })
             .collect();
 
-        for report in host.take_reports() {
-            violations.push(Violation {
-                rule_id: rule.spec.id.clone(),
-                location: Location::new(path.clone(), Position::new(report.line, report.column)),
-                message: report
-                    .message
-                    .unwrap_or_else(|| rule.spec.card.message.clone()),
-                remediation: rule.spec.card.remediation.clone(),
-                severity: rule.spec.severity,
-                fix: report.fix,
-            });
-        }
+        let violations = Self::violations_from_js(rule, path, host.take_reports());
 
         Ok((violations, facts, host.date_was_read(), timing))
     }
@@ -2379,7 +2712,15 @@ struct FileOutcome {
 
 impl FileOutcome {
     /// A file that never reached a parser — gated out, unreadable, or not UTF-8.
-    const fn skipped(path: FilePath) -> Self {
+    ///
+    /// `timings` carries whichever gate rejections and `unread` counts this file already
+    /// produced for rules that never reach a later constructor: the path gate's rejections,
+    /// always; the content gate's, when the file failed to decode as UTF-8 after surviving
+    /// it; and an `unread` count for every rule that was admitted (by the path gate alone,
+    /// or by both gates) when the file turned out to be unreadable or not UTF-8 — those
+    /// rules were never rejected by any gate, so they must not be counted as `path_gated`
+    /// or `content_gated`, and they never reached a parser, so they must not be `parsed`.
+    fn skipped(path: FilePath, timings: Vec<(RuleId, RuleTiming)>) -> Self {
         Self {
             path,
             violations: Vec::new(),
@@ -2388,7 +2729,7 @@ impl FileOutcome {
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
             read_the_date: false,
-            timings: Vec::new(),
+            timings,
             entry: None,
             parsed: false,
         }
@@ -2412,8 +2753,15 @@ impl FileOutcome {
     /// A file whose result came back from the cache.
     ///
     /// Counted as parsed, because from outside the run it was checked — reporting a warm
-    /// run as having checked nothing would make the number useless.
-    fn cached(path: FilePath, key: CacheKey, entry: CacheEntry) -> Self {
+    /// run as having checked nothing would make the number useless. `timings` carries the
+    /// path gate's rejections plus a `cached` count for every rule still admitted when the
+    /// cache was consulted.
+    fn cached(
+        path: FilePath,
+        key: CacheKey,
+        entry: CacheEntry,
+        timings: Vec<(RuleId, RuleTiming)>,
+    ) -> Self {
         Self {
             path,
             violations: entry.violations.clone(),
@@ -2424,14 +2772,22 @@ impl FileOutcome {
             // A cache hit ran no rules, so nothing read the date this time. Whether the
             // entry was dated is already settled by the key it was found under.
             read_the_date: false,
-            timings: Vec::new(),
+            timings,
             entry: Some((key, entry)),
             parsed: true,
         }
     }
 
     /// A file that no rule's content gates admitted.
-    fn empty_entry(path: FilePath, key: Option<CacheKey>) -> Self {
+    ///
+    /// `timings` carries the path gate's rejections plus a `content_gated` count for every
+    /// rule that survived it — which, for this constructor, is every rule that reached the
+    /// content gate at all.
+    fn empty_entry(
+        path: FilePath,
+        key: Option<CacheKey>,
+        timings: Vec<(RuleId, RuleTiming)>,
+    ) -> Self {
         Self {
             path,
             violations: Vec::new(),
@@ -2440,7 +2796,7 @@ impl FileOutcome {
             suppressions: Vec::new(),
             used_suppressions: Vec::new(),
             read_the_date: false,
-            timings: Vec::new(),
+            timings,
             entry: key.map(|key| (key, CacheEntry::default())),
             parsed: false,
         }
@@ -2669,8 +3025,9 @@ fn declared_bindings_match(bound: &[ExternalBinding]) -> Result<(), RunError> {
 /// Everything about a run that every file's key shares.
 ///
 /// A named function rather than a call inside [`Engine::prepare`], because it is the one place
-/// the five run-wide inputs are actually assembled and a value dropped here is dropped from
-/// every key in the run. Inline it and "the compilation environment reaches a real run's key"
+/// the run-wide inputs are actually assembled — whatever [`RunKey::new`] takes, which is the
+/// list rather than any number written here — and a value dropped here is dropped from every
+/// key in the run. Inline it and "the compilation environment reaches a real run's key"
 /// becomes a claim about a private field of a struct that needs a project on disk to build.
 ///
 /// # Errors
@@ -2681,6 +3038,7 @@ fn run_key(
     ruleset_hash: &[u8],
     config_hash: &[u8],
     grammars: &[GrammarKey],
+    languages: &[(String, [u8; 32])],
 ) -> Result<RunKey, RunError> {
     let compile_env = lanekeep_wasm::compile_env_hash().map_err(|e| RunError::WasmRuntime {
         detail: e.to_string(),
@@ -2692,10 +3050,53 @@ fn run_key(
         engine_version(),
         &host_api_hash(),
         &compile_env,
+        &analysis_hash(languages),
         ruleset_hash,
         config_hash,
         grammars,
     ))
+}
+
+/// Every registered grammar, as the cache key sees it.
+///
+/// A function rather than an inline `map` so that a test can call the assembly the run actually
+/// uses. Built inline, a mutation putting `[0; 32]` here in place of the real digest was invisible:
+/// the key-level tests construct their own `GrammarKey`s, so they pass whatever this does.
+///
+/// The digest covers the ABI and the node kinds and fields a query is compiled against, so a
+/// tree-sitter bump invalidates — and so does a regeneration at an unchanged ABI, which the bare
+/// ABI version this used to carry could not see.
+///
+/// Sorted by id, so the key does not depend on registration order.
+fn grammar_keys(registry: &LanguageRegistry) -> Vec<GrammarKey> {
+    let mut grammars: Vec<GrammarKey> = registry
+        .languages()
+        .map(|language| GrammarKey {
+            id: language.id().to_string(),
+            digest: lanekeep_lang::grammar_digest(&language.grammar()),
+        })
+        .collect();
+    grammars.sort_by(|a, b| a.id.cmp(&b.id));
+    grammars
+}
+
+/// Every registered language's own analysis identity, as the cache key sees it.
+///
+/// A function rather than an inline `map`, symmetric with `grammar_keys` above and for the same
+/// reason: built inline beside its call site, a mutation putting `[0; 32]` here in place of the
+/// real identity was invisible, because the key-level tests construct their own
+/// `(String, [u8; 32])` pairs and pass whatever this does regardless.
+///
+/// `languages()` iterates a `BTreeMap` and is already documented as ordered by id, so this sort
+/// is not doing any work today — it is asserted rather than relied upon, the same insurance
+/// `grammar_keys` takes against a registration-order dependency.
+fn analysis_keys(registry: &LanguageRegistry) -> Vec<(String, [u8; 32])> {
+    let mut languages: Vec<(String, [u8; 32])> = registry
+        .languages()
+        .map(|language| (language.id().to_string(), language.analysis_identity()))
+        .collect();
+    languages.sort_by(|a, b| a.0.cmp(&b.0));
+    languages
 }
 
 /// Everything a rule may reach, from both engines, in one cache-key field.
@@ -2727,6 +3128,79 @@ fn fold_host_api(ctx_version: u32, wasm_world: &[u8]) -> [u8; 32] {
     hasher.update(&ctx_version.to_le_bytes());
     hasher.update(wasm_world);
     *hasher.finalize().as_bytes()
+}
+
+/// Everything the host analyses compute, in one cache-key field.
+///
+/// The type oracle's own identity, the language-resolution crate's own identity, and every
+/// registered language's. A language's resolver decides where a name was declared, which is
+/// what `ctx.bindingKind` and `ctx.resolvesToImport` answer with and what the oracle reads
+/// before it can type anything — so a result computed by a resolver that no longer exists is
+/// not a valid result for a run that has a different one.
+///
+/// **The oracle alone was the whole of this field until now, and the gap was not theoretical.**
+/// `oracle_identity` digests `crates/lanekeep-types/src/`, and the scope list deciding which
+/// nodes carry type parameters lives in `lanekeep-lang-js`. Correcting it changed what the
+/// oracle answered — `type Amount = number; interface O<Amount> { x: Amount }` went from
+/// `number` to nothing at all — while every hash stayed identical. `engine_version` is no
+/// backstop either: it is major.minor on purpose, and a resolver fix ships as a patch.
+///
+/// `lanekeep_lang::crate_identity()` is the resolver-core term: it digests
+/// `crates/lanekeep-lang`'s own sources — `glob_matches`, `Binding::is_import_of`,
+/// `is_imported_from` and `BindingKind::as_str` — which is the code every language's resolver
+/// answers *through*, not a per-language concern. It has no `Language` impl to hang a method
+/// on, and it does not vary with which languages are registered, so it is folded once, fixed,
+/// beside the oracle's identity, rather than per language.
+///
+/// Per language rather than per crate, because the registry is what knows which languages a run
+/// has. Three of the six share one identity, since `typescript`, `tsx` and `javascript` come
+/// from one crate and one resolver; the ids are what keep those three from folding to the same
+/// bytes as one.
+fn analysis_hash(languages: &[(String, [u8; 32])]) -> [u8; 32] {
+    fold_analysis(
+        &lanekeep_types::oracle_identity(),
+        &lanekeep_lang::crate_identity(),
+        languages,
+    )
+}
+
+/// The fold, separated from its inputs so a test can vary them.
+///
+/// `oracle_identity()`, `crate_identity()` and every `analysis_identity()` are derived at build
+/// time, so none of them can be moved in a test against the real function — and "every
+/// language's identity is in the key" is exactly the claim that is worth nothing unasserted.
+/// Same reasoning, and the same shape, as `fold_host_api` above.
+fn fold_analysis(
+    oracle: &[u8],
+    resolver_core: &[u8],
+    languages: &[(String, [u8; 32])],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lanekeep-analysis");
+    // Length-prefixed throughout. `oracle` and `resolver_core` are the only two adjacent
+    // variable-length fields in this fold — every other field is either a fixed 32-byte
+    // identity or itself the count prefix — so they are the one adjacency an unprefixed
+    // concatenation could actually collide on: `"oracle"` + `"resolver-core"` and
+    // `"oracleresolver"` + `"-core"` concatenate to the identical `"oracleresolver-core"`.
+    analysis_field(&mut hasher, oracle);
+    analysis_field(&mut hasher, resolver_core);
+    analysis_field(
+        &mut hasher,
+        &u64::try_from(languages.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for (id, identity) in languages {
+        analysis_field(&mut hasher, id.as_bytes());
+        analysis_field(&mut hasher, identity);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// One length-prefixed field of the analysis fold.
+fn analysis_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
 }
 
 /// The engine version a cache key uses: major.minor only.
@@ -2804,6 +3278,120 @@ mod tests {
     }
 
     #[test]
+    fn a_languages_analysis_identity_reaches_the_analysis_fold() {
+        // The claim the whole term exists for: change a resolver, get a different key. It
+        // cannot be asserted against the real function, because `oracle_identity` and every
+        // `analysis_identity` are derived at build time and none of them can be moved from a
+        // test — which is exactly why the fold is separated from its inputs, the same
+        // reasoning `fold_host_api` beside it already uses.
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [2; 32])],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn the_oracle_identity_reaches_the_analysis_fold() {
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"different-oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn a_resolver_cores_identity_reaches_the_analysis_fold() {
+        // `lanekeep_lang::crate_identity()` covers the code every language's resolver answers
+        // through — `glob_matches`, `is_import_of`, `is_imported_from`, `BindingKind::as_str` —
+        // and it is fixed rather than per language, so it needs its own discriminating case.
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core-one",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"oracle",
+            b"resolver-core-two",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn a_languages_id_reaches_the_analysis_fold() {
+        // Two languages with one shared identity is the ordinary case — `typescript`, `tsx`
+        // and `javascript` all come from one crate — so the ids are what distinguish a
+        // registry of three from a registry of two.
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(b"oracle", b"resolver-core", &[("tsx".to_owned(), [1; 32])]);
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn adding_a_language_changes_the_analysis_fold() {
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            &[
+                ("typescript".to_owned(), [1; 32]),
+                ("tsx".to_owned(), [1; 32]),
+            ],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn analysis_fold_fields_cannot_run_together() {
+        // The reason every field is length-prefixed. `oracle` and `resolver_core` are the only
+        // two adjacent variable-length fields in this fold — every language entry's identity is
+        // a fixed 32 bytes, so an id/identity boundary cannot shift the way two arbitrary byte
+        // strings can. Unprefixed, `"oracle"` + `"resolver-core"` and `"oracleresolver"` +
+        // `"-core"` concatenate to the identical `"oracleresolver-core"`; prefixed, they must
+        // differ.
+        let one = fold_analysis(b"oracle", b"resolver-core", &[]);
+        let two = fold_analysis(b"oracleresolver", b"-core", &[]);
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn the_analysis_fold_reads_the_real_oracle_and_the_real_languages() {
+        // The fold is only worth testing if the shipped call feeds it the shipped values. A
+        // hash derived correctly and then not passed is the same stale-answer bug as one that
+        // is never derived.
+        let languages = [("typescript".to_owned(), [3; 32])];
+        assert_eq!(
+            analysis_hash(&languages),
+            fold_analysis(
+                &lanekeep_types::oracle_identity(),
+                &lanekeep_lang::crate_identity(),
+                &languages
+            )
+        );
+    }
+
+    #[test]
     fn the_two_wasm_inputs_reach_a_real_runs_key() {
         // Both of the new fields, asserted at the place they are assembled rather than at
         // `RunKey`'s door. A hash that is derived correctly and then not passed is the same
@@ -2811,10 +3399,12 @@ mod tests {
         // pass against exactly that.
         let grammars = [GrammarKey {
             id: "typescript".to_owned(),
-            abi: 15,
+            digest: [15; 32],
         }];
+        let languages = [("typescript".to_owned(), [3; 32])];
         let content = lanekeep_core::ContentHash::new([7; 32]);
-        let real = run_key(b"ruleset", b"config", &grammars).expect("the runtime describes itself");
+        let real = run_key(b"ruleset", b"config", &grammars, &languages)
+            .expect("the runtime describes itself");
 
         for (label, host_api, compile_env) in [
             (
@@ -2834,6 +3424,7 @@ mod tests {
                 engine_version(),
                 &host_api,
                 &compile_env,
+                &analysis_hash(&languages),
                 b"ruleset",
                 b"config",
                 &grammars,
@@ -2844,6 +3435,65 @@ mod tests {
                 "{label} must reach the key a run actually files results under"
             );
         }
+    }
+
+    #[test]
+    fn a_grammars_real_digest_reaches_a_real_runs_key() {
+        // Denies a digest computed correctly by `GrammarShape::digest` and then not passed into
+        // the key. `grammar_keys` is called here rather than reconstructed, which is the whole
+        // point: a version of it returning `[0; 32]` leaves `the_two_wasm_inputs_reach_a_real_runs_key`
+        // and `every_registered_grammar_has_its_own_digest` (in `lanekeep-languages`) both green,
+        // because both construct their own `GrammarKey`s rather than calling this assembly, and
+        // fails only here.
+        let real_grammars = grammar_keys(&lanekeep_languages::registry());
+        let zeroed_grammars: Vec<GrammarKey> = real_grammars
+            .iter()
+            .map(|grammar| GrammarKey {
+                id: grammar.id.clone(),
+                digest: [0; 32],
+            })
+            .collect();
+
+        let languages = [("typescript".to_owned(), [3; 32])];
+        let content = lanekeep_core::ContentHash::new([7; 32]);
+        let real = run_key(b"ruleset", b"config", &real_grammars, &languages)
+            .expect("the runtime describes itself");
+        let zeroed = run_key(b"ruleset", b"config", &zeroed_grammars, &languages)
+            .expect("the runtime describes itself");
+
+        assert_ne!(
+            real.for_file("src/a.ts", &content),
+            zeroed.for_file("src/a.ts", &content),
+            "a grammar's real digest must reach the key a run actually files results under"
+        );
+    }
+
+    #[test]
+    fn a_languages_real_analysis_identity_reaches_a_real_runs_key() {
+        // The mirror of the test above, for `analysis_keys` rather than `grammar_keys`. Built
+        // inline at the call site, a mutation returning `[0; 32]` in place of
+        // `language.analysis_identity()` was invisible: every other test here constructs its
+        // own `(String, [u8; 32])` pairs rather than calling this assembly, so none of them
+        // would have caught it. `analysis_keys` is called here, not reconstructed, for the same
+        // reason `grammar_keys` is called above rather than rebuilt.
+        let real_grammars = grammar_keys(&lanekeep_languages::registry());
+        let real_languages = analysis_keys(&lanekeep_languages::registry());
+        let zeroed_languages: Vec<(String, [u8; 32])> = real_languages
+            .iter()
+            .map(|(id, _)| (id.clone(), [0; 32]))
+            .collect();
+
+        let content = lanekeep_core::ContentHash::new([7; 32]);
+        let real = run_key(b"ruleset", b"config", &real_grammars, &real_languages)
+            .expect("the runtime describes itself");
+        let zeroed = run_key(b"ruleset", b"config", &real_grammars, &zeroed_languages)
+            .expect("the runtime describes itself");
+
+        assert_ne!(
+            real.for_file("src/a.ts", &content),
+            zeroed.for_file("src/a.ts", &content),
+            "a language's real analysis identity must reach the key a run actually files results under"
+        );
     }
 
     #[test]
@@ -3233,6 +3883,580 @@ mod tests {
         assert_eq!(outcome.violations.len(), 1);
     }
 
+    /// A rule admitted only under `src/only/**`, for the path-gate counters.
+    fn path_gated_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               query: '(debugger_statement) @stmt',\n\
+               gates: {{ pathMatches: ['src/only/**'] }},\n\
+               card: {{ message: 'debugger statement', remediation: 'remove it',\n\
+                 examples: {{ bad: 'debugger;', good: 'x;' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.stmt); }},\n\
+             }});\n"
+        )
+    }
+
+    /// A rule admitted only in files whose bytes contain `debugger`, for the content-gate
+    /// counters.
+    fn content_gated_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               query: '(debugger_statement) @stmt',\n\
+               gates: {{ fileContains: ['debugger'] }},\n\
+               card: {{ message: 'debugger statement', remediation: 'remove it',\n\
+                 examples: {{ bad: 'debugger;', good: 'x;' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.stmt); }},\n\
+             }});\n"
+        )
+    }
+
+    /// A rule admitted only under `src/only/**` *and* only in files containing `debugger`
+    /// — both gates declared on one rule, for the mutant that reads the content gate's
+    /// source from `self.rules` instead of the path gate's survivors.
+    fn both_gated_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               query: '(debugger_statement) @stmt',\n\
+               gates: {{ pathMatches: ['src/only/**'], fileContains: ['debugger'] }},\n\
+               card: {{ message: 'debugger statement', remediation: 'remove it',\n\
+                 examples: {{ bad: 'debugger;', good: 'x;' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.stmt); }},\n\
+             }});\n"
+        )
+    }
+
+    /// A rule declaring only `javascript`, over a corpus of `.ts` files it therefore never
+    /// runs against — for the `language_gated` counter, and for the ordering mutant that
+    /// moves its push below `parse_once`'s early return. Every admitted rule here fails to
+    /// declare the file's language, so `parse_once` finds none of them a match and returns
+    /// `None` for every file, which is exactly the early return the ordering has to survive.
+    fn wrong_language_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';
+             export default defineRule({{
+               id: '{id}',
+               language: ['javascript'],
+               query: '(debugger_statement) @stmt',
+               card: {{ message: 'debugger statement', remediation: 'remove it',
+                 examples: {{ bad: 'debugger;', good: 'x;' }} }},
+               check(ctx, m) {{ ctx.report(m.stmt); }},
+             }});
+"
+        )
+    }
+
+    /// A config importing several rule modules by path, each bound to a distinct name.
+    fn multi_rule_config(rule_paths: &[&str]) -> String {
+        use std::fmt::Write as _;
+
+        let mut imports = String::new();
+        for (i, path) in rule_paths.iter().enumerate() {
+            let _ = writeln!(imports, "import r{i} from '{path}';");
+        }
+        let names: Vec<String> = (0..rule_paths.len()).map(|i| format!("r{i}")).collect();
+        format!(
+            "import {{ defineConfig }} from 'lanekeep';\n\
+             {imports}\
+             export default defineConfig({{ include: ['src/**/*.ts'], rules: [{}] }});\n",
+            names.join(", ")
+        )
+    }
+
+    /// A rule's timing row from a profiled run, or a panic naming which rule was missing.
+    fn timing_for<'a>(outcome: &'a Outcome, id: &str) -> &'a RuleTiming {
+        outcome
+            .timings
+            .as_ref()
+            .expect("profiling collects timings")
+            .get(&id.parse::<RuleId>().expect("a well-formed rule id"))
+            .unwrap_or_else(|| panic!("no timing recorded for `{id}`"))
+    }
+
+    #[test]
+    fn the_six_gate_counters_reconcile_for_every_rule() {
+        // The load-bearing test. For every rule, `path_gated + unread + cached +
+        // content_gated + language_gated + parsed` must equal `files_discovered` — over a
+        // corpus where every one of the six actually occurs, on both a cold run and a warm
+        // one. A single rule with a single outcome (the tests below) would pass against
+        // almost any bug that swaps or drops one of the six; this one needs all of them
+        // present at once, twice, to fail for the reason it should. `language_gated` is not
+        // driven to nonzero here — a dedicated test does that, because it is also the test
+        // for an ordering bug `parsed`'s own push has to survive — but every rule below
+        // declares no `language` of its own, so it stays at zero and the six-term sum still
+        // has to hold.
+        //
+        // `unread` used to be missing entirely: a file that vanished, or failed to decode
+        // as UTF-8, after a gate admitted a rule to it, left that rule's row one short of
+        // `files_discovered` — a hole in the exact invariant this diagnostic exists to
+        // guarantee. Deleting the `unread` counting at either `skipped()` call site that
+        // follows the path gate reintroduces that hole and fails this test.
+        //
+        // `local/both-gated` declares *both* a path gate and a content gate, which none of
+        // the other two rules here do. Reading the content gate's source rules from
+        // `self.rules` instead of the path gate's own survivors re-evaluates a rule the
+        // path gate already excluded — `d.ts` is outside `src/only` (excluding
+        // `local/both-gated` from `admitted` there) and contains no `debugger` (so its
+        // content gate would also reject it, if wrongly asked) — producing a spurious
+        // second rejection for the same file and breaking this rule's reconciliation
+        // without touching `local/path-gated` or `local/content-gated`, neither of which
+        // declares both gates on one rule.
+        let project = Project::new(
+            "gate-counters-reconcile",
+            &[
+                ("rule-a.ts", &path_gated_rule("local/path-gated")),
+                ("rule-b.ts", &content_gated_rule("local/content-gated")),
+                ("rule-c.ts", &both_gated_rule("local/both-gated")),
+                (
+                    "lanekeep.config.ts",
+                    &multi_rule_config(&["./rule-a", "./rule-b", "./rule-c"]),
+                ),
+                ("src/only/a.ts", "debugger;\n"),
+                ("src/only/b.ts", "const b = 1;\n"),
+                ("src/other/c.ts", "debugger;\n"),
+                ("src/other/d.ts", "const d = 1;\n"),
+            ],
+        );
+        // Not valid UTF-8 (a lone continuation byte, 0x80), but under `src/only` and
+        // containing `debugger` as ASCII — so all three rules' path and content gates admit
+        // it on the strength of its bytes, and each learns it is unreadable only once it
+        // tries to decode it as source.
+        fs::write(project.dir.join("src/only/e.ts"), b"debugger;\x80").expect("writes raw bytes");
+
+        let ids = [
+            "local/path-gated",
+            "local/content-gated",
+            "local/both-gated",
+        ];
+
+        let cold = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs cold");
+        assert_eq!(cold.files_discovered, 5);
+
+        let discovered = u64::try_from(cold.files_discovered).expect("small count");
+        for id in ids {
+            let timing = timing_for(&cold, id);
+            assert_eq!(
+                timing.path_gated
+                    + timing.unread
+                    + timing.cached
+                    + timing.content_gated
+                    + timing.language_gated
+                    + timing.parsed,
+                discovered,
+                "`{id}` does not reconcile cold: {timing:?}"
+            );
+            assert_eq!(
+                timing.unread, 1,
+                "the non-UTF-8 file must count as `unread`, for every rule: {timing:?}"
+            );
+            assert_eq!(
+                timing.cached, 0,
+                "nothing is cached on a cold run: {timing:?}"
+            );
+        }
+
+        // Warm: the four readable files now hit the cache (an unreadable file's
+        // `FileOutcome` never carries a cache entry, so `e.ts` is recomputed identically
+        // every run and stays `unread` rather than becoming `cached`).
+        let warm = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs warm");
+        assert_eq!(warm.files_discovered, 5);
+        for id in ids {
+            let timing = timing_for(&warm, id);
+            assert_eq!(
+                timing.path_gated
+                    + timing.unread
+                    + timing.cached
+                    + timing.content_gated
+                    + timing.language_gated
+                    + timing.parsed,
+                discovered,
+                "`{id}` does not reconcile warm: {timing:?}"
+            );
+            assert!(
+                timing.cached > 0,
+                "a warm run must serve at least one readable file from cache: {timing:?}"
+            );
+            assert_eq!(
+                timing.unread, 1,
+                "the non-UTF-8 file is never cached, so it must still count as `unread` warm: {timing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_gates_rejects_land_only_in_path_gated() {
+        // Folding a path-gate reject into `content_gated`, or dropping it, would leave this
+        // failing without touching `the_six_gate_counters_reconcile_for_every_rule` — that
+        // test only checks the sum, and a bug that moves a count between two of the buckets
+        // leaves the sum untouched.
+        let project = Project::new(
+            "gate-counters-path",
+            &[
+                ("rule.ts", &path_gated_rule("local/path-gated")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/only/a.ts", "const a = 1;\n"),
+                ("src/other/b.ts", "const b = 1;\n"),
+                ("src/other/c.ts", "const c = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        let timing = timing_for(&outcome, "local/path-gated");
+        assert_eq!(
+            timing.path_gated, 2,
+            "the two files outside `src/only` are path-gated: {timing:?}"
+        );
+        assert_eq!(timing.content_gated, 0, "{timing:?}");
+        assert_eq!(timing.cached, 0, "run cold, nothing is cached: {timing:?}");
+        assert_eq!(
+            timing.parsed, 1,
+            "the one admitted file still parses: {timing:?}"
+        );
+    }
+
+    #[test]
+    fn a_content_gates_rejects_land_only_in_content_gated() {
+        let project = Project::new(
+            "gate-counters-content",
+            &[
+                ("rule.ts", &content_gated_rule("local/content-gated")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+                ("src/b.ts", "const b = 1;\n"),
+                ("src/c.ts", "const c = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        let timing = timing_for(&outcome, "local/content-gated");
+        assert_eq!(
+            timing.path_gated, 0,
+            "this rule declares no path gate: {timing:?}"
+        );
+        assert_eq!(
+            timing.content_gated, 2,
+            "the two files without `debugger` are content-gated: {timing:?}"
+        );
+        assert_eq!(timing.cached, 0, "run cold, nothing is cached: {timing:?}");
+        assert_eq!(
+            timing.parsed, 1,
+            "the one file containing the needle still parses: {timing:?}"
+        );
+    }
+
+    #[test]
+    fn a_rule_whose_language_does_not_match_counts_as_language_gated_not_parsed() {
+        // The gap the reviewer measured directly: a rule declaring `language: ['javascript']`
+        // over a `.ts` corpus used to report `parsed: 2, matches: 0` — indistinguishable from
+        // a query that is simply too narrow, the exact trap `AGENTS.md` records costing 2218
+        // false positives on a real migration, now arriving from the diagnostic side rather
+        // than the engine's own dispatch.
+        //
+        // This is also the fixture for the ordering bug in `check_file`: because this rule
+        // matches neither `.ts` file's language, `parse_once` finds no admitted rule for
+        // either file and returns `None` for both — the early return the `parsed`/
+        // `language_gated` push has to survive. Moving that push below the `let Some(…) =
+        // self.parse_once(…) else { return Ok(outcome); }` passes every other test in this
+        // module (none of them reaches that `None` arm with a nonempty `admitted`) and fails
+        // this one: with no push before the early return, this rule gets no timing entry at
+        // all for either file, and `timing_for` panics rather than reading a wrong bucket.
+        let project = Project::new(
+            "gate-counters-language",
+            &[
+                ("rule.ts", &wrong_language_rule("local/wrong-language")),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "debugger;
+",
+                ),
+                (
+                    "src/b.ts",
+                    "const b = 1;
+",
+                ),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        assert!(
+            outcome.violations.is_empty(),
+            "a rule whose language never matches must not report on these files: {:?}",
+            outcome.violations
+        );
+
+        let timing = timing_for(&outcome, "local/wrong-language");
+        assert_eq!(
+            timing.language_gated, 2,
+            "both `.ts` files must count as `language_gated` for a `javascript`-only rule: \
+             {timing:?}"
+        );
+        assert_eq!(
+            timing.parsed, 0,
+            "a rule whose language never matches must never count as `parsed`: {timing:?}"
+        );
+        assert_eq!(
+            timing.path_gated
+                + timing.unread
+                + timing.cached
+                + timing.content_gated
+                + timing.language_gated
+                + timing.parsed,
+            2,
+            "{timing:?}"
+        );
+    }
+
+    #[test]
+    fn path_gated_and_content_gated_counts_are_not_interchangeable() {
+        // One file, rejected by two different rules for two different reasons. Swapping
+        // which counter each rule's rejection lands in — or counting both rules the same
+        // way — would pass the two tests above (each only ever exercises one bucket) and
+        // still be wrong.
+        let project = Project::new(
+            "gate-counters-distinguished",
+            &[
+                ("rule-a.ts", &path_gated_rule("local/path-gated")),
+                ("rule-b.ts", &content_gated_rule("local/content-gated")),
+                (
+                    "lanekeep.config.ts",
+                    &multi_rule_config(&["./rule-a", "./rule-b"]),
+                ),
+                // Outside `src/only`, so the path-gated rule rejects it before any read;
+                // no `debugger`, so the content-gated rule reads it and rejects it after.
+                ("src/other/a.ts", "const a = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        let path_gated = timing_for(&outcome, "local/path-gated");
+        assert_eq!(path_gated.path_gated, 1, "{path_gated:?}");
+        assert_eq!(path_gated.content_gated, 0, "{path_gated:?}");
+
+        let content_gated = timing_for(&outcome, "local/content-gated");
+        assert_eq!(content_gated.path_gated, 0, "{content_gated:?}");
+        assert_eq!(content_gated.content_gated, 1, "{content_gated:?}");
+    }
+
+    #[test]
+    fn a_warm_run_counts_files_as_cached_and_still_reconciles() {
+        // The test the whole five-column decision exists for. Deleting the `cached`
+        // counting at the cache-hit site — or, worse, not carrying `path_gate_timings`
+        // through that early return at all — would leave a warm run's per-rule sum short
+        // by however many files hit the cache. Every test above runs cold and cannot catch
+        // that: `FileOutcome::cached` is the one constructor none of them exercise.
+        let project = Project::new(
+            "gate-counters-warm",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+                ("src/b.ts", "debugger;\n"),
+            ],
+        );
+
+        let cold = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs cold");
+        let cold_timing = timing_for(&cold, "local/no-debugger");
+        assert_eq!(cold_timing.parsed, 2, "{cold_timing:?}");
+        assert_eq!(cold_timing.cached, 0, "{cold_timing:?}");
+
+        let warm = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs warm");
+        let warm_timing = timing_for(&warm, "local/no-debugger");
+        assert_eq!(
+            warm_timing.cached, 2,
+            "the second run must serve both files from the cache: {warm_timing:?}"
+        );
+        assert_eq!(
+            warm_timing.path_gated
+                + warm_timing.unread
+                + warm_timing.cached
+                + warm_timing.content_gated
+                + warm_timing.language_gated
+                + warm_timing.parsed,
+            2,
+            "{warm_timing:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_read_counts_as_unread_not_path_gated() {
+        // The one `unread` site the non-UTF-8 fixture (in the reconciliation test) cannot
+        // reach on its own. Deleting the `unread_timings` call at *this* branch specifically
+        // — as opposed to gutting `unread_timings`'s own body, which kills both call sites
+        // at once and says nothing about which caller's test actually covers which site,
+        // per AGENTS.md's note that a shared helper reported "caught" by mutation testing
+        // does not say which caller caught it — passes every other test in this module.
+        // Mode 000 gives a deterministic `fs::read` failure without racing discovery for a
+        // file that vanishes mid-run.
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = Project::new(
+            "gate-counters-unreadable",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "debugger;
+",
+                ),
+                (
+                    "src/b.ts",
+                    "debugger;
+",
+                ),
+            ],
+        );
+        let unreadable = project.dir.join("src/b.ts");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("makes it unreadable");
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+
+        // Left readable, or the fixture's own cleanup cannot remove it.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).expect("restores");
+
+        let timing = timing_for(&outcome, "local/no-debugger");
+        assert_eq!(
+            timing.unread, 1,
+            "the unreadable file must count as `unread`, not go uncounted: {timing:?}"
+        );
+        assert_eq!(
+            timing.path_gated, 0,
+            "the path gate admitted this file — it must not also be counted rejected: \
+             {timing:?}"
+        );
+        assert_eq!(
+            timing.parsed, 1,
+            "the readable file must still parse: {timing:?}"
+        );
+    }
+
+    #[test]
+    fn the_counters_are_absent_without_profiling() {
+        // Deleting `self.profiling.then_some(timings)` in favor of always returning `Some`
+        // would make this fail: a caller who never asked for `--profile` must see `None`,
+        // exactly as before this change.
+        let project = Project::new(
+            "gate-counters-off",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "debugger;\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        assert!(outcome.timings.is_none(), "profiling was never asked for");
+    }
+
+    #[test]
+    fn gate_counting_does_not_change_which_violations_are_reported() {
+        // Acceptance item 3, at the unit level. The counting added beside the `.filter()`
+        // predicates at the path and content gates must leave those predicates' behavior
+        // exactly alone — this asserts on violations, not on any counter, so a change that
+        // narrowed or widened a gate while counting it correctly would still be caught here.
+        let project = Project::new(
+            "gate-counters-unaffected",
+            &[
+                ("rule-a.ts", &path_gated_rule("local/path-gated")),
+                ("rule-b.ts", &content_gated_rule("local/content-gated")),
+                (
+                    "lanekeep.config.ts",
+                    &multi_rule_config(&["./rule-a", "./rule-b"]),
+                ),
+                ("src/only/a.ts", "debugger;\n"),
+                ("src/only/b.ts", "const b = 1;\n"),
+                ("src/other/c.ts", "debugger;\n"),
+                ("src/other/d.ts", "const d = 1;\n"),
+            ],
+        );
+
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .without_cache()
+            .run()
+            .expect("runs");
+
+        assert!(outcome.timings.is_none(), "not profiling");
+
+        let mut files: Vec<&str> = outcome
+            .violations
+            .iter()
+            .map(|v| v.location.file.as_str())
+            .collect();
+        files.sort_unstable();
+        assert_eq!(
+            files,
+            // `src/only/a.ts` twice: it satisfies both rules' gates — under `src/only` for
+            // the path-gated rule and containing `debugger` for the content-gated one — so
+            // both report on it. `src/other/c.ts` only satisfies the content-gated rule's.
+            vec!["src/only/a.ts", "src/only/a.ts", "src/other/c.ts"],
+            "both rules must still admit exactly the files containing `debugger`"
+        );
+    }
+
     #[test]
     fn a_rule_set_to_off_does_not_run() {
         let project = Project::new(
@@ -3293,6 +4517,87 @@ mod tests {
         assert!(rendered.contains("local/throws"), "{rendered}");
         assert!(rendered.contains("src/a.ts"), "{rendered}");
         assert!(rendered.contains("rule bug"), "{rendered}");
+    }
+
+    /// A rule reading its parameter's type, checked against a nominal and a primitive
+    /// annotation in one project — the first test in the corpus where `ctx.types` decides a
+    /// violation.
+    ///
+    /// The pair matters: the `number` fixture alone would also pass against an oracle that
+    /// answered `number` for every node, having never actually consulted the annotation. The
+    /// `Decimal` fixture, present and unreported, is what rules that out.
+    const NUMBER_AMOUNT_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+        export default defineRule({\n\
+          id: 'local/number-amount',\n\
+          requires: ['types'],\n\
+          severity: 'error',\n\
+          query: '(required_parameter pattern: (identifier) @p)',\n\
+          card: { message: 'no', remediation: 'use Decimal', examples: { bad: 'a', good: 'b' } },\n\
+          check(ctx, m) {\n\
+            const t = ctx.types.typeOf(m.p);\n\
+            if (t !== undefined && t.primitive === 'number') ctx.report(m.p);\n\
+          },\n\
+        });\n";
+
+    #[test]
+    fn a_rule_declaring_types_reports_the_number_parameter_and_not_the_decimal_one() {
+        let project = Project::new(
+            "ctx-types-primitive",
+            &[
+                ("rule.ts", NUMBER_AMOUNT_RULE),
+                ("lanekeep.config.ts", &config_for("src/**/*.ts")),
+                ("src/number.ts", "function credit(amount: number) {}\n"),
+                (
+                    "src/decimal.ts",
+                    "import { Decimal } from 'decimal.js';\n\
+                     function credit(amount: Decimal) {}\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+
+        assert_eq!(outcome.violations.len(), 1, "{:?}", outcome.violations);
+        assert_eq!(
+            outcome.violations[0].location.file.as_str(),
+            "src/number.ts",
+            "{:?}",
+            outcome.violations
+        );
+    }
+
+    /// The matched half of the test above: delete `requires: ['types']` and the identical
+    /// handler reaches for `ctx.types` on a context that never installed it. The run must
+    /// abort naming the rule — silence here (a clean report with no violations) would be
+    /// exactly the failure mode capability declarations exist to rule out.
+    #[test]
+    fn a_rule_reading_ctx_types_without_declaring_it_aborts_the_run_naming_itself() {
+        let undeclared = NUMBER_AMOUNT_RULE.replace("requires: ['types'],\n", "");
+        assert_ne!(
+            undeclared, NUMBER_AMOUNT_RULE,
+            "the replace must actually remove the `requires` line"
+        );
+
+        let project = Project::new(
+            "ctx-types-undeclared",
+            &[
+                ("rule.ts", &undeclared),
+                ("lanekeep.config.ts", &config_for("src/**/*.ts")),
+                ("src/number.ts", "function credit(amount: number) {}\n"),
+            ],
+        );
+
+        let err = project
+            .run()
+            .expect_err("ctx.types must be absent without `requires: ['types']`");
+        let rendered = err.to_string();
+        assert!(rendered.contains("local/number-amount"), "{rendered}");
+        assert!(rendered.contains("src/number.ts"), "{rendered}");
+        // Six `RunError` variants all name a rule, so the assertion above alone would pass
+        // against a completely different failure — an invalid query, an unknown language, a
+        // missing component. This is what pins the failure to the one this test is about:
+        // `ctx.types` reached on a context that never installed it.
+        assert!(rendered.contains("typeOf"), "{rendered}");
     }
 
     #[test]
@@ -5958,6 +7263,10 @@ export default defineRule({
                 timeout: None,
                 has_reduce,
                 component: Some(backed_by(fixture())),
+                // A component cannot declare `requires` — `rule-metadata` has no such field —
+                // so every component-backed `RuleSpec` carries an empty list, exactly as
+                // `lanekeep-config`'s `build_rule` produces for one.
+                requires: Vec::new(),
             }
         }
 
@@ -7346,6 +8655,54 @@ export default defineRule({
             let rendered = err.to_string();
             assert!(rendered.contains("for `python`"), "{rendered}");
             assert!(rendered.contains("call_expression"), "{rendered}");
+        }
+
+        /// `requires: ['types']` is the author's half of the decision; the file's own
+        /// language having a probed oracle is the other half, and this is where a rule can
+        /// declare the capability and still not get it.
+        ///
+        /// Down here, beside the query test above, for the same reason: only this module's
+        /// runner knows a language with no TypeScript-shaped grammar at all. Every fixture
+        /// above this in the file is TypeScript-family, so none of them can tell
+        /// `Engine::types_for` apart from a version that handed back whichever oracle
+        /// happened to exist regardless of which language the file is — this test is what
+        /// tells them apart.
+        #[test]
+        fn types_for_reads_the_files_own_language_not_whichever_oracle_exists() {
+            let project = Project::new(
+                "cross-language-types",
+                &[
+                    (
+                        "rule.ts",
+                        "import { defineRule } from 'lanekeep';\n\
+                        export default defineRule({\n\
+                          id: 'local/cross-language',\n\
+                          language: ['typescript', 'python'],\n\
+                          requires: ['types'],\n\
+                          query: {\n\
+                            typescript: '(identifier) @id',\n\
+                            python: '(identifier) @id',\n\
+                          },\n\
+                          card: { message: 'm', remediation: 'r', \
+                            examples: { bad: 'a', good: 'b' } },\n\
+                          check(ctx, m) { ctx.types.typeOf(m.id); },\n\
+                        });\n",
+                    ),
+                    (
+                        "lanekeep.json",
+                        r#"{"include": ["src/**/*.py"],
+                        "namespaces": ["local"], "rules": ["./rule"]}"#,
+                    ),
+                    ("src/a.py", "x = 1\n"),
+                ],
+            );
+
+            let err = project.run_json().expect_err(
+                "python has no TypeScript-shaped grammar, so ctx.types must stay absent",
+            );
+            let rendered = err.to_string();
+            assert!(rendered.contains("local/cross-language"), "{rendered}");
+            assert!(rendered.contains("typeOf"), "{rendered}");
         }
 
         #[test]

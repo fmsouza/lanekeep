@@ -1,8 +1,8 @@
 //! Built-in rules shipped with lanekeep.
 //!
 //! The rules shipping with lanekeep, authored against the same host API that project-authored
-//! rules use and embedded into the binary at build time. Nine are TypeScript modules evaluated
-//! in QuickJS — the two Python-targeting rules and the seven TypeScript-targeting rules, four of
+//! rules use and embedded into the binary at build time. Eleven are TypeScript modules evaluated
+//! in QuickJS — the two Python-targeting rules and the nine TypeScript-targeting rules, four of
 //! which were briefly compiled to a StarlingMonkey component and reverted, because that form cost
 //! 13 MB and 110× per host-API crossing for no speed benefit. The rest are WebAssembly
 //! components —
@@ -65,11 +65,11 @@
 
 /// The rules this build runs as TypeScript modules, as `(name, source)`.
 ///
-/// Evaluated in QuickJS, from source, on every run. Nine rules ship this way: the two
-/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the seven
+/// Evaluated in QuickJS, from source, on every run. Eleven rules ship this way: the two
+/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the nine
 /// TypeScript-targeting rules (`duplicate-implementation`, `no-assertionless-test`,
-/// `no-circular-imports`, `no-default-export`, `no-restricted-calls`, `no-restricted-imports`,
-/// `no-unused-exports`). Four of them were
+/// `no-circular-imports`, `no-default-export`, `no-restricted-arguments`, `no-restricted-calls`,
+/// `no-restricted-imports`, `no-restricted-types`, `no-unused-exports`). Four of them were
 /// briefly compiled ahead of time into a shared StarlingMonkey component and reverted, because
 /// the compiled form cost 13 MB of binary and 110× per host-API crossing for no speed benefit —
 /// see `docs/architecture.md` §15.1 for the measurement.
@@ -102,12 +102,20 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
         include_str!("../rules/no-mutable-default-argument.ts"),
     ),
     (
+        "no-restricted-arguments",
+        include_str!("../rules/no-restricted-arguments.ts"),
+    ),
+    (
         "no-restricted-calls",
         include_str!("../rules/no-restricted-calls.ts"),
     ),
     (
         "no-restricted-imports",
         include_str!("../rules/no-restricted-imports.ts"),
+    ),
+    (
+        "no-restricted-types",
+        include_str!("../rules/no-restricted-types.ts"),
     ),
     (
         "no-unused-exports",
@@ -142,7 +150,7 @@ type BuiltInComponent = (&'static str, &'static [u8], Option<&'static [u8]>);
 /// Go all fail by panicking, which traps, and a trap arrives at the host with no stack at all.
 /// There is nothing to remap. `go-rules/` builds with `-panic=trap` and `-no-debug`, so there is
 /// not even a name inside the artifact to map back to. A source map would only be needed for a
-/// component compiled from TypeScript, and none ships today — the seven TypeScript-targeting
+/// component compiled from TypeScript, and none ships today — the nine TypeScript-targeting
 /// built-ins run as QuickJS modules (see [`BUILT_IN_RULES`]).
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
@@ -365,7 +373,7 @@ mod tests {
         // these quietly revert with nothing red.
         //
         // Two shapes, deliberately together. The four rules ported to another language have no
-        // source at all and ship as components; the six TypeScript rules ship as modules,
+        // source at all and ship as components; the nine TypeScript rules ship as modules,
         // evaluated in QuickJS, because the compiled-component form (StarlingMonkey in WASM)
         // costs 13 MB and 110× per crossing for no speed benefit.
         for name in [
@@ -389,10 +397,13 @@ mod tests {
 
         for name in [
             "duplicate-implementation",
+            "no-assertionless-test",
             "no-circular-imports",
             "no-default-export",
+            "no-restricted-arguments",
             "no-restricted-calls",
             "no-restricted-imports",
+            "no-restricted-types",
             "no-unused-exports",
         ] {
             assert!(

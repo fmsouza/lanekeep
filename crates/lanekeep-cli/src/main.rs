@@ -85,10 +85,14 @@ enum Command {
         #[arg(long)]
         staged: bool,
 
-        /// Report where the run spent its time, per rule.
+        /// Report where the run spent its time and what each rule looked at, per rule.
         ///
-        /// The split between query matching and handler execution is what tells an author
-        /// whether their query or their code is the problem.
+        /// Two tables on stderr. The first splits time between query matching and handler
+        /// execution, which is what tells an author whether their query or their code is
+        /// the problem. The second accounts for every discovered file: what each rule's
+        /// gates rejected, what the cache served, and what the rule actually parsed — the
+        /// table to read when a rule reports nothing. Pair it with `--no-cache` when the
+        /// gate columns are the question.
         #[arg(long)]
         profile: bool,
 
@@ -441,6 +445,97 @@ fn write_profile(
     Ok(())
 }
 
+/// Print what each rule's gates let through, per rule.
+///
+/// A second table rather than more columns on [`write_profile`]'s: that one answers "which
+/// rule is expensive", so it sorts by total elapsed time; this one answers "what did each rule
+/// even look at", which is not a time question, so sorting it by elapsed time would reorder rows
+/// for a reason unrelated to what they show. `timings` is a `BTreeMap<RuleId, _>`, and its own
+/// comparator is rule id (`RuleId`'s hand-written `Ord`), so iterating it already yields rows in
+/// ascending rule-id order — nothing here needs to re-sort.
+///
+/// `files_discovered` is threaded through rather than derived from a row's own sum, on purpose:
+/// the trailing line is the reader's reconciliation check, and computing it from the same
+/// numbers it is meant to check would make a miscount invisible instead of visible.
+///
+/// The paragraph after the reconciliation line is printed, not left as a source comment — an
+/// author staring at `--profile` output is the reader it is for, and a comment in `main.rs`
+/// never reaches them.
+///
+/// **Every sentence in it is conditioned on `cached: 0` and `parsed: 0`, and those
+/// conditions are the whole difficulty.** Two earlier drafts keyed on "a large counter"
+/// instead and both accused a healthy rule, each time a rule that had *run*: this
+/// repository's own output has
+/// `lanekeep/no-circular-imports` at `lang-gated 156 / parsed 26`, reporting nothing with a
+/// correct `language` declaration, and `local/one-parser-per-file` at `content-gated 148 /
+/// parsed 34`, reporting nothing with a correct gate and thirty-four candidate files it
+/// simply found nothing in. A counter covering most of the corpus is ordinary; `parsed: 0`
+/// is what says a rule never ran, and only then does the largest other counter name a cause.
+/// The `lang-gated` clause names both of that counter's causes — a `language` declaration
+/// naming the wrong grammar (`AGENTS.md` records that costing 2218 false positives in the
+/// mirror direction) *and* an `include` admitting files no grammar claims at all, which no
+/// declaration can fix.
+///
+/// The `cached` caveat is printed because it is the default path, and it says only that the
+/// columns right of `cached` are **incomplete** — never which of them go to zero, and never
+/// that two rules render alike. Five drafts tried to characterize the warm path and all five
+/// were false: a file no grammar claims, a file whose language no rule surviving the content
+/// gates declares, and a file that is not valid UTF-8 all get no cache entry, so they are
+/// re-attributed on every warm run forever. This repository's own second warm pass puts a
+/// `2` in `content-gated` or `lang-gated` in all seventeen rows, and which of the two
+/// differs by rule. "Incomplete" is
+/// the claim that survives every corner, and it is the whole of what the reader has to act
+/// on: re-run with `--no-cache`.
+///
+/// `path_gated` is exempted because it genuinely is unaffected — `Engine::check_file` applies
+/// the path gates and records the counter before the read and before the cache is consulted
+/// at all, so two rules differing only in `pathMatches` render different rows warm.
+fn write_gate_profile(
+    timings: &BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming>,
+    files_discovered: usize,
+) -> anyhow::Result<()> {
+    let mut stderr = std::io::stderr();
+    writeln!(stderr, "\nprofile — what each rule looked at\n")?;
+    writeln!(
+        stderr,
+        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
+        "rule", "path-gated", "unread", "cached", "content-gated", "lang-gated", "parsed"
+    )?;
+
+    for (id, timing) in timings {
+        writeln!(
+            stderr,
+            "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
+            id.to_string(),
+            timing.path_gated,
+            timing.unread,
+            timing.cached,
+            timing.content_gated,
+            timing.language_gated,
+            timing.parsed
+        )?;
+    }
+
+    writeln!(
+        stderr,
+        "\n  each row sums to {files_discovered} files discovered\n"
+    )?;
+    writeln!(
+        stderr,
+        "  a nonzero cached means the columns to its right are incomplete for this run — \
+         re-run\n  with `--no-cache` to read them; path-gated is unaffected, since a path \
+         gate runs\n  before the cache is consulted\n  a rule reporting nothing with \
+         cached 0 and parsed 0 never ran, and its largest\n  other counter says what took \
+         the files: content-gated is a gate narrower than the\n  query, or no candidate \
+         files here; lang-gated is a `language` naming a grammar\n  other than the one its \
+         files parse with, or an `include` admitting files no\n  grammar claims at all\n  \
+         a rule reporting nothing with parsed above 0 did run — some files reached its\n  \
+         query and it found nothing in them\n"
+    )?;
+    stderr.flush()?;
+    Ok(())
+}
+
 /// The config a fresh project starts with.
 ///
 /// A built-in rule and a local one, because the second is the thing worth showing: lanekeep
@@ -467,7 +562,7 @@ struct Scaffold {
     /// specifier, or the `{ "rule": ..., "options": {} }` object form a factory rule needs.
     ///
     /// `lanekeep/no-unwrap` is a factory — it is how its `allow` option is reached at all —
-    /// so a bare quoted string for it would fail config load with `missing 'id'` the moment a
+    /// so a bare quoted string for it would fail config load with ``missing `id` `` the moment a
     /// Rust project ran `init`. Formatting each entry here rather than quoting a bare
     /// specifier in `starter_config` is what lets the two forms coexist without
     /// `starter_config` having to know which built-ins are factories.
@@ -1214,6 +1309,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     if let Some(timings) = &outcome.timings {
         // To stderr, so `--profile --format json` still pipes a clean document.
         write_profile(timings)?;
+        write_gate_profile(timings, outcome.files_discovered)?;
     }
 
     let code = lanekeep_report::exit_code(&outcome.violations, warn_only);

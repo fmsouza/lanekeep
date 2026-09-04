@@ -11,7 +11,7 @@ Not a linter in the ESLint sense. ESLint enforces language-level correctness; la
 ### v1 goals
 
 - TypeScript / JavaScript (incl. TSX/JSX).
-- **Rules are programs, authored in TypeScript** — the same language as the code they inspect. Turing-complete, with no expressiveness ceiling to hit. A rule may also be a WebAssembly component (§4), which is how four of the thirteen built-ins ship: two written in Rust and two written in Go. The other nine run as QuickJS modules; four of those were briefly compiled to a StarlingMonkey component and reverted, because the compiled form cost 13 MB of binary and 110× per host-API crossing for no speed benefit (§15.1). TypeScript is the form a project starts from and the one this document is written in.
+- **Rules are programs, authored in TypeScript** — the same language as the code they inspect. Turing-complete, with no expressiveness ceiling to hit. A rule may also be a WebAssembly component (§4), which is how four of the fifteen built-ins ship: two written in Rust and two written in Go. The other eleven run as QuickJS modules; four of those were briefly compiled to a StarlingMonkey component and reverted, because the compiled form cost 13 MB of binary and 110× per host-API crossing for no speed benefit (§15.1). TypeScript is the form a project starts from and the one this document is written in.
 - **Rules run sandboxed inside the binary.** An embedded JavaScript engine, or wasmtime for a component, reaching only host functions lanekeep chooses to expose.
 - **The hot path stays in Rust.** A rule declares a tree-sitter query; Rust matches it at native speed and calls into TypeScript only on matches.
 - Built-in rules ship with the tool and are authored against the same API user rules use.
@@ -96,6 +96,9 @@ lanekeep/
     lanekeep-lang-go/    # Go grammar + binding resolution
     lanekeep-lang-rust/  # Rust grammar + binding resolution
     lanekeep-languages/  # the set of supported languages, assembled in one place
+    lanekeep-types/      # the bounded type oracle: a node's type and symbol, from one
+                         #   parsed file. Not lanekeep-types-gen below, which renders
+                         #   TypeScript definitions and shares nothing but the word
     lanekeep-config/     # schema, config loading, canonicalization + hashing
     lanekeep-cache/      # content-addressed store with dependency tracking
     lanekeep-wasm/       # component execution: the WIT host API, wasmtime wiring
@@ -145,7 +148,8 @@ pub trait Language {
     fn id(&self) -> &'static str;
     fn extensions(&self) -> &[&'static str];
     fn grammar(&self) -> tree_sitter::Language;
-    fn grammar_abi(&self) -> u16;
+    fn grammar_abi(&self) -> usize;
+    fn analysis_identity(&self) -> [u8; 32];
 
     /// Language-specific light semantics. JS resolves imports and
     /// local bindings; other languages may return Unsupported.
@@ -155,6 +159,26 @@ pub trait Language {
 
 Implement this on day one even though only `lanekeep-lang-js` exists. It is cheap now and impossible to retrofit.
 
+### The control-flow graph
+
+`lanekeep-lang-js` builds a per-function control-flow graph for TypeScript and TSX — `Cfg`, split across `cfg.rs` (the block/edge model and the source-order guarantee), `cfg_build.rs` (construction) and `cfg_query.rs` (the reachability queries). Not JavaScript or JSX: construction has not been exercised against that grammar, only against TypeScript and TSX's own byte-identical node shapes. It is host-side, built on demand for a function a rule's query already matched, and never serialized — the graph is a function of the file's own bytes, which `RunKey::for_file` already keys (§8.1), so it adds no cache-key *field* and needs no field on `Entry`. It does invalidate the cache once, all the same, and the two are worth holding apart: `crates/lanekeep-lang-js/build.rs` folds every `.rs` file under that crate's `src/` into its `analysis_identity()`, and that is one term of the run key's `analysis_hash` — a field of the global prefix, not a per-language one — so three new files there discard every cached entry on upgrade, for every language rather than only for TypeScript, TSX and JavaScript. That is the digest's deliberate over-invalidation rather than a defect. The alternative is a hand-maintained list of files somebody has to remember to extend, which is the silent cache-key gap the walk exists to remove. Nothing in the engine calls it. #193's obligation analysis and #194's taint analysis are its first two consumers, over the must-queries (`on_all_paths_from`, and `on_all_paths_from_any` for a construct construction duplicated) and `reaches` respectively, and the graph is split from both so that a defect in it is diagnosed as a graph defect rather than chased through whichever rule's fixtures happened to trip over it first.
+
+It is not a `Language` method, unlike everything else this crate exposes that way. Construction dispatches on tree-sitter node kind, never on a language identifier, so a trait method would commit to a signature before a second implementor exists to check it against — the opposite of the day-one stance the `Language` trait above was deliberately given. It stays three plain files in this crate rather than becoming a `lanekeep-cfg` one for the same reason: `lanekeep-nodes` moved out of `lanekeep-js` only once `lanekeep-wasm` became a second engine that needed its exact type, not in anticipation of one. What would move the CFG out is a second language needing it; nothing today knows where that seam belongs.
+
+**Basic blocks split at every branch, short-circuit operators included.** `&&`, `??` and `?.` are control flow inside an expression — `a?.b.c` reaches `.c` only when `a` is non-nullish — and a graph that only split on statements could not represent that at all. `BlockId` order **is** source order, established by a renumbering pass once construction finishes rather than by a sort at each call site, so nothing consuming the graph can forget to ask for the order it is already in. `block_of(node)` resolves in two stages: an exact attribution wins outright, and only when nothing attributes `node` exactly does the narrowest block *containing* it answer instead. The order matters because a statement whose expressions branch is attributed to its own join block, so containment alone would answer with the enclosing statement's block for every fragment inside it — the exact match is what makes "where does this expression complete" answerable for a construct that branches at all. `blocks_of` is the same lookup without the shortcut: every block attributing `node`, ascending, and `block_of` is defined as its first element.
+
+**A `finally` is emitted once per distinct continuation, not once per statement that leaves the `try`.** Every `return` in the guarded region shares one copy, because they all continue to the same place; normal completion, a propagating `throw`, and each `break`/`continue` *target* that escapes the `try` gets one more. Two `break`s to the same target share a copy exactly as multiple `return`s do — the copy is keyed on the continuation alone, never on how a jump reached it. One shape breaks that symmetry deliberately: normal completion of the body and normal completion of a `catch` both continue to the same block and still get a copy each, because the memo lives on the `try`'s own pending entry, does not survive its pop, and each of the two tails then pushes a fresh one. So `try { a(); } catch (e) { b(); } finally { c(); }` — the commonest shape of all — builds **two** copies for one continuation. Hoisting that entry out would make it one; it is left alone because the count that carries weight is several `return`s sharing a copy, and that one is exact. After construction, "the finalizer runs on every path out of the `try`" is a fact about the edge set, with no flag to read and no keyword to match. That is the benefit, and it comes with a consequence a consumer has to hold at the same time: a duplicated finalizer's cleanup lives in *several* blocks, so `on_all_paths_from` asked about any one copy answers `false` even on a `try` whose cleanup genuinely runs on every path. Combining those per-copy answers recovers nothing — with `false` for each copy the OR is `false` and the AND is `false`, while the construct is on every path — because a boolean per copy has already discarded *which* paths that copy covers. The group question is `on_all_paths_from_any(from, blocks_of(node))`, which deletes the whole set in one walk and asks whether the exit is still reachable; `on_all_paths_from` takes exactly one block and cannot be asked it.
+
+Two approximations are deliberate. The first follows this repository's usual bias for a checker: **exception edges are emitted for explicit `throw` statements only** — a call that may throw gets none. The rejected alternative, an edge from every `call_expression`, would make `acquire(); doWork(); release()` report in every function that does not wrap it in `try`/`finally`: true, and useless. False negatives are the price this repository pays; false positives are what it forbids.
+
+The second inverts that bias on purpose, because #193's obligation analysis asks a *must* question rather than the usual *may* one. **A nested function is one opaque node in its parent's graph** — its body is a separate `Cfg` a consumer builds on demand, and inter-procedural analysis is out of scope for this graph entirely. `const buf = acquire(); arr.forEach(x => release(buf))` reads as not-discharged: a false positive on code that is actually fine. The rejected alternative — splicing the callback in as a may-execute branch — would instead read `onClick(() => release(buf))` as discharged when the handler may never fire: a false negative, and the worse failure here, because a must-analysis that can be talked into silently proving a property that does not hold is not proving anything. Both gaps are a single, narrow decision point in `cfg_build.rs` — the `throw_statement` arm, and the nested-function check at the top of `expression` — so #195's corpus calibration can reprice either without touching the rest of the walk.
+
+Two smaller omissions run the same way as the first approximation, and are recorded rather than fixed. **`for_in_statement`'s `left` is never walked**: `for (const [a, b = f()] of xs)` drops the default initializer's flow, and `for (x.y of xs)` never evaluates the assignment target at all. That is asymmetric with `for_statement`, which does walk its `initializer`, and the asymmetry is the accident — nothing about `for...of` makes its left-hand side less able to contain flow. **A `catch` parameter's destructuring defaults are not walked either**, so `catch ({ code = f() })` loses the same thing. Both under-approximate: a path the program has that the graph does not, which is the direction this design takes wherever it has a choice, and each is a few lines in one arm if #195 wants it repriced.
+
+Two smaller facts are worth stating so nobody rediscovers them by surprise. `for (;;)` gets no `False` edge: tree-sitter declares `for_statement`'s `condition` field required, so an omitted one still parses as a placeholder node rather than as an absent field, and construction has to filter that placeholder explicitly or it would invent an exit from a loop that has none. There is no constant folding anywhere in this construction, so `while (true)` keeps both edges regardless — the graph has no opinion on whether a condition is constant, only on whether one is present. And `a?.b!.c` is a known, accepted gap: `non_null_expression` ends a postfix chain, which is the same behavior `(a?.b).c` and `x[a?.b]` both require of it, so `.c` is modeled as reached unconditionally even though TypeScript erases `!` at run time and the real value can still be `undefined`. This error runs the other way from the two above — over-reachability, which surfaces downstream as a visible false positive rather than as silence — and the fix, if #195 wants one, is a pass-through for that one node kind rather than a general widening.
+
+Measured on a synthetic 400-statement function (`benches/cfg.rs`): 812 µs to build, about 2 µs per statement — three orders of magnitude under §15's 800 ms cold-run budget. Construction runs per matched function, never per file, so today this is headroom for #193 and #194 to spend rather than a cost the engine pays.
+
 ---
 
 ## 4. Rule definition format
@@ -163,7 +187,7 @@ A rule declares metadata, a tree-sitter query that gates execution — one per l
 
 Neither is privileged. A component is held to the same validation a TypeScript rule is — namespace, card, queries, `has-check` — by the same code, and both engines run in one pass over one corpus. Which form a rule takes is invisible to a config: `lanekeep/no-unwrap` names the rule, not its implementation, so a rule migrating from one to the other requires no config change.
 
-**A component's source language is not part of the arrangement, and four of the thirteen built-ins are components today.** Two are written in Rust and compiled with `cargo component` — `docs/authoring-rust-rules.md` is how one is written. Two are written in Go and compiled with TinyGo into one shared component — `docs/authoring-go-rules.md`, and they are the migration that shows the arrangement holding in the harder direction: their TypeScript is deleted, so a Go rule is the component or it is nothing. The other nine are QuickJS modules, and three of those — `duplicate-implementation`, `no-restricted-calls`, `no-assertionless-test` — each target five of the six registered languages (every one but JavaScript) through the one-query-per-grammar form above, which is that mechanism carrying production weight rather than a toy example. For one release cycle the split read differently: the four TypeScript-inspecting built-ins were compiled ahead of time by `componentize-js` into one shared component (§5.2), sources frozen byte-for-byte and their four test files passing unmodified — which is what proved that which engine runs a rule and which language it was written in are independent questions — and were then reverted to modules by measurement (§15.1, §16 M5). The proof stands; the shipping decision moved.
+**A component's source language is not part of the arrangement, and four of the fifteen built-ins are components today.** Two are written in Rust and compiled with `cargo component` — `docs/authoring-rust-rules.md` is how one is written. Two are written in Go and compiled with TinyGo into one shared component — `docs/authoring-go-rules.md`, and they are the migration that shows the arrangement holding in the harder direction: their TypeScript is deleted, so a Go rule is the component or it is nothing. The other eleven are QuickJS modules, and three of those — `duplicate-implementation`, `no-restricted-calls`, `no-assertionless-test` — each target five of the six registered languages (every one but JavaScript) through the one-query-per-grammar form above, which is that mechanism carrying production weight rather than a toy example. For one release cycle the split read differently: the four TypeScript-inspecting built-ins were compiled ahead of time by `componentize-js` into one shared component (§5.2), sources frozen byte-for-byte and their four test files passing unmodified — which is what proved that which engine runs a rule and which language it was written in are independent questions — and were then reverted to modules by measurement (§15.1, §16 M5). The proof stands; the shipping decision moved.
 
 The TypeScript form is the one everything below is written in, because it is the one a project starts from.
 
@@ -184,8 +208,9 @@ export default defineRule({
     },
   },
 
-  // Evaluated in Rust before the file is read or parsed. Purely an optimization —
-  // omitting them changes nothing but speed.
+  // Evaluated in Rust before the file is read or parsed, and narrower than the query
+  // below — neutral anyway, because nothing the handler reports can occur in a file
+  // without `makeStyles` in it. Keeping that true is the author's job — §7.1.
   gates: {
     pathMatches: ['**/*.{ts,tsx}'],
     fileContains: ['makeStyles'],
@@ -203,7 +228,7 @@ export default defineRule({
 
     const call = ctx.closestAncestor(m.match, '(call_expression function: (identifier) @f)')
     if (!call) return
-    if (!ctx.resolvesToImport(call.f, { module: '@rneui/themed', name: 'makeStyles' })) return
+    if (!ctx.resolvesToImport(call.f, '@rneui/themed', 'makeStyles')) return
 
     ctx.report(m.match)
   },
@@ -412,7 +437,7 @@ The light semantic layer that pure syntactic matching gets wrong. Implemented in
 
 | Function | Notes |
 |---|---|
-| `ctx.resolvesToImport(node, { module, name })` | Handles aliasing: `import { makeStyles as ms }` |
+| `ctx.resolvesToImport(node, module, name?)` | Handles aliasing: `import { makeStyles as ms }` |
 | `ctx.isImportedFrom(node, moduleGlob)` | |
 | `ctx.bindingKind(node)` | `const \| let \| var \| param \| function \| class \| import` |
 | `ctx.isShadowed(node)` | Locally rebound identifier |
@@ -519,6 +544,21 @@ The world's bytes are a cache-key input (§8.1, `host_api_hash`), so widening th
 
 `docs/authoring-rust-rules.md` is the playbook for writing one.
 
+### 6.10 `ctx.types`
+
+The one part of this host API a rule has to ask for by name. Declaring `requires: ['types']` on `RuleSpec` is what makes `ctx.types` exist at all; declaring `requires: ['dataflow']` is refused at config load instead, because this build has no analysis to serve it yet. The engine probes each registered language once per run — never per file, never per rule — and hands a rule the resulting token only when its own `requires` names the capability.
+
+| Function | Notes |
+|---|---|
+| `ctx.types.typeOf(node)` | The type of the expression at `node`, from the bounded within-file type oracle |
+| `ctx.types.symbolOf(node)` | Where the identifier at `node` was declared |
+
+Both answer from the parsed file alone — no `tsconfig.json`, no declaration files, no cross-file resolution — and both return `undefined` freely. **`undefined` is the oracle's first-class answer, not a failure to work around.** It would rather say nothing than say something wrong: a rule reporting on a wrong type accuses correct code, which is a worse failure than reporting on nothing. A rule is expected to check for `undefined` and quietly stay silent, the same posture the rest of this section already takes on a dead handle (§6.2).
+
+**Reaching for `ctx.types` without declaring it fails differently, and on purpose.** The namespace itself is absent rather than present-and-empty, so an undeclared access is a `TypeError` at the first call, not the quiet `undefined` `typeOf` returns for an ordinary "I don't know." The two are not the same failure: one is the oracle's considered answer about a piece of code, the other is an author who forgot a line finding out immediately rather than by reading a clean report that never looked. The identical absence reaches a rule that declared the capability but runs against a language with no TypeScript-shaped grammar — declaring `requires: ['types']` and having a usable oracle underneath are two separate conditions, and either missing is loud rather than silently degraded.
+
+`ctx.types` has no component form. A component's `rule-metadata` has no `requires` field to carry the declaration — `world.wit` is untouched by this surface entirely — so unlike everything else in this section, it lives in the JavaScript host alone.
+
 ---
 
 ## 7. Making it fast
@@ -534,7 +574,13 @@ Declared per rule under `gates`, evaluated in Rust:
 | `pathMatches` / `pathNotMatches` | No file read at all |
 | `fileContains` / `fileNotContains` | One read, substring scan via memchr. No parse. |
 
-The single largest lever available. A rule scoped to `makeStyles` skips parsing every file whose bytes do not contain that string. Gates are pure optimization — removing one changes results not at all, only speed.
+The single largest lever available. A rule scoped to `makeStyles` skips parsing every file whose bytes do not contain that string.
+
+**A gate is declared, not derived.** Nothing computes it from the rule's query and nothing checks the two against each other, so a file a gate rejects is a file the rule never runs on, and a violation there is never found.
+
+A gate is neutral when it admits every file the rule would have reported on. That is a condition on the author rather than a property the engine guarantees, and nothing here can check it — the reporting set is whatever the handler decides. The way to keep it safely is to keep each gate wider than the query it guards, which is **sufficient rather than necessary** and, unlike the condition itself, can be settled by reading. A rule whose handler filters may gate far narrower and still be neutral: §4's sample gates on `makeStyles` under a query matching a numeric property in *any* object literal, and is neutral because nothing it reports can occur in a file whose bytes lack that string.
+
+`fileContains` is where this is easiest to get wrong, because it is an *and*: a rule matching either of two tokens cannot express its gate as a list of both, since that rejects every file carrying only one, and the rule then reports nothing while looking perfectly healthy. When a gate is the suspect, `--profile`'s second table (§15) is where it is settled — it reports, per rule, how many of the discovered files each gate rejected and how many the rule actually parsed. A nonzero `cached` means the columns to its right are incomplete for that run, since a cache hit returns before the content gates are consulted — re-run with `--no-cache` to read them. `path-gated` is unaffected, because a path gate runs before the cache is consulted at all.
 
 ### 7.2 The query gate
 
@@ -563,9 +609,12 @@ key = blake3(
                                   //   and anything bound beside that world
     wasm_compile_env_hash,        // how a component is compiled: wasmtime's own
                                   //   precompile-compatibility hash
+    analysis_hash,                // what the host analyses compute: the type oracle's
+                                  //   own identity, the resolver core's, and every
+                                  //   registered language's
     ruleset_hash,                 // rule module sources in the graph, and component bytes
     config_hash,                  // severity, include/exclude, options
-    every (grammar_id, grammar_abi) in the registry, sorted and count-prefixed
+    every (grammar_id, grammar_digest) in the registry, sorted and count-prefixed
     file_relative_path,           // path gates exist — path is an input
     file_content_hash,            // blake3 of bytes
 )
@@ -582,6 +631,12 @@ Grammars enter the key as the **whole registry**, not the one language a given f
 `wasm_compile_env_hash` is `wasmtime`'s own `Engine::precompile_compatibility_hash`, read off an engine built from `lanekeep-wasm`'s one configuration. A precompiled `.cwasm` records the tunables it was compiled under and `wasmtime` refuses one that disagrees, so those tunables decide whether a component runs at all; the ones that survive that check still decide what the guest computes, because `MEMORY_RESERVATION` and `MEMORY_GUARD_SIZE` together decide whether Cranelift elides bounds checks. It is taken from `wasmtime` rather than listed here because `check_tunables` compares twenty-six fields, three of which are lanekeep's constants and twenty-three of which move with the `wasmtime` version, the target triple *and the resolved feature set* — Cargo's feature unification can move `concurrency_support`, `recording`, `memory_reservation` or `memory_init_cow` without the version moving.
 
 It is a compilation environment and **not** a runtime, which is why it is not named one. Settings that live entirely host-side are outside it on purpose: the memory ceiling is enforced by a resource limiter the compiled code knows nothing about, and the epoch tick interval only changes *when* a breach is noticed. Those are budgets, and §6.8 already says a budget cancels a run rather than changing its answer — so neither belongs in a key.
+
+`analysis_hash` is what the host analyses compute — a third question with the same failure mode as the two above. It carries `lanekeep_types::oracle_identity()` and every registered language's `analysis_identity()`, each a digest over that crate's own sources taken at build time rather than hand-maintained: an oracle whose operator table, shadow check or recursion bound changes moves this field, and so does a resolver whose scope list changes, without anyone having to remember to bump anything — unlike `HOST_API_VERSION` beside it. Separate from `host_api_hash` for the same reason `wasm_compile_env_hash` already is: that field answers what a rule may *reach* — whether `ctx.types` exists at all — this one answers what it *says*, and folding the two together would leave a test unable to tell which one the key actually covers.
+
+**The languages are in it because leaving them out was a real gap, not a hypothetical one.** For a while this field carried the oracle alone, and a language crate's `BindingResolver` — which decides where a name was declared, and which the oracle reads before it can type anything — reached no hash at all. Correcting `lanekeep-lang-js`'s scope list so that a type parameter declared on an interface, a type alias or an abstract class is visible changed what the oracle answered, from a confident `number` to nothing, with every cache key identical either way. `engine_version` is no backstop: it is major.minor deliberately, and a resolver fix is a patch release.
+
+Beside the per-language identities sits one fixed term, `lanekeep_lang::crate_identity()`: a digest over `crates/lanekeep-lang`'s own sources — `glob_matches`, `Binding::is_import_of`, `is_imported_from` and `BindingKind::as_str` — which is the code every language's resolver answers *through*, not a per-language concern. It has no `Language` impl to hang a method on and does not vary with which languages are registered, so it is folded once, beside the oracle's identity, rather than per language.
 
 Value: `{ violations, facts, suppressions, deps }`.
 
@@ -605,7 +660,15 @@ Three things people get wrong here, all of which are silent-staleness bugs:
 
   **A rule's options reach the key as data, on the path that knows them.** That reads as obvious and was not true once: a `lanekeep.json` rule's options were interpolated into the generated entry module as a factory-call argument, and `Sandbox::eval_module` hands that module straight to the engine without going through the loader — so the loader, which is what `ruleset_hash` folds, never saw them. Editing `{"rule": "x", "options": {"limit": 1}}` to `{"limit": 2}` produced two identical keys and a warm run kept answering the previous configuration. The general fact is worth more than the instance: **a value that exists only in generated entry-module source is in neither hash.** A `lanekeep.config.ts` was unaffected, because its options live in the config module's own source, which the loader did read — which is also why every test of this property passed against the bug.
 - **Relative path belongs in the key.** Path gates make results path-sensitive; a moved file with identical bytes is not a cache hit.
-- **Grammar ABI belongs in the key.** A tree-sitter grammar bump changes node shapes and therefore query results.
+- **A grammar's shape belongs in the key.** A tree-sitter bump changes node kinds and field
+  names and therefore query results. The term is a digest of the shape the grammar exposes —
+  its ABI version, its node kinds with their named / visible / supertype flags, its field
+  names, its supertype list and its parse-state count — rather than the ABI version alone,
+  which could not see a regeneration within one ABI. Not the grammar's *declared* version:
+  `Language::metadata()` is `None` on any grammar built for an ABI below 15, which today is
+  both `typescript` and `tsx`. Not its bytes either, which tree-sitter's Rust API does not
+  expose — so a regeneration preserving every name and count is the one change this term
+  still cannot see.
 
 Suppressions live in the entry because directives are parsed during the per-file pass, and a reduce-phase violation may be reported at a site in a file that was not reprocessed this run. An entry without them would drop the directive and report a suppressed violation on the warm path.
 
@@ -1048,7 +1111,7 @@ Two things follow. The component-count arithmetic for Go is Rust's rather than J
 
 For scale at the other end, and read as magnitudes rather than as a ratio because the two were not taken on one profile: `crates/lanekeep-rules/tests/no_context_in_struct.rs` runs its whole nine-case table against the committed Go component in 0.12 s on the dev profile, where ~6.5 s was recorded for a *single* first `run` against the JavaScript one on the release profile — in the header of `typescript_builtins_as_components.rs`, a test that left with the §16 M5 revert.
 
-**Both Go built-ins are migrations, one for one, so their arrival left the built-in count where it was.** The roster has moved twice since this section's measurements: the §16 M5 revert took the four TypeScript-inspecting rules back to QuickJS modules, and three multi-language rules (`duplicate-implementation`, `no-restricted-calls`, `no-assertionless-test`) arrived as modules — thirteen built-ins today, four of them components: the two Rust rules and the two Go rules. Nothing in this section is re-baselined by any of that: a Go rule adds no host function, no boundary crossing and no cache-key input, and §15.1's per-crossing figures were taken against a Rust component and a JavaScript one, neither of which moved.
+**Both Go built-ins are migrations, one for one, so their arrival left the built-in count where it was.** The roster has moved since this section's measurements: the §16 M5 revert took the four TypeScript-inspecting rules back to QuickJS modules, and five rules arrived as modules after it — the three multi-language ones (`duplicate-implementation`, `no-restricted-calls`, `no-assertionless-test`) and the two type-aware ones (`no-restricted-types`, `no-restricted-arguments`) — fifteen built-ins today, four of them components: the two Rust rules and the two Go rules. Nothing in this section is re-baselined by any of that: a Go rule adds no host function, no boundary crossing and no cache-key input, and §15.1's per-crossing figures were taken against a Rust component and a JavaScript one, neither of which moved.
 
 **The warm column grows faster than the rule count, and that was a defect rather than a property — closed with a load memo.** The increments were +534 ms, +745 ms, +906 ms: `lanekeep-config` loaded once per rule *reference*, so four rules of one component deserialized the same 34 MB artifact repeatedly and instantiated it more than once, where the whole point of sharing the component is to pay for the engine once. The fix is a memo keyed on the content identity `Loaded` already carries — the same identity `lanekeep-wasm` keys instance sharing on (§6.9) — rather than anything structural, and it lives in both sequential load passes (`compile_components` and the engine's prepare-time `load_components`) rather than behind a lock in the loader, which stays lock-free. The memo is keyed on the bytes, not the name, because two different components can share a name across configs. Done, and re-measured above: the four-row now sits at the one-rule figures, so **naming a fifth rule of that component costs nothing extra in warm time**.
 
@@ -1066,9 +1129,13 @@ So the two jobs are separated. The report prints every scenario against its budg
 
 The first is the cache's entire purpose, and it is the check that caught a warm run starting a QuickJS engine per worker. The second says a file selection must not cost more than no selection. The ceiling is not a budget — it is 75× the budget — and exists so an infinite loop or a quadratic blowup fails the job instead of running until the runner gives up.
 
-Instrumentation behind `--profile` only, reporting per-rule time split between query matching and handler execution — the split that tells an author whether their query or their code is the problem — plus the match count, which is the number §7.2's gate exists to keep small.
+Instrumentation behind `--profile` only, printing two tables. The first reports per-rule time split between query matching and handler execution — the split that tells an author whether their query or their code is the problem — plus the match count, which is the number §7.2's gate exists to keep small. The second reports, per rule, what became of every file discovery selected: how many its path gates rejected, how many went unread, how many the cache served, how many its content gates rejected, how many it never ran against because no grammar it declares parses them, and how many it actually parsed. Those six are mutually exclusive and sum to the discovered file count, which the table prints beneath them, so a row that fails to reconcile is visible rather than merely wrong. The fifth counter has two causes and the printed text names both: the file parses with a grammar the rule does not declare, or **no grammar claims its extension at all** — an `include` of `src/**/*` sweeping up Markdown puts every such file there for every rule, and no `language` declaration could move it. They share one counter because the second is a corpus-wide fact identical in every row, so a column for it would carry no per-rule signal.
 
-It goes to stderr, so `--profile --format json` still pipes a clean document, and it is sorted by total cost with the rule id breaking ties, so the table does not reorder between runs for reasons nobody can see. A rule that matched nothing still appears: its query ran on every file, and the rule whose query is expensive *and* matches nothing is the worst case there is.
+Both go to stderr, so `--profile --format json` still pipes a clean document. The time table is sorted by total cost with the rule id breaking ties; the gate table is sorted by rule id alone, because "what did this rule look at" is not a time question and ordering it by elapsed time would move rows for a reason unrelated to what they show. Neither reorders between runs over one corpus for reasons nobody can see. A rule that matched nothing still appears, and the gate table is what says why — on a cold run, since `cached` precedes the last three columns and a nonzero `cached` leaves them incomplete. Its query may have run on every file and found nothing — expensive *and* fruitless, the worst case there is. It may never have run at all, because a gate, the cache, or the absence of any grammar it declares took every file first. Or it ran on whatever survived and found nothing there, which is the ordinary shape for any gated rule. The time table cannot tell these apart, since all of them spell zero matches; `parsed` is the column that does.
+
+`parsed` is the column that carries the question: `parsed: 0` says the rule never ran, and only then does the largest of its other counters name what took the files. A counter covering most of the corpus beside a nonzero `parsed` is ordinary — measured at `d0e15fe`, `lanekeep/no-circular-imports` checks this repository at `lang-gated 156 / parsed 26` with a correct `language`, and `local/one-parser-per-file` at `content-gated 148 / parsed 34` with a correct gate.
+
+What the warm path leaves in those columns is deliberately *not* characterized beyond "incomplete". Files receive no cache entry — one no grammar claims, one whose language no rule surviving the content gates declares, one that is not valid UTF-8 — so each is re-attributed on every warm run for as long as it is in the corpus. Measured at `d0e15fe`, this repository's second consecutive warm pass carries a `2` in `content-gated` or `lang-gated` in all seventeen rows, and which of the two differs by rule.
 
 Off by default, because measuring costs a clock read per handler invocation and the warm path is the one place that matters most.
 
@@ -1195,7 +1262,7 @@ its wheel is written. The floor survives the runtime.
 
 ## 16. Milestones
 
-**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships thirteen built-in rules, four of them as WebAssembly components (two Rust, two Go) and nine as QuickJS modules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
+**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust; ships fifteen built-in rules, four of them as WebAssembly components (two Rust, two Go) and eleven as QuickJS modules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
 Two things named here are still outstanding, and each is stated where it belongs rather than only here: the §15 performance budgets are targets that are not all met, and M5's authoring path compiles no rule that ships today — the four that took it were reverted — and no project's own rules on demand either.
 

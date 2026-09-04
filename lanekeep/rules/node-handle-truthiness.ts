@@ -38,8 +38,9 @@ export default defineRule({
   // `['ctx.']`, not `['ctx.parent']`. The rule now matches `ctx.root` too, and a file using
   // only that would be rejected by the narrower gate before the query ever ran — which would
   // have left the guaranteed-bug case unreachable behind a gate added to make the rule fast.
-  // `ctx.` admits nearly every rule file, so it buys little; §7.1 is explicit that a gate is
-  // pure optimization, and an over-broad one costs a parse rather than a wrong answer.
+  // `ctx.` admits nearly every rule file, so it buys little; §7.1's safe way to keep a gate
+  // neutral is to keep it wider than the query it guards, and an over-broad one costs a parse
+  // rather than a wrong answer.
   gates: { fileContains: ['ctx.'] },
 
   // Two shapes, because the host API has two. `ctx.parent(n)` is a call; `ctx.root` is a

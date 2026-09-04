@@ -8,11 +8,14 @@
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
  * The world is the single source of truth for every member the renderer emits straight from it.
- * Two members deviate from the world on purpose, and both are QuickJS-shaped: `today` is omitted
- * from `RuleContext` because QuickJS exposes it as a conditional property rather than a callable,
- * a shape this renderer cannot state honestly from the world; and `facts` is added to
+ * Three members deviate from the world on purpose, and all three are QuickJS-shaped: `today` is
+ * omitted from `RuleContext` because QuickJS exposes it as a conditional property rather than a
+ * callable, a shape this renderer cannot state honestly from the world; `facts` is added to
  * `RuleContext` because QuickJS hands a per-file rule `facts` that the world declares only on
- * `reduce-context`. Nothing else is added or omitted by hand.
+ * `reduce-context`; and `types` is added to `RuleContext` because `ctx.types` — the bounded
+ * type oracle — is QuickJS-only and has no presence in `world.wit` at all: a component rule
+ * cannot declare `requires`, so there is nothing for the world to say about it. Nothing else is
+ * added or omitted by hand.
  */
 
 /**
@@ -78,7 +81,23 @@ export interface RuleCard {
   }
 }
 
-/** Cheap rejections applied before a file is read or parsed. */
+/**
+ * Cheap rejections applied before a file is read or parsed.
+ *
+ * A gate is declared, not derived: nothing here is computed from the rule's `query`, and
+ * nothing checks the two against each other. So a gate can change what the rule reports — a
+ * file it rejects is a file the rule never runs on, and a violation there is never found.
+ *
+ * A gate is neutral when it admits every file the rule would have reported on — yours to
+ * keep, and not something the engine can check. The safe way to keep it is to gate wider
+ * than the query, which is sufficient rather than necessary: a rule whose handler filters
+ * may gate far narrower and still be neutral. `--profile` prints, per rule, how many files
+ * each gate rejected and how many the rule actually parsed, which is where a suspected gate
+ * is settled. A nonzero `cached` means the columns to its right are
+ * incomplete for that run, since a cache hit returns before the content gates are consulted;
+ * pair `--profile` with `--no-cache` to read them. `path-gated` is unaffected, because a path
+ * gate runs before the cache is consulted at all.
+ */
 export interface Gates {
   /**
    * Glob patterns a file's path must match for the rule to consider it.
@@ -191,6 +210,79 @@ export interface StructureFingerprint {
   nodes: number
 }
 
+/**
+ * Where a name came from. Returned by {@link TypeApi.symbolOf} directly, and nested under a
+ * {@link TypeInfo} whose `symbol` field is set.
+ */
+export interface SymbolInfo {
+  /**
+   * The name as it appears at the use site, not at the declaration. For a renamed import —
+   * `import { Decimal as Money }` — this is the local alias `Money`, never the exported
+   * name `Decimal`. Comparing this field against an expected export name therefore rejects
+   * a renamed import of the right type; `module` is the reliable field for "did this come
+   * from there".
+   */
+  name: string
+  /**
+   * The module it was imported from. Absent for a local declaration — that absence is what
+   * distinguishes an imported `Decimal` from a local class that happens to share the name.
+   */
+  module?: string
+}
+
+/**
+ * What the oracle established about an expression, from {@link TypeApi.typeOf}.
+ *
+ * At most one of `primitive`, `symbol` or `union` is set, matching which kind of type this
+ * is — a `union`'s members are already flattened one level and in canonical order. `text` is
+ * set alongside whichever it is, but it is **display-only**: what TypeScript itself would
+ * call the type, for a message a rule builds. Branch on `primitive` and `symbol`, never on
+ * `text`'s wording.
+ *
+ * All three can be unset at once: a *nominal* type whose name the resolver could not
+ * attribute — an unresolvable, global or ambient type such as `Date` used with no local
+ * declaration or import — carries only `text`. That is not a gap to code around; it is
+ * another shape of the same "I could not be sure" answer this whole surface is built on,
+ * the same posture `typeOf` itself takes by returning `undefined` rather than guessing. Do
+ * not assume the final branch of `if (primitive) … else if (symbol) … else` is unreachable
+ * — for this shape, it is not.
+ *
+ * There is deliberately no `complete` field. Nothing in this milestone can make the oracle's
+ * answer partial, and a field that never varies would only teach a rule to stop checking it.
+ */
+export interface TypeInfo {
+  /** What TypeScript would call this type. Display-only — branch on the fields below instead. */
+  text: string
+  /** Set when this is a primitive — exactly the set TypeScript itself recognizes as one. */
+  primitive?: 'number' | 'string' | 'boolean' | 'bigint' | 'symbol' | 'null' | 'undefined'
+  /**
+   * Set when this is a named type and the oracle could resolve where the name came from.
+   * Absent on an unresolvable, global or ambient nominal type — see the interface doc above.
+   */
+  symbol?: SymbolInfo
+  /** Set when this is a union. */
+  union?: TypeInfo[]
+}
+
+/**
+ * The bounded within-file type oracle, reached through `ctx.types`.
+ *
+ * Every question can come back with no answer, and no answer is a first-class result rather
+ * than a failure to work around: the oracle is conservative on purpose, and it would rather
+ * say nothing than say something wrong, because a rule reporting on a wrong type accuses
+ * correct code. A rule is expected to check for `undefined` and quietly stay silent, the same
+ * posture the rest of the navigation surface already takes on a dead handle.
+ */
+export interface TypeApi {
+  /**
+   * The type of the expression at `n`. `undefined` is that first-class no-answer, not a
+   * failure.
+   */
+  typeOf(n: Node): TypeInfo | undefined
+  /** Where the identifier at `n` was declared. `undefined` on the same terms as `typeOf`. */
+  symbolOf(n: Node): SymbolInfo | undefined
+}
+
 /** A rule's RuleContext surface. */
 export interface RuleContext {
   readonly filePath: string
@@ -219,6 +311,18 @@ export interface RuleContext {
   report(at: Node, message?: string | ReportOptions): void
   /** Facts emitted so far, optionally filtered by `kind`. */
   facts(kind?: string): EmittedFact[]
+  /**
+   * The bounded within-file type oracle, present only for a rule that declared
+   * `requires: ['types']`.
+   *
+   * Typed as always present because there is no way to spell "present when
+   * this rule's own `requires` says so" as a type — so a rule that forgets the
+   * declaration still compiles. It finds out at the first call instead:
+   * `ctx.types` is `undefined` at run time, and `ctx.types.typeOf(...)` throws a
+   * `TypeError` rather than returning a quietly wrong answer. That loudness is
+   * deliberate.
+   */
+  types: TypeApi
 }
 
 /** A violation the reduce phase reports, which has no node to point at. */
@@ -256,6 +360,15 @@ export interface Rule {
    * or Rust rule means it silently never fires.
    */
   language?: LanguageId | LanguageId[]
+  /**
+   * Host analyses this rule needs before it can run.
+   *
+   * Absent means none, which is every rule today. A rule declaring one the engine cannot
+   * provide is refused at load rather than run without it: an analysis that silently goes
+   * missing makes the rule report nothing, and a rule reporting nothing is indistinguishable
+   * from a codebase with nothing to report.
+   */
+  requires?: Array<'types' | 'dataflow'>
   /** How serious a violation is, before any config override. */
   severity: Severity
   /** What the rule tells whoever has to act on it. */

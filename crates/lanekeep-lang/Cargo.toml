@@ -12,8 +12,20 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 thiserror = { workspace = true }
 tree-sitter = { workspace = true }
 
+[build-dependencies]
+blake3 = { workspace = true }
+
 [lints]
 workspace = true
+
+# `blake3` is used both here, by `src/grammar.rs`'s digest, and by `build.rs`, which hashes
+# this crate's own `src/` into `crate_identity`. cargo-machete does not scan build scripts, so
+# it sees the `[build-dependencies]` entry as unused regardless of the `[dependencies]` one
+# above satisfying it in `src/`. This stanza covers only that build-script half.
+# `crates/lanekeep-types/Cargo.toml` carries the same stanza for the same reason.
+[package.metadata.cargo-machete]
+ignored = ["blake3"]

@@ -17,5 +17,21 @@ tree-sitter = { workspace = true }
 tree-sitter-javascript = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 
+[[bench]]
+name = "cfg"
+# No harness, matching `crates/lanekeep-types/benches/construction.rs`: this reports an
+# absolute figure a human reads once, not a statistical comparison against a baseline.
+harness = false
+
+[build-dependencies]
+blake3 = { workspace = true }
+
 [lints]
 workspace = true
+
+# `blake3` is used only by `build.rs`, which hashes this crate's own `src/` into
+# `analysis_identity`. cargo-machete does not scan build scripts, so it sees a
+# `[build-dependencies]` entry nothing in `src/` or `tests/` references and calls it unused.
+# `crates/lanekeep-types/Cargo.toml` carries the same stanza for the same reason.
+[package.metadata.cargo-machete]
+ignored = ["blake3"]

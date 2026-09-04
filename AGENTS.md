@@ -137,6 +137,8 @@ crates/
   lanekeep-lang-go      Go grammar, binding resolution
   lanekeep-lang-rust    Rust grammar, binding resolution
   lanekeep-languages    the set of supported languages, assembled in one place
+  lanekeep-types     the bounded type oracle: a node's type and symbol, from one parsed file
+                     — not lanekeep-types-gen, which renders TypeScript definitions
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
   lanekeep-wasm      WebAssembly component execution: the WIT host API, wasmtime wiring
@@ -319,6 +321,49 @@ you chose.
 (import_clause ...))` can never match, because the grammar puts `import_clause` first — and
 the error is exactly that, "this pattern can never match", which is easy to read as "this
 node type does not exist". Check the grammar's child order before rewriting the node names.
+
+**Four of the eighteen node kinds that carry `type_parameters` were not scopes, and the wrong
+answer they produced was a confident one.** `SCOPE_KINDS` in `crates/lanekeep-lang-js/src/binding.rs`
+decides which nodes `declaration_entry` asks for that field. `tree-sitter-typescript` 0.23.2's
+`typescript/src/node-types.json` declares the field on eighteen kinds; eight were already scopes.
+`abstract_class_declaration`, `interface_declaration`, `type_alias_declaration` and
+`function_signature` were missing, so a type parameter declared on any of them was invisible, the
+scope walk escaped outward, and `type Amount = number; interface O<Amount> { x: Amount }` typed
+`x` as **`number`** — identical in every byte to a declared `number`, with nothing to say a type
+parameter had been passed over. `lanekeep/no-restricted-types` reported conforming code because of
+it, while the same program spelled `class` rather than `abstract class` was correctly silent.
+
+Six carriers are still missing: `abstract_method_signature`, `call_signature`,
+`construct_signature`, `constructor_type`, `function_type`, `method_signature`, tracked as
+[#208](https://github.com/fmsouza/lanekeep/issues/208). **All six also carry `parameters`**, so
+each would widen parameter resolution as `function_signature` did, and each needs its own
+before/after measurement. Until then,
+`type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`, because
+`method_signature` carries the type parameters and `interface_declaration` does not.
+
+This entry has now carried four wrong claims about its own subject, and they are worth listing
+because the shape repeats: nine carriers, then twelve, then "four of the six carry `parameters`",
+then a sentence grouping the six by where they appear. The first two came from parse samples that
+did not parse everything; the second two were simply asserted. Every one was caught by someone
+reading `node-types.json`, which is where the field is declared and where no sample can be
+incomplete.
+
+The fourth was deleted rather than corrected, and that is the remedy worth copying. Each wrong
+claim was a *characterization* — a grouping, a proportion, a total — that nothing depended on. What
+the entry needs is three facts: six remain, all six carry `parameters`, and the reproducer above.
+When a replacement for a false claim keeps coming back false, stop replacing it and cut it.
+
+The measurement is the part worth copying, and it is also where the first pass at this entry went
+wrong: it counted the carriers by walking a parse of a hand-written sample and asserting the
+sample produces zero `ERROR` nodes — the first attempt wrote `function<T>(a: T)` and
+`class<T> { }` without the space each needs, the grammar rejected both, three kinds silently
+vanished, and the count came back nine instead of the true eighteen. A later pass wrote a fuller
+sample and still landed on twelve, because it omitted every signature-shaped and type-shaped
+generic construct — the sample looked complete and was not, and nothing about a parse with zero
+`ERROR` nodes says the sample covers every construct. The set of missing kinds differs with the
+sample either way, which is exactly why a wrong total survives review. Read `node-types.json`,
+where the field is *declared*, instead: a source-of-truth listing cannot omit a kind by accident
+the way a hand-written sample can.
 
 **A raw control character in a rule's source reports a parse failure somewhere else.** A NUL
 written into a template literal made the stripper report an error at the enclosing
@@ -819,19 +864,22 @@ intrinsics are an allowlist and `Object` is not on it), which is what `builtin.d
 along. The mirror image is a genuine factory referenced *bare* from a JSON config, which renders
 as a function where a rule object is expected.
 
-**That fix is retired rather than still running, and the split it served has moved twice since
-— so read the split from the tables, not from this paragraph.** `BUILT_IN_RULES` and
+**That fix is retired rather than still running, and the split it served has moved since — so
+read the split from the tables, not from this paragraph.** `BUILT_IN_RULES` and
 `COMPONENT_RULES` in `crates/lanekeep-rules/src/lib.rs` are the source of truth. As of #172
-thirteen built-ins ship, four as WebAssembly components — `no-unwrap` and `no-glob-import` from
-Rust crates, `no-package-init` and `no-context-in-struct` sharing the Go component — and nine
-as QuickJS modules: the four TypeScript-inspecting rules went into a StarlingMonkey component
-and came back in #147 (13 MB of binary and 110× per host-API crossing for no speed benefit,
-architecture §15.1), and `no-restricted-calls`, `duplicate-implementation` and
-`no-assertionless-test` arrived as modules after them. Six of the nine are genuine factories —
-every module except the three plain `defineRule` objects, `no-broad-except`,
-`no-default-export` and `no-mutable-default-argument` — and none carries the
-`for (const key in …)` copy: the dual shape is gone, not restored. The one surviving instance of it is
-`crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy that ships to nobody.
+thirteen built-ins shipped, four as WebAssembly components — `no-unwrap` and `no-glob-import`
+from Rust crates, `no-package-init` and `no-context-in-struct` sharing the Go component — and
+nine as QuickJS modules: the four TypeScript-inspecting rules went into a StarlingMonkey
+component and came back in #147 (13 MB of binary and 110× per host-API crossing for no speed
+benefit, architecture §15.1), and `no-restricted-calls`, `duplicate-implementation` and
+`no-assertionless-test` arrived as modules after them. `no-restricted-types` arrived as a
+tenth module after that, and `no-restricted-arguments` as an eleventh, so fifteen built-ins ship
+today. Eight of the eleven modules are genuine factories — every module except the three plain
+`defineRule` objects, `no-broad-except`, `no-default-export` and
+`no-mutable-default-argument` — and none carries
+the `for (const key in …)` copy: the dual shape is gone, not restored. The one surviving
+instance of it is `crates/lanekeep-engine/benches/no-unwrap.ts`, a frozen pre-migration copy
+that ships to nobody.
 
 What stands in the dual shape's place is `rules_module` in `crates/lanekeep-config/src/json.rs`,
 and it treats the two kinds differently. A component's options travel as JSON data to
@@ -857,6 +905,13 @@ authoring — five of the eight were factory-shaped the day "three" was written.
 arriving again. A count written out in prose is the spelling no pattern matches and no test
 covers — hence the opening instruction: derive the split from the tables, and treat any number
 this section states as a claim to recompute rather than to trust.
+
+A near miss, not a fourth instance: a draft of this entry claimed `no-restricted-arguments`
+landing right after `no-restricted-types` had made it stale a fourth time. It had not — the
+change that added `no-restricted-arguments` updated this section's counts in the same commit,
+which is the opposite of going stale — and review caught the false claim before it shipped.
+Worth naming precisely because the two read alike from a distance: a section going stale and a
+section being updated incorrectly are different failures, and only the second happened here.
 
 **`Sandbox::eval_module` does not go through the loader, so the synthetic entry module is not in
 `ruleset_hash`.** `hash_ruleset` folds over what `RuleLoader` recorded, and the loader only sees a
@@ -1264,6 +1319,16 @@ that job pins four versions rather than one. And the warning: `go-maporder.wasm`
 fixture built by the same recipe, is byte-identical through 116 and 131, so **a fixture cannot
 stand in for this check** — only the real artifact is large enough for two optimizers to disagree
 about.
+
+**A grammar's declared version cannot identify it, because `metadata()` is `None` on the two
+grammars this repository reads most.** `tree_sitter::Language::metadata()` returns the version a
+grammar was generated with, and it is present only from ABI 15. Measured 2026-09-03 over the six
+registered languages: `go`, `javascript`, `python` and `rust` are ABI 15 and answer
+`Some((0, 25, 0))` or `Some((0, 24, 1))`; **`typescript` and `tsx` are ABI 14 and answer `None`**,
+as does `name()`. A cache term keyed on it would therefore be constant for TypeScript, which is
+the language every shipped rule targets. `crates/lanekeep-lang/src/grammar.rs` folds the shape the
+grammar exposes instead — node kinds, field names, supertypes and the three counts — which every
+ABI answers.
 
 ## What not to do
 

@@ -6,8 +6,38 @@
 //! extensions, because they are genuinely different grammars: TSX gives up the
 //! angle-bracket type assertion `<T>expr` so the same syntax can open a JSX element.
 //! Parsing a `.tsx` file with the TypeScript grammar produces errors on valid code.
+//!
+//! # The control-flow graph
+//!
+//! [`mod@cfg`] holds a per-function control-flow graph for TypeScript and TSX: basic blocks
+//! split at every branch — short-circuit operators included, since `&&`, `??` and `?.` are
+//! control flow inside an expression — and a `finally` emitted once per distinct
+//! continuation rather than special-cased. Nothing in the engine calls it. #193's obligation
+//! analysis and #194's taint analysis are its first two consumers, over
+//! `on_all_paths_from` and `reaches` respectively, which is why the graph and the two
+//! queries are public from a module neither of them exists in yet.
+//!
+//! It is not a [`Language`] method, unlike everything else this crate exposes that way.
+//! Construction dispatches on tree-sitter node kind, never on a language identifier, so a
+//! trait method would commit to a signature before a second implementor exists to check it
+//! against — the opposite of the day-one stance `docs/architecture.md`'s `Language` trait
+//! section gives [`Language`] itself: implement it before a second language exists, because
+//! it is cheap now and impossible to retrofit.
+//!
+//! It lives in this crate rather than a `lanekeep-cfg` one on the precedent
+//! `crates/lanekeep-nodes/src/lib.rs` sets: that crate lived in `lanekeep-js` until
+//! `lanekeep-wasm` became a second engine needing its exact type, and was extracted then
+//! rather than in anticipation. **What would move this out is a second language needing a
+//! CFG** — only `cfg_build`'s construction reads node kinds; the language-agnostic part
+//! today is just the block/edge model and the two traversals in [`mod@cfg`], and one
+//! implementor is not enough to know where that seam actually belongs.
 
 pub mod binding;
+pub mod cfg;
+mod cfg_build;
+mod cfg_query;
+
+pub use cfg::{Block, BlockId, Cfg, Edge, EdgeKind};
 
 use std::sync::Arc;
 
@@ -22,6 +52,21 @@ use crate::binding::JsBindingResolver;
 /// hold it for the life of a file.
 static RESOLVER: std::sync::LazyLock<Arc<dyn BindingResolver>> =
     std::sync::LazyLock::new(|| Arc::new(JsBindingResolver));
+
+/// What this crate's analysis *is*, as a digest of every source file that decides an answer.
+///
+/// A cache key input, returned by every [`Language`] this crate registers. Derived by
+/// `build.rs` from a walk over `src/` rather than hand-maintained: the alternative is a list
+/// of files somebody has to remember to extend, and nothing detects a missed entry.
+///
+/// Shared by every language this crate registers, which is correct — they share one resolver,
+/// so a change to it changes what all of them answer.
+#[must_use]
+pub fn analysis_identity() -> [u8; 32] {
+    // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot be
+    // a silent gap.
+    lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_JS_ANALYSIS_HASH"))
+}
 
 /// TypeScript without JSX: `.ts`, `.mts`, `.cts`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -52,6 +97,10 @@ impl Language for TypeScript {
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     }
+
+    fn analysis_identity(&self) -> [u8; 32] {
+        analysis_identity()
+    }
 }
 
 impl Language for Tsx {
@@ -69,6 +118,10 @@ impl Language for Tsx {
 
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_typescript::LANGUAGE_TSX.into()
+    }
+
+    fn analysis_identity(&self) -> [u8; 32] {
+        analysis_identity()
     }
 }
 
@@ -88,6 +141,10 @@ impl Language for JavaScript {
 
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_javascript::LANGUAGE.into()
+    }
+
+    fn analysis_identity(&self) -> [u8; 32] {
+        analysis_identity()
     }
 }
 
