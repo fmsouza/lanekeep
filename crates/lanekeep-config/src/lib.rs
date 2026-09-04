@@ -5693,6 +5693,45 @@ mod tests {
         assert!(config.rules[0].requires.is_empty());
     }
 
+    /// A `requires` array with multiple entries is validated in full, not just its first entry.
+    ///
+    /// Mutations that optimize the validation loop to `.first()` instead of iterating all
+    /// entries are caught here: `requires: ['types', 'speed']` has a known capability first
+    /// (which would pass a first-entry-only check) and an unknown one second. The refusal must
+    /// name the unknown capability, proving the walk does not stop at entry 0. This test covers
+    /// the unknown-capability branch of `check_requires`; its complement, the all-implemented
+    /// multi-entry branch, is `a_requires_array_with_multiple_implemented_capabilities_loads`.
+    #[test]
+    fn a_requires_array_is_validated_beyond_its_first_entry() {
+        let error = load_requiring("requires-multi-unknown", "['types', 'speed']")
+            .expect_err("an unknown capability in a multi-entry array is refused");
+        let text = format!("{error}");
+        assert!(
+            text.contains("local/example"),
+            "refusal must name the rule: {text}"
+        );
+        assert!(
+            text.contains("speed"),
+            "refusal must name the unknown capability: {text}"
+        );
+    }
+
+    /// A `requires` array with multiple implemented capabilities loads.
+    ///
+    /// Complements `a_requires_array_is_validated_beyond_its_first_entry`, proving that
+    /// multi-entry arrays are not rejected simply for being multi-entry: both `types` and
+    /// `dataflow` are known and implemented, and the rule must load successfully with both
+    /// in its `requires` list.
+    #[test]
+    fn a_requires_array_with_multiple_implemented_capabilities_loads() {
+        let config = load_requiring("requires-multi-implemented", "['types', 'dataflow']")
+            .expect("a multi-entry array with all implemented capabilities must load");
+        assert_eq!(
+            config.rules[0].requires,
+            vec![Capability::Types, Capability::Dataflow]
+        );
+    }
+
     /// A JSON rule's options are a cache-key input, and were reaching neither hash.
     ///
     /// The same config in the same directory, one option value edited: before this was
