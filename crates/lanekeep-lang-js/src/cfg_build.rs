@@ -66,7 +66,7 @@ const POSTFIX_KINDS: &[&str] = &[
 /// Statement kinds that are loops, and so can house a labeled `continue`.
 ///
 /// A label on one of these — or a chain of labels stacked above one, each wrapping the
-/// next — belongs to the loop's own [`Target`], via `pending_label`, so the loop can
+/// next — belongs to the loop's own [`Target`], via `pending_labels`, so the loop can
 /// answer a labeled `continue`. A label whose body is neither a loop nor another labeled
 /// statement gets a break-only `Target` from `labeled_statement` itself, with
 /// `continue_to: None` — an unlabeled `continue` then passes through it to the enclosing
@@ -144,7 +144,7 @@ struct Builder<'t, 's> {
     /// (via `std::mem::take`) by whichever constructor ends the chain — a loop
     /// constructor, or `labeled_statement` itself for a non-loop body — which is what
     /// keeps it empty for the next, unrelated labeled statement.
-    pending_label: Vec<&'s str>,
+    pending_labels: Vec<&'s str>,
 }
 
 impl<'t> Cfg<'t> {
@@ -167,7 +167,7 @@ impl<'t> Cfg<'t> {
             targets: Vec::new(),
             finallys: Vec::new(),
             handlers: Vec::new(),
-            pending_label: Vec::new(),
+            pending_labels: Vec::new(),
         };
 
         let entry = builder.cfg.entry();
@@ -583,7 +583,16 @@ impl<'t, 's> Builder<'t, 's> {
         None
     }
 
-    /// The common shape: a header that tests, a body, and an exit.
+    /// The common shape: a header, a body, and an exit.
+    ///
+    /// `header` and `test` coincide for a non-branching condition and diverge whenever the
+    /// condition itself does: `while (a && b)` evaluates `a` in `header`, and `split`
+    /// emits `a`'s own True/False *from* `header`. The loop's own True/False — body versus
+    /// `after` — must come from `test`, the block where the *whole* condition's evaluation
+    /// completes (its join, for a compound one), or `header` would carry two conflicting
+    /// edges per label: one from the condition's internal branch, one from the loop's.
+    /// `header` stays right for the back edge and `continue_to` — re-testing the whole
+    /// condition from its start on a `continue` is correct.
     ///
     /// `conditional` is false for `for (;;)`, which has no test and therefore no way to
     /// fall out. Emitting a `False` edge there would invent a path the program does not
@@ -593,6 +602,7 @@ impl<'t, 's> Builder<'t, 's> {
         &mut self,
         node: Node<'t>,
         header: BlockId,
+        test: BlockId,
         continue_to: BlockId,
         labels: Vec<&'s str>,
         conditional: bool,
@@ -602,9 +612,9 @@ impl<'t, 's> Builder<'t, 's> {
         let body_entry = self
             .cfg
             .alloc(body.map_or(node.end_byte(), |b| b.start_byte()));
-        self.cfg.edge(header, body_entry, EdgeKind::True, false);
+        self.cfg.edge(test, body_entry, EdgeKind::True, false);
         if conditional {
-            self.cfg.edge(header, after, EdgeKind::False, false);
+            self.cfg.edge(test, after, EdgeKind::False, false);
         }
 
         self.targets.push(Target {
@@ -634,6 +644,7 @@ impl<'t, 's> Builder<'t, 's> {
             .cfg
             .alloc(condition.map_or(node.start_byte(), |c| c.start_byte()));
         self.cfg.edge(current, header, EdgeKind::Normal, false);
+        let mut test = header;
         if let Some(condition) = condition {
             let end = self.expression(condition, header);
             self.cfg.attribute(end, condition);
@@ -641,9 +652,10 @@ impl<'t, 's> Builder<'t, 's> {
             // answers `None`, since the node's own start byte (the `while` keyword)
             // precedes everything attributed inside it.
             self.cfg.attribute(end, node);
+            test = end;
         }
-        let labels = std::mem::take(&mut self.pending_label);
-        self.loop_statement(node, header, header, labels, true)
+        let labels = std::mem::take(&mut self.pending_labels);
+        self.loop_statement(node, header, test, header, labels, true)
     }
 
     fn do_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
@@ -658,7 +670,7 @@ impl<'t, 's> Builder<'t, 's> {
         let after = self.cfg.alloc(node.end_byte());
 
         self.targets.push(Target {
-            labels: std::mem::take(&mut self.pending_label),
+            labels: std::mem::take(&mut self.pending_labels),
             break_to: after,
             continue_to: Some(latch),
             finally_depth: self.finallys.len(),
@@ -669,6 +681,7 @@ impl<'t, 's> Builder<'t, 's> {
         if let Some(tail) = tail {
             self.cfg.edge(tail, latch, EdgeKind::Normal, false);
         }
+        let mut test = latch;
         if let Some(condition) = condition {
             let end = self.expression(condition, latch);
             self.cfg.attribute(end, condition);
@@ -676,11 +689,15 @@ impl<'t, 's> Builder<'t, 's> {
             // answers `None`, since the node's own start byte (the `do` keyword) precedes
             // everything attributed inside it.
             self.cfg.attribute(end, node);
+            test = end;
         }
         // The one edge that is both a back edge and a true branch, which is why `back` is
-        // a field on `Edge` rather than a variant of `EdgeKind`.
-        self.cfg.edge(latch, body_entry, EdgeKind::True, true);
-        self.cfg.edge(latch, after, EdgeKind::False, false);
+        // a field on `Edge` rather than a variant of `EdgeKind`. Emitted from `test` —
+        // where the *whole* condition's evaluation completes — rather than `latch`, which
+        // would otherwise also carry a conflicting pair of True/False edges from the
+        // condition's own internal branch whenever it short-circuits.
+        self.cfg.edge(test, body_entry, EdgeKind::True, true);
+        self.cfg.edge(test, after, EdgeKind::False, false);
         Some(after)
     }
 
@@ -738,8 +755,15 @@ impl<'t, 's> Builder<'t, 's> {
         self.cfg
             .edge(increment_entry, header, EdgeKind::Normal, true);
 
-        let labels = std::mem::take(&mut self.pending_label);
-        self.loop_statement(node, header, increment_entry, labels, condition.is_some())
+        let labels = std::mem::take(&mut self.pending_labels);
+        self.loop_statement(
+            node,
+            header,
+            test,
+            increment_entry,
+            labels,
+            condition.is_some(),
+        )
     }
 
     /// Never `None`, for the same reason as [`Self::while_statement`].
@@ -762,19 +786,19 @@ impl<'t, 's> Builder<'t, 's> {
         // on — the test is the implicit "does the iteration have a next value" — so this
         // attributes directly to `header`.
         self.cfg.attribute(header, node);
-        let labels = std::mem::take(&mut self.pending_label);
-        self.loop_statement(node, header, header, labels, true)
+        let labels = std::mem::take(&mut self.pending_labels);
+        self.loop_statement(node, header, header, header, labels, true)
     }
 
     fn labeled_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
         let label = node.child_by_field_name("label").map(|n| self.text(n));
         let body = node.child_by_field_name("body")?;
         if let Some(label) = label {
-            self.pending_label.push(label);
+            self.pending_labels.push(label);
         }
 
         // A label on a loop, or on another label that itself eventually wraps one, belongs
-        // to that loop's own target — `pending_label` accumulates through the chain so
+        // to that loop's own target — `pending_labels` accumulates through the chain so
         // `a: b: while (c) {}` reaches the loop's `Target` with both labels at once.
         // Anything else ends the chain here and gets a break-only target for everything
         // accumulated so far.
@@ -784,7 +808,7 @@ impl<'t, 's> Builder<'t, 's> {
 
         let after = self.cfg.alloc(node.end_byte());
         self.targets.push(Target {
-            labels: std::mem::take(&mut self.pending_label),
+            labels: std::mem::take(&mut self.pending_labels),
             break_to: after,
             continue_to: None,
             finally_depth: self.finallys.len(),
@@ -1736,7 +1760,7 @@ function f() {
     fn a_continue_through_stacked_labels_reaches_the_loop_header() {
         // `a: b: while (c) {}` is valid JavaScript with both labels naming the same loop.
         // `a`'s body is `b`'s `labeled_statement`, not the `while` directly, so this pins
-        // the recursive accumulation in `pending_label` rather than only the single-label
+        // the recursive accumulation in `pending_labels` rather than only the single-label
         // case every other labeled-loop test here exercises.
         let source = "function f() { a: b: while (c) { continue a; } }";
         let tree = parse(source);
@@ -1775,6 +1799,130 @@ function f() {
             targets,
             vec![after],
             "break b; must leave the loop through both stacked labels",
+        );
+    }
+
+    #[test]
+    fn a_compound_while_condition_puts_the_loops_edges_on_the_join_not_the_header() {
+        // `while (a && b)`'s header evaluates only `a`; `split` emits `a`'s own True (to
+        // `b`'s block) and False (to the join) *from* `header`. The loop's own True/False
+        // — body versus `after` — must come from that join instead, where the *whole*
+        // condition's evaluation completes. Wiring them from `header` too would give it
+        // two edges per label, indistinguishable from each other.
+        let source = "function f() { while (a && b) { break; } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        let header = cfg.block_of(ident("a")).unwrap();
+        // `while_statement`'s own node is attributed to the join (Task 4's own-node
+        // attribution fix, combined with this fix's routing of the loop's edges there).
+        let join = cfg.block_of(find(&tree, "while_statement")).unwrap();
+        assert_ne!(
+            header, join,
+            "a compound condition's header and join must differ"
+        );
+
+        let header_kinds: Vec<EdgeKind> = cfg
+            .block(header)
+            .successors
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            header_kinds.len(),
+            2,
+            "header must carry only the condition's own edges, got {header_kinds:?}",
+        );
+        let header_targets: Vec<BlockId> = cfg
+            .block(header)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert!(
+            header_targets.contains(&join),
+            "header's False edge must reach the join"
+        );
+
+        let join_kinds: Vec<EdgeKind> = cfg.block(join).successors.iter().map(|e| e.kind).collect();
+        assert!(
+            join_kinds.contains(&EdgeKind::True),
+            "the loop's True edge must leave the join"
+        );
+        assert!(
+            join_kinds.contains(&EdgeKind::False),
+            "the loop's False edge must leave the join"
+        );
+    }
+
+    #[test]
+    fn break_leaves_a_compound_condition_loop_too() {
+        // Same property as `break_leaves_the_loop`, on a condition that branches. This is
+        // what actually confirms the fix rather than only the block-of-while-statement
+        // attribution: before it, `header`'s own False edge (from `split`) bypassed a ban
+        // on the join, so this exact mutation was undetectable for any compound-condition
+        // loop even after `while_statement` started attributing its own node to the join.
+        let source = "function f() { while (a && b) { break; } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "break_statement")).unwrap();
+        let after = cfg
+            .block_of(find_all(&tree, "expression_statement")[0])
+            .unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(targets.len(), 1, "a break has one way out");
+        assert!(
+            skips(&cfg, jump, after, find(&tree, "while_statement")),
+            "a break must reach the code after a compound-condition loop without re-entering it",
+        );
+    }
+
+    #[test]
+    fn a_compound_do_while_condition_puts_the_back_edge_on_the_join_not_the_latch() {
+        // Same shape as the compound `while` case: `x && y`'s own `split` emits from
+        // `latch` (where the condition starts), so the loop's own True (back to the body)
+        // and False (to `after`) must come from the join instead, or `latch` would carry
+        // a second, conflicting pair of edges from the condition's own internal branch.
+        let source = "function f() { do { a(); } while (x && y); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        let latch = cfg.block_of(ident("x")).unwrap();
+        let join = cfg.block_of(find(&tree, "do_statement")).unwrap();
+        assert_ne!(
+            latch, join,
+            "a compound condition's latch and join must differ"
+        );
+
+        let latch_kinds: Vec<EdgeKind> =
+            cfg.block(latch).successors.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            latch_kinds.len(),
+            2,
+            "latch must carry only the condition's own edges, got {latch_kinds:?}",
+        );
+
+        let edges = back_edges(&cfg);
+        assert_eq!(edges.len(), 1, "exactly one back edge, got {edges:?}");
+        assert_eq!(
+            edges[0].0,
+            join.index(),
+            "the back edge must leave the join, where the whole condition's evaluation completes, not the latch",
         );
     }
 }
