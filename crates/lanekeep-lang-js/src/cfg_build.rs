@@ -87,7 +87,9 @@ struct Target<'s> {
     /// `None` for a `switch` or a labeled block, which `continue` passes through.
     continue_to: Option<BlockId>,
     /// `self.finallys.len()` when this target was pushed. Jumping here unwinds
-    /// everything pushed since.
+    /// everything pushed since — and it is also what [`Builder::emit_finally_copy`] cuts
+    /// this stack on, so a finalizer copy cannot answer a jump with a loop that was opened
+    /// inside the `try` the finalizer belongs to.
     finally_depth: usize,
 }
 
@@ -108,7 +110,8 @@ struct Handler {
     ///
     /// Recorded *after* the enclosing `try`'s own finalizer is pushed, so that finalizer
     /// is above this depth and does not run on the body-to-`catch` path: `finally` runs
-    /// after `catch`, not instead of it.
+    /// after `catch`, not instead of it. Being above it is also what takes this handler
+    /// out of scope inside a copy of that finalizer, in [`Builder::emit_finally_copy`].
     finally_depth: usize,
 }
 
@@ -236,11 +239,11 @@ impl<'t, 's> Builder<'t, 's> {
                     None => Some(block),
                 }
             }
-            // Declared no fields; the operand is `named_child(0)`. The edge to the exit
-            // goes through every pending `finally`, which is the whole of "a `return`
-            // inside a `try` runs the finalizer first" — there is no case for `try` here.
+            // The edge to the exit goes through every pending `finally`, which is the
+            // whole of "a `return` inside a `try` runs the finalizer first" — there is no
+            // case for `try` here.
             "return_statement" => {
-                let end = match node.named_child(0) {
+                let end = match Self::operand(node) {
                     Some(operand) => self.expression(operand, current),
                     None => current,
                 };
@@ -256,7 +259,7 @@ impl<'t, 's> Builder<'t, 's> {
             // function that does not wrap it, which is true and unusable. Widening it is
             // #195's decision, and this is the one place that would change.
             "throw_statement" => {
-                let end = match node.named_child(0) {
+                let end = match Self::operand(node) {
                     Some(operand) => self.expression(operand, current),
                     None => current,
                 };
@@ -939,10 +942,28 @@ impl<'t, 's> Builder<'t, 's> {
         Some(after)
     }
 
-    /// Where an uncaught `throw` goes, and how many finally levels to unwind first.
+    /// The operand of a `return` or a `throw`, which declare no fields.
+    ///
+    /// Not `named_child(0)`: `comment` is a *named* node in this grammar, so
+    /// `throw /* why */ a || b;` would hand back the comment, and the `||` split would be
+    /// silently absent — an under-approximation with no symptom, since a missing split only
+    /// ever removes paths. Every other arm reaches its operand through
+    /// `child_by_field_name`, which cannot pick a comment up; these two have to filter.
+    fn operand(node: Node<'t>) -> Option<Node<'t>> {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() != "comment")
+    }
+
+    /// Where a `throw` goes, and how many finally levels to unwind first.
     ///
     /// With no enclosing `catch` it leaves the function, and *every* pending finalizer is
     /// on the way — hence depth `0` rather than the current stack height.
+    ///
+    /// "Enclosing" is whatever [`Self::emit_finally_copy`] left on the stack, which is not
+    /// always the lexically enclosing `try`: inside a copy of a finalizer, that `try`'s own
+    /// handler has been cut, because a `throw` in a `finally` propagates past the whole
+    /// statement rather than into the `catch` beside it.
     fn innermost_handler(&self) -> (BlockId, usize) {
         self.handlers
             .last()
@@ -985,23 +1006,51 @@ impl<'t, 's> Builder<'t, 's> {
         // continuation reuses it instead of recursing without bound.
         self.finallys[level].memo.push((continuation, entry));
 
-        // A copy of level N must not see levels N and inward as pending: a `return`
-        // inside it unwinds only what encloses it. `split_off` leaves `self.finallys`
-        // holding exactly the outer levels, and the levels moved out carry their own
-        // memos back in with them.
-        let inner = self.finallys.split_off(level);
+        // All three scope stacks are narrowed, not just `finallys`, and for one reason:
+        // this copy is emitted *during* the guarded body's walk, so everything the `try`
+        // opened — its own handler, its own finalizer, every loop nested inside it — is
+        // still pushed, and none of it is in scope for a finalizer that runs on the way
+        // out of the statement. A `return` in the copy must unwind only what encloses the
+        // `try`; a `throw` in it is not caught by the `catch` beside it; a `break` or
+        // `continue` in it cannot target a loop the finalizer sits outside. Leaving
+        // `handlers` and `targets` alone puts edges in the graph for paths the program
+        // does not have, which is the invented-path failure this whole construction is
+        // shaped to avoid.
+        //
+        // `finally_depth` separates the two sides: anything the `try` opened recorded a
+        // depth *above* `level`, and anything enclosing it recorded `level` or less.
+        // Depths are monotone up both stacks — nothing is pushed while an entry recorded
+        // at a greater depth is still live — so one position cuts each cleanly.
+        let handler_cut = self
+            .handlers
+            .iter()
+            .position(|handler| handler.finally_depth > level)
+            .unwrap_or(self.handlers.len());
+        let target_cut = self
+            .targets
+            .iter()
+            .position(|target| target.finally_depth > level)
+            .unwrap_or(self.targets.len());
+        // The levels moved out carry their own memos back in with them.
+        let inner_finallys = self.finallys.split_off(level);
+        let inner_handlers = self.handlers.split_off(handler_cut);
+        let inner_targets = self.targets.split_off(target_cut);
         if let Some(tail) = self.statement(body, entry) {
             self.cfg.edge(tail, continuation, EdgeKind::Normal, false);
         }
-        self.finallys.extend(inner);
+        self.finallys.extend(inner_finallys);
+        self.handlers.extend(inner_handlers);
+        self.targets.extend(inner_targets);
         entry
     }
 
     /// `try`/`catch`/`finally`, with the finalizer emitted once per distinct continuation.
     ///
     /// #192's design, §4.8. Every `return` in the guarded region shares one copy, because
-    /// they all continue to the exit; normal completion gets its own; a propagating
-    /// `throw` another; each `break`/`continue` target that escapes one more. After
+    /// they all continue to the exit; normal completion gets its own — one each for the
+    /// body and the `catch` when both complete, per the comment on the loop that emits
+    /// them; a propagating `throw` another; each `break`/`continue` target that escapes
+    /// one more. After
     /// construction, "the finalizer is on every path out of the `try`" is a fact about the
     /// edge set — there is no flag to read and no keyword to match, which is what #192
     /// asks for.
@@ -2644,23 +2693,25 @@ function f() {
         );
     }
 
-    /// How many blocks are attributed a node whose trimmed text is exactly `text`.
+    /// Every block attributed a node whose trimmed text is exactly `text`, in source order.
     ///
-    /// The count of `finally` copies, in other words, which is the one question about this
-    /// construction that `block_of` cannot answer: several copies hold an equally narrow
-    /// attribution of the same node, and `block_of` would quietly pick the lowest id.
+    /// One entry per copy of a duplicated `finally` — the question about this construction
+    /// that `block_of` cannot answer, since several copies hold an equally narrow
+    /// attribution of the same node and it answers with the lowest-numbered. A property
+    /// that must hold of *every* copy has to be asserted over this, not over `block_of`.
     ///
     /// The text to match is a *statement* — `c();`, not `c()`. `children` attributes
     /// neither a `call_expression` nor its operands, so the narrowest thing attributed
     /// inside a finalizer body is the `expression_statement` around the call.
-    fn blocks_with_text(cfg: &Cfg<'_>, source: &str, text: &str) -> usize {
+    fn blocks_with_text(cfg: &Cfg<'_>, source: &str, text: &str) -> Vec<BlockId> {
         cfg.blocks()
             .filter(|(_, b)| {
                 b.nodes
                     .iter()
                     .any(|n| source[n.byte_range()].trim() == text)
             })
-            .count()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// The first block, in source order, attributed a node whose trimmed text is `text`.
@@ -2668,15 +2719,9 @@ function f() {
     /// For anything that is *not* copied there is exactly one, and this says which without
     /// going through `block_of`'s containment fallback.
     fn block_with_text(cfg: &Cfg<'_>, source: &str, text: &str) -> BlockId {
-        let (id, _) = cfg
-            .blocks()
-            .find(|(_, b)| {
-                b.nodes
-                    .iter()
-                    .any(|n| source[n.byte_range()].trim() == text)
-            })
-            .unwrap_or_else(|| panic!("no block attributed `{text}`"));
-        id
+        *blocks_with_text(cfg, source, text)
+            .first()
+            .unwrap_or_else(|| panic!("no block attributed `{text}`"))
     }
 
     #[test]
@@ -2719,7 +2764,7 @@ function f() {
 }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
-        let copies = blocks_with_text(&cfg, source, "c();");
+        let copies = blocks_with_text(&cfg, source, "c();").len();
         // Two returns share one copy (both continue to the exit); normal completion has
         // its own. Never one per `return`.
         assert_eq!(
@@ -2933,14 +2978,20 @@ function f() {
         let source = "function f() { try { a(); } finally { return 1; } }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let copies = blocks_with_text(&cfg, source, "return 1;");
+        assert_eq!(copies.len(), 1, "one continuation, one copy");
+        // The edge itself, rather than reachability past a node that resolves to no block
+        // and therefore bans nothing: under the mutation the copy's `return` lands on a
+        // second copy of itself, and the exit is not reachable from either.
+        let targets: Vec<BlockId> = cfg
+            .block(copies[0])
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
         assert_eq!(
-            blocks_with_text(&cfg, source, "return 1;"),
-            1,
-            "one continuation, one copy",
-        );
-        let body = block_with_text(&cfg, source, "a();");
-        assert!(
-            skips(&cfg, body, cfg.exit(), find(&tree, "function_declaration")),
+            targets,
+            vec![cfg.exit()],
             "the finalizer's own return must leave the function",
         );
     }
@@ -2992,5 +3043,117 @@ function f() {
             Some(block_with_text(&cfg, source, "before();")),
             "the try belongs to the block control was in when it started",
         );
+    }
+
+    #[test]
+    fn a_throw_in_a_finally_is_not_caught_by_its_own_try() {
+        // A finalizer copy is emitted *during* the guarded body's walk, so this `try`'s own
+        // handler is still pushed while the copy is built. It is not in scope for it: a
+        // `throw` in a `finally` propagates past the whole statement and is never caught by
+        // the `catch` beside it. Asserted over every copy, because `block_of` answers with
+        // only the lowest-numbered one and the copies here differ.
+        let source = "function f() { try { return 1; } catch (e) { h(); } finally { throw x; } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let handler = block_with_text(&cfg, source, "h();");
+        let copies = blocks_with_text(&cfg, source, "throw x;");
+        assert_eq!(
+            copies.len(),
+            2,
+            "one copy for the return's continuation, one for the catch's normal completion",
+        );
+        for copy in copies {
+            let targets: Vec<BlockId> = cfg
+                .block(copy)
+                .successors
+                .iter()
+                .map(|e| e.target)
+                .collect();
+            assert_eq!(
+                targets,
+                vec![cfg.exit()],
+                "a throw in a finally leaves the function; it must not reach {handler:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_continue_in_a_finally_targets_the_loop_the_try_is_in() {
+        // The same displaced stack, one construct over: the copy is built inside the *inner*
+        // loop's body walk, so that loop's `Target` is still pushed and answers a `continue`
+        // the finalizer is not inside. `finally_depth` is what separates the two — the inner
+        // loop recorded a depth above this finalizer's level, the outer one below it.
+        let source =
+            "function f() { while (d) { try { while (c) { return 1; } } finally { continue; } } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        let outer_header = cfg.block_of(ident("d")).unwrap();
+        let inner_header = cfg.block_of(ident("c")).unwrap();
+        assert_ne!(
+            outer_header, inner_header,
+            "the two loop headers must be distinct blocks, or this asserts nothing",
+        );
+        let copies = blocks_with_text(&cfg, source, "continue;");
+        assert_eq!(
+            copies.len(),
+            2,
+            "one copy for the return, one for normal completion"
+        );
+        for copy in copies {
+            let targets: Vec<BlockId> = cfg
+                .block(copy)
+                .successors
+                .iter()
+                .map(|e| e.target)
+                .collect();
+            assert_eq!(
+                targets,
+                vec![outer_header],
+                "a continue in a finally targets the loop the try is in, not one inside it",
+            );
+        }
+    }
+
+    #[test]
+    fn a_comment_before_the_operand_does_not_displace_it() {
+        // `comment` is a *named* node in this grammar, so `named_child(0)` hands back the
+        // comment and the real operand goes unwalked — the `||` split silently absent, which
+        // only ever *removes* paths and so has no symptom. Every other arm reaches its
+        // operand through `child_by_field_name`, which cannot pick a comment up; `return`
+        // and `throw` declare no fields and have to filter.
+        for source in [
+            "function f() { return /* why */ a || b; }",
+            "function f() { throw /* why */ a || b; }",
+        ] {
+            let tree = parse(source);
+            let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+            let ident = |name: &str| {
+                find_all(&tree, "identifier")
+                    .into_iter()
+                    .find(|n| &source[n.byte_range()] == name)
+                    .unwrap()
+            };
+            let test = cfg.block_of(ident("a")).unwrap();
+            let right = cfg.block_of(ident("b")).unwrap();
+            // `||` takes `False` to its right operand: direction, not membership.
+            let false_edges: Vec<BlockId> = cfg
+                .block(test)
+                .successors
+                .iter()
+                .filter(|e| e.kind == EdgeKind::False)
+                .map(|e| e.target)
+                .collect();
+            assert_eq!(
+                false_edges,
+                vec![right],
+                "`{source}`: the operand after the comment was not walked",
+            );
+        }
     }
 }

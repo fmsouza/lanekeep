@@ -262,6 +262,14 @@ impl<'t> Cfg<'t> {
     ///
     /// Ties break to the lowest [`BlockId`] in both stages.
     ///
+    /// **One node can belong to several blocks.** A `finally` body is emitted once per
+    /// distinct continuation, so every node inside one is attributed to each copy — and
+    /// the copies are real, separate blocks, which is what keeps "the finalizer is on
+    /// every path out of the `try`" a fact about the edge set. Exact identity then matches
+    /// more than one block and this answers with the lowest-numbered of them: one true
+    /// answer among several, never a merge. A consumer that needs a property to hold of
+    /// *every* copy has to scan [`Self::blocks`] rather than ask here.
+    ///
     /// The `root`-containment check below is a correctness gate: it is what keeps a
     /// node attributed from outside `root` from answering a query for an offset outside
     /// it.
