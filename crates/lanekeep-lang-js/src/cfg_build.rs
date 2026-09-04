@@ -944,15 +944,21 @@ impl<'t, 's> Builder<'t, 's> {
 
     /// The operand of a `return` or a `throw`, which declare no fields.
     ///
-    /// Not `named_child(0)`: `comment` is a *named* node in this grammar, so
+    /// Not `named_child(0)`: the grammar's extras are *named* nodes, so
     /// `throw /* why */ a || b;` would hand back the comment, and the `||` split would be
     /// silently absent — an under-approximation with no symptom, since a missing split only
     /// ever removes paths. Every other arm reaches its operand through
-    /// `child_by_field_name`, which cannot pick a comment up; these two have to filter.
+    /// `child_by_field_name`, which cannot pick one up; these two have to filter.
+    ///
+    /// Both of `node-types.json`'s named extras are listed, rather than only the one a
+    /// fixture can reach: `html_comment`'s scanner runs to end of line, so it swallows any
+    /// operand beside it and a following line is cut off by ASI — no program appears to
+    /// reach it. It is named anyway because "the grammar's extras" is the rule, and a list
+    /// that happens to match today's reachable cases is the kind that goes quietly stale.
     fn operand(node: Node<'t>) -> Option<Node<'t>> {
         let mut cursor = node.walk();
         node.named_children(&mut cursor)
-            .find(|child| child.kind() != "comment")
+            .find(|child| !matches!(child.kind(), "comment" | "html_comment"))
     }
 
     /// Where a `throw` goes, and how many finally levels to unwind first.
@@ -1031,6 +1037,12 @@ impl<'t, 's> Builder<'t, 's> {
             .iter()
             .position(|target| target.finally_depth > level)
             .unwrap_or(self.targets.len());
+        // One consequence, deliberately not tested: a `break`/`continue` in a finalizer
+        // naming a label *inside* the guarded body now finds no target, and `jump` returns
+        // without an edge — a copy block with no successors. That jump is a `SyntaxError`
+        // and no real parse reaches here with one; of the two wrong answers available for a
+        // program that cannot exist, the one that invents no edge is the right one to have.
+        //
         // The levels moved out carry their own memos back in with them.
         let inner_finallys = self.finallys.split_off(level);
         let inner_handlers = self.handlers.split_off(handler_cut);
@@ -3056,6 +3068,11 @@ function f() {
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
         let handler = block_with_text(&cfg, source, "h();");
+        assert_ne!(
+            handler,
+            cfg.exit(),
+            "the catch body must be a block of its own, or the assertion below is vacuous",
+        );
         let copies = blocks_with_text(&cfg, source, "throw x;");
         assert_eq!(
             copies.len(),
@@ -3155,5 +3172,41 @@ function f() {
                 "`{source}`: the operand after the comment was not walked",
             );
         }
+    }
+
+    #[test]
+    fn a_throw_in_a_finally_reaches_a_handler_outside_the_try() {
+        // The *boundary* of the `handlers` cut, which the test above cannot see: there, the
+        // only live handler is the finalizer's own `try`, and both `>` and `>=` remove it.
+        // Here the enclosing `try`'s handler was recorded at depth 0 — the same level the
+        // inner finalizer sits at — so `>` keeps it and `>=` would cut it, leaving the
+        // throw with no handler and an edge to the exit instead of into the catch.
+        let source =
+            "function f() { try { try { return 1; } finally { throw x; } } catch (e) { h(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let handler = block_with_text(&cfg, source, "h();");
+        assert_ne!(
+            handler,
+            cfg.exit(),
+            "the catch body must be a block of its own, or the assertion below is vacuous",
+        );
+        let copies = blocks_with_text(&cfg, source, "throw x;");
+        assert_eq!(
+            copies.len(),
+            1,
+            "the return is the only continuation out of the inner try",
+        );
+        let targets: Vec<BlockId> = cfg
+            .block(copies[0])
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![handler],
+            "a throw in a finally is caught by a handler outside the try it belongs to",
+        );
     }
 }
