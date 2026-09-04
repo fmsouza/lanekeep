@@ -1230,7 +1230,8 @@ mod tests {
         // `source` that is not what `root` was parsed from reaches `text`, which slices
         // `source[node.byte_range()]`. The fixture uses `a && b` on purpose: `binary_expression`
         // is the first arm to read an operator's text, so without the guard this panics inside
-        // the walk — "byte index 24 is out of bounds" — rather than answering.
+        // the walk — measured: `start byte index 17 is out of bounds for string of length 3`,
+        // from `text`, naming neither parameter — rather than answering.
         let long = "function f() { a && b; }";
         let tree = parse(long);
         let function = find(&tree, "function_declaration");
