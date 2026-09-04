@@ -1,10 +1,14 @@
 //! Construction: the walk that turns a parsed function into a [`Cfg`].
 //!
-//! Two mutually recursive operations. `statement` returns `None` when control cannot fall
-//! through — after `return`, `throw`, `break` and `continue` — which is what makes
-//! unreachable code fall out of the construction rather than needing to be detected.
-//! `expression` returns the block where evaluation completes, which differs from the block
-//! it started in exactly when the expression branches.
+//! Two operations. `statement` returns `None` when control cannot fall through — after
+//! `return`, `throw`, `break` and `continue` — which is what makes unreachable code fall out
+//! of the construction rather than needing to be detected. `expression` returns the block
+//! where evaluation completes, which differs from the block it started in exactly when the
+//! expression branches.
+//!
+//! `statement` calls `expression`, never the reverse. There is no cycle, because a nested
+//! function is attributed whole rather than descended into — so no expression ever needs to
+//! reach back into statement territory.
 
 use tree_sitter::Node;
 
@@ -216,13 +220,23 @@ impl<'t, 's> Builder<'t, 's> {
             "statement_block" => self.statements(node, current),
             "if_statement" => self.if_statement(node, current),
             "empty_statement" => Some(current),
-            // Deprecated syntax that still parses. Without this arm its body would fall to
-            // the catch-all and be walked as an *expression*, so a `return` inside one
-            // would produce no exit edge at all — silently.
-            "with_statement" => match node.child_by_field_name("body") {
-                Some(body) => self.statement(body, current),
-                None => Some(current),
-            },
+            // Deprecated syntax that still parses. Without an arm here its body would
+            // fall to the catch-all and be walked as an *expression*, so a `return` inside
+            // one would produce no exit edge at all — silently.
+            "with_statement" => {
+                // The `object` field is required by the grammar and must be evaluated:
+                // `with (a && b) { ... }` carries Task 3's short-circuit edges inside it,
+                // and delegating straight to the body would drop them silently.
+                let mut block = current;
+                if let Some(object) = node.child_by_field_name("object") {
+                    block = self.expression(object, block);
+                }
+                self.cfg.attribute(block, node);
+                match node.child_by_field_name("body") {
+                    Some(body) => self.statement(body, block),
+                    None => Some(block),
+                }
+            }
             // A minimal placeholder ahead of Task 6, which owns `return_statement` for real
             // and replaces this arm wholesale once `finallys` unwinding exists. Declared no
             // fields; the operand is `named_child(0)`. Without this arm `return` falls to
@@ -373,6 +387,32 @@ mod tests {
     }
 
     #[test]
+    fn every_function_like_root_kind_builds() {
+        // Pins all six function-like `ROOT_KINDS` entries, not just `function_declaration`
+        // and `arrow_function`, which is all the rest of this file's tests happen to cover.
+        // A kind added to `ROOT_KINDS` without a `body` field would fail silently — `build`
+        // returns `Some` either way, just with an empty walk — so this checks that each
+        // kind's body is actually walked, not merely that `build` accepts the kind.
+        for (source, kind) in [
+            ("function f() { a(); }", "function_declaration"),
+            ("function* f() { a(); }", "generator_function_declaration"),
+            ("const f = function () { a(); };", "function_expression"),
+            ("const f = function* () { a(); };", "generator_function"),
+            ("const f = () => { a(); };", "arrow_function"),
+            ("class C { m() { a(); } }", "method_definition"),
+        ] {
+            let tree = parse(source);
+            let cfg = Cfg::build(source, find(&tree, kind))
+                .unwrap_or_else(|| panic!("`{kind}` is a root"));
+            assert!(
+                attributed(&cfg, find(&tree, "expression_statement"))
+                    .contains(&"expression_statement"),
+                "`{kind}`: body was not walked",
+            );
+        }
+    }
+
+    #[test]
     fn straight_line_statements_share_one_block() {
         let source = "function f() { a(); b(); c(); }";
         let tree = parse(source);
@@ -482,10 +522,20 @@ mod tests {
         let source = "const f = (x) => x + 1;";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "arrow_function")).unwrap();
-        // The body is a single implicit return, so it is attributed and the entry block
-        // has a way out. Task 7 adds the reachability form of the same claim.
-        assert!(cfg.block_of(find(&tree, "binary_expression")).is_some());
-        assert!(!cfg.block(cfg.entry()).successors.is_empty());
+        // The body is a single implicit return: it is attributed, and the block it
+        // completes in is the one that flows to the exit. Not `!successors.is_empty()` on
+        // the entry — `build` wires `entry -> start` before it looks at the body at all,
+        // so that edge exists for every root whether the body was handled or not.
+        let body = cfg
+            .block_of(find(&tree, "binary_expression"))
+            .expect("the body is walked");
+        let targets: Vec<BlockId> = cfg
+            .block(body)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(targets, vec![cfg.exit()]);
     }
 
     #[test]
@@ -506,6 +556,25 @@ mod tests {
             attributed(&cfg, find(&tree, "return_statement")).contains(&"return_statement"),
             "the `return` inside `with` must be attributed as itself, not folded into an \
              opaque `with_statement`",
+        );
+    }
+
+    #[test]
+    fn a_with_statement_evaluates_its_object() {
+        // `object` is a required field on `with_statement`, and it must be walked: without
+        // that, `with (a && b) { ... }` would silently drop Task 3's short-circuit edges
+        // inside the object expression. A bare identifier or an unsplit `a && b` can't make
+        // that observable yet, though — Task 2's placeholder `expression` is a no-op on
+        // anything that isn't a nested function (its one early return is the only thing it
+        // does), so the object needs a nested function inside it before "walked" versus
+        // "skipped" produces any difference at all.
+        let source = "function f() { with (() => { inner(); }) { return 1; } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let arrow = find(&tree, "arrow_function");
+        assert!(
+            attributed(&cfg, arrow).contains(&"arrow_function"),
+            "the `with` object must be walked, not skipped in favor of the body alone",
         );
     }
 
