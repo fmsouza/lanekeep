@@ -13,8 +13,10 @@
 
 pub mod binding;
 pub mod grammar;
+pub mod obligation;
 
 pub use grammar::grammar_digest;
+pub use obligation::{ObligationAnalyzer, ObligationScope, UnmetObligation};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -70,6 +72,15 @@ pub trait Language: Send + Sync {
     /// placeholder: a rule asking about bindings in such a language gets nothing back
     /// instead of a confidently wrong answer.
     fn resolver(&self) -> Option<Arc<dyn binding::BindingResolver>> {
+        None
+    }
+
+    /// The typestate/obligation analysis for this language, when it has one.
+    ///
+    /// Returns `None` for a language with no obligation analyzer yet, which is honest
+    /// rather than a placeholder: a rule asking about obligations in such a language gets
+    /// nothing back instead of a confidently wrong answer.
+    fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
         None
     }
 
