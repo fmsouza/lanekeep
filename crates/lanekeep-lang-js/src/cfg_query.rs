@@ -32,6 +32,13 @@ impl Cfg<'_> {
     /// is written here.
     #[must_use]
     pub fn on_all_paths_from(&self, from: BlockId, to: BlockId) -> bool {
+        // Redundant with `walk`'s own first line: when `from == to`, `avoid == Some(from)`,
+        // so `walk` immediately hits `Some(from) == avoid` and returns `false`, which this
+        // function negates to `true` — the same answer this early return gives, for every
+        // input. No fixture can distinguish "guard present" from "guard deleted", so this
+        // is not untested code waiting for a test that would catch its removal; there is no
+        // such test. Kept anyway, because the reflexive case should be legible at the call
+        // site rather than emergent two functions away.
         if from == to {
             return true;
         }
