@@ -62,3 +62,102 @@ fn silent_when_released_on_all_paths() {
         .accepts("function f() { const b = acq(); rel(b); }\n")
         .expect("released on the only path");
 }
+
+/// #193's real acceptance rule, `secrets-zeroed-on-all-paths`. Where `RULE` above uses bare
+/// `acq`/`rel` calls to pin the wiring, this exercises a realistic acquire/release shape — a
+/// member-call acquire (`e.getEntropy()`/`e.deriveSeed()`), a two-form release (`.fill(0)`
+/// with a literal zero argument, or a `zeroBytes(...)` helper call) — against the seven
+/// function-scope behaviors the feature's acceptance contract lists.
+///
+/// Namespaced `local/`, not the design doc's own illustrative `pera/`: `RuleTester`'s
+/// generated `lanekeep.config.ts` declares no `namespaces`, and `rule_id::Namespace`'s two
+/// built-ins — `lanekeep` and `local` — are exactly the ones that need no declaring. A
+/// project's real `lanekeep.json` would declare `pera` and use it there; this fixture proves
+/// the CFG/analyzer wiring, which the namespace does not touch.
+const SECRETS: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/secrets-zeroed-on-all-paths',\n\
+      requires: ['dataflow'],\n\
+      obligation: {\n\
+        acquire: ['(call_expression function: (member_expression property: (property_identifier) @m) \
+                    (#any-of? @m \"getEntropy\" \"deriveSeed\")) @acquire'],\n\
+        release: ['(call_expression function: (member_expression property: (property_identifier) @p) \
+                    (#eq? @p \"fill\") arguments: (arguments (number) @z) (#eq? @z \"0\")) @release',\n\
+                  '(call_expression function: (identifier) @f (#eq? @f \"zeroBytes\")) @release'],\n\
+        scope: 'function',\n\
+      },\n\
+      card: { message: 'secret buffer not zeroed on all paths',\n\
+              remediation: 'call .fill(0) or zeroBytes on every path, e.g. in finally',\n\
+              examples: { bad: 'const b = e.getEntropy();',\n\
+                          good: 'const b = e.getEntropy(); try {} finally { b.fill(0); }' } },\n\
+      checkObligation(ctx, u) {\n\
+        ctx.report(u.exit, u.partial ? 'zeroed on some paths, not all' : 'never zeroed');\n\
+      },\n\
+    });\n";
+
+fn secrets() -> RuleTester {
+    RuleTester::new("secrets", SECRETS).expect("builds")
+}
+
+#[test]
+fn happy_path_only_reports_partial() {
+    secrets()
+        .reports_messages(
+            "function f(c) { const b = e.getEntropy(); if (c) { return; } b.fill(0); }\n",
+            &["zeroed on some paths, not all"],
+        )
+        .expect("early return skips the fill");
+}
+
+#[test]
+fn zeroed_in_finally_is_silent() {
+    secrets()
+        .accepts(
+            "function f() { const b = e.getEntropy(); try { use(b); } finally { b.fill(0); } }\n",
+        )
+        .expect("finally is on all paths");
+}
+
+#[test]
+fn zeroed_only_after_throw_reports() {
+    secrets()
+        .reports_messages(
+            "function f(c) { const b = e.getEntropy(); if (c) { throw x; } b.fill(0); }\n",
+            &["zeroed on some paths, not all"],
+        )
+        .expect("the throw path never zeroes");
+}
+
+#[test]
+fn never_zeroed_reports_never() {
+    secrets()
+        .reports_messages(
+            "function f() { const b = e.getEntropy(); }\n",
+            &["never zeroed"],
+        )
+        .expect("no fill anywhere");
+}
+
+#[test]
+fn zeroed_on_both_branches_is_silent() {
+    secrets()
+        .accepts("function f(c) { const b = e.getEntropy(); if (c) { b.fill(0); } else { b.fill(0); } }\n")
+        .expect("both branches discharge");
+}
+
+#[test]
+fn zeroed_in_a_maybe_zero_iteration_loop_reports() {
+    secrets()
+        .reports_messages(
+            "function f(xs) { const b = e.getEntropy(); for (const x of xs) { b.fill(0); } }\n",
+            &["zeroed on some paths, not all"],
+        )
+        .expect("a zero-iteration loop skips the fill");
+}
+
+#[test]
+fn zero_bytes_helper_discharges() {
+    secrets()
+        .accepts("function f() { const b = e.getEntropy(); zeroBytes(b); }\n")
+        .expect("the helper release form counts");
+}
