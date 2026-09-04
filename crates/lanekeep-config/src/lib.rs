@@ -460,9 +460,10 @@ struct RawRule {
 
 /// `obligation` as written — permissive, on the same reasoning as [`RawTimeouts`] and
 /// [`RawSuppressions`]: a malformed value becomes a diagnostic naming the rule and the field
-/// rather than a deserialization error naming a line of generated JSON. Validating its shape —
-/// and refusing it where `checkObligation` disagrees with its presence — is future work; this
-/// phase only carries it through. See #193.
+/// rather than a deserialization error naming a line of generated JSON. Its shape is checked
+/// by [`check_obligation_shape`], called from `build_rule` before [`check_requires`]: that
+/// `checkObligation` agrees with its presence, that `requires` names `dataflow`, and that
+/// `scope` is `"function"` or `"block"`. See #193.
 #[derive(Debug, Deserialize)]
 struct RawObligation {
     #[serde(default)]
@@ -5448,7 +5449,11 @@ mod tests {
         let err = load_rule_source("ob-no-handler", src).expect_err("no checkObligation");
         let text = err.to_string();
         assert!(text.contains("local/x"), "{text}");
-        assert!(text.contains("checkObligation"), "{text}");
+        // Unique to the `(true, false)` arm of `check_obligation_shape`. This fixture also
+        // declares no `check`, so it satisfies the relaxed no-`check` gate's condition too —
+        // asserting only `"checkObligation"` (present in both messages) would pass even if
+        // this arm fell through to that gate instead of firing itself.
+        assert!(text.contains("can never fire"), "{text}");
     }
 
     /// The reverse mistake: a handler with no obligation spec to drive it.
