@@ -98,15 +98,6 @@ impl<'t> Cfg<'t> {
     /// incidental: [`Self::finish`] sorts on `start` with a stable sort, so a tie —
     /// a `program` whose first statement begins at byte 0 — resolves by allocation
     /// order. Allocating them in any other order would silently move them.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
-                  lands it is reachable only from this file's own tests. Remove once \
-                  task 2 calls it."
-        )
-    )]
     pub(crate) fn new_empty(root: Range<usize>) -> Self {
         let mut cfg = Self {
             blocks: Vec::new(),
@@ -120,15 +111,6 @@ impl<'t> Cfg<'t> {
     }
 
     /// A fresh empty block covering from `start`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
-                  lands it is reachable only from this file's own tests. Remove once \
-                  task 2 calls it."
-        )
-    )]
     pub(crate) fn alloc(&mut self, start: usize) -> BlockId {
         self.blocks.push(Block {
             nodes: Vec::new(),
@@ -140,15 +122,6 @@ impl<'t> Cfg<'t> {
     }
 
     /// Add an edge, ignoring an exact duplicate.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
-                  lands it is reachable only from this file's own tests. Remove once \
-                  task 2 calls it."
-        )
-    )]
     pub(crate) fn edge(&mut self, from: BlockId, to: BlockId, kind: EdgeKind, back: bool) {
         let edge = Edge {
             target: to,
@@ -162,15 +135,6 @@ impl<'t> Cfg<'t> {
     }
 
     /// Attribute `node` to `id`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
-                  lands it is reachable only from this file's own tests. Remove once \
-                  task 2 calls it."
-        )
-    )]
     pub(crate) fn attribute(&mut self, id: BlockId, node: Node<'t>) {
         self.blocks[id.0].nodes.push(node);
     }
@@ -180,15 +144,6 @@ impl<'t> Cfg<'t> {
     /// Called once, after construction. Sorting here rather than at each call site is
     /// what makes determinism a property of the type: a consumer iterating `0..n` gets
     /// source order without having to remember to ask for it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
-                  lands it is reachable only from this file's own tests. Remove once \
-                  task 2 calls it."
-        )
-    )]
     pub(crate) fn finish(&mut self) {
         let mut order: Vec<usize> = (0..self.blocks.len()).collect();
         // Allocation order is part of the sort key, not an inherited property of a stable
@@ -316,11 +271,6 @@ pub(crate) mod testing {
     }
 
     /// Parse with the TSX grammar.
-    #[expect(
-        dead_code,
-        reason = "no Task 1 fixture needs JSX; a later task's tests exercise this. Part of \
-                  the test-only surface the task brief names explicitly."
-    )]
     pub(crate) fn parse_tsx(source: &str) -> Tree {
         parse_with(&Tsx, source)
     }

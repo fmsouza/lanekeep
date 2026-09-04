@@ -9,6 +9,7 @@
 
 pub mod binding;
 pub mod cfg;
+mod cfg_build;
 
 pub use cfg::{Block, BlockId, Cfg, Edge, EdgeKind};
 
