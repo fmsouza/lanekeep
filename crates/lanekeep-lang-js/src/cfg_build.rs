@@ -1134,7 +1134,6 @@ mod tests {
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
         let chain = find(&tree, "member_expression");
-        let object = chain.child_by_field_name("object").unwrap();
         let property = chain.child_by_field_name("property").unwrap();
 
         let rest = cfg.block_of(property).unwrap();
@@ -1145,26 +1144,31 @@ mod tests {
             .find(|e| e.kind == EdgeKind::Normal)
             .map(|e| e.target)
             .expect("the rest of the chain rejoins");
+        // Every *occurrence*, not every block: `??` attributes the same chain to this
+        // same join as its left operand, so this pins `attribute`'s duplicate guard too.
         let holding: Vec<BlockId> = cfg
             .blocks()
-            .filter(|(_, block)| block.nodes.iter().any(|n| n.id() == chain.id()))
-            .map(|(id, _)| id)
+            .flat_map(|(id, block)| {
+                block
+                    .nodes
+                    .iter()
+                    .filter(|n| n.id() == chain.id())
+                    .map(move |_| id)
+            })
             .collect();
         assert_eq!(
             holding,
             vec![join],
-            "`a?.b` belongs to its join and to no other block",
+            "`a?.b` is attributed to its join, once, and to no other block",
         );
-
-        // And `block_of` is not the way to ask this, before or after the change. A chain
-        // starts where its base starts, so range containment answers with the *base's*
-        // block — `identifier("a")` is the narrowest attribution over that offset, and it
-        // always outranks the chain's own. Pinned so nobody reads the line above as a
-        // promise `block_of` does not make.
+        // And this is the question a rule asks: where does this expression complete?
+        // `block_of` can answer it only because an exact match outranks containment — a
+        // chain starts where its base starts, so containment alone would answer with the
+        // base's block, which sits on one branch of the join.
         assert_eq!(
             cfg.block_of(chain),
-            cfg.block_of(object),
-            "a chain resolves to its base's block, not to its join",
+            Some(join),
+            "a chain resolves to the block it completes in",
         );
     }
 

@@ -140,9 +140,19 @@ impl<'t> Cfg<'t> {
         }
     }
 
-    /// Attribute `node` to `id`.
+    /// Attribute `node` to `id`, ignoring an exact duplicate.
+    ///
+    /// Symmetric with [`Self::edge`] directly above, and for the same reason. One
+    /// node reaching one block twice is not a caller bug: `cfg_build`'s chain walk
+    /// attributes a chain to its join, and an enclosing `&&`/`||`/`??` attributes that
+    /// same chain, as its left operand, to the block the operand's evaluation returned —
+    /// which is that very join. [`Block::nodes`] is "the AST nodes attributed to this
+    /// block", so a consumer iterating it has to see each of them once.
     pub(crate) fn attribute(&mut self, id: BlockId, node: Node<'t>) {
-        self.blocks[id.0].nodes.push(node);
+        let nodes = &mut self.blocks[id.0].nodes;
+        if !nodes.iter().any(|seen| seen.id() == node.id()) {
+            nodes.push(node);
+        }
     }
 
     /// Renumber every block into source order, then derive the predecessor lists.
@@ -232,11 +242,25 @@ impl<'t> Cfg<'t> {
 
     /// The block `node` belongs to, or `None` when nothing attributed covers it.
     ///
-    /// Among every attribution whose byte range contains `node`'s first byte, the
-    /// **narrowest** wins; ties break to the lowest [`BlockId`]. Innermost-wins is what
-    /// makes this correct given that a split statement is attributed to its own join
-    /// block: a plain containment lookup would answer with the enclosing statement's
-    /// block for every fragment of it.
+    /// Two stages, and their order is the whole point.
+    ///
+    /// **Exact identity first.** If some block was attributed this very node, that block
+    /// is the answer. An exact match is the most precise attribution there can be, so
+    /// preferring it can never make an answer worse — and it is what makes "where does
+    /// this expression complete?" answerable for a construct that branches. `cfg_build`
+    /// attributes an optional chain to its join, the merge point both the short-circuited
+    /// and the completed path reach; containment alone would answer with the block holding
+    /// the chain's *base*, which sits on one branch of it, because a chain starts where its
+    /// base starts and the base's own attribution is narrower.
+    ///
+    /// **Containment second**, for a node nothing attributed directly — a fragment of some
+    /// larger attributed construct. Among every attribution whose byte range contains
+    /// `node`'s first byte, the **narrowest** wins. Innermost-wins is what makes this
+    /// correct given that a split statement is attributed to its own join block: a plain
+    /// containment lookup would answer with the enclosing statement's block for every
+    /// fragment of it.
+    ///
+    /// Ties break to the lowest [`BlockId`] in both stages.
     ///
     /// The `root`-containment check below is a correctness gate: it is what keeps a
     /// node attributed from outside `root` from answering a query for an offset outside
@@ -246,6 +270,12 @@ impl<'t> Cfg<'t> {
         let offset = node.start_byte();
         if !self.root.contains(&offset) {
             return None;
+        }
+        // Blocks are visited in ascending index order, so the first hit is the lowest id.
+        for (index, block) in self.blocks.iter().enumerate() {
+            if block.nodes.iter().any(|seen| seen.id() == node.id()) {
+                return Some(BlockId(index));
+            }
         }
         let mut best: Option<(usize, BlockId)> = None;
         for (index, block) in self.blocks.iter().enumerate() {
@@ -426,6 +456,72 @@ mod tests {
         assert_eq!(
             cfg.block(BlockId(3)).predecessors,
             vec![BlockId(1), BlockId(2)]
+        );
+    }
+
+    #[test]
+    fn attributing_one_node_twice_to_one_block_records_it_once() {
+        // Not a caller bug: `cfg_build` attributes an optional chain to its join, and an
+        // enclosing `??` attributes the same chain, as its left operand, to that same
+        // block. `nodes` is what a consumer iterates, so it has to hold each node once.
+        let source = "a();";
+        let tree = super::testing::parse(source);
+        let call = super::testing::find(&tree, "call_expression");
+        let mut cfg = Cfg::new_empty(0..source.len());
+        let first = cfg.alloc(0);
+        let second = cfg.alloc(1);
+        cfg.attribute(first, call);
+        cfg.attribute(first, call);
+        assert_eq!(cfg.block(first).nodes.len(), 1, "one block, one entry");
+
+        // Per block, like `edge`'s guard — not a global "attribute this node once" rule,
+        // which would silently drop the second block's claim on it.
+        cfg.attribute(second, call);
+        assert_eq!(
+            cfg.block(second).nodes.len(),
+            1,
+            "a different block still records it"
+        );
+    }
+
+    #[test]
+    fn block_of_prefers_an_exact_match_to_a_narrower_container() {
+        // The two stages, with containment pointing the other way. `a.b` and `a` start at
+        // the same byte and `a` is narrower, so containment alone answers with `a`'s block
+        // — which is the wrong answer when `a.b` is itself attributed somewhere, because an
+        // exact match is the most precise attribution there can be. In `cfg_build` this is
+        // an optional chain and its base: the chain completes at its join, the base sits on
+        // one branch of it.
+        let source = "a.b;";
+        let tree = super::testing::parse(source);
+        let member = super::testing::find(&tree, "member_expression");
+        let object = member
+            .child_by_field_name("object")
+            .expect("`a.b` has an object");
+        let property = member
+            .child_by_field_name("property")
+            .expect("`a.b` has a property");
+        let mut cfg = Cfg::new_empty(0..source.len());
+        let narrow = cfg.alloc(0);
+        let wide = cfg.alloc(1);
+        cfg.attribute(narrow, object);
+        cfg.attribute(wide, member);
+
+        assert_eq!(
+            cfg.block_of(member),
+            Some(wide),
+            "an exact match outranks a narrower attribution over the same offset",
+        );
+        assert_eq!(
+            cfg.block_of(object),
+            Some(narrow),
+            "and so does the base's own"
+        );
+        // `b` is attributed nowhere, so the containment fallback answers for it.
+        assert_eq!(
+            cfg.block_of(property),
+            Some(wide),
+            "a node nothing attributed falls back to narrowest containment",
         );
     }
 
