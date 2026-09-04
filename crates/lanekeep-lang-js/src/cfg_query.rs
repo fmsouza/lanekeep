@@ -30,6 +30,16 @@ impl Cfg<'_> {
     /// infinite loop — because there are then no paths for a witness to be found on. That
     /// is the correct must-semantics and it is not what a reader guesses, which is why it
     /// is written here.
+    ///
+    /// **Takes exactly one block.** [`Cfg::blocks_of`] can resolve a construct to more
+    /// than one copy — a `finally` body duplicated once per continuation (`cfg_build.rs`,
+    /// Task 6) is the case that exists today — and each copy sits on only the subset of
+    /// paths that reach the continuation it was built for. Calling this once on a single
+    /// copy answers about that one block, and can answer `false` for **every** copy of a
+    /// construct that genuinely runs on every path, because the copies partition the path
+    /// set and no one of them covers all of it. A caller that needs "is this construct on
+    /// every path" has to check every element of [`Cfg::blocks_of`] and combine the
+    /// results — this method cannot be asked that question directly.
     #[must_use]
     pub fn on_all_paths_from(&self, from: BlockId, to: BlockId) -> bool {
         // Redundant with `walk`'s own first line: when `from == to`, `avoid == Some(from)`,
@@ -69,8 +79,12 @@ impl Cfg<'_> {
                 if Some(target) == avoid || visited[target.index()] {
                     continue;
                 }
-                // Marked on push rather than on pop: a back edge then terminates the walk
-                // instead of re-entering the loop body forever.
+                // Marked on push rather than on pop: once a block is queued, nothing
+                // will queue it again, so no block is ever pushed more than once. The
+                // walk terminates either way — that comes from the visited set existing
+                // at all, not from when it is written — but marking on pop would let a
+                // block sit on the stack multiple times before its first pop, redoing its
+                // successor scan once per duplicate.
                 visited[target.index()] = true;
                 stack.push(target);
             }
@@ -78,10 +92,11 @@ impl Cfg<'_> {
         false
     }
 }
+
 #[cfg(test)]
 mod tests {
-    use crate::cfg::Cfg;
     use crate::cfg::testing::{find, find_all, parse};
+    use crate::cfg::{BlockId, Cfg};
 
     fn build<'t>(tree: &'t tree_sitter::Tree, source: &str) -> Cfg<'t> {
         Cfg::build(source, find(tree, "function_declaration")).expect("a root")
@@ -196,5 +211,87 @@ mod tests {
             cfg.on_all_paths_from(inside, cfg.entry()),
             "with no path to the exit there is no witness, so the answer is vacuously true",
         );
+    }
+
+    #[test]
+    fn a_duplicated_finalizer_is_not_on_all_paths_through_any_one_copy() {
+        // T7-R5: the coordinator's own example for this ruling was
+        // `try { if (a) { return 1; } else { throw x; } } finally { c(); }`, which turns
+        // out to build *one* copy, not two — both branches diverge to the same
+        // continuation (`exit`), and `emit_finally_copy` memoizes on the continuation, so
+        // the second call to `unwind` hits the memo and reuses the first copy. Verified by
+        // instrumenting `Cfg::build` on that exact source before writing this fixture.
+        //
+        // Two continuations need two genuinely different destinations. An `if` with no
+        // `else` gives that: the `throw` leaves through `exit` directly, and falling off
+        // the end of the `if` is *normal completion* of the `try` body, which
+        // `try_statement` unwinds separately to its own `after` block (Task 6's
+        // `the_finally_is_copied_once_per_continuation_not_once_per_exit` already
+        // establishes the same split, with two `return`s standing in for the throw).
+        let source = "function f(a) { try { if (a) { throw x; } } finally { c(); } }";
+        let tree = parse(source);
+        let cfg = build(&tree, source);
+        let copies = cfg.blocks_of(
+            find_all(&tree, "expression_statement")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == "c();")
+                .unwrap(),
+        );
+        assert_eq!(
+            copies.len(),
+            2,
+            "one copy for the throw's continuation, one for normal completion's",
+        );
+
+        // Neither copy alone is on every path: the throw path avoids the
+        // normal-completion copy, and the normal-completion path avoids the throw's copy.
+        for &copy in &copies {
+            assert!(
+                !cfg.on_all_paths_from(cfg.entry(), copy),
+                "block {copy:?} sits on only its own continuation's paths, not on every path",
+            );
+        }
+
+        // What *is* true is a fact about the set: no path avoids every copy at once. This
+        // is the property `on_all_paths_from` cannot express (it takes one block), which
+        // is exactly why `blocks_of` exists — a caller checks this itself, over every
+        // element, rather than being able to ask the query for it directly.
+        assert!(
+            !avoids_every(&cfg, cfg.entry(), cfg.exit(), &copies),
+            "every path must pass through at least one copy of the finalizer",
+        );
+    }
+
+    /// Whether some path from `from` to `to` avoids every block in `avoided`.
+    ///
+    /// A test-only generalization of `walk`'s single-`avoid` case to a set, for asserting
+    /// the property `on_all_paths_from` cannot: that a *group* of blocks together, not any
+    /// one of them, is what sits on every path. Same shape as `walk` — explicit stack,
+    /// visited bitset — for the same reason: no hash container, and no dependence on the
+    /// order edges happened to be added in.
+    fn avoids_every(cfg: &Cfg<'_>, from: BlockId, to: BlockId, avoided: &[BlockId]) -> bool {
+        let mut visited = vec![false; cfg.blocks().count()];
+        let mut stack = vec![from];
+        visited[from.index()] = true;
+        while let Some(id) = stack.pop() {
+            if id == to {
+                return true;
+            }
+            let mut next: Vec<BlockId> = cfg
+                .block(id)
+                .successors
+                .iter()
+                .map(|edge| edge.target)
+                .collect();
+            next.sort_unstable();
+            for target in next {
+                if avoided.contains(&target) || visited[target.index()] {
+                    continue;
+                }
+                visited[target.index()] = true;
+                stack.push(target);
+            }
+        }
+        false
     }
 }

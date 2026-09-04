@@ -244,14 +244,16 @@ impl<'t> Cfg<'t> {
     ///
     /// Two stages, and their order is the whole point.
     ///
-    /// **Exact identity first.** If some block was attributed this very node, that block
-    /// is the answer. An exact match is the most precise attribution there can be, so
-    /// preferring it can never make an answer worse — and it is what makes "where does
-    /// this expression complete?" answerable for a construct that branches. `cfg_build`
-    /// attributes an optional chain to its join, the merge point both the short-circuited
-    /// and the completed path reach; containment alone would answer with the block holding
-    /// the chain's *base*, which sits on one branch of it, because a chain starts where its
-    /// base starts and the base's own attribution is narrower.
+    /// **Exact identity first** — the first (lowest-numbered) element of
+    /// [`Self::blocks_of`], when it is non-empty. If some block was attributed this very
+    /// node, that block is the answer. An exact match is the most precise attribution
+    /// there can be, so preferring it can never make an answer worse — and it is what
+    /// makes "where does this expression complete?" answerable for a construct that
+    /// branches. `cfg_build` attributes an optional chain to its join, the merge point
+    /// both the short-circuited and the completed path reach; containment alone would
+    /// answer with the block holding the chain's *base*, which sits on one branch of it,
+    /// because a chain starts where its base starts and the base's own attribution is
+    /// narrower.
     ///
     /// **Containment second**, for a node nothing attributed directly — a fragment of some
     /// larger attributed construct. Among every attribution whose byte range contains
@@ -265,10 +267,12 @@ impl<'t> Cfg<'t> {
     /// **One node can belong to several blocks.** A `finally` body is emitted once per
     /// distinct continuation, so every node inside one is attributed to each copy — and
     /// the copies are real, separate blocks, which is what keeps "the finalizer is on
-    /// every path out of the `try`" a fact about the edge set. Exact identity then matches
-    /// more than one block and this answers with the lowest-numbered of them: one true
-    /// answer among several, never a merge. A consumer that needs a property to hold of
-    /// *every* copy has to scan [`Self::blocks`] rather than ask here.
+    /// every path out of the `try`" a fact about the edge set. This method then answers
+    /// with the lowest-numbered of them: one true answer among several, never a merge. A
+    /// consumer that needs a property to hold of *every* copy has to check every element
+    /// of [`Self::blocks_of`] instead — [`Cfg::on_all_paths_from`] in particular
+    /// takes a single block and answers about that block alone, which is the wrong
+    /// question for a construct that may be duplicated.
     ///
     /// The `root`-containment check below is a correctness gate: it is what keeps a
     /// node attributed from outside `root` from answering a query for an offset outside
@@ -279,11 +283,8 @@ impl<'t> Cfg<'t> {
         if !self.root.contains(&offset) {
             return None;
         }
-        // Blocks are visited in ascending index order, so the first hit is the lowest id.
-        for (index, block) in self.blocks.iter().enumerate() {
-            if block.nodes.iter().any(|seen| seen.id() == node.id()) {
-                return Some(BlockId(index));
-            }
+        if let Some(&first) = self.blocks_of(node).first() {
+            return Some(first);
         }
         let mut best: Option<(usize, BlockId)> = None;
         for (index, block) in self.blocks.iter().enumerate() {
@@ -299,6 +300,35 @@ impl<'t> Cfg<'t> {
             }
         }
         best.map(|(_, id)| id)
+    }
+
+    /// Every block whose `nodes` attribute `node` by exact identity, ascending by
+    /// [`BlockId`].
+    ///
+    /// [`Self::block_of`] is this list's first element — the right answer for "where does
+    /// this node live," and the wrong one for "does this hold of the node everywhere it
+    /// lives." A `finally` body duplicated once per continuation (`cfg_build`, Task 6)
+    /// attributes each of its nodes to every copy, so a property that must hold of the
+    /// construct as a whole — not merely of whichever copy happens to sort lowest — has to
+    /// be checked against every element here. This is the reason
+    /// [`Cfg::on_all_paths_from`] takes exactly one [`BlockId`]: it cannot answer
+    /// "is this construct on every path," only "is this one block," and a construct that
+    /// resolves to more than one block needs the question asked once per element, with the
+    /// results combined by the caller.
+    ///
+    /// No containment fallback, unlike `block_of`: a node attributed to more than one
+    /// block is always attributed by exact identity (containment can only ever place a
+    /// fragment in the single narrowest enclosing block), so there is nothing for a
+    /// fallback to add here — an empty result means no block attributes `node` exactly,
+    /// full stop.
+    #[must_use = "blocks_of() has no side effect; discarding its result visits nothing"]
+    pub fn blocks_of(&self, node: Node<'_>) -> Vec<BlockId> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.nodes.iter().any(|seen| seen.id() == node.id()))
+            .map(|(index, _)| BlockId(index))
+            .collect()
     }
 }
 
@@ -490,6 +520,54 @@ mod tests {
             1,
             "a different block still records it"
         );
+    }
+
+    #[test]
+    fn blocks_of_lists_every_exact_attribution_ascending() {
+        // `blocks_of` walks `self.blocks` by index, so ascending order falls out of the
+        // iteration itself — asserted here as the list a caller actually gets, not merely
+        // as an implementation detail.
+        let source = "a();";
+        let tree = super::testing::parse(source);
+        let call = super::testing::find(&tree, "call_expression");
+        let mut cfg = Cfg::new_empty(0..source.len());
+        let first = cfg.alloc(0);
+        let second = cfg.alloc(1);
+        // Attributed in reverse of their `BlockId` order, so this cannot pass merely
+        // because `blocks_of` happens to preserve attribution-call order.
+        cfg.attribute(second, call);
+        cfg.attribute(first, call);
+        assert_eq!(cfg.blocks_of(call), vec![first, second]);
+    }
+
+    #[test]
+    fn blocks_of_is_empty_when_nothing_attributes_the_node() {
+        let source = "a();";
+        let tree = super::testing::parse(source);
+        let call = super::testing::find(&tree, "call_expression");
+        let cfg = Cfg::new_empty(0..source.len());
+        assert_eq!(cfg.blocks_of(call), Vec::<BlockId>::new());
+    }
+
+    #[test]
+    fn block_of_is_the_first_element_of_blocks_of() {
+        // Executable form of `block_of`'s own doc comment, not merely a claim in prose:
+        // a caller must be able to trust the two never drift, since `block_of` delegates
+        // to `blocks_of` rather than duplicating its scan.
+        let source = "a();";
+        let tree = super::testing::parse(source);
+        let call = super::testing::find(&tree, "call_expression");
+        let mut cfg = Cfg::new_empty(0..source.len());
+        let first = cfg.alloc(0);
+        let second = cfg.alloc(1);
+        cfg.attribute(second, call);
+        cfg.attribute(first, call);
+        assert_eq!(
+            cfg.block_of(call),
+            cfg.blocks_of(call).first().copied(),
+            "block_of must answer with blocks_of's own first element, not an independent scan",
+        );
+        assert_eq!(cfg.block_of(call), Some(first));
     }
 
     #[test]
