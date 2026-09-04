@@ -8,6 +8,9 @@
 //! Parsing a `.tsx` file with the TypeScript grammar produces errors on valid code.
 
 pub mod binding;
+pub mod cfg;
+
+pub use cfg::{Block, BlockId, Cfg, Edge, EdgeKind};
 
 use std::sync::Arc;
 
