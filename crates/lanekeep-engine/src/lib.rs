@@ -7266,6 +7266,9 @@ export default defineRule({
                 // so every component-backed `RuleSpec` carries an empty list, exactly as
                 // `lanekeep-config`'s `build_rule` produces for one.
                 requires: Vec::new(),
+                // Same reasoning as `requires`: `rule-metadata` has no `obligation` field
+                // either, so `lanekeep-config` never produces one for a component-backed rule.
+                obligation: None,
             }
         }
 

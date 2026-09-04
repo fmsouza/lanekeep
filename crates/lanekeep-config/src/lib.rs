@@ -117,6 +117,30 @@ pub struct RuleSpec {
     /// reaching this point with a non-empty list has had each entry confirmed implemented by
     /// `check_requires`, so the engine can act on it without re-checking.
     pub requires: Vec<Capability>,
+    /// The rule's typestate obligation, if it declared one.
+    ///
+    /// Carried through unvalidated in this phase: whether `obligation` requires `dataflow` in
+    /// `requires`, and whether `checkObligation` is present exactly when `obligation` is, are
+    /// refusals `build_rule` does not yet make. Both land once `dataflow` is implemented and
+    /// there is an engine to hand this to.
+    pub obligation: Option<ObligationSpec>,
+}
+
+/// A rule's typestate obligation, as extracted from its source.
+///
+/// `scope` is kept as the raw string the rule declared — `"function"` or `"block"` — rather
+/// than a `lanekeep-lang` enum, because this crate has no dependency on that crate. Nothing
+/// here confirms it is one of those two values, or that it is even present when a rule also
+/// declares `checkObligation`: that validation, and parsing the string into the analyzer's
+/// own enum, are the engine's job once there is an analyzer to hand it to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObligationSpec {
+    /// Queries whose `@acquire` capture starts an obligation on the captured value.
+    pub acquire: Vec<String>,
+    /// Queries whose `@release` capture discharges it.
+    pub release: Vec<String>,
+    /// `"function"` or `"block"`, as written — see the struct doc for what is not yet checked.
+    pub scope: String,
 }
 
 /// Where a component-backed rule's code is, and what it is configured with.
@@ -425,6 +449,28 @@ struct RawRule {
     requires: Option<serde_json::Value>,
     has_check: bool,
     has_reduce: bool,
+    obligation: Option<RawObligation>,
+    // Not yet read anywhere: nothing in this build relaxes the no-`check` gate for a rule that
+    // only implements `checkObligation`, so there is no consumer for this until something does.
+    #[expect(
+        dead_code,
+        reason = "read once the no-`check` gate accepts an obligation-only rule — see #193"
+    )]
+    has_check_obligation: bool,
+}
+
+/// `obligation` as written — permissive, on the same reasoning as [`RawTimeouts`] and
+/// [`RawSuppressions`]: a malformed value becomes a diagnostic naming the rule and the field
+/// rather than a deserialization error naming a line of generated JSON. Validating its shape —
+/// and refusing it where `checkObligation` disagrees with its presence — is future work; this
+/// phase only carries it through. See #193.
+#[derive(Debug, Deserialize)]
+struct RawObligation {
+    #[serde(default)]
+    acquire: Vec<String>,
+    #[serde(default)]
+    release: Vec<String>,
+    scope: Option<String>,
 }
 
 /// `language: 'tsx'` and `language: ['typescript', 'tsx']` are both ordinary things to write.
@@ -649,6 +695,8 @@ const EXTRACT: &str = r"
                 requires: r?.requires ?? null,
                 has_check: typeof r?.check === 'function',
                 has_reduce: typeof r?.reduce === 'function',
+                obligation: r?.obligation ?? null,
+                has_check_obligation: typeof r?.checkObligation === 'function',
             })),
         });
     })()
@@ -1844,7 +1892,37 @@ fn raw_rule_from(
         requires: None,
         has_check,
         has_reduce,
+        // Same reasoning as `requires` above: `rule-metadata` has no `obligation` field, so a
+        // component rule has nowhere to declare one and none of this is ever anything but the
+        // default.
+        obligation: None,
+        has_check_obligation: false,
     }
+}
+
+/// Resolve a rule's `language` list, and refuse the one shape that would leave it unable to
+/// ever run: an explicit empty list.
+///
+/// Absent `language` defaults to both TypeScript dialects — a rule written for TypeScript is
+/// meant for the TypeScript in the project, and in any React codebase most of that lives in
+/// `.tsx`, which the TypeScript grammar cannot parse. An empty list is not "every language",
+/// it is *no file at all* — a rule runs only on a file whose own language it names — and it is
+/// silent: the rule loads, matches nothing and reports nothing, which is indistinguishable
+/// from the code being clean. The world declares that the host refuses one at load
+/// (`crates/lanekeep-wasm/wit/world.wit`); this is that refusal, and it covers a TypeScript
+/// rule writing `language: []` for the same reason.
+fn resolve_languages(language: Option<RawLanguages>, id: &RuleId) -> Result<Vec<String>, String> {
+    let languages = language.map_or_else(
+        || vec!["typescript".to_owned(), "tsx".to_owned()],
+        RawLanguages::into_vec,
+    );
+    if languages.is_empty() {
+        return Err(format!(
+            "`{id}` names no language — a rule runs only on files whose language it names, so \
+             an empty list means it can never run"
+        ));
+    }
+    Ok(languages)
 }
 
 fn build_rule(
@@ -1922,24 +2000,7 @@ fn build_rule(
         .map_err(|e| fail(format!("`{id}`: {e}")))?
         .unwrap_or(Severity::Error);
 
-    // Both TypeScript dialects by default, because a rule written for TypeScript is meant for
-    // the TypeScript in the project — and in any React codebase most of that lives in `.tsx`,
-    // which the TypeScript grammar cannot parse.
-    let languages = raw.language.map_or_else(
-        || vec!["typescript".to_owned(), "tsx".to_owned()],
-        RawLanguages::into_vec,
-    );
-    // An empty list is not "every language", it is *no file at all* — a rule runs only on a
-    // file whose own language it names — and it is silent: the rule loads, matches nothing and
-    // reports nothing, which is indistinguishable from the code being clean. The world declares
-    // that the host refuses one at load (`crates/lanekeep-wasm/wit/world.wit`); this is that
-    // refusal, and it covers a TypeScript rule writing `language: []` for the same reason.
-    if languages.is_empty() {
-        return Err(fail(format!(
-            "`{id}` names no language — a rule runs only on files whose language it names, so \
-             an empty list means it can never run"
-        )));
-    }
+    let languages = resolve_languages(raw.language, &id).map_err(fail)?;
 
     let queries = match raw.query {
         None => return Err(fail(format!("`{id}` has no `query`"))),
@@ -1989,6 +2050,21 @@ fn build_rule(
         has_reduce: raw.has_reduce,
         component,
         requires,
+        obligation: build_obligation(raw.obligation),
+    })
+}
+
+/// Translate a rule's raw `obligation`, if it declared one, into the config's `ObligationSpec`.
+///
+/// Carried through as written; validating the shape — an absent or invalid `scope`, a
+/// `checkObligation` with no `obligation` or the reverse, `obligation` without `dataflow` in
+/// `requires` — is future work (#193). Defaulting an absent `scope` to `"function"` here is a
+/// placeholder for that refusal, not a considered default.
+fn build_obligation(raw: Option<RawObligation>) -> Option<ObligationSpec> {
+    raw.map(|o| ObligationSpec {
+        acquire: o.acquire,
+        release: o.release,
+        scope: o.scope.unwrap_or_else(|| "function".to_owned()),
     })
 }
 
@@ -5183,6 +5259,110 @@ mod tests {
             ],
         );
         fixture.load_config()
+    }
+
+    /// A rule declaring a typestate `obligation` and `checkObligation`.
+    ///
+    /// Carries both `query` and `check` alongside `obligation`/`checkObligation` — not because
+    /// an obligation-only rule is meant to need a `check`, but because relaxing the no-`check`
+    /// gate for a rule that only implements `checkObligation` is future work (#193), not this
+    /// one. A fixture without `check` would be refused by that earlier gate ("has no `check`
+    /// function") before it ever reached the `dataflow`-not-implemented refusal this test is
+    /// about, which would be red for the wrong reason.
+    fn obligation_rule(id: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               requires: ['dataflow'],\n\
+               query: '(identifier) @id',\n\
+               obligation: {{\n\
+                 acquire: ['(call_expression) @acquire'],\n\
+                 release: ['(call_expression) @release'],\n\
+                 scope: 'function',\n\
+               }},\n\
+               card: {{ message: 'm', remediation: 'r', examples: {{ bad: 'a', good: 'b' }} }},\n\
+               check(ctx, m) {{ ctx.report(m.id); }},\n\
+               checkObligation(ctx, u) {{ ctx.report(u.exit); }},\n\
+             }});\n"
+        )
+    }
+
+    /// `obligation` is parsed off the rule module and reaches `RuleSpec` — proven here by the
+    /// one channel available while `dataflow` is unimplemented: a well-formed obligation rule
+    /// must still be refused, and refused specifically by the capability gate rather than by
+    /// any earlier gate choking on the unfamiliar shape.
+    ///
+    /// `dataflow` is not yet in `IMPLEMENTED` (see #193), so this cannot assert
+    /// `config.rules[0].obligation` directly — the load never reaches `Ok(RuleSpec { .. })`.
+    /// What it can and does assert is that the refusal is the *capability* one
+    /// (`check_requires`), naming `dataflow` and "does not provide" — proving the `obligation`
+    /// and `checkObligation` shape parsed cleanly through `RawRule` deserialization and
+    /// `EXTRACT`'s `JSON.stringify` round trip without upsetting anything ahead of that gate.
+    #[test]
+    fn an_obligation_spec_is_extracted_onto_the_rule() {
+        let fixture = Fixture::new(
+            "obligation-extract",
+            &[
+                ("rule.ts", &obligation_rule("local/zeroed")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let err = fixture
+            .load_config()
+            .expect_err("dataflow is not implemented yet");
+        let text = err.to_string();
+        assert!(text.contains("dataflow"), "{text}");
+        assert!(text.contains("does not provide"), "{text}");
+    }
+
+    /// The obligation's fields — not just its presence — reach `RuleSpec`.
+    ///
+    /// The test above cannot show this: it can only observe a rule that fails to load, and
+    /// `check_requires` refuses `dataflow` from `raw.requires` alone, before `obligation` is
+    /// ever consulted — a rule declaring `obligation` and one silently dropping it fail with
+    /// the identical message. This rule declares no `requires`, so the load succeeds and
+    /// `config.rules[0].obligation` is reachable directly, with a non-default `scope` so a
+    /// build that ignores the declared value and always falls back to `"function"` cannot
+    /// pass by accident.
+    #[test]
+    fn an_obligation_specs_fields_reach_the_rule_spec() {
+        let rule = "import { defineRule } from 'lanekeep';\n\
+             export default defineRule({\n\
+               id: 'local/zeroed',\n\
+               query: '(identifier) @id',\n\
+               obligation: {\n\
+                 acquire: ['(call_expression) @acquire'],\n\
+                 release: ['(call_expression) @release'],\n\
+                 scope: 'block',\n\
+               },\n\
+               card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+               check(ctx, m) { ctx.report(m.id); },\n\
+               checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+             });\n";
+        let fixture = Fixture::new(
+            "obligation-fields",
+            &[
+                ("rule.ts", rule),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let config = fixture
+            .load_config()
+            .expect("no `requires`, so nothing refuses this load");
+        let obligation = config.rules[0]
+            .obligation
+            .as_ref()
+            .expect("`obligation` was declared and must be extracted");
+        assert_eq!(
+            obligation.acquire,
+            vec!["(call_expression) @acquire".to_owned()]
+        );
+        assert_eq!(
+            obligation.release,
+            vec!["(call_expression) @release".to_owned()]
+        );
+        assert_eq!(obligation.scope, "block");
     }
 
     /// A capability name nothing could ever provide is a typo, and only this layer can say so.
