@@ -36,12 +36,14 @@ pub mod binding;
 pub mod cfg;
 mod cfg_build;
 mod cfg_query;
+mod obligation;
 
 pub use cfg::{Block, BlockId, Cfg, Edge, EdgeKind};
 
 use std::sync::Arc;
 
 use lanekeep_lang::binding::BindingResolver;
+use lanekeep_lang::obligation::ObligationAnalyzer;
 use lanekeep_lang::{Language, LanguageId, LanguageRegistry, RegistryError};
 
 use crate::binding::JsBindingResolver;
@@ -52,6 +54,13 @@ use crate::binding::JsBindingResolver;
 /// hold it for the life of a file.
 static RESOLVER: std::sync::LazyLock<Arc<dyn BindingResolver>> =
     std::sync::LazyLock::new(|| Arc::new(JsBindingResolver));
+
+/// The obligation analyzer every language in this crate shares.
+///
+/// Built once rather than per call, same reasoning as [`RESOLVER`]: the analyzer is
+/// stateless, and a host context needs to hold it for the life of a file.
+static OBLIGATION: std::sync::LazyLock<Arc<dyn ObligationAnalyzer>> =
+    std::sync::LazyLock::new(|| Arc::new(obligation::JsObligationAnalyzer));
 
 /// What this crate's analysis *is*, as a digest of every source file that decides an answer.
 ///
@@ -85,6 +94,10 @@ impl Language for TypeScript {
         Some(Arc::clone(&RESOLVER))
     }
 
+    fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
+        Some(Arc::clone(&OBLIGATION))
+    }
+
     fn id(&self) -> LanguageId {
         LanguageId::new("typescript")
     }
@@ -106,6 +119,10 @@ impl Language for TypeScript {
 impl Language for Tsx {
     fn resolver(&self) -> Option<Arc<dyn BindingResolver>> {
         Some(Arc::clone(&RESOLVER))
+    }
+
+    fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
+        Some(Arc::clone(&OBLIGATION))
     }
 
     fn id(&self) -> LanguageId {

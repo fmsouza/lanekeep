@@ -215,8 +215,7 @@ impl<'t> Cfg<'t> {
 /// function-like kinds is defined once (AGENTS.md records `SCOPE_KINDS` drifting when a
 /// second copy was maintained by hand).
 #[must_use]
-#[allow(unreachable_pub, dead_code)]
-pub fn enclosing_cfg_root(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn enclosing_cfg_root(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = Some(node);
     while let Some(n) = current {
         if ROOT_KINDS.contains(&n.kind()) {
@@ -230,8 +229,7 @@ pub fn enclosing_cfg_root(node: Node<'_>) -> Option<Node<'_>> {
 /// The nearest `statement_block` ancestor of `node`, the lexical region `scope: 'block'`
 /// bounds an obligation to.
 #[must_use]
-#[allow(unreachable_pub, dead_code)]
-pub fn enclosing_block(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn enclosing_block(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(n) = current {
         if n.kind() == "statement_block" {
