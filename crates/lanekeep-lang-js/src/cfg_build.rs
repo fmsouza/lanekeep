@@ -333,6 +333,22 @@ mod tests {
             .collect()
     }
 
+    /// The kinds attributed to the block `node` resolves to.
+    ///
+    /// **Assert on this, never on `block_of(node).is_some()`.** `block_of` resolves by
+    /// range containment, so an attribution that is too *wide* — the whole `else_clause`
+    /// instead of the statement inside it, the whole `with_statement` instead of its body
+    /// — still contains the node's start byte and still answers `Some`. Four of this
+    /// task's six mutations survived on exactly that.
+    fn attributed<'a>(cfg: &'a Cfg<'_>, node: tree_sitter::Node<'_>) -> Vec<&'a str> {
+        let id = cfg.block_of(node).expect("the node resolves to a block");
+        cfg.block(id)
+            .nodes
+            .iter()
+            .map(tree_sitter::Node::kind)
+            .collect()
+    }
+
     #[test]
     fn a_function_declaration_is_a_root() {
         let tree = parse("function f() { a(); }");
@@ -379,7 +395,11 @@ mod tests {
     #[test]
     fn an_else_clause_is_unwrapped_to_its_statement() {
         // `alternative` is an `else_clause`, not a statement. Walking it directly drops
-        // the body, which is exactly what this asserts against.
+        // the body, which is exactly what this asserts against. `block_of(call).is_some()`
+        // is not enough: an unwrapped `else_clause` attributes the whole clause (rather
+        // than the statement inside it) to the same block, and that wider attribution
+        // still contains the statement's start byte, so presence alone would pass either
+        // way. Asserting the attributed *kind* is what actually distinguishes them.
         let source = "function f() { if (c) { a(); } else { b(); } }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
@@ -387,8 +407,8 @@ mod tests {
         assert_eq!(calls.len(), 2);
         for call in calls {
             assert!(
-                cfg.block_of(call).is_some(),
-                "`{}` reached no block",
+                attributed(&cfg, call).contains(&"expression_statement"),
+                "`{}` was not attributed as itself",
                 call.kind()
             );
         }
@@ -396,25 +416,34 @@ mod tests {
 
     #[test]
     fn an_else_if_chains_rather_than_nesting_a_clause() {
+        // Same weakness as the test above: `block_of(call).is_some()` would also pass if
+        // an `else if` clause were attributed whole instead of unwrapped, since the call
+        // still falls inside that wider range.
         let source = "function f() { if (a) { x(); } else if (b) { y(); } else { z(); } }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
         for call in find_all(&tree, "expression_statement") {
-            assert!(cfg.block_of(call).is_some());
+            assert!(attributed(&cfg, call).contains(&"expression_statement"));
         }
     }
 
     #[test]
     fn both_arms_returning_leaves_the_join_unreachable() {
-        let source = "function f() { if (c) { return 1; } else { return 2; } }";
+        // Not a predecessor-count check on `join`: `join`'s predecessor list is populated
+        // solely by the two `if let Some(tail) = self.statement(...)` bodies, which are
+        // already gated on whether each arm falls through — `reachable` never touches an
+        // edge itself, it only decides what `if_statement` returns to *its* caller. So a
+        // broken `reachable` (e.g. forced `true` unconditionally) is invisible to `join`'s
+        // predecessors and to everything else in this block: the entire test binary passed
+        // against that mutation. The only place the bookkeeping is externally visible is
+        // whether the *next* statement after the `if` gets walked at all.
+        let source = "function f() { if (c) { return 1; } else { return 2; } after(); }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
-        // Every block after the `if` has no predecessors: nothing falls through to it.
-        let orphans = cfg
-            .blocks()
-            .filter(|(id, b)| b.predecessors.is_empty() && *id != cfg.entry())
-            .count();
-        assert!(orphans >= 1, "the join must be left unreachable");
+        assert!(
+            cfg.block_of(find(&tree, "call_expression")).is_none(),
+            "`after()` is unreachable, so nothing should have walked it",
+        );
     }
 
     #[test]
@@ -427,6 +456,17 @@ mod tests {
         // resolve to the block holding the arrow, not to a block of its own.
         let arrow = find(&tree, "arrow_function");
         assert_eq!(cfg.block_of(inner), cfg.block_of(arrow));
+        // Deleting the early return that stops `expression` at a nested function collapses
+        // the *entire* body into one block, since nothing inside any expression walk is
+        // attributed individually any more — only the enclosing statement is, by
+        // `statement`'s catch-all. Under that collapse `block_of(inner) == block_of(arrow)`
+        // above holds vacuously (everything shares the one block), so it takes asserting
+        // that the arrow itself was attributed to actually require the early return to
+        // have fired.
+        assert!(
+            attributed(&cfg, arrow).contains(&"arrow_function"),
+            "the arrow itself must be attributed, not merely reachable from the same block",
+        );
         assert!(
             !cfg.blocks().any(
                 |(_, b)| b.nodes.iter().any(|n| n.kind() == "statement_block"
@@ -451,15 +491,21 @@ mod tests {
     #[test]
     fn a_with_statement_walks_its_body_as_statements() {
         // Deprecated, and it parses, so omitting it drops every statement inside one.
+        //
+        // Not an edge-to-`exit` assertion: this fixture's `return` is the function's sole
+        // and last statement, so even an opaque, un-unwrapped `with_statement` — attributed
+        // whole, with `return_statement` never walked as a statement at all — still ends up
+        // on a block whose only successor is `exit`, via the ordinary "fell off the end of
+        // the function" edge. That coincidence is exactly what let this test pass with the
+        // `"with_statement"` arm deleted outright. Asserting the attributed *kind* is what
+        // separates "walked as statements" from "walked as one opaque expression".
         let source = "function f(o) { with (o) { return 1; } }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
-        let ret = cfg.block_of(find(&tree, "return_statement")).unwrap();
-        let targets: Vec<BlockId> = cfg.block(ret).successors.iter().map(|e| e.target).collect();
-        assert_eq!(
-            targets,
-            vec![cfg.exit()],
-            "a return inside `with` must reach the exit"
+        assert!(
+            attributed(&cfg, find(&tree, "return_statement")).contains(&"return_statement"),
+            "the `return` inside `with` must be attributed as itself, not folded into an \
+             opaque `with_statement`",
         );
     }
 
