@@ -63,16 +63,20 @@ const POSTFIX_KINDS: &[&str] = &[
     "call_expression",
 ];
 
-/// A `break`/`continue` target.
+/// Statement kinds that are loops, and so can house a labeled `continue`.
 ///
-/// Unconditional `expect`, not `cfg_attr(not(test), ..)`: unlike Task 1's crate-internal
-/// methods, nothing in this file's own test module constructs one either, so the lint
-/// would still fire in a test build if this were gated on `not(test)`.
-#[expect(
-    dead_code,
-    reason = "lanekeep#192 task 4 (loops) is the first construct that pushes one; until \
-              then nothing constructs a `Target`. Remove once task 4 does."
-)]
+/// A label on one of these belongs to the loop's own [`Target`], via `pending_label`, so
+/// the loop can answer a labeled `continue`. A label on anything else gets a break-only
+/// `Target` from `labeled_statement` itself, with `continue_to: None` — an unlabeled
+/// `continue` then passes through it to the enclosing loop.
+const LOOP_KINDS: &[&str] = &[
+    "while_statement",
+    "do_statement",
+    "for_statement",
+    "for_in_statement",
+];
+
+/// A `break`/`continue` target.
 struct Target<'s> {
     /// The label this target answers to, if any.
     label: Option<&'s str>,
@@ -115,19 +119,10 @@ struct Builder<'t, 's> {
     cfg: Cfg<'t>,
     /// Read only by `text`.
     source: &'s str,
-    #[expect(
-        dead_code,
-        reason = "lanekeep#192 task 4 (loops) is the first construct that reads this \
-                  stack; populated from this task so later tasks add no struct churn. \
-                  Remove once task 4 reads it."
-    )]
     targets: Vec<Target<'s>>,
-    #[expect(
-        dead_code,
-        reason = "lanekeep#192 task 6 (try/finally) is the first construct that reads \
-                  this stack; populated from this task so later tasks add no struct \
-                  churn. Remove once task 6 reads it."
-    )]
+    /// Read here only for its length, to stamp `Target::finally_depth`. Empty until Task 6
+    /// pushes to it, so every depth recorded today is `0`; Task 6 is the first to read a
+    /// `Pending` back out of it.
     finallys: Vec<Pending<'t>>,
     #[expect(
         dead_code,
@@ -136,16 +131,12 @@ struct Builder<'t, 's> {
                   Remove once task 6 reads it."
     )]
     handlers: Vec<Handler>,
-    /// A label waiting for the loop it belongs to (Task 4).
+    /// A label waiting for the loop it belongs to.
     ///
     /// A field rather than a parameter: it would otherwise thread through `statement`,
-    /// which every construct calls and none of the others needs.
-    #[expect(
-        dead_code,
-        reason = "lanekeep#192 task 4 (labeled loops) is the first construct that reads \
-                  this field; populated from this task so later tasks add no struct \
-                  churn. Remove once task 4 reads it."
-    )]
+    /// which every construct calls and none of the others needs. Set by
+    /// `labeled_statement` for the one call into the loop that owns it, and read (and
+    /// cleared) by that loop's own constructor.
     pending_label: Option<&'s str>,
 }
 
@@ -264,8 +255,15 @@ impl<'t, 's> Builder<'t, 's> {
                 self.cfg.edge(end, exit, EdgeKind::Normal, false);
                 None
             }
-            // Tasks 3-6 add arms here (throw, break/continue, loops, switch, try/finally).
-            // Everything unlisted is a statement whose only flow is through its own
+            "while_statement" => Some(self.while_statement(node, current)),
+            "do_statement" => self.do_statement(node, current),
+            "for_statement" => Some(self.for_statement(node, current)),
+            "for_in_statement" => Some(self.for_in_statement(node, current)),
+            "labeled_statement" => self.labeled_statement(node, current),
+            "break_statement" => self.jump(node, current, false),
+            "continue_statement" => self.jump(node, current, true),
+            // Task 5 (`switch`) and Task 6 (`try`/`catch`/`finally`, `throw`) add arms
+            // here. Everything unlisted is a statement whose only flow is through its own
             // expressions.
             _ => {
                 let end = self.expression(node, current);
@@ -541,6 +539,226 @@ impl<'t, 's> Builder<'t, 's> {
         }
 
         reachable.then_some(join)
+    }
+
+    /// The block a `break`/`continue` goes to, with the finally depth to unwind first.
+    ///
+    /// Innermost-first. An unlabeled `continue` skips targets that answer only `break` —
+    /// a `switch`, a labeled block — which is why the two are separate searches rather
+    /// than one.
+    fn jump_target(&self, label: Option<&str>, is_continue: bool) -> Option<(BlockId, usize)> {
+        self.targets.iter().rev().find_map(|target| {
+            if label.is_some() && target.label != label {
+                return None;
+            }
+            if is_continue {
+                target.continue_to.map(|to| (to, target.finally_depth))
+            } else {
+                Some((target.break_to, target.finally_depth))
+            }
+        })
+    }
+
+    /// Returning `None` for a `break`/`continue` with no enclosing target is correct: the
+    /// statement is unreachable-from-here either way, and a parse with no target is not
+    /// valid JavaScript.
+    fn jump(&mut self, node: Node<'t>, current: BlockId, is_continue: bool) -> Option<BlockId> {
+        self.cfg.attribute(current, node);
+        let label = node.child_by_field_name("label").map(|n| self.text(n));
+        // Task 6 replaces `to` with `self.unwind(depth, to)`. Until then the depth is
+        // unused and every finally stack is empty.
+        let (to, _depth) = self.jump_target(label, is_continue)?;
+        // A `continue` is a back edge and a `break` is not. Comparing ids here would read
+        // *allocation* order, since `finish` has not renumbered anything yet.
+        self.cfg.edge(current, to, EdgeKind::Normal, is_continue);
+        None
+    }
+
+    /// The common shape: a header that tests, a body, and an exit.
+    ///
+    /// `conditional` is false for `for (;;)`, which has no test and therefore no way to
+    /// fall out. Emitting a `False` edge there would invent a path the program does not
+    /// have — and would make every obligation inside such a loop look dischargeable.
+    /// No constant folding: `while (true)` has a condition, so it keeps both edges.
+    fn loop_statement(
+        &mut self,
+        node: Node<'t>,
+        header: BlockId,
+        continue_to: BlockId,
+        label: Option<&'s str>,
+        conditional: bool,
+    ) -> BlockId {
+        let after = self.cfg.alloc(node.end_byte());
+        let body = node.child_by_field_name("body");
+        let body_entry = self
+            .cfg
+            .alloc(body.map_or(node.end_byte(), |b| b.start_byte()));
+        self.cfg.edge(header, body_entry, EdgeKind::True, false);
+        if conditional {
+            self.cfg.edge(header, after, EdgeKind::False, false);
+        }
+
+        self.targets.push(Target {
+            label,
+            break_to: after,
+            continue_to: Some(continue_to),
+            finally_depth: self.finallys.len(),
+        });
+        let tail = body.and_then(|b| self.statement(b, body_entry));
+        self.targets.pop();
+
+        if let Some(tail) = tail {
+            self.cfg
+                .edge(tail, continue_to, EdgeKind::Normal, continue_to == header);
+        }
+        after
+    }
+
+    /// Never `None`: a `while` always produces its `after` block, whether or not it is
+    /// reachable. Reachability is a fact about `after`'s predecessor count, not about this
+    /// return value — the same "no constant folding" stance `loop_statement` documents.
+    fn while_statement(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
+        let condition = node.child_by_field_name("condition");
+        // Anchored on the condition rather than on the statement, so the header cannot tie
+        // with a block the enclosing construct allocated at the same offset.
+        let header = self
+            .cfg
+            .alloc(condition.map_or(node.start_byte(), |c| c.start_byte()));
+        self.cfg.edge(current, header, EdgeKind::Normal, false);
+        if let Some(condition) = condition {
+            let end = self.expression(condition, header);
+            self.cfg.attribute(end, condition);
+        }
+        let label = self.pending_label.take();
+        self.loop_statement(node, header, header, label, true)
+    }
+
+    fn do_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
+        let body = node.child_by_field_name("body")?;
+        let body_entry = self.cfg.alloc(body.start_byte());
+        self.cfg.edge(current, body_entry, EdgeKind::Normal, false);
+
+        let condition = node.child_by_field_name("condition");
+        let latch = self
+            .cfg
+            .alloc(condition.map_or(node.end_byte(), |c| c.start_byte()));
+        let after = self.cfg.alloc(node.end_byte());
+
+        self.targets.push(Target {
+            label: self.pending_label.take(),
+            break_to: after,
+            continue_to: Some(latch),
+            finally_depth: self.finallys.len(),
+        });
+        let tail = self.statement(body, body_entry);
+        self.targets.pop();
+
+        if let Some(tail) = tail {
+            self.cfg.edge(tail, latch, EdgeKind::Normal, false);
+        }
+        if let Some(condition) = condition {
+            let end = self.expression(condition, latch);
+            self.cfg.attribute(end, condition);
+        }
+        // The one edge that is both a back edge and a true branch, which is why `back` is
+        // a field on `Edge` rather than a variant of `EdgeKind`.
+        self.cfg.edge(latch, body_entry, EdgeKind::True, true);
+        self.cfg.edge(latch, after, EdgeKind::False, false);
+        Some(after)
+    }
+
+    /// `for_statement`'s `condition` and `initializer` fields, unlike `increment`, are
+    /// declared `required` in the grammar — so an omitted clause is not an absent field.
+    /// It is a present `empty_statement` placeholder at the clause's position. Measured
+    /// against `tree-sitter-typescript` 0.23.2: `for (;;)` gives
+    /// `condition = Some(empty_statement)` and `initializer = Some(empty_statement)`, not
+    /// `None`. Trusting `child_by_field_name(..).is_some()` for either would make
+    /// `for (;;)` read as conditional, inventing a `False` edge out of a loop that has no
+    /// way to fall out. `increment` never produces the placeholder — it is genuinely
+    /// optional at the grammar level — so filtering it the same way is a no-op there.
+    fn for_clause(node: Node<'t>, field: &str) -> Option<Node<'t>> {
+        node.child_by_field_name(field)
+            .filter(|clause| clause.kind() != "empty_statement")
+    }
+
+    /// Never `None`, for the same reason as [`Self::while_statement`].
+    fn for_statement(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
+        let mut block = current;
+        if let Some(initializer) = Self::for_clause(node, "initializer") {
+            block = self.expression(initializer, block);
+            self.cfg.attribute(block, initializer);
+        }
+        let condition = Self::for_clause(node, "condition");
+        let header = self
+            .cfg
+            .alloc(condition.map_or(node.end_byte(), |c| c.start_byte()));
+        self.cfg.edge(block, header, EdgeKind::Normal, false);
+        if let Some(condition) = condition {
+            let end = self.expression(condition, header);
+            self.cfg.attribute(end, condition);
+        }
+
+        let increment = Self::for_clause(node, "increment");
+        let increment_entry = self
+            .cfg
+            .alloc(increment.map_or(node.end_byte(), |i| i.start_byte()));
+        if let Some(increment) = increment {
+            let end = self.expression(increment, increment_entry);
+            self.cfg.attribute(end, increment);
+        }
+        // `continue` targets the increment, not the header: skipping it would turn every
+        // `continue` in a counted loop into an infinite loop, and nothing else would say so.
+        self.cfg
+            .edge(increment_entry, header, EdgeKind::Normal, true);
+
+        let label = self.pending_label.take();
+        self.loop_statement(node, header, increment_entry, label, condition.is_some())
+    }
+
+    /// Never `None`, for the same reason as [`Self::while_statement`].
+    fn for_in_statement(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
+        let mut block = current;
+        if let Some(right) = node.child_by_field_name("right") {
+            block = self.expression(right, block);
+            self.cfg.attribute(block, right);
+        }
+        // One kind for `for...in` and `for...of` alike; the `operator` field says which,
+        // and neither the edges nor the blocks differ.
+        let header = self.cfg.alloc(
+            node.child_by_field_name("left")
+                .map_or(node.start_byte(), |l| l.start_byte()),
+        );
+        self.cfg.edge(block, header, EdgeKind::Normal, false);
+        let label = self.pending_label.take();
+        self.loop_statement(node, header, header, label, true)
+    }
+
+    fn labeled_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
+        let label = node.child_by_field_name("label").map(|n| self.text(n));
+        let body = node.child_by_field_name("body")?;
+
+        // A label on a loop belongs to that loop's own target, so the loop can answer a
+        // labeled `continue`. A label on anything else gets a break-only target here.
+        if LOOP_KINDS.contains(&body.kind()) {
+            self.pending_label = label;
+            let tail = self.statement(body, current);
+            self.pending_label = None;
+            return tail;
+        }
+
+        let after = self.cfg.alloc(node.end_byte());
+        self.targets.push(Target {
+            label,
+            break_to: after,
+            continue_to: None,
+            finally_depth: self.finallys.len(),
+        });
+        let tail = self.statement(body, current);
+        self.targets.pop();
+        if let Some(tail) = tail {
+            self.cfg.edge(tail, after, EdgeKind::Normal, false);
+        }
+        Some(after)
     }
 }
 
@@ -1239,5 +1457,196 @@ mod tests {
             "an unsplit chain is attributed whole, with no fragment blocks",
         );
         assert!(!skips(&cfg, cfg.entry(), cfg.exit(), last));
+    }
+
+    fn back_edges(cfg: &Cfg<'_>) -> Vec<(usize, usize)> {
+        cfg.blocks()
+            .flat_map(|(id, b)| {
+                b.successors
+                    .iter()
+                    .filter(|e| e.back)
+                    .map(move |e| (id.index(), e.target.index()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_while_loop_has_a_back_edge_to_its_header() {
+        let source = "function f() { while (c) { a(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let edges = back_edges(&cfg);
+        assert_eq!(edges.len(), 1, "exactly one back edge, got {edges:?}");
+        let (from, to) = edges[0];
+        assert!(
+            to < from,
+            "a back edge must target an earlier block, got {from} -> {to}"
+        );
+    }
+
+    #[test]
+    fn a_do_while_loop_has_a_back_edge_from_its_condition() {
+        let source = "function f() { do { a(); } while (c); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        assert_eq!(back_edges(&cfg).len(), 1);
+    }
+
+    #[test]
+    fn every_loop_form_produces_exactly_one_back_edge() {
+        for source in [
+            "function f() { while (c) { a(); } }",
+            "function f() { do { a(); } while (c); }",
+            "function f() { for (let i = 0; i < n; i++) { a(); } }",
+            "function f() { for (const k in o) { a(); } }",
+            "function f() { for (const v of o) { a(); } }",
+        ] {
+            let tree = parse(source);
+            let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+            assert_eq!(back_edges(&cfg).len(), 1, "in `{source}`");
+        }
+    }
+
+    #[test]
+    fn for_of_and_for_in_are_the_same_node_kind() {
+        // Guards the design's claim rather than trusting it: one construction covers both,
+        // so a change that special-cases `in` would break `of` silently.
+        for source in [
+            "function f() { for (const k in o) { a(); } }",
+            "function f() { for (const v of o) { a(); } }",
+        ] {
+            let tree = parse(source);
+            assert_eq!(find(&tree, "for_in_statement").kind(), "for_in_statement");
+            let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+            // The attributed kind, not `.is_some()`: a too-wide attribution still contains
+            // the node's start byte and answers `Some` against a broken construction.
+            assert!(
+                attributed(&cfg, find(&tree, "expression_statement"))
+                    .contains(&"expression_statement"),
+                "in `{source}`",
+            );
+        }
+    }
+
+    #[test]
+    fn a_conditionless_for_loop_has_no_way_to_fall_through() {
+        // `condition` and `initializer` are declared `required` in `for_statement`'s
+        // grammar, so an omitted clause is not an absent field — `child_by_field_name`
+        // returns a present `empty_statement` placeholder instead of `None`. Measured
+        // against `tree-sitter-typescript` 0.23.2: `for (;;)` gives
+        // `condition = Some(empty_statement)`. Trusting `.is_some()` there would make
+        // `for (;;)` read as conditional and invent a `False` edge out of the header,
+        // letting `after()` look reachable without ever running the loop body.
+        let source = "function f() { for (;;) { a(); } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let body_call = find(&tree, "call_expression");
+        assert!(
+            !skips(&cfg, cfg.entry(), cfg.exit(), body_call),
+            "an unconditional `for` must not be skippable",
+        );
+    }
+
+    #[test]
+    fn continue_in_a_for_targets_the_increment_not_the_header() {
+        let source = "function f() { for (let i = 0; i < n; i++) { continue; } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "continue_statement")).unwrap();
+        let increment = cfg.block_of(find(&tree, "update_expression")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![increment],
+            "continue must reach the increment"
+        );
+    }
+
+    #[test]
+    fn break_leaves_the_loop() {
+        let source = "function f() { while (c) { break; } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "break_statement")).unwrap();
+        let after = cfg
+            .block_of(find_all(&tree, "expression_statement")[0])
+            .unwrap();
+        // Exactly one edge out, and it leaves the loop rather than continuing it.
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(targets.len(), 1, "a break has one way out");
+        assert!(
+            skips(&cfg, jump, after, find(&tree, "while_statement")),
+            "a break must reach the code after the loop without re-entering it",
+        );
+    }
+
+    #[test]
+    fn a_labeled_break_leaves_the_outer_loop() {
+        let source = "\
+function f() {
+  outer: while (a) {
+    while (b) {
+      break outer;
+    }
+    inner();
+  }
+  after();
+}";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "break_statement")).unwrap();
+        let inner = cfg
+            .block_of(find_all(&tree, "expression_statement")[0])
+            .unwrap();
+        // `inner()` is after the inner loop and inside the outer one. A labeled break must
+        // not reach it; an unlabeled one would.
+        assert!(!skips(
+            &cfg,
+            jump,
+            inner,
+            find(&tree, "function_declaration")
+        ));
+    }
+
+    #[test]
+    fn a_labeled_continue_targets_the_outer_header() {
+        let source = "\
+function f() {
+  outer: while (a) {
+    while (b) {
+      continue outer;
+    }
+  }
+}";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "continue_statement")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0] < jump, "must jump backwards to the outer header");
+    }
+
+    #[test]
+    fn a_label_on_a_block_answers_break_but_not_continue() {
+        let source = "function f() { done: { if (c) { break done; } a(); } b(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        assert!(cfg.block_of(find(&tree, "break_statement")).is_some());
+        assert!(back_edges(&cfg).is_empty(), "a labeled block is not a loop");
     }
 }
