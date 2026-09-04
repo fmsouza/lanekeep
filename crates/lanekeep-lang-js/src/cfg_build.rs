@@ -2591,8 +2591,12 @@ function f() {
         let out = |id: BlockId| -> Vec<BlockId> {
             cfg.block(id).successors.iter().map(|e| e.target).collect()
         };
-        assert!(out(a).contains(&d), "case 1 falls through to default");
-        assert!(out(d).contains(&b), "default falls through to case 2");
+        // The whole edge set, not `.contains`: a fallthrough that *also* jumped straight to
+        // after-switch would satisfy a membership check while inventing a path out of the
+        // middle of the chain. This file's own idiom everywhere else is `assert_eq!` against
+        // the full target list, for exactly that reason.
+        assert_eq!(out(a), vec![d], "case 1 falls through to default, only");
+        assert_eq!(out(d), vec![b], "default falls through to case 2, only");
     }
 
     #[test]
@@ -2810,6 +2814,56 @@ function f() {
             copies, 2,
             "expected one copy per continuation, got {copies}"
         );
+    }
+
+    #[test]
+    fn a_catch_that_falls_through_gets_its_own_copy_of_the_finally() {
+        // The commonest `try` shape there is, and no fixture built it: every other
+        // `try`/`catch`/`finally` here ends its body in a `throw` or a `return`, so only one
+        // of the two tails is ever `Some` and the loop that wires them runs once. With both
+        // tails live it runs twice, and each iteration pushes a *fresh* `Pending` — a fresh
+        // memo — so normal completion of the body and normal completion of the `catch` get a
+        // copy each even though both continue to the same `after`. Two copies for one
+        // continuation, which is the documented exception to "once per distinct
+        // continuation" and the one place the memo does not do the sharing.
+        let source = "function f() { try { a(); } catch (e) { b(); } finally { c(); } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+
+        let copies = blocks_with_text(&cfg, source, "c();");
+        assert_eq!(
+            copies.len(),
+            2,
+            "one copy per live tail, not one per continuation, got {}",
+            copies.len()
+        );
+
+        // Not the count alone: which tail reaches which copy. A construction that emitted two
+        // copies but sent both tails into one of them would pass a count assertion while
+        // leaving the other copy with no predecessor at all.
+        let out = |id: BlockId| -> Vec<BlockId> {
+            cfg.block(id).successors.iter().map(|e| e.target).collect()
+        };
+        let body_tail = block_with_text(&cfg, source, "a();");
+        let catch_tail = block_with_text(&cfg, source, "b();");
+        assert_eq!(out(body_tail).len(), 1, "the body tail has one successor");
+        assert_eq!(out(catch_tail).len(), 1, "the catch tail has one successor");
+        assert_ne!(
+            out(body_tail),
+            out(catch_tail),
+            "the two tails must reach different copies; a shared memo would merge them"
+        );
+        assert!(
+            copies.contains(&out(body_tail)[0]) && copies.contains(&out(catch_tail)[0]),
+            "each tail must reach one of the counted copies"
+        );
+
+        // And both copies converge on the code after the `try`, so the duplication adds
+        // blocks without adding a continuation.
+        let after = block_with_text(&cfg, source, "after();");
+        for &copy in &copies {
+            assert_eq!(out(copy), vec![after], "every copy continues to `after`");
+        }
     }
 
     #[test]
