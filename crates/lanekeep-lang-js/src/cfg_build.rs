@@ -832,6 +832,12 @@ impl<'t, 's> Builder<'t, 's> {
     /// can be. Only the former carries a `value`, which is what keeps `default` out of
     /// the test chain — it takes no part in deciding which arm runs, only in *where
     /// control lands* when every test fails.
+    ///
+    /// **Zero `switch_case` arms is a real, distinct shape** — `switch (x) { default: ...
+    /// }`, even `switch (x) {}` — and "every test fails" is vacuously true there: there is
+    /// no *last* failing test to hang `default`'s edge off, because `previous_test` never
+    /// leaves `None`. The discriminant itself has to reach `default` (or, with no
+    /// `default` either, after-switch) directly in that case; see `first` below.
     fn switch_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
         let body = node.child_by_field_name("body")?;
         let mut block = current;
@@ -839,6 +845,10 @@ impl<'t, 's> Builder<'t, 's> {
             block = self.expression(value, block);
             self.cfg.attribute(block, value);
         }
+        // Same reasoning as `if_statement`: without this, `block_of(switch_statement)`
+        // answers `None`, since the node's own start byte (the `switch` keyword) precedes
+        // everything attributed inside it.
+        self.cfg.attribute(block, node);
 
         let mut cursor = body.walk();
         let arms: Vec<Node<'t>> = body.named_children(&mut cursor).collect();
@@ -850,6 +860,15 @@ impl<'t, 's> Builder<'t, 's> {
             .iter()
             .map(|arm| self.cfg.alloc(arm.start_byte()))
             .collect();
+
+        // A `default` need not be last, so it is found by position rather than assumed to
+        // be the chain's tail. Computed before the test chain below: the zero-`switch_case`
+        // shape needs it to route the discriminant directly, since no test ever runs to
+        // hand it off.
+        let default_entry = arms
+            .iter()
+            .position(|arm| arm.kind() == "switch_default")
+            .map(|index| entries[index]);
 
         // The test chain, over the `switch_case` arms only. `switch_default` has no
         // `value` and takes no part in it.
@@ -870,15 +889,15 @@ impl<'t, 's> Builder<'t, 's> {
             previous_test = Some(end);
         }
 
-        self.cfg
-            .edge(block, chain_start.unwrap_or(after), EdgeKind::Normal, false);
+        // Case tests exist: enter the chain. None but a `default` exists: its body always
+        // runs, so the discriminant reaches it directly. Neither (an empty switch body):
+        // nothing to run.
+        let first = chain_start.or(default_entry).unwrap_or(after);
+        self.cfg.edge(block, first, EdgeKind::Normal, false);
 
-        // A `default` need not be last, so it is the *final failing test*'s destination
-        // rather than the chain's tail.
-        let default_entry = arms
-            .iter()
-            .position(|arm| arm.kind() == "switch_default")
-            .map(|index| entries[index]);
+        // The *final* failing test's `False` edge reaches `default` when the switch has
+        // one, and after-switch otherwise. Only fires when there was at least one test to
+        // fail from — the zero-`switch_case` shape is handled by `first` above instead.
         if let Some(last) = previous_test {
             self.cfg
                 .edge(last, default_entry.unwrap_or(after), EdgeKind::False, false);
@@ -2371,6 +2390,65 @@ function f() {
                 attributed(&cfg, statement),
             );
         }
+    }
+
+    #[test]
+    fn an_empty_switch_falls_through_to_after() {
+        // `switch (x) {}`: no arms at all, so `chain_start` and `default_entry` are both
+        // `None` and the discriminant must reach after-switch directly.
+        let source = "function f(x) { switch (x) {} after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let discriminant = cfg.block_of(find(&tree, "switch_statement")).unwrap();
+        let after = cfg.block_of(find(&tree, "expression_statement")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(discriminant)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![after],
+            "an empty switch must fall straight through to the code after it",
+        );
+    }
+
+    #[test]
+    fn a_switch_with_only_a_default_reaches_it() {
+        // The critical case: zero `switch_case` arms, only `default`. The chain loop
+        // `continue`s on every arm (none carries a `value`), so `chain_start` and
+        // `previous_test` both stay `None` — every other fixture in this file has at
+        // least one preceding `case`, which sets `previous_test` and hides this gap.
+        // Without the three-way fallback, the discriminant edges straight to after-switch
+        // and `default`'s entry is left with a fallthrough edge out and no edge in:
+        // unreachable in the graph while always executing at run time.
+        let source = "function f(x) { switch (x) { default: d(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let discriminant = cfg.block_of(find(&tree, "switch_statement")).unwrap();
+        let default_body = cfg
+            .block_of(find(&tree, "switch_default").named_child(0).unwrap())
+            .unwrap();
+        // The outgoing edge from the discriminant's own block, and the incoming
+        // predecessor on `default`'s entry: asserted directly rather than through
+        // `skips`-style reachability, since a redundant path could otherwise mask a
+        // missing edge here exactly as it did in the prior fix round.
+        let targets: Vec<BlockId> = cfg
+            .block(discriminant)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![default_body],
+            "with no case tests, the discriminant must reach default's body directly",
+        );
+        assert!(
+            cfg.block(default_body).predecessors.contains(&discriminant),
+            "default's entry must have the discriminant's block as a predecessor",
+        );
     }
 
     #[test]
