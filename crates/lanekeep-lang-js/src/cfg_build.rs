@@ -1648,5 +1648,19 @@ function f() {
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
         assert!(cfg.block_of(find(&tree, "break_statement")).is_some());
         assert!(back_edges(&cfg).is_empty(), "a labeled block is not a loop");
+        // `block_of(...).is_some()` above cannot see a missing edge: `jump` attributes the
+        // `break` node to its block unconditionally, before `jump_target` is ever
+        // consulted, so presence is guaranteed whether or not an edge was ever added. If
+        // `labeled_statement` failed to push a `Target` for this label at all (treating
+        // every body as a loop, say), `jump_target` would find nothing and `jump` would
+        // add no edge — silently. Assert the edge itself.
+        let jump = cfg.block_of(find(&tree, "break_statement")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(targets.len(), 1, "the break must have exactly one way out");
     }
 }
