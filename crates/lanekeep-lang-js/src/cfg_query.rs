@@ -85,7 +85,7 @@ impl Cfg<'_> {
 
     /// Whether control can reach `to` from `from` without entering any block in `avoid`.
     ///
-    /// The public form of the private [`Self::walk`], for a consumer that needs the witness
+    /// The public form of the private `walk`, for a consumer that needs the witness
     /// path rather than the all-paths verdict — obligation analysis, to name the exit an
     /// undischarged value escapes through.
     #[must_use]
