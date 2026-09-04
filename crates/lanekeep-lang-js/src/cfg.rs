@@ -226,6 +226,19 @@ impl<'t> Cfg<'t> {
     }
 
     /// One block by id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` did not come from **this** graph. A [`BlockId`] is an index into one
+    /// `Cfg`'s own block list and carries no provenance, so an id from another function's
+    /// graph either indexes out of range — a panic — or, worse, addresses an unrelated
+    /// block of the same number. Nothing at the type level distinguishes the two `Cfg`s,
+    /// and `clippy::missing_panics_doc` cannot see a slice index, so this section is the
+    /// only warning there is.
+    ///
+    /// Documented rather than made fallible: this is public API of a published crate, so
+    /// adding the section costs nothing while changing the return type to `Option` would
+    /// be a breaking change. Every query below shares the hazard for the same reason.
     #[must_use]
     pub fn block(&self, id: BlockId) -> &Block<'t> {
         &self.blocks[id.0]

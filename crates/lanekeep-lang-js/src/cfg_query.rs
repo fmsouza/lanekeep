@@ -20,6 +20,12 @@ impl Cfg<'_> {
     /// Whether control can reach `to` from `from`.
     ///
     /// Reflexive: a block reaches itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either id came from another function's graph; see [`Cfg::block`]. The
+    /// walk indexes its visited set by `BlockId`, so an out-of-range id is caught there
+    /// rather than announced.
     #[must_use]
     pub fn reaches(&self, from: BlockId, to: BlockId) -> bool {
         self.walk(from, &[], to)
@@ -50,6 +56,10 @@ impl Cfg<'_> {
     /// carries which paths its copy covers. Ask [`Cfg::on_all_paths_from_any`] instead: it
     /// takes the whole set and deletes it in one walk, which is the only form in which
     /// this question can be put about a duplicated construct.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either id came from another function's graph; see [`Cfg::block`].
     #[must_use]
     pub fn on_all_paths_from(&self, from: BlockId, to: BlockId) -> bool {
         // Redundant with `walk`'s own first line: when `from == to`, `avoid` holds `from`,
@@ -89,6 +99,12 @@ impl Cfg<'_> {
     ///   there.
     /// - An empty `through` is therefore `false` whenever the exit is reachable at all,
     ///   and vacuously `true` when it is not. Nothing is on a path that does not exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from`, or any element of `through`, came from another function's graph;
+    /// see [`Cfg::block`]. A set makes this easier to do by accident than the single form
+    /// does, since the ids arrive as a collection built somewhere else.
     #[must_use]
     pub fn on_all_paths_from_any(&self, from: BlockId, through: &[BlockId]) -> bool {
         !self.walk(from, through, self.exit)
