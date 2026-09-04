@@ -119,10 +119,11 @@ pub struct RuleSpec {
     pub requires: Vec<Capability>,
     /// The rule's typestate obligation, if it declared one.
     ///
-    /// Carried through unvalidated in this phase: whether `obligation` requires `dataflow` in
-    /// `requires`, and whether `checkObligation` is present exactly when `obligation` is, are
-    /// refusals `build_rule` does not yet make. Both land once `dataflow` is implemented and
-    /// there is an engine to hand this to.
+    /// By the time a `RuleSpec` exists, `build_rule` has already refused the shape mistakes:
+    /// `obligation` without `checkObligation` or the reverse, an `obligation` not paired with
+    /// `requires: ['dataflow']`, and a `scope` other than `"function"` or `"block"`. What is
+    /// still ahead is `dataflow` itself — it is not yet in `IMPLEMENTED`, so a well-formed
+    /// obligation rule still fails to load, at the capability gate rather than at this one.
     pub obligation: Option<ObligationSpec>,
 }
 
@@ -450,12 +451,10 @@ struct RawRule {
     has_check: bool,
     has_reduce: bool,
     obligation: Option<RawObligation>,
-    // Not yet read anywhere: nothing in this build relaxes the no-`check` gate for a rule that
-    // only implements `checkObligation`, so there is no consumer for this until something does.
-    #[expect(
-        dead_code,
-        reason = "read once the no-`check` gate accepts an obligation-only rule — see #193"
-    )]
+    /// Whether the rule declared `checkObligation`, on the same reasoning as `has_check`:
+    /// `JSON.stringify` drops functions, so this has to be recorded at extraction time or a
+    /// missing handler and a typo become indistinguishable. Read by `build_rule`'s obligation
+    /// shape refusals and by the relaxed no-`check` gate.
     has_check_obligation: bool,
 }
 
@@ -1925,6 +1924,67 @@ fn resolve_languages(language: Option<RawLanguages>, id: &RuleId) -> Result<Vec<
     Ok(languages)
 }
 
+/// Whether a rule's raw `requires` — still the JSON it was written as — names `dataflow`.
+///
+/// Reads the array by hand rather than after [`check_requires`] has parsed it into
+/// `Vec<Capability>`, because [`check_obligation_shape`] runs *before* that call: a shape
+/// mistake has to be reported precisely even while `dataflow` is still unimplemented, rather
+/// than deferring to whatever `check_requires` would have said. A malformed `requires` (not
+/// an array, or an array of non-strings) is not this function's concern — it answers `false`,
+/// and `check_requires` is what refuses the shape itself, later.
+fn has_dataflow(requires: &serde_json::Value) -> bool {
+    requires
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(|e| e.as_str() == Some("dataflow")))
+}
+
+/// Refuse a rule whose `obligation`/`checkObligation` pair does not hang together.
+///
+/// Three mistakes, in the order they are found: `obligation` declared with no
+/// `checkObligation` to fire it, `checkObligation` declared with no `obligation` to drive it,
+/// and — once both are present — an `obligation` not paired with `requires: ['dataflow']` or
+/// carrying a `scope` other than `"function"` or `"block"`.
+///
+/// Takes the individual fields rather than `&RawRule`, on the same terms as
+/// [`check_requires`]: by the time this runs, `build_rule` has already moved `raw.id` out to
+/// parse it, so `raw` can no longer be borrowed whole.
+///
+/// Called from [`build_rule`] *before* [`check_requires`], so a shape mistake is reported on
+/// its own terms even while `dataflow` is unimplemented: `check_requires` would otherwise
+/// refuse `requires: ['dataflow']` first, with a message that names neither `obligation` nor
+/// `checkObligation`. See #193.
+fn check_obligation_shape(
+    obligation: Option<&RawObligation>,
+    has_check_obligation: bool,
+    requires: Option<&serde_json::Value>,
+    id: &RuleId,
+) -> Result<(), String> {
+    match (obligation.is_some(), has_check_obligation) {
+        (true, false) => Err(format!(
+            "`{id}` declares `obligation` but no `checkObligation` — it can never fire"
+        )),
+        (false, true) => Err(format!(
+            "`{id}` declares `checkObligation` but no `obligation` — nothing drives it"
+        )),
+        (true, true) => {
+            if !requires.is_some_and(has_dataflow) {
+                return Err(format!(
+                    "`{id}` declares `obligation` but does not `requires: ['dataflow']` — \
+                     the capability must be visible in the rule's header"
+                ));
+            }
+            match obligation.and_then(|o| o.scope.as_deref()) {
+                Some(scope) if scope != "function" && scope != "block" => Err(format!(
+                    "`{id}` has an obligation `scope` of `{scope}` — it must be \
+                     `function` or `block`"
+                )),
+                _ => Ok(()),
+            }
+        }
+        (false, false) => Ok(()),
+    }
+}
+
 fn build_rule(
     raw: RawRule,
     position: usize,
@@ -1962,12 +2022,25 @@ fn build_rule(
         )));
     }
 
+    // Obligation shape is validated before the capability gate, so these mistakes are
+    // reported precisely even while `dataflow` is still unimplemented. See #193.
+    check_obligation_shape(
+        raw.obligation.as_ref(),
+        raw.has_check_obligation,
+        raw.requires.as_ref(),
+        &id,
+    )
+    .map_err(fail)?;
+
     // The check that JSON extraction exists to make possible. A rule whose handler is
     // missing or misspelled would otherwise load cleanly and never report, which is
-    // indistinguishable from the code being fine.
-    if !raw.has_check {
+    // indistinguishable from the code being fine. Either handler satisfies it now: an
+    // obligation-only rule has no `check`, and the obligation-shape match above has already
+    // confirmed a `checkObligation` never stands alone without an `obligation` to drive it.
+    if !raw.has_check && !raw.has_check_obligation {
         return Err(fail(format!(
-            "`{id}` has no `check` function — a rule without one can never report anything"
+            "`{id}` has no `check` or `checkObligation` — a rule without a handler can \
+             never report anything"
         )));
     }
 
@@ -2056,10 +2129,10 @@ fn build_rule(
 
 /// Translate a rule's raw `obligation`, if it declared one, into the config's `ObligationSpec`.
 ///
-/// Carried through as written; validating the shape — an absent or invalid `scope`, a
-/// `checkObligation` with no `obligation` or the reverse, `obligation` without `dataflow` in
-/// `requires` — is future work (#193). Defaulting an absent `scope` to `"function"` here is a
-/// placeholder for that refusal, not a considered default.
+/// The shape is validated before this ever runs: `build_rule` refuses an
+/// `obligation`/`checkObligation` mismatch, a missing `requires: ['dataflow']` and an unknown
+/// `scope`, all ahead of `check_requires`. So an invalid `scope` never reaches here — only an
+/// absent one can, and `"function"` is its default.
 fn build_obligation(raw: Option<RawObligation>) -> Option<ObligationSpec> {
     raw.map(|o| ObligationSpec {
         acquire: o.acquire,
@@ -5263,12 +5336,11 @@ mod tests {
 
     /// A rule declaring a typestate `obligation` and `checkObligation`.
     ///
-    /// Carries both `query` and `check` alongside `obligation`/`checkObligation` — not because
-    /// an obligation-only rule is meant to need a `check`, but because relaxing the no-`check`
-    /// gate for a rule that only implements `checkObligation` is future work (#193), not this
-    /// one. A fixture without `check` would be refused by that earlier gate ("has no `check`
-    /// function") before it ever reached the `dataflow`-not-implemented refusal this test is
-    /// about, which would be red for the wrong reason.
+    /// Carries `check` alongside `obligation`/`checkObligation` even though the no-`check` gate
+    /// now accepts an obligation-only rule: this fixture is for the tests below that need the
+    /// load to fail specifically at the `dataflow`-not-implemented refusal, and keeping `check`
+    /// here means it stays unaffected by whichever obligation-shape or handler-presence gate
+    /// `build_rule` happens to check first.
     fn obligation_rule(id: &str) -> String {
         format!(
             "import {{ defineRule }} from 'lanekeep';\n\
@@ -5318,42 +5390,24 @@ mod tests {
 
     /// The obligation's fields — not just its presence — reach `RuleSpec`.
     ///
-    /// The test above cannot show this: it can only observe a rule that fails to load, and
-    /// `check_requires` refuses `dataflow` from `raw.requires` alone, before `obligation` is
-    /// ever consulted — a rule declaring `obligation` and one silently dropping it fail with
-    /// the identical message. This rule declares no `requires`, so the load succeeds and
-    /// `config.rules[0].obligation` is reachable directly, with a non-default `scope` so a
-    /// build that ignores the declared value and always falls back to `"function"` cannot
-    /// pass by accident.
+    /// This used to prove it through a full `Fixture::load_config()`, reachable by declaring
+    /// no `requires` at all — the one gap the obligation-shape refusals added by #193 did not
+    /// yet exist to close. They close it now: `obligation` without `requires: ['dataflow']` is
+    /// refused ahead of `check_requires`, so *every* rule declaring `obligation` fails to load
+    /// while `dataflow` remains unimplemented, whichever of its fields are wired through
+    /// correctly — `an_obligation_spec_is_extracted_onto_the_rule`, above, is what the full
+    /// pipeline can still show. The fields themselves are provable now only by calling
+    /// `build_obligation` directly, the function `build_rule` calls once the shape has already
+    /// passed — with a non-default `scope` so a build that ignores the declared value and
+    /// always falls back to `"function"` cannot pass by accident.
     #[test]
     fn an_obligation_specs_fields_reach_the_rule_spec() {
-        let rule = "import { defineRule } from 'lanekeep';\n\
-             export default defineRule({\n\
-               id: 'local/zeroed',\n\
-               query: '(identifier) @id',\n\
-               obligation: {\n\
-                 acquire: ['(call_expression) @acquire'],\n\
-                 release: ['(call_expression) @release'],\n\
-                 scope: 'block',\n\
-               },\n\
-               card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
-               check(ctx, m) { ctx.report(m.id); },\n\
-               checkObligation(ctx, u) { ctx.report(u.exit); },\n\
-             });\n";
-        let fixture = Fixture::new(
-            "obligation-fields",
-            &[
-                ("rule.ts", rule),
-                ("lanekeep.config.ts", &config_with("rules: [rule]")),
-            ],
-        );
-        let config = fixture
-            .load_config()
-            .expect("no `requires`, so nothing refuses this load");
-        let obligation = config.rules[0]
-            .obligation
-            .as_ref()
-            .expect("`obligation` was declared and must be extracted");
+        let raw = RawObligation {
+            acquire: vec!["(call_expression) @acquire".to_owned()],
+            release: vec!["(call_expression) @release".to_owned()],
+            scope: Some("block".to_owned()),
+        };
+        let obligation = build_obligation(Some(raw)).expect("`Some` in, `Some` out");
         assert_eq!(
             obligation.acquire,
             vec!["(call_expression) @acquire".to_owned()]
@@ -5363,6 +5417,93 @@ mod tests {
             vec!["(call_expression) @release".to_owned()]
         );
         assert_eq!(obligation.scope, "block");
+    }
+
+    /// Load a config whose single rule is exactly `rule_src`, and return what happened.
+    ///
+    /// For the obligation-shape refusals below, which each need a rule spliced with one
+    /// specific mistake rather than the fixed shape [`rule_requiring`] produces.
+    fn load_rule_source(name: &str, rule_src: &str) -> Result<Config, ConfigError> {
+        Fixture::new(
+            name,
+            &[
+                ("rule.ts", rule_src),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        )
+        .load_config()
+    }
+
+    /// `obligation` with no `checkObligation` can never fire — nothing ever calls it — and
+    /// that is worth refusing at load rather than leaving as a rule that silently never
+    /// reports through its obligation half.
+    #[test]
+    fn obligation_without_check_obligation_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x) @acquire'], release: ['(y) @release'], scope: 'function' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+            });\n";
+        let err = load_rule_source("ob-no-handler", src).expect_err("no checkObligation");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
+        assert!(text.contains("checkObligation"), "{text}");
+    }
+
+    /// The reverse mistake: a handler with no obligation spec to drive it.
+    #[test]
+    fn check_obligation_without_obligation_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("handler-no-ob", src).expect_err("no obligation spec");
+        assert!(err.to_string().contains("obligation"), "{}", err);
+    }
+
+    /// The capability an obligation rests on has to be visible in the rule's own header, not
+    /// only implied by the presence of `obligation` — the same reasoning `requires` exists for
+    /// generally, applied to the one field that always needs `dataflow` specifically.
+    ///
+    /// This refusal has to fire before `check_requires` gets a chance to speak for a *missing*
+    /// `requires` at all: an absent `requires` is not a refusal on its own, so without the
+    /// obligation-specific check this fixture would load — or fail with an unrelated message —
+    /// rather than naming the real mistake.
+    #[test]
+    fn obligation_without_dataflow_requirement_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x',\n\
+              obligation: { acquire: ['(x) @acquire'], release: ['(y) @release'], scope: 'function' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-no-requires", src).expect_err("missing requires dataflow");
+        assert!(err.to_string().contains("dataflow"), "{}", err);
+    }
+
+    /// `scope` is not free text — the analyzer only ever tracks an obligation across a
+    /// `function` or a `block` — so an unknown value is refused by name rather than reaching
+    /// an engine that has no case for it.
+    #[test]
+    fn an_unknown_obligation_scope_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x) @acquire'], release: ['(y) @release'], scope: 'loop' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-bad-scope", src).expect_err("bad scope");
+        let text = err.to_string();
+        assert!(text.contains("scope"), "{text}");
+        assert!(
+            text.contains("function") && text.contains("block"),
+            "{text}"
+        );
     }
 
     /// A capability name nothing could ever provide is a typo, and only this layer can say so.
