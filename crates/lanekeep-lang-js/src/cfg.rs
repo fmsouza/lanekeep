@@ -91,19 +91,6 @@ pub struct Cfg<'t> {
     pub(crate) root: Range<usize>,
 }
 
-// `cfg_attr`, not a bare `expect`: under `--cfg test` these five are called from `mod
-// tests` below, so the lint does not fire there and a bare `expect` would itself warn as
-// unfulfilled. Only the non-test build has nothing calling them yet.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "`new_empty`, `alloc`, `edge`, `attribute` and `finish` are the \
-                  construction API `Cfg::build` (lanekeep#192 task 2) is written against; \
-                  until it lands they are reachable only from this file's own tests. Remove \
-                  once task 2 calls them."
-    )
-)]
 impl<'t> Cfg<'t> {
     /// A graph over `root` holding only its synthetic entry and exit.
     ///
@@ -111,6 +98,15 @@ impl<'t> Cfg<'t> {
     /// incidental: [`Self::finish`] sorts on `start` with a stable sort, so a tie —
     /// a `program` whose first statement begins at byte 0 — resolves by allocation
     /// order. Allocating them in any other order would silently move them.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
+                  lands it is reachable only from this file's own tests. Remove once \
+                  task 2 calls it."
+        )
+    )]
     pub(crate) fn new_empty(root: Range<usize>) -> Self {
         let mut cfg = Self {
             blocks: Vec::new(),
@@ -124,6 +120,15 @@ impl<'t> Cfg<'t> {
     }
 
     /// A fresh empty block covering from `start`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
+                  lands it is reachable only from this file's own tests. Remove once \
+                  task 2 calls it."
+        )
+    )]
     pub(crate) fn alloc(&mut self, start: usize) -> BlockId {
         self.blocks.push(Block {
             nodes: Vec::new(),
@@ -135,6 +140,15 @@ impl<'t> Cfg<'t> {
     }
 
     /// Add an edge, ignoring an exact duplicate.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
+                  lands it is reachable only from this file's own tests. Remove once \
+                  task 2 calls it."
+        )
+    )]
     pub(crate) fn edge(&mut self, from: BlockId, to: BlockId, kind: EdgeKind, back: bool) {
         let edge = Edge {
             target: to,
@@ -148,6 +162,15 @@ impl<'t> Cfg<'t> {
     }
 
     /// Attribute `node` to `id`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
+                  lands it is reachable only from this file's own tests. Remove once \
+                  task 2 calls it."
+        )
+    )]
     pub(crate) fn attribute(&mut self, id: BlockId, node: Node<'t>) {
         self.blocks[id.0].nodes.push(node);
     }
@@ -157,6 +180,15 @@ impl<'t> Cfg<'t> {
     /// Called once, after construction. Sorting here rather than at each call site is
     /// what makes determinism a property of the type: a consumer iterating `0..n` gets
     /// source order without having to remember to ask for it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "`Cfg::build` (lanekeep#192 task 2) is written against this; until it \
+                  lands it is reachable only from this file's own tests. Remove once \
+                  task 2 calls it."
+        )
+    )]
     pub(crate) fn finish(&mut self) {
         let mut order: Vec<usize> = (0..self.blocks.len()).collect();
         // Allocation order is part of the sort key, not an inherited property of a stable
@@ -229,6 +261,7 @@ impl<'t> Cfg<'t> {
     }
 
     /// Every block, in source position order.
+    #[must_use = "blocks() has no side effect; discarding its result visits nothing"]
     pub fn blocks(&self) -> impl Iterator<Item = (BlockId, &Block<'t>)> {
         self.blocks
             .iter()
@@ -244,14 +277,9 @@ impl<'t> Cfg<'t> {
     /// block: a plain containment lookup would answer with the enclosing statement's
     /// block for every fragment of it.
     ///
-    /// The `root`-containment check below is an early-out, not a correctness gate.
-    /// `attribute` is crate-internal, and every caller in this crate only ever attributes
-    /// a node drawn from within `root` — so no attributed range can contain an offset
-    /// outside it, and the loop that follows would already answer `None` on its own. The
-    /// check earns its place anyway (one comparison against walking every block for
-    /// nothing), but no mutation of it is observable while that invariant holds. It
-    /// becomes load-bearing, rather than merely cheap, the moment a caller attributes a
-    /// node from outside `root`.
+    /// The `root`-containment check below is a correctness gate: it is what keeps a
+    /// node attributed from outside `root` from answering a query for an offset outside
+    /// it.
     #[must_use]
     pub fn block_of(&self, node: Node<'_>) -> Option<BlockId> {
         let offset = node.start_byte();
@@ -420,6 +448,32 @@ mod tests {
     }
 
     #[test]
+    fn a_block_with_two_predecessors_lists_them_ascending() {
+        // Nothing else in this file builds a block with more than one predecessor, so
+        // `Block::predecessors`'s documented "ascending" order has never been exercised.
+        let mut cfg = Cfg::new_empty(0..100);
+        let entry = cfg.entry();
+        let exit = cfg.exit();
+        let a = cfg.alloc(10);
+        let b = cfg.alloc(20);
+        let join = cfg.alloc(30);
+        cfg.edge(entry, a, EdgeKind::Normal, false);
+        cfg.edge(entry, b, EdgeKind::Normal, false);
+        // Added in the order b-then-a, the reverse of their eventual ascending ids, so
+        // this cannot pass merely because predecessors happen to record insertion order.
+        cfg.edge(b, join, EdgeKind::Normal, false);
+        cfg.edge(a, join, EdgeKind::Normal, false);
+        cfg.edge(join, exit, EdgeKind::Normal, false);
+        cfg.finish();
+
+        // a(10) renumbers to id 1, b(20) to id 2, join(30) to id 3.
+        assert_eq!(
+            cfg.block(BlockId(3)).predecessors,
+            vec![BlockId(1), BlockId(2)]
+        );
+    }
+
+    #[test]
     fn the_back_flag_survives_renumbering() {
         let cfg = out_of_order();
         let back: Vec<bool> = cfg
@@ -470,7 +524,14 @@ mod tests {
         let tree = super::testing::parse("const a = 1;\nfunction f() {}");
         let function = super::testing::find(&tree, "function_declaration");
         let outside = super::testing::find(&tree, "lexical_declaration");
-        let cfg = Cfg::new_empty(function.byte_range());
+        let mut cfg = Cfg::new_empty(function.byte_range());
+        // Load-bearing. With nothing attributed, every block's `nodes` is empty and the
+        // containment loop below has nothing to match regardless of the guard, so this
+        // test would pass whether or not the guard runs. Attributing `outside` gives the
+        // loop a range that trivially contains its own start byte — the guard is then
+        // the only thing standing between that and a wrong `Some`.
+        cfg.attribute(cfg.entry(), outside);
+        cfg.finish();
         assert_eq!(cfg.block_of(outside), None);
     }
 
