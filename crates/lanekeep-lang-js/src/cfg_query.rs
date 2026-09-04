@@ -23,9 +23,10 @@ impl Cfg<'_> {
     ///
     /// # Panics
     ///
-    /// Panics if either id came from another function's graph; see [`Cfg::block`]. The
-    /// walk indexes its visited set by `BlockId`, so an out-of-range id is caught there
-    /// rather than announced.
+    /// Panics if `from` came from another function's graph and is out of range here; see
+    /// [`Cfg::block`]. The walk indexes its visited set by `from`, and by nothing else —
+    /// `to` is only ever compared, so a foreign `to` answers `false` rather than panicking,
+    /// which is the quieter and worse of the two failures.
     #[must_use]
     pub fn reaches(&self, from: BlockId, to: BlockId) -> bool {
         self.walk(from, &[], to)
@@ -59,7 +60,10 @@ impl Cfg<'_> {
     ///
     /// # Panics
     ///
-    /// Panics if either id came from another function's graph; see [`Cfg::block`].
+    /// Panics if `from` came from another function's graph and is out of range here; see
+    /// [`Cfg::block`]. `to` is only ever compared, never indexed, so a foreign one is not
+    /// caught at all: it deletes no block, and the answer comes back as though nothing had
+    /// been asked about.
     #[must_use]
     pub fn on_all_paths_from(&self, from: BlockId, to: BlockId) -> bool {
         // Redundant with `walk`'s own first line: when `from == to`, `avoid` holds `from`,
@@ -102,9 +106,11 @@ impl Cfg<'_> {
     ///
     /// # Panics
     ///
-    /// Panics if `from`, or any element of `through`, came from another function's graph;
-    /// see [`Cfg::block`]. A set makes this easier to do by accident than the single form
-    /// does, since the ids arrive as a collection built somewhere else.
+    /// Panics if `from` came from another function's graph and is out of range here; see
+    /// [`Cfg::block`]. Elements of `through` are only ever compared, so foreign ones delete
+    /// nothing and this answers `false` for a construct that is on every path — a set makes
+    /// that easier to do by accident than the single form does, since the ids arrive as a
+    /// collection built somewhere else.
     #[must_use]
     pub fn on_all_paths_from_any(&self, from: BlockId, through: &[BlockId]) -> bool {
         !self.walk(from, through, self.exit)
