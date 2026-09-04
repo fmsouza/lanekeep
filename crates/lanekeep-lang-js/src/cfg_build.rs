@@ -2787,6 +2787,11 @@ function f() {
 
     #[test]
     fn a_throw_reaches_its_catch() {
+        // Not `skips(..., find(&tree, "function_declaration"))`: the function root is
+        // attributed nowhere, so `block_of` answers `None`, the ban is a no-op, and
+        // `skips` degrades to plain reachability — weakening this to "some route exists"
+        // rather than pinning the throw's own edge. Assert the successor directly
+        // instead, as `a_throw_enters_the_catch_before_the_finally` below already does.
         let source = "function f() { try { throw e; } catch (x) { h(); } }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
@@ -2799,9 +2804,16 @@ function f() {
             .collect();
         assert_eq!(kinds, vec![EdgeKind::Exception]);
         let handler = block_with_text(&cfg, source, "h();");
-        assert!(
-            skips(&cfg, thrown, handler, find(&tree, "function_declaration")),
-            "the throw must reach the catch body",
+        let targets: Vec<BlockId> = cfg
+            .block(thrown)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![handler],
+            "the throw must reach the catch body"
         );
     }
 
