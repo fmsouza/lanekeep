@@ -1809,6 +1809,14 @@ function f() {
         // — body versus `after` — must come from that join instead, where the *whole*
         // condition's evaluation completes. Wiring them from `header` too would give it
         // two edges per label, indistinguishable from each other.
+        //
+        // Direction, not membership: collecting kinds and targets into two separate,
+        // unpaired vectors and asserting `.contains` on each — as an earlier draft of this
+        // test did — passes even if the loop's own True/False are swapped at the join (a
+        // loop that runs while its condition is *false*), since `join_kinds` is still
+        // `[True, False]` in some order and `header_targets.contains(&join)` is unaffected
+        // either way. `and_labels_true_toward_the_right_operand`, above, carries the same
+        // lesson for `split`'s own edges.
         let source = "function f() { while (a && b) { break; } after(); }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
@@ -1822,6 +1830,10 @@ function f() {
         // `while_statement`'s own node is attributed to the join (Task 4's own-node
         // attribution fix, combined with this fix's routing of the loop's edges there).
         let join = cfg.block_of(find(&tree, "while_statement")).unwrap();
+        let body_entry = cfg.block_of(find(&tree, "break_statement")).unwrap();
+        let after = cfg
+            .block_of(find_all(&tree, "expression_statement")[0])
+            .unwrap();
         assert_ne!(
             header, join,
             "a compound condition's header and join must differ"
@@ -1838,25 +1850,29 @@ function f() {
             2,
             "header must carry only the condition's own edges, got {header_kinds:?}",
         );
-        let header_targets: Vec<BlockId> = cfg
-            .block(header)
-            .successors
-            .iter()
-            .map(|e| e.target)
-            .collect();
-        assert!(
-            header_targets.contains(&join),
+
+        let to = |from: BlockId, kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(from)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(header, EdgeKind::False),
+            vec![join],
             "header's False edge must reach the join"
         );
-
-        let join_kinds: Vec<EdgeKind> = cfg.block(join).successors.iter().map(|e| e.kind).collect();
-        assert!(
-            join_kinds.contains(&EdgeKind::True),
-            "the loop's True edge must leave the join"
+        assert_eq!(
+            to(join, EdgeKind::True),
+            vec![body_entry],
+            "the join's True edge must enter the body"
         );
-        assert!(
-            join_kinds.contains(&EdgeKind::False),
-            "the loop's False edge must leave the join"
+        assert_eq!(
+            to(join, EdgeKind::False),
+            vec![after],
+            "the join's False edge must reach the code after the loop"
         );
     }
 
@@ -1923,6 +1939,103 @@ function f() {
             edges[0].0,
             join.index(),
             "the back edge must leave the join, where the whole condition's evaluation completes, not the latch",
+        );
+    }
+
+    #[test]
+    fn a_compound_for_condition_puts_the_loops_edges_on_the_join_not_the_header() {
+        // Same property as the `while` case, for `for`'s own condition. Every other `for`
+        // fixture in this file has a non-branching condition, so `test == header` there
+        // trivially — a wiring bug specific to `for_statement` (swapping `test` and
+        // `increment_entry` at the `loop_statement` call site, or passing `header` where
+        // `test` belongs) would pass every one of them, and every other test in the file,
+        // silently.
+        let source = "function f() { for (let i = 0; a && b; i++) { c(); } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        let header = cfg.block_of(ident("a")).unwrap();
+        let join = cfg.block_of(find(&tree, "for_statement")).unwrap();
+        let statements = find_all(&tree, "expression_statement");
+        let body_entry = cfg.block_of(statements[0]).unwrap();
+        let after = cfg.block_of(statements[1]).unwrap();
+        assert_ne!(
+            header, join,
+            "a compound condition's header and join must differ"
+        );
+
+        let header_kinds: Vec<EdgeKind> = cfg
+            .block(header)
+            .successors
+            .iter()
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            header_kinds.len(),
+            2,
+            "header must carry only the condition's own edges, got {header_kinds:?}",
+        );
+
+        let to = |from: BlockId, kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(from)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(header, EdgeKind::False),
+            vec![join],
+            "header's False edge must reach the join"
+        );
+        assert_eq!(
+            to(join, EdgeKind::True),
+            vec![body_entry],
+            "the join's True edge must enter the body"
+        );
+        assert_eq!(
+            to(join, EdgeKind::False),
+            vec![after],
+            "the join's False edge must reach the code after the loop"
+        );
+    }
+
+    #[test]
+    fn a_continue_in_a_compound_while_condition_targets_the_header_not_the_join() {
+        // The continue target for a `while` is the header — re-testing the *whole*
+        // condition from its start — not the join where the loop's own True/False live,
+        // and not `b`'s block either. Targeting the join would skip the condition test
+        // entirely: a silent infinite loop, not a visible wrong answer, which is why this
+        // needs its own check rather than trusting the "continue re-tests the whole
+        // condition" claim on faith. `block_of(while_statement)` resolves to the join, not
+        // the header, so `header` is found through `a`'s own block instead.
+        let source = "function f() { while (a && b) { continue; } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "continue_statement")).unwrap();
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        let header = cfg.block_of(ident("a")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![header],
+            "continue must target the header, not the join or b's block"
         );
     }
 }
