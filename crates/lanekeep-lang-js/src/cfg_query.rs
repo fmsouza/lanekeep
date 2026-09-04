@@ -81,6 +81,16 @@ impl Cfg<'_> {
         !self.walk(from, &[to], self.exit)
     }
 
+    /// Whether control can reach `to` from `from` without entering any block in `avoid`.
+    ///
+    /// The public form of the private [`Self::walk`], for a consumer that needs the witness
+    /// path rather than the all-paths verdict — obligation analysis, to name the exit an
+    /// undischarged value escapes through.
+    #[must_use]
+    pub fn reaches_avoiding(&self, from: BlockId, avoid: &[BlockId], to: BlockId) -> bool {
+        self.walk(from, avoid, to)
+    }
+
     /// Whether every path from `from` to [`Cfg::exit`] passes through **at least one** of
     /// `through`.
     ///
@@ -363,5 +373,23 @@ mod tests {
             !cfg.on_all_paths_from_any(cfg.entry(), &[]),
             "an empty set is on no path at all while the exit is reachable",
         );
+    }
+
+    #[test]
+    fn reaches_avoiding_is_blocked_by_the_avoided_set() {
+        // acquire -> (release) -> exit ; avoiding the release, the exit is unreachable
+        let source = "function f() { a(); r(); }";
+        let tree = parse(source);
+        let cfg = build(&tree, source);
+        let release = cfg
+            .block_of(
+                find_all(&tree, "call_expression")
+                    .into_iter()
+                    .find(|n| &source[n.byte_range()] == "r()")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(cfg.reaches_avoiding(cfg.entry(), &[], cfg.exit()));
+        assert!(!cfg.reaches_avoiding(cfg.entry(), &[release], cfg.exit()));
     }
 }
