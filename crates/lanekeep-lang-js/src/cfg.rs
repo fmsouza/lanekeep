@@ -269,10 +269,12 @@ impl<'t> Cfg<'t> {
     /// the copies are real, separate blocks, which is what keeps "the finalizer is on
     /// every path out of the `try`" a fact about the edge set. This method then answers
     /// with the lowest-numbered of them: one true answer among several, never a merge. A
-    /// consumer that needs a property to hold of *every* copy has to check every element
-    /// of [`Self::blocks_of`] instead — [`Cfg::on_all_paths_from`] in particular
-    /// takes a single block and answers about that block alone, which is the wrong
-    /// question for a construct that may be duplicated.
+    /// consumer asking whether a property holds of the *construct* has to take the whole
+    /// list from [`Self::blocks_of`] and ask about it at once —
+    /// [`Cfg::on_all_paths_from_any`] is that question, and
+    /// [`Cfg::on_all_paths_from`] is not: it takes a single block, answers about that
+    /// block alone, and answers `false` for every copy of a construct that runs on every
+    /// path.
     ///
     /// The `root`-containment check below is a correctness gate: it is what keeps a
     /// node attributed from outside `root` from answering a query for an offset outside
@@ -307,14 +309,18 @@ impl<'t> Cfg<'t> {
     ///
     /// [`Self::block_of`] is this list's first element — the right answer for "where does
     /// this node live," and the wrong one for "does this hold of the node everywhere it
-    /// lives." A `finally` body duplicated once per continuation (`cfg_build`, Task 6)
-    /// attributes each of its nodes to every copy, so a property that must hold of the
-    /// construct as a whole — not merely of whichever copy happens to sort lowest — has to
-    /// be checked against every element here. This is the reason
-    /// [`Cfg::on_all_paths_from`] takes exactly one [`BlockId`]: it cannot answer
-    /// "is this construct on every path," only "is this one block," and a construct that
-    /// resolves to more than one block needs the question asked once per element, with the
-    /// results combined by the caller.
+    /// lives." A `finally` body duplicated once per continuation (`cfg_build`) attributes
+    /// each of its nodes to every copy, so a property that must hold of the construct as a
+    /// whole — not merely of whichever copy happens to sort lowest — has to be asked about
+    /// this whole list.
+    ///
+    /// **Pass it to a query that takes a set, rather than folding per-element answers.**
+    /// [`Cfg::on_all_paths_from`] takes exactly one [`BlockId`] and can answer `false`
+    /// for every copy of a finalizer that runs on every path, so neither an OR nor an AND
+    /// over its per-copy answers is the answer about the construct — the paths each copy
+    /// covers are what has to be combined, and a boolean has already thrown that away.
+    /// [`Cfg::on_all_paths_from_any`] takes this list and deletes it in one walk, which
+    /// is what makes the question askable at all.
     ///
     /// No containment fallback, unlike `block_of`: a node attributed to more than one
     /// block is always attributed by exact identity (containment can only ever place a

@@ -4,6 +4,11 @@
 //! there, and *must* it pass through a given block on the way out. lanekeep #194's taint
 //! is the first consumer of the may-question and #193's obligation of the must-question.
 //!
+//! The must-question comes in two shapes, one block and a set of them, and the set is not a
+//! convenience over the single form: construction duplicates a `finally` body per
+//! continuation, and the per-copy answers cannot be combined into the answer about the
+//! construct. Both shapes are one walk with the same body.
+//!
 //! Both walks use an explicit stack with a visited set, pushing successors in
 //! [`BlockId`] order. No hash container is iterated anywhere in this file — which is the
 //! checkable form of the determinism requirement, since an arbitrary iteration order
@@ -17,7 +22,7 @@ impl Cfg<'_> {
     /// Reflexive: a block reaches itself.
     #[must_use]
     pub fn reaches(&self, from: BlockId, to: BlockId) -> bool {
-        self.walk(from, None, to)
+        self.walk(from, &[], to)
     }
 
     /// Whether **every** path from `from` to [`Cfg::exit`] passes through `to`.
@@ -31,33 +36,71 @@ impl Cfg<'_> {
     /// is the correct must-semantics and it is not what a reader guesses, which is why it
     /// is written here.
     ///
-    /// **Takes exactly one block.** [`Cfg::blocks_of`] can resolve a construct to more
-    /// than one copy — a `finally` body duplicated once per continuation (`cfg_build.rs`,
-    /// Task 6) is the case that exists today — and each copy sits on only the subset of
-    /// paths that reach the continuation it was built for. Calling this once on a single
-    /// copy answers about that one block, and can answer `false` for **every** copy of a
-    /// construct that genuinely runs on every path, because the copies partition the path
-    /// set and no one of them covers all of it. A caller that needs "is this construct on
-    /// every path" has to check every element of [`Cfg::blocks_of`] and combine the
-    /// results — this method cannot be asked that question directly.
+    /// **Takes exactly one block**, so it is the wrong question for a construct that may
+    /// be duplicated. [`Cfg::blocks_of`] can resolve one to several copies — a `finally`
+    /// body emitted once per continuation (`cfg_build.rs`) is the case that exists today —
+    /// and each copy sits on only the subset of paths reaching the continuation it was
+    /// built for. Asked about one copy this answers about that one block, and it can
+    /// answer `false` for **every** copy of a construct that genuinely runs on every path,
+    /// because the copies partition the path set and no one of them covers all of it.
+    ///
+    /// **Combining those per-copy answers recovers nothing.** With `false` for each copy,
+    /// the OR is `false` and the AND is `false`, while the truth is that the construct is
+    /// on every path — no function of the per-copy booleans yields it, since none of them
+    /// carries which paths its copy covers. Ask [`Cfg::on_all_paths_from_any`] instead: it
+    /// takes the whole set and deletes it in one walk, which is the only form in which
+    /// this question can be put about a duplicated construct.
     #[must_use]
     pub fn on_all_paths_from(&self, from: BlockId, to: BlockId) -> bool {
-        // Redundant with `walk`'s own first line: when `from == to`, `avoid == Some(from)`,
-        // so `walk` immediately hits `Some(from) == avoid` and returns `false`, which this
-        // function negates to `true` — the same answer this early return gives, for every
-        // input. No fixture can distinguish "guard present" from "guard deleted", so this
-        // is not untested code waiting for a test that would catch its removal; there is no
-        // such test. Kept anyway, because the reflexive case should be legible at the call
-        // site rather than emergent two functions away.
+        // Redundant with `walk`'s own first line: when `from == to`, `avoid` holds `from`,
+        // so `walk` immediately hits `avoid.contains(&from)` and returns `false`, which
+        // this function negates to `true` — the same answer this early return gives, for
+        // every input. No fixture can distinguish "guard present" from "guard deleted"
+        // *through this method*; `on_all_paths_from_any_is_true_when_from_is_in_the_set`
+        // covers `walk`'s line itself, which has no such shadowing guard above it. Kept
+        // anyway, because the reflexive case should be legible at the call site rather
+        // than emergent two functions away.
         if from == to {
             return true;
         }
-        !self.walk(from, Some(to), self.exit)
+        !self.walk(from, &[to], self.exit)
     }
 
-    /// Depth-first from `from`, never entering `avoid`, stopping at `goal`.
-    fn walk(&self, from: BlockId, avoid: Option<BlockId>, goal: BlockId) -> bool {
-        if Some(from) == avoid {
+    /// Whether every path from `from` to [`Cfg::exit`] passes through **at least one** of
+    /// `through`.
+    ///
+    /// The set form of [`Cfg::on_all_paths_from`], and the method to reach for when
+    /// [`Cfg::blocks_of`] answers with more than one block. Same walk, avoiding the whole
+    /// set at once: delete every element and ask whether the exit is still reachable, in
+    /// which case that walk is a witness to a path taking none of them.
+    ///
+    /// A duplicated `finally` is the reason this exists rather than a generalization for
+    /// its own sake. Each copy carries only the paths reaching its own continuation, so
+    /// the single form answers `false` for every copy of a finalizer that nonetheless runs
+    /// on every path — and no combination of those `false`s recovers the truth. The
+    /// property is a fact about the copies *together*, which is a question only a set can
+    /// put.
+    ///
+    /// The single form's two edge cases hold here unchanged, plus one this shape adds:
+    ///
+    /// - **Vacuously true when the exit is unreachable from `from`** — `from` inside an
+    ///   infinite loop — because there are then no paths for a witness to be found on.
+    /// - **True when `from` is itself in `through`**, since every path from `from` starts
+    ///   there.
+    /// - An empty `through` is therefore `false` whenever the exit is reachable at all,
+    ///   and vacuously `true` when it is not. Nothing is on a path that does not exist.
+    #[must_use]
+    pub fn on_all_paths_from_any(&self, from: BlockId, through: &[BlockId]) -> bool {
+        !self.walk(from, through, self.exit)
+    }
+
+    /// Depth-first from `from`, never entering a block in `avoid`, stopping at `goal`.
+    ///
+    /// `avoid` is a slice rather than a set container: it holds a handful of blocks — the
+    /// copies of one construct — so a linear scan beats hashing outright, and this file's
+    /// header states why no hash container appears here in the first place.
+    fn walk(&self, from: BlockId, avoid: &[BlockId], goal: BlockId) -> bool {
+        if avoid.contains(&from) {
             return false;
         }
         let mut visited = vec![false; self.blocks.len()];
@@ -76,7 +119,7 @@ impl Cfg<'_> {
                 .collect();
             next.sort_unstable();
             for target in next {
-                if Some(target) == avoid || visited[target.index()] {
+                if avoid.contains(&target) || visited[target.index()] {
                     continue;
                 }
                 // Marked on push rather than on pop: once a block is queued, nothing
@@ -95,8 +138,8 @@ impl Cfg<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::cfg::Cfg;
     use crate::cfg::testing::{find, find_all, parse};
-    use crate::cfg::{BlockId, Cfg};
 
     fn build<'t>(tree: &'t tree_sitter::Tree, source: &str) -> Cfg<'t> {
         Cfg::build(source, find(tree, "function_declaration")).expect("a root")
@@ -214,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicated_finalizer_is_not_on_all_paths_through_any_one_copy() {
+    fn a_duplicated_finalizer_is_on_all_paths_only_as_a_set() {
         // T7-R5: the coordinator's own example for this ruling was
         // `try { if (a) { return 1; } else { throw x; } } finally { c(); }`, which turns
         // out to build *one* copy, not two — both branches diverge to the same
@@ -243,7 +286,10 @@ mod tests {
             "one copy for the throw's continuation, one for normal completion's",
         );
 
-        // Neither copy alone is on every path: the throw path avoids the
+        // Both halves of the contrast, in one place, because either alone reads as a
+        // property of this fixture rather than as the reason the set form exists.
+        //
+        // Half one: neither copy alone is on every path. The throw path avoids the
         // normal-completion copy, and the normal-completion path avoids the throw's copy.
         for &copy in &copies {
             assert!(
@@ -252,46 +298,45 @@ mod tests {
             );
         }
 
-        // What *is* true is a fact about the set: no path avoids every copy at once. This
-        // is the property `on_all_paths_from` cannot express (it takes one block), which
-        // is exactly why `blocks_of` exists — a caller checks this itself, over every
-        // element, rather than being able to ask the query for it directly.
+        // Half two: the finalizer nonetheless runs on every path, and `on_all_paths_from_any`
+        // is what says so. Note what half one rules out — every per-copy answer is `false`,
+        // so an OR over them is `false` and an AND over them is `false`, and neither is the
+        // `true` below. There is no function of the per-copy booleans that gets here; the
+        // set has to enter the walk as a set.
         assert!(
-            !avoids_every(&cfg, cfg.entry(), cfg.exit(), &copies),
+            cfg.on_all_paths_from_any(cfg.entry(), &copies),
             "every path must pass through at least one copy of the finalizer",
         );
     }
 
-    /// Whether some path from `from` to `to` avoids every block in `avoided`.
-    ///
-    /// A test-only generalization of `walk`'s single-`avoid` case to a set, for asserting
-    /// the property `on_all_paths_from` cannot: that a *group* of blocks together, not any
-    /// one of them, is what sits on every path. Same shape as `walk` — explicit stack,
-    /// visited bitset — for the same reason: no hash container, and no dependence on the
-    /// order edges happened to be added in.
-    fn avoids_every(cfg: &Cfg<'_>, from: BlockId, to: BlockId, avoided: &[BlockId]) -> bool {
-        let mut visited = vec![false; cfg.blocks().count()];
-        let mut stack = vec![from];
-        visited[from.index()] = true;
-        while let Some(id) = stack.pop() {
-            if id == to {
-                return true;
-            }
-            let mut next: Vec<BlockId> = cfg
-                .block(id)
-                .successors
-                .iter()
-                .map(|edge| edge.target)
-                .collect();
-            next.sort_unstable();
-            for target in next {
-                if avoided.contains(&target) || visited[target.index()] {
-                    continue;
-                }
-                visited[target.index()] = true;
-                stack.push(target);
-            }
-        }
-        false
+    #[test]
+    fn on_all_paths_from_any_is_true_when_from_is_in_the_set() {
+        // `walk`'s own first line, and the only test that reaches it: `on_all_paths_from`
+        // has a reflexive early return of its own that answers before the walk is ever
+        // called, so deleting that line is invisible through the single form. Here nothing
+        // shadows it — with it gone the walk starts inside the avoided set, reaches the
+        // exit, and the answer flips to `false`.
+        let source = "function f() { a(); }";
+        let tree = parse(source);
+        let cfg = build(&tree, source);
+        assert!(cfg.on_all_paths_from_any(cfg.entry(), &[cfg.entry()]));
+    }
+
+    #[test]
+    fn on_all_paths_from_any_is_false_when_one_path_avoids_every_block() {
+        // The negative direction, which the duplicated-finalizer test above cannot give:
+        // every assertion there is that some block or set *is* on every path, so a body of
+        // `true` would satisfy all of them. Here the `if` supplies a path around the whole
+        // set — one block in this fixture, since nothing duplicates it.
+        let source = "function f(c) { if (c) { z(); } }";
+        let tree = parse(source);
+        let cfg = build(&tree, source);
+        let cleanup = cfg.blocks_of(find(&tree, "expression_statement"));
+        assert_eq!(cleanup.len(), 1, "nothing duplicates a plain `if` body");
+        assert!(!cfg.on_all_paths_from_any(cfg.entry(), &cleanup));
+        assert!(
+            !cfg.on_all_paths_from_any(cfg.entry(), &[]),
+            "an empty set is on no path at all while the exit is reachable",
+        );
     }
 }
