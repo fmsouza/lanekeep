@@ -27,6 +27,7 @@
       "options": {
         "allow": [
           "crates/lanekeep-engine/benches/*",
+          "crates/lanekeep-lang-js/benches/*",
           "crates/lanekeep-rules/tests/*",
           "crates/lanekeep-types/benches/*",
           "crates/lanekeep-types/tests/*",
@@ -98,6 +99,7 @@
           "crates/lanekeep-engine/benches/crossings.rs",
           "crates/lanekeep-lang-go/build.rs",
           "crates/lanekeep-lang-go/src/lib.rs",
+          "crates/lanekeep-lang-js/benches/cfg.rs",
           "crates/lanekeep-lang-js/build.rs",
           "crates/lanekeep-lang-python/build.rs",
           "crates/lanekeep-lang-python/src/lib.rs",

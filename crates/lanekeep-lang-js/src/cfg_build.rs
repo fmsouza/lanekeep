@@ -3275,7 +3275,7 @@ function f() {
                 "edges must stay linear: {edges} for {n} statements ({measurements:?})",
             );
         }
-        // Doubling the input must not more than roughly double the graph. The real ratio
+        // Quadrupling the input must not more than roughly quadruple the graph. The real ratio
         // at 4x is 3.95 against this 5x limit — 26% headroom, which would be uncomfortably
         // tight for a timing assertion but is fine here: construction is deterministic, so
         // the ratio is exact and cannot drift under load. 5x is loose enough to pass
