@@ -65,10 +65,12 @@ const POSTFIX_KINDS: &[&str] = &[
 
 /// Statement kinds that are loops, and so can house a labeled `continue`.
 ///
-/// A label on one of these belongs to the loop's own [`Target`], via `pending_label`, so
-/// the loop can answer a labeled `continue`. A label on anything else gets a break-only
-/// `Target` from `labeled_statement` itself, with `continue_to: None` — an unlabeled
-/// `continue` then passes through it to the enclosing loop.
+/// A label on one of these — or a chain of labels stacked above one, each wrapping the
+/// next — belongs to the loop's own [`Target`], via `pending_label`, so the loop can
+/// answer a labeled `continue`. A label whose body is neither a loop nor another labeled
+/// statement gets a break-only `Target` from `labeled_statement` itself, with
+/// `continue_to: None` — an unlabeled `continue` then passes through it to the enclosing
+/// loop.
 const LOOP_KINDS: &[&str] = &[
     "while_statement",
     "do_statement",
@@ -78,8 +80,9 @@ const LOOP_KINDS: &[&str] = &[
 
 /// A `break`/`continue` target.
 struct Target<'s> {
-    /// The label this target answers to, if any.
-    label: Option<&'s str>,
+    /// The labels this target answers to. Empty for an unlabeled construct; more than one
+    /// when stacked labels (`a: b: while (c) { ... }`) all name the same loop.
+    labels: Vec<&'s str>,
     break_to: BlockId,
     /// `None` for a `switch` or a labeled block, which `continue` passes through.
     continue_to: Option<BlockId>,
@@ -131,13 +134,17 @@ struct Builder<'t, 's> {
                   Remove once task 6 reads it."
     )]
     handlers: Vec<Handler>,
-    /// A label waiting for the loop it belongs to.
+    /// Labels stacked above the construct they belong to, outermost first.
     ///
     /// A field rather than a parameter: it would otherwise thread through `statement`,
-    /// which every construct calls and none of the others needs. Set by
-    /// `labeled_statement` for the one call into the loop that owns it, and read (and
-    /// cleared) by that loop's own constructor.
-    pending_label: Option<&'s str>,
+    /// which every construct calls and none but `labeled_statement` needs.
+    /// `labeled_statement` pushes onto it and recurses when its own body is itself a loop
+    /// or another labeled statement, so `a: b: while (c) {}` accumulates both labels
+    /// before the `while` constructor drains them into its `Target` in one call. Drained
+    /// (via `std::mem::take`) by whichever constructor ends the chain — a loop
+    /// constructor, or `labeled_statement` itself for a non-loop body — which is what
+    /// keeps it empty for the next, unrelated labeled statement.
+    pending_label: Vec<&'s str>,
 }
 
 impl<'t> Cfg<'t> {
@@ -160,7 +167,7 @@ impl<'t> Cfg<'t> {
             targets: Vec::new(),
             finallys: Vec::new(),
             handlers: Vec::new(),
-            pending_label: None,
+            pending_label: Vec::new(),
         };
 
         let entry = builder.cfg.entry();
@@ -548,7 +555,9 @@ impl<'t, 's> Builder<'t, 's> {
     /// than one.
     fn jump_target(&self, label: Option<&str>, is_continue: bool) -> Option<(BlockId, usize)> {
         self.targets.iter().rev().find_map(|target| {
-            if label.is_some() && target.label != label {
+            if let Some(label) = label
+                && !target.labels.contains(&label)
+            {
                 return None;
             }
             if is_continue {
@@ -585,7 +594,7 @@ impl<'t, 's> Builder<'t, 's> {
         node: Node<'t>,
         header: BlockId,
         continue_to: BlockId,
-        label: Option<&'s str>,
+        labels: Vec<&'s str>,
         conditional: bool,
     ) -> BlockId {
         let after = self.cfg.alloc(node.end_byte());
@@ -599,7 +608,7 @@ impl<'t, 's> Builder<'t, 's> {
         }
 
         self.targets.push(Target {
-            label,
+            labels,
             break_to: after,
             continue_to: Some(continue_to),
             finally_depth: self.finallys.len(),
@@ -628,9 +637,13 @@ impl<'t, 's> Builder<'t, 's> {
         if let Some(condition) = condition {
             let end = self.expression(condition, header);
             self.cfg.attribute(end, condition);
+            // Same reasoning as `if_statement`: without this, `block_of(while_statement)`
+            // answers `None`, since the node's own start byte (the `while` keyword)
+            // precedes everything attributed inside it.
+            self.cfg.attribute(end, node);
         }
-        let label = self.pending_label.take();
-        self.loop_statement(node, header, header, label, true)
+        let labels = std::mem::take(&mut self.pending_label);
+        self.loop_statement(node, header, header, labels, true)
     }
 
     fn do_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
@@ -645,7 +658,7 @@ impl<'t, 's> Builder<'t, 's> {
         let after = self.cfg.alloc(node.end_byte());
 
         self.targets.push(Target {
-            label: self.pending_label.take(),
+            labels: std::mem::take(&mut self.pending_label),
             break_to: after,
             continue_to: Some(latch),
             finally_depth: self.finallys.len(),
@@ -659,6 +672,10 @@ impl<'t, 's> Builder<'t, 's> {
         if let Some(condition) = condition {
             let end = self.expression(condition, latch);
             self.cfg.attribute(end, condition);
+            // Same reasoning as `if_statement`: without this, `block_of(do_statement)`
+            // answers `None`, since the node's own start byte (the `do` keyword) precedes
+            // everything attributed inside it.
+            self.cfg.attribute(end, node);
         }
         // The one edge that is both a back edge and a true branch, which is why `back` is
         // a field on `Edge` rather than a variant of `EdgeKind`.
@@ -693,10 +710,20 @@ impl<'t, 's> Builder<'t, 's> {
             .cfg
             .alloc(condition.map_or(node.end_byte(), |c| c.start_byte()));
         self.cfg.edge(block, header, EdgeKind::Normal, false);
-        if let Some(condition) = condition {
-            let end = self.expression(condition, header);
-            self.cfg.attribute(end, condition);
-        }
+        // Same reasoning as `if_statement`: without this, `block_of(for_statement)`
+        // answers `None`, since the node's own start byte (the `for` keyword) precedes
+        // everything attributed inside it. Falls back to `header` itself when there is no
+        // condition to evaluate (`for (;;)`) — the block still exists and is still the
+        // construct's own decision point, even though nothing runs there.
+        let test = match condition {
+            Some(condition) => {
+                let end = self.expression(condition, header);
+                self.cfg.attribute(end, condition);
+                end
+            }
+            None => header,
+        };
+        self.cfg.attribute(test, node);
 
         let increment = Self::for_clause(node, "increment");
         let increment_entry = self
@@ -711,8 +738,8 @@ impl<'t, 's> Builder<'t, 's> {
         self.cfg
             .edge(increment_entry, header, EdgeKind::Normal, true);
 
-        let label = self.pending_label.take();
-        self.loop_statement(node, header, increment_entry, label, condition.is_some())
+        let labels = std::mem::take(&mut self.pending_label);
+        self.loop_statement(node, header, increment_entry, labels, condition.is_some())
     }
 
     /// Never `None`, for the same reason as [`Self::while_statement`].
@@ -729,30 +756,43 @@ impl<'t, 's> Builder<'t, 's> {
                 .map_or(node.start_byte(), |l| l.start_byte()),
         );
         self.cfg.edge(block, header, EdgeKind::Normal, false);
-        let label = self.pending_label.take();
-        self.loop_statement(node, header, header, label, true)
+        // Same reasoning as `if_statement`: without this, `block_of(for_in_statement)`
+        // answers `None`, since the node's own start byte (the `for` keyword) precedes
+        // everything attributed inside it. There is no condition expression to anchor
+        // on — the test is the implicit "does the iteration have a next value" — so this
+        // attributes directly to `header`.
+        self.cfg.attribute(header, node);
+        let labels = std::mem::take(&mut self.pending_label);
+        self.loop_statement(node, header, header, labels, true)
     }
 
     fn labeled_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
         let label = node.child_by_field_name("label").map(|n| self.text(n));
         let body = node.child_by_field_name("body")?;
+        if let Some(label) = label {
+            self.pending_label.push(label);
+        }
 
-        // A label on a loop belongs to that loop's own target, so the loop can answer a
-        // labeled `continue`. A label on anything else gets a break-only target here.
-        if LOOP_KINDS.contains(&body.kind()) {
-            self.pending_label = label;
-            let tail = self.statement(body, current);
-            self.pending_label = None;
-            return tail;
+        // A label on a loop, or on another label that itself eventually wraps one, belongs
+        // to that loop's own target — `pending_label` accumulates through the chain so
+        // `a: b: while (c) {}` reaches the loop's `Target` with both labels at once.
+        // Anything else ends the chain here and gets a break-only target for everything
+        // accumulated so far.
+        if LOOP_KINDS.contains(&body.kind()) || body.kind() == "labeled_statement" {
+            return self.statement(body, current);
         }
 
         let after = self.cfg.alloc(node.end_byte());
         self.targets.push(Target {
-            label,
+            labels: std::mem::take(&mut self.pending_label),
             break_to: after,
             continue_to: None,
             finally_depth: self.finallys.len(),
         });
+        // Same reasoning as `if_statement`: without this, `block_of(labeled_statement)`
+        // answers `None` for a label that isn't on a loop, since the node's own start byte
+        // (the label) precedes everything attributed inside `body`.
+        self.cfg.attribute(current, node);
         let tail = self.statement(body, current);
         self.targets.pop();
         if let Some(tail) = tail {
@@ -1662,5 +1702,79 @@ function f() {
             .map(|e| e.target)
             .collect();
         assert_eq!(targets.len(), 1, "the break must have exactly one way out");
+    }
+
+    #[test]
+    fn an_unlabeled_continue_passes_through_a_labeled_block_to_the_loop() {
+        // `continue` targets the innermost enclosing *loop*; a labeled block is not a
+        // loop, so its `Target` (`continue_to: None`) must not intercept an unlabeled
+        // `continue` even though it is nearer on the stack. `block_of(...).is_some()`
+        // alone can't see this: `jump` attributes the node before consulting the target
+        // stack, so presence is guaranteed regardless of which target — or none — the
+        // search actually resolves to. `block_of(while_statement)` resolving at all is
+        // itself new: it depends on `while_statement` attributing its own node to the
+        // header, the same fix that made `break_leaves_the_loop`'s `skips` exclusion real.
+        let source = "function f() { while (c) { done: { continue; } } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "continue_statement")).unwrap();
+        let header = cfg.block_of(find(&tree, "while_statement")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![header],
+            "continue must reach the loop header, not done's break-only target",
+        );
+    }
+
+    #[test]
+    fn a_continue_through_stacked_labels_reaches_the_loop_header() {
+        // `a: b: while (c) {}` is valid JavaScript with both labels naming the same loop.
+        // `a`'s body is `b`'s `labeled_statement`, not the `while` directly, so this pins
+        // the recursive accumulation in `pending_label` rather than only the single-label
+        // case every other labeled-loop test here exercises.
+        let source = "function f() { a: b: while (c) { continue a; } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "continue_statement")).unwrap();
+        let header = cfg.block_of(find(&tree, "while_statement")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![header],
+            "continue a; must reach the loop header through both stacked labels",
+        );
+    }
+
+    #[test]
+    fn a_break_through_stacked_labels_leaves_the_loop() {
+        let source = "function f() { a: b: while (c) { break b; } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "break_statement")).unwrap();
+        let after = cfg
+            .block_of(find_all(&tree, "expression_statement")[0])
+            .unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![after],
+            "break b; must leave the loop through both stacked labels",
+        );
     }
 }
