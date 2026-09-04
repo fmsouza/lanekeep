@@ -2786,6 +2786,63 @@ function f() {
     }
 
     #[test]
+    fn two_breaks_to_the_same_target_share_one_finally_copy() {
+        // T9-R1: `emit_finally_copy` memoizes on `continuation` alone, so it cannot tell
+        // *how* a jump reached that continuation — two `break`s to the same loop share a
+        // copy exactly as the two `return`s above share theirs. This is the fixture that
+        // was missing: nothing here exercised two same-target jumps out of one `try`.
+        let source = "\
+function f() {
+  while (x) {
+    try {
+      if (a) break;
+      if (b) break;
+    } finally { c(); }
+  }
+}";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+
+        let copies = blocks_with_text(&cfg, source, "c();");
+        // One copy for both breaks (they share a target: the block after the `while`),
+        // one for normal completion of the try body (falling through both `if`s continues
+        // the loop instead of leaving it). Never three, which is what one copy per
+        // `break` would give.
+        assert_eq!(
+            copies.len(),
+            2,
+            "expected one copy per continuation, got {}",
+            copies.len()
+        );
+
+        // Not just the count: pin down that the two breaks land on the *identical* copy,
+        // rather than two different ones that happen to still total two blocks.
+        let breaks = find_all(&tree, "break_statement");
+        assert_eq!(breaks.len(), 2, "fixture must declare exactly two breaks");
+        let successor_of = |node: tree_sitter::Node<'_>| -> BlockId {
+            let block = cfg.block_of(node).unwrap();
+            let targets: Vec<BlockId> = cfg
+                .block(block)
+                .successors
+                .iter()
+                .map(|e| e.target)
+                .collect();
+            assert_eq!(targets.len(), 1, "a break has exactly one successor");
+            targets[0]
+        };
+        let first = successor_of(breaks[0]);
+        let second = successor_of(breaks[1]);
+        assert_eq!(
+            first, second,
+            "both breaks must land on the same finally copy"
+        );
+        assert!(
+            copies.contains(&first),
+            "the shared copy must be one of the two counted"
+        );
+    }
+
+    #[test]
     fn a_throw_reaches_its_catch() {
         // Not `skips(..., find(&tree, "function_declaration"))`: the function root is
         // attributed nowhere, so `block_of` answers `None`, the ban is a no-op, and
