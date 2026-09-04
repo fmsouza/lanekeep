@@ -34,10 +34,16 @@ impl BlockId {
 
 /// What decided that control took this edge.
 ///
-/// `True` and `False` name the outcome of the source block's terminating condition. For
-/// `a ?? b` and `a?.b` the condition is "the left operand is non-nullish", so `False` is
-/// the edge that continues to the right-hand side. That is a stated convention rather
-/// than a derivation, because two readers would otherwise pick opposite labels.
+/// `True` and `False` name the outcome of the source block's terminating condition. That
+/// is a stated convention rather than a derivation, because two readers would otherwise
+/// pick opposite labels.
+///
+/// `&&` takes `True` to its right operand; `||` and `??` take `False` to theirs. `a ?? b`
+/// and `a?.b` share one condition — "the left operand is non-nullish" — and land on
+/// *opposite* edges, which is the half that has to be said rather than inferred: `??`
+/// evaluates `b` when the condition fails, so `False` goes there, while `?.` continues
+/// the chain when it holds, so `True` goes to the rest of the chain and `False` skips
+/// straight to the join, where the whole chain is `undefined`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     /// Straight-line flow, or the only way out of the block.

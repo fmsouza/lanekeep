@@ -41,6 +41,18 @@ const NESTED_FUNCTION_KINDS: &[&str] = &[
     "method_definition",
 ];
 
+/// Postfix kinds that can extend a chain.
+///
+/// A chain is spelled outside-in by the tree — `a?.b.c` is
+/// `member_expression(object: member_expression(a ?. b), property: c)` — and evaluated
+/// inside-out. `new_expression` is deliberately absent: its operand is a `constructor`
+/// field and `new a?.b()` is not legal syntax, so it never continues a chain.
+const POSTFIX_KINDS: &[&str] = &[
+    "member_expression",
+    "subscript_expression",
+    "call_expression",
+];
+
 /// A `break`/`continue` target.
 ///
 /// Unconditional `expect`, not `cfg_attr(not(test), ..)`: unlike Task 1's crate-internal
@@ -266,17 +278,62 @@ impl<'t, 's> Builder<'t, 's> {
         }
     }
 
-    /// Whether this node opens an optional chain.
+    /// The sub-expression a postfix node applies to: `object` for a member or subscript
+    /// access, `function` for a call.
+    fn postfix_base(node: Node<'_>) -> Option<Node<'_>> {
+        node.child_by_field_name("object")
+            .or_else(|| node.child_by_field_name("function"))
+    }
+
+    /// The `?.` that makes this one link short-circuit, if it has one.
     ///
-    /// `member_expression` and `subscript_expression` declare `optional_chain` as a
-    /// field; `call_expression` carries it as a child instead.
-    fn is_optional(node: Node<'_>) -> bool {
-        if node.child_by_field_name("optional_chain").is_some() {
-            return true;
+    /// Two spellings, and only the first is what the node-types file advertises.
+    /// `member_expression` and `subscript_expression` declare an `optional_chain` field,
+    /// whose value is a named node of that kind. `call_expression` declares neither the
+    /// field nor a child of that kind: `common/define-grammar.js` overrides the base call
+    /// rule so that TypeScript's optional form is
+    /// `seq(field('function', ..), '?.', field('type_arguments', ..), field('arguments', ..))`
+    /// — a bare *anonymous* `?.` token. Matching only the first spelling is why `f?.()`
+    /// and `obj.method?.()` were modelled as unconditional calls.
+    ///
+    /// Returned rather than reduced to a `bool` because two other things need the node
+    /// itself: the continuation block starts where the marker ends, and the marker is
+    /// punctuation that must be kept out of `Block::nodes`.
+    fn optional_marker(node: Node<'_>) -> Option<Node<'_>> {
+        if let Some(field) = node.child_by_field_name("optional_chain") {
+            return Some(field);
         }
         let mut cursor = node.walk();
         node.children(&mut cursor)
-            .any(|child| child.kind() == "optional_chain")
+            .find(|child| child.kind() == "optional_chain" || child.kind() == "?.")
+    }
+
+    /// Whether `node` is the outermost link of its postfix chain.
+    ///
+    /// Only the root builds the chain; every inner link is reached from it and is never
+    /// dispatched on its own. A postfix node whose parent is postfix but which is not
+    /// that parent's base — the index in `x[a?.b]`, say — is a chain of its own.
+    fn is_chain_root(node: Node<'_>) -> bool {
+        match node.parent() {
+            Some(parent) if POSTFIX_KINDS.contains(&parent.kind()) => {
+                Self::postfix_base(parent).map(|base| base.id()) != Some(node.id())
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether any link in the chain rooted at `node` short-circuits.
+    fn chain_has_optional(node: Node<'_>) -> bool {
+        let mut link = node;
+        loop {
+            if Self::optional_marker(link).is_some() {
+                return true;
+            }
+            match Self::postfix_base(link) {
+                Some(base) if POSTFIX_KINDS.contains(&base.kind()) => link = base,
+                _ => return false,
+            }
+        }
     }
 
     fn expression(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
@@ -294,10 +351,11 @@ impl<'t, 's> Builder<'t, 's> {
                 }
             }
             "ternary_expression" => self.ternary(node, current),
-            "member_expression" | "subscript_expression" | "call_expression"
-                if Self::is_optional(node) =>
+            kind if POSTFIX_KINDS.contains(&kind)
+                && Self::is_chain_root(node)
+                && Self::chain_has_optional(node) =>
             {
-                self.optional_chain(node, current)
+                self.postfix_chain(node, current)
             }
             _ => self.children(node, current),
         }
@@ -367,33 +425,60 @@ impl<'t, 's> Builder<'t, 's> {
         join
     }
 
-    /// `a?.b` — when `a` is nullish the whole chain is `undefined` and the rest is skipped.
-    fn optional_chain(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
-        let Some(object) = node
-            .child_by_field_name("object")
-            .or_else(|| node.child_by_field_name("function"))
-        else {
-            return self.children(node, current);
-        };
-        let test = self.expression(object, current);
-        self.cfg.attribute(test, object);
-
-        let rest_entry = self.cfg.alloc(object.end_byte());
-        let join = self.cfg.alloc(node.end_byte());
-        self.cfg.edge(test, rest_entry, EdgeKind::True, false);
-        self.cfg.edge(test, join, EdgeKind::False, false);
-
-        // Everything but the object: the property, the index, the arguments.
-        let mut cursor = node.walk();
-        let rest: Vec<Node<'t>> = node
-            .named_children(&mut cursor)
-            .filter(|c| c.id() != object.id())
-            .collect();
-        let mut block = rest_entry;
-        for child in rest {
-            block = self.expression(child, block);
-            self.cfg.attribute(block, child);
+    /// A postfix chain with at least one optional link.
+    ///
+    /// **One join for the whole chain**, because ECMA-262 short-circuits the chain and not
+    /// the link: once `a?.b` yields `undefined`, `a?.b.c` never reads `c` and `a?.b.c()`
+    /// never calls. The outer links carry no marker of their own — `a?.b.c` is
+    /// `member_expression(object: member_expression(a ?. b), property: c)` — so a join per
+    /// optional link would model `c` as reached on both branches.
+    ///
+    /// `True` continues the chain and `False` reaches the join, per the convention
+    /// [`EdgeKind`] states: the condition is "the operand so far is non-nullish".
+    fn postfix_chain(&mut self, node: Node<'t>, current: BlockId) -> BlockId {
+        // The tree spells a chain outermost-first; evaluation runs the other way.
+        let mut links = vec![node];
+        let mut base = Self::postfix_base(node);
+        while let Some(inner) = base.filter(|inner| POSTFIX_KINDS.contains(&inner.kind())) {
+            links.push(inner);
+            base = Self::postfix_base(inner);
         }
+        links.reverse();
+        // `base` is now what the innermost link applies to, and by construction it is not
+        // itself a link — so nothing here re-dispatches a node this loop already owns.
+
+        let mut block = current;
+        if let Some(base) = base {
+            block = self.expression(base, block);
+            self.cfg.attribute(block, base);
+        }
+
+        let join = self.cfg.alloc(node.end_byte());
+        for link in links {
+            let marker = Self::optional_marker(link);
+            if let Some(marker) = marker {
+                let rest = self.cfg.alloc(marker.end_byte());
+                self.cfg.edge(block, rest, EdgeKind::True, false);
+                self.cfg.edge(block, join, EdgeKind::False, false);
+                block = rest;
+            }
+            // This link's own operands: the property, the index, the type arguments, the
+            // arguments. Not its base, which the link below it already evaluated, and not
+            // the `optional_chain` marker — that one is a *named* node despite being
+            // punctuation, so leaving it in would put `?.` into `Block::nodes`.
+            let skip = [Self::postfix_base(link), marker].map(|found| found.map(|n| n.id()));
+            let mut cursor = link.walk();
+            let operands: Vec<Node<'t>> = link
+                .named_children(&mut cursor)
+                .filter(|child| !skip.contains(&Some(child.id())))
+                .collect();
+            for operand in operands {
+                block = self.expression(operand, block);
+                self.cfg.attribute(block, operand);
+            }
+            self.cfg.attribute(block, link);
+        }
+
         self.cfg.edge(block, join, EdgeKind::Normal, false);
         join
     }
@@ -879,5 +964,207 @@ mod tests {
             .child_by_field_name("property")
             .unwrap();
         assert!(!skips(&cfg, cfg.entry(), cfg.exit(), property));
+    }
+    #[test]
+    fn an_optional_call_short_circuits_past_its_arguments() {
+        // `call_expression` carries neither an `optional_chain` field nor a child of that
+        // kind — TypeScript overrides the base call rule and spells the optional form as a
+        // bare `?.` token — so a detector written from `node-types.json` alone models both
+        // of these commonplace idioms as unconditional calls.
+        for source in [
+            "function outer() { const x = f?.(); }",
+            "function outer() { const x = obj.method?.(); }",
+        ] {
+            let tree = parse(source);
+            let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+            // `formal_parameters`, not `arguments`, is the declaration's own list, so this
+            // is the call's. The `call_expression` node itself cannot be used here: it
+            // starts where its callee does, and `block_of` resolves by range containment,
+            // so it would answer with the callee's block rather than the call's.
+            let arguments = find(&tree, "arguments");
+            assert!(
+                attributed(&cfg, arguments).contains(&"call_expression"),
+                "{source}: the arguments must resolve to the block holding the call",
+            );
+            assert!(
+                skips(&cfg, cfg.entry(), cfg.exit(), arguments),
+                "{source}: the call must be skippable when the callee is nullish",
+            );
+        }
+    }
+
+    #[test]
+    fn an_optional_chain_short_circuits_every_later_link() {
+        // `a?.b.c` is `member_expression(object: member_expression(a ?. b), property: c)`.
+        // The outer `.c` carries no marker of its own, so a join per *link* leaves `c`
+        // walked on both branches — reached even when `a` is nullish, which ECMA-262 says
+        // it is not.
+        let source = "function f() { const x = a?.b.c; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let property = |name: &str| {
+            find_all(&tree, "property_identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        assert_eq!(
+            attributed(&cfg, property("c")),
+            vec![
+                "property_identifier",
+                "member_expression",
+                "property_identifier",
+                "member_expression",
+            ],
+            "both links belong to the one block the chain continues into",
+        );
+        assert!(
+            skips(&cfg, cfg.entry(), cfg.exit(), property("c")),
+            "`c` is not read when `a` is nullish",
+        );
+        // The marker is a *named* node despite being punctuation, so an unfiltered
+        // `named_children` walk puts `?.` into `Block::nodes`.
+        assert!(
+            !shape(&cfg).concat().contains(&"optional_chain"),
+            "`?.` is punctuation and must not be attributed",
+        );
+    }
+
+    #[test]
+    fn an_optional_chain_short_circuits_past_a_later_call() {
+        // The worse half of the same defect: modelled per-link, `a?.b.c()` makes the call
+        // happen unconditionally.
+        let source = "function f() { const x = a?.b.c(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let arguments = find(&tree, "arguments");
+        assert!(
+            attributed(&cfg, arguments).contains(&"call_expression"),
+            "the arguments must resolve to the block holding the call",
+        );
+        assert!(
+            skips(&cfg, cfg.entry(), cfg.exit(), arguments),
+            "the call must not happen when `a` is nullish",
+        );
+    }
+
+    #[test]
+    fn an_optional_link_labels_true_toward_the_rest_of_the_chain() {
+        // Direction, not membership. `??` and `?.` share a condition — "the left operand
+        // is non-nullish" — and land on opposite labels: `??` evaluates its right operand
+        // when the condition fails, `?.` continues the chain when it holds.
+        let source = "function f() { const x = a?.b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let chain = find(&tree, "member_expression");
+        let object = chain.child_by_field_name("object").unwrap();
+        let property = chain.child_by_field_name("property").unwrap();
+        assert_eq!(
+            attributed(&cfg, object),
+            vec!["identifier"],
+            "`a` is evaluated before the branch, in its own block",
+        );
+        assert_eq!(
+            attributed(&cfg, property),
+            vec!["property_identifier", "member_expression"],
+            "`b` belongs to the block the chain continues into",
+        );
+        let test = cfg.block_of(object).unwrap();
+        let rest = cfg.block_of(property).unwrap();
+        let join = cfg
+            .block(rest)
+            .successors
+            .iter()
+            .find(|e| e.kind == EdgeKind::Normal)
+            .map(|e| e.target)
+            .expect("the rest of the chain rejoins");
+        assert_ne!(rest, join, "the chain's continuation is not its join");
+        let to = |kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(test)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(EdgeKind::True),
+            vec![rest],
+            "`?.` continues the chain when the left operand is non-nullish",
+        );
+        assert_eq!(
+            to(EdgeKind::False),
+            vec![join],
+            "`?.` yields `undefined` and skips to the join when it is nullish",
+        );
+    }
+
+    #[test]
+    fn logical_or_short_circuits_past_its_right_operand() {
+        let source = "function f() { const x = a || b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let right = find_all(&tree, "identifier")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "b")
+            .unwrap();
+        assert_eq!(attributed(&cfg, right), vec!["identifier"]);
+        assert!(
+            skips(&cfg, cfg.entry(), cfg.exit(), right),
+            "`b` must be skippable when `a` is truthy",
+        );
+    }
+
+    #[test]
+    fn logical_or_labels_false_toward_the_right_operand() {
+        // `||` shares `short_circuit_edges`'s second arm with `??` and had no test of its
+        // own, so splitting that arm and giving `||` the `&&` pair passed the whole file.
+        let source = "function f() { const x = a || b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        let test = cfg.block_of(ident("a")).unwrap();
+        let right = cfg.block_of(ident("b")).unwrap();
+        let to = |kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(test)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(EdgeKind::False),
+            vec![right],
+            "`||` evaluates its right operand when the left is falsy",
+        );
+        assert_ne!(
+            to(EdgeKind::True),
+            vec![right],
+            "`||` skips it when the left is truthy",
+        );
+    }
+
+    #[test]
+    fn a_plain_member_chain_does_not_split() {
+        // The chain walk runs over every postfix chain; only an optional one may branch.
+        let source = "function f() { const x = a.b.c; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let last = find_all(&tree, "property_identifier")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "c")
+            .unwrap();
+        assert_eq!(
+            attributed(&cfg, last),
+            vec!["lexical_declaration"],
+            "an unsplit chain is attributed whole, with no fragment blocks",
+        );
+        assert!(!skips(&cfg, cfg.entry(), cfg.exit(), last));
     }
 }
