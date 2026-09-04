@@ -317,7 +317,7 @@ impl<'t, 's> Builder<'t, 's> {
     /// rule so that TypeScript's optional form is
     /// `seq(field('function', ..), '?.', field('type_arguments', ..), field('arguments', ..))`
     /// — a bare *anonymous* `?.` token. Matching only the first spelling is why `f?.()`
-    /// and `obj.method?.()` were modelled as unconditional calls.
+    /// and `obj.method?.()` were modeled as unconditional calls.
     ///
     /// Returned rather than reduced to a `bool` because two other things need the node
     /// itself: the continuation block starts where the marker ends, and the marker is
@@ -1680,7 +1680,7 @@ mod tests {
 
     #[test]
     fn an_optional_chain_short_circuits_past_a_later_call() {
-        // The worse half of the same defect: modelled per-link, `a?.b.c()` makes the call
+        // The worse half of the same defect: modeled per-link, `a?.b.c()` makes the call
         // happen unconditionally.
         let source = "function f() { const x = a?.b.c(); }";
         let tree = parse(source);
