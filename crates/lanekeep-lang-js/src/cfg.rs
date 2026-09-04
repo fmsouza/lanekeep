@@ -477,6 +477,39 @@ mod tests {
             "exit loses the tie it did not create"
         );
         assert_eq!(cfg.blocks().count(), 3);
+
+        // The synthetic above proves the tie-break and nothing about *reachability*: it
+        // allocates the tying block by hand. What the comment and the design's §5 claim is
+        // that construction reaches this shape for a `program` root and cannot for a
+        // function-like one, and a change making the first unreachable would leave every
+        // assertion above green with the prose stale.
+        let last_of = |cfg: &Cfg<'_>| cfg.blocks().count() - 1;
+
+        // A function-like root ends at its closing brace, past every block inside it, so
+        // nothing ties and exit does sort last.
+        let outer_source = "function f() { for (;;) { a(); } }";
+        let outer_tree = super::testing::parse(outer_source);
+        let function = super::testing::find(&outer_tree, "function_declaration");
+        let outer = Cfg::build(outer_source, function).expect("a function root builds");
+        assert_eq!(
+            outer.exit().index(),
+            last_of(&outer),
+            "nothing can start at the closing brace, so exit sorts last here",
+        );
+
+        // A `program` ends where its last statement ends, and `loop_statement` allocates its
+        // `after` block at exactly that byte. Measured on this fixture: seven blocks, four
+        // of them starting at byte 17, with `exit` at id 3.
+        let top_source = "for (;;) { a(); }";
+        let top_tree = super::testing::parse(top_source);
+        let top = Cfg::build(top_source, top_tree.root_node()).expect("a program root builds");
+        assert_eq!(top.exit().index(), 3);
+        assert_eq!(last_of(&top), 6);
+        assert_ne!(
+            top.exit().index(),
+            last_of(&top),
+            "a construct ending where the program ends ties with exit and beats it",
+        );
     }
 
     #[test]

@@ -154,11 +154,16 @@ impl<'t> Cfg<'t> {
     /// **The two parameters can disagree, and the caller is what pairs them.** `root` must
     /// be a node of the tree `source` was parsed from: construction slices `source` by node
     /// byte range, so a `source` shorter than the tree indexes out of bounds. Also `None`
-    /// for that, which closes the loud half — a `root` past the end of `source` — and only
-    /// that half. Two *different* strings of the same length still slice successfully and
-    /// answer about text nobody parsed, and no cheap check distinguishes them; a mismatched
-    /// pair remains a caller error, one that is now refused rather than a panic wherever the
-    /// walk first reads text.
+    /// for that, which turns a panic wherever the walk first reads text into a refusal at
+    /// the call.
+    ///
+    /// It closes one shape and not the hazard. A *different* string of the same length is
+    /// still accepted, and what happens then depends on the bytes: every read whose range
+    /// lands on a `char` boundary slices successfully and answers about text nobody parsed,
+    /// while one that does not panics with `byte index N is not a char boundary`. So the
+    /// remaining failure is silent on ASCII and loud on multibyte UTF-8 — the worse of those
+    /// being the silent one. No cheap check distinguishes the pair; it stays a caller error,
+    /// named here rather than left to be discovered.
     #[must_use]
     pub fn build(source: &str, root: Node<'t>) -> Option<Self> {
         if !ROOT_KINDS.contains(&root.kind()) {
@@ -322,14 +327,30 @@ impl<'t, 's> Builder<'t, 's> {
 
     /// The `?.` that makes this one link short-circuit, if it has one.
     ///
-    /// Two spellings, and only the first is what the node-types file advertises.
-    /// `member_expression` and `subscript_expression` declare an `optional_chain` field,
-    /// whose value is a named node of that kind. `call_expression` declares neither the
-    /// field nor a child of that kind: `common/define-grammar.js` overrides the base call
-    /// rule so that TypeScript's optional form is
-    /// `seq(field('function', ..), '?.', field('type_arguments', ..), field('arguments', ..))`
-    /// — a bare *anonymous* `?.` token. Matching only the first spelling is why `f?.()`
-    /// and `obj.method?.()` were modeled as unconditional calls.
+    /// **Two spellings, and the grammars disagree about which kinds use which.** A marker is
+    /// either a *named* node of kind `optional_chain`, or a bare *anonymous* `?.` token.
+    ///
+    /// - `member_expression` and `subscript_expression` declare an `optional_chain` field in
+    ///   every grammar registered here, and its value is the named node.
+    /// - `call_expression` declares that field in `tree-sitter-javascript` 0.25.0
+    ///   (`grammar.js:868`), which `register_all` registers and whose grammar also covers
+    ///   JSX — but **not** in `tree-sitter-typescript` 0.23.2, where `common/define-grammar.js`
+    ///   overrides the base call rule to
+    ///   `seq(field('function', ..), '?.', field('type_arguments', ..), field('arguments', ..))`.
+    ///   In TypeScript and TSX its declared fields are `function`, `type_arguments`,
+    ///   `arguments`, and the anonymous token is the only marker there is. Missing that is
+    ///   why `f?.()` and `obj.method?.()` were once modeled as unconditional calls.
+    ///
+    /// **The field read below is a fast path, not the second of two required cases**, and it
+    /// is worth saying so where someone might otherwise restore the opposite claim. In all
+    /// three `node-types.json` files the field's value is a named child of kind
+    /// `optional_chain`, so the scan already reaches everything the field read reaches.
+    /// Measured, by deleting each arm in turn: without the field read the whole suite stays
+    /// green; without the scan, `an_optional_call_short_circuits_past_its_arguments` fails,
+    /// alone — it is the one fixture whose marker is anonymous. (A count of passing tests
+    /// would go stale here; the named test does not.) Kept because naming the declared field states the
+    /// intent, and because it would still answer correctly for a grammar that declared the
+    /// field with some other value kind. The scan is the arm that must not be deleted.
     ///
     /// Returned rather than reduced to a `bool` because two other things need the node
     /// itself: the continuation block starts where the marker ends, and the marker is

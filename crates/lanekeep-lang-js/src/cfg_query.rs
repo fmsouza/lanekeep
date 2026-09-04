@@ -24,9 +24,10 @@ impl Cfg<'_> {
     /// # Panics
     ///
     /// Panics if `from` came from another function's graph and is out of range here; see
-    /// [`Cfg::block`]. The walk indexes its visited set by `from`, and by nothing else —
-    /// `to` is only ever compared, so a foreign `to` answers `false` rather than panicking,
-    /// which is the quieter and worse of the two failures.
+    /// [`Cfg::block`]. `from` is the only *parameter* the walk indexes — it also indexes
+    /// each edge target, but those come from the graph itself and are in range by
+    /// construction. `to` is only ever compared, so a foreign `to` answers `false` rather
+    /// than panicking, which is the quieter and worse of the two failures.
     #[must_use]
     pub fn reaches(&self, from: BlockId, to: BlockId) -> bool {
         self.walk(from, &[], to)
@@ -118,9 +119,11 @@ impl Cfg<'_> {
 
     /// Depth-first from `from`, never entering a block in `avoid`, stopping at `goal`.
     ///
-    /// `avoid` is a slice rather than a set container: it holds a handful of blocks — the
-    /// copies of one construct — so a linear scan beats hashing outright, and this file's
-    /// header states why no hash container appears here in the first place.
+    /// `avoid` is a slice rather than a set container because it holds a handful of blocks
+    /// — the copies of one construct — so a linear scan beats hashing outright. Not for the
+    /// determinism requirement: this file's header forbids *iterating* a hash container, and
+    /// a `HashSet` read only through `contains` would not breach that. Size is the whole
+    /// reason.
     fn walk(&self, from: BlockId, avoid: &[BlockId], goal: BlockId) -> bool {
         if avoid.contains(&from) {
             return false;
