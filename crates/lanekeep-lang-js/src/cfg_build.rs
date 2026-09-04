@@ -227,6 +227,21 @@ pub fn enclosing_cfg_root(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+/// The nearest `statement_block` ancestor of `node`, the lexical region `scope: 'block'`
+/// bounds an obligation to.
+#[must_use]
+#[allow(unreachable_pub, dead_code)]
+pub fn enclosing_block(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "statement_block" {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
 impl<'t, 's> Builder<'t, 's> {
     /// The text of `node`, carrying the *source's* lifetime rather than a borrow of `self`.
     ///
