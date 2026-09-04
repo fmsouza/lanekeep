@@ -754,13 +754,31 @@ mod tests {
         let source = "function f() { const x = a && b; }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
-        let left = find_all(&tree, "identifier")
-            .into_iter()
-            .find(|n| &source[n.byte_range()] == "a")
-            .unwrap();
-        let test = cfg.block_of(left).unwrap();
-        let kinds: Vec<EdgeKind> = cfg.block(test).successors.iter().map(|e| e.kind).collect();
-        assert!(kinds.contains(&EdgeKind::True) && kinds.contains(&EdgeKind::False));
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        let test = cfg.block_of(ident("a")).unwrap();
+        let right = cfg.block_of(ident("b")).unwrap();
+        // Direction, not membership. Asserting only that a True and a False edge exist
+        // lets the whole label convention be inverted with nothing noticing — and #193
+        // and #194 read these labels off the graph.
+        let to = |kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(test)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(EdgeKind::True),
+            vec![right],
+            "`&&` evaluates its right operand when true"
+        );
+        assert_ne!(to(EdgeKind::False), vec![right], "`&&` skips it when false");
     }
 
     #[test]
@@ -773,6 +791,42 @@ mod tests {
             .find(|n| &source[n.byte_range()] == "b")
             .unwrap();
         assert!(skips(&cfg, cfg.entry(), cfg.exit(), right));
+    }
+
+    #[test]
+    fn nullish_coalescing_labels_false_toward_the_right_operand() {
+        // The opposite polarity to `&&`, and the reason row 3's mutation was survivable:
+        // the condition is "the left operand is non-nullish", so `False` is the edge that
+        // evaluates the right-hand side.
+        let source = "function f() { const x = a ?? b; }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let ident = |name: &str| {
+            find_all(&tree, "identifier")
+                .into_iter()
+                .find(|n| &source[n.byte_range()] == name)
+                .unwrap()
+        };
+        let test = cfg.block_of(ident("a")).unwrap();
+        let right = cfg.block_of(ident("b")).unwrap();
+        let to = |kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(test)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(EdgeKind::False),
+            vec![right],
+            "`??` evaluates its right operand when the left is nullish"
+        );
+        assert_ne!(
+            to(EdgeKind::True),
+            vec![right],
+            "`??` skips it when the left is non-nullish"
+        );
     }
 
     #[test]
