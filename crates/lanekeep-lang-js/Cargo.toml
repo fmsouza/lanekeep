@@ -17,6 +17,12 @@ tree-sitter = { workspace = true }
 tree-sitter-javascript = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 
+[[bench]]
+name = "cfg"
+# No harness, matching `crates/lanekeep-types/benches/construction.rs`: this reports an
+# absolute figure a human reads once, not a statistical comparison against a baseline.
+harness = false
+
 [build-dependencies]
 blake3 = { workspace = true }
 

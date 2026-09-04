@@ -3221,4 +3221,60 @@ function f() {
             "a throw in a finally is caught by a handler outside the try it belongs to",
         );
     }
+
+    /// A function body of `n` statements, mixing straight-line and branching forms.
+    ///
+    /// Duplicated verbatim in `benches/cfg.rs`, which is a separate crate target compiled
+    /// without `cfg(test)` and so cannot reach this module. Keep the two in step.
+    #[expect(
+        clippy::format_push_string,
+        reason = "builds a one-off test fixture, not a hot path; `allow-*-in-tests` does not \
+                  reach this lint the way it does `unwrap`/`expect`"
+    )]
+    fn synthetic(n: usize) -> String {
+        let mut source = String::from("function f(x) {\n");
+        for i in 0..n {
+            match i % 4 {
+                0 => source.push_str(&format!("  const v{i} = x + {i};\n")),
+                1 => source.push_str(&format!("  if (v{} > 0) {{ g({i}); }}\n", i - 1)),
+                2 => source.push_str(&format!("  while (v{} > {i}) {{ h({i}); }}\n", i - 2)),
+                _ => source.push_str(&format!("  const w{i} = a{i} && b{i};\n")),
+            }
+        }
+        source.push_str("  return 0;\n}\n");
+        source
+    }
+
+    #[test]
+    fn blocks_and_edges_stay_linear_in_statement_count() {
+        // A wall-clock ceiling is what AGENTS.md records timing out at 120 s under a
+        // loaded gate while passing alone in 33 s. Shape is what actually catches the
+        // regression that would blow the cold budget, and it cannot flake.
+        let mut measurements = Vec::new();
+        for n in [100usize, 200, 400] {
+            let source = synthetic(n);
+            let tree = parse(&source);
+            let cfg = Cfg::build(&source, find(&tree, "function_declaration")).unwrap();
+            let blocks = cfg.blocks().count();
+            let edges: usize = cfg.blocks().map(|(_, b)| b.successors.len()).sum();
+            measurements.push((n, blocks, edges));
+        }
+        for &(n, blocks, edges) in &measurements {
+            assert!(
+                blocks < n * 8,
+                "blocks must stay linear: {blocks} for {n} statements ({measurements:?})",
+            );
+            assert!(
+                edges < n * 12,
+                "edges must stay linear: {edges} for {n} statements ({measurements:?})",
+            );
+        }
+        // Doubling the input must not more than roughly double the graph.
+        let (_, small, _) = measurements[0];
+        let (_, large, _) = measurements[2];
+        assert!(
+            large < small * 6,
+            "4x the statements gave {large} blocks against {small} — superlinear",
+        );
+    }
 }
