@@ -8,6 +8,21 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set dotenv-load := false
 
+# The Go toolchain every recipe here builds through, pinned because its version is one of the
+# four inputs to `go-builtins.wasm`'s bytes — and a component's bytes are a `ruleset_hash`
+# input, so two people on one commit with two Go versions compute two cache keys. Keep it equal
+# to `go-version` in `.github/workflows/ci.yml`, which installs this same version and is where
+# the other three pins live.
+#
+# Without it a host `go` newer than TinyGo supports fails `crates/lanekeep-rules/build.rs` with
+# `requires go version 1.19 through 1.26, got go1.27` — and because that build script runs under
+# `cargo`, it takes `just test` and both gates down with it rather than only `just go-rules`.
+#
+# `GOTOOLCHAIN` rather than a `_require` on the version: the go command downloads and re-execs
+# the named toolchain itself, so an unsuitable host `go` costs one download instead of an error
+# nobody can clear without changing their machine.
+export GOTOOLCHAIN := "go1.26.5"
+
 # Show available recipes.
 default:
     @just --list --unsorted
