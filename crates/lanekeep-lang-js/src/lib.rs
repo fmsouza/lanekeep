@@ -6,6 +6,31 @@
 //! extensions, because they are genuinely different grammars: TSX gives up the
 //! angle-bracket type assertion `<T>expr` so the same syntax can open a JSX element.
 //! Parsing a `.tsx` file with the TypeScript grammar produces errors on valid code.
+//!
+//! # The control-flow graph
+//!
+//! [`mod@cfg`] holds a per-function control-flow graph for TypeScript and TSX: basic blocks
+//! split at every branch — short-circuit operators included, since `&&`, `??` and `?.` are
+//! control flow inside an expression — and a `finally` emitted once per distinct
+//! continuation rather than special-cased. Nothing in the engine calls it. #193's obligation
+//! analysis and #194's taint analysis are its first two consumers, over
+//! `on_all_paths_from` and `reaches` respectively, which is why the graph and the two
+//! queries are public from a module neither of them exists in yet.
+//!
+//! It is not a [`Language`] method, unlike everything else this crate exposes that way.
+//! Construction dispatches on tree-sitter node kind, never on a language identifier, so a
+//! trait method would commit to a signature before a second implementor exists to check it
+//! against — the opposite of the day-one stance `docs/architecture.md`'s `Language` trait
+//! section gives [`Language`] itself: implement it before a second language exists, because
+//! it is cheap now and impossible to retrofit.
+//!
+//! It lives in this crate rather than a `lanekeep-cfg` one on the precedent
+//! `crates/lanekeep-nodes/src/lib.rs` sets: that crate lived in `lanekeep-js` until
+//! `lanekeep-wasm` became a second engine needing its exact type, and was extracted then
+//! rather than in anticipation. **What would move this out is a second language needing a
+//! CFG** — only `cfg_build`'s construction reads node kinds; the language-agnostic part
+//! today is just the block/edge model and the two traversals in [`mod@cfg`], and one
+//! implementor is not enough to know where that seam actually belongs.
 
 pub mod binding;
 pub mod cfg;
