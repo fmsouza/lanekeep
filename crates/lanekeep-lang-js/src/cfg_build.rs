@@ -2323,12 +2323,15 @@ function f() {
 
     #[test]
     fn a_switch_with_no_default_falls_out_when_no_case_matches() {
-        let source = "function f(x) { switch (x) { case 1: a(); } after(); }";
+        // Not `case 1: a();`: that body falls through to after-switch on its own (the
+        // ordinary "no next arm" fallthrough), so `after` stays reachable from `test` even
+        // with the no-default `False` edge deleted outright — measured by mutation, see
+        // the Task 5 fix report. `return` cuts the case body's own fallthrough, which
+        // makes the `False` edge the only route from `test` to `after`.
+        let source = "function f(x) { switch (x) { case 1: return; } after(); }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
-        let after = cfg
-            .block_of(find_all(&tree, "expression_statement")[1])
-            .unwrap();
+        let after = cfg.block_of(find(&tree, "expression_statement")).unwrap();
         let test = cfg
             .block_of(
                 find(&tree, "switch_case")
@@ -2336,7 +2339,19 @@ function f() {
                     .unwrap(),
             )
             .unwrap();
-        assert!(skips(&cfg, test, after, find(&tree, "switch_case")));
+        let to = |kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(test)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(EdgeKind::False),
+            vec![after],
+            "with no default, the last failing test must reach the code after the switch"
+        );
     }
 
     #[test]
