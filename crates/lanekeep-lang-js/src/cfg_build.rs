@@ -269,9 +269,9 @@ impl<'t, 's> Builder<'t, 's> {
             "labeled_statement" => self.labeled_statement(node, current),
             "break_statement" => self.jump(node, current, false),
             "continue_statement" => self.jump(node, current, true),
-            // Task 5 (`switch`) and Task 6 (`try`/`catch`/`finally`, `throw`) add arms
-            // here. Everything unlisted is a statement whose only flow is through its own
-            // expressions.
+            "switch_statement" => self.switch_statement(node, current),
+            // Task 6 (`try`/`catch`/`finally`, `throw`) adds arms here. Everything
+            // unlisted is a statement whose only flow is through its own expressions.
             _ => {
                 let end = self.expression(node, current);
                 self.cfg.attribute(end, node);
@@ -824,6 +824,94 @@ impl<'t, 's> Builder<'t, 's> {
         }
         Some(after)
     }
+
+    /// Case tests chain by their `False` edge; fallthrough is a `Normal` edge from one
+    /// arm's own fall-through block to the next arm's entry, in source order.
+    ///
+    /// `switch_case` and `switch_default` are the only two kinds `body`'s named children
+    /// can be. Only the former carries a `value`, which is what keeps `default` out of
+    /// the test chain — it takes no part in deciding which arm runs, only in *where
+    /// control lands* when every test fails.
+    fn switch_statement(&mut self, node: Node<'t>, current: BlockId) -> Option<BlockId> {
+        let body = node.child_by_field_name("body")?;
+        let mut block = current;
+        if let Some(value) = node.child_by_field_name("value") {
+            block = self.expression(value, block);
+            self.cfg.attribute(block, value);
+        }
+
+        let mut cursor = body.walk();
+        let arms: Vec<Node<'t>> = body.named_children(&mut cursor).collect();
+        let after = self.cfg.alloc(node.end_byte());
+
+        // One entry block per arm, allocated up front so a fallthrough edge can name the
+        // next arm before it has been walked.
+        let entries: Vec<BlockId> = arms
+            .iter()
+            .map(|arm| self.cfg.alloc(arm.start_byte()))
+            .collect();
+
+        // The test chain, over the `switch_case` arms only. `switch_default` has no
+        // `value` and takes no part in it.
+        let mut previous_test: Option<BlockId> = None;
+        let mut chain_start: Option<BlockId> = None;
+        for (index, arm) in arms.iter().enumerate() {
+            let Some(value) = arm.child_by_field_name("value") else {
+                continue;
+            };
+            let test = self.cfg.alloc(value.start_byte());
+            let end = self.expression(value, test);
+            self.cfg.attribute(end, value);
+            self.cfg.edge(end, entries[index], EdgeKind::True, false);
+            match previous_test {
+                Some(previous) => self.cfg.edge(previous, test, EdgeKind::False, false),
+                None => chain_start = Some(test),
+            }
+            previous_test = Some(end);
+        }
+
+        self.cfg
+            .edge(block, chain_start.unwrap_or(after), EdgeKind::Normal, false);
+
+        // A `default` need not be last, so it is the *final failing test*'s destination
+        // rather than the chain's tail.
+        let default_entry = arms
+            .iter()
+            .position(|arm| arm.kind() == "switch_default")
+            .map(|index| entries[index]);
+        if let Some(last) = previous_test {
+            self.cfg
+                .edge(last, default_entry.unwrap_or(after), EdgeKind::False, false);
+        }
+
+        self.targets.push(Target {
+            labels: std::mem::take(&mut self.pending_labels),
+            break_to: after,
+            // A `switch` answers `break` and passes `continue` through to the enclosing
+            // loop, which is why this is `None` rather than `Some(after)`.
+            continue_to: None,
+            finally_depth: self.finallys.len(),
+        });
+        for (index, arm) in arms.iter().enumerate() {
+            let mut arm_cursor = arm.walk();
+            let statements: Vec<Node<'t>> = arm
+                .children_by_field_name("body", &mut arm_cursor)
+                .collect();
+            let mut tail = Some(entries[index]);
+            for statement in statements {
+                let Some(block) = tail else { break };
+                tail = self.statement(statement, block);
+            }
+            // Fallthrough: the next arm's entry in source order, or out of the switch.
+            if let Some(tail) = tail {
+                let next = entries.get(index + 1).copied().unwrap_or(after);
+                self.cfg.edge(tail, next, EdgeKind::Normal, false);
+            }
+        }
+        self.targets.pop();
+
+        Some(after)
+    }
 }
 
 #[cfg(test)]
@@ -835,14 +923,6 @@ mod tests {
     fn shape(cfg: &Cfg<'_>) -> Vec<Vec<&'static str>> {
         cfg.blocks()
             .map(|(_, b)| b.nodes.iter().map(tree_sitter::Node::kind).collect())
-            .collect()
-    }
-
-    fn successors(cfg: &Cfg<'_>, id: BlockId) -> Vec<(BlockId, EdgeKind)> {
-        cfg.block(id)
-            .successors
-            .iter()
-            .map(|e| (e.target, e.kind))
             .collect()
     }
 
@@ -922,13 +1002,35 @@ mod tests {
 
     #[test]
     fn an_if_splits_into_test_then_and_join() {
+        // Direction, not membership: asserting only that a True and a False edge exist
+        // passes even with the consequence and the join swapped between them — the
+        // dominant defect on this branch, found five times across three tasks. Pin which
+        // target each label actually leads to instead.
         let source = "function f() { if (c) { a(); } b(); }";
         let tree = parse(source);
         let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
         let test = cfg.block_of(find(&tree, "if_statement")).unwrap();
-        let kinds: Vec<EdgeKind> = successors(&cfg, test).into_iter().map(|(_, k)| k).collect();
-        assert!(kinds.contains(&EdgeKind::True), "got {kinds:?}");
-        assert!(kinds.contains(&EdgeKind::False), "got {kinds:?}");
+        let statements = find_all(&tree, "expression_statement");
+        let then_body = cfg.block_of(statements[0]).unwrap();
+        let after = cfg.block_of(statements[1]).unwrap();
+        let to = |kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(test)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(EdgeKind::True),
+            vec![then_body],
+            "the condition being true must enter the consequence"
+        );
+        assert_eq!(
+            to(EdgeKind::False),
+            vec![after],
+            "the condition being false must reach the join, not the consequence"
+        );
     }
 
     #[test]
@@ -1803,6 +1905,39 @@ function f() {
     }
 
     #[test]
+    fn a_simple_while_condition_labels_true_toward_the_body() {
+        // Task 4 hardened only `while (a && b)`-style fixtures, where the condition's own
+        // split forces `header != test`. A plain, non-compound condition — where
+        // `header == test`, the ordinary case in real code — had no test asserting which
+        // way its True/False edges point at all, compound or not.
+        let source = "function f() { while (c) { a(); } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let header = cfg.block_of(find(&tree, "while_statement")).unwrap();
+        let statements = find_all(&tree, "expression_statement");
+        let body_entry = cfg.block_of(statements[0]).unwrap();
+        let after = cfg.block_of(statements[1]).unwrap();
+        let to = |kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(header)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(EdgeKind::True),
+            vec![body_entry],
+            "a plain while's True edge must enter the body"
+        );
+        assert_eq!(
+            to(EdgeKind::False),
+            vec![after],
+            "a plain while's False edge must reach the code after the loop"
+        );
+    }
+
+    #[test]
     fn a_compound_while_condition_puts_the_loops_edges_on_the_join_not_the_header() {
         // `while (a && b)`'s header evaluates only `a`; `split` emits `a`'s own True (to
         // `b`'s block) and False (to the join) *from* `header`. The loop's own True/False
@@ -2066,6 +2201,186 @@ function f() {
             targets,
             vec![header],
             "continue must target the header, not the join or b's block"
+        );
+    }
+
+    #[test]
+    fn switch_cases_fall_through_to_the_next_body() {
+        let source = "function f(x) { switch (x) { case 1: a(); case 2: b(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let statements = find_all(&tree, "expression_statement");
+        let first = cfg.block_of(statements[0]).unwrap();
+        let second = cfg.block_of(statements[1]).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(first)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert!(
+            targets.contains(&second),
+            "case 1 must fall through to case 2"
+        );
+    }
+
+    #[test]
+    fn a_break_cuts_the_fallthrough() {
+        let source = "function f(x) { switch (x) { case 1: a(); break; case 2: b(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let statements = find_all(&tree, "expression_statement");
+        let first = cfg.block_of(statements[0]).unwrap();
+        let second = cfg.block_of(statements[1]).unwrap();
+        assert!(
+            !skips(&cfg, first, second, find(&tree, "function_declaration")),
+            "a break must remove the fallthrough edge",
+        );
+    }
+
+    #[test]
+    fn case_tests_chain_by_the_false_edge() {
+        // Direction, not membership: `kinds.contains(&EdgeKind::True) &&
+        // kinds.contains(&EdgeKind::False)` would also pass with the match and the
+        // chain-onward edges swapped — the same dominant defect flagged above for `if`.
+        // Pin which target each edge actually leads to.
+        let source = "function f(x) { switch (x) { case 1: a(); break; case 2: b(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let cases = find_all(&tree, "switch_case");
+        let first_test = cfg
+            .block_of(cases[0].child_by_field_name("value").unwrap())
+            .unwrap();
+        let second_test = cfg
+            .block_of(cases[1].child_by_field_name("value").unwrap())
+            .unwrap();
+        let first_body = cfg
+            .block_of(find_all(&tree, "expression_statement")[0])
+            .unwrap();
+        let to = |kind: EdgeKind| -> Vec<BlockId> {
+            cfg.block(first_test)
+                .successors
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.target)
+                .collect()
+        };
+        assert_eq!(
+            to(EdgeKind::True),
+            vec![first_body],
+            "case 1's test must enter its own body when it matches"
+        );
+        assert_eq!(
+            to(EdgeKind::False),
+            vec![second_test],
+            "case 1's test must chain to case 2's test when it doesn't match"
+        );
+    }
+
+    #[test]
+    fn a_default_in_a_non_final_position_is_the_last_tests_false_edge() {
+        let source = "function f(x) { switch (x) { case 1: a(); default: d(); case 2: b(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let cases = find_all(&tree, "switch_case");
+        let last_test = cfg
+            .block_of(cases[1].child_by_field_name("value").unwrap())
+            .unwrap();
+        let default_body = cfg
+            .block_of(find(&tree, "switch_default").named_child(0).unwrap())
+            .unwrap();
+        let falsy: Vec<BlockId> = cfg
+            .block(last_test)
+            .successors
+            .iter()
+            .filter(|e| e.kind == EdgeKind::False)
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            falsy,
+            vec![default_body],
+            "the last failing test must reach `default`"
+        );
+    }
+
+    #[test]
+    fn a_default_stays_in_the_fallthrough_chain_at_its_own_position() {
+        let source = "function f(x) { switch (x) { case 1: a(); default: d(); case 2: b(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let statements = find_all(&tree, "expression_statement");
+        let (a, d, b) = (
+            cfg.block_of(statements[0]).unwrap(),
+            cfg.block_of(statements[1]).unwrap(),
+            cfg.block_of(statements[2]).unwrap(),
+        );
+        let out = |id: BlockId| -> Vec<BlockId> {
+            cfg.block(id).successors.iter().map(|e| e.target).collect()
+        };
+        assert!(out(a).contains(&d), "case 1 falls through to default");
+        assert!(out(d).contains(&b), "default falls through to case 2");
+    }
+
+    #[test]
+    fn a_switch_with_no_default_falls_out_when_no_case_matches() {
+        let source = "function f(x) { switch (x) { case 1: a(); } after(); }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let after = cfg
+            .block_of(find_all(&tree, "expression_statement")[1])
+            .unwrap();
+        let test = cfg
+            .block_of(
+                find(&tree, "switch_case")
+                    .child_by_field_name("value")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(skips(&cfg, test, after, find(&tree, "switch_case")));
+    }
+
+    #[test]
+    fn every_statement_of_a_multi_statement_case_is_reached() {
+        // `switch_case`'s `body` is a repeated field. `child_by_field_name` returns the
+        // first only, which would silently drop `b()`.
+        let source = "function f(x) { switch (x) { case 1: a(); b(); } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        for statement in find_all(&tree, "expression_statement") {
+            // The attributed kind, not `.is_some()`: with `child_by_field_name` the whole
+            // `switch_case` would be attributed instead, and its range still contains
+            // every statement inside it.
+            assert!(
+                attributed(&cfg, statement).contains(&"expression_statement"),
+                "dropped a case statement: got {:?}",
+                attributed(&cfg, statement),
+            );
+        }
+    }
+
+    #[test]
+    fn continue_in_a_switch_inside_a_for_targets_the_increment() {
+        // A `switch`'s own `Target` must have `continue_to: None`, so an unlabeled
+        // `continue` passes through it to the enclosing loop instead of being
+        // intercepted by the switch's own after-block. None of this file's other
+        // `for`/`continue` fixtures put a `switch` in the loop body, so none of them can
+        // catch a switch that wrongly answers `continue` itself.
+        let source =
+            "function f(x) { for (let i = 0; i < n; i++) { switch (x) { case 1: continue; } } }";
+        let tree = parse(source);
+        let cfg = Cfg::build(source, find(&tree, "function_declaration")).unwrap();
+        let jump = cfg.block_of(find(&tree, "continue_statement")).unwrap();
+        let increment = cfg.block_of(find(&tree, "update_expression")).unwrap();
+        let targets: Vec<BlockId> = cfg
+            .block(jump)
+            .successors
+            .iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![increment],
+            "continue inside a switch must pass through to the for loop's increment",
         );
     }
 }
