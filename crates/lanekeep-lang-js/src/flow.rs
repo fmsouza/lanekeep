@@ -3,8 +3,19 @@
 //! A value-level may-taint: a `@source` value that reaches a `@sink` with no intervening
 //! `@sanitizer` is one [`FlowPath`]. It is resolved on demand — from each sink backward
 //! through the def-use chain (declarators and reassignments), following local identifier
-//! aliases and cutting at sanitizers — with the per-function [`Cfg`](crate::cfg::Cfg)'s
-//! reachability deciding whether a definition reaches the sink (the flow-sensitivity).
+//! aliases and cutting at sanitizers.
+//!
+//! Flow-sensitivity is **reaching-definitions with kill**: at each read of a binding, only
+//! the definitions that actually reach that read taint it — the nearest definition on each
+//! control-flow path, with no later definition of the same binding between it and the read.
+//! Intra-block statement order decides within a block (a later write clobbers an earlier
+//! one); the per-function [`Cfg`](crate::cfg::Cfg)'s reachability decides across blocks,
+//! avoiding every block that redefines the binding. A definition to a sanitizer's result or
+//! to any other clean value therefore *kills* an earlier tainted definition — the in-place
+//! sanitizer `s = redact(s)` and the clean reassignment `s = "public"` both cut the flow,
+//! unifying the sanitizer-cut and reassignment-kill into one mechanism. Path-insensitively:
+//! a kill on one branch does not kill on another, so if any path reaches the read with a
+//! tainted nearest definition, the flow is reported.
 //!
 //! v1 is intra-procedural, path-insensitive, and does not follow taint through a call's
 //! arguments. See
@@ -43,7 +54,6 @@ impl FlowAnalyzer for JsFlowAnalyzer {
                 Some((root, cfg)) => (Some(*root), Some(cfg)),
                 None => (None, None),
             };
-            let sink_block = cfg.and_then(|cfg| cfg.block_of(sink));
             let taint = Taint {
                 tree,
                 source,
@@ -52,7 +62,7 @@ impl FlowAnalyzer for JsFlowAnalyzer {
                 cfg,
                 root,
             };
-            for fact in taint.taint_of(sink, sink_block, 0) {
+            for fact in taint.taint_of(sink, 0) {
                 flows.push(FlowPath {
                     source: fact.source,
                     sink,
@@ -73,6 +83,7 @@ struct Fact<'t> {
 
 /// A definition of a binding: the assignment site (declarator or `=` expression) and the
 /// right-hand-side value it stores.
+#[derive(Clone, Copy)]
 struct Def<'t> {
     /// The `variable_declarator` or `assignment_expression` — the step recorded for an alias
     /// hop.
@@ -101,7 +112,7 @@ impl<'t> Taint<'_, 't> {
     /// Value-level: a `@sanitizer` call yields a clean value regardless of its arguments,
     /// an arbitrary non-source call carries nothing (v1 does not track taint through a
     /// call), and only a direct `@source` or a local alias of a tainted binding is tainted.
-    fn taint_of(&self, expr: Node<'t>, sink_block: Option<BlockId>, depth: u32) -> Vec<Fact<'t>> {
+    fn taint_of(&self, expr: Node<'t>, depth: u32) -> Vec<Fact<'t>> {
         if depth >= MAX_DEPTH {
             return Vec::new();
         }
@@ -127,7 +138,7 @@ impl<'t> Taint<'_, 't> {
                 .collect();
         }
         match expr.kind() {
-            "identifier" => self.taint_of_identifier(expr, sink_block, depth),
+            "identifier" => self.taint_of_identifier(expr, depth),
             // A non-source, non-sanitizer call is opaque: v1 does not follow taint through a
             // call's arguments (the alias-through-call false negative, spec §13). Only a
             // direct source or a local identifier alias carries taint.
@@ -136,23 +147,19 @@ impl<'t> Taint<'_, 't> {
     }
 
     /// The taint facts an identifier read carries: resolve it to its declaration and follow
-    /// each reaching definition.
-    fn taint_of_identifier(
-        &self,
-        ident: Node<'t>,
-        sink_block: Option<BlockId>,
-        depth: u32,
-    ) -> Vec<Fact<'t>> {
+    /// the definitions that *reach this read*, cutting later-clobbered ones.
+    ///
+    /// The use point is `ident` itself, so each level of the alias walk asks the
+    /// reaching-definitions question at its own read — the inner `a` of `s = a` is resolved
+    /// against the defs that reach *it*, not against the sink.
+    fn taint_of_identifier(&self, ident: Node<'t>, depth: u32) -> Vec<Fact<'t>> {
         let Some(decl) = JsBindingResolver.declaration_of(self.tree, self.source, ident) else {
             return Vec::new();
         };
         let mut facts = Vec::new();
-        for def in self.definitions_of(decl) {
-            if !self.reaches_sink(def.rhs, sink_block) {
-                continue;
-            }
+        for def in self.reaching_defs(decl, ident) {
             let alias = def.rhs.kind() == "identifier";
-            for mut fact in self.taint_of(def.rhs, sink_block, depth.saturating_add(1)) {
+            for mut fact in self.taint_of(def.rhs, depth.saturating_add(1)) {
                 if alias {
                     // A `const b = a` / `b = a` hop is one step; a direct source assignment
                     // adds none.
@@ -231,16 +238,91 @@ impl<'t> Taint<'_, 't> {
         found
     }
 
-    /// Whether a definition's block can reach the sink's block. Absent a CFG, or a block for
-    /// either node, the definition is admitted (over-approximate may-taint).
-    fn reaches_sink(&self, def: Node<'t>, sink_block: Option<BlockId>) -> bool {
-        let (Some(cfg), Some(sink_block)) = (self.cfg, sink_block) else {
+    /// The definitions of `decl` that reach a read at `use_node`, by reaching-definitions
+    /// with kill: the nearest definition on each control-flow path with no later definition
+    /// of the same binding between it and the read.
+    ///
+    /// Two stages. **Within the read's own block**, the nearest preceding definition is the
+    /// unique reaching one — control flowing to the read passes through it, clobbering any
+    /// earlier definition in the block and any definition entering from outside, so nothing
+    /// else reaches. This is the intra-block-order kill (a later same-block write wins) and
+    /// it is what makes the in-place sanitizer and the clean reassignment cut. **Across
+    /// blocks**, when no definition precedes the read inside its block, a definition reaches
+    /// only along a path that redefines the binding nowhere in between — every *other* block
+    /// holding a definition of `decl` is avoided. Path-insensitively: a kill on one branch
+    /// does not kill on another, since a single surviving path is a witness.
+    ///
+    /// Absent a CFG, or a block for the read, every definition is admitted — the
+    /// over-approximating may-taint bias, never a false negative.
+    fn reaching_defs(&self, decl: Node<'t>, use_node: Node<'t>) -> Vec<Def<'t>> {
+        let all = self.definitions_of(decl);
+        let use_block = self.cfg.and_then(|cfg| cfg.block_of(use_node));
+        let use_pos = use_node.start_byte();
+
+        // A definition "precedes" the read when its store completes before the read: the
+        // right-hand side ends at or before the read's first byte. Distinct statements order
+        // by position; the one subtlety this closes is a self-referential store like
+        // `s = f(s)`, whose right-hand side *contains* the inner read of `s` — that read
+        // sees the prior definition, and `rhs.end > use.start` correctly excludes this one.
+        let def_block = |def: &Def<'t>| self.cfg.and_then(|cfg| cfg.block_of(def.rhs));
+        let precedes = |def: &Def<'t>| def.rhs.end_byte() <= use_pos;
+
+        // Stage 1 — the nearest definition preceding the read inside its own block wins
+        // outright: it is on every path to the read (a block is straight-line), so it
+        // clobbers both earlier in-block definitions and every definition from another block.
+        if let Some(use_block) = use_block {
+            let nearest = all
+                .iter()
+                .filter(|def| precedes(def) && def_block(def) == Some(use_block))
+                .max_by_key(|def| def.rhs.start_byte());
+            if let Some(&nearest) = nearest {
+                return vec![nearest];
+            }
+        }
+
+        // Stage 2 — no definition precedes the read in its block, so reaching definitions
+        // arrive from other blocks (or, for a definition at or after the read in the read's
+        // own block, only around a loop back-edge). A definition's block must reach the read
+        // along a path redefining the binding nowhere between: avoid every other block that
+        // holds a definition of `decl`.
+        let mut def_blocks: Vec<BlockId> = all.iter().filter_map(def_block).collect();
+        def_blocks.sort_unstable();
+        def_blocks.dedup();
+
+        all.iter()
+            .copied()
+            .filter(|def| self.definition_reaches(def_block(def), use_block, &def_blocks))
+            .collect()
+    }
+
+    /// Whether a definition in block `db` reaches a read in block `ub` without the binding
+    /// being redefined in between — the Stage 2 test of [`Self::reaching_defs`].
+    fn definition_reaches(
+        &self,
+        db: Option<BlockId>,
+        ub: Option<BlockId>,
+        def_blocks: &[BlockId],
+    ) -> bool {
+        let (Some(cfg), Some(db), Some(ub)) = (self.cfg, db, ub) else {
+            // No graph, or an unattributed definition or read: admit it (may-taint bias).
             return true;
         };
-        match cfg.block_of(def) {
-            Some(def_block) => cfg.reaches(def_block, sink_block),
-            None => true,
+        if db == ub {
+            // Same block, and Stage 1 already claimed any definition preceding the read, so
+            // this one is at or after it — reachable only by a back-edge. Admitted as the
+            // sound over-approximation for the loop-carried case (no fixture exercises it;
+            // the may-analysis keeps it rather than risk a false negative on a real loop).
+            return true;
         }
+        // Every *other* definition block is a kill on the way from `db` to `ub`; `db` itself
+        // is excluded so a loop back through it re-generates, not kills, and `ub` is excluded
+        // because Stage 1 established it holds no definition preceding the read.
+        let avoid: Vec<BlockId> = def_blocks
+            .iter()
+            .copied()
+            .filter(|&block| block != db && block != ub)
+            .collect();
+        cfg.reaches_avoiding(db, &avoid, ub)
     }
 }
 
@@ -549,5 +631,138 @@ mod tests {
         assert_eq!(flows[0].2, 0, "log(a) reads the source directly");
         assert_eq!(flows[1].1, "b");
         assert_eq!(flows[1].2, 1, "log(b) reads it through one alias");
+    }
+
+    #[test]
+    fn sanitize_in_place_kills_the_declarator() {
+        // Case (a): reassigning `s` to `redact(s)` clobbers the tainted declarator. The sink
+        // reads the sanitized value, so this is silent — matching the new-variable form
+        // `const c = redact(s); log(c)`, which was already clean. The two forms must agree.
+        let flows = run(
+            "function f() { let s = getSecret(); s = redact(s); log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "an in-place sanitizer must kill the taint"
+        );
+    }
+
+    #[test]
+    fn reassign_to_a_clean_value_kills_taint() {
+        // Case (b): a later clean redefinition kills taint (spec §5).
+        let flows = run(
+            "function f() { let s = getSecret(); s = \"public\"; log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty(), "a clean reassignment must kill the taint");
+    }
+
+    #[test]
+    fn a_tainted_def_last_in_the_block_is_not_killed() {
+        // Soundness guard 1: the tainted def is the LAST in the block, so it reaches the
+        // use. A kill that ignored intra-block statement order would wrongly drop it.
+        let flows = run(
+            "function f() { let s = \"public\"; s = getSecret(); log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "the last def before the use must survive");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn sanitize_then_retaint_in_one_block_reports() {
+        // Soundness guard 2: sanitize, then re-taint, in one block. The re-taint is the
+        // nearest preceding def of the use and must report.
+        let flows = run(
+            "function f(x) { let s = redact(x); s = getSecret(); log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "the re-taint must survive the earlier sanitize"
+        );
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn a_partial_sanitize_on_one_branch_still_reports() {
+        // Path-insensitivity: the path skipping the `if` reaches the sink with the tainted
+        // declarator, so a sanitize on only one branch does not kill.
+        let flows = run(
+            "function f(c) { let s = getSecret(); if (c) { s = redact(s); } log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "the branch-skipping path keeps the taint");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn sanitizing_both_branches_kills_taint() {
+        // Every path from the tainted declarator to the sink passes a sanitizer, so the
+        // reaching-defs kill removes it on both branches.
+        let flows = run(
+            "function f(c) { let s = getSecret(); if (c) { s = redact(s); } else { s = redact(s); } log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "a sanitizer on every branch kills the taint"
+        );
+    }
+
+    #[test]
+    fn steps_are_the_shorter_of_two_unequal_chains() {
+        // One (source, sink) pair reached by a one-hop chain (then) and a two-hop chain
+        // (else). Canonicalization keeps the shorter, locking "strictly shorter wins" at
+        // unequal lengths — `steps_are_the_shortest_chain` only exercises equal lengths.
+        let flows = run_full(
+            "function f(c) { const a = getSecret(); let s; if (c) { s = a; } else { const b = a; s = b; } log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "the two chains collapse to one (source, sink)"
+        );
+        assert_eq!(flows[0].0, "getSecret()");
+        assert_eq!(flows[0].2, 1, "the shorter (one-hop) chain wins");
+    }
+
+    #[test]
+    fn a_propagating_reassignment_on_every_branch_still_reports() {
+        // Soundness of the avoid-based kill. Both branches redefine `s`, so the declarator's
+        // block is avoided on every path to the sink and does not itself reach it. The kill
+        // must not lose the flow: each `s = t` reassignment is a def that *reaches* the sink
+        // and carries taint (t aliases the source), so reaching-definitions surfaces it
+        // through the intervening def. A kill that only asked "does the original source
+        // survive" would drop this — a false negative.
+        let flows = run(
+            "function f(c) { let s = getSecret(); let t = s; if (c) { s = t; } else { s = t; } log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "a taint-propagating reassignment on every branch still reaches the sink"
+        );
+        assert_eq!(flows[0].0, "getSecret()");
     }
 }

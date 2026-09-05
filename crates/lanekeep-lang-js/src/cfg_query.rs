@@ -33,6 +33,28 @@ impl Cfg<'_> {
         self.walk(from, &[], to)
     }
 
+    /// Whether control can reach `to` from `from` without entering any block in `avoid`.
+    ///
+    /// The may-question with a kill set — [`Cfg::reaches`] is this with an empty `avoid`.
+    /// lanekeep #194's reaching-definitions asks it as "does this definition's block reach
+    /// the use without passing through a block that redefines the same binding," the `avoid`
+    /// set being the other definitions' blocks. A path routing around every avoided block is
+    /// a witness; absent one, every path is killed.
+    ///
+    /// Reflexive only when `from == to` and `from` is not itself in `avoid`: `walk` returns
+    /// `false` at once for a `from` in the set (its first line), so a caller wanting a
+    /// non-trivial cycle back to `from` must start the walk from a successor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from` came from another function's graph and is out of range here; see
+    /// [`Cfg::reaches`], whose hazard this shares. `to` and the `avoid` elements are only
+    /// ever compared, so foreign ones answer `false` / delete nothing rather than panicking.
+    #[must_use]
+    pub fn reaches_avoiding(&self, from: BlockId, avoid: &[BlockId], to: BlockId) -> bool {
+        self.walk(from, avoid, to)
+    }
+
     /// Whether **every** path from `from` to [`Cfg::exit`] passes through `to`.
     ///
     /// Delete `to` and ask whether the exit is still reachable: if it is, that walk is a
@@ -210,6 +232,67 @@ mod tests {
             )
             .unwrap();
         assert!(!cfg.reaches(cfg.entry(), dead));
+    }
+
+    #[test]
+    fn reaches_avoiding_routes_around_or_is_blocked_by_the_kill_set() {
+        // The two directions of #194's reaching-defs question, in one fixture. An `if` with
+        // no `else` leaves a path around the then-body, so avoiding it still reaches the
+        // join; avoiding *every* branch of an if/else blocks it, since each path takes one.
+        let around_source = "function f(c) { if (c) { z(); } y(); }";
+        let around_tree = parse(around_source);
+        let around = build(&around_tree, around_source);
+        let then_block = around
+            .block_of(find(&around_tree, "expression_statement"))
+            .unwrap();
+        let join = around
+            .block_of(
+                find_all(&around_tree, "expression_statement")
+                    .into_iter()
+                    .find(|n| &around_source[n.byte_range()] == "y();")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            around.reaches(around.entry(), join),
+            "the join is reachable with nothing avoided",
+        );
+        assert!(
+            around.reaches_avoiding(around.entry(), &[then_block], join),
+            "the else-less path routes around the then-body",
+        );
+
+        let blocked_source = "function f(c) { if (c) { a(); } else { b(); } d(); }";
+        let blocked_tree = parse(blocked_source);
+        let blocked = build(&blocked_tree, blocked_source);
+        let then_arm = blocked
+            .block_of(
+                find_all(&blocked_tree, "expression_statement")
+                    .into_iter()
+                    .find(|n| &blocked_source[n.byte_range()] == "a();")
+                    .unwrap(),
+            )
+            .unwrap();
+        let else_arm = blocked
+            .block_of(
+                find_all(&blocked_tree, "expression_statement")
+                    .into_iter()
+                    .find(|n| &blocked_source[n.byte_range()] == "b();")
+                    .unwrap(),
+            )
+            .unwrap();
+        let after = blocked
+            .block_of(
+                find_all(&blocked_tree, "expression_statement")
+                    .into_iter()
+                    .find(|n| &blocked_source[n.byte_range()] == "d();")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            !blocked.reaches_avoiding(blocked.entry(), &[then_arm, else_arm], after),
+            "every path takes one arm, so avoiding both blocks the join",
+        );
     }
 
     #[test]
