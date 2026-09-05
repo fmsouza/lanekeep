@@ -17,6 +17,16 @@
 //! a kill on one branch does not kill on another, so if any path reaches the read with a
 //! tainted nearest definition, the flow is reported.
 //!
+//! **Field- and index-insensitive (spec §2).** A write to any field or index of an object —
+//! `o.secret = s`, `a[0] = s` — taints the whole base binding, and reading any field or index
+//! of a tainted base — `o.public`, `a[1]` — is tainted. A field write is a **weak update**: it
+//! adds taint from that point forward and never *kills* a prior definition, since it mutates
+//! the object rather than rebinding the name. So field/index writes form a separate additive
+//! union outside the reaching-defs-with-kill machinery above (which governs only strong
+//! identifier updates); a weak write is admitted whenever it may reach the read. This
+//! over-approximates — reading `o.public` after `o.secret` was tainted reports though the two
+//! fields are distinct — which is the sound direction for a taint tool.
+//!
 //! v1 is intra-procedural, path-insensitive, and does not follow taint through a call's
 //! arguments. See
 //! `docs/superpowers/specs/2026-09-05-taint-analysis-flow-checkflow-design.md` §5.
@@ -139,6 +149,15 @@ impl<'t> Taint<'_, 't> {
         }
         match expr.kind() {
             "identifier" => self.taint_of_identifier(expr, depth),
+            // A field or index read (`o.public`, `a[1]`) is tainted iff its base object is —
+            // the field-insensitive read side (spec §2). Resolve to the base identifier and
+            // reuse the identifier taint logic, which folds in the base's field/index writes
+            // (`weak_reaching_defs`). A read whose base is not a plain identifier (a call
+            // result, `this`) has no binding to consult, so it carries nothing.
+            "member_expression" | "subscript_expression" => match base_identifier(expr) {
+                Some(base) => self.taint_of_identifier(base, depth),
+                None => Vec::new(),
+            },
             // A non-source, non-sanitizer call is opaque: v1 does not follow taint through a
             // call's arguments (the alias-through-call false negative, spec §13). Only a
             // direct source or a local identifier alias carries taint.
@@ -157,18 +176,33 @@ impl<'t> Taint<'_, 't> {
             return Vec::new();
         };
         let mut facts = Vec::new();
+        // Strong updates — the declarator initializer and full identifier reassignments —
+        // resolved by reaching-definitions with kill: only the defs that reach this read.
         for def in self.reaching_defs(decl, ident) {
-            let alias = def.rhs.kind() == "identifier";
-            for mut fact in self.taint_of(def.rhs, depth.saturating_add(1)) {
-                if alias {
-                    // A `const b = a` / `b = a` hop is one step; a direct source assignment
-                    // adds none.
-                    fact.steps.push(def.site);
-                }
-                facts.push(fact);
-            }
+            self.collect_def_facts(def, depth, &mut facts);
+        }
+        // Weak updates — field/index writes to this binding (`o.x = …`, `a[0] = …`). Field-
+        // insensitive: any such write taints the whole object. They are additive and never
+        // killed, so they union in here rather than participating in the kill above; each is
+        // admitted when it may reach this read.
+        for def in self.weak_reaching_defs(decl, ident) {
+            self.collect_def_facts(def, depth, &mut facts);
         }
         facts
+    }
+
+    /// Fold the taint carried by one definition's right-hand side into `facts`: recurse into
+    /// the value, recording an alias hop (`const b = a`, `b = a`, `o.x = a`) as one step and a
+    /// direct value assignment as none. Shared by the strong ([`Self::reaching_defs`]) and weak
+    /// ([`Self::weak_reaching_defs`]) definition walks.
+    fn collect_def_facts(&self, def: Def<'t>, depth: u32, facts: &mut Vec<Fact<'t>>) {
+        let alias = def.rhs.kind() == "identifier";
+        for mut fact in self.taint_of(def.rhs, depth.saturating_add(1)) {
+            if alias {
+                fact.steps.push(def.site);
+            }
+            facts.push(fact);
+        }
     }
 
     /// Every definition of the binding `decl` declares: its declarator's own initializer,
@@ -210,6 +244,40 @@ impl<'t> Taint<'_, 't> {
                 && left.kind() == "identifier"
                 && JsBindingResolver
                     .declaration_of(self.tree, self.source, left)
+                    .is_some_and(|target| target.id() == decl.id())
+            {
+                found.push(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        found.sort_by_key(Node::start_byte);
+        found
+    }
+
+    /// Every `assignment_expression` in the enclosing function whose left-hand side is a
+    /// `member_expression` or `subscript_expression` (`o.secret = …`, `a[0] = …`) whose base
+    /// identifier resolves to `decl`, in source order. These are the field/index writes: weak
+    /// updates that taint the whole base object (field-insensitive, spec §2). Empty without a
+    /// root to scan.
+    ///
+    /// Disjoint from [`Self::assignments_to`] by left-hand-side kind — an identifier target is
+    /// a strong update, a member/subscript target a weak one, and no assignment is both.
+    fn field_writes_to(&self, decl: Node<'t>) -> Vec<Node<'t>> {
+        let Some(root) = self.root else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "assignment_expression"
+                && let Some(left) = node.child_by_field_name("left")
+                && matches!(left.kind(), "member_expression" | "subscript_expression")
+                && let Some(base) = base_identifier(left)
+                && JsBindingResolver
+                    .declaration_of(self.tree, self.source, base)
                     .is_some_and(|target| target.id() == decl.id())
             {
                 found.push(node);
@@ -324,11 +392,79 @@ impl<'t> Taint<'_, 't> {
             .collect();
         cfg.reaches_avoiding(db, &avoid, ub)
     }
+
+    /// The field/index writes to `decl`'s binding that may reach a read at `use_node`, as weak
+    /// (additive) definitions. Unlike [`Self::reaching_defs`], a weak update neither kills nor
+    /// is killed: every write that may reach the read contributes its right-hand side's taint,
+    /// because a field write mutates the object in place rather than rebinding the name. The
+    /// site is the `assignment_expression`, its `rhs` the assigned value.
+    fn weak_reaching_defs(&self, decl: Node<'t>, use_node: Node<'t>) -> Vec<Def<'t>> {
+        self.field_writes_to(decl)
+            .into_iter()
+            .filter_map(|assignment| {
+                let rhs = assignment.child_by_field_name("right")?;
+                let def = Def {
+                    site: assignment,
+                    rhs,
+                };
+                self.weak_def_reaches(&def, use_node).then_some(def)
+            })
+            .collect()
+    }
+
+    /// Whether a weak (field/index) write may reach a read — the may-reach test for
+    /// [`Self::weak_reaching_defs`], with no kill set because a weak update is never clobbered.
+    ///
+    /// Within the read's own block a write *preceding* the read reaches; a write at or after
+    /// the read reaches only when the block sits on a cycle, so a back-edge can carry the value
+    /// around — a straight-line later write must not taint an earlier read, the
+    /// flow-sensitivity spec §2 promises. Across blocks, plain CFG reachability decides. Absent
+    /// a CFG, or for an unattributed read or write, the write is admitted — the may-taint
+    /// over-approximation, never a false negative.
+    fn weak_def_reaches(&self, def: &Def<'t>, use_node: Node<'t>) -> bool {
+        let Some(cfg) = self.cfg else {
+            return true;
+        };
+        match (cfg.block_of(def.rhs), cfg.block_of(use_node)) {
+            (Some(db), Some(ub)) if db == ub => {
+                def.rhs.end_byte() <= use_node.start_byte() || block_in_cycle(cfg, db)
+            }
+            (Some(db), Some(ub)) => cfg.reaches(db, ub),
+            _ => true,
+        }
+    }
 }
 
 /// Whether `node` is one of `set`, by tree-unique node identity.
 fn is_member(node: Node<'_>, set: &[Node<'_>]) -> bool {
     set.iter().any(|member| member.id() == node.id())
+}
+
+/// The base identifier a member or subscript access is rooted at, walking `object` links to
+/// the leftmost identifier: `o.a.b` and `o[i].c` both resolve to `o`. `None` when the base is
+/// not a plain identifier — a call result, `this`, a parenthesized expression — because there
+/// is then no binding for field-insensitive tainting to attach to.
+fn base_identifier(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => return Some(current),
+            "member_expression" | "subscript_expression" => {
+                current = current.child_by_field_name("object")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Whether `block` sits on a cycle: control can return to it from one of its own successors.
+/// [`Cfg::reaches`] is reflexive, so it cannot answer this directly — the walk instead starts
+/// one step out, at each successor, and asks whether that successor reaches `block` again.
+fn block_in_cycle(cfg: &Cfg<'_>, block: BlockId) -> bool {
+    cfg.block(block)
+        .successors
+        .iter()
+        .any(|edge| cfg.reaches(edge.target, block))
 }
 
 /// The nearest enclosing function's root node and its CFG, walking ancestors until
@@ -763,6 +899,99 @@ mod tests {
             1,
             "a taint-propagating reassignment on every branch still reaches the sink"
         );
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    // --- Field-insensitive over-tainting (#194 §11) ---------------------------------------
+    //
+    // Field-sensitive = no and Index-sensitive = no (spec §2): any field/index write taints
+    // the whole base object, and any field/index read of a tainted base is tainted. A field
+    // write is a *weak* update — it adds taint from that point forward and never kills a prior
+    // definition, unlike a full identifier reassignment (a strong update / reaching-def kill).
+
+    #[test]
+    fn a_field_write_taints_the_object_and_a_later_field_read_reports() {
+        // The §11 case: `o.secret = getSecret()` taints `o`; reading a *different* field
+        // `o.public` afterward is tainted because the analysis is field-insensitive.
+        let flows = run(
+            "function f(){ const o = {}; o.secret = getSecret(); log(o.public); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "the field write taints the whole object");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn reading_the_written_field_reports() {
+        let flows = run(
+            "function f(){ const o = {}; o.secret = getSecret(); log(o.secret); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn a_base_that_is_never_tainted_does_not_report() {
+        // Negative: no write taints `o`, so a field read is clean. Guards the read side
+        // against reporting on any member access.
+        let flows = run(
+            "function f(){ const o = {}; log(o.public); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty(), "an untainted base must not report");
+    }
+
+    #[test]
+    fn a_clean_field_write_does_not_kill_an_unrelated_taint() {
+        // Weak-update soundness: the clean field write `o.x = "clean"` must not touch the
+        // taint on the separate binding `s`.
+        let flows = run(
+            "function f(){ let s = getSecret(); const o = {}; o.x = \"clean\"; log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a field write to o must not kill s's taint");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn a_field_write_does_not_kill_a_prior_write_to_the_same_object() {
+        // Weak-update soundness: `o.a = getSecret()` taints o; the later clean `o.b = "clean"`
+        // is a weak update and must NOT clobber it (a strong reassignment would). Reading
+        // `o.a` still reports.
+        let flows = run(
+            "function f(){ const o = {}; o.a = getSecret(); o.b = \"clean\"; log(o.a); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "a weak field write must not kill prior taint"
+        );
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn an_index_write_taints_the_whole_array() {
+        // Index-insensitive (spec §2): `a[0] = getSecret()` taints `a`; reading `a[1]` is
+        // tainted.
+        let flows = run(
+            "function f(){ const a = []; a[0] = getSecret(); log(a[1]); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a subscript write taints the whole array");
         assert_eq!(flows[0].0, "getSecret()");
     }
 }
