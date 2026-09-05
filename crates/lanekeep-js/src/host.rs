@@ -64,7 +64,11 @@ use lanekeep_types::{Symbol, Type, TypeScriptOracle, TypeScriptSupport};
 ///   hash plus exact node count), computed host-side in one walk.
 /// - `3` — `ctx.types`: the bounded within-file type oracle, present only for a rule that
 ///   declared `requires: ['types']`.
-pub const HOST_API_VERSION: u32 = 3;
+/// - `4` — `checkFlow`: the taint-flow handler, invoked once per canonical `FlowPath` with
+///   `{ source, sink, steps }` node handles. It reaches `ctx` — the same reporting surface
+///   `check` does — so a build with it can produce a verdict a build without it could not,
+///   which is why the version moves even though no `ctx` function was added or changed.
+pub const HOST_API_VERSION: u32 = 4;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
