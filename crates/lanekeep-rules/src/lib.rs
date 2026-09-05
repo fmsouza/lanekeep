@@ -410,6 +410,7 @@ mod tests {
             "no-restricted-calls",
             "no-restricted-imports",
             "no-restricted-types",
+            "no-secret-in-string",
             "no-unused-exports",
         ] {
             assert!(
