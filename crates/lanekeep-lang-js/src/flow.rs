@@ -1,8 +1,13 @@
 //! The taint (data-flow) analysis for TypeScript, TSX and JavaScript.
 //!
-//! A forward may-taint over the per-function [`Cfg`](crate::cfg::Cfg): a `@source` value
-//! that reaches a `@sink` with no intervening `@sanitizer` is one [`FlowPath`]. The
-//! analysis is intra-procedural (v1), value-level, and path-insensitive — see
+//! A value-level may-taint: a `@source` value that reaches a `@sink` with no intervening
+//! `@sanitizer` is one [`FlowPath`]. It is resolved on demand — from each sink backward
+//! through the def-use chain (declarators and reassignments), following local identifier
+//! aliases and cutting at sanitizers — with the per-function [`Cfg`](crate::cfg::Cfg)'s
+//! reachability deciding whether a definition reaches the sink (the flow-sensitivity).
+//!
+//! v1 is intra-procedural, path-insensitive, and does not follow taint through a call's
+//! arguments. See
 //! `docs/superpowers/specs/2026-09-05-taint-analysis-flow-checkflow-design.md` §5.
 
 use lanekeep_lang::binding::BindingResolver;
@@ -33,14 +38,19 @@ impl FlowAnalyzer for JsFlowAnalyzer {
         for &sink in sinks {
             // Each sink is analyzed in its own enclosing function's CFG. Rebuilding per
             // sink keeps the borrow simple; the fixtures hold one or two functions.
-            let cfg = enclosing_cfg(source, sink);
-            let sink_block = cfg.as_ref().and_then(|cfg| cfg.block_of(sink));
+            let root_and_cfg = enclosing_root_and_cfg(source, sink);
+            let (root, cfg) = match &root_and_cfg {
+                Some((root, cfg)) => (Some(*root), Some(cfg)),
+                None => (None, None),
+            };
+            let sink_block = cfg.and_then(|cfg| cfg.block_of(sink));
             let taint = Taint {
                 tree,
                 source,
                 sources,
                 sanitizers,
-                cfg: cfg.as_ref(),
+                cfg,
+                root,
             };
             for fact in taint.taint_of(sink, sink_block, 0) {
                 flows.push(FlowPath {
@@ -50,7 +60,7 @@ impl FlowAnalyzer for JsFlowAnalyzer {
                 });
             }
         }
-        flows
+        canonicalize(flows)
     }
 }
 
@@ -59,6 +69,16 @@ impl FlowAnalyzer for JsFlowAnalyzer {
 struct Fact<'t> {
     source: Node<'t>,
     steps: Vec<Node<'t>>,
+}
+
+/// A definition of a binding: the assignment site (declarator or `=` expression) and the
+/// right-hand-side value it stores.
+struct Def<'t> {
+    /// The `variable_declarator` or `assignment_expression` — the step recorded for an alias
+    /// hop.
+    site: Node<'t>,
+    /// The value expression assigned.
+    rhs: Node<'t>,
 }
 
 /// The immutable context for one sink's taint walk.
@@ -71,6 +91,8 @@ struct Taint<'a, 't> {
     /// graph makes reachability unanswerable, so the walk then admits every definition —
     /// the may-analysis's correct over-approximating bias.
     cfg: Option<&'a Cfg<'t>>,
+    /// The enclosing function's root node, whose subtree is scanned for reassignments.
+    root: Option<Node<'t>>,
 }
 
 impl<'t> Taint<'_, 't> {
@@ -125,20 +147,73 @@ impl<'t> Taint<'_, 't> {
             return Vec::new();
         };
         let mut facts = Vec::new();
-        for def in definitions_of(decl) {
-            if !self.reaches_sink(def, sink_block) {
+        for def in self.definitions_of(decl) {
+            if !self.reaches_sink(def.rhs, sink_block) {
                 continue;
             }
-            let alias = def.kind() == "identifier";
-            for mut fact in self.taint_of(def, sink_block, depth.saturating_add(1)) {
+            let alias = def.rhs.kind() == "identifier";
+            for mut fact in self.taint_of(def.rhs, sink_block, depth.saturating_add(1)) {
                 if alias {
-                    // A `const b = a` hop is one step; a direct source assignment adds none.
-                    fact.steps.push(def);
+                    // A `const b = a` / `b = a` hop is one step; a direct source assignment
+                    // adds none.
+                    fact.steps.push(def.site);
                 }
                 facts.push(fact);
             }
         }
         facts
+    }
+
+    /// Every definition of the binding `decl` declares: its declarator's own initializer,
+    /// plus every `x = <rhs>` in the enclosing function whose target resolves back to `decl`.
+    /// Path-insensitive — a binding assigned in two branches has two definitions, and both
+    /// are followed.
+    fn definitions_of(&self, decl: Node<'t>) -> Vec<Def<'t>> {
+        let mut defs = Vec::new();
+        if decl.kind() == "variable_declarator"
+            && let Some(value) = decl.child_by_field_name("value")
+        {
+            defs.push(Def {
+                site: decl,
+                rhs: value,
+            });
+        }
+        for assignment in self.assignments_to(decl) {
+            if let Some(rhs) = assignment.child_by_field_name("right") {
+                defs.push(Def {
+                    site: assignment,
+                    rhs,
+                });
+            }
+        }
+        defs
+    }
+
+    /// Every `assignment_expression` in the enclosing function whose left-hand identifier
+    /// resolves to `decl`, in source order. Empty without a root to scan.
+    fn assignments_to(&self, decl: Node<'t>) -> Vec<Node<'t>> {
+        let Some(root) = self.root else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "assignment_expression"
+                && let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "identifier"
+                && JsBindingResolver
+                    .declaration_of(self.tree, self.source, left)
+                    .is_some_and(|target| target.id() == decl.id())
+            {
+                found.push(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        found.sort_by_key(Node::start_byte);
+        found
     }
 
     /// The `@source` nodes lying within `expr`'s byte range, in source order. A source that
@@ -169,35 +244,66 @@ impl<'t> Taint<'_, 't> {
     }
 }
 
-/// The right-hand-side expressions that define the binding `decl` declares. For 4b this is
-/// the declarator's own initializer; later sub-tasks add reassignments.
-fn definitions_of(decl: Node<'_>) -> Vec<Node<'_>> {
-    let mut defs = Vec::new();
-    if decl.kind() == "variable_declarator"
-        && let Some(value) = decl.child_by_field_name("value")
-    {
-        defs.push(value);
-    }
-    defs
-}
-
 /// Whether `node` is one of `set`, by tree-unique node identity.
 fn is_member(node: Node<'_>, set: &[Node<'_>]) -> bool {
     set.iter().any(|member| member.id() == node.id())
 }
 
-/// The nearest enclosing function's CFG, walking ancestors until [`Cfg::build`] accepts one
-/// as a root kind. `program` is a root, so a match is always found for a node in a parsed
-/// tree.
-fn enclosing_cfg<'t>(source: &str, node: Node<'t>) -> Option<Cfg<'t>> {
+/// The nearest enclosing function's root node and its CFG, walking ancestors until
+/// [`Cfg::build`] accepts one as a root kind. `program` is a root, so a match is always found
+/// for a node in a parsed tree.
+fn enclosing_root_and_cfg<'t>(source: &str, node: Node<'t>) -> Option<(Node<'t>, Cfg<'t>)> {
     let mut current = Some(node);
     while let Some(node) = current {
         if let Some(cfg) = Cfg::build(source, node) {
-            return Some(cfg);
+            return Some((node, cfg));
         }
         current = node.parent();
     }
     None
+}
+
+/// Reduce raw flows to one canonical [`FlowPath`] per `(source, sink)`: keep the shortest
+/// `steps` chain (ties by the first differing step's start byte), drop exact duplicates, and
+/// emit in `(sink start, source start)` order. Determinism rests on this sort and on nothing
+/// here iterating a hash container.
+fn canonicalize(mut flows: Vec<FlowPath<'_>>) -> Vec<FlowPath<'_>> {
+    // Group identical `(source, sink)` pairs together with the shortest chain first, so the
+    // dedup below keeps the shortest. Node ranges identify source and sink; `steps` positions
+    // give a total order for the two-runs-identical guarantee.
+    flows.sort_by(|a, b| {
+        pair_key(a)
+            .cmp(&pair_key(b))
+            .then_with(|| a.steps.len().cmp(&b.steps.len()))
+            .then_with(|| step_positions(a).cmp(&step_positions(b)))
+    });
+    flows.dedup_by(|a, b| pair_key(a) == pair_key(b));
+    // Final output order: sink position, then source position (ranges break ties totally).
+    flows.sort_by_key(|flow| {
+        (
+            flow.sink.start_byte(),
+            flow.source.start_byte(),
+            flow.sink.end_byte(),
+            flow.source.end_byte(),
+        )
+    });
+    flows
+}
+
+/// The `(source range, sink range)` identity of a flow — what makes two flows the same
+/// `(source, sink)` pair.
+fn pair_key(flow: &FlowPath<'_>) -> (usize, usize, usize, usize) {
+    (
+        flow.source.start_byte(),
+        flow.source.end_byte(),
+        flow.sink.start_byte(),
+        flow.sink.end_byte(),
+    )
+}
+
+/// A flow's step start bytes, for a deterministic tie-break between equal-length chains.
+fn step_positions(flow: &FlowPath<'_>) -> Vec<usize> {
+    flow.steps.iter().map(Node::start_byte).collect()
 }
 
 #[cfg(test)]
@@ -249,6 +355,31 @@ mod tests {
                 (
                     src[flow.source.byte_range()].to_owned(),
                     src[flow.sink.byte_range()].to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Like [`run`], but also reporting each flow's `steps` length — for the canonical-path
+    /// assertions where the number of hops matters.
+    fn run_full(
+        src: &str,
+        source_name: &str,
+        sink_name: &str,
+        sanitizer_name: &str,
+    ) -> Vec<(String, String, usize)> {
+        let tree = parse(src);
+        let sources = calls_named(&tree, src, source_name);
+        let sinks = sink_args(&tree, src, sink_name);
+        let sanitizers = calls_named(&tree, src, sanitizer_name);
+        JsFlowAnalyzer
+            .analyze(&tree, src, &sources, &sinks, &sanitizers)
+            .into_iter()
+            .map(|flow| {
+                (
+                    src[flow.source.byte_range()].to_owned(),
+                    src[flow.sink.byte_range()].to_owned(),
+                    flow.steps.len(),
                 )
             })
             .collect()
@@ -362,5 +493,61 @@ mod tests {
             "redact",
         );
         assert!(flows.is_empty(), "v1 does not follow taint through a call");
+    }
+
+    #[test]
+    fn two_sources_into_one_sink_dedup_deterministically() {
+        // both branches taint s; path-insensitive → both reach log(s).
+        let src = "function f(c) { let s; if (c) { s = getSecret(); } else { s = getSecret(); } log(s); }";
+        let flows = run(src, "getSecret", "log", "redact");
+        // One canonical flow per (source, sink); ordered by source position; no duplicates.
+        assert_eq!(flows.len(), 2);
+        assert!(flows[0].1 == flows[1].1, "same sink");
+        // The two sources are the two distinct getSecret() calls, in source order.
+        assert!(
+            flows[0].0.starts_with("getSecret") && flows[1].0.starts_with("getSecret"),
+            "both flows originate at a source"
+        );
+        // Determinism: running twice gives identical ordering.
+        let again = run(src, "getSecret", "log", "redact");
+        assert_eq!(flows, again);
+    }
+
+    #[test]
+    fn one_source_reaching_a_sink_two_ways_is_deduplicated() {
+        // Both branches alias the same `a = getSecret()` into `s`, so one (source, sink)
+        // pair is reached by two chains. Path-insensitive union then dedup → a single flow.
+        let src = "function f(c) { const a = getSecret(); let s; if (c) { s = a; } else { s = a; } log(s); }";
+        let flows = run(src, "getSecret", "log", "redact");
+        assert_eq!(
+            flows.len(),
+            1,
+            "duplicate (source, sink) pairs collapse to one"
+        );
+        assert_eq!(flows[0].0, "getSecret()");
+        assert_eq!(
+            run(src, "getSecret", "log", "redact"),
+            flows,
+            "deterministic"
+        );
+    }
+
+    #[test]
+    fn steps_are_the_shortest_chain() {
+        // When two def-use chains reach the sink, `steps` is the shortest; tie broken by
+        // position. Here log(a) reads the source directly (empty steps) while log(b) reads
+        // it through one alias (one step).
+        let flows = run_full(
+            "function f() { const a = getSecret(); const b = a; log(a); log(b); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 2);
+        // Canonical order is by sink position: log(a) precedes log(b).
+        assert_eq!(flows[0].1, "a");
+        assert_eq!(flows[0].2, 0, "log(a) reads the source directly");
+        assert_eq!(flows[1].1, "b");
+        assert_eq!(flows[1].2, 1, "log(b) reads it through one alias");
     }
 }
