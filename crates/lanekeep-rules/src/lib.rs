@@ -156,7 +156,7 @@ type BuiltInComponent = (&'static str, &'static [u8], Option<&'static [u8]>);
 /// Go all fail by panicking, which traps, and a trap arrives at the host with no stack at all.
 /// There is nothing to remap. `go-rules/` builds with `-panic=trap` and `-no-debug`, so there is
 /// not even a name inside the artifact to map back to. A source map would only be needed for a
-/// component compiled from TypeScript, and none ships today — the nine TypeScript-targeting
+/// component compiled from TypeScript, and none ships today — the ten TypeScript-targeting
 /// built-ins run as QuickJS modules (see [`BUILT_IN_RULES`]).
 ///
 /// Ordered, on the same terms as [`BUILT_IN_RULES`].
@@ -379,7 +379,7 @@ mod tests {
         // these quietly revert with nothing red.
         //
         // Two shapes, deliberately together. The four rules ported to another language have no
-        // source at all and ship as components; the nine TypeScript rules ship as modules,
+        // source at all and ship as components; the ten TypeScript rules ship as modules,
         // evaluated in QuickJS, because the compiled-component form (StarlingMonkey in WASM)
         // costs 13 MB and 110× per crossing for no speed benefit.
         for name in [
