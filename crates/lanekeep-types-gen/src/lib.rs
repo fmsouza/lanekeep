@@ -82,6 +82,8 @@ pub fn render_index_dts(wit: &str) -> String {
         render_context(&resolve, "RuleContext", &check_context, true),
         render_reduce_location(),
         render_context(&resolve, "ReduceContext", &reduce_context, false),
+        render_flow_spec(),
+        render_flow_path(),
         render_rule(),
         render_config(),
         render_define_rule(),
@@ -692,6 +694,28 @@ export interface ReduceLocation {
 }
 ";
 
+const FLOW_SPEC: &str = "\
+/** Queries whose named captures drive the taint analysis. */
+export type FlowSpec = {
+  /** Queries whose `@source` capture marks a tainted origin. */
+  sources: string[]
+  /** Queries whose `@sink` capture marks a forbidden destination. */
+  sinks: string[]
+  /** Queries whose `@sanitizer` capture clears taint from the value it produces. */
+  sanitizers?: string[]
+}
+";
+
+const FLOW_PATH: &str = "\
+/** One tainted flow: a source whose value reaches a sink with no intervening sanitizer. */
+export type FlowPath = {
+  readonly source: Node
+  readonly sink: Node
+  /** The assignments and calls between source and sink, in flow order. One canonical path. */
+  readonly steps: readonly Node[]
+}
+";
+
 const RULE: &str = "\
 /** A rule, as `defineRule` takes it. */
 export interface Rule {
@@ -753,6 +777,14 @@ export interface Rule {
   check?(ctx: RuleContext, match: Match): void
   /** Called once per run, after every file, with facts only. */
   reduce?(ctx: ReduceContext): void
+  /**
+   * A taint-flow specification: queries whose captures mark tainted origins, forbidden
+   * destinations, and the calls that neutralize a value. Requires `requires: ['dataflow']`
+   * and a `checkFlow` handler; a rule declaring one without the other is refused at load.
+   */
+  flow?: FlowSpec
+  /** Called once per canonical tainted flow from a source to a sink. */
+  checkFlow?(ctx: RuleContext, path: FlowPath): void
 }
 ";
 
@@ -880,6 +912,14 @@ fn render_type_api() -> String {
 
 fn render_reduce_location() -> String {
     REDUCE_LOCATION.to_owned()
+}
+
+fn render_flow_spec() -> String {
+    FLOW_SPEC.to_owned()
+}
+
+fn render_flow_path() -> String {
+    FLOW_PATH.to_owned()
 }
 
 fn render_rule() -> String {

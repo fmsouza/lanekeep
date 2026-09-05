@@ -342,6 +342,24 @@ export interface ReduceContext {
   report(at: ReduceLocation, message?: string | ReportOptions): void
 }
 
+/** Queries whose named captures drive the taint analysis. */
+export type FlowSpec = {
+  /** Queries whose `@source` capture marks a tainted origin. */
+  sources: string[]
+  /** Queries whose `@sink` capture marks a forbidden destination. */
+  sinks: string[]
+  /** Queries whose `@sanitizer` capture clears taint from the value it produces. */
+  sanitizers?: string[]
+}
+
+/** One tainted flow: a source whose value reaches a sink with no intervening sanitizer. */
+export type FlowPath = {
+  readonly source: Node
+  readonly sink: Node
+  /** The assignments and calls between source and sink, in flow order. One canonical path. */
+  readonly steps: readonly Node[]
+}
+
 /** A rule, as `defineRule` takes it. */
 export interface Rule {
   /**
@@ -402,6 +420,14 @@ export interface Rule {
   check?(ctx: RuleContext, match: Match): void
   /** Called once per run, after every file, with facts only. */
   reduce?(ctx: ReduceContext): void
+  /**
+   * A taint-flow specification: queries whose captures mark tainted origins, forbidden
+   * destinations, and the calls that neutralize a value. Requires `requires: ['dataflow']`
+   * and a `checkFlow` handler; a rule declaring one without the other is refused at load.
+   */
+  flow?: FlowSpec
+  /** Called once per canonical tainted flow from a source to a sink. */
+  checkFlow?(ctx: RuleContext, path: FlowPath): void
 }
 
 /** A lanekeep configuration, as `defineConfig` takes it. */
