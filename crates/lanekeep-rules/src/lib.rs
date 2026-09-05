@@ -1,8 +1,8 @@
 //! Built-in rules shipped with lanekeep.
 //!
 //! The rules shipping with lanekeep, authored against the same host API that project-authored
-//! rules use and embedded into the binary at build time. Eleven are TypeScript modules evaluated
-//! in QuickJS — the two Python-targeting rules and the nine TypeScript-targeting rules, four of
+//! rules use and embedded into the binary at build time. Twelve are TypeScript modules evaluated
+//! in QuickJS — the two Python-targeting rules and the ten TypeScript-targeting rules, four of
 //! which were briefly compiled to a StarlingMonkey component and reverted, because that form cost
 //! 13 MB and 110× per host-API crossing for no speed benefit. The rest are WebAssembly
 //! components —
@@ -65,14 +65,16 @@
 
 /// The rules this build runs as TypeScript modules, as `(name, source)`.
 ///
-/// Evaluated in QuickJS, from source, on every run. Eleven rules ship this way: the two
-/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the nine
+/// Evaluated in QuickJS, from source, on every run. Twelve rules ship this way: the two
+/// Python-targeting rules (`no-broad-except`, `no-mutable-default-argument`) and the ten
 /// TypeScript-targeting rules (`duplicate-implementation`, `no-assertionless-test`,
 /// `no-circular-imports`, `no-default-export`, `no-restricted-arguments`, `no-restricted-calls`,
-/// `no-restricted-imports`, `no-restricted-types`, `no-unused-exports`). Four of them were
-/// briefly compiled ahead of time into a shared StarlingMonkey component and reverted, because
-/// the compiled form cost 13 MB of binary and 110× per host-API crossing for no speed benefit —
-/// see `docs/architecture.md` §15.1 for the measurement.
+/// `no-restricted-imports`, `no-restricted-types`, `no-secret-in-string`, `no-unused-exports`).
+/// Four of the TypeScript-targeting ones were briefly compiled ahead of time into a shared
+/// StarlingMonkey component and reverted, because the compiled form cost 13 MB of binary and
+/// 110× per host-API crossing for no speed benefit — see `docs/architecture.md` §15.1 for the
+/// measurement. `no-secret-in-string` is the first of the twelve driven by `checkFlow` rather
+/// than `check` — it declares `requires: ['dataflow']` and a `flow` instead of a `query`.
 ///
 /// Ordered, so the source stays greppable and a diff shows what moved. Nothing derives an
 /// order from this table directly — see [`names`], which merges the tables and sorts.
@@ -116,6 +118,10 @@ const BUILT_IN_RULES: &[(&str, &str)] = &[
     (
         "no-restricted-types",
         include_str!("../rules/no-restricted-types.ts"),
+    ),
+    (
+        "no-secret-in-string",
+        include_str!("../rules/no-secret-in-string.ts"),
     ),
     (
         "no-unused-exports",

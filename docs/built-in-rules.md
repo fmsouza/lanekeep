@@ -631,6 +631,94 @@ through one fails at runtime the same way.
 A module importing itself is not reported. It is a different mistake, and "extract what both
 modules need into a third" is not advice that applies to it.
 
+---
+
+## `lanekeep/no-secret-in-string`
+
+A secret value reaching a string sink — logged, concatenated, or otherwise turned into text —
+without passing through a sanitizer first.
+
+The first built-in driven by `checkFlow` rather than `check`. Every other rule in this document
+declares a `query` and a `check(ctx, m)` that runs once per match; this one declares a `flow` —
+`sources`, `sinks` and an optional `sanitizers`, each a list of tree-sitter queries — and a
+`checkFlow(ctx, path)` that the engine calls once per canonical tainted path it finds between
+them. The engine does the analysis natively (def-use through assignments and local aliases,
+cut at a sanitizer) and only crosses into the sandbox once per finding, on the same terms as
+every other rule's boundary-proportional-to-matches guarantee.
+
+```json
+{ "rules": ["lanekeep/no-secret-in-string"] }
+```
+
+Or from a `lanekeep.config.ts`, since it is a TypeScript module rather than a compiled rule:
+
+```ts
+import noSecretInString from 'lanekeep/no-secret-in-string'
+
+export default defineConfig({ rules: [noSecretInString] })
+```
+
+It ships as a worked example as much as a usable rule: `getSecret`, `log` and `redact` are
+illustrative names, not a real project's API — this is not a rule most projects should run
+as-is. Its value is mostly as a template: `crates/lanekeep-rules/rules/no-secret-in-string.ts`
+is a complete, minimal `flow`/`checkFlow` rule, and a project writing its own copies the shape —
+`requires: ['dataflow']`, a `flow` naming `sources`, `sinks` and optionally `sanitizers`, and a
+`checkFlow(ctx, path)` reporting at `path.sink` — substituting its own source, sink and
+sanitizer callables.
+
+Its card: **message** `A secret value reaches a string.`, **remediation** "Redact it before it
+becomes a string.", with the example pair `log(getSecret())` (reported) and
+`log(redact(getSecret()))` (fine). The violation is always anchored at the sink — the node
+`path.sink` names, which is the argument that received the tainted value — never at the source
+or at an intermediate assignment.
+
+### `requires: ['dataflow']` is not optional decoration
+
+Declaring it is what makes `flow`/`checkFlow` legal at all: a rule with a `flow` and no
+`checkFlow`, a `checkFlow` and no `flow`, or either without `requires: ['dataflow']`, is refused
+at config load rather than silently doing nothing. The three refusals are config-loading
+concerns and are tested where the pairing is implemented
+(`crates/lanekeep-config/src/lib.rs`), not here.
+
+### What counts as a source, a sink and a sanitizer
+
+Each is a set of tree-sitter queries — one rule can name several, to cover more than one shape
+of secret origin or string sink — and each query must bind the capture its role names:
+`@source`, `@sink` or `@sanitizer`. For this rule specifically: a source is any call to
+`getSecret`; a sink is the argument of any call to `log`; a sanitizer is any call to `redact`.
+A value is reported when some source's value reaches some sink's argument with no sanitizer
+call between the two along that path.
+
+### The analysis this rule rides on, and what a clean report does and does not mean
+
+The analysis is intra-procedural (per function), flow-sensitive with reaching-definitions-style
+kill (a later clean reassignment of the same binding cuts an earlier taint), but deliberately
+**path-insensitive** and **field-insensitive** — a may-analysis that leans toward false
+positives rather than false negatives. Concretely, against this rule's own acceptance fixtures
+in `crates/lanekeep-rules/tests/no_secret_in_string.rs`:
+
+| Shape | Reported? | Why |
+| --- | --- | --- |
+| `log(getSecret())` | yes | direct |
+| `const s = getSecret(); log(s);` | yes | `s`'s only definition is tainted |
+| `const s = getSecret(); const c = redact(s); log(c);` | **no** | `c`'s only definition is the sanitizer call — clean |
+| `const s = getSecret(); log(s); const c = redact(s);` | yes | flow-sensitive: sanitizing *after* the read does not retroactively clean it |
+| `const a = getSecret(); const b = a; log(b);` | yes | a direct alias (`b`'s initializer is the identifier `a`) |
+| `const a = getSecret(); const b = identity(a); log(b);` | **no** — documented v1 false negative | taint is not followed through a call's own arguments; `identity(a)` is opaque |
+| `o.secret = getSecret(); log(o.public);` | yes — documented over-approximation | field-insensitive: tainting one field taints the whole binding, and every field read from it |
+| `const s = getSecret(); if (isTest) { log(s); }` | yes — documented, path-insensitive | the analysis asks only whether some path reaches the read, never whether that branch runs |
+| two branches each doing `s = getSecret()`, one `log(s)` after | yes, **twice** | two distinct sources reaching one sink are two distinct findings, not deduplicated into one — deduplication only collapses a *single* source reaching one sink by more than one path |
+
+**A clean report from this rule is evidence a *tracked* path was not found, not that no secret
+reaches a string.** The false negatives above are the trade v1 makes deliberately (see
+`crates/lanekeep-lang-js/src/flow.rs`). Widening `sanitizers` is the project-facing lever for
+narrowing either direction — it is checked project-wide, unlike a suppression comment on one
+finding. A suppression on a dataflow finding is also worth an expiry: refactoring the
+intermediate steps of a flow is exactly the kind of change that silently removes the path a
+suppression was written against, more so than for an ordinary per-line finding.
+
+---
+
 # Python
 
 Both Python rules resolve identifiers rather than matching text, which is what keeps them

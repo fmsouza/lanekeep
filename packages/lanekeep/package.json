@@ -14,6 +14,7 @@
       "no-restricted-calls": ["builtin.d.ts"],
       "no-restricted-imports": ["builtin.d.ts"],
       "no-restricted-types": ["builtin.d.ts"],
+      "no-secret-in-string": ["builtin.d.ts"],
       "no-unused-exports": ["builtin.d.ts"]
     }
   },
@@ -56,6 +57,9 @@
       "types": "./builtin.d.ts"
     },
     "./no-restricted-types": {
+      "types": "./builtin.d.ts"
+    },
+    "./no-secret-in-string": {
       "types": "./builtin.d.ts"
     },
     "./no-unused-exports": {
