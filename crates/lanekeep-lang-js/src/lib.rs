@@ -13,8 +13,9 @@
 //! split at every branch — short-circuit operators included, since `&&`, `??` and `?.` are
 //! control flow inside an expression — and a `finally` emitted once per distinct
 //! continuation rather than special-cased. Nothing in the engine calls it. #193's obligation
-//! analysis and #194's taint analysis are its first two consumers, over
-//! `on_all_paths_from` and `reaches` respectively, which is why the graph and the two
+//! analysis and #194's taint analysis are its first two consumers; obligation analysis
+//! consumes the all-paths and reachability queries (`on_all_paths_from_any`,
+//! `on_all_paths_within`, `reaches`, `reaches_avoiding`), which is why the graph and these
 //! queries are public from a module neither of them exists in yet.
 //!
 //! It is not a [`Language`] method, unlike everything else this crate exposes that way.
