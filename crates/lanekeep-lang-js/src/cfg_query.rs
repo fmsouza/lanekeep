@@ -14,6 +14,8 @@
 //! checkable form of the determinism requirement, since an arbitrary iteration order
 //! would make output vary between runs on identical input.
 
+use std::ops::Range;
+
 use crate::cfg::{BlockId, Cfg};
 
 impl Cfg<'_> {
@@ -39,7 +41,9 @@ impl Cfg<'_> {
     /// lanekeep #194's reaching-definitions asks it as "does this definition's block reach
     /// the use without passing through a block that redefines the same binding," the `avoid`
     /// set being the other definitions' blocks. A path routing around every avoided block is
-    /// a witness; absent one, every path is killed.
+    /// a witness; absent one, every path is killed. #193's obligation analysis reaches for the
+    /// same method when it needs the witness path rather than an all-paths verdict — to name
+    /// the exit an undischarged value escapes through.
     ///
     /// Reflexive only when `from == to` and `from` is not itself in `avoid`: `walk` returns
     /// `false` at once for a `from` in the set (its first line), so a caller wanting a
@@ -139,6 +143,61 @@ impl Cfg<'_> {
         !self.walk(from, through, self.exit)
     }
 
+    /// Whether every path leaving `region` from `from` passes through one of `through`.
+    ///
+    /// The block-scope analogue of [`Self::on_all_paths_from_any`], whose goal is the
+    /// function exit. Here the goal is the region's frontier — the first block on each path
+    /// whose `start` byte is outside `region`. If some frontier block is reachable from
+    /// `from` while avoiding every `through` block, that walk witnesses a path out of the
+    /// region that discharges nothing.
+    ///
+    /// **A `through` block only counts once it is confirmed still inside `region`.** Checking
+    /// set membership before checking position would credit a release block that has itself
+    /// already crossed the frontier — exactly the case a block-scoped obligation must reject,
+    /// since a release lexically outside the block cannot be what discharged it. `from` is
+    /// exempted from the position check (it is where the acquire sits, not where its
+    /// enclosing block starts, so its own `start` byte is typically before `region`), matching
+    /// `walk`'s treatment of its own starting block.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `from` came from another function's graph and is out of range here; see
+    /// [`Cfg::block`]. Elements of `through` are only ever compared, so a foreign one
+    /// avoids nothing.
+    #[must_use]
+    pub fn on_all_paths_within(
+        &self,
+        from: BlockId,
+        region: Range<usize>,
+        through: &[BlockId],
+    ) -> bool {
+        // Successors in `BlockId` order; explicit stack; no hash container iterated —
+        // same discipline as `walk`, restated rather than shared because the stopping
+        // condition here is a predicate over the region, not a single goal block.
+        let mut visited = vec![false; self.blocks.len()];
+        let mut stack = vec![from];
+        visited[from.index()] = true;
+        while let Some(id) = stack.pop() {
+            let block = self.block(id);
+            let left_region = id != from && !region.contains(&block.start);
+            if through.contains(&id) && !left_region {
+                continue; // discharged, and it happened before leaving the region
+            }
+            if left_region {
+                return false; // left the region without passing a release still inside it
+            }
+            let mut next: Vec<BlockId> = block.successors.iter().map(|edge| edge.target).collect();
+            next.sort_unstable();
+            for target in next {
+                if !visited[target.index()] {
+                    visited[target.index()] = true;
+                    stack.push(target);
+                }
+            }
+        }
+        true
+    }
+
     /// Depth-first from `from`, never entering a block in `avoid`, stopping at `goal`.
     ///
     /// `avoid` is a slice rather than a set container because it holds a handful of blocks
@@ -185,8 +244,8 @@ impl Cfg<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::cfg::Cfg;
     use crate::cfg::testing::{find, find_all, parse};
+    use crate::cfg::{BlockId, Cfg};
 
     fn build<'t>(tree: &'t tree_sitter::Tree, source: &str) -> Cfg<'t> {
         Cfg::build(source, find(tree, "function_declaration")).expect("a root")
@@ -446,5 +505,79 @@ mod tests {
             !cfg.on_all_paths_from_any(cfg.entry(), &[]),
             "an empty set is on no path at all while the exit is reachable",
         );
+    }
+
+    #[test]
+    fn reaches_avoiding_is_blocked_by_the_avoided_set() {
+        // acquire -> (release) -> exit ; avoiding the release, the exit is unreachable
+        let source = "function f() { a(); r(); }";
+        let tree = parse(source);
+        let cfg = build(&tree, source);
+        let release = cfg
+            .block_of(
+                find_all(&tree, "call_expression")
+                    .into_iter()
+                    .find(|n| &source[n.byte_range()] == "r()")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(cfg.reaches_avoiding(cfg.entry(), &[], cfg.exit()));
+        assert!(!cfg.reaches_avoiding(cfg.entry(), &[release], cfg.exit()));
+    }
+
+    /// Resolves an `acquire`/`release`/`enclosing_block` triple for the two fixtures below.
+    ///
+    /// The `release` is put inside a `switch` with only a `default` arm — the one construct
+    /// that reaches an inner statement through a single, *unconditional* edge
+    /// (`switch_statement`'s own doc comment: zero `switch_case` arms means the discriminant
+    /// reaches `default` directly) while still allocating it a block of its own. A bare
+    /// `{ a(); r(); }` does not: `cfg_build.rs`'s `"statement_block" => self.statements(...)`
+    /// has no `alloc` of its own, so a nested block with nothing branching inside it merges
+    /// straight into the block around it. Measured: with `a()` and `r()` both left as plain
+    /// statements, `block_of` resolves both to the *same* block — the one enclosing them —
+    /// whose own `start` sits before the region regardless of which fixture it is, so
+    /// `on_all_paths_within` cannot tell "release inside" from "release after" apart at all;
+    /// the `switch` gives `release` a block whose `start` genuinely differs between the two
+    /// fixtures, which is the fact the function is supposed to be reading.
+    fn block_scope_fixture<'t>(
+        tree: &'t tree_sitter::Tree,
+        source: &str,
+        cfg: &Cfg<'t>,
+    ) -> (BlockId, std::ops::Range<usize>, BlockId) {
+        let a_call = find_all(tree, "call_expression")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "a()")
+            .unwrap();
+        let r_call = find_all(tree, "call_expression")
+            .into_iter()
+            .find(|n| &source[n.byte_range()] == "r()")
+            .unwrap();
+        let region = super::super::cfg_build::enclosing_block(a_call)
+            .unwrap()
+            .byte_range();
+        let acquire = cfg.block_of(a_call).unwrap();
+        let release = cfg.block_of(r_call).unwrap();
+        (acquire, region, release)
+    }
+
+    #[test]
+    fn a_release_inside_the_block_discharges_block_scope() {
+        // acquire and release both inside the outer block; leaving it (at `after`), the
+        // release has already run — on the switch's one path, `r()` before `after()`.
+        let source = "function f() { { a(); switch (x) { default: r(); } } after(); }";
+        let tree = parse(source);
+        let cfg = build(&tree, source);
+        let (acquire, region, release) = block_scope_fixture(&tree, source, &cfg);
+        assert!(cfg.on_all_paths_within(acquire, region, &[release]));
+    }
+
+    #[test]
+    fn a_release_after_the_block_does_not_discharge_block_scope() {
+        // release is outside the (smaller) block; leaving it, `r()` has not run yet.
+        let source = "function f() { { a(); } switch (x) { default: r(); } }";
+        let tree = parse(source);
+        let cfg = build(&tree, source);
+        let (acquire, region, release) = block_scope_fixture(&tree, source, &cfg);
+        assert!(!cfg.on_all_paths_within(acquire, region, &[release]));
     }
 }

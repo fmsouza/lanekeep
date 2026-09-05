@@ -353,6 +353,73 @@ impl<'t> Cfg<'t> {
             .map(|(index, _)| BlockId(index))
             .collect()
     }
+
+    /// Every point control leaves the function, in source order.
+    ///
+    /// One [`Exit`] per predecessor of [`Self::exit`], classified by the *last* node
+    /// attributed to that predecessor: `cfg_build` attributes a `return`/`throw` to the
+    /// block its operand's evaluation completes in, and — because control cannot fall
+    /// through either one — nothing is attributed to that block afterward, so the
+    /// attribution left standing is always the terminating statement itself. A
+    /// predecessor reaching exit by falling off the end of the function carries no
+    /// return/throw attribution and is `ImplicitEnd` with no node.
+    ///
+    /// # Limitation
+    ///
+    /// A `return`/`throw` that unwinds through an enclosing `finally` is misclassified.
+    /// `cfg_build`'s `unwind`/`emit_finally_copy` route that exit edge through a fresh
+    /// copy of the `finally` body rather than directly to [`Self::exit`], so the
+    /// predecessor this method sees is the finally-copy's *tail* block, not the block
+    /// the original `return`/`throw` was attributed to. The exit is classified — and its
+    /// node chosen or withheld — by how that copy ends: typically `ImplicitEnd` with no
+    /// node, or whichever `return`/`throw` the `finally` body itself terminates with. The
+    /// witness for such a path therefore describes the `finally`'s own terminating
+    /// behavior, not the `return`/`throw` that triggered the unwind.
+    #[must_use = "exits() has no side effect; discarding its result visits nothing"]
+    pub fn exits(&self) -> Vec<Exit<'t>> {
+        let mut out = Vec::new();
+        // `predecessors` is ascending (source order); no hash container is iterated.
+        for &pred in &self.block(self.exit()).predecessors {
+            let last = self.block(pred).nodes.last().copied();
+            let kind = match last.map(|node| node.kind()) {
+                Some("return_statement") => ExitKind::Return,
+                Some("throw_statement") => ExitKind::Throw,
+                _ => ExitKind::ImplicitEnd,
+            };
+            let node = matches!(kind, ExitKind::Return | ExitKind::Throw)
+                .then_some(last)
+                .flatten();
+            out.push(Exit {
+                block: pred,
+                kind,
+                node,
+            });
+        }
+        out
+    }
+}
+
+/// How a path leaves the function, per [`Cfg::exits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    /// A `return_statement` reaching the exit.
+    Return,
+    /// A `throw_statement` reaching the exit.
+    Throw,
+    /// Control falls off the end of the function with no `return`/`throw`.
+    ImplicitEnd,
+}
+
+/// One way control leaves the function: a predecessor of [`Cfg::exit`], how it exits, and
+/// the terminating node when there is one.
+#[derive(Debug)]
+pub struct Exit<'t> {
+    /// The predecessor of [`Cfg::exit`] this exit witnesses.
+    pub block: BlockId,
+    /// How this path leaves.
+    pub kind: ExitKind,
+    /// The `return`/`throw` node, or `None` for [`ExitKind::ImplicitEnd`].
+    pub node: Option<Node<'t>>,
 }
 
 #[cfg(test)]
@@ -419,7 +486,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockId, Cfg, EdgeKind};
+    use super::{BlockId, Cfg, EdgeKind, ExitKind};
 
     /// A three-block graph allocated out of source order, so `finish` has something to do.
     fn out_of_order() -> Cfg<'static> {
@@ -772,5 +839,42 @@ mod tests {
             result.is_err(),
             "a fixture with a syntax error must fail loudly"
         );
+    }
+
+    #[test]
+    fn exits_classifies_return_throw_and_implicit_end() {
+        let source = "function f(c) { if (c) { return 1; } if (!c) { throw e; } }";
+        let tree = super::testing::parse(source);
+        let cfg = Cfg::build(source, super::testing::find(&tree, "function_declaration")).unwrap();
+        let exits = cfg.exits();
+        let kinds: Vec<_> = exits.iter().map(|e| e.kind).collect();
+        assert!(kinds.contains(&ExitKind::Return));
+        assert!(kinds.contains(&ExitKind::Throw));
+        // falling off the end after the second `if` reaches the exit with no return/throw
+        assert!(kinds.contains(&ExitKind::ImplicitEnd));
+
+        // Pin the witness *node* for each kind, not just the kind label — Return's is
+        // pinned separately, by `a_return_exit_carries_its_node`.
+        let throw = exits.iter().find(|e| e.kind == ExitKind::Throw).unwrap();
+        assert_eq!(throw.node.unwrap().kind(), "throw_statement");
+
+        let implicit_end = exits
+            .iter()
+            .find(|e| e.kind == ExitKind::ImplicitEnd)
+            .unwrap();
+        assert!(implicit_end.node.is_none());
+    }
+
+    #[test]
+    fn a_return_exit_carries_its_node() {
+        let source = "function f() { return 1; }";
+        let tree = super::testing::parse(source);
+        let cfg = Cfg::build(source, super::testing::find(&tree, "function_declaration")).unwrap();
+        let ret = cfg
+            .exits()
+            .into_iter()
+            .find(|e| e.kind == ExitKind::Return)
+            .unwrap();
+        assert_eq!(ret.node.unwrap().kind(), "return_statement");
     }
 }

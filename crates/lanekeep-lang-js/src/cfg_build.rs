@@ -210,6 +210,36 @@ impl<'t> Cfg<'t> {
     }
 }
 
+/// The nearest ancestor (or `node` itself) that a [`Cfg`] can be built from — a function
+/// or the program. The single reader of [`ROOT_KINDS`] outside construction, so the set of
+/// function-like kinds is defined once (AGENTS.md records `SCOPE_KINDS` drifting when a
+/// second copy was maintained by hand).
+#[must_use]
+pub(crate) fn enclosing_cfg_root(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if ROOT_KINDS.contains(&n.kind()) {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// The nearest `statement_block` ancestor of `node`, the lexical region `scope: 'block'`
+/// bounds an obligation to.
+#[must_use]
+pub(crate) fn enclosing_block(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "statement_block" {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
 impl<'t, 's> Builder<'t, 's> {
     /// The text of `node`, carrying the *source's* lifetime rather than a borrow of `self`.
     ///
@@ -3447,6 +3477,28 @@ function f() {
         assert!(
             large < small * 5,
             "4x the statements gave {large} blocks against {small} — superlinear",
+        );
+    }
+
+    #[test]
+    fn enclosing_cfg_root_finds_the_nearest_function() {
+        let source = "function outer() { function inner() { acquire(); } }";
+        let tree = parse(source);
+        let acquire = find(&tree, "call_expression");
+        let root = super::enclosing_cfg_root(acquire).expect("a root");
+        assert_eq!(root.kind(), "function_declaration");
+        // nearest, not outermost: it is `inner`, whose body holds the call
+        assert!(source[root.byte_range()].starts_with("function inner"));
+    }
+
+    #[test]
+    fn a_top_level_node_roots_at_the_program() {
+        let source = "acquire();";
+        let tree = parse(source);
+        let acquire = find(&tree, "call_expression");
+        assert_eq!(
+            super::enclosing_cfg_root(acquire).unwrap().kind(),
+            "program"
         );
     }
 }

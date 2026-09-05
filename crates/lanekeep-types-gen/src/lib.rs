@@ -84,6 +84,8 @@ pub fn render_index_dts(wit: &str) -> String {
         render_context(&resolve, "ReduceContext", &reduce_context, false),
         render_flow_spec(),
         render_flow_path(),
+        render_obligation_spec(),
+        render_unmet_obligation(),
         render_rule(),
         render_config(),
         render_define_rule(),
@@ -517,6 +519,35 @@ export interface Gates {
 }
 ";
 
+const OBLIGATION_SPEC: &str = "\
+/**
+ * A typestate obligation: an acquired resource must reach a release on every
+ * path out of `scope`. Requires `requires: ['dataflow']`.
+ */
+export type ObligationSpec = {
+  /** Queries whose `@acquire` capture starts an obligation on the captured value. */
+  acquire: string[]
+  /** Queries whose `@release` capture discharges it. */
+  release: string[]
+  /**
+   * `'function'` — every path out of the enclosing function, `return`/`throw` included.
+   * `'block'` — every path out of the block the acquire is in.
+   */
+  scope: 'function' | 'block'
+}
+";
+
+const UNMET_OBLIGATION: &str = "\
+/** An acquire some path leaves undischarged, passed to `checkObligation`. */
+export type UnmetObligation = {
+  readonly acquire: Node
+  /** The exit the value escapes through — a `return`, a `throw`, or the implicit end. */
+  readonly exit: Node
+  /** Whether any path *did* discharge it: partial coverage reads differently to none. */
+  readonly partial: boolean
+}
+";
+
 const FIX: &str = "\
 /** A replacement a rule offers for a violation. */
 export interface Fix {
@@ -790,6 +821,14 @@ export interface Rule {
   flow?: FlowSpec
   /** Called once per canonical tainted flow from a source to a sink. */
   checkFlow?(ctx: RuleContext, path: FlowPath): void
+  /**
+   * A typestate obligation: queries whose captures acquire an obligation on a value and
+   * queries that discharge it. Requires `requires: ['dataflow']` and a `checkObligation`
+   * handler; a rule declaring one without the other is refused at load.
+   */
+  obligation?: ObligationSpec
+  /** Called once per value left with an unmet obligation at the end of its scope. */
+  checkObligation?(ctx: RuleContext, unmet: UnmetObligation): void
 }
 ";
 
@@ -877,6 +916,14 @@ fn render_rule_card() -> String {
 
 fn render_gates() -> String {
     GATES.to_owned()
+}
+
+fn render_obligation_spec() -> String {
+    OBLIGATION_SPEC.to_owned()
+}
+
+fn render_unmet_obligation() -> String {
+    UNMET_OBLIGATION.to_owned()
 }
 
 fn render_fix() -> String {

@@ -13,8 +13,9 @@
 //! split at every branch — short-circuit operators included, since `&&`, `??` and `?.` are
 //! control flow inside an expression — and a `finally` emitted once per distinct
 //! continuation rather than special-cased. Nothing in the engine calls it. #193's obligation
-//! analysis and #194's taint analysis are its first two consumers, over
-//! `on_all_paths_from` and `reaches` respectively, which is why the graph and the two
+//! analysis and #194's taint analysis are its first two consumers; obligation analysis
+//! consumes the all-paths and reachability queries (`on_all_paths_from_any`,
+//! `on_all_paths_within`, `reaches`, `reaches_avoiding`), which is why the graph and these
 //! queries are public from a module neither of them exists in yet.
 //!
 //! It is not a [`Language`] method, unlike everything else this crate exposes that way.
@@ -37,6 +38,7 @@ pub mod cfg;
 mod cfg_build;
 mod cfg_query;
 mod flow;
+mod obligation;
 
 pub use cfg::{Block, BlockId, Cfg, Edge, EdgeKind};
 
@@ -44,6 +46,7 @@ use std::sync::Arc;
 
 use lanekeep_lang::binding::BindingResolver;
 use lanekeep_lang::flow::FlowAnalyzer;
+use lanekeep_lang::obligation::ObligationAnalyzer;
 use lanekeep_lang::{Language, LanguageId, LanguageRegistry, RegistryError};
 
 use crate::binding::JsBindingResolver;
@@ -62,6 +65,13 @@ static RESOLVER: std::sync::LazyLock<Arc<dyn BindingResolver>> =
 /// context holds it for the life of a file.
 static FLOW_ANALYZER: std::sync::LazyLock<Arc<dyn FlowAnalyzer>> =
     std::sync::LazyLock::new(|| Arc::new(JsFlowAnalyzer));
+
+/// The obligation analyzer every language in this crate shares.
+///
+/// Built once rather than per call, same reasoning as [`RESOLVER`]: the analyzer is
+/// stateless, and a host context needs to hold it for the life of a file.
+static OBLIGATION: std::sync::LazyLock<Arc<dyn ObligationAnalyzer>> =
+    std::sync::LazyLock::new(|| Arc::new(obligation::JsObligationAnalyzer));
 
 /// What this crate's analysis *is*, as a digest of every source file that decides an answer.
 ///
@@ -99,6 +109,10 @@ impl Language for TypeScript {
         Some(Arc::clone(&FLOW_ANALYZER))
     }
 
+    fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
+        Some(Arc::clone(&OBLIGATION))
+    }
+
     fn id(&self) -> LanguageId {
         LanguageId::new("typescript")
     }
@@ -124,6 +138,10 @@ impl Language for Tsx {
 
     fn flow_analyzer(&self) -> Option<Arc<dyn FlowAnalyzer>> {
         Some(Arc::clone(&FLOW_ANALYZER))
+    }
+
+    fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
+        Some(Arc::clone(&OBLIGATION))
     }
 
     fn id(&self) -> LanguageId {
