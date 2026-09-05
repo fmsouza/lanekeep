@@ -85,10 +85,12 @@ being present. The load-time refusals, all naming the rule:
 | `obligation` with no `checkObligation` | refused — it could never fire |
 | `checkObligation` with no `obligation` | refused — nothing drives it |
 | `obligation` with no `requires: ['dataflow']` | refused — the capability must be declared |
-| `obligation` on a language with no analyzer (today, anything but TypeScript/TSX) | refused |
 | `scope` other than `'function'`/`'block'` | refused |
 | an acquire or release query that fails to compile | refused, naming the rule, at the same point a broken main `query` is |
 | neither `check` nor `obligation` | refused — a rule needs a handler |
+
+A rule targeting a language with no obligation analyzer is not on this list — it loads
+cleanly and is silent at run time instead. See Limitations below.
 
 ## What `checkObligation` receives
 
@@ -155,9 +157,16 @@ Each of these is a stated v1 scope decision, not an oversight — see
   say "returning the value counts as releasing it": a release is only ever a query match.
 - **Nothing crosses a function boundary.** The unit of analysis is the function the acquire
   is in; a callback or a call passed the acquired value is invisible to it.
-- **`--fix` does not apply.** `checkObligation` has no way to attach a `Fix` — the remedy is
-  almost always a `finally` that does not exist yet, not a byte-range replacement — so put the
-  whole remedy in `card.remediation`.
+- **Silent, not refused, on a language with no analyzer.** In v1 the analyzer exists only for
+  TypeScript and TSX. Declaring `obligation` for any other language is not a load-time
+  mistake — the rule loads cleanly, and `checkObligation` is simply never invoked for that
+  language's files, the same quiet-absence posture `ctx.types` takes when it has nothing to
+  say. A `check` the same rule also declares is unaffected and still runs.
+- **`--fix` is not offered.** `checkObligation` gets the same `ctx.report(node, { fix })`
+  `check` does, so nothing stops a handler from attaching a `Fix` to `unmet.exit` or
+  `unmet.acquire` — it is just a poor fit: a fix replaces one node's text, and the remedy is
+  almost always a `finally` that does not exist yet, not a replacement of the node the
+  violation is reported on. Put the whole remedy in `card.remediation` instead.
 - **Not skipped by `--since` or `--staged`.** Unlike a cross-file `reduce` rule, an obligation
   rule is per-file and needs no whole-corpus view, so it runs — and can find something — over
   however small a set of changed files you give it. It is safe, and useful, in a pre-commit
