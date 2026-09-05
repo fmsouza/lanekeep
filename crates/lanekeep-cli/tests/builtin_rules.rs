@@ -111,9 +111,14 @@ fn a_built_in_rule_can_be_imported_by_specifier() {
 /// A built-in **factory**, configured — through the format that can now reach one.
 ///
 /// `no-restricted-imports` exports a function over its options rather than a rule object, and
-/// both shapes have to keep working now that they live in one component: `configure` applies a
-/// factory to its options and uses a rule object as it comes. This is the factory half, end to
-/// end, from JSON on disk to a message carrying the configured reason.
+/// both shapes have to keep working behind one config syntax. For a module rule that happens in
+/// JavaScript, not in the host: `rules_module` in `crates/lanekeep-config/src/json.rs` imports
+/// the rule's default export into the generated entry module and, where the config supplied
+/// options, emits a call applying it to them when it is a function and a throw when it is not.
+/// (`configure` is how a *component* is given its options — a WIT export, taking them as JSON
+/// after instantiation, because a component cannot close over a host-supplied value. A
+/// TypeScript module never reaches it.) This is the factory half, end to end, from JSON on disk
+/// to a message carrying the configured reason.
 ///
 /// `no-restricted-imports` was briefly compiled into a component and reverted (see
 /// `crates/lanekeep-rules/src/lib.rs`'s `BUILT_IN_RULES` doc comment) — it ships as a TypeScript
@@ -121,8 +126,8 @@ fn a_built_in_rule_can_be_imported_by_specifier() {
 /// those eleven modules are genuine factories a `.config.ts` can import and call, this one
 /// included, so the capability being covered here — "a built-in factory can be configured" —
 /// has more than one built-in that could stand in for it; this one is kept because its JSON
-/// path (`configure` applying a factory to its options) is the one this test exists to drive
-/// end to end.
+/// path (the entry module calling a factory with the options the config gave it) is the one
+/// this test exists to drive end to end.
 #[test]
 fn a_built_in_factory_rule_can_be_configured() {
     let project = Project::new(

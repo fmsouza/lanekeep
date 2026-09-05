@@ -64,7 +64,9 @@ use lanekeep_types::{Symbol, Type, TypeScriptOracle, TypeScriptSupport};
 ///   hash plus exact node count), computed host-side in one walk.
 /// - `3` — `ctx.types`: the bounded within-file type oracle, present only for a rule that
 ///   declared `requires: ['types']`.
-pub const HOST_API_VERSION: u32 = 3;
+/// - `4` — obligation typestate: the host invokes a third handler, `checkObligation`, with
+///   a host-constructed `UnmetObligation` (`acquire`/`exit` node handles, `partial`).
+pub const HOST_API_VERSION: u32 = 4;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -546,7 +546,9 @@ The world's bytes are a cache-key input (§8.1, `host_api_hash`), so widening th
 
 ### 6.10 `ctx.types`
 
-The one part of this host API a rule has to ask for by name. Declaring `requires: ['types']` on `RuleSpec` is what makes `ctx.types` exist at all; declaring `requires: ['dataflow']` is refused at config load instead, because this build has no analysis to serve it yet. The engine probes each registered language once per run — never per file, never per rule — and hands a rule the resulting token only when its own `requires` names the capability.
+The one part of this host API a rule has to ask for by name. Declaring `requires: ['types']` on `RuleSpec` is what makes `ctx.types` exist at all. The engine probes each registered language once per run — never per file, never per rule — and hands a rule the resulting token only when its own `requires` names the capability.
+
+`requires: ['dataflow']` is the sibling capability, and it no longer refuses at load: #193 shipped an analysis for it, the obligation typestate check documented at §6.11. In v1 the analyzer exists only for TypeScript and TSX — a consequence of this feature's scope, not a designed guarantee — so a `dataflow` rule declared for a language with no analyzer behind the token is not refused. It is a silent per-file absence instead: the engine never invokes `checkObligation` for that language's files, the same quiet preference for saying nothing over saying something wrong that `ctx.types` shows below. That is not full symmetry with `types`, though — an *undeclared* `ctx.types` access is still loud, and `dataflow` has nothing equivalent to reach for: `checkObligation` is a handler the engine calls into, not a namespace the rule dereferences, so there is no undeclared-access case for it to loudly fail. The two capabilities differ in what the token unlocks: a `ctx.*` namespace for `types`, a second handler invocation (`checkObligation`) for `dataflow`.
 
 | Function | Notes |
 |---|---|
@@ -558,6 +560,44 @@ Both answer from the parsed file alone — no `tsconfig.json`, no declaration fi
 **Reaching for `ctx.types` without declaring it fails differently, and on purpose.** The namespace itself is absent rather than present-and-empty, so an undeclared access is a `TypeError` at the first call, not the quiet `undefined` `typeOf` returns for an ordinary "I don't know." The two are not the same failure: one is the oracle's considered answer about a piece of code, the other is an author who forgot a line finding out immediately rather than by reading a clean report that never looked. The identical absence reaches a rule that declared the capability but runs against a language with no TypeScript-shaped grammar — declaring `requires: ['types']` and having a usable oracle underneath are two separate conditions, and either missing is loud rather than silently degraded.
 
 `ctx.types` has no component form. A component's `rule-metadata` has no `requires` field to carry the declaration — `world.wit` is untouched by this surface entirely — so unlike everything else in this section, it lives in the JavaScript host alone.
+
+### 6.11 Obligation typestate
+
+`requires: ['dataflow']` unlocks a second `RuleSpec` shape beside plain `check`: a rule declares `obligation` — `acquire`/`release` tree-sitter queries plus a `scope` — and `checkObligation(ctx, unmet)` is invoked once per acquire the analysis cannot prove discharged. It is a **must**-analysis over the per-function control-flow graph (§3, "The control-flow graph"): an acquired resource has to reach a release on every path out of `scope`, not merely on some path — the opposite bias from an ordinary query-driven rule, and the reason that section already documents its `may`/`must` trade-offs as a deliberate pair rather than a single default.
+
+```ts
+export default defineRule({
+  id: 'local/secrets-zeroed-on-all-paths',
+  requires: ['dataflow'],
+  obligation: {
+    acquire: ['(call_expression function: (member_expression property: (property_identifier) @m) (#any-of? @m "getEntropy" "deriveSeed")) @acquire'],
+    release: ['(call_expression function: (member_expression property: (property_identifier) @p) (#eq? @p "fill") arguments: (arguments (number) @z) (#eq? @z "0")) @release'],
+    scope: 'function',
+  },
+  card: { /* message, remediation, examples */ },
+  checkObligation(ctx, unmet) {
+    ctx.report(unmet.exit, unmet.partial ? 'zeroed on some paths, not all' : 'never zeroed')
+  },
+})
+```
+
+`scope: 'function'` asks whether every path out of the enclosing function — `return` and `throw` included — passes a release; `scope: 'block'` narrows the question to the lexical block the acquire sits in. `unmet.exit` is the source-earliest `return`, `throw`, or implicit function end reachable from the acquire without crossing a release, and `unmet.partial` says whether *some* path did discharge it — a resource zeroed on the happy path but missed on an early `return` reads differently in a report than one never zeroed at all.
+
+**Intra-procedural and per-file.** Nothing crosses a function boundary (a nested function is opaque to its parent's graph, §3) or a file boundary — `checkObligation` runs from the engine's ordinary per-file dispatch, in the same `check` phase as the main query loop and under the same per-invocation timeout, with its `ctx.report` calls harvested exactly as `check`'s are. That has a consequence worth stating plainly: **unlike a cross-file `reduce` rule (§4, "Cross-file rules"), an obligation rule is never skipped by `--since` or `--staged`** (§8.4) — there is no whole-corpus fact set for a subset run to get wrong, so checking three changed files is exactly as sound as checking all of them. It is the one capability in this document that gets *more* useful in the pre-commit loop rather than less.
+
+**`--fix` is not offered.** `checkObligation` receives the same `RuleContext` as `check`, and `ctx.report` accepts a `Fix` there exactly as it does anywhere else — nothing stops a handler from attaching one to `unmet.exit` or `unmet.acquire`. It is not expected to: a `Fix` replaces one node's text, and the remedy for an unmet obligation is almost never that — it is almost always adding a `finally` that does not exist at the report site, which a single node's replacement text can only approximate by reconstructing the surrounding code around it. `card.remediation` is expected to carry the whole remedy in prose instead, the same posture a reduce-phase violation already takes for the same reason (§10.1).
+
+**Documented v1 limitations**, each a deliberate scope decision rather than an oversight:
+
+- **No value identity.** A release on all paths discharges every acquire it is on-all-paths-from, regardless of which value it released — exact with one acquire per function, imprecise with several. The same absence means `return` and `throw` never discharge an obligation on their own: a release is only ever a query match, never inferred from a `return`/`throw` handing the acquired value to a caller that might release it instead.
+- **Value-insensitive by construction, not by omission**, for the same reason: the question the analysis asks is "does some release sit on every path", never "is *this* value released here."
+- **Block-scope precision.** `scope: 'block'` restricts discharge to a release lexically inside the acquire's own block — filtered by byte range before the CFG walk runs — and a path counts as having left the block once it reaches a block whose start byte falls outside that range. Two things follow. A `return`/`throw` unwound through a `finally` is reported at whichever concrete node the graph says is actually reachable: if the `finally` itself terminates unconditionally, that is the `finally`'s own exit, not the original statement inside the `try` (§3 documents the same edge for the function-scope case, under "A `finally` is emitted once per distinct continuation"). And because the block frontier is byte-range containment rather than a re-parse of the lexical structure, an odd boundary can classify a block as having left the region when it has not; the wrong answer that produces is always **over-report**, the same must-analysis bias §3 states for a nested function — never a silently discharged obligation.
+
+An `obligation` without `checkObligation`, a `checkObligation` without `obligation`, an `obligation` without `requires: ['dataflow']`, and a `scope` outside `'function'`/`'block'` are each refused at load, naming the rule — the same posture every other authoring mistake in this document gets. A language with no analyzer behind the token is not one of these: it is the runtime absence described above, not a load-time mistake, so it costs a silently-unfiring `checkObligation` rather than a refusal. Today that is every language but TypeScript and TSX.
+
+**The host surface grew to carry it.** A host-invoked third handler and a host-constructed `UnmetObligation` are new invocation surface even though no new `ctx` method was added, so `HOST_API_VERSION` moved 3 → 4 (§8.1) — a one-time cache invalidation for every build, dataflow rule or not, on the same terms version 3 already invalidated once for `ctx.types`.
+
+`docs/obligation-rules.md` is the authoring playbook: the full `ObligationSpec` shape and a worked example through all seven of the acceptance behaviors above.
 
 ---
 
@@ -704,6 +744,8 @@ Both are **intersected with discovery** rather than used in place of it, so `inc
 
 Both **skip cross-file rules**, and say so on stderr naming the rules that did not run. A reduce phase consumes facts from every file, so running one over a subset does not give a smaller answer — it gives a wrong one. `no-unused-exports` over three changed files would report every export in them as unused, because the importers were never looked at.
 
+An obligation rule (§6.11) has no `reduce`, so it is not cross-file by this definition and neither flag skips it — it runs, and reports, exactly as it would over full discovery.
+
 Computing them properly would mean processing the whole corpus, which is what the flag exists to avoid. Skipping is the only option that is both fast and never wrong. Staying quiet about it is not an option at all: a rule that silently stops running turns a clean result into a false "fixed".
 
 A ref that does not resolve is an error. Checking everything instead would be a surprising amount of work done silently; checking nothing would look like a clean run.
@@ -832,6 +874,8 @@ The range comes from a **node**, never from offsets a rule computed. Offsets a r
 Two fixes touching the same bytes cannot both apply — the second would be editing text the first replaced. One is applied and the other skipped, chosen by start offset so the outcome does not depend on the order rules happened to run in, and the skipped count is always reported. A run that fixed three of five things and said it fixed everything would leave someone believing the file was clean.
 
 A reduce-phase violation carries no fix: there is no parse tree in that phase, so no node to replace and no range to compute. Cross-file findings are fixed by hand.
+
+An obligation violation (§6.11) is not expected to carry a fix either, for the opposite reason: the tree is right there, and `checkObligation` can attach a `Fix` exactly as `check` can — but the remedy is almost never a replacement at the report site, since it is almost always adding a `finally` that does not exist yet, and a fix is a poor fit for that. `card.remediation` carries the whole remedy instead.
 
 ---
 
