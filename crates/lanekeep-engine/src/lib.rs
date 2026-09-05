@@ -3237,8 +3237,9 @@ fn declared_bindings_match(bound: &[ExternalBinding]) -> Result<(), RunError> {
 /// Everything about a run that every file's key shares.
 ///
 /// A named function rather than a call inside [`Engine::prepare`], because it is the one place
-/// the five run-wide inputs are actually assembled and a value dropped here is dropped from
-/// every key in the run. Inline it and "the compilation environment reaches a real run's key"
+/// the run-wide inputs are actually assembled — whatever [`RunKey::new`] takes, which is the
+/// list rather than any number written here — and a value dropped here is dropped from every
+/// key in the run. Inline it and "the compilation environment reaches a real run's key"
 /// becomes a claim about a private field of a struct that needs a project on disk to build.
 ///
 /// # Errors
