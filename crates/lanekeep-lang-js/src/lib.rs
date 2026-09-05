@@ -36,6 +36,7 @@ pub mod binding;
 pub mod cfg;
 mod cfg_build;
 mod cfg_query;
+mod flow;
 
 pub use cfg::{Block, BlockId, Cfg, Edge, EdgeKind};
 
