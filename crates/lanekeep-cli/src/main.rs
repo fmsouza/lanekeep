@@ -559,13 +559,12 @@ struct Scaffold {
     /// The `exclude` glob, or none when the language has no obvious test convention.
     exclude: Option<&'static str>,
     /// Built-in rules to enable, each pre-formatted as a `rules` array entry — a quoted bare
-    /// specifier, or the `{ "rule": ..., "options": {} }` object form a factory rule needs.
+    /// specifier, or the `{ "rule": ..., "options": {} }` object form.
     ///
-    /// `lanekeep/no-unwrap` is a factory — it is how its `allow` option is reached at all —
-    /// so a bare quoted string for it would fail config load with ``missing `id` `` the moment a
-    /// Rust project ran `init`. Formatting each entry here rather than quoting a bare
-    /// specifier in `starter_config` is what lets the two forms coexist without
-    /// `starter_config` having to know which built-ins are factories.
+    /// Formatting each entry here rather than quoting a bare specifier in `starter_config` is
+    /// what lets the two forms coexist without `starter_config` knowing which is which: a
+    /// module rule that exports a factory is only loadable in the object form, and a scaffold
+    /// may prefer that form anyway to show a new user where options go.
     builtins: &'static [&'static str],
     /// Filename of the starter rule, under `lanekeep/rules/`.
     rule_file: &'static str,
@@ -751,8 +750,10 @@ const RUST: Scaffold = Scaffold {
     // A Rust project keeps its unit tests beside the code they cover, so there is no test
     // path to exclude — `#[cfg(test)]` is the convention, not a directory.
     exclude: None,
-    // The object form, not a bare specifier: `no-unwrap` is a factory, and calling it with no
-    // options is what makes it behave the way the bare form used to.
+    // The object form is a choice, not a necessity: `no-unwrap` is a component, so the bare
+    // specifier loads fine and keeps the default empty `allow` — a bare reference sends `null`
+    // to its `configure`. Scaffolding the object form instead shows a new user where options
+    // go, and `allow` is the option a real Rust project reaches for first.
     builtins: &["{ \"rule\": \"lanekeep/no-unwrap\", \"options\": {} }"],
     rule_file: "no-dbg.ts",
     rule: RUST_RULE,
