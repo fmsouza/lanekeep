@@ -83,17 +83,26 @@ impl<'t> Taint<'_, 't> {
         if depth >= MAX_DEPTH {
             return Vec::new();
         }
-        // A sanitizer's result is clean — cut the value — before anything it contains is
-        // considered.
+        // A sanitizer call's result is clean — cut the value — regardless of its arguments,
+        // and before any source it textually wraps is considered. This is what makes
+        // `redact(getSecret())` silent where `foo(getSecret())` is not.
         if is_member(expr, self.sanitizers) {
             return Vec::new();
         }
-        // A direct source: the expression is a `@source` call itself.
-        if is_member(expr, self.sources) {
-            return vec![Fact {
-                source: expr,
-                steps: Vec::new(),
-            }];
+        // A `@source` appearing within the expression taints it: identity when the sink or
+        // value *is* the source call, containment when it wraps one (`getSecret() + x`).
+        // Taint carried by a *binding* through a call is a different question, answered
+        // below by def-use — and `identity(a)` wraps no source, so it stays clean (the v1
+        // alias-through-call false negative).
+        let direct = self.sources_within(expr);
+        if !direct.is_empty() {
+            return direct
+                .into_iter()
+                .map(|source| Fact {
+                    source,
+                    steps: Vec::new(),
+                })
+                .collect();
         }
         match expr.kind() {
             "identifier" => self.taint_of_identifier(expr, sink_block, depth),
@@ -127,6 +136,21 @@ impl<'t> Taint<'_, 't> {
             }
         }
         facts
+    }
+
+    /// The `@source` nodes lying within `expr`'s byte range, in source order. A source that
+    /// *is* `expr` is included (its range covers itself), so this subsumes the direct case.
+    fn sources_within(&self, expr: Node<'t>) -> Vec<Node<'t>> {
+        let mut found: Vec<Node<'t>> = self
+            .sources
+            .iter()
+            .copied()
+            .filter(|source| {
+                expr.start_byte() <= source.start_byte() && source.end_byte() <= expr.end_byte()
+            })
+            .collect();
+        found.sort_by_key(Node::start_byte);
+        found
     }
 
     /// Whether a definition's block can reach the sink's block. Absent a CFG, or a block for
@@ -269,6 +293,44 @@ mod tests {
         // const s = clean(); log(s); — clean() is neither a source nor a sanitizer.
         let flows = run(
             "function f() { const s = clean(); log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty());
+    }
+
+    #[test]
+    fn a_sanitizer_before_the_sink_cuts() {
+        // reads the *clean* value c, not s → silent.
+        let flows = run(
+            "function f() { const s = getSecret(); const c = redact(s); log(c); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty());
+    }
+
+    #[test]
+    fn a_sanitizer_after_the_sink_does_not_cut() {
+        // log reads s while it is still tainted; redact runs afterward.
+        let flows = run(
+            "function f() { const s = getSecret(); log(s); const c = redact(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1);
+    }
+
+    #[test]
+    fn a_sanitizer_wrapping_a_source_cuts() {
+        // redact(getSecret()) textually wraps the source; the cut must win over containment,
+        // or c is tainted. This is what makes the sanitizer check load-bearing: without it,
+        // the wrapped source would taint c.
+        let flows = run(
+            "function f() { const c = redact(getSecret()); log(c); }",
             "getSecret",
             "log",
             "redact",
