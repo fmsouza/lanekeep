@@ -705,6 +705,9 @@ in `crates/lanekeep-rules/tests/no_secret_in_string.rs`:
 | `const s = getSecret(); log(s); const c = redact(s);` | yes | flow-sensitive: sanitizing *after* the read does not retroactively clean it |
 | `const a = getSecret(); const b = a; log(b);` | yes | a direct alias (`b`'s initializer is the identifier `a`) |
 | `const a = getSecret(); const b = identity(a); log(b);` | **no** — documented v1 false negative | taint is not followed through a call's own arguments; `identity(a)` is opaque |
+| `const { x } = getSecret(); log(x);` | **no** — documented v1 false negative | a binding introduced by destructuring is not tracked in v1 |
+| `for (const x of getSecret()) { log(x); }` | **no** — documented v1 false negative | a binding introduced by a `for...of` header is not tracked in v1 |
+| `let msg = ""; msg += getSecret(); log(msg);` | yes | augmented assignment (`+=`, `\|\|=`, …) is a weak update — tainted-iff-RHS, and it never kills prior taint |
 | `o.secret = getSecret(); log(o.public);` | yes — documented over-approximation | field-insensitive: tainting one field taints the whole binding, and every field read from it |
 | `const s = getSecret(); if (isTest) { log(s); }` | yes — documented, path-insensitive | the analysis asks only whether some path reaches the read, never whether that branch runs |
 | two branches each doing `s = getSecret()`, one `log(s)` after | yes, **twice** | two distinct sources reaching one sink are two distinct findings, not deduplicated into one — deduplication only collapses a *single* source reaching one sink by more than one path |

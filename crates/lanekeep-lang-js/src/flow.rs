@@ -27,8 +27,20 @@
 //! over-approximates — reading `o.public` after `o.secret` was tainted reports though the two
 //! fields are distinct — which is the sound direction for a taint tool.
 //!
+//! **Augmented assignment is a weak update too.** `x += rhs` (and `-=`, `||=`, `??=`, …)
+//! desugars to `x = x op rhs`, whose result is tainted if *either* the prior `x` or `rhs` is
+//! tainted. So an `op=` joins the same additive, non-killing union: it contributes `rhs`'s taint
+//! and never *kills* the prior definition of `x`, which keeps reaching the read. Modeling it as
+//! a strong def would kill that prior taint and silence `let s = getSecret(); s += "clean";
+//! log(s)` — a false negative. An identifier target adds taint to the name; a member/subscript
+//! target (`o.total += rhs`) is a field write to the base, exactly like `o.total = rhs`.
+//! tree-sitter parses `s += x` as `augmented_assignment_expression`, distinct from the
+//! `assignment_expression` the strong path matches.
+//!
 //! v1 is intra-procedural, path-insensitive, and does not follow taint through a call's
-//! arguments. See
+//! arguments; nor does it track a binding introduced by **destructuring** (`const { x } =
+//! getSecret()`) or by a **`for...of`** header (`for (const x of getSecret())`) — both v1 false
+//! negatives. See
 //! `docs/superpowers/specs/2026-09-05-taint-analysis-flow-checkflow-design.md` §5.
 
 use lanekeep_lang::binding::BindingResolver;
@@ -137,6 +149,13 @@ impl<'t> Taint<'_, 't> {
         // Taint carried by a *binding* through a call is a different question, answered
         // below by def-use — and `identity(a)` wraps no source, so it stays clean (the v1
         // alias-through-call false negative).
+        //
+        // Deliberate over-approximation: containment is textual, and the sanitizer cut above
+        // only fires when `expr` *itself* is the sanitizer call. So a source wrapped by a
+        // sanitizer *inside* a larger sink expression — `log(redact(getSecret()) + "x")` —
+        // still reports here, a false positive. The sanitizer-cuts-the-value rule is precise
+        // for a def-use chain (a binding assigned from a sanitizer), not for a source textually
+        // nested in a compound sink expression; over-reporting is the sound direction.
         let direct = self.sources_within(expr);
         if !direct.is_empty() {
             return direct
@@ -257,14 +276,16 @@ impl<'t> Taint<'_, 't> {
         found
     }
 
-    /// Every `assignment_expression` in the enclosing function whose left-hand side is a
-    /// `member_expression` or `subscript_expression` (`o.secret = …`, `a[0] = …`) whose base
+    /// Every assignment in the enclosing function whose left-hand side is a `member_expression`
+    /// or `subscript_expression` (`o.secret = …`, `a[0] = …`, `o.total += …`) whose base
     /// identifier resolves to `decl`, in source order. These are the field/index writes: weak
-    /// updates that taint the whole base object (field-insensitive, spec §2). Empty without a
-    /// root to scan.
+    /// updates that taint the whole base object (field-insensitive, spec §2). Both plain `=` and
+    /// augmented `op=` targets count — a field write mutates the object in place either way and
+    /// so never kills a prior definition. Empty without a root to scan.
     ///
-    /// Disjoint from [`Self::assignments_to`] by left-hand-side kind — an identifier target is
-    /// a strong update, a member/subscript target a weak one, and no assignment is both.
+    /// Disjoint from [`Self::assignments_to`] by left-hand-side kind — an identifier target is a
+    /// strong update, a member/subscript target a weak one, and no assignment is both — and from
+    /// [`Self::augmented_assignments_to`] by left-hand-side kind for the same reason.
     fn field_writes_to(&self, decl: Node<'t>) -> Vec<Node<'t>> {
         let Some(root) = self.root else {
             return Vec::new();
@@ -272,8 +293,10 @@ impl<'t> Taint<'_, 't> {
         let mut found = Vec::new();
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if node.kind() == "assignment_expression"
-                && let Some(left) = node.child_by_field_name("left")
+            if matches!(
+                node.kind(),
+                "assignment_expression" | "augmented_assignment_expression"
+            ) && let Some(left) = node.child_by_field_name("left")
                 && matches!(left.kind(), "member_expression" | "subscript_expression")
                 && let Some(base) = base_identifier(left)
                 && JsBindingResolver
@@ -291,8 +314,52 @@ impl<'t> Taint<'_, 't> {
         found
     }
 
+    /// Every `augmented_assignment_expression` in the enclosing function whose left-hand side is
+    /// a plain identifier resolving to `decl` (`x += …`, `x -=`, `x ||=`, `x ??=`, …), in source
+    /// order. These are **weak** updates: `x op= rhs` desugars to `x = x op rhs`, whose result is
+    /// tainted if *either* the prior `x` or `rhs` is tainted. So such a def contributes `rhs`'s
+    /// taint but never *kills* the prior definition of `x` — which keeps reaching the read
+    /// through [`Self::reaching_defs`]. Modeling `op=` as a strong (killing) def would silence
+    /// `let s = getSecret(); s += "clean"; log(s)`, a false negative and the worst outcome for a
+    /// may-taint analysis. Empty without a root to scan.
+    ///
+    /// Disjoint from [`Self::assignments_to`] by node kind: that finds `assignment_expression`
+    /// (a strong `=` update that kills), this finds `augmented_assignment_expression` (a weak
+    /// `op=` update). An `op=` with a member/subscript target (`o.x += …`) is left to
+    /// [`Self::field_writes_to`] instead, matched there by left-hand-side kind.
+    fn augmented_assignments_to(&self, decl: Node<'t>) -> Vec<Node<'t>> {
+        let Some(root) = self.root else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "augmented_assignment_expression"
+                && let Some(left) = node.child_by_field_name("left")
+                && left.kind() == "identifier"
+                && JsBindingResolver
+                    .declaration_of(self.tree, self.source, left)
+                    .is_some_and(|target| target.id() == decl.id())
+            {
+                found.push(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        found.sort_by_key(Node::start_byte);
+        found
+    }
+
     /// The `@source` nodes lying within `expr`'s byte range, in source order. A source that
     /// *is* `expr` is included (its range covers itself), so this subsumes the direct case.
+    ///
+    /// Attribution: when a source is textually contained in the sink expression, the [`FlowPath`]
+    /// `source` reported is that contained source node itself — the sink's other operands (an
+    /// identifier alias in `getSecret() + x`) are not separately walked here. Invisible to the
+    /// shipped rule, which reports at `path.sink`; relevant to any future rule that reports at
+    /// `path.source`.
     fn sources_within(&self, expr: Node<'t>) -> Vec<Node<'t>> {
         let mut found: Vec<Node<'t>> = self
             .sources
@@ -393,14 +460,17 @@ impl<'t> Taint<'_, 't> {
         cfg.reaches_avoiding(db, &avoid, ub)
     }
 
-    /// The field/index writes to `decl`'s binding that may reach a read at `use_node`, as weak
-    /// (additive) definitions. Unlike [`Self::reaching_defs`], a weak update neither kills nor
-    /// is killed: every write that may reach the read contributes its right-hand side's taint,
-    /// because a field write mutates the object in place rather than rebinding the name. The
-    /// site is the `assignment_expression`, its `rhs` the assigned value.
+    /// The weak (additive) definitions of `decl`'s binding that may reach a read at `use_node`:
+    /// the field/index writes ([`Self::field_writes_to`]) and the identifier augmented
+    /// assignments ([`Self::augmented_assignments_to`]). Unlike [`Self::reaching_defs`], a weak
+    /// update neither kills nor is killed: every write that may reach the read contributes its
+    /// right-hand side's taint, because a field write mutates the object in place rather than
+    /// rebinding the name, and an `op=` reads the prior value it adds to. The site is the
+    /// assignment expression, its `rhs` the assigned value.
     fn weak_reaching_defs(&self, decl: Node<'t>, use_node: Node<'t>) -> Vec<Def<'t>> {
         self.field_writes_to(decl)
             .into_iter()
+            .chain(self.augmented_assignments_to(decl))
             .filter_map(|assignment| {
                 let rhs = assignment.child_by_field_name("right")?;
                 let def = Def {
@@ -992,6 +1062,85 @@ mod tests {
             "redact",
         );
         assert_eq!(flows.len(), 1, "a subscript write taints the whole array");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    // --- Augmented assignment as a weak update (#194 final review) -------------------------
+    //
+    // tree-sitter parses `s += x` as `augmented_assignment_expression`, distinct from the
+    // `assignment_expression` the strong path matches. `x op= rhs` desugars to `x = x op rhs`:
+    // the result is tainted if *either* the prior `x` or `rhs` is tainted, so it is a WEAK
+    // update — tainted-iff-RHS, never killing a prior def of `x`. It rides the same additive,
+    // non-killing path as a field/index write.
+
+    #[test]
+    fn an_augmented_assignment_from_a_source_reports() {
+        // FLAGSHIP: `msg += getSecret()` taints `msg` — the string-concatenation pattern
+        // `no-secret-in-string` exists to catch. Silent before augmented assignment was
+        // modeled, because the strong path never saw the `+=`.
+        let flows = run(
+            "function f(){ let msg = \"\"; msg += getSecret(); log(msg); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "the += taints msg");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn a_prior_taint_survives_an_augmented_assignment() {
+        // SOUNDNESS: `s = getSecret(); s += "clean"` desugars to `s = s + "clean"`, whose
+        // result is tainted because the *old* s was. A weak update does not kill, so the
+        // tainted declarator still reaches the sink. Modeling `+=` as a strong def would
+        // clobber it and wrongly silence this — the worst outcome for a may-taint tool.
+        let flows = run(
+            "function f(){ let s = getSecret(); s += \"clean\"; log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a += must not kill the prior taint on s");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn an_augmented_assignment_of_clean_values_does_not_report() {
+        // NEGATIVE: neither the declarator nor the `+=` RHS is tainted, so nothing reports.
+        let flows = run(
+            "function f(){ let s = \"a\"; s += \"b\"; log(s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty(), "a += of clean values must stay silent");
+    }
+
+    #[test]
+    fn a_non_string_augmented_operator_still_reports() {
+        // `n += getSecret()` on a number is still reported: v1 does not reason about numeric
+        // coercion, and over-approximating is the sound direction for a taint tool.
+        let flows = run(
+            "function f(){ let n = 0; n += getSecret(); log(n); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a non-string += is over-approximated");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn an_augmented_write_to_a_field_taints_the_object() {
+        // A member-target `op=` (`o.total += getSecret()`) is a field write like `o.total =
+        // …`: field-insensitive, it taints the whole `o`, so reading any field reports.
+        let flows = run(
+            "function f(){ const o = {}; o.total += getSecret(); log(o.other); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "an augmented field write taints the object");
         assert_eq!(flows[0].0, "getSecret()");
     }
 }

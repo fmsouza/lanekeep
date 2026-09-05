@@ -146,6 +146,21 @@ fn two_sources_into_one_sink_report_deterministically() {
 // implemented and validated: `crates/lanekeep-config/src/lib.rs`'s
 // `flow_without_check_flow_is_refused` (Task 2, spec §4.2). Not duplicated here.
 
+/// #13 — augmented assignment (`msg += getSecret()`) is a weak update that taints `msg`: the
+/// string-concatenation shape this rule exists to catch. tree-sitter parses it as
+/// `augmented_assignment_expression`, distinct from the strong `=` path, and the analyzer models
+/// it as tainted-iff-RHS without killing prior taint — pinned at the analyzer layer by
+/// `crates/lanekeep-lang-js/src/flow.rs`'s `an_augmented_assignment_from_a_source_reports`.
+#[test]
+fn augmented_assignment_from_a_source_reports() {
+    tester()
+        .reports_at(
+            "function f() { let msg = \"\"; msg += getSecret(); log(msg); }\n",
+            &[(1, 54)],
+        )
+        .expect("`msg += getSecret()` taints `msg`, read at the sink");
+}
+
 /// #12 — determinism: two runs over the same input are byte-identical. The two-source fixture
 /// from #10 is the one that would expose a nondeterministic worklist or an unstable dedup/sort,
 /// since it is the only fixture here with more than one flow into the same sink.
