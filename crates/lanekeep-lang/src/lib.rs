@@ -12,9 +12,11 @@
 //! after a second language arrives is the expensive version of the same work.
 
 pub mod binding;
+pub mod flow;
 pub mod grammar;
 pub mod obligation;
 
+pub use flow::{FlowAnalyzer, FlowPath};
 pub use grammar::grammar_digest;
 pub use obligation::{ObligationAnalyzer, ObligationScope, UnmetObligation};
 
@@ -81,6 +83,15 @@ pub trait Language: Send + Sync {
     /// rather than a placeholder: a rule asking about obligations in such a language gets
     /// nothing back instead of a confidently wrong answer.
     fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
+        None
+    }
+
+    /// The taint/data-flow analysis for this language, when it has one.
+    ///
+    /// Returns `None` for a language with no flow analyzer yet, which is honest rather than a
+    /// placeholder: a rule asking about flows in such a language gets nothing back instead of
+    /// a confidently wrong answer.
+    fn flow_analyzer(&self) -> Option<Arc<dyn FlowAnalyzer>> {
         None
     }
 
