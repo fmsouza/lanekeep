@@ -4828,6 +4828,81 @@ mod tests {
         assert_eq!(hex(&first), hex(&second));
     }
 
+    /// #193's cache-key property (spec §7): an obligation rule's `acquire`/`release`/`scope`
+    /// live in the rule's own module source, so a warm run must never keep discharging an
+    /// obligation against a query or scope the rule no longer names. Nothing new was added to
+    /// `hash_ruleset` or `hash_config` for this feature — the claim is that the *existing*
+    /// verbatim module fold (proven generally by `the_ruleset_hash_covers_an_imported_helper`,
+    /// above) already reaches these three fields specifically, the same way #196 argued
+    /// `requires` needed no dedicated cache-key input because it is written in the rule's own
+    /// source too. This test proves that for `obligation` rather than assuming it.
+    ///
+    /// Each field is changed alone, from the same baseline, so a mutant that folds only one of
+    /// the three (e.g. `release` but not `scope`) cannot pass by accident.
+    ///
+    /// The complementary #186-framed claim — that a config naming **no** dataflow rule folds
+    /// nothing obligation-specific into either hash — is not asserted as a second test here,
+    /// deliberately, on the same reasoning #196 gave for the equivalent `requires` claim: it
+    /// can only be checked by comparing this build against one from before #193, which no test
+    /// in a single checkout can construct. It is instead provable from the diff, the same way
+    /// #196 proved it for `requires`: `hash_ruleset` (`:2259` above) and `hash_config` (`:2373`)
+    /// name neither `obligation` nor `Capability::Dataflow` anywhere in their bodies, so a
+    /// config whose rules never mention `obligation` produces exactly the module bytes it
+    /// always did, and folds them exactly as `the_ruleset_hash_is_stable_when_nothing_changed`
+    /// already asserts for an ordinary rule.
+    #[test]
+    fn changing_an_obligations_acquire_release_or_scope_changes_the_ruleset_hash() {
+        let fixture = Fixture::new(
+            "obligation-fields-hash",
+            &[
+                ("rule.ts", &obligation_rule("local/zeroed")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let baseline = fixture.load_config().expect("loads").ruleset_hash;
+
+        let release_edited = obligation_rule("local/zeroed").replacen(
+            "release: ['(call_expression) @release']",
+            "release: ['(identifier) @release']",
+            1,
+        );
+        fixture.write_all(&[("rule.ts", &release_edited)]);
+        let release_changed = fixture.load_config().expect("loads").ruleset_hash;
+        assert_ne!(
+            hex(&baseline),
+            hex(&release_changed),
+            "editing an obligation's `release` query must invalidate the ruleset hash"
+        );
+
+        let scope_edited =
+            obligation_rule("local/zeroed").replacen("scope: 'function'", "scope: 'block'", 1);
+        fixture.write_all(&[("rule.ts", &scope_edited)]);
+        let scope_changed = fixture.load_config().expect("loads").ruleset_hash;
+        assert_ne!(
+            hex(&baseline),
+            hex(&scope_changed),
+            "editing an obligation's `scope` must invalidate the ruleset hash"
+        );
+        assert_ne!(
+            hex(&release_changed),
+            hex(&scope_changed),
+            "two different obligation edits must not collide on the same hash"
+        );
+
+        let acquire_edited = obligation_rule("local/zeroed").replacen(
+            "acquire: ['(call_expression) @acquire']",
+            "acquire: ['(identifier) @acquire']",
+            1,
+        );
+        fixture.write_all(&[("rule.ts", &acquire_edited)]);
+        let acquire_changed = fixture.load_config().expect("loads").ruleset_hash;
+        assert_ne!(
+            hex(&baseline),
+            hex(&acquire_changed),
+            "editing an obligation's `acquire` query must invalidate the ruleset hash"
+        );
+    }
+
     #[test]
     fn the_ruleset_hash_covers_a_components_bytes() {
         // The component half of the same property `the_ruleset_hash_covers_an_imported_helper`
