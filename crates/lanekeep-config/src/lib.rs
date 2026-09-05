@@ -99,6 +99,17 @@ pub struct RuleSpec {
     pub timeout: Option<Duration>,
     /// Whether the rule has a `reduce` phase.
     pub has_reduce: bool,
+    /// Whether the rule has a `checkFlow` handler.
+    ///
+    /// Recorded the same way `has_check`/`has_reduce` are — `EXTRACT` reads it off the rule
+    /// object before `JSON.stringify` would drop it silently — because a `flow` with no
+    /// handler to run it, or a handler with nothing to call it on, is a rule that loads
+    /// clean and never reports: exactly the failure this field exists to catch at load time
+    /// instead.
+    pub has_check_flow: bool,
+    /// The rule's taint-flow queries, when it declared `flow`. `None` for every rule that
+    /// did not — which is every rule except a dataflow one.
+    pub flow: Option<FlowSpec>,
     /// The compiled component this rule's handlers live in, or `None` for a TypeScript rule.
     ///
     /// **This is what sends a rule to one engine or the other.** `lanekeep-engine` runs a rule
@@ -143,6 +154,23 @@ pub struct ObligationSpec {
     pub release: Vec<String>,
     /// `"function"` or `"block"`, as written — see the struct doc for what is not yet checked.
     pub scope: String,
+}
+
+/// A rule's taint-flow queries, as loaded from config. The engine compiles these.
+///
+/// A distinct type from the TypeScript `FlowSpec` `packages/lanekeep/index.d.ts` declares
+/// (that one is the authoring shape; JSON crossing the sandbox boundary) and from
+/// `lanekeep-lang`'s `FlowPath` (that one is a *result* of running the analysis, not the
+/// query that drives it) — same name, three different questions, no Rust name clash because
+/// only this one lives in this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowSpec {
+    /// Queries whose `@source` capture marks a tainted origin.
+    pub sources: Vec<String>,
+    /// Queries whose `@sink` capture marks a forbidden destination.
+    pub sinks: Vec<String>,
+    /// Queries whose `@sanitizer` capture clears taint from the value it produces.
+    pub sanitizers: Vec<String>,
 }
 
 /// Where a component-backed rule's code is, and what it is configured with.
@@ -432,6 +460,15 @@ struct RawSuppressions {
 }
 
 #[derive(Debug, Deserialize)]
+// Four independent handler-presence flags — `has_check`, `has_reduce`, `has_check_flow`,
+// `has_check_obligation` — each a `typeof … === 'function'` probe recorded by `EXTRACT`, not a
+// state machine to fold into an enum. The dataflow family (#193 obligation + #194 flow) took the
+// count from three to four; `#[expect]` rather than `#[allow]` so this self-clears if a handler
+// is ever removed.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config-extraction DTO of independent handler-presence flags"
+)]
 struct RawRule {
     id: Option<String>,
     language: Option<RawLanguages>,
@@ -451,6 +488,12 @@ struct RawRule {
     requires: Option<serde_json::Value>,
     has_check: bool,
     has_reduce: bool,
+    has_check_flow: bool,
+    /// A rule's taint-flow spec, still as the JSON it was written as — parsed and validated
+    /// by [`parse_flow`] rather than by serde, for the same reason `requires` is: a
+    /// wrong-shaped role should be refused by name, not turned into a generic deserialize
+    /// error that names neither the rule nor the field.
+    flow: Option<serde_json::Value>,
     obligation: Option<RawObligation>,
     /// Whether the rule declared `checkObligation`, on the same reasoning as `has_check`:
     /// `JSON.stringify` drops functions, so this has to be recorded at extraction time or a
@@ -556,10 +599,12 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
 ///
 /// Which capabilities are implemented is a property of this build, not of the config, so it
 /// is expressed as a fact about [`Capability`] rather than read from anything a project
-/// writes. `Dataflow` joined this list at #193, which is every variant `Capability` has —
-/// so today this equals [`Capability::all`]. It will not stay that way the moment a third
-/// capability is declared and not yet implemented, which is what keeps this list here
-/// rather than replaced by that call.
+/// writes. `Dataflow` is the one capability both dataflow analyses rest on: obligation
+/// (`obligation`/`checkObligation`, #193) and taint flow (`flow`/`checkFlow`, #194), paired
+/// at load by `build_rule`'s coherent-shape checks. It is every variant `Capability` has
+/// besides `Types`, so today this equals [`Capability::all`]. It will not stay that way the
+/// moment a third capability is declared and not yet implemented, which is what keeps this
+/// list here rather than replaced by that call.
 const IMPLEMENTED: &[Capability] = &[Capability::Types, Capability::Dataflow];
 
 /// Render a set of capabilities as backtick-quoted names, comma separated.
@@ -636,6 +681,15 @@ fn check_requires(
     // Only after every name is confirmed real does an unimplemented one get to speak for
     // itself — the same ordering as before, kept so a config carrying both a typo and a real
     // capability still reports the typo.
+    //
+    // **This loop's "walk every entry, do not stop at the first" behavior currently has no
+    // test that fails without it.** `an_unimplemented_capability_is_refused_beside_an_implemented_one`
+    // used to prove it with `['types', 'dataflow']` in both orders; now that `Dataflow` is
+    // implemented alongside `Types`, `IMPLEMENTED` covers every `Capability` variant and no
+    // combination of real names can reach this `return Err` at all. When a third capability
+    // is added unimplemented, restore that test with the new name paired with an implemented
+    // one, in both orders — a `capabilities.iter().take(1)` regression is invisible to every
+    // other test in this crate, because none of them declares more than one capability.
     for capability in &capabilities {
         if !IMPLEMENTED.contains(capability) {
             return Err(format!(
@@ -650,6 +704,96 @@ fn check_requires(
     // Declaring nothing is not declaring badly. An empty list and an absent one say the same
     // thing, and refusing on presence rather than on content would reject both.
     Ok(capabilities)
+}
+
+/// Parse `flow` into its three typed roles, refusing whatever this build cannot use.
+///
+/// # Why a query missing its own capture is refused rather than run and found empty
+///
+/// A source query with no `@source` — misspelled, or copied from a sink and never edited —
+/// compiles and matches nothing forever, which is the same silence every other refusal in
+/// this module exists to prevent: the rule loads, the flow analysis has one fewer source
+/// than the author wrote, and a run reporting less than it should looks exactly like a run
+/// reporting everything. A substring check is what v1 can afford; it does not catch a query
+/// that binds the capture under a predicate the query never actually reaches, only a query
+/// that could never have bound it at all — the same gap `requires` accepts for a capability
+/// a rule declares and simply never calls.
+///
+/// # Why an empty or absent `sources`/`sinks` is refused
+///
+/// A flow traces from a source to a sink; with zero of either there is nothing to trace, so
+/// `checkFlow` can never be called with a result and the rule reports nothing forever — the
+/// same silent-no-op shape already refused at load for an empty `query` and an empty
+/// `language`. `packages/lanekeep/index.d.ts` agrees: `FlowSpec` declares `sources` and
+/// `sinks` required and only `sanitizers` optional. `sanitizers` has no such floor — a flow
+/// that never sanitizes anything is a perfectly ordinary one.
+fn parse_flow(flow: &serde_json::Value, id: &RuleId) -> Result<FlowSpec, String> {
+    if !flow.is_object() {
+        return Err(format!(
+            "`{id}` has a `flow` that is {} — it must be an object with `sources`, `sinks` \
+             and optional `sanitizers` query arrays",
+            json_kind(flow),
+        ));
+    }
+    let sources = parse_flow_role(flow, "sources", "@source", id)?;
+    if sources.is_empty() {
+        return Err(format!(
+            "`{id}` has a `flow` with no `sources` — a flow with no source can never report"
+        ));
+    }
+    let sinks = parse_flow_role(flow, "sinks", "@sink", id)?;
+    if sinks.is_empty() {
+        return Err(format!(
+            "`{id}` has a `flow` with no `sinks` — a flow with no sink can never report"
+        ));
+    }
+    let sanitizers = parse_flow_role(flow, "sanitizers", "@sanitizer", id)?;
+    Ok(FlowSpec {
+        sources,
+        sinks,
+        sanitizers,
+    })
+}
+
+/// One `flow` role: an array of query strings, each required to bind the capture it names.
+///
+/// Absence and an empty array are indistinguishable here — both come back as an empty
+/// `Vec` — because this function validates a role's shape, not its cardinality. Whether an
+/// empty role is acceptable is `parse_flow`'s call: it refuses an empty-or-absent `sources`
+/// or `sinks` right after calling this, and leaves an empty-or-absent `sanitizers` alone.
+fn parse_flow_role(
+    flow: &serde_json::Value,
+    role: &str,
+    capture: &str,
+    id: &RuleId,
+) -> Result<Vec<String>, String> {
+    let Some(value) = flow.get(role) else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(format!(
+            "`{id}` has a `flow.{role}` that is {} — it must be an array of query strings",
+            json_kind(value),
+        ));
+    };
+    let mut queries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(query) = entry.as_str() else {
+            return Err(format!(
+                "`{id}` has a `flow.{role}` entry that is {} — every entry must be a query \
+                 string",
+                json_kind(entry),
+            ));
+        };
+        if !query.contains(capture) {
+            return Err(format!(
+                "`{id}` has a `flow.{role}` query that never binds `{capture}` — a query in \
+                 this role must capture what it names"
+            ));
+        }
+        queries.push(query.to_owned());
+    }
+    Ok(queries)
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,9 +817,9 @@ const ENTRY: &str = "__lanekeep_entry__.js";
 
 /// The script that reduces the config to JSON.
 ///
-/// `has_check` and `has_reduce` are recorded here rather than inferred later, because
-/// `JSON.stringify` drops functions and there is no way to tell afterwards whether a rule
-/// had a handler or a typo.
+/// `has_check`, `has_reduce` and `has_check_flow` are recorded here rather than inferred
+/// later, because `JSON.stringify` drops functions and there is no way to tell afterwards
+/// whether a rule had a handler or a typo.
 const EXTRACT: &str = r"
     (() => {
         const c = globalThis.__lanekeepConfig;
@@ -699,6 +843,8 @@ const EXTRACT: &str = r"
                 requires: r?.requires ?? null,
                 has_check: typeof r?.check === 'function',
                 has_reduce: typeof r?.reduce === 'function',
+                has_check_flow: typeof r?.checkFlow === 'function',
+                flow: r?.flow ?? null,
                 obligation: r?.obligation ?? null,
                 has_check_obligation: typeof r?.checkObligation === 'function',
             })),
@@ -1877,25 +2023,28 @@ fn raw_rule_from(
             file_not_contains: metadata.gates.file_not_contains,
         },
         timeout: metadata.timeout,
-        // A component cannot declare one, because `rule-metadata` has no such field: the
-        // world is deliberately unchanged, since no component rule targets a language either
-        // analysis will support.
+        // A component cannot declare any of `requires`, `flow` or a `checkFlow` handler,
+        // because `rule-metadata` has no such fields: the world is deliberately unchanged,
+        // since no component rule targets a language either analysis will support.
         //
         // **Nothing here notices the day it grows one.** The exhaustive struct literal below
         // is exhaustive over its *destination* — a field added to `RawRule` is `E0063` at
         // this initializer, which is a real guard and the one that put this very line here:
         // #196 added `requires` to `RawRule` and could not compile until it did.
-        // Its *source* is read field by field, so a `requires` added to `rule-metadata`
-        // in `wit/world.wit` compiles clean here and is silently dropped: a component would
-        // declare an analysis, be handed none, report nothing, and read as a clean codebase.
-        // Both halves measured — growing the record left `cargo check -p lanekeep-config`
-        // green.
+        // Its *source* is read field by field, so a `requires` (or a `flow`) added to
+        // `rule-metadata` in `wit/world.wit` compiles clean here and is silently dropped: a
+        // component would declare an analysis, be handed none, report nothing, and read as a
+        // clean codebase. Both halves measured — growing the record left
+        // `cargo check -p lanekeep-config` green.
         //
         // So whoever adds that field to the world adds the read here in the same change.
         // There is no compile error waiting to remind them.
         requires: None,
         has_check,
         has_reduce,
+        // A component cannot have a `checkFlow` either, for the same reason as `flow` above.
+        has_check_flow: false,
+        flow: None,
         // Same reasoning as `requires` above: `rule-metadata` has no `obligation` field, so a
         // component rule has nowhere to declare one and none of this is ever anything but the
         // default.
@@ -1991,6 +2140,15 @@ fn check_obligation_shape(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one rule is validated field by field, each check naming the rule and returning \
+              its own refusal in place — id, namespace, handler shape, card, severity, \
+              languages, then query — and splitting any one check into its own function would \
+              separate a refusal from the single place the rest of the rule's shape is legible \
+              against. The coherent-shape checks for `flow`/`checkFlow`/`requires` are what \
+              pushed this over the threshold; they read the same way as every check beside them"
+)]
 fn build_rule(
     raw: RawRule,
     position: usize,
@@ -2041,19 +2199,55 @@ fn build_rule(
 
     // The check that JSON extraction exists to make possible. A rule whose handler is
     // missing or misspelled would otherwise load cleanly and never report, which is
-    // indistinguishable from the code being fine. Either handler satisfies it now: an
-    // obligation-only rule has no `check`, and the obligation-shape match above has already
-    // confirmed a `checkObligation` never stands alone without an `obligation` to drive it.
-    if !raw.has_check && !raw.has_check_obligation {
+    // indistinguishable from the code being fine. A rule may run through an ordinary
+    // `check`, a `checkFlow`, a `checkObligation`, or a combination — the checks below are
+    // that coherent-shape proof, before the card and the query, because this is about whether
+    // the rule can run at all rather than about whether it is well written.
+    let has_flow = raw.flow.is_some();
+    let requires = check_requires(raw.requires.as_ref(), &id).map_err(fail)?;
+    let declares_dataflow = requires.contains(&Capability::Dataflow);
+
+    // Flow pairing: `flow` ⟺ `checkFlow`, and either one requires `dataflow`. Obligation is
+    // the sibling member of the dataflow family, paired above by `check_obligation_shape`;
+    // both analyses rest on the one `dataflow` capability.
+    if has_flow && !raw.has_check_flow {
         return Err(fail(format!(
-            "`{id}` has no `check` or `checkObligation` — a rule without a handler can \
-             never report anything"
+            "`{id}` declares `flow` but has no `checkFlow` — a flow with nothing to run \
+             reports nothing"
+        )));
+    }
+    if raw.has_check_flow && !has_flow {
+        return Err(fail(format!(
+            "`{id}` has a `checkFlow` but no `flow` — there is nothing for it to be called on"
+        )));
+    }
+    if (has_flow || raw.has_check_flow) && !declares_dataflow {
+        return Err(fail(format!(
+            "`{id}` uses dataflow (`flow`/`checkFlow`) but does not declare `requires: \
+             ['dataflow']`"
         )));
     }
 
-    // Before the card and the query, because this refusal is about whether the rule can run
-    // at all rather than about whether it is well written.
-    let requires = check_requires(raw.requires.as_ref(), &id).map_err(fail)?;
+    // The rule must be able to run at all through some handler: an ordinary `check`, or one
+    // of the two dataflow-family handlers, `checkFlow` (#194) or `checkObligation` (#193). A
+    // rule with none can never report anything — the failure the lone `!has_check` refusal
+    // used to catch before a dataflow handler was a second way to satisfy it.
+    if !raw.has_check && !raw.has_check_flow && !raw.has_check_obligation {
+        return Err(fail(format!(
+            "`{id}` has no `check`, `checkFlow` or `checkObligation` — a rule without a \
+             handler can never report anything"
+        )));
+    }
+
+    // Parsed only once the shape above is known coherent, so a malformed role is reported
+    // for a rule that is actually trying to be a flow rule, never for one already refused
+    // for a structural mismatch above.
+    let flow = raw
+        .flow
+        .as_ref()
+        .map(|value| parse_flow(value, &id))
+        .transpose()
+        .map_err(fail)?;
 
     let card = raw
         .card
@@ -2081,7 +2275,17 @@ fn build_rule(
         .unwrap_or(Severity::Error);
 
     let languages = resolve_languages(raw.language, &id).map_err(fail)?;
-    let queries = build_queries(raw.query, raw.obligation.is_some(), &languages, &id, fail)?;
+    // A top-level `query` feeds `check`, so it is required only for a rule that has one. A
+    // flow-only or obligation-only rule (no top-level `check`) drives itself off its own
+    // queries — a flow's sources/sinks, an obligation's acquire/release — and needs none;
+    // `raw.obligation.is_some()` also spares a rule that pairs `obligation` with a `check`.
+    let queries = build_queries(
+        raw.query,
+        raw.obligation.is_some() || !raw.has_check,
+        &languages,
+        &id,
+        fail,
+    )?;
 
     Ok(RuleSpec {
         index: position - 1,
@@ -2094,6 +2298,8 @@ fn build_rule(
         gates: raw.gates,
         timeout: raw.timeout.map(Duration::from_millis),
         has_reduce: raw.has_reduce,
+        has_check_flow: raw.has_check_flow,
+        flow,
         component,
         requires,
         obligation: build_obligation(raw.obligation),
@@ -2103,19 +2309,21 @@ fn build_rule(
 /// Build a rule's per-language query map, or refuse a missing or malformed `query`.
 ///
 /// Split out of `build_rule` only to keep that function under clippy's line limit — the
-/// obligation-only exception below (no `query` when the rule declared one instead) is what
-/// pushed it over, on the same terms as [`check_obligation_shape`]'s own extraction.
+/// `query_optional` exception below (no `query` when the rule drives itself off its own
+/// dataflow queries instead) is what pushed it over, on the same terms as
+/// [`check_obligation_shape`]'s own extraction.
 fn build_queries(
     raw_query: Option<RawQueries>,
-    has_obligation: bool,
+    query_optional: bool,
     languages: &[String],
     id: &RuleId,
     fail: impl Fn(String) -> ConfigError,
 ) -> Result<BTreeMap<String, String>, ConfigError> {
     match raw_query {
-        // An obligation-only rule has no `check` to feed matches to — `checkObligation` runs
-        // off the acquire/release queries instead, so there is no main query to require here.
-        None if has_obligation => Ok(BTreeMap::new()),
+        // A flow-only or obligation-only rule has no top-level `check` to feed matches to —
+        // `checkFlow` runs off the flow's sources/sinks and `checkObligation` off the
+        // acquire/release queries instead, so there is no main query to require here.
+        None if query_optional => Ok(BTreeMap::new()),
         None => Err(fail(format!("`{id}` has no `query`"))),
         Some(RawQueries::One(query)) => {
             if query.trim().is_empty() {
@@ -5639,7 +5847,8 @@ mod tests {
         );
     }
 
-    /// The capability #193 implements now loads — the `dataflow` twin of
+    /// `requires: ['dataflow']` loads — the capability both dataflow analyses rest on,
+    /// obligation (#193) and taint flow (#194). The `dataflow` twin of
     /// `a_rule_requiring_types_now_loads`, below.
     ///
     /// This test used to be `a_known_capability_in_requires_is_refused_while_unimplemented`,
@@ -5657,6 +5866,10 @@ mod tests {
     /// because the day a third capability is declared and not yet implemented, the true
     /// version of that test becomes possible again and should be written fresh against
     /// whichever capability that is.
+    ///
+    /// Declaring `dataflow` on its own is deliberately unremarkable: `requires` unlocks a
+    /// surface (`flow`/`checkFlow`, `obligation`/`checkObligation`) rather than demanding it
+    /// be used, the same as `types` unlocking `ctx.types` without requiring a call to it.
     #[test]
     fn a_rule_requiring_dataflow_now_loads() {
         let config = load_requiring("requires-dataflow-ok", "['dataflow']")
@@ -5740,7 +5953,7 @@ mod tests {
         assert!(text.contains("speed"), "{text}");
     }
 
-    /// The capability this pull request implements now loads.
+    /// The capability #199 implements now loads.
     #[test]
     fn a_rule_requiring_types_now_loads() {
         let config = load_requiring("requires-types-ok", "['types']")
@@ -5766,6 +5979,241 @@ mod tests {
         );
         let config = fixture.load_config().expect("loads");
         assert!(config.rules[0].requires.is_empty());
+    }
+
+    /// A card valid enough to load, for the flow tests below — none of them are testing the
+    /// card, so it is written once as a bare `CARD` identifier the generated module declares,
+    /// rather than five times inline.
+    const CARD: &str =
+        "{ message: 'no', remediation: 'do this', examples: { bad: 'a', good: 'b' } }";
+
+    /// Wrap a rule module body — a bare `export default defineRule({...})`, as the flow
+    /// tests below write it — with the import and the `CARD` const it references bare.
+    fn flow_rule_module(body: &str) -> String {
+        format!("import {{ defineRule }} from 'lanekeep';\nconst CARD = {CARD};\n{body}\n")
+    }
+
+    /// A fixture directory name unique across concurrent test runs without being derived
+    /// from what is written to it.
+    ///
+    /// A path keyed on content races when two tests legitimately write identical bytes
+    /// (`json.rs`'s own fixture helper hit exactly this, `std::fs::write` truncates before
+    /// it writes, and the sibling thread reads a half-written file) — and every flow test
+    /// below shares this one helper, so a future addition with the same body as an existing
+    /// one would silently reintroduce it. `nextest` runs one process per test, so two
+    /// concurrently *running* tests never share a pid; plain `cargo test` shares one process
+    /// across threads, so the counter is what separates them there. Neither alone would
+    /// cover both runners.
+    fn unique_fixture_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// Load a fixture whose single rule is `body`, under a config that declares the `test`
+    /// namespace every flow test's `test/f` id needs.
+    fn load_flow_fixture(body: &str) -> Result<Config, ConfigError> {
+        let fixture = Fixture::new(
+            &unique_fixture_name("flow"),
+            &[
+                ("rule.ts", &flow_rule_module(body)),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("namespaces: ['test'], rules: [rule]"),
+                ),
+            ],
+        );
+        fixture.load_config()
+    }
+
+    /// The load error's rendered text, for a rule module body expected to be refused.
+    fn load_err(body: &str) -> String {
+        format!(
+            "{}",
+            load_flow_fixture(body).expect_err("the rule is refused")
+        )
+    }
+
+    /// The single loaded `RuleSpec`, for a rule module body expected to load cleanly.
+    fn load_one(body: &str) -> RuleSpec {
+        let mut config = load_flow_fixture(body).expect("the rule loads");
+        assert_eq!(config.rules.len(), 1, "exactly one rule");
+        config.rules.remove(0)
+    }
+
+    #[test]
+    fn flow_without_check_flow_is_refused() {
+        // requires+flow present, checkFlow absent → refuse, naming the rule.
+        let err = load_err(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: { sources: ['(identifier) @source'], sinks: ['(identifier) @sink'] },
+        })
+    ",
+        );
+        assert!(
+            err.contains("`test/f`") && err.contains("checkFlow"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_flow_without_flow_is_refused() {
+        let err = load_err(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          checkFlow() {},
+        })
+    ",
+        );
+        assert!(
+            err.contains("`test/f`") && err.contains("flow"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn flow_without_requires_dataflow_is_refused() {
+        let err = load_err(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          flow: { sources: ['(identifier) @source'], sinks: ['(identifier) @sink'] },
+          checkFlow() {},
+        })
+    ",
+        );
+        assert!(
+            err.contains("`test/f`") && err.contains("dataflow"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_rule_with_neither_check_nor_check_flow_is_refused() {
+        let err = load_err(
+            r"
+        export default defineRule({ id: 'test/f', severity: 'error', card: CARD })
+    ",
+        );
+        assert!(err.contains("`test/f`"), "got: {err}");
+    }
+
+    #[test]
+    fn a_valid_flow_rule_loads_and_records_its_flow() {
+        let spec = load_one(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: {
+            sources: ['(call_expression function: (identifier) @source)'],
+            sinks: ['(arguments (identifier) @sink)'],
+            sanitizers: ['(call_expression function: (identifier) @sanitizer)'],
+          },
+          checkFlow() {},
+        })
+    ",
+        );
+        assert!(spec.has_check_flow);
+        let flow = spec.flow.expect("flow recorded");
+        assert_eq!(flow.sources.len(), 1);
+        assert_eq!(flow.sinks.len(), 1);
+        assert_eq!(flow.sanitizers.len(), 1);
+    }
+
+    /// The other half of the brief's ruling: a flow-only rule's file gate is its flow
+    /// queries, not a top-level one, so it must load with nothing synthesized in their
+    /// place.
+    #[test]
+    fn a_flow_only_rule_has_no_top_level_queries() {
+        let spec = load_one(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: { sources: ['(identifier) @source'], sinks: ['(identifier) @sink'] },
+          checkFlow() {},
+        })
+    ",
+        );
+        assert!(spec.queries.is_empty(), "{:?}", spec.queries);
+    }
+
+    /// The relaxation is additive: a rule with an ordinary `check` and no dataflow handler
+    /// is refused for a missing `query` exactly as it was before `flow`/`checkFlow` existed.
+    #[test]
+    fn an_ordinary_check_rule_still_requires_a_query() {
+        let err = load_err(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          check(ctx, m) {},
+        })
+    ",
+        );
+        assert!(
+            err.contains("`test/f`") && err.contains("query"),
+            "got: {err}"
+        );
+    }
+
+    /// `flow`'s three roles are parsed, not merely counted: a role that is present but the
+    /// wrong shape, or a query that could never bind the capture its own role names, is
+    /// refused by name — the same "wrong shape is as loud as a wrong value" reasoning
+    /// `requires` already applies to itself. `sources` and `sinks` carry a further rule
+    /// `sanitizers` does not: empty-or-absent is refused, because a flow that can never taint
+    /// anything or never reach a forbidden destination can never call `checkFlow` with a
+    /// result — the same silent-no-op shape refused elsewhere for an empty `query` and an
+    /// empty `language`.
+    #[test]
+    fn a_malformed_flow_is_refused_rather_than_ignored() {
+        for (name, flow) in [
+            ("flow-not-an-object", "'nonsense'"),
+            (
+                "flow-role-not-an-array",
+                "{ sources: 'not an array', sinks: ['(identifier) @sink'] }",
+            ),
+            (
+                "flow-query-missing-its-capture",
+                "{ sources: ['(identifier) @wrong'], sinks: ['(identifier) @sink'] }",
+            ),
+            (
+                "flow-role-entry-not-a-string",
+                "{ sources: [123], sinks: ['(identifier) @sink'] }",
+            ),
+            (
+                "flow-sources-empty",
+                "{ sources: [], sinks: ['(identifier) @sink'] }",
+            ),
+            ("flow-sources-absent", "{ sinks: ['(identifier) @sink'] }"),
+            (
+                "flow-sinks-empty",
+                "{ sources: ['(identifier) @source'], sinks: [] }",
+            ),
+            ("flow-sinks-absent", "{ sources: ['(identifier) @source'] }"),
+        ] {
+            let err = load_err(&format!(
+                r"
+            export default defineRule({{
+              id: 'test/f', severity: 'error', card: CARD,
+              requires: ['dataflow'],
+              flow: {flow},
+              checkFlow() {{}},
+            }})
+        "
+            ));
+            assert!(err.contains("`test/f`"), "{name}: got {err}");
+            assert!(err.contains("flow"), "{name}: got {err}");
+        }
     }
 
     /// A `requires` array with multiple entries is validated in full, not just its first entry.

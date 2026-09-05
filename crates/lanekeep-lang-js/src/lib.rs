@@ -37,6 +37,7 @@ pub mod binding;
 pub mod cfg;
 mod cfg_build;
 mod cfg_query;
+mod flow;
 mod obligation;
 
 pub use cfg::{Block, BlockId, Cfg, Edge, EdgeKind};
@@ -44,10 +45,12 @@ pub use cfg::{Block, BlockId, Cfg, Edge, EdgeKind};
 use std::sync::Arc;
 
 use lanekeep_lang::binding::BindingResolver;
+use lanekeep_lang::flow::FlowAnalyzer;
 use lanekeep_lang::obligation::ObligationAnalyzer;
 use lanekeep_lang::{Language, LanguageId, LanguageRegistry, RegistryError};
 
 use crate::binding::JsBindingResolver;
+use crate::flow::JsFlowAnalyzer;
 
 /// The resolver every language in this crate shares.
 ///
@@ -55,6 +58,13 @@ use crate::binding::JsBindingResolver;
 /// hold it for the life of a file.
 static RESOLVER: std::sync::LazyLock<Arc<dyn BindingResolver>> =
     std::sync::LazyLock::new(|| Arc::new(JsBindingResolver));
+
+/// The flow analyzer every language in this crate shares.
+///
+/// Built once for the same reason as [`RESOLVER`]: the analyzer is stateless and a host
+/// context holds it for the life of a file.
+static FLOW_ANALYZER: std::sync::LazyLock<Arc<dyn FlowAnalyzer>> =
+    std::sync::LazyLock::new(|| Arc::new(JsFlowAnalyzer));
 
 /// The obligation analyzer every language in this crate shares.
 ///
@@ -95,6 +105,10 @@ impl Language for TypeScript {
         Some(Arc::clone(&RESOLVER))
     }
 
+    fn flow_analyzer(&self) -> Option<Arc<dyn FlowAnalyzer>> {
+        Some(Arc::clone(&FLOW_ANALYZER))
+    }
+
     fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
         Some(Arc::clone(&OBLIGATION))
     }
@@ -122,6 +136,10 @@ impl Language for Tsx {
         Some(Arc::clone(&RESOLVER))
     }
 
+    fn flow_analyzer(&self) -> Option<Arc<dyn FlowAnalyzer>> {
+        Some(Arc::clone(&FLOW_ANALYZER))
+    }
+
     fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
         Some(Arc::clone(&OBLIGATION))
     }
@@ -146,6 +164,10 @@ impl Language for Tsx {
 impl Language for JavaScript {
     fn resolver(&self) -> Option<Arc<dyn BindingResolver>> {
         Some(Arc::clone(&RESOLVER))
+    }
+
+    fn flow_analyzer(&self) -> Option<Arc<dyn FlowAnalyzer>> {
+        Some(Arc::clone(&FLOW_ANALYZER))
     }
 
     fn id(&self) -> LanguageId {

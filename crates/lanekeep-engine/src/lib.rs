@@ -220,7 +220,16 @@ struct Prepared {
     spec: RuleSpec,
     gates: CompiledGates,
     /// What this rule compiled for each language it targets, in the order it declared them.
+    ///
+    /// The main query is `None` for an obligation-only or flow-only rule — one with no
+    /// top-level `check` — whose file gate is its obligation or flow queries instead.
     compiled: Vec<CompiledForLanguage>,
+    /// Compiled taint-flow role queries per language, for a rule that declared `flow`. Empty
+    /// for every rule that did not.
+    ///
+    /// Compiled once here, exactly as `compiled` is, and never per file — the flow queries are
+    /// as expensive to compile as any other and a warm run must not pay for them repeatedly.
+    flow_compiled: Vec<FlowQueries>,
     /// Where this rule's handlers live in the run's [`RuleSet`], or `None` for a TypeScript
     /// rule executed through the QuickJS sandbox.
     ///
@@ -244,6 +253,104 @@ impl Prepared {
             .iter()
             .find(|(language, _, _)| language.id().as_str() == id)
     }
+
+    /// The compiled flow queries for a file of the given language, or `None` when this rule
+    /// declared no `flow` for it — in which case the flow phase does not run it on that file.
+    ///
+    /// The flow counterpart of [`Prepared::for_language`], and separate from it because the
+    /// flow role queries live in their own `flow_compiled` list rather than in `compiled`:
+    /// the file's language is matched against the flow queries' own language here.
+    fn flow_for_language(&self, id: &str) -> Option<&FlowQueries> {
+        self.flow_compiled
+            .iter()
+            .find(|flow| flow.language.id().as_str() == id)
+    }
+
+    /// The grammar handle for a file of the given language, from this rule's `compiled` entry
+    /// or its flow queries — whichever targets it.
+    ///
+    /// Used to decide whether a file needs parsing at all. Every rule that targets a language
+    /// has a `compiled` entry for it — an obligation-only or flow-only rule's entry carries a
+    /// `None` query but still names the language — so [`Prepared::for_language`] covers them;
+    /// the flow fallback stays as a defensive second source for a rule whose only reason to
+    /// touch the file is its flow queries.
+    fn language_for(&self, id: &str) -> Option<&Arc<dyn Language>> {
+        self.for_language(id)
+            .map(|(language, _, _)| language)
+            .or_else(|| self.flow_for_language(id).map(|flow| &flow.language))
+    }
+}
+
+/// One language's compiled taint-flow role queries.
+///
+/// Each role holds every query the rule declared for it, compiled against this language's
+/// grammar. A role's queries are run in order and their capture nodes concatenated, so the
+/// node sets the analyzer receives are deterministic.
+struct FlowQueries {
+    language: Arc<dyn Language>,
+    /// Queries whose `@source` capture marks a tainted origin.
+    sources: Vec<CompiledQuery>,
+    /// Queries whose `@sink` capture marks a forbidden destination.
+    sinks: Vec<CompiledQuery>,
+    /// Queries whose `@sanitizer` capture cuts taint from the value it produces.
+    sanitizers: Vec<CompiledQuery>,
+}
+
+/// Compile one flow role's queries against a language, naming the rule on failure.
+///
+/// The role's captures were validated at config load (`lanekeep-config`'s `parse_flow`
+/// checks each query names the capture its role requires), so a failure here is a genuine
+/// query-compilation error, reported the same way a top-level `query` is.
+fn compile_flow_role(
+    language: &dyn Language,
+    language_id: &str,
+    rule_id: &RuleId,
+    queries: &[String],
+) -> Result<Vec<CompiledQuery>, RunError> {
+    queries
+        .iter()
+        .map(|source| {
+            CompiledQuery::compile(language, source).map_err(|e: CompileError| RunError::Query {
+                rule: rule_id.to_string(),
+                language: language_id.to_owned(),
+                detail: e.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Every node bound to `capture` across a role's queries, in tree-walk order per query and
+/// query order between them.
+///
+/// A free function rather than a closure so the `'tree` lifetime tying the returned nodes to
+/// the borrowed tree can be named — a closure cannot express a lifetime-parametric return.
+fn collect_captures<'tree>(
+    queries: &[CompiledQuery],
+    tree: &'tree tree_sitter::Tree,
+    source: &str,
+    capture: &str,
+) -> Vec<tree_sitter::Node<'tree>> {
+    let mut nodes = Vec::new();
+    for query in queries {
+        query.for_each_match(tree, source.as_bytes(), |m| {
+            if let Some(node) = m.get(capture) {
+                nodes.push(node);
+            }
+        });
+    }
+    nodes
+}
+
+/// One canonical [`lanekeep_lang::FlowPath`] reduced to arena capture paths.
+///
+/// A `FlowPath` borrows the parsed tree, so it cannot outlive the immutable arena borrow the
+/// analysis runs under. Its nodes are turned into structural paths — the same representation
+/// `check`'s captures take between the tree borrow and interning — so the handles can be minted
+/// once the borrow has ended. See [`Engine::run_flow_rule`].
+struct FlowPathPaths {
+    source: Vec<u32>,
+    sink: Vec<u32>,
+    steps: Vec<Vec<u32>>,
 }
 
 /// The file a rule is about to run against, and the tree every rule on it shares.
@@ -896,6 +1003,7 @@ impl Engine {
             .filter(|spec| spec.severity.is_enabled())
             .map(|spec| {
                 let mut compiled = Vec::with_capacity(spec.languages.len());
+                let mut flow_compiled = Vec::new();
                 for id in &spec.languages {
                     let language =
                         registry
@@ -913,12 +1021,13 @@ impl Engine {
                     // surfaces — at config load, naming the rule, rather than as silence at
                     // run time.
                     //
-                    // `spec.queries` is empty for an obligation-only rule — build_rule's
-                    // one exception to requiring a `query` — so there is nothing to compile
-                    // here for it. A *non-empty* map missing this specific language would be
-                    // the exact cover promised at config load broken, which is a bug in the
-                    // engine's own bookkeeping, named rather than silently compiled against
-                    // nothing.
+                    // `spec.queries` is empty for an obligation-only or flow-only rule —
+                    // build_rule's two exceptions to requiring a `query`, whose file gate is
+                    // its obligation or flow queries instead — so the main query is `None`
+                    // and there is nothing to compile here for it. A *non-empty* map missing
+                    // this specific language would be the exact cover promised at config load
+                    // broken, which is a bug in the engine's own bookkeeping, named rather
+                    // than silently compiled against nothing.
                     let query = if spec.queries.is_empty() {
                         None
                     } else {
@@ -976,7 +1085,30 @@ impl Engine {
                         })
                         .transpose()?;
 
-                    compiled.push((language, query, obligation));
+                    // Cloned into `compiled` because the flow block below moves `language`.
+                    compiled.push((Arc::clone(&language), query, obligation));
+
+                    // Flow role queries, compiled once here for the same reason the top-level
+                    // query is: a warm run must not recompile them per file. This moves
+                    // `language`, so it comes after the `compiled` push above.
+                    if let Some(flow) = &spec.flow {
+                        flow_compiled.push(FlowQueries {
+                            sources: compile_flow_role(
+                                language.as_ref(),
+                                id,
+                                &spec.id,
+                                &flow.sources,
+                            )?,
+                            sinks: compile_flow_role(language.as_ref(), id, &spec.id, &flow.sinks)?,
+                            sanitizers: compile_flow_role(
+                                language.as_ref(),
+                                id,
+                                &spec.id,
+                                &flow.sanitizers,
+                            )?,
+                            language,
+                        });
+                    }
                 }
 
                 let gates = CompiledGates::compile(&spec.gates).map_err(|e| RunError::Gates {
@@ -990,6 +1122,7 @@ impl Engine {
                     spec: spec.clone(),
                     gates,
                     compiled,
+                    flow_compiled,
                     // Filled in below too, by the one place components are loaded.
                     slot: None,
                 })
@@ -1769,6 +1902,11 @@ impl Engine {
     ) -> Result<FileOutcome, RunError> {
         let path = file.path;
         self.dispatch(worker, files, admitted, file, &mut outcome)?;
+        // The flow phase runs after the check phase, over the same file and the same admitted
+        // set, so its violations land in `outcome` before the entry is built and before
+        // directives are applied — a flow finding is reported at the sink and suppressed there
+        // like any other.
+        self.dispatch_flow(worker, files, admitted, file, &mut outcome)?;
         self.apply_directives(&mut outcome, directives, path);
 
         outcome.suppressions.clone_from(&directives.valid);
@@ -2193,9 +2331,12 @@ impl Engine {
         admitted: &[&Prepared],
     ) -> Option<(Arc<dyn Language>, tree_sitter::Tree)> {
         let language_id = self.language_of(path)?;
-        let (language, _, _) = admitted
+        // Any admitted rule that targets this language is reason to parse — a check or
+        // obligation rule through its `compiled` entry, a flow rule through its flow queries.
+        // `language_for` folds both, and returns the grammar the file will be parsed with.
+        let language = admitted
             .iter()
-            .find_map(|rule| rule.for_language(language_id))?;
+            .find_map(|rule| rule.language_for(language_id))?;
 
         // lanekeep-ignore-next-line local/one-parser-per-file reason: the one shared per-file parse every rule's query runs against
         let mut parser = tree_sitter::Parser::new();
@@ -2638,8 +2779,207 @@ impl Engine {
         )?;
         timing.handler = timing.handler.saturating_add(obligation_time);
 
-        let facts = host
-            .take_facts()
+        let facts = Self::facts_from(rule, path, &host);
+        let violations = Self::violations_from_js(rule, path, host.take_reports());
+
+        Ok((violations, facts, host.date_was_read(), timing))
+    }
+
+    /// The flow phase for one file: run every admitted rule that declared a `checkFlow`.
+    ///
+    /// A sibling of the check dispatch and of the reduce phase, but per file like the former
+    /// rather than once per run like the latter — taint is an intra-procedural, within-file
+    /// analysis (spec §6), so a flow rule's answer for a file is a function of that file alone.
+    /// Its violations, facts and date-read flag fold into `outcome` exactly as the check
+    /// phase's do.
+    fn dispatch_flow(
+        &self,
+        worker: &mut Worker<'_>,
+        files: &Arc<FileAccess>,
+        admitted: &[&Prepared],
+        file: &FileUnderCheck<'_>,
+        outcome: &mut FileOutcome,
+    ) -> Result<(), RunError> {
+        for rule in admitted {
+            if !rule.spec.has_check_flow {
+                continue;
+            }
+            let (violations, facts, read_the_date, timing) =
+                self.run_flow_rule(worker, files, rule, file)?;
+            outcome.violations.extend(violations);
+            outcome.facts.extend(facts);
+            outcome.read_the_date |= read_the_date;
+            if self.profiling {
+                outcome.timings.push((rule.spec.id.clone(), timing));
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one flow rule over one file: role queries → taint analysis → `checkFlow` per path.
+    ///
+    /// The same four return values as [`Engine::run_rule`], so `dispatch_flow` folds them in
+    /// the same way. The novel step is the node→handle conversion in the middle, and it is the
+    /// *same* two-phase conversion the check path uses: the analyzer returns
+    /// `tree_sitter::Node`s from the file's own parsed tree, `NodeArena::path_of` reduces each
+    /// to a structural path while the tree is borrowed, and `NodeArena::intern_path` mints the
+    /// handle once the borrow has ended. A JS `Node` *is* that handle — the same integer a
+    /// `Match` carries into `check` — so `checkFlow` receives `{ source, sink, steps }` of
+    /// handles and reports at `path.sink` through the ordinary `ctx` surface.
+    fn run_flow_rule(
+        &self,
+        worker: &mut Worker<'_>,
+        files: &Arc<FileAccess>,
+        rule: &Prepared,
+        file: &FileUnderCheck<'_>,
+    ) -> Result<(Vec<Violation>, Vec<Fact>, bool, RuleTiming), RunError> {
+        let FileUnderCheck {
+            path,
+            source,
+            tree,
+            language: _,
+        } = *file;
+
+        // The grammar is chosen by the file, not by the rule — the same gate the check phase
+        // applies. A flow rule that does not name this file's language does not run on it.
+        let Some(language_id) = self.language_of(path) else {
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
+        };
+        let Some(flow) = rule.flow_for_language(language_id) else {
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
+        };
+        let language = &flow.language;
+        // A language with no taint analysis (only JS/TS/TSX has one today) yields nothing for a
+        // flow rule rather than erroring — the truthful answer, and the same posture the engine
+        // takes for a language with no binding resolver.
+        let Some(analyzer) = language.flow_analyzer() else {
+            return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
+        };
+
+        // A refcounted copy, not a re-parse — the arena needs to own its tree, exactly as the
+        // check path clones the shared tree per rule.
+        let tree = tree.clone();
+        let mut timing = RuleTiming::default();
+        let clock = |on: bool| on.then(std::time::Instant::now);
+
+        let mut host = HostContext::new(tree, source.to_owned(), path.as_str())
+            .with_resolver_from(language.as_ref())
+            .with_language(Arc::clone(language))
+            .with_today(&self.today.to_string())
+            .with_file_access(Arc::clone(files));
+        if let Some(support) = self.types_for(rule, language) {
+            host = host.with_types(support);
+        }
+
+        // Phase 1 — matching and analysis, all native Rust, under one immutable borrow of the
+        // arena's own tree. The role queries collect the source/sink/sanitizer node sets, the
+        // analyzer returns canonical deduplicated flows over them, and each flow is reduced to
+        // owned capture paths before the borrow ends.
+        let query_started = clock(self.profiling);
+        let flows: Vec<FlowPathPaths> = {
+            let arena = host.arena().borrow();
+            let ts_tree = arena.tree();
+
+            let sources = collect_captures(&flow.sources, ts_tree, source, "source");
+            let sinks = collect_captures(&flow.sinks, ts_tree, source, "sink");
+            let sanitizers = collect_captures(&flow.sanitizers, ts_tree, source, "sanitizer");
+
+            analyzer
+                .analyze(ts_tree, source, &sources, &sinks, &sanitizers)
+                .into_iter()
+                .filter_map(|flow_path| {
+                    // A node that does not resolve to a path is dropped rather than mapped to
+                    // the wrong handle — but every flow node came from `ts_tree`, so `path_of`
+                    // resolves. `source` and `sink` are load-bearing (the sink is where the
+                    // report lands); the steps are informational and mapped best-effort.
+                    Some(FlowPathPaths {
+                        source: arena.path_of(flow_path.source)?,
+                        sink: arena.path_of(flow_path.sink)?,
+                        steps: flow_path
+                            .steps
+                            .iter()
+                            .filter_map(|step| arena.path_of(*step))
+                            .collect(),
+                    })
+                })
+                .collect()
+        };
+
+        if let Some(started) = query_started {
+            timing.query = started.elapsed();
+            timing.matches = flows.len() as u64;
+        }
+
+        if flows.is_empty() {
+            // No captures, or no flow between them: no crossing into the sandbox at all, the
+            // boundary-proportional-to-findings invariant the phase is built around.
+            return Ok((Vec::new(), Vec::new(), false, timing));
+        }
+
+        // Only now, with flows in hand, is a sandbox needed — the same lazy build the check
+        // path makes, so a file with no flow never starts one.
+        let sandbox = worker.sandbox()?;
+        let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
+
+        for flow_path in flows {
+            // Phase 2 — mint the handles from the paths collected above, then invoke the
+            // handler through the module the config already loaded, so the rule object here is
+            // the same one the config validated.
+            let (source_handle, sink_handle, step_handles) = {
+                let mut arena = host.arena().borrow_mut();
+                let source_handle = arena.intern_path(flow_path.source);
+                let sink_handle = arena.intern_path(flow_path.sink);
+                let step_handles: Vec<u32> = flow_path
+                    .steps
+                    .into_iter()
+                    .filter_map(|step| arena.intern_path(step))
+                    .collect();
+                (source_handle, sink_handle, step_handles)
+            };
+            // A flow whose source or sink no longer resolves is dropped rather than reported
+            // at a made-up node — the posture `ctx.report` itself takes for a dead handle.
+            let (Some(source_handle), Some(sink_handle)) = (source_handle, sink_handle) else {
+                continue;
+            };
+
+            let steps_literal = step_handles
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let call = format!(
+                "globalThis.__lanekeepConfig.rules[{}].checkFlow(ctx, {{ source: {source_handle}, \
+                 sink: {sink_handle}, steps: [{steps_literal}] }})",
+                rule_index(&rule.spec)
+            );
+
+            let handler_started = clock(self.profiling);
+            let outcome = sandbox.eval_with_host_timeout::<()>(&host, &call, timeout);
+            if let Some(started) = handler_started {
+                timing.handler = timing.handler.saturating_add(started.elapsed());
+            }
+
+            outcome.map_err(|e: SandboxError| RunError::Rule {
+                rule: rule.spec.id.to_string(),
+                file: path.as_str().to_owned(),
+                detail: e.to_string(),
+            })?;
+        }
+
+        let facts = Self::facts_from(rule, path, &host);
+        let violations = Self::violations_from_js(rule, path, host.take_reports());
+
+        Ok((violations, facts, host.date_was_read(), timing))
+    }
+
+    /// The facts a host collected while checking one file, tagged with the rule and file they
+    /// came from.
+    ///
+    /// Emission order within the file is assigned here rather than trusted from the rule, so a
+    /// rule cannot reorder its own facts relative to another file's and change what `reduce`
+    /// sees. Shared by the check and flow phases, whose collection is identical.
+    fn facts_from(rule: &Prepared, path: &FilePath, host: &HostContext) -> Vec<Fact> {
+        host.take_facts()
             .into_iter()
             .enumerate()
             .map(|(sequence, emitted)| Fact {
@@ -2647,16 +2987,9 @@ impl Engine {
                 file: path.clone(),
                 kind: emitted.kind,
                 data: emitted.data,
-                // Emission order within the file. The engine assigns it rather than
-                // trusting the rule, so a rule cannot reorder its own facts relative to
-                // another file's and change what `reduce` sees.
                 sequence: u32::try_from(sequence).unwrap_or(u32::MAX),
             })
-            .collect();
-
-        let violations = Self::violations_from_js(rule, path, host.take_reports());
-
-        Ok((violations, facts, host.date_was_read(), timing))
+            .collect()
     }
 
     /// Run this rule's typestate obligation, if it declared one and this language has an
@@ -5303,6 +5636,117 @@ export default defineRule({
         );
     }
 
+    // --- the flow phase ------------------------------------------------------------------
+
+    /// A taint rule: a secret origin reaching a string sink, with a sanitizer that cuts it.
+    ///
+    /// Flow-only — it declares no top-level `query` and no `check`, so its whole driver is
+    /// `checkFlow`. It is the smallest rule that exercises the engine's flow phase end to
+    /// end: the three role queries, the analyzer, the node→handle mapping, and the report.
+    const SECRET_FLOW_RULE: &str = r#"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/no-secret-in-string',
+  requires: ['dataflow'],
+  flow: {
+    sources: ['(call_expression function: (identifier) @source (#eq? @source "getSecret"))'],
+    sinks: ['(call_expression function: (identifier) @fn (#eq? @fn "log") arguments: (arguments (_) @sink))'],
+    sanitizers: ['(call_expression function: (identifier) @sanitizer (#eq? @sanitizer "redact"))'],
+  },
+  card: {
+    message: 'a secret reaches a string sink',
+    remediation: 'redact the value before it is stringified',
+    examples: { bad: 'log(getSecret())', good: 'log(redact(getSecret()))' },
+  },
+  checkFlow(ctx, path) {
+    ctx.report(path.sink, 'a tainted value reaches this sink');
+  },
+});
+"#;
+
+    #[test]
+    fn a_flow_rule_reports_at_its_sink() {
+        // The whole phase in one file: a `@source` (`getSecret()`) whose value flows through
+        // an assignment to a `@sink` (the argument of `log(...)`), reported at the sink. The
+        // location pins the node→handle→position mapping: the reported handle must resolve to
+        // the exact `s` inside `log(s)`, not the declaration and not the call.
+        let project = Project::new(
+            "flow-reports-at-sink",
+            &[
+                ("rule.ts", SECRET_FLOW_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s);\n}\n",
+                ),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        let found: Vec<(&str, u32, u32, &str)> = outcome
+            .violations
+            .iter()
+            .map(|v| {
+                (
+                    v.location.file.as_str(),
+                    v.location.position.line,
+                    v.location.position.column,
+                    v.message.as_str(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            found,
+            vec![("src/a.ts", 3, 7, "a tainted value reaches this sink")],
+            "exactly one violation, at the `s` inside `log(s)`"
+        );
+    }
+
+    #[test]
+    fn a_flow_run_is_byte_identical_across_two_runs() {
+        // Determinism (spec §11): the analyzer returns canonical, deduplicated flows and the
+        // engine sorts violations, so two runs over identical input must serialize identically.
+        // Two sources into one sink is the case that would expose a nondeterministic worklist.
+        let project = Project::new(
+            "flow-determinism",
+            &[
+                ("rule.ts", SECRET_FLOW_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  const t = getSecret();\n  \
+                     log(s);\n  log(t);\n}\n",
+                ),
+            ],
+        );
+
+        let render = |outcome: &Outcome| -> String {
+            outcome
+                .violations
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{}:{}:{} {}",
+                        v.location.file.as_str(),
+                        v.location.position.line,
+                        v.location.position.column,
+                        v.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let first = render(&project.run().expect("first run"));
+        let second = render(&project.run().expect("second run"));
+        assert_eq!(first, second, "two runs must be byte-identical");
+        assert_eq!(
+            first.lines().count(),
+            2,
+            "both `log(...)` sinks report, once each: {first}"
+        );
+    }
+
     #[test]
     fn facts_reach_reduce_in_the_same_order_on_every_run() {
         // The determinism invariant at the level a rule can observe: `ctx.facts()` is in
@@ -7475,10 +7919,13 @@ export default defineRule({
                 timeout: None,
                 has_reduce,
                 component: Some(backed_by(fixture())),
-                // A component cannot declare `requires` — `rule-metadata` has no such field —
-                // so every component-backed `RuleSpec` carries an empty list, exactly as
-                // `lanekeep-config`'s `build_rule` produces for one.
+                // A component cannot declare `requires`, `flow` or a `checkFlow` handler —
+                // `rule-metadata` has no such fields — so every component-backed `RuleSpec`
+                // carries the same empty/absent values `lanekeep-config`'s `build_rule`
+                // produces for one (`crates/lanekeep-config/src/lib.rs`'s `raw_rule_from`).
                 requires: Vec::new(),
+                has_check_flow: false,
+                flow: None,
                 // Same reasoning as `requires`: `rule-metadata` has no `obligation` field
                 // either, so `lanekeep-config` never produces one for a component-backed rule.
                 obligation: None,
@@ -8554,6 +9001,7 @@ export default defineRule({
                 spec,
                 gates,
                 compiled: vec![(language, Some(query), None)],
+                flow_compiled: Vec::new(),
                 slot: None,
             }
         }

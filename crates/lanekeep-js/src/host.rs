@@ -64,9 +64,17 @@ use lanekeep_types::{Symbol, Type, TypeScriptOracle, TypeScriptSupport};
 ///   hash plus exact node count), computed host-side in one walk.
 /// - `3` — `ctx.types`: the bounded within-file type oracle, present only for a rule that
 ///   declared `requires: ['types']`.
-/// - `4` — obligation typestate: the host invokes a third handler, `checkObligation`, with
-///   a host-constructed `UnmetObligation` (`acquire`/`exit` node handles, `partial`).
-pub const HOST_API_VERSION: u32 = 4;
+/// - `4` — never shipped as a single combined build: #193 (obligation) and #194 (flow) each
+///   bumped to `4` independently for one new handler, so `4` is ambiguous — a cached result
+///   at that version could have been reached by either surface — and this merge supersedes it.
+/// - `5` — both dataflow handlers present together. `checkObligation` (#193): obligation
+///   typestate, invoked with a host-constructed `UnmetObligation` (`acquire`/`exit` node
+///   handles, `partial`). `checkFlow` (#194): the taint-flow handler, invoked once per
+///   canonical `FlowPath` with `{ source, sink, steps }` node handles. Each reaches `ctx` —
+///   the same reporting surface `check` does — so a build with them can produce a verdict a
+///   build without them could not, which is why the version moves even though no `ctx`
+///   function was added or changed.
+pub const HOST_API_VERSION: u32 = 5;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]

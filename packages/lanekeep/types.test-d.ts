@@ -27,6 +27,7 @@ import noRestrictedArguments from 'lanekeep/no-restricted-arguments'
 import noRestrictedCalls from 'lanekeep/no-restricted-calls'
 import noRestrictedImports from 'lanekeep/no-restricted-imports'
 import noRestrictedTypes from 'lanekeep/no-restricted-types'
+import noSecretInString from 'lanekeep/no-secret-in-string'
 import noUnusedExports from 'lanekeep/no-unused-exports'
 
 void duplicateImplementation
@@ -39,4 +40,5 @@ void noRestrictedArguments
 void noRestrictedCalls
 void noRestrictedImports
 void noRestrictedTypes
+void noSecretInString
 void noUnusedExports

@@ -342,6 +342,24 @@ export interface ReduceContext {
   report(at: ReduceLocation, message?: string | ReportOptions): void
 }
 
+/** Queries whose named captures drive the taint analysis. */
+export type FlowSpec = {
+  /** Queries whose `@source` capture marks a tainted origin. */
+  sources: string[]
+  /** Queries whose `@sink` capture marks a forbidden destination. */
+  sinks: string[]
+  /** Queries whose `@sanitizer` capture clears taint from the value it produces. */
+  sanitizers?: string[]
+}
+
+/** One tainted flow: a source whose value reaches a sink with no intervening sanitizer. */
+export type FlowPath = {
+  readonly source: Node
+  readonly sink: Node
+  /** The assignments and calls between source and sink, in flow order. One canonical path. */
+  readonly steps: readonly Node[]
+}
+
 /**
  * A typestate obligation: an acquired resource must reach a release on every
  * path out of `scope`. Requires `requires: ['dataflow']`.
@@ -407,6 +425,11 @@ export interface Rule {
    * what keeps a JavaScript rule affordable. Write the narrowest query that captures what
    * you need; `check` then only refines.
    *
+   * Optional — required only when `check` is present. A flow-only rule (`checkFlow` with no
+   * `check`) declares no top-level query; its file gate comes from the union of its `flow`
+   * queries instead (see {@link FlowSpec}). The type cannot express that conditional, so a
+   * `check` rule missing `query` type-checks here and is refused by the config loader instead.
+   *
    * A single string applies to every declared language. An object maps each declared
    * language to its own query — required when the grammars do not share node vocabulary
    * (Python spells a call `call`, the other supported grammars say `call_expression`).
@@ -420,14 +443,28 @@ export interface Rule {
    * no backreferences or lookaround. `#is?`, `#is-not?`, `#set!`, or an operator the
    * binding does not know is refused at compile time.
    */
-  query: string | Partial<Record<LanguageId, string>>
+  query?: string | Partial<Record<LanguageId, string>>
   /** A per-invocation budget overriding the default, in milliseconds. */
   timeout?: number
   /** Called once per query match. */
   check?(ctx: RuleContext, match: Match): void
   /** Called once per run, after every file, with facts only. */
   reduce?(ctx: ReduceContext): void
+  /**
+   * A taint-flow specification: queries whose captures mark tainted origins, forbidden
+   * destinations, and the calls that neutralize a value. Requires `requires: ['dataflow']`
+   * and a `checkFlow` handler; a rule declaring one without the other is refused at load.
+   */
+  flow?: FlowSpec
+  /** Called once per canonical tainted flow from a source to a sink. */
+  checkFlow?(ctx: RuleContext, path: FlowPath): void
+  /**
+   * A typestate obligation: queries whose captures acquire an obligation on a value and
+   * queries that discharge it. Requires `requires: ['dataflow']` and a `checkObligation`
+   * handler; a rule declaring one without the other is refused at load.
+   */
   obligation?: ObligationSpec
+  /** Called once per value left with an unmet obligation at the end of its scope. */
   checkObligation?(ctx: RuleContext, unmet: UnmetObligation): void
 }
 
