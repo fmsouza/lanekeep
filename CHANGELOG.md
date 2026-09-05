@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/fmsouza/lanekeep/compare/v0.8.1...v0.9.0) - 2026-09-05
+
+### Added
+
+- *(lang-js)* per-function control-flow graph for TypeScript and TSX ([#209](https://github.com/fmsouza/lanekeep/pull/209))
+- *(types)* add the bounded within-file type oracle ([#198](https://github.com/fmsouza/lanekeep/pull/198))
+- *(config)* add `requires`, the per-rule opt-in for host analyses ([#196](https://github.com/fmsouza/lanekeep/pull/196))
+- *(rules)* typestate obligations via obligation/checkObligation ([#193](https://github.com/fmsouza/lanekeep/pull/193)) ([#213](https://github.com/fmsouza/lanekeep/pull/213))
+- taint analysis — flow / checkFlow, def-use over the CFG ([#194](https://github.com/fmsouza/lanekeep/pull/194)) ([#215](https://github.com/fmsouza/lanekeep/pull/215))
+- *(js)* expose the type oracle to rules as ctx.types ([#199](https://github.com/fmsouza/lanekeep/pull/199))
+- *(rules)* [**breaking**] no-restricted-types reads typed members ([#207](https://github.com/fmsouza/lanekeep/pull/207))
+- *(rules)* add no-restricted-types, the first built-in a type decides ([#200](https://github.com/fmsouza/lanekeep/pull/200))
+- *(rules)* add no-restricted-arguments rule to catch the inline case ([#204](https://github.com/fmsouza/lanekeep/pull/204))
+
+### Documentation
+
+- re-baseline every document to the v0.8.1 tree ([#181](https://github.com/fmsouza/lanekeep/pull/181))
+- *(engine)* run_key names its input list rather than a count ([#210](https://github.com/fmsouza/lanekeep/pull/210))
+- *(tests)* a module factory is configured by the entry module ([#211](https://github.com/fmsouza/lanekeep/pull/211))
+- *(cli)* correct the stale factory claim on the init scaffold ([#214](https://github.com/fmsouza/lanekeep/pull/214))
+
+### Fixed
+
+- *(docs)* gates are not semantically neutral ([#206](https://github.com/fmsouza/lanekeep/pull/206))
+
 ## [0.8.1](https://github.com/fmsouza/lanekeep/compare/v0.8.0...v0.8.1) - 2026-08-29
 
 ### Fixed
