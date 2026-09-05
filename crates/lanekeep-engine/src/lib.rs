@@ -46,7 +46,7 @@ use lanekeep_js::{
     FileAccess, HOST_API_VERSION, HostContext, Limits, ReduceContext, ReduceFact, RuleRoot,
     RunClock, Sandbox, SandboxError,
 };
-use lanekeep_lang::{Language, LanguageId, LanguageRegistry};
+use lanekeep_lang::{Language, LanguageId, LanguageRegistry, ObligationAnalyzer, ObligationScope};
 use lanekeep_query::{CompileError, CompiledQuery};
 use lanekeep_types::TypeScriptSupport;
 use lanekeep_wasm::bindings::types;
@@ -207,8 +207,9 @@ pub enum RunError {
 /// A rule prepared for execution: metadata plus everything compiled.
 ///
 /// The query is compiled once per language the rule targets, because a query is compiled
-/// against a grammar and the grammars differ. Which one a given file uses is decided by the
-/// file, not by the rule — see [`Prepared::for_language`].
+/// against a grammar and the grammars differ. So is a rule's obligation, when it declared
+/// one — the acquire/release queries share that same per-language compile. Which language a
+/// given file uses is decided by the file, not by the rule — see [`Prepared::for_language`].
 struct Prepared {
     /// This rule's position in [`Engine::rules`].
     ///
@@ -218,8 +219,8 @@ struct Prepared {
     index: usize,
     spec: RuleSpec,
     gates: CompiledGates,
-    /// Compiled query per language, in the order the rule declared them.
-    compiled: Vec<(Arc<dyn Language>, CompiledQuery)>,
+    /// What this rule compiled for each language it targets, in the order it declared them.
+    compiled: Vec<CompiledForLanguage>,
     /// Where this rule's handlers live in the run's [`RuleSet`], or `None` for a TypeScript
     /// rule executed through the QuickJS sandbox.
     ///
@@ -233,15 +234,15 @@ struct Prepared {
 }
 
 impl Prepared {
-    /// The grammar and query to use for a file of the given language, or `None` when this
-    /// rule does not target it — in which case the rule does not run on that file at all.
+    /// What this rule compiled for a file of the given language, or `None` when this rule
+    /// does not target it — in which case the rule does not run on that file at all.
     ///
     /// Running it anyway is what the old behavior did, and it does not fail loudly: the file
     /// parses into a tree of `ERROR` nodes and every query quietly matches nothing.
-    fn for_language(&self, id: &str) -> Option<&(Arc<dyn Language>, CompiledQuery)> {
+    fn for_language(&self, id: &str) -> Option<&CompiledForLanguage> {
         self.compiled
             .iter()
-            .find(|(language, _)| language.id().as_str() == id)
+            .find(|(language, _, _)| language.id().as_str() == id)
     }
 }
 
@@ -302,6 +303,34 @@ type RuleMatches = Vec<MatchCaptures>;
 
 /// Matches from one traversal, indexed by position in [`Engine::rules`].
 type MatchesByRule = Vec<RuleMatches>;
+
+/// A rule's typestate obligation, compiled against one language's grammar.
+///
+/// Mirrors `lanekeep_config::ObligationSpec` once its query strings are compiled and its
+/// scope is parsed — the same promotion the main query goes through, so a broken acquire or
+/// release query is reported at prepare time, naming its rule, rather than at whichever file
+/// first asks the analyzer to run.
+struct CompiledObligation {
+    /// Queries whose `@acquire` capture starts an obligation.
+    acquire: Vec<CompiledQuery>,
+    /// Queries whose `@release` capture discharges it.
+    release: Vec<CompiledQuery>,
+    /// The scope the obligation must be discharged within.
+    scope: ObligationScope,
+}
+
+/// What one rule compiled for one language it targets.
+///
+/// The main query is `None` for an obligation-only rule, which has no `check` to feed
+/// matches to. The obligation is `None` for every rule that declared none, which is nearly
+/// all of them. `build_rule` refuses a rule with neither a `query` nor an `obligation`, so at
+/// least one of the two is always present for every language this entry names — that is what
+/// "targets" means, and what [`Prepared::for_language`] answers `Some` for.
+type CompiledForLanguage = (
+    Arc<dyn Language>,
+    Option<CompiledQuery>,
+    Option<CompiledObligation>,
+);
 
 /// One language's patterns, accumulated across rules before anything is compiled.
 struct Concatenation {
@@ -372,7 +401,11 @@ fn combine_queries(rules: &[Prepared]) -> BTreeMap<String, CombinedQuery> {
     let mut sources: BTreeMap<String, Concatenation> = BTreeMap::new();
 
     for (index, rule) in rules.iter().enumerate() {
-        for (language, query) in &rule.compiled {
+        for (language, query, _obligation) in &rule.compiled {
+            // An obligation-only rule has nothing to contribute here — no main query means
+            // no patterns to concatenate — and runs entirely through the obligation arm in
+            // `Engine::run_rule` instead.
+            let Some(query) = query else { continue };
             let entry = sources
                 .entry(language.id().as_str().to_owned())
                 .or_insert_with(|| Concatenation {
@@ -857,64 +890,111 @@ impl Engine {
         // nearly zero, and would cost the guarantee the comment below describes: a broken query
         // is reported here, naming its rule, rather than staying silent until some file happens
         // to need it.
-        let prepared: Vec<Result<Prepared, RunError>> =
-            config
-                .rules
-                .par_iter()
-                .filter(|spec| spec.severity.is_enabled())
-                .map(|spec| {
-                    let mut compiled = Vec::with_capacity(spec.languages.len());
-                    for id in &spec.languages {
-                        let language = registry.by_id(id).cloned().ok_or_else(|| {
-                            RunError::UnknownLanguage {
+        let prepared: Vec<Result<Prepared, RunError>> = config
+            .rules
+            .par_iter()
+            .filter(|spec| spec.severity.is_enabled())
+            .map(|spec| {
+                let mut compiled = Vec::with_capacity(spec.languages.len());
+                for id in &spec.languages {
+                    let language =
+                        registry
+                            .by_id(id)
+                            .cloned()
+                            .ok_or_else(|| RunError::UnknownLanguage {
                                 rule: spec.id.to_string(),
                                 language: id.clone(),
                                 known: known.clone(),
-                            }
-                        })?;
+                            })?;
 
-                        // Compiled against this grammar specifically, from this language's own
-                        // query string selected from the per-language map. A query that is valid
-                        // for one dialect and not another is a rule bug, and this is where it
-                        // surfaces — at config load, naming the rule, rather than as silence at
-                        // run time.
-                        // The exact cover was validated at config load; a missing entry here
-                        // is a bug in the engine's own bookkeeping, named rather than
-                        // silently compiled against nothing.
+                    // Compiled against this grammar specifically, from this language's own
+                    // query string selected from the per-language map. A query that is valid
+                    // for one dialect and not another is a rule bug, and this is where it
+                    // surfaces — at config load, naming the rule, rather than as silence at
+                    // run time.
+                    //
+                    // `spec.queries` is empty for an obligation-only rule — build_rule's
+                    // one exception to requiring a `query` — so there is nothing to compile
+                    // here for it. A *non-empty* map missing this specific language would be
+                    // the exact cover promised at config load broken, which is a bug in the
+                    // engine's own bookkeeping, named rather than silently compiled against
+                    // nothing.
+                    let query = if spec.queries.is_empty() {
+                        None
+                    } else {
                         let source = spec.queries.get(id.as_str()).ok_or_else(|| {
                             RunError::MissingQuery {
                                 rule: spec.id.to_string(),
                                 language: id.clone(),
                             }
                         })?;
-                        let query = CompiledQuery::compile(language.as_ref(), source).map_err(
+                        Some(CompiledQuery::compile(language.as_ref(), source).map_err(
                             |e: CompileError| RunError::Query {
                                 rule: spec.id.to_string(),
                                 language: id.clone(),
                                 detail: e.to_string(),
                             },
-                        )?;
+                        )?)
+                    };
 
-                        compiled.push((language, query));
-                    }
+                    // The obligation's acquire/release queries compile against this same
+                    // grammar, for the same reason the main query does — see
+                    // `CompiledObligation`. A broken one is reported here too, naming its
+                    // rule, rather than at whichever file first asks the analyzer to run.
+                    let obligation = spec
+                        .obligation
+                        .as_ref()
+                        .map(|o| -> Result<CompiledObligation, RunError> {
+                            let compile_one = |q: &str| {
+                                CompiledQuery::compile(language.as_ref(), q).map_err(
+                                    |e: CompileError| RunError::Query {
+                                        rule: spec.id.to_string(),
+                                        language: id.clone(),
+                                        detail: e.to_string(),
+                                    },
+                                )
+                            };
+                            Ok(CompiledObligation {
+                                acquire: o
+                                    .acquire
+                                    .iter()
+                                    .map(|q| compile_one(q))
+                                    .collect::<Result<Vec<_>, _>>()?,
+                                release: o
+                                    .release
+                                    .iter()
+                                    .map(|q| compile_one(q))
+                                    .collect::<Result<Vec<_>, _>>()?,
+                                scope: ObligationScope::parse(&o.scope).ok_or_else(|| {
+                                    RunError::Query {
+                                        rule: spec.id.to_string(),
+                                        language: id.clone(),
+                                        detail: format!("invalid obligation scope `{}`", o.scope),
+                                    }
+                                })?,
+                            })
+                        })
+                        .transpose()?;
 
-                    let gates =
-                        CompiledGates::compile(&spec.gates).map_err(|e| RunError::Gates {
-                            rule: spec.id.to_string(),
-                            detail: e.to_string(),
-                        })?;
+                    compiled.push((language, query, obligation));
+                }
 
-                    Ok(Prepared {
-                        // Filled in below, once config order is known.
-                        index: 0,
-                        spec: spec.clone(),
-                        gates,
-                        compiled,
-                        // Filled in below too, by the one place components are loaded.
-                        slot: None,
-                    })
+                let gates = CompiledGates::compile(&spec.gates).map_err(|e| RunError::Gates {
+                    rule: spec.id.to_string(),
+                    detail: e.to_string(),
+                })?;
+
+                Ok(Prepared {
+                    // Filled in below, once config order is known.
+                    index: 0,
+                    spec: spec.clone(),
+                    gates,
+                    compiled,
+                    // Filled in below too, by the one place components are loaded.
+                    slot: None,
                 })
-                .collect();
+            })
+            .collect();
 
         // The first failure by *config order*, not by whichever thread finished first. Two
         // broken rules must always name the same one, or the same project reports a different
@@ -2113,7 +2193,7 @@ impl Engine {
         admitted: &[&Prepared],
     ) -> Option<(Arc<dyn Language>, tree_sitter::Tree)> {
         let language_id = self.language_of(path)?;
-        let (language, _) = admitted
+        let (language, _, _) = admitted
             .iter()
             .find_map(|rule| rule.for_language(language_id))?;
 
@@ -2165,7 +2245,12 @@ impl Engine {
         let Some(language_id) = self.language_of(path) else {
             return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
         };
-        let Some((_, compiled_query)) = rule.for_language(language_id) else {
+        // A component rule always compiles a main query — `obligation` has no WIT surface, so
+        // a component-backed `RuleSpec` never carries one (see `ComponentRule`) — but the
+        // shape is `Option<CompiledQuery>` now that an obligation-only TypeScript rule can
+        // target a language with none. `None` here cannot happen in practice; treated as "no
+        // match" rather than reached at all.
+        let Some((_, Some(compiled_query), _)) = rule.for_language(language_id) else {
             return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
         };
 
@@ -2393,6 +2478,25 @@ impl Engine {
         self.type_support.get(&language.id()).cloned()
     }
 
+    /// The obligation analyzer to run for this rule and language, if any.
+    ///
+    /// Mirrors [`Self::types_for`] immediately above on both conditions: the rule declared
+    /// `requires: ['dataflow']`, confirmed by `check_requires` at config load, and this
+    /// language actually implements one. A rule that requires the capability against a
+    /// language with no analyzer yet gets nothing back, the same honest absence
+    /// [`Language::obligation_analyzer`] documents on itself, rather than a confidently wrong
+    /// answer. An associated function rather than a method, unlike `types_for` — it never
+    /// reads `self`.
+    fn obligation_analyzer_for(
+        rule: &Prepared,
+        language: &Arc<dyn Language>,
+    ) -> Option<Arc<dyn ObligationAnalyzer>> {
+        if !rule.spec.requires.contains(&Capability::Dataflow) {
+            return None;
+        }
+        language.obligation_analyzer()
+    }
+
     fn run_rule(
         &self,
         worker: &mut Worker<'_>,
@@ -2413,7 +2517,7 @@ impl Engine {
         let Some(language_id) = self.language_of(path) else {
             return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
         };
-        let Some((language, compiled_query)) = rule.for_language(language_id) else {
+        let Some((language, compiled_query, obligation)) = rule.for_language(language_id) else {
             return Ok((Vec::new(), Vec::new(), false, RuleTiming::default()));
         };
 
@@ -2449,7 +2553,7 @@ impl Engine {
         if let Some(found) = precollected {
             // Already matched, in one traversal shared with every other rule on this file.
             matches = found;
-        } else {
+        } else if let Some(compiled_query) = compiled_query {
             // No combined query for this language, or profiling asked for the per-rule
             // split. Walk the tree for this rule alone.
             let arena = host.arena().borrow();
@@ -2464,13 +2568,18 @@ impl Engine {
                 matches.push(captures);
             });
         }
+        // else: an obligation-only rule has no main query to walk — `matches` stays empty,
+        // and the obligation arm below runs independently of it.
 
         if let Some(started) = query_started {
             timing.query = started.elapsed();
             timing.matches = matches.len() as u64;
         }
 
-        if matches.is_empty() {
+        // An obligation-only rule has no matches to report through — that is expected, not a
+        // sign nothing to do remains. Only bail here when there is truly nothing: no matches
+        // *and* no obligation to run.
+        if matches.is_empty() && obligation.is_none() {
             return Ok((Vec::new(), Vec::new(), false, timing));
         }
 
@@ -2515,6 +2624,20 @@ impl Engine {
             })?;
         }
 
+        // The typestate obligation, if this rule declared one and this language has an
+        // analyzer for it. Runs after the match loop above and before the reports are taken
+        // below, so `checkObligation`'s own `ctx.report` calls are harvested by the same
+        // `host.take_reports()` the match loop's `check` calls are.
+        let obligation_time = self.run_obligation(
+            rule,
+            language,
+            obligation.as_ref(),
+            (source, path),
+            (&host, sandbox),
+            timeout,
+        )?;
+        timing.handler = timing.handler.saturating_add(obligation_time);
+
         let facts = host
             .take_facts()
             .into_iter()
@@ -2534,6 +2657,95 @@ impl Engine {
         let violations = Self::violations_from_js(rule, path, host.take_reports());
 
         Ok((violations, facts, host.date_was_read(), timing))
+    }
+
+    /// Run this rule's typestate obligation, if it declared one and this language has an
+    /// analyzer for it, dispatching each unmet one to `checkObligation`.
+    ///
+    /// Split out of [`Self::run_rule`] only to keep that function under clippy's line limit.
+    /// Called after its match loop and before its reports are taken, so `checkObligation`'s
+    /// own `ctx.report` calls are harvested by the same `host.take_reports()` the match
+    /// loop's `check` calls are — which is why this reads and writes through the caller's
+    /// own `host` and `sandbox` rather than opening either itself. Returns the time spent
+    /// inside `checkObligation` handlers, for the caller to fold into its own timing on the
+    /// same terms as the match loop's handler time.
+    fn run_obligation(
+        &self,
+        rule: &Prepared,
+        language: &Arc<dyn Language>,
+        obligation: Option<&CompiledObligation>,
+        (source, path): (&str, &FilePath),
+        (host, sandbox): (&HostContext, &Sandbox),
+        timeout: Duration,
+    ) -> Result<Duration, RunError> {
+        let clock = |on: bool| on.then(std::time::Instant::now);
+        let mut handler_time = Duration::ZERO;
+
+        let Some((obligation, analyzer)) =
+            obligation.zip(Self::obligation_analyzer_for(rule, language))
+        else {
+            return Ok(handler_time);
+        };
+
+        // Collect the acquire/release nodes and run the analyzer under one immutable arena
+        // borrow, then turn its verdicts into owned paths before the borrow ends — the same
+        // two-phase shape [`Self::run_rule`]'s match loop uses, forced by the arena needing
+        // `&mut self` to intern a handle.
+        let plan: Vec<(Vec<u32>, Vec<u32>, bool)> = {
+            let arena = host.arena().borrow();
+            let tree = arena.tree();
+            let nodes_named = |queries: &[CompiledQuery], name: &str| {
+                let mut found = Vec::new();
+                for q in queries {
+                    q.for_each_match(tree, source.as_bytes(), |m| {
+                        found.extend(m.get_all(name));
+                    });
+                }
+                found
+            };
+            let acquires = nodes_named(&obligation.acquire, "acquire");
+            let releases = nodes_named(&obligation.release, "release");
+            analyzer
+                .analyze(tree, source, obligation.scope, &acquires, &releases)
+                .into_iter()
+                .filter_map(|u| {
+                    Some((arena.path_of(u.acquire)?, arena.path_of(u.exit)?, u.partial))
+                })
+                .collect()
+        };
+
+        for (acquire_path, exit_path, partial) in plan {
+            let (acquire_handle, exit_handle) = {
+                let mut arena = host.arena().borrow_mut();
+                (
+                    arena.intern_path(acquire_path),
+                    arena.intern_path(exit_path),
+                )
+            };
+            let (Some(acquire_handle), Some(exit_handle)) = (acquire_handle, exit_handle) else {
+                continue;
+            };
+
+            let call = format!(
+                "globalThis.__lanekeepConfig.rules[{}].checkObligation(ctx, \
+                 {{acquire: {acquire_handle}, exit: {exit_handle}, partial: {partial}}})",
+                rule_index(&rule.spec)
+            );
+
+            let handler_started = clock(self.profiling);
+            let outcome = sandbox.eval_with_host_timeout::<()>(host, &call, timeout);
+            if let Some(started) = handler_started {
+                handler_time = handler_time.saturating_add(started.elapsed());
+            }
+
+            outcome.map_err(|e: SandboxError| RunError::Rule {
+                rule: rule.spec.id.to_string(),
+                file: path.as_str().to_owned(),
+                detail: e.to_string(),
+            })?;
+        }
+
+        Ok(handler_time)
     }
 }
 
@@ -7267,6 +7479,9 @@ export default defineRule({
                 // so every component-backed `RuleSpec` carries an empty list, exactly as
                 // `lanekeep-config`'s `build_rule` produces for one.
                 requires: Vec::new(),
+                // Same reasoning as `requires`: `rule-metadata` has no `obligation` field
+                // either, so `lanekeep-config` never produces one for a component-backed rule.
+                obligation: None,
             }
         }
 
@@ -8338,7 +8553,7 @@ export default defineRule({
                 index: 0,
                 spec,
                 gates,
-                compiled: vec![(language, query)],
+                compiled: vec![(language, Some(query), None)],
                 slot: None,
             }
         }

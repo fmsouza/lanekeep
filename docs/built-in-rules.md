@@ -73,6 +73,10 @@ JavaScript" for a while and the rules underneath it never fired on a `.js` file,
 quiet kind of wrong: a rule that does not run looks exactly like a codebase with nothing to
 report. Extending them is a rule change rather than a documentation one.
 
+None of the rules below declare `obligation`. `requires: ['dataflow']` — the typestate
+capability behind a must-be-released-on-every-path check, `docs/architecture.md` §6.11 — has
+no shipped built-in yet; `docs/obligation-rules.md` has the mechanism and a worked example.
+
 ## `lanekeep/no-default-export`
 
 Named exports only.

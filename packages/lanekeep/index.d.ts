@@ -342,6 +342,31 @@ export interface ReduceContext {
   report(at: ReduceLocation, message?: string | ReportOptions): void
 }
 
+/**
+ * A typestate obligation: an acquired resource must reach a release on every
+ * path out of `scope`. Requires `requires: ['dataflow']`.
+ */
+export type ObligationSpec = {
+  /** Queries whose `@acquire` capture starts an obligation on the captured value. */
+  acquire: string[]
+  /** Queries whose `@release` capture discharges it. */
+  release: string[]
+  /**
+   * `'function'` — every path out of the enclosing function, `return`/`throw` included.
+   * `'block'` — every path out of the block the acquire is in.
+   */
+  scope: 'function' | 'block'
+}
+
+/** An acquire some path leaves undischarged, passed to `checkObligation`. */
+export type UnmetObligation = {
+  readonly acquire: Node
+  /** The exit the value escapes through — a `return`, a `throw`, or the implicit end. */
+  readonly exit: Node
+  /** Whether any path *did* discharge it: partial coverage reads differently to none. */
+  readonly partial: boolean
+}
+
 /** A rule, as `defineRule` takes it. */
 export interface Rule {
   /**
@@ -402,6 +427,8 @@ export interface Rule {
   check?(ctx: RuleContext, match: Match): void
   /** Called once per run, after every file, with facts only. */
   reduce?(ctx: ReduceContext): void
+  obligation?: ObligationSpec
+  checkObligation?(ctx: RuleContext, unmet: UnmetObligation): void
 }
 
 /** A lanekeep configuration, as `defineConfig` takes it. */
