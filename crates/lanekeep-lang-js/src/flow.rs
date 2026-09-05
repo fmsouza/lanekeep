@@ -106,6 +106,9 @@ impl<'t> Taint<'_, 't> {
         }
         match expr.kind() {
             "identifier" => self.taint_of_identifier(expr, sink_block, depth),
+            // A non-source, non-sanitizer call is opaque: v1 does not follow taint through a
+            // call's arguments (the alias-through-call false negative, spec §13). Only a
+            // direct source or a local identifier alias carries taint.
             _ => Vec::new(),
         }
     }
@@ -336,5 +339,28 @@ mod tests {
             "redact",
         );
         assert!(flows.is_empty());
+    }
+
+    #[test]
+    fn a_const_alias_propagates_taint() {
+        let flows = run(
+            "function f() { const a = getSecret(); const b = a; log(b); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1);
+    }
+
+    #[test]
+    fn aliasing_through_a_call_does_not_propagate() {
+        // Documented v1 false NEGATIVE: identity(a) is not tracked.
+        let flows = run(
+            "function f() { const a = getSecret(); const b = identity(a); log(b); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty(), "v1 does not follow taint through a call");
     }
 }
