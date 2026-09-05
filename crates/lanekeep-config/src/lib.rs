@@ -658,6 +658,15 @@ fn check_requires(
 /// that binds the capture under a predicate the query never actually reaches, only a query
 /// that could never have bound it at all — the same gap `requires` accepts for a capability
 /// a rule declares and simply never calls.
+///
+/// # Why an empty or absent `sources`/`sinks` is refused
+///
+/// A flow traces from a source to a sink; with zero of either there is nothing to trace, so
+/// `checkFlow` can never be called with a result and the rule reports nothing forever — the
+/// same silent-no-op shape already refused at load for an empty `query` and an empty
+/// `language`. `packages/lanekeep/index.d.ts` agrees: `FlowSpec` declares `sources` and
+/// `sinks` required and only `sanitizers` optional. `sanitizers` has no such floor — a flow
+/// that never sanitizes anything is a perfectly ordinary one.
 fn parse_flow(flow: &serde_json::Value, id: &RuleId) -> Result<FlowSpec, String> {
     if !flow.is_object() {
         return Err(format!(
@@ -666,18 +675,32 @@ fn parse_flow(flow: &serde_json::Value, id: &RuleId) -> Result<FlowSpec, String>
             json_kind(flow),
         ));
     }
+    let sources = parse_flow_role(flow, "sources", "@source", id)?;
+    if sources.is_empty() {
+        return Err(format!(
+            "`{id}` has a `flow` with no `sources` — a flow with no source can never report"
+        ));
+    }
+    let sinks = parse_flow_role(flow, "sinks", "@sink", id)?;
+    if sinks.is_empty() {
+        return Err(format!(
+            "`{id}` has a `flow` with no `sinks` — a flow with no sink can never report"
+        ));
+    }
+    let sanitizers = parse_flow_role(flow, "sanitizers", "@sanitizer", id)?;
     Ok(FlowSpec {
-        sources: parse_flow_role(flow, "sources", "@source", id)?,
-        sinks: parse_flow_role(flow, "sinks", "@sink", id)?,
-        sanitizers: parse_flow_role(flow, "sanitizers", "@sanitizer", id)?,
+        sources,
+        sinks,
+        sanitizers,
     })
 }
 
 /// One `flow` role: an array of query strings, each required to bind the capture it names.
 ///
-/// Absence and an empty array say the same thing here, exactly as they do for `requires` —
-/// `sanitizers` is the role most rules omit, and refusing on presence rather than on content
-/// would reject the two roles that are not optional along with it.
+/// Absence and an empty array are indistinguishable here — both come back as an empty
+/// `Vec` — because this function validates a role's shape, not its cardinality. Whether an
+/// empty role is acceptable is `parse_flow`'s call: it refuses an empty-or-absent `sources`
+/// or `sinks` right after calling this, and leaves an empty-or-absent `sanitizers` alone.
 fn parse_flow_role(
     flow: &serde_json::Value,
     role: &str,
@@ -5685,7 +5708,11 @@ mod tests {
     /// `flow`'s three roles are parsed, not merely counted: a role that is present but the
     /// wrong shape, or a query that could never bind the capture its own role names, is
     /// refused by name — the same "wrong shape is as loud as a wrong value" reasoning
-    /// `requires` already applies to itself.
+    /// `requires` already applies to itself. `sources` and `sinks` carry a further rule
+    /// `sanitizers` does not: empty-or-absent is refused, because a flow that can never taint
+    /// anything or never reach a forbidden destination can never call `checkFlow` with a
+    /// result — the same silent-no-op shape refused elsewhere for an empty `query` and an
+    /// empty `language`.
     #[test]
     fn a_malformed_flow_is_refused_rather_than_ignored() {
         for (name, flow) in [
@@ -5698,6 +5725,20 @@ mod tests {
                 "flow-query-missing-its-capture",
                 "{ sources: ['(identifier) @wrong'], sinks: ['(identifier) @sink'] }",
             ),
+            (
+                "flow-role-entry-not-a-string",
+                "{ sources: [123], sinks: ['(identifier) @sink'] }",
+            ),
+            (
+                "flow-sources-empty",
+                "{ sources: [], sinks: ['(identifier) @sink'] }",
+            ),
+            ("flow-sources-absent", "{ sinks: ['(identifier) @sink'] }"),
+            (
+                "flow-sinks-empty",
+                "{ sources: ['(identifier) @source'], sinks: [] }",
+            ),
+            ("flow-sinks-absent", "{ sources: ['(identifier) @source'] }"),
         ] {
             let err = load_err(&format!(
                 r"
