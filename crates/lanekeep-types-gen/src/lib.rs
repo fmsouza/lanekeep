@@ -757,6 +757,11 @@ export interface Rule {
    * what keeps a JavaScript rule affordable. Write the narrowest query that captures what
    * you need; `check` then only refines.
    *
+   * Optional — required only when `check` is present. A flow-only rule (`checkFlow` with no
+   * `check`) declares no top-level query; its file gate comes from the union of its `flow`
+   * queries instead (see {@link FlowSpec}). The type cannot express that conditional, so a
+   * `check` rule missing `query` type-checks here and is refused by the config loader instead.
+   *
    * A single string applies to every declared language. An object maps each declared
    * language to its own query — required when the grammars do not share node vocabulary
    * (Python spells a call `call`, the other supported grammars say `call_expression`).
@@ -770,7 +775,7 @@ export interface Rule {
    * no backreferences or lookaround. `#is?`, `#is-not?`, `#set!`, or an operator the
    * binding does not know is refused at compile time.
    */
-  query: string | Partial<Record<LanguageId, string>>
+  query?: string | Partial<Record<LanguageId, string>>
   /** A per-invocation budget overriding the default, in milliseconds. */
   timeout?: number
   /** Called once per query match. */

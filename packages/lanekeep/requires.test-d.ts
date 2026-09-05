@@ -57,3 +57,21 @@ defineRule({
   // @ts-expect-error the array is the only shape; a bare string is the mistake this invites
   requires: 'types',
 })
+
+// The flow-only shape `no-secret-in-string` ships: `checkFlow` and `flow`, no `check` and no
+// top-level `query` at all — its file gate is the union of its `flow` queries instead. `query`
+// on `Rule` is required only when `check` is present, which the config loader enforces
+// (`crates/lanekeep-config/src/lib.rs`'s `build_rule`); the type only has to admit its absence.
+// This rule fails to compile if `query` ever regresses back to required.
+defineRule({
+  id: 'local/flow-only',
+  severity: 'error',
+  card,
+  requires: ['dataflow'],
+  flow: {
+    sources: ['(call_expression function: (identifier) @fn (#eq? @fn "taintedInput")) @source'],
+    sinks: ['(call_expression function: (identifier) @fn (#eq? @fn "sink")) @sink'],
+    sanitizers: ['(call_expression function: (identifier) @fn (#eq? @fn "sanitize")) @sanitizer'],
+  },
+  checkFlow(ctx, path) {},
+})
