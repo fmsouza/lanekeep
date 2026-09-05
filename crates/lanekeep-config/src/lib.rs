@@ -460,6 +460,15 @@ struct RawSuppressions {
 }
 
 #[derive(Debug, Deserialize)]
+// Four independent handler-presence flags — `has_check`, `has_reduce`, `has_check_flow`,
+// `has_check_obligation` — each a `typeof … === 'function'` probe recorded by `EXTRACT`, not a
+// state machine to fold into an enum. The dataflow family (#193 obligation + #194 flow) took the
+// count from three to four; `#[expect]` rather than `#[allow]` so this self-clears if a handler
+// is ever removed.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config-extraction DTO of independent handler-presence flags"
+)]
 struct RawRule {
     id: Option<String>,
     language: Option<RawLanguages>,
