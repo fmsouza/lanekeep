@@ -277,7 +277,8 @@ fn a_project_file_cannot_shadow_a_built_in() {
 
 // --- built-ins that ship as components -----------------------------------------------
 
-/// A built-in component, named exactly as `lanekeep init` scaffolds it.
+/// A built-in component, named by its bare specifier — the form that keeps its default
+/// options. (`lanekeep init` scaffolds the object form; the configured test below covers it.)
 ///
 /// **This is the only test that walks the whole chain in one process**: a `lanekeep.json` on
 /// disk, parsed and resolved in Rust, its component bytes taken from the embedded table, asked
