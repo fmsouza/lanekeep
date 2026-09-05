@@ -110,8 +110,20 @@ struct Def<'t> {
     /// The `variable_declarator` or `assignment_expression` — the step recorded for an alias
     /// hop.
     site: Node<'t>,
-    /// The value expression assigned.
+    /// The value expression assigned. For the parameter-origin definition (#217) this is the
+    /// parameter node itself — equal to `site` — which is what [`Def::is_parameter_origin`] tests.
     rhs: Node<'t>,
+}
+
+impl Def<'_> {
+    /// Whether this is the parameter-origin definition [`Taint::definitions_of`] seeds for a
+    /// `@source` captured on a parameter (#217). Its `rhs` *is* its `site` — the parameter node —
+    /// a shape no ordinary definition has (a declarator's `rhs` is its `value` child, an
+    /// assignment's its `right`). Such a def is the taint origin, not an alias hop, and lives at
+    /// the function's entry block rather than in a body block.
+    fn is_parameter_origin(&self) -> bool {
+        self.rhs.id() == self.site.id()
+    }
 }
 
 /// The immutable context for one sink's taint walk.
@@ -215,7 +227,10 @@ impl<'t> Taint<'_, 't> {
     /// direct value assignment as none. Shared by the strong ([`Self::reaching_defs`]) and weak
     /// ([`Self::weak_reaching_defs`]) definition walks.
     fn collect_def_facts(&self, def: Def<'t>, depth: u32, facts: &mut Vec<Fact<'t>>) {
-        let alias = def.rhs.kind() == "identifier";
+        // An alias hop is a def whose value is *another* binding (`b = a`, `s = a`): recorded as
+        // one step. The parameter-origin def (#217) is the origin, not a hop — its `rhs` is its
+        // own `site` — so it records no step, matching a tainted declarator read directly.
+        let alias = def.rhs.kind() == "identifier" && !def.is_parameter_origin();
         for mut fact in self.taint_of(def.rhs, depth.saturating_add(1)) {
             if alias {
                 fact.steps.push(def.site);
@@ -236,6 +251,22 @@ impl<'t> Taint<'_, 't> {
             defs.push(Def {
                 site: decl,
                 rhs: value,
+            });
+        }
+        // A parameter captured as a `@source` is tainted from function entry (#217): the
+        // callback-delivered secret `withSecret((sk) => …)`, the corpus's dominant pattern
+        // (docs/taint-calibration.md). A parameter has no declarator or assignment to seed from,
+        // so model it as a strong definition whose value is the parameter node itself — which
+        // `sources_within` recognizes as the captured source — positioned at the parameter,
+        // before every read in the body. `reaching_defs` maps it to the entry block, so a later
+        // reassignment or in-place sanitizer kills it exactly as it kills a tainted declarator
+        // (Stage 1 within a block, Stage 2's avoid-set across branches), and the parameter's own
+        // reassignments (below) still apply. Disjoint from the declarator branch: a node is never
+        // both a `variable_declarator` and a parameter.
+        if is_value_parameter(decl) && !self.sources_within(decl).is_empty() {
+            defs.push(Def {
+                site: decl,
+                rhs: decl,
             });
         }
         for assignment in self.assignments_to(decl) {
@@ -399,7 +430,21 @@ impl<'t> Taint<'_, 't> {
         // by position; the one subtlety this closes is a self-referential store like
         // `s = f(s)`, whose right-hand side *contains* the inner read of `s` — that read
         // sees the prior definition, and `rhs.end > use.start` correctly excludes this one.
-        let def_block = |def: &Def<'t>| self.cfg.and_then(|cfg| cfg.block_of(def.rhs));
+        // The parameter-origin def (#217) has no CFG block — the parameter sits in the function
+        // header, which `cfg_build` attributes to nothing — so map it to the entry block. That
+        // makes reaching-definitions treat it as a top-of-body definition: a cross-block
+        // sanitizer or reassignment on every path kills it via Stage 2's avoid-set, exactly as
+        // it kills a tainted declarator, rather than a block-less def bypassing the kill and
+        // being admitted on every path.
+        let def_block = |def: &Def<'t>| {
+            self.cfg.and_then(|cfg| {
+                if def.is_parameter_origin() {
+                    Some(cfg.entry())
+                } else {
+                    cfg.block_of(def.rhs)
+                }
+            })
+        };
         let precedes = |def: &Def<'t>| def.rhs.end_byte() <= use_pos;
 
         // Stage 1 — the nearest definition preceding the read inside its own block wins
@@ -525,6 +570,25 @@ fn base_identifier(node: Node<'_>) -> Option<Node<'_>> {
             _ => return None,
         }
     }
+}
+
+/// Whether `decl` is a value-parameter binding node — the declaration [`JsBindingResolver`] returns
+/// for a parameter use. In the TS/TSX grammar that is a `required_parameter`/`optional_parameter`
+/// (a bare `identifier` in plain JS) directly under a `formal_parameters` list, or the bare
+/// identifier of an unparenthesized arrow's `parameter` field. These are the only bindings seeded
+/// as tainted-from-entry when captured as a `@source` (#217). The check excludes a body-spanning
+/// binding such as a function name, whose declaration node would let `sources_within` mistake any
+/// source in the body for the binding itself; a parameter's node covers only the parameter.
+fn is_value_parameter(decl: Node<'_>) -> bool {
+    decl.parent().is_some_and(|parent| match parent.kind() {
+        "formal_parameters" => true,
+        // The singular `parameter` field of an unparenthesized arrow (`sk => …`). Guarding on the
+        // field id keeps the arrow *body* — also a child of `arrow_function` — from matching.
+        "arrow_function" => {
+            parent.child_by_field_name("parameter").map(|p| p.id()) == Some(decl.id())
+        }
+        _ => false,
+    })
 }
 
 /// Whether `block` sits on a cycle: control can return to it from one of its own successors.
@@ -1142,5 +1206,231 @@ mod tests {
         );
         assert_eq!(flows.len(), 1, "an augmented field write taints the object");
         assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    // --- #217: taint seeded at a source captured on a parameter binding --------------------
+    //
+    // A `@source` that lands on a callback *parameter* (`withSecret((sk) => …)`) must taint the
+    // parameter's uses in its own arrow/function body. The v1 analyzer seeded a source only at an
+    // *expression* node, so a capture on a parameter binding produced no tainted definition — the
+    // corpus's dominant secret pattern, a v1 false negative (#195, docs/taint-calibration.md).
+    //
+    // These mirror the #195 source queries 1a/1b: the captured node is the parameter *identifier*
+    // — inside `(required_parameter (identifier))` for a parenthesized param, or the bare
+    // `parameter` field of an unparenthesized arrow.
+
+    /// The binding identifier of an arrow's single parameter: the `parameter` field
+    /// (unparenthesized `sk => …`) or the first named child of `formal_parameters`, unwrapped
+    /// through a `required_parameter`/`optional_parameter` wrapper (parenthesized `(sk) => …`).
+    fn arrow_param_identifier(arrow: Node<'_>) -> Option<Node<'_>> {
+        if let Some(param) = arrow.child_by_field_name("parameter") {
+            return (param.kind() == "identifier").then_some(param);
+        }
+        let params = arrow.child_by_field_name("parameters")?;
+        let mut cursor = params.walk();
+        let first = params.children(&mut cursor).find(Node::is_named)?;
+        match first.kind() {
+            "identifier" => Some(first),
+            "required_parameter" | "optional_parameter" => {
+                let mut inner = first.walk();
+                first
+                    .children(&mut inner)
+                    .find(|c| c.kind() == "identifier")
+            }
+            _ => None,
+        }
+    }
+
+    /// The parameter identifier of the first arrow-function argument to each call named `wrapper`
+    /// — the #195 `withSecret`-family `@source` capture (queries 1a/1b).
+    fn callback_param_sources<'t>(tree: &'t Tree, source: &str, wrapper: &str) -> Vec<Node<'t>> {
+        calls_named(tree, source, wrapper)
+            .into_iter()
+            .filter_map(|call| {
+                let args = call.child_by_field_name("arguments")?;
+                let mut cursor = args.walk();
+                let arrow = args
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == "arrow_function")?;
+                arrow_param_identifier(arrow)
+            })
+            .collect()
+    }
+
+    /// Run the analyzer with the callback parameter of `wrapper` as the `@source`, `sink_name`'s
+    /// first argument as the `@sink`, and calls to `sanitizer_name` as sanitizers. The
+    /// non-empty-sources guard keeps a RED failure meaning "the analyzer did not seed the
+    /// parameter", never "the harness captured nothing".
+    fn run_param(
+        src: &str,
+        wrapper: &str,
+        sink_name: &str,
+        sanitizer_name: &str,
+    ) -> Vec<(String, String)> {
+        let tree = parse(src);
+        let sources = callback_param_sources(&tree, src, wrapper);
+        assert!(
+            !sources.is_empty(),
+            "no @source captured — test harness bug"
+        );
+        let sinks = sink_args(&tree, src, sink_name);
+        let sanitizers = calls_named(&tree, src, sanitizer_name);
+        JsFlowAnalyzer
+            .analyze(&tree, src, &sources, &sinks, &sanitizers)
+            .into_iter()
+            .map(|flow| {
+                (
+                    src[flow.source.byte_range()].to_owned(),
+                    src[flow.sink.byte_range()].to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_source_captured_on_a_parenthesized_parameter_reports() {
+        // Acceptance: `withSecret((sk) => { log(sk); })` — the parameter is the secret.
+        let flows = run_param(
+            "function _(){ withSecret((sk) => { log(sk); }); }",
+            "withSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "the captured parameter taints its use");
+        assert_eq!(flows[0].0, "sk");
+        assert_eq!(flows[0].1, "sk");
+    }
+
+    #[test]
+    fn a_source_captured_on_a_bare_arrow_parameter_reports() {
+        // Unparenthesized, expression body: `withSecret(sk => log(sk))` — the real corpus form.
+        let flows = run_param(
+            "function _(){ withSecret(sk => log(sk)); }",
+            "withSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].0, "sk");
+    }
+
+    #[test]
+    fn a_captured_parameter_through_one_assignment_reports() {
+        // Indirection: `const t = sk; log(t)` inside the callback body.
+        let flows = run_param(
+            "function _(){ withSecret((sk) => { const t = sk; log(t); }); }",
+            "withSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].0, "sk");
+    }
+
+    #[test]
+    fn a_captured_parameter_with_the_callback_first_reports() {
+        // The wrapper takes the callback as its first of several arguments.
+        let flows = run_param(
+            "function _(){ withSecret((sk) => { log(sk); }, id); }",
+            "withSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].0, "sk");
+    }
+
+    #[test]
+    fn a_captured_parameter_into_a_template_literal_sink_reports() {
+        // The #195 template sink query is `(template_substitution (_) @sink)`: the sink node is
+        // the interpolated expression `sk`, which `taint_of_identifier` handles — no
+        // `template_string` arm needed.
+        let src = "function _(){ withSecret((sk) => { log(`x${sk}`); }); }";
+        let tree = parse(src);
+        let sources = callback_param_sources(&tree, src, "withSecret");
+        assert!(
+            !sources.is_empty(),
+            "no @source captured — test harness bug"
+        );
+        let sinks: Vec<Node<'_>> = find_all(&tree, "template_substitution")
+            .into_iter()
+            .filter_map(|sub| sub.named_child(0))
+            .collect();
+        let sanitizers = calls_named(&tree, src, "redact");
+        let flows: Vec<_> = JsFlowAnalyzer
+            .analyze(&tree, src, &sources, &sinks, &sanitizers)
+            .into_iter()
+            .map(|flow| src[flow.source.byte_range()].to_owned())
+            .collect();
+        assert_eq!(
+            flows.len(),
+            1,
+            "the interpolated parameter taints the template sink"
+        );
+        assert_eq!(flows[0], "sk");
+    }
+
+    #[test]
+    fn a_captured_parameter_used_only_after_a_sanitizer_stays_silent() {
+        // Kill semantics still apply: `sk = redact(sk)` before the sink clobbers the entry taint,
+        // exactly as an in-place sanitizer kills a tainted declarator (Stage 1 within the block).
+        let flows = run_param(
+            "function _(){ withSecret((sk) => { sk = redact(sk); log(sk); }); }",
+            "withSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "an in-place sanitizer must kill the parameter taint"
+        );
+    }
+
+    #[test]
+    fn a_captured_parameter_sanitized_on_one_branch_still_reports() {
+        // Path-insensitive soundness: the branch-skipping path reaches the sink with the
+        // parameter still tainted, so a one-branch sanitize must not kill.
+        let flows = run_param(
+            "function _(c){ withSecret((sk) => { if (c) { sk = redact(sk); } log(sk); }); }",
+            "withSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "the branch-skipping path keeps the taint");
+        assert_eq!(flows[0].0, "sk");
+    }
+
+    #[test]
+    fn a_captured_parameter_sanitized_on_every_branch_stays_silent() {
+        // Cross-block kill parity with a tainted declarator (`sanitizing_both_branches_kills_taint`):
+        // every path from function entry to the sink passes a sanitizer, so the parameter's
+        // entry-origin taint is killed on every branch and nothing reports. Guards the entry-block
+        // attribution: without it the block-less parameter def bypasses the avoid-set kill.
+        let flows = run_param(
+            "function _(c){ withSecret((sk) => { if (c) { sk = redact(sk); } else { sk = redact(sk); } log(sk); }); }",
+            "withSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "a sanitizer on every branch must kill the parameter taint"
+        );
+    }
+
+    #[test]
+    fn a_captured_parameter_does_not_taint_an_unrelated_local() {
+        // Seeding is scoped to the parameter binding: a clean local read in the same callback
+        // must stay silent, or the fix would taint the whole function.
+        let flows = run_param(
+            "function _(){ withSecret((sk) => { const p = other(); log(p); }); }",
+            "withSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "a clean local must not be tainted by the parameter source"
+        );
     }
 }
