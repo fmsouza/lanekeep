@@ -10,8 +10,8 @@ snapshot rather than a working checkout.
 **This document has two parts.** Everything from here through the Appendix is the original
 #195 measurement, kept as the pre-#217 baseline — it found a dominant false negative and one
 fixable false positive that made a false-positive rate premature to publish. See **Re-run
-after #217 / #218 (#220)** at the end of this document for the re-measurement once both
-closed, and the B4 verdict it makes possible.
+after #217 / #218 (#220)** at the end of this document for a trustworthy re-measurement once
+both were closed, and the B4 verdict it makes possible.
 
 ## Reproduction
 
@@ -203,6 +203,12 @@ plus `hashPin`/`pbkdf2` (a PIN hash is not the secret).
                         "scrubLegacyPayloadSecrets" "describeBytes" "hashPin" "pbkdf2"))
 ```
 
+**Note, added by the #220 re-run below:** the sanitizer query above captures `@sanitizer` on the
+callee `(identifier)`, not on the enclosing `call_expression`. The analyzer's containment checks
+match against the whole call node, so a query captured this way never satisfies them — see
+**Re-run after #217 / #218 (#220)** for how this was found and fixed. Anyone re-deriving this
+query today should capture the whole `call_expression`, not just the identifier.
+
 Two shapes deviate from a naive draft and matter for anyone re-deriving them against
 `tree-sitter-typescript@0.23.2`: an unparenthesized single arrow parameter is
 `arrow_function parameter: (identifier)` (query 1b), while a parenthesized one is
@@ -273,8 +279,8 @@ All three findings sink at the same place, `extensions/keystore-chrome/src/keyst
 `key.privateKey` reads that feed `seed` (lines 107–109). This is the identical
 field-insensitivity shape #194's sensitivity table names, reported three times by the
 per-`(source, sink)` granularity #195 already flags as a reporting artifact: **one logical false
-positive, not three.** Verified by tracing the mechanism in `flow.rs` directly and by a
-controller spot-read of the site.
+positive, not three.** Verified by tracing the mechanism in `flow.rs` directly and by
+manual inspection of the site.
 
 | Class | #195 (`281fb79`) | #220 (this pull request) |
 |---|---|---|
@@ -291,14 +297,18 @@ a template string that calls `describeBytes(account.secretKey)` to build a `secr
 no longer reports. `describeBytes` is a `@sanitizer`; with the call-capture fix, both
 `is_member` (the sink itself is the sanitizer call) and `sanitizer_between` cut the flow. #218's
 fix is now actually reachable, and it works: confirmed absent from the run's JSON output and by
-a controller spot-read of the site.
+a manual check of the site.
 
 **The `withSecret` false negative is closed.** #195's dominant concern — that callback-delivered
-secrets were invisible to the analyzer — is fixed by #217. A deep verification pass enumerated
+secrets were invisible to the analyzer — is fixed by #217. An independent manual audit enumerated
 all 16 in-scope `withSecret` / `withBackup*` sites: 11 are captured by the source query (bare,
 parenthesized, and async arrow forms), and 5 are not (named-handler references and
 zero-parameter callbacks — a query-coverage gap, not an analyzer gap, and none of the 5 leak
-either). Every captured callback's secret is either consumed by crypto, derivation, or decoding,
+either). This 16-site count is not directly comparable to #195's 35-site tally — the two figures
+use different enumeration scopes, this one counting callback call sites within the calibration's
+include/exclude globs while #195's tally was broader — and the substantive point is that every
+in-scope callback-delivered secret is now seeded, with none reaching a sink. Every captured
+callback's secret is either consumed by crypto, derivation, or decoding,
 or only reaches a sink through an opaque call. Zero flows is the correct answer here, and #217's
 seeding is demonstrably live: a direct `bytes => logger.info(bytes)` now reports, proven by the
 `calibration_queries` `RuleTester` tests and by tracing the `flow.rs` mechanism directly.
