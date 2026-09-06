@@ -714,10 +714,10 @@ fn check_requires(
 /// compiles and matches nothing forever, which is the same silence every other refusal in
 /// this module exists to prevent: the rule loads, the flow analysis has one fewer source
 /// than the author wrote, and a run reporting less than it should looks exactly like a run
-/// reporting everything. A substring check is what v1 can afford; it does not catch a query
-/// that binds the capture under a predicate the query never actually reaches, only a query
-/// that could never have bound it at all — the same gap `requires` accepts for a capability
-/// a rule declares and simply never calls.
+/// reporting everything. The check is exact, on what the query's text binds
+/// ([`lanekeep_query::capture_sites`]): `@sinks` does not pass for `@sink`, and a name that
+/// appears only inside a predicate is a reference, not a binding. It was a substring test
+/// until the scanner existed, which is exactly the superstring gap.
 ///
 /// # Why an empty or absent `sources`/`sinks` is refused
 ///
@@ -791,7 +791,7 @@ fn parse_flow_role(
                 json_kind(entry),
             ));
         };
-        if !query.contains(capture) {
+        if !binds(query, capture) {
             return Err(format!(
                 "`{id}` has a `flow.{role}` query that never binds `{capture}` — a query in \
                  this role must capture what it names"
@@ -802,10 +802,21 @@ fn parse_flow_role(
     Ok(queries)
 }
 
-/// The field slots a call's callee occupies: `function:` on a call, `constructor:` on a `new`.
+/// Whether `query`'s text binds `capture` (written with its `@`) exactly, by name.
+fn binds(query: &str, capture: &str) -> bool {
+    let name = capture.trim_start_matches('@');
+    lanekeep_query::capture_sites(query)
+        .iter()
+        .any(|site| site.name == name)
+}
+
+/// The field slots a callee occupies, read off each shipped grammar's `node-types.json`:
+/// `function:` on `call_expression` in TypeScript, TSX, JavaScript, Go and Rust and on
+/// Python's `call`; `constructor:` on `new_expression` in TypeScript, TSX and JavaScript.
 ///
-/// The same two names across every grammar lanekeep ships — tree-sitter's TypeScript,
-/// JavaScript, Python, Go and Rust grammars all label a call's callee `function` — which is
+/// Two more kinds carry `function:` — TypeScript's `instantiation_expression` and Rust's
+/// `generic_function` — and a capture there is refused on the same terms, since each names a
+/// callee and neither contains an argument. That the labels are shared across grammars is
 /// what lets this be checked with no grammar in hand.
 const CALLEE_SLOTS: [&str; 2] = ["function", "constructor"];
 
@@ -2256,7 +2267,7 @@ fn check_obligation_role(
         ));
     }
     for query in queries {
-        if !query.contains(capture) {
+        if !binds(query, capture) {
             return Err(format!(
                 "`{id}` has an `obligation.{role}` query that never binds `{capture}` — a \
                  query in this role must capture what it names"
@@ -5971,6 +5982,23 @@ mod tests {
         assert!(text.contains("@acquire"), "{text}");
     }
 
+    /// `@acquires` contains `@acquire` and binds nothing the engine reads under that name; the
+    /// floor has to be an exact match on the bound capture, not a substring test.
+    #[test]
+    fn an_acquire_query_binding_a_longer_capture_name_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x) @acquires'], release: ['(y) @release'], scope: 'function' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-acquire-superstring", src).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
+        assert!(text.contains("@acquire"), "{text}");
+    }
+
     #[test]
     fn a_release_query_that_never_binds_its_capture_is_refused() {
         let src = "import { defineRule } from 'lanekeep';\n\
@@ -6431,6 +6459,29 @@ mod tests {
         assert!(err.contains("`test/f`"), "got: {err}");
         assert!(err.contains("@sink"), "got: {err}");
         assert!(err.contains("callee"), "got: {err}");
+    }
+
+    /// A capture that merely *contains* the role's name is not the role's capture: `@sinks`
+    /// binds nothing the engine reads as `@sink`, and a substring test would wave it through
+    /// into exactly the silence the floor exists to refuse.
+    #[test]
+    fn a_flow_query_binding_a_longer_capture_name_is_refused() {
+        let err = load_err(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: {
+            sources: ['(call_expression) @source'],
+            sinks: ['(arguments (identifier) @sinks)'],
+          },
+          checkFlow() {},
+        })
+    ",
+        );
+        assert!(err.contains("`test/f`"), "got: {err}");
+        assert!(err.contains("@sink"), "got: {err}");
+        assert!(err.contains("never binds"), "got: {err}");
     }
 
     /// The boundary of the refusal, pinned so it cannot creep: a `@source` on the callee is

@@ -505,18 +505,19 @@ fn built_ins_are_reachable_without_a_lanekeep_directory() {
 
 // --- #205: the doc and the rule tables have to name the same rules -----------------------
 
-/// Every `## \`lanekeep/<name>\`` heading in `docs/built-in-rules.md`, in the order they
-/// appear.
+/// Every rule heading in `docs/built-in-rules.md` — a level-two heading whose whole text is
+/// the backticked rule id — in the order they appear, as bare names.
 ///
-/// Deliberately naive: a heading is a line starting with `` ## `lanekeep/ `` and ending with
-/// a backtick, which is the exact shape every rule section in the file uses (checked against
-/// `## \`lanekeep/no-restricted-arguments\`` and its fifteen siblings). Nothing here parses
-/// Markdown in general — the file is data for this one purpose.
+/// Deliberately naive: a heading is a line that starts with two hashes, a space and a
+/// backticked `lanekeep/` prefix, and ends with the closing backtick — the exact shape every
+/// rule section in the file uses. Nothing here parses Markdown in general; the file is data
+/// for this one purpose, and a section written in any other shape shows up as "documented but
+/// not shipped" rather than being silently skipped.
 fn doc_headings(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| line.strip_prefix("## `lanekeep/"))
         .filter_map(|rest| rest.strip_suffix('`'))
-        .map(|name| name.to_string())
+        .map(str::to_owned)
         .collect()
 }
 
