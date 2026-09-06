@@ -49,7 +49,7 @@ export default defineRule({
       '(call_expression function: (identifier) @fn (#eq? @fn "log") arguments: (arguments (_) @sink))',
     ],
     sanitizers: [
-      '(call_expression function: (identifier) @sanitizer (#eq? @sanitizer "redact"))',
+      '(call_expression function: (identifier) @fn (#eq? @fn "redact")) @sanitizer',
     ],
   },
 

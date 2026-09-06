@@ -60,6 +60,35 @@ fn sanitizer_before_sink_is_silent() {
         .expect("`c`'s only definition is `redact(s)`, which is clean");
 }
 
+/// #4b — the source wrapped *directly* by the sanitizer inside the sink's own argument, with no
+/// intermediate variable: the rule's own flagship doc example
+/// (`crates/lanekeep-rules/rules/no-secret-in-string.ts`'s `log(redact(getSecret()))`, called
+/// "silent" there). Distinct from #4: that fixture routes the sanitized value through a
+/// reassignment, which an *unrelated* mechanism (v1 does not propagate taint through a call's own
+/// arguments into a reassignment) already silences regardless of whether `redact` is even
+/// recognized as a sanitizer. This fixture exercises the sanitizer capture itself, through the
+/// real query-capture pipeline (`crates/lanekeep-engine/src/lib.rs`'s `collect_captures`) rather
+/// than `flow.rs`'s own unit-test helper `calls_named`, which hand-builds whole-call sanitizer
+/// nodes and so never exercised whether a query naming `@sanitizer` on the callee identifier —
+/// the shape this rule shipped with — actually cuts a flow. It did not, until the sanitizer
+/// query was changed to capture the whole call (`(call_expression ...) @sanitizer`) instead.
+#[test]
+fn sanitizer_wrapping_the_source_directly_is_silent() {
+    tester()
+        .accepts("function f() { log(redact(getSecret())); }\n")
+        .expect("`redact(getSecret())` sanitizes its argument before it reaches the sink");
+}
+
+/// #4c — the same direct-wrap shape, inside a template substitution rather than a call argument.
+/// Mirrors the corpus shape #218 names as its motivating fix target
+/// (``secretKey=${describeBytes(account.secretKey)}`` at `migrateLegacyAccount.ts:81`).
+#[test]
+fn sanitizer_wrapping_the_source_in_a_template_is_silent() {
+    tester()
+        .accepts("function f() { log(`x=${redact(getSecret())}`); }\n")
+        .expect("the template substitution's only content is the sanitized call");
+}
+
 /// #5 — the same sanitizer, applied **after** the sink: flow-sensitivity means it does not
 /// retroactively clean the read that already happened.
 #[test]
