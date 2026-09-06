@@ -1,0 +1,18 @@
+{
+  "include": [
+    "apps/*/src/**/*.{ts,tsx}",
+    "packages/*/src/**/*.{ts,tsx}",
+    "extensions/*/src/**/*.{ts,tsx}"
+  ],
+  "exclude": [
+    "**/tools/**",
+    "**/conformance/**",
+    "**/__tests__/**",
+    "**/__mocks__/**",
+    "**/*.spec.{ts,tsx}",
+    "**/*.test.{ts,tsx}",
+    "**/*.stories.{ts,tsx}",
+    "**/*.setup.{ts,tsx}"
+  ],
+  "rules": ["./no-secret-in-string.calib.ts"]
+}
