@@ -648,6 +648,7 @@ test-scripts:
     @./scripts/test-shell-portability.sh
     @./scripts/test-workflows.sh
     @./scripts/test-release-config.sh
+    @./scripts/test-taint-calibration.sh
 
 # The Go code: formatting, vet, and tests. **Two modules, and the second one is the reason
 # this recipe is not one command.**
@@ -1010,6 +1011,14 @@ bench-js-component:
         crates/lanekeep-engine/benches/no-unwrap-entry.ts \
         target/bench/no-unwrap-js.wasm \
         --bundle-config crates/lanekeep-engine/benches/no-unwrap.rolldown.mjs
+
+# Re-run the #195 taint-analysis calibration against an external corpus checkout.
+#
+# NOT in `check`: it needs an external corpus (perawallet/pera-react-native, pinned to the
+# SHA in scripts/taint-calibration.sh) and a release binary. See docs/taint-calibration.md.
+taint-calibration corpus out="calibration-run.json":
+    cargo build --release -p lanekeep-cli
+    LANEKEEP_BIN=target/release/lanekeep ./scripts/taint-calibration.sh {{corpus}} {{out}}
 
 # Review pending insta snapshots interactively.
 snapshot:
