@@ -506,8 +506,10 @@ struct RawRule {
 /// [`RawSuppressions`]: a malformed value becomes a diagnostic naming the rule and the field
 /// rather than a deserialization error naming a line of generated JSON. Its shape is checked
 /// by [`check_obligation_shape`], called from `build_rule` before [`check_requires`]: that
-/// `checkObligation` agrees with its presence, that `requires` names `dataflow`, and that
-/// `scope` is `"function"` or `"block"`. See #193.
+/// `checkObligation` agrees with its presence, that `requires` names `dataflow`, that
+/// `acquire` and `release` are non-empty and each query binds the capture its role names, and
+/// that a `scope` written at all is `"function"` or `"block"`. An absent `scope` is refused
+/// by [`build_obligation`], where the value is consumed. See #193.
 #[derive(Debug, Deserialize)]
 struct RawObligation {
     #[serde(default)]
@@ -748,11 +750,8 @@ fn parse_flow(flow: &serde_json::Value, id: &RuleId) -> Result<FlowSpec, String>
         ));
     }
     let sanitizers = parse_flow_role(flow, "sanitizers", "@sanitizer", id)?;
-    for query in &sinks {
-        check_capture_slot(query, "sinks", "@sink", id)?;
-    }
     for query in &sanitizers {
-        check_capture_slot(query, "sanitizers", "@sanitizer", id)?;
+        check_sanitizer_slot(query, id)?;
     }
     Ok(FlowSpec {
         sources,
@@ -820,7 +819,7 @@ fn binds(query: &str, capture: &str) -> bool {
 /// what lets this be checked with no grammar in hand.
 const CALLEE_SLOTS: [&str; 2] = ["function", "constructor"];
 
-/// Refuse a `flow.sinks` or `flow.sanitizers` query that binds its capture in a callee slot.
+/// Refuse a `flow.sanitizers` query that binds `@sanitizer` in a callee slot.
 ///
 /// # Why this shape is refused rather than run
 ///
@@ -835,15 +834,20 @@ const CALLEE_SLOTS: [&str; 2] = ["function", "constructor"];
 /// report reads exactly like a rule whose sanitizers were never declared. The shipped
 /// `lanekeep/no-secret-in-string` carried this shape from the day it landed until #222.
 ///
-/// A `@sink` on the callee is the twin: a sink is *the value that must not arrive*, and the
-/// analyzer resolves an identifier sink by the definitions reaching it — so a sink bound to
-/// `log` in `log(x)` reports only when the binding `log` is itself tainted, which is never
-/// what that query was written to mean.
+/// # Why `@sink` on a callee is not refused, though it looks like the same mistake
 ///
-/// `@source` is deliberately not checked. A source is found by *containment in* the expression
-/// read at the sink (`sources_within`), and a callee identifier sits inside the call it names,
-/// so `(call_expression function: (identifier) @source (#eq? @source "getSecret"))` seeds
-/// exactly as the whole-call form does.
+/// The analyzer does not ignore it. A sink is resolved through `taint_of` whatever node it
+/// is, and for a callee identifier that is the callee's *binding*: `const h = getSecret();
+/// h()` reports at `h()` — "a tainted value is invoked" — and there is no other way to spell
+/// that rule. It is never what a `log(x)`-shaped query was written to mean, and a rule that
+/// wants the argument has to capture the argument, which `docs/built-in-rules.md` says where
+/// authors look. That is a judgment about intent, and a load-time refusal with no escape
+/// hatch is the wrong place to encode one.
+///
+/// `@source` is not checked for a stronger reason. A source is found by *containment in* the
+/// expression read at the sink (`sources_within`), and a callee identifier sits inside the
+/// call it names, so `(call_expression function: (identifier) @source (#eq? @source
+/// "getSecret"))` seeds exactly as the whole-call form does.
 ///
 /// # Why lexically, and why only the slot the capture's own pattern fills
 ///
@@ -851,15 +855,14 @@ const CALLEE_SLOTS: [&str; 2] = ["function", "constructor"];
 /// [`lanekeep_query::capture_sites`] reads it off the query's text — without a grammar, which
 /// is the only way to do it here, before any language has been chosen to compile against.
 /// The check looks at the field label on the pattern the capture decorates and nothing
-/// deeper: `@sink` on the `object:` of a member callee (`secret.toString()` as a sink on the
-/// receiver) is a working shape and stays accepted. A sanitizer bound *inside* a callee — on
-/// a member expression's receiver — is as inert as one bound on the callee and is not caught;
-/// this refuses the shape that shipped, not every shape that could.
-fn check_capture_slot(query: &str, role: &str, capture: &str, id: &RuleId) -> Result<(), String> {
-    let name = capture.trim_start_matches('@');
+/// deeper, and an alternation's branches count as filling its slot, as tree-sitter has it.
+/// A sanitizer bound *inside* a callee — on a member expression's receiver — is as inert as
+/// one bound on the callee and is not caught; this refuses the shape that shipped, not every
+/// shape that could.
+fn check_sanitizer_slot(query: &str, id: &RuleId) -> Result<(), String> {
     let Some(slot) = lanekeep_query::capture_sites(query)
         .into_iter()
-        .filter(|site| site.name == name)
+        .filter(|site| site.name == "sanitizer")
         .find_map(|site| {
             site.field
                 .filter(|field| CALLEE_SLOTS.contains(&field.as_str()))
@@ -867,24 +870,11 @@ fn check_capture_slot(query: &str, role: &str, capture: &str, id: &RuleId) -> Re
     else {
         return Ok(());
     };
-    let (consequence, remedy) = if role == "sanitizers" {
-        (
-            "can never contain the arguments it is meant to clean, so the sanitizer would \
-             never cut a flow",
-            "capture the whole call instead: `(call_expression function: (identifier) @fn \
-             (#eq? @fn \"redact\")) @sanitizer`",
-        )
-    } else {
-        (
-            "names the function being called, not a value arriving anywhere, so the sink \
-             would only ever report a tainted callee binding",
-            "capture the argument that must not arrive instead: `(call_expression function: \
-             (identifier) @fn (#eq? @fn \"log\") arguments: (arguments (_) @sink))`",
-        )
-    };
     Err(format!(
-        "`{id}` has a `flow.{role}` query binding `{capture}` to a callee — the `{slot}:` \
-         child of a call {consequence}; {remedy}"
+        "`{id}` has a `flow.sanitizers` query binding `@sanitizer` in a callee slot \
+         (`{slot}:`) — a callee can never contain the arguments it is meant to clean, so the \
+         sanitizer would never cut a flow; capture the whole call instead: `(call_expression \
+         function: (identifier) @fn (#eq? @fn \"redact\")) @sanitizer`"
     ))
 }
 
@@ -2257,13 +2247,8 @@ fn check_obligation_role(
 ) -> Result<(), String> {
     if queries.is_empty() {
         return Err(format!(
-            "`{id}` has an `obligation` with no `{role}` — with nothing to {}, \
-             `checkObligation` can never say anything true",
-            if role == "acquire" {
-                "acquire"
-            } else {
-                "release"
-            }
+            "`{id}` has an `obligation` with no `{role}` — with nothing to {role}, \
+             `checkObligation` can never say anything true"
         ));
     }
     for query in queries {
@@ -6438,12 +6423,15 @@ mod tests {
         assert!(err.contains("`constructor:`"), "got: {err}");
     }
 
-    /// The sink twin: a `@sink` on the callee names the function being called, not a value
-    /// arriving anywhere, so it reports only if the callee *binding* is itself tainted — never
-    /// what `log(x)` means.
+    /// The sink twin is *not* refused, and the reason is measured rather than assumed: a sink
+    /// is resolved through `taint_of` whatever node it is, so a `@sink` on a callee identifier
+    /// reports when the callee's *binding* is tainted — `const h = getSecret(); h()` — and no
+    /// other capture can express that rule. A `log(x)`-shaped rule has to capture the
+    /// argument, which `docs/built-in-rules.md` says where authors look; the loader does not
+    /// turn that judgment into an impossibility.
     #[test]
-    fn a_sink_bound_in_the_callee_slot_is_refused() {
-        let err = load_err(
+    fn a_sink_bound_in_the_callee_slot_loads() {
+        let spec = load_one(
             r"
         export default defineRule({
           id: 'test/f', severity: 'error', card: CARD,
@@ -6456,9 +6444,7 @@ mod tests {
         })
     ",
         );
-        assert!(err.contains("`test/f`"), "got: {err}");
-        assert!(err.contains("@sink"), "got: {err}");
-        assert!(err.contains("callee"), "got: {err}");
+        assert_eq!(spec.flow.expect("flow recorded").sinks.len(), 1);
     }
 
     /// A capture that merely *contains* the role's name is not the role's capture: `@sinks`

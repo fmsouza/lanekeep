@@ -451,9 +451,9 @@ fn the_reported_message_falls_back_with_no_reason() {
 // Same gap as `no-restricted-types`: every fixture above is a bare `.ts` source through
 // `tester`'s default extension, and neither `reports_at` nor `accepts` looks at severity.
 
-/// `.tsx` reaches the rule at all — pinned against `language: ['typescript']`, which parses a
-/// `.tsx` file with the TypeScript grammar and turns every JSX element into an `ERROR` node the
-/// query cannot match.
+/// `.tsx` reaches the rule at all — pinned against `language: ['typescript']`. A rule runs only
+/// on the languages it names, so dropping `'tsx'` parses nothing wrongly: the rule never sees the
+/// file, and the violation below goes unreported with nothing to say why.
 #[test]
 fn a_forbidden_argument_is_reported_inside_tsx() {
     RuleTester::configured_with_extension(
@@ -474,8 +474,10 @@ fn a_forbidden_argument_is_reported_inside_tsx() {
     );
 }
 
-/// The severity the engine reports at is `Error`, not the generic default `Warn` a mutation to
-/// `severity: 'warn'` would leave silently in place.
+/// The severity the engine reports at is `Error`, pinned against a declaration downgraded to
+/// `'warn'` or `'off'`. A *deleted* declaration is not covered: the loader's fallback is
+/// `Error` too (`unwrap_or(Severity::Error)` in `crates/lanekeep-config/src/lib.rs`), so only
+/// an explicit downgrade can change what this asserts.
 #[test]
 fn the_violation_severity_is_error() {
     let violations = tester(MONEY)

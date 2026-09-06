@@ -65,6 +65,19 @@ fn taint_reaches_a_sink_in_a_javascript_file() {
         .expect("the alias carries the secret to the sink");
 }
 
+/// `.jsx` parses under the same grammar, and a JSX expression container is an ordinary
+/// expression to the graph — held to by a flow that crosses one.
+#[test]
+fn taint_reaches_a_sink_inside_jsx() {
+    RuleTester::with_extension("jsx-flow", FLOW_RULE, "jsx")
+        .expect("builds")
+        .reports_at(
+            "function f() { const s = getSecret(); return <div>{log(s)}</div>; }\n",
+            &[(1, 56)],
+        )
+        .expect("the flow crosses a JSX expression container");
+}
+
 #[test]
 fn a_sanitizer_cuts_taint_in_a_javascript_file() {
     flow()

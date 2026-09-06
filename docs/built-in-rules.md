@@ -695,14 +695,17 @@ call between the two along that path.
 
 Which node each capture binds is part of the contract. A `@sanitizer` is the **whole call**,
 `(call_expression function: (identifier) @fn (#eq? @fn "redact")) @sanitizer`: the analysis
-cuts a flow only where the sanitizer node is the value the sink reads or contains the source,
-and a call is the only node that is both. A `@sink` is the **value that must not arrive** — the
-argument, here `(arguments (_) @sink)` — never the call around it. A `@source` may be the call
-or its callee identifier; either sits inside the expression the sink reads, which is how a
-source is found. The natural misspelling, `@sanitizer` or `@sink` on the callee identifier,
-compiles and matches and does nothing — this rule shipped with it, and its `log(redact(…))`
-example reported until #222 — so config load refuses a `@sanitizer` or `@sink` bound in a
-call's callee slot, naming the rule and the remedy.
+cuts a flow where the sanitizer node is the value the sink reads or contains the source, and
+the call is the node those two conditions were written around. A `@sink` is the **value that
+must not arrive** — the argument, here `(arguments (_) @sink)` — never the call around it. A
+`@source` may be the call or its callee identifier; either sits inside the expression the sink
+reads, which is how a source is found. The natural misspelling, `@sanitizer` on the callee
+identifier, compiles and matches and does nothing — this rule shipped with it, and its
+`log(redact(…))` example reported until #222 — so config load refuses a `@sanitizer` bound in
+a call's callee slot, naming the rule and the remedy. A `@sink` on the callee is not refused,
+because it means something: it reports when the callee's own binding is tainted
+(`const h = getSecret(); h()`) and is silent for `log(x)`, which is why a rule about the
+argument captures the argument.
 
 ### It runs under `--since` and `--staged`
 

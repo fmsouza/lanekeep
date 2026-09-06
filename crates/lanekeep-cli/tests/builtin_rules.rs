@@ -523,7 +523,7 @@ fn doc_headings(text: &str) -> Vec<String> {
 
 /// The set the doc claims to cover must equal the set the binary actually ships — in both
 /// directions. `lanekeep_rules::names()` is the union of `BUILT_IN_RULES` and
-/// `COMPONENT_RULES`, sorted (`crates/lanekeep-rules/src/lib.rs:81`, `:196`, `:319`): a rule in
+/// `COMPONENT_RULES`, sorted, from `crates/lanekeep-rules/src/lib.rs`: a rule in
 /// either table and undocumented ships silently unexplained, and a documented rule in neither
 /// table describes something nobody can configure.
 #[test]
@@ -547,7 +547,6 @@ fn every_documented_rule_matches_a_shipped_one_and_back() {
     );
 }
 
-#[cfg(test)]
 mod doc_headings_tests {
     use super::doc_headings;
 

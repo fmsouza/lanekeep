@@ -576,10 +576,12 @@ fn a_type_parameter_on_a_member_is_not_a_violation() {
 // through `tester`'s default extension, and `reports_at`/`accepts` never look at severity at
 // all. A mutation to either survives every test above and needs its own.
 
-/// `.tsx` reaches the rule at all — pinned against `language: ['typescript']`, which parses a
-/// `.tsx` file with the TypeScript grammar and turns every JSX element into an `ERROR` node the
-/// query cannot match. The fixture is a component whose body is otherwise the rule's own money
-/// example, so the only thing that could make it silent is the grammar mismatch.
+/// `.tsx` reaches the rule at all — pinned against `language: ['typescript']`. The grammar
+/// that parses a file is chosen by the file, and a rule runs only on the languages it names
+/// (`Prepared::for_language` in `crates/lanekeep-engine/src/lib.rs`), so dropping `'tsx'`
+/// parses nothing wrongly: the rule simply never sees a `.tsx` file, and a codebase with nothing
+/// to report is indistinguishable from one the rule never read. The fixture is a component
+/// whose body is otherwise the rule's own money example; the JSX in it is incidental.
 #[test]
 fn a_forbidden_primitive_is_reported_inside_tsx() {
     RuleTester::configured_with_extension(
@@ -597,8 +599,10 @@ fn a_forbidden_primitive_is_reported_inside_tsx() {
     .expect("`amount` is money and money is not a number, even inside a component");
 }
 
-/// The severity the engine reports at is `Error`, not the generic default `Warn` a mutation to
-/// `severity: 'warn'` would leave silently in place.
+/// The severity the engine reports at is `Error`, pinned against a declaration downgraded to
+/// `'warn'` or `'off'`. A *deleted* declaration is not covered: the loader's fallback is
+/// `Error` too (`unwrap_or(Severity::Error)` in `crates/lanekeep-config/src/lib.rs`), so only
+/// an explicit downgrade can change what this asserts.
 #[test]
 fn the_violation_severity_is_error() {
     let violations = tester(MONEY)

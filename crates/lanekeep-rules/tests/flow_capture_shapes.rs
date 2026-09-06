@@ -75,28 +75,36 @@ fn a_sanitizer_captured_on_the_callee_is_refused_before_anything_runs() {
     }
 }
 
-/// The sink twin of the same footgun.
+/// A rule whose `@sink` is the callee identifier of any call.
+const SINK_ON_THE_CALLEE_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/flow', requires: ['dataflow'], severity: 'error',\n\
+      flow: {\n\
+        sources: ['(call_expression function: (identifier) @fn (#eq? @fn \"getSecret\")) @source'],\n\
+        sinks: ['(call_expression function: (identifier) @sink)'],\n\
+      },\n\
+      card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+      checkFlow(ctx, path) { ctx.report(path.sink, 'invoked'); },\n\
+    });\n";
+
+/// The sink twin is *not* refused, because the analyzer honors it: a callee sink reports when
+/// the callee's binding is tainted, and no other capture can express that rule.
 #[test]
-fn a_sink_captured_on_the_callee_is_refused_before_anything_runs() {
-    let source = "import { defineRule } from 'lanekeep';\n\
-        export default defineRule({\n\
-          id: 'local/flow', requires: ['dataflow'], severity: 'error',\n\
-          flow: {\n\
-            sources: ['(call_expression function: (identifier) @fn (#eq? @fn \"getSecret\")) @source'],\n\
-            sinks: ['(call_expression function: (identifier) @sink (#eq? @sink \"log\"))'],\n\
-          },\n\
-          card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
-          checkFlow(ctx, path) { ctx.report(path.sink, 'reaches'); },\n\
-        });\n";
-    let tester = RuleTester::new("flow-sink-on-callee", source).expect("builds");
-    match tester.run("function f() { log(getSecret()); }\n") {
-        Err(TestError::Load(message)) => {
-            assert!(message.contains("local/flow"), "{message}");
-            assert!(message.contains("@sink"), "{message}");
-            assert!(message.contains("callee"), "{message}");
-        }
-        other => panic!("expected a load refusal, got {other:?}"),
-    }
+fn a_sink_captured_on_the_callee_reports_a_tainted_callee() {
+    RuleTester::new("flow-sink-on-callee", SINK_ON_THE_CALLEE_RULE)
+        .expect("builds")
+        .reports_at("function f() { const h = getSecret(); h(); }\n", &[(1, 39)])
+        .expect("`h`'s only definition is the secret, and `h()` invokes it");
+}
+
+/// …and it is silent for the ordinary call, which is what makes it the wrong spelling for a
+/// `log(x)` sink: the argument is the value that arrives, and a rule about that captures it.
+#[test]
+fn a_sink_captured_on_the_callee_is_silent_for_an_ordinary_call() {
+    RuleTester::new("flow-sink-on-callee-plain", SINK_ON_THE_CALLEE_RULE)
+        .expect("builds")
+        .accepts("function f() { log(getSecret()); }\n")
+        .expect("`log` is not tainted; its argument is, and nothing captures it");
 }
 
 /// The refusal's boundary: a `@source` on the callee is a working shape — the callee sits

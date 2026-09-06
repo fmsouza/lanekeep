@@ -31,7 +31,9 @@ pub struct CaptureSite {
 /// (`(c)* @x` binds `@x` to `(c)`); an alternation, an anonymous `"token"` and a wildcard `_`
 /// are patterns like any other; a `!field` negation and a `.` anchor label nothing.
 ///
-/// Total over any text: a malformed query yields whatever sites its text does bind, and
+/// Total over any text: a malformed query yields whatever sites its text does bind, nesting
+/// past a fixed depth (`MAX_DEPTH`, 512 levels) stops being attributed rather than
+/// overflowing the stack, and
 /// [`CompiledQuery::compile`](crate::CompiledQuery::compile) is where the syntax error is
 /// reported. This function's only obligation on the way there is to neither lose nor invent a
 /// site.
@@ -42,7 +44,7 @@ pub fn capture_sites(query: &str) -> Vec<CaptureSite> {
         pos: 0,
         sites: Vec::new(),
     };
-    scanner.sequence(None);
+    scanner.sequence(None, None, 0);
     scanner.sites
 }
 
@@ -57,13 +59,22 @@ struct Scanner<'a> {
 
 /// A byte that may appear in a node kind, a field name, a supertype path or a capture name.
 ///
-/// `.` is in the set for capture names like `@x.y`, and it is also the anchor token — which
+/// tree-sitter's own identifier scanner admits alphanumerics, `_`, `-` and `.`, classifying
+/// whole characters; this one reads bytes, so every non-ASCII byte is admitted too and a name
+/// like `@sinké` is read whole rather than cut at its first multi-byte character — cut, it
+/// would read as `sink` and refuse a legitimate query. `/` is added for a supertype path,
+/// which the real scanner handles outside the identifier. `.` is also the anchor token, which
 /// is why [`Scanner::sequence`] checks for an anchor before it reads an identifier. `?` and
-/// `!`, which tree-sitter's own identifier scanner admits, are left out so that `@x?` binds
-/// `x` and then reads `?` as the quantifier it was meant as.
+/// `!` are not identifier characters there either, and keeping them out here is what lets
+/// `@x?` bind `x` and then read `?` as the quantifier it was meant as.
 const fn is_ident(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/')
+    byte.is_ascii_alphanumeric() || byte >= 0x80 || matches!(byte, b'_' | b'-' | b'.' | b'/')
 }
+
+/// Nesting past this depth is no longer attributed: an opener is stepped over like any other
+/// byte, so pathological text degrades to unattributed sites rather than to a stack overflow.
+/// No query a compiler accepts comes anywhere near it.
+const MAX_DEPTH: usize = 512;
 
 impl Scanner<'_> {
     fn peek(&self) -> Option<u8> {
@@ -74,8 +85,11 @@ impl Scanner<'_> {
     ///
     /// A `field:` label is held until the next pattern at this level and handed to it; a
     /// pattern is a `(…)` group, a `[…]` alternation, a `"token"` or a bare `_`, and each
-    /// takes its trailing quantifiers and captures on its way out.
-    fn sequence(&mut self, close: Option<u8>) {
+    /// takes its trailing quantifiers and captures on its way out. `inherited` is the slot an
+    /// enclosing alternation fills: tree-sitter writes a field onto every branch of `[…]`, so
+    /// each pattern directly inside one is bound in that slot unless a label of its own says
+    /// otherwise. `depth` is how many openers are on the stack, against [`MAX_DEPTH`].
+    fn sequence(&mut self, close: Option<u8>, inherited: Option<&str>, depth: usize) {
         let mut pending_field: Option<String> = None;
         loop {
             self.skip_trivia();
@@ -91,10 +105,13 @@ impl Scanner<'_> {
                         return;
                     }
                 }
+                b'(' | b'[' if depth >= MAX_DEPTH => self.pos += 1,
                 b'(' => {
                     self.pos += 1;
                     self.skip_trivia();
-                    if self.peek() == Some(b'#') {
+                    // `(#…)`, and the legacy `(.…)` spelling, are predicates: the captures
+                    // they name are references, not bindings.
+                    if matches!(self.peek(), Some(b'#' | b'.')) {
                         self.skip_predicate();
                         continue;
                     }
@@ -102,17 +119,20 @@ impl Scanner<'_> {
                     // `((a) (b))`. The kind, when present, does not decide where a capture
                     // binds, so it is read and dropped.
                     self.ident();
-                    self.sequence(Some(b')'));
-                    self.trailing(pending_field.take().as_deref());
+                    self.sequence(Some(b')'), None, depth + 1);
+                    let field = Self::slot(&mut pending_field, inherited);
+                    self.trailing(field.as_deref());
                 }
                 b'[' => {
                     self.pos += 1;
-                    self.sequence(Some(b']'));
-                    self.trailing(pending_field.take().as_deref());
+                    let field = Self::slot(&mut pending_field, inherited);
+                    self.sequence(Some(b']'), field.as_deref(), depth + 1);
+                    self.trailing(field.as_deref());
                 }
                 b'"' => {
                     self.skip_string();
-                    self.trailing(pending_field.take().as_deref());
+                    let field = Self::slot(&mut pending_field, inherited);
+                    self.trailing(field.as_deref());
                 }
                 // An anchor, or a quantifier with no pattern to attach to. The anchor is
                 // checked before the identifier arm because `.` is an identifier byte too.
@@ -138,12 +158,19 @@ impl Scanner<'_> {
                     } else {
                         // A bare `_` wildcard — or, in malformed text, a bare word — stands
                         // as a pattern of its own.
-                        self.trailing(pending_field.take().as_deref());
+                        let field = Self::slot(&mut pending_field, inherited);
+                        self.trailing(field.as_deref());
                     }
                 }
                 _ => self.pos += 1,
             }
         }
+    }
+
+    /// The slot the pattern that just closed fills: its own pending label when one was
+    /// written, else the slot of the alternation it is a branch of.
+    fn slot(pending: &mut Option<String>, inherited: Option<&str>) -> Option<String> {
+        pending.take().or_else(|| inherited.map(str::to_owned))
     }
 
     /// Consume the quantifiers and captures that follow a pattern, binding each capture to
@@ -290,6 +317,51 @@ mod tests {
     #[test]
     fn an_alternation_in_a_slot_carries_the_field() {
         assert_eq!(sites("(a b: [(c) (d)] @x)"), vec![site("x", Some("b"))]);
+    }
+
+    /// tree-sitter writes a field onto every branch of an alternation, so a capture on a
+    /// branch is bound in the slot — `function: [(identifier) @s (member_expression) @s]` is
+    /// the callee-slot shape twice over.
+    #[test]
+    fn an_alternation_in_a_slot_labels_each_branch() {
+        assert_eq!(
+            sites("(a b: [(c) @x (d) @y] @z)"),
+            vec![
+                site("x", Some("b")),
+                site("y", Some("b")),
+                site("z", Some("b"))
+            ]
+        );
+        assert_eq!(sites("(a b: [[(c) @x]])"), vec![site("x", Some("b"))]);
+        // A capture nested inside a branch's own children is that child's, not the slot's.
+        assert_eq!(sites("(a b: [(c (e) @x)])"), vec![site("x", None)]);
+    }
+
+    /// The legacy `(.eq? …)` spelling is a predicate too — `query.c` opens a predicate on
+    /// either `(#` or `(.`.
+    #[test]
+    fn a_legacy_dot_predicate_is_not_a_binding_site() {
+        assert_eq!(
+            sites(r#"(a b: (c) @x (.eq? @x "y"))"#),
+            vec![site("x", Some("b"))]
+        );
+    }
+
+    /// A capture name is any run of identifier characters, ASCII or not; truncating at the
+    /// first non-ASCII byte would turn `@sinké` into `sink` and refuse a legitimate query.
+    #[test]
+    fn a_non_ascii_capture_name_is_read_whole() {
+        assert_eq!(sites("(a b: (c) @sinké)"), vec![site("sinké", Some("b"))]);
+    }
+
+    /// Nesting past the cap stops attributing slots instead of recursing, so no text can
+    /// overflow the stack on the way to the compiler's own syntax error.
+    #[test]
+    fn nesting_beyond_the_cap_does_not_recurse() {
+        let deep = "(".repeat(100_000);
+        assert_eq!(sites(&deep), Vec::new());
+        let deep_capture = format!("{}(x) @y{}", "(".repeat(100_000), ")".repeat(100_000));
+        assert_eq!(sites(&deep_capture), vec![site("y", None)]);
     }
 
     #[test]
