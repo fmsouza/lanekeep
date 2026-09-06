@@ -7,6 +7,12 @@ it is measured against a real corpus, and the number is published with the disci
 `AGENTS.md` demands: both SHAs, the machine, the exact queries, measured against an immutable
 snapshot rather than a working checkout.
 
+**This document has two parts.** Everything from here through the Appendix is the original
+#195 measurement, kept as the pre-#217 baseline — it found a dominant false negative and one
+fixable false positive that made a false-positive rate premature to publish. See **Re-run
+after #217 / #218 (#220)** at the end of this document for the re-measurement once both
+closed, and the B4 verdict it makes possible.
+
 ## Reproduction
 
 | | |
@@ -222,3 +228,122 @@ arrows, expression and block bodies, one-assignment indirection, template-litera
 wrapper taking the callback first) plus two controls (a direct-return accessor and a
 property-read) in a single fixture; the source queries captured the parameter in all six
 (a diagnostic gate rule reported seven captures) while the flow rule reported neither.
+
+## Re-run after #217 / #218 (#220)
+
+#217 (parameter-origin seeding) and #218 (the compound-sink sanitizer fix) close the two
+correctness gaps #195 identified. This section re-runs the same calibration at a new pinned
+pair and answers the B4 question the original run could not decide.
+
+### Reproduction
+
+| | |
+|---|---|
+| Corpus | `perawallet/pera-react-native` @ **`3b17bb2ed15e4fcd113b962b2ab26e2347b22dcd`** — unchanged from #195 |
+| lanekeep | this pull request — taint-analysis code frozen at **`75af559`** (the sanitizer-capture fix, below), calibration harness at **`e2fda4f`**; branch `claude/lanekeep-issue-220-19638d` at measurement time. `lanekeep 0.8.1`, `HOST_API_VERSION=5` — same binary version and host API as #195's **`281fb79`** |
+| Toolchain | `rustc 1.95.0`, pinned by `rust-toolchain.toml` — unchanged |
+| Machine | Apple M3 Max, 14 cores, macOS 26.6.2 (Darwin 25.6.0, arm64) — same machine class as #195 |
+| Date | 2026-09-06 |
+| Scope | same include globs as the Appendix above (`apps/*/src`, `packages/*/src`, `extensions/*/src`); excludes reconstructed from #195's prose Scope row. 3,984 files parsed, 0 aborts (#195: 3,985 — a one-file difference, immaterial to scope) |
+| Run | `just taint-calibration <corpus>` → `lanekeep check <snapshot> --no-cache --format json`. lanekeep's own check wall-clock: **0.39–0.43 s** (#195: **0.47 s**). Harness total about 2 s, including a `git archive` + `tar` extract of 5,562 files |
+
+### What changed since #195
+
+Two things changed, not one. **lanekeep itself** moved from `281fb79` to this pull request,
+which includes #217 (seed taint at a source captured on a parameter binding) and #218 (honor a
+sanitizer wrapping a source in a compound sink). **The sanitizer query also changed** — from
+capturing `@sanitizer` on the callee identifier to capturing the whole call expression — and
+that second change is not cosmetic.
+
+#195's own sanitizer query (reproduced in the Appendix above), and the shipped
+`lanekeep/no-secret-in-string` rule that used the identical idiom, captured `@sanitizer` on the
+bare `(identifier)` node. But the analyzer's `is_member` and `sanitizer_between` checks match
+against the enclosing `call_expression`, never against the identifier inside it. So #218's
+compound-sink fix was a no-op through #195's own query: the fix landed in the analyzer, but
+nothing in the query shape let it fire. This pull request corrects the query to capture the
+whole call — `(call_expression function:(identifier) @fn (#any-of? @fn …)) @sanitizer` — in
+both the calibration rule and the shipped `lanekeep/no-secret-in-string` rule, which carried the
+same latent bug: its documented-as-silent example, `log(redact(getSecret()))`, actually reported
+before this fix.
+
+### Result: 3 findings, 0 true positives
+
+All three findings sink at the same place, `extensions/keystore-chrome/src/keystore/sign.ts:112`
+— the `${seed.length}` template substitution described above — with sources at the three
+`key.privateKey` reads that feed `seed` (lines 107–109). This is the identical
+field-insensitivity shape #194's sensitivity table names, reported three times by the
+per-`(source, sink)` granularity #195 already flags as a reporting artifact: **one logical false
+positive, not three.** Verified by tracing the mechanism in `flow.rs` directly and by a
+controller spot-read of the site.
+
+| Class | #195 (`281fb79`) | #220 (this pull request) |
+|---|---|---|
+| True positive | 0 | 0 |
+| FP — field-insensitivity | 3 | 3 (= 1 logical site) |
+| FP — path-insensitivity | 0 | 0 |
+| FP — other (compound-sink sanitizer bypass) | 1 | **0 — fixed** |
+| False negative — parameter-origin (`withSecret`) | ≥35 sites invisible | **closed** (16 in-scope sites now seeded; 0 leak) |
+
+### Two headline changes vs #195
+
+**The compound-sink FP is gone.** #195's FP #4 — `packages/migrate/src/migrate/migrateLegacyAccount.ts:81`,
+a template string that calls `describeBytes(account.secretKey)` to build a `secretKey=` field —
+no longer reports. `describeBytes` is a `@sanitizer`; with the call-capture fix, both
+`is_member` (the sink itself is the sanitizer call) and `sanitizer_between` cut the flow. #218's
+fix is now actually reachable, and it works: confirmed absent from the run's JSON output and by
+a controller spot-read of the site.
+
+**The `withSecret` false negative is closed.** #195's dominant concern — that callback-delivered
+secrets were invisible to the analyzer — is fixed by #217. A deep verification pass enumerated
+all 16 in-scope `withSecret` / `withBackup*` sites: 11 are captured by the source query (bare,
+parenthesized, and async arrow forms), and 5 are not (named-handler references and
+zero-parameter callbacks — a query-coverage gap, not an analyzer gap, and none of the 5 leak
+either). Every captured callback's secret is either consumed by crypto, derivation, or decoding,
+or only reaches a sink through an opaque call. Zero flows is the correct answer here, and #217's
+seeding is demonstrably live: a direct `bytes => logger.info(bytes)` now reports, proven by the
+`calibration_queries` `RuleTester` tests and by tracing the `flow.rs` mechanism directly.
+
+Two of the 16 sites need an honest caveat, and it is deliberately not phrased as "used safely":
+`packages/card/src/api/transport/baanx-client.ts:82` builds an Authorization header from
+`textDecoder.decode(bytes)` inside a template string, and `packages/card/src/session/session.ts:91`
+assigns `textDecoder.decode(bytes)` directly to a `refreshToken` field for a token-refresh
+request. Both are legitimate destinations for the secret, not leaks. They stay invisible to the
+analyzer only because `textDecoder.decode(...)` is an opaque call — the analyzer does not model
+what a called function does with its argument, which is an intra-procedural limitation, not a
+#217 shortfall. So there is no false assurance about a real leak at these two sites, but the
+reason they are silent is the opaque-call boundary, not "safe by construction."
+
+### Perf
+
+Still not a concern. lanekeep's own check wall-clock is **0.39–0.43 s** across runs on 3,984
+files, statistically the same as #195's **0.47 s** on 3,985.
+
+### B4 verdict
+
+**B4 is now decidable, and it is field sensitivity.** With both of #195's confounders removed —
+the false negative closed by #217, the compound-sink FP fixed by #218 — the residual false
+positives are trustworthy, and 100% of them are field-insensitivity: the "a property of a secret
+that is not itself the secret" shape #194's sensitivity table already names, here `.length`, and
+by extension `.byteLength`, a checksum, or similar. This confirms #195's hypothesis rather than
+merely repeating it.
+
+The sample-size caveat from #195 still applies, in a narrower form: the absolute count is one
+field-insensitivity site (reported three times by the per-`(source, sink)` granularity), so a
+published false-positive *rate* remains statistically meaningless — the decision rests on the
+qualitative pattern, not on a large sample. Path- or branch-sensitivity is not indicated (0
+path-insensitivity FPs, same as #195), and cross-function summaries are not indicated either: the
+flows are intra-function, #217 fixed seeding rather than composition, and no finding here argues
+for summary machinery.
+
+### Harness and follow-ups
+
+The calibration harness is now committed (`just taint-calibration`, `scripts/calibration/`,
+`scripts/taint-calibration.sh`), so this re-run — and any future one — is a repeatable command
+rather than the manual procedure #195 documented.
+
+One footgun remains open as a follow-up, not fixed here: nothing validates that a `@sanitizer`
+capture is bound to a whole call rather than to an identifier inside it, so a rule can write the
+identifier-capture idiom and have its sanitizer silently do nothing — exactly the bug this pull
+request fixes in the calibration rule and in `no-secret-in-string`. The engine test fixture
+`crates/lanekeep-engine/src/lib.rs:5653` (`SECRET_FLOW_RULE`, a documented "copy-me" example)
+still uses the identifier-capture idiom and is inert today.
