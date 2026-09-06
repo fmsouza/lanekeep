@@ -83,5 +83,35 @@ if CALIB_CORPUS_SHA="$corpus_sha" LANEKEEP_BIN="$work/nonexistent" "$HARNESS" "$
 # 6. missing corpus directory → non-zero.
 if LANEKEEP_BIN="$stub" "$HARNESS" "$work/nodir" "$out" >/dev/null 2>&1; then no "missing corpus should fail"; else ok; fi
 
+# 7. lanekeep exits 1 when it finds violations (linter convention: 0 clean, 1 has
+#    error-severity violations, 2 run aborted/limit breach — lanekeep_report::exit_code).
+#    The harness runs the check as `json="$(lanekeep ...)"` under `set -euo pipefail`, so an
+#    unguarded command substitution aborts the whole script the instant a real run has any
+#    findings, with no output at all. The stub above always exits 0, which is exactly why
+#    this case did not exist before. Findings are the expected case here: the harness must
+#    still exit 0 and write the payload.
+stub1="$work/lanekeep1"
+cat > "$stub1" <<'EOF'
+#!/usr/bin/env bash
+cat <<'JSON'
+{ "version": 1, "ok": false, "total": 1, "files_discovered": 5, "files_parsed": 5, "warn_only": false, "violations": [{"ruleId": "x", "file": "a.ts", "line": 1, "column": 1, "message": "m", "severity": "error"}] }
+JSON
+exit 1
+EOF
+chmod +x "$stub1"
+out1="$work/out1.json"
+if CALIB_CORPUS_SHA="$corpus_sha" LANEKEEP_BIN="$stub1" "$HARNESS" "$corpus" "$out1" >/dev/null 2>&1; then ok; else no "findings (exit 1) should still exit 0"; fi
+grep -q '"files_parsed": 5' "$out1" 2>/dev/null && ok || no "out.json should carry the findings payload"
+
+# 8. lanekeep exits 2 (run aborted / limit breach) → non-zero, never swallowed as a finding.
+stub2="$work/lanekeep2"
+cat > "$stub2" <<'EOF'
+#!/usr/bin/env bash
+echo "run aborted: timeout" >&2
+exit 2
+EOF
+chmod +x "$stub2"
+if CALIB_CORPUS_SHA="$corpus_sha" LANEKEEP_BIN="$stub2" "$HARNESS" "$corpus" "$out" >/dev/null 2>&1; then no "abort (exit 2) should fail"; else ok; fi
+
 printf 'taint-calibration: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

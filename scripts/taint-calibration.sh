@@ -60,7 +60,14 @@ git_ -C "$corpus" archive "$CORPUS_SHA" | tar -x -C "$snapshot"
 # Both must sit at the check root: rule-module resolution is confined to it.
 cp "$calib_dir/lanekeep.json" "$calib_dir/no-secret-in-string.calib.ts" "$snapshot/"
 
-json="$("$LANEKEEP_BIN" check "$snapshot" --no-cache --format json)"
+# lanekeep exits 0 (clean), 1 (violations found), or 2 (run aborted / limit breach).
+# Findings are the expected case here — only an abort is a harness failure.
+rc=0
+json="$("$LANEKEEP_BIN" check "$snapshot" --no-cache --format json)" || rc=$?
+if [ "$rc" -ge 2 ]; then
+    echo "error: lanekeep exited $rc — a run abort or limit breach, not findings" >&2
+    exit "$rc"
+fi
 
 # Pull files_parsed out of the payload without a JSON tool (bash only). The field name is
 # stable; the value is the digits immediately after it, whether pretty-printed or compact.
