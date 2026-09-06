@@ -748,6 +748,12 @@ fn parse_flow(flow: &serde_json::Value, id: &RuleId) -> Result<FlowSpec, String>
         ));
     }
     let sanitizers = parse_flow_role(flow, "sanitizers", "@sanitizer", id)?;
+    for query in &sinks {
+        check_capture_slot(query, "sinks", "@sink", id)?;
+    }
+    for query in &sanitizers {
+        check_capture_slot(query, "sanitizers", "@sanitizer", id)?;
+    }
     Ok(FlowSpec {
         sources,
         sinks,
@@ -794,6 +800,81 @@ fn parse_flow_role(
         queries.push(query.to_owned());
     }
     Ok(queries)
+}
+
+/// The field slots a call's callee occupies: `function:` on a call, `constructor:` on a `new`.
+///
+/// The same two names across every grammar lanekeep ships — tree-sitter's TypeScript,
+/// JavaScript, Python, Go and Rust grammars all label a call's callee `function` — which is
+/// what lets this be checked with no grammar in hand.
+const CALLEE_SLOTS: [&str; 2] = ["function", "constructor"];
+
+/// Refuse a `flow.sinks` or `flow.sanitizers` query that binds its capture in a callee slot.
+///
+/// # Why this shape is refused rather than run
+///
+/// `(call_expression function: (identifier) @sanitizer (#eq? @sanitizer "redact"))` is the
+/// natural way to write "calls to `redact` sanitize", it compiles, and it matches — and the
+/// sanitizer never cuts anything (#222, #223). The analyzer
+/// (`crates/lanekeep-lang-js/src/flow.rs`) cuts a flow in two ways, and a callee satisfies
+/// neither: `is_member` asks whether the expression read at the sink *is* the sanitizer node,
+/// and `sanitizer_between` asks whether the sanitizer node *contains* the source and is
+/// contained by that expression. A call's callee is neither the value the call produces nor a
+/// container of the call's arguments, so a sanitizer bound there is inert, and the rule's
+/// report reads exactly like a rule whose sanitizers were never declared. The shipped
+/// `lanekeep/no-secret-in-string` carried this shape from the day it landed until #222.
+///
+/// A `@sink` on the callee is the twin: a sink is *the value that must not arrive*, and the
+/// analyzer resolves an identifier sink by the definitions reaching it — so a sink bound to
+/// `log` in `log(x)` reports only when the binding `log` is itself tainted, which is never
+/// what that query was written to mean.
+///
+/// `@source` is deliberately not checked. A source is found by *containment in* the expression
+/// read at the sink (`sources_within`), and a callee identifier sits inside the call it names,
+/// so `(call_expression function: (identifier) @source (#eq? @source "getSecret"))` seeds
+/// exactly as the whole-call form does.
+///
+/// # Why lexically, and why only the slot the capture's own pattern fills
+///
+/// Neither this crate nor tree-sitter's `Query` can ask which node a capture binds, so
+/// [`lanekeep_query::capture_sites`] reads it off the query's text — without a grammar, which
+/// is the only way to do it here, before any language has been chosen to compile against.
+/// The check looks at the field label on the pattern the capture decorates and nothing
+/// deeper: `@sink` on the `object:` of a member callee (`secret.toString()` as a sink on the
+/// receiver) is a working shape and stays accepted. A sanitizer bound *inside* a callee — on
+/// a member expression's receiver — is as inert as one bound on the callee and is not caught;
+/// this refuses the shape that shipped, not every shape that could.
+fn check_capture_slot(query: &str, role: &str, capture: &str, id: &RuleId) -> Result<(), String> {
+    let name = capture.trim_start_matches('@');
+    let Some(slot) = lanekeep_query::capture_sites(query)
+        .into_iter()
+        .filter(|site| site.name == name)
+        .find_map(|site| {
+            site.field
+                .filter(|field| CALLEE_SLOTS.contains(&field.as_str()))
+        })
+    else {
+        return Ok(());
+    };
+    let (consequence, remedy) = if role == "sanitizers" {
+        (
+            "can never contain the arguments it is meant to clean, so the sanitizer would \
+             never cut a flow",
+            "capture the whole call instead: `(call_expression function: (identifier) @fn \
+             (#eq? @fn \"redact\")) @sanitizer`",
+        )
+    } else {
+        (
+            "names the function being called, not a value arriving anywhere, so the sink \
+             would only ever report a tainted callee binding",
+            "capture the argument that must not arrive instead: `(call_expression function: \
+             (identifier) @fn (#eq? @fn \"log\") arguments: (arguments (_) @sink))`",
+        )
+    };
+    Err(format!(
+        "`{id}` has a `flow.{role}` query binding `{capture}` to a callee — the `{slot}:` \
+         child of a call {consequence}; {remedy}"
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2095,10 +2176,18 @@ fn has_dataflow(requires: &serde_json::Value) -> bool {
 
 /// Refuse a rule whose `obligation`/`checkObligation` pair does not hang together.
 ///
-/// Three mistakes, in the order they are found: `obligation` declared with no
-/// `checkObligation` to fire it, `checkObligation` declared with no `obligation` to drive it,
-/// and — once both are present — an `obligation` not paired with `requires: ['dataflow']` or
-/// carrying a `scope` other than `"function"` or `"block"`.
+/// In the order they are found: `obligation` declared with no `checkObligation` to fire it,
+/// `checkObligation` declared with no `obligation` to drive it, and — once both are present —
+/// an `obligation` not paired with `requires: ['dataflow']`, an `acquire` or `release` role
+/// that is empty or holds a query never binding the capture its role names, or a `scope`
+/// other than `"function"` or `"block"`. An *absent* `scope` is [`build_obligation`]'s to
+/// refuse, where the value is consumed.
+///
+/// The role floors are `parse_flow`'s, restated: an empty `acquire` has nothing to be
+/// obligated and an empty `release` nothing to discharge it, so `checkObligation` is either
+/// never called or called for every acquire, and a query without its `@acquire`/`@release`
+/// compiles and matches nothing forever. Each is a rule that loads and silently says less than
+/// its author wrote.
 ///
 /// Takes the individual fields rather than `&RawRule`, on the same terms as
 /// [`check_requires`]: by the time this runs, `build_rule` has already moved `raw.id` out to
@@ -2128,6 +2217,10 @@ fn check_obligation_shape(
                      the capability must be visible in the rule's header"
                 ));
             }
+            if let Some(obligation) = obligation {
+                check_obligation_role(&obligation.acquire, "acquire", "@acquire", id)?;
+                check_obligation_role(&obligation.release, "release", "@release", id)?;
+            }
             match obligation.and_then(|o| o.scope.as_deref()) {
                 Some(scope) if scope != "function" && scope != "block" => Err(format!(
                     "`{id}` has an obligation `scope` of `{scope}` — it must be \
@@ -2138,6 +2231,39 @@ fn check_obligation_shape(
         }
         (false, false) => Ok(()),
     }
+}
+
+/// One `obligation` role: non-empty, every query binding the capture the role names.
+///
+/// `RawObligation` deserializes an absent role as an empty `Vec`, so absence and emptiness
+/// arrive here indistinguishable and are refused with one message — exactly as `parse_flow`
+/// treats a `sources` or `sinks` that is missing or `[]`.
+fn check_obligation_role(
+    queries: &[String],
+    role: &str,
+    capture: &str,
+    id: &RuleId,
+) -> Result<(), String> {
+    if queries.is_empty() {
+        return Err(format!(
+            "`{id}` has an `obligation` with no `{role}` — with nothing to {}, \
+             `checkObligation` can never say anything true",
+            if role == "acquire" {
+                "acquire"
+            } else {
+                "release"
+            }
+        ));
+    }
+    for query in queries {
+        if !query.contains(capture) {
+            return Err(format!(
+                "`{id}` has an `obligation.{role}` query that never binds `{capture}` — a \
+                 query in this role must capture what it names"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[expect(
@@ -2286,6 +2412,7 @@ fn build_rule(
         &id,
         fail,
     )?;
+    let obligation = build_obligation(raw.obligation, &id).map_err(fail)?;
 
     Ok(RuleSpec {
         index: position - 1,
@@ -2302,7 +2429,7 @@ fn build_rule(
         flow,
         component,
         requires,
-        obligation: build_obligation(raw.obligation),
+        obligation,
     })
 }
 
@@ -2361,16 +2488,31 @@ fn build_queries(
 
 /// Translate a rule's raw `obligation`, if it declared one, into the config's `ObligationSpec`.
 ///
-/// The shape is validated before this ever runs: `build_rule` refuses an
-/// `obligation`/`checkObligation` mismatch, a missing `requires: ['dataflow']` and an unknown
-/// `scope`, all ahead of `check_requires`. So an invalid `scope` never reaches here — only an
-/// absent one can, and `"function"` is its default.
-fn build_obligation(raw: Option<RawObligation>) -> Option<ObligationSpec> {
-    raw.map(|o| ObligationSpec {
-        acquire: o.acquire,
-        release: o.release,
-        scope: o.scope.unwrap_or_else(|| "function".to_owned()),
+/// Most of the shape is validated before this ever runs: `build_rule` refuses an
+/// `obligation`/`checkObligation` mismatch, a missing `requires: ['dataflow']`, an empty or
+/// capture-less role and an unknown `scope`, all ahead of `check_requires`. So an invalid
+/// `scope` never reaches here — only an absent one can, and that is refused here rather than
+/// defaulted: `ObligationSpec.scope` is required in `packages/lanekeep/index.d.ts`, and a
+/// module that omits it anyway is either not type-checked or generated, neither of which
+/// makes silently choosing `'function'` on its behalf the right answer. The loader says the
+/// same thing the declared type does.
+fn build_obligation(
+    raw: Option<RawObligation>,
+    id: &RuleId,
+) -> Result<Option<ObligationSpec>, String> {
+    raw.map(|o| {
+        let Some(scope) = o.scope else {
+            return Err(format!(
+                "`{id}` has an `obligation` with no `scope` — it must be `function` or `block`"
+            ));
+        };
+        Ok(ObligationSpec {
+            acquire: o.acquire,
+            release: o.release,
+            scope,
+        })
     })
+    .transpose()
 }
 
 /// Hash the code every rule in this run is made of: modules the loader read, and components.
@@ -5694,10 +5836,11 @@ mod tests {
     ///
     /// Calls `build_obligation` directly, the function `build_rule` calls once the shape has
     /// already passed, rather than reusing `an_obligation_spec_is_extracted_onto_the_rule`'s
-    /// full `Fixture::load_config()` above: that fixture's `scope` is `"function"`, which is
-    /// also `build_obligation`'s fallback for an absent one, so it cannot tell a correctly
-    /// wired field from one silently defaulted. This one declares `"block"` instead, so a
-    /// build that ignores the declared value cannot pass by accident.
+    /// full `Fixture::load_config()` above: that fixture's `scope` is `"function"`, the value
+    /// `docs/obligation-rules.md` treats as the ordinary one, so it cannot tell a correctly
+    /// wired field from one a build had quietly substituted — which `build_obligation` did
+    /// for an absent `scope` until it started refusing one. This one declares `"block"`
+    /// instead, so a build that ignores the declared value cannot pass by accident.
     #[test]
     fn an_obligation_specs_fields_reach_the_rule_spec() {
         let raw = RawObligation {
@@ -5705,7 +5848,9 @@ mod tests {
             release: vec!["(call_expression) @release".to_owned()],
             scope: Some("block".to_owned()),
         };
-        let obligation = build_obligation(Some(raw)).expect("`Some` in, `Some` out");
+        let obligation = build_obligation(Some(raw), &"local/x".parse().expect("valid id"))
+            .expect("a declared scope is accepted")
+            .expect("`Some` in, `Some` out");
         assert_eq!(
             obligation.acquire,
             vec!["(call_expression) @acquire".to_owned()]
@@ -5801,6 +5946,94 @@ mod tests {
             });\n";
         let err = load_rule_source("ob-bad-scope", src).expect_err("bad scope");
         let text = err.to_string();
+        assert!(text.contains("scope"), "{text}");
+        assert!(
+            text.contains("function") && text.contains("block"),
+            "{text}"
+        );
+    }
+
+    /// An `acquire` query that never binds `@acquire` would compile and match nothing forever,
+    /// which is the silence `parse_flow_role` already refuses for a flow role — an obligation
+    /// role gets the same floor.
+    #[test]
+    fn an_acquire_query_that_never_binds_its_capture_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x) @grab'], release: ['(y) @release'], scope: 'function' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-acquire-capture", src).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
+        assert!(text.contains("@acquire"), "{text}");
+    }
+
+    #[test]
+    fn a_release_query_that_never_binds_its_capture_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x) @acquire'], release: ['(y) @drop'], scope: 'function' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-release-capture", src).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
+        assert!(text.contains("@release"), "{text}");
+    }
+
+    /// With no `acquire` there is nothing to be obligated, so `checkObligation` can never be
+    /// called — the same silent no-op an empty `flow.sources` is refused for.
+    #[test]
+    fn an_obligation_with_no_acquire_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: [], release: ['(y) @release'], scope: 'function' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-no-acquire", src).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
+        assert!(text.contains("acquire"), "{text}");
+    }
+
+    /// Absent, not merely empty: the two spellings reach the same refusal.
+    #[test]
+    fn an_obligation_with_no_release_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x) @acquire'], scope: 'function' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-no-release", src).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
+        assert!(text.contains("release"), "{text}");
+    }
+
+    /// `ObligationSpec.scope` is required in `packages/lanekeep/index.d.ts`; a module that
+    /// omits it anyway is refused rather than silently given `'function'`, so the loader and
+    /// the declared type say the same thing.
+    #[test]
+    fn an_obligation_with_no_scope_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x) @acquire'], release: ['(y) @release'] },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-no-scope", src).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
         assert!(text.contains("scope"), "{text}");
         assert!(
             text.contains("function") && text.contains("block"),
@@ -6117,7 +6350,7 @@ mod tests {
           flow: {
             sources: ['(call_expression function: (identifier) @source)'],
             sinks: ['(arguments (identifier) @sink)'],
-            sanitizers: ['(call_expression function: (identifier) @sanitizer)'],
+            sanitizers: ['(call_expression) @sanitizer'],
           },
           checkFlow() {},
         })
@@ -6128,6 +6361,99 @@ mod tests {
         assert_eq!(flow.sources.len(), 1);
         assert_eq!(flow.sinks.len(), 1);
         assert_eq!(flow.sanitizers.len(), 1);
+    }
+
+    /// The #223 footgun: `@sanitizer` on the callee identifier is accepted by the substring
+    /// check and never cuts anything, because a callee can never contain the arguments it is
+    /// supposed to clean. Refused at load, naming the rule, the capture and the remedy.
+    #[test]
+    fn a_sanitizer_bound_in_the_callee_slot_is_refused() {
+        let err = load_err(
+            r#"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: {
+            sources: ['(call_expression) @source'],
+            sinks: ['(arguments (identifier) @sink)'],
+            sanitizers: ['(call_expression function: (identifier) @sanitizer (#eq? @sanitizer "redact"))'],
+          },
+          checkFlow() {},
+        })
+    "#,
+        );
+        assert!(err.contains("`test/f`"), "got: {err}");
+        assert!(err.contains("@sanitizer"), "got: {err}");
+        assert!(err.contains("callee"), "got: {err}");
+        assert!(err.contains("`function:`"), "got: {err}");
+    }
+
+    /// A `new` expression's callee is the `constructor:` child, and is just as unable to
+    /// contain its arguments.
+    #[test]
+    fn a_sanitizer_bound_in_a_constructor_slot_is_refused() {
+        let err = load_err(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: {
+            sources: ['(call_expression) @source'],
+            sinks: ['(arguments (identifier) @sink)'],
+            sanitizers: ['(new_expression constructor: (identifier) @sanitizer)'],
+          },
+          checkFlow() {},
+        })
+    ",
+        );
+        assert!(err.contains("@sanitizer"), "got: {err}");
+        assert!(err.contains("`constructor:`"), "got: {err}");
+    }
+
+    /// The sink twin: a `@sink` on the callee names the function being called, not a value
+    /// arriving anywhere, so it reports only if the callee *binding* is itself tainted — never
+    /// what `log(x)` means.
+    #[test]
+    fn a_sink_bound_in_the_callee_slot_is_refused() {
+        let err = load_err(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: {
+            sources: ['(call_expression) @source'],
+            sinks: ['(call_expression function: (identifier) @sink)'],
+          },
+          checkFlow() {},
+        })
+    ",
+        );
+        assert!(err.contains("`test/f`"), "got: {err}");
+        assert!(err.contains("@sink"), "got: {err}");
+        assert!(err.contains("callee"), "got: {err}");
+    }
+
+    /// The boundary of the refusal, pinned so it cannot creep: a `@source` on the callee is
+    /// fine, because a source is found by *containment in* the expression read at the sink
+    /// (`sources_within` in `crates/lanekeep-lang-js/src/flow.rs`), and a callee identifier
+    /// sits inside the call it names. `crates/lanekeep-engine`'s `SECRET_FLOW_RULE` relies on
+    /// exactly this shape.
+    #[test]
+    fn a_source_bound_in_the_callee_slot_loads() {
+        let spec = load_one(
+            r#"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: {
+            sources: ['(call_expression function: (identifier) @source (#eq? @source "getSecret"))'],
+            sinks: ['(arguments (identifier) @sink)'],
+          },
+          checkFlow() {},
+        })
+    "#,
+        );
+        assert_eq!(spec.flow.expect("flow recorded").sources.len(), 1);
     }
 
     /// The other half of the brief's ruling: a flow-only rule's file gate is its flow

@@ -5643,6 +5643,15 @@ export default defineRule({
     /// Flow-only — it declares no top-level `query` and no `check`, so its whole driver is
     /// `checkFlow`. It is the smallest rule that exercises the engine's flow phase end to
     /// end: the three role queries, the analyzer, the node→handle mapping, and the report.
+    ///
+    /// The three role queries bind their captures on different nodes, and the difference is
+    /// the contract rather than taste. `@source` sits on the callee identifier, which works
+    /// because a source is found by containment in the expression read at the sink. `@sink`
+    /// is the argument, the value that must not arrive. `@sanitizer` is the **whole call**:
+    /// the analyzer cuts a flow only where the sanitizer node *is* the value read or
+    /// *contains* the source, and a callee identifier is neither — bound there it compiles,
+    /// matches and never cuts (#222, #223), which is the shape this fixture carried until
+    /// #224 and which config load now refuses.
     const SECRET_FLOW_RULE: &str = r#"import { defineRule } from 'lanekeep';
 export default defineRule({
   id: 'local/no-secret-in-string',
@@ -5650,7 +5659,7 @@ export default defineRule({
   flow: {
     sources: ['(call_expression function: (identifier) @source (#eq? @source "getSecret"))'],
     sinks: ['(call_expression function: (identifier) @fn (#eq? @fn "log") arguments: (arguments (_) @sink))'],
-    sanitizers: ['(call_expression function: (identifier) @sanitizer (#eq? @sanitizer "redact"))'],
+    sanitizers: ['(call_expression function: (identifier) @fn (#eq? @fn "redact")) @sanitizer'],
   },
   card: {
     message: 'a secret reaches a string sink',
@@ -5744,6 +5753,38 @@ export default defineRule({
             first.lines().count(),
             2,
             "both `log(...)` sinks report, once each: {first}"
+        );
+    }
+
+    #[test]
+    fn a_flow_rules_sanitizer_cuts_the_flow_it_wraps() {
+        // The sanitizer half of `SECRET_FLOW_RULE`, exercised rather than merely declared: the
+        // same rule and the same sink, with `redact(...)` between the source and it, reports
+        // nothing. The control file beside it — the bare source, no sanitizer — must report,
+        // so the silence is the sanitizer's doing and not a rule that never ran.
+        let project = Project::new(
+            "flow-sanitizer-cuts",
+            &[
+                ("rule.ts", SECRET_FLOW_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/wrapped.ts",
+                    "function f() {\n  log(redact(getSecret()));\n}\n",
+                ),
+                ("src/bare.ts", "function g() {\n  log(getSecret());\n}\n"),
+            ],
+        );
+
+        let outcome = project.run().expect("runs");
+        let files: Vec<&str> = outcome
+            .violations
+            .iter()
+            .map(|v| v.location.file.as_str())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["src/bare.ts"],
+            "the wrapped source is silent and the bare one reports"
         );
     }
 
