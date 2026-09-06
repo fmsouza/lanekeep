@@ -162,13 +162,25 @@ impl<'t> Taint<'_, 't> {
         // below by def-use — and `identity(a)` wraps no source, so it stays clean (the v1
         // alias-through-call false negative).
         //
-        // Deliberate over-approximation: containment is textual, and the sanitizer cut above
-        // only fires when `expr` *itself* is the sanitizer call. So a source wrapped by a
-        // sanitizer *inside* a larger sink expression — `log(redact(getSecret()) + "x")` —
-        // still reports here, a false positive. The sanitizer-cuts-the-value rule is precise
-        // for a def-use chain (a binding assigned from a sanitizer), not for a source textually
-        // nested in a compound sink expression; over-reporting is the sound direction.
-        let direct = self.sources_within(expr);
+        // A contained source wrapped by a sanitizer is cut (#218). The `is_member` cut above
+        // fires only when `expr` *itself* is the sanitizer call; a source nested in a sanitizer
+        // *inside* a larger sink expression — `log(redact(getSecret()) + "x")`, or a
+        // `` `…${describeBytes(secret)}…` `` template — would otherwise report on syntactic
+        // containment alone, a false positive on correctly-sanitized code (#195).
+        //
+        // The cut requires the sanitizer to sit *between* the source and `expr` — `source ⊆
+        // sanitizer ⊆ expr` — so the source's contribution to `expr`'s value passes through it.
+        // Restricting the sanitizer to `expr`'s own range is load-bearing: a sanitizer that merely
+        // *contains* `expr` cleans its own result, not the side effects of its arguments, so a
+        // secret leaking through a side effect — `redact(o.x = getSecret())`, then reading `o` —
+        // reaches its own sink by a def-use edge that never crosses the sanitizer, and must still
+        // report. A bare (unwrapped) contained source is untouched either way, so
+        // `log(getSecret() + "x")` still reports.
+        let direct: Vec<Node<'t>> = self
+            .sources_within(expr)
+            .into_iter()
+            .filter(|source| !self.sanitizer_between(*source, expr))
+            .collect();
         if !direct.is_empty() {
             return direct
                 .into_iter()
@@ -402,6 +414,28 @@ impl<'t> Taint<'_, 't> {
             .collect();
         found.sort_by_key(Node::start_byte);
         found
+    }
+
+    /// Whether a `@sanitizer` call sits between `source` and `expr` — `source ⊆ sanitizer ⊆ expr`
+    /// by byte range — so `source`'s contribution to `expr`'s value passes through it and is clean
+    /// (#218). Used to cut a sanitizer-wrapped source contained in a compound sink expression,
+    /// which `is_member` — matching only when the whole expression *is* the sanitizer call — does
+    /// not catch.
+    ///
+    /// The `sanitizer ⊆ expr` bound is load-bearing, not cosmetic. A sanitizer that merely
+    /// *contains* `expr` (an ancestor) cleans its own result, not the side effects of its
+    /// arguments: in `redact(o.x = getSecret())` the assignment taints `o` as a side effect, and a
+    /// later read of `o` reaches its sink by a def-use edge that never crosses `redact`. That read
+    /// evaluates `expr = getSecret()` (the field write's rhs), which no sanitizer lies *within*, so
+    /// it is not cut — the may-taint bias is preserved. Nodes nest in a tree, so byte containment
+    /// is exact syntactic nesting; no cross-subtree coincidence is possible.
+    fn sanitizer_between(&self, source: Node<'t>, expr: Node<'t>) -> bool {
+        self.sanitizers.iter().any(|sanitizer| {
+            expr.start_byte() <= sanitizer.start_byte()
+                && sanitizer.end_byte() <= expr.end_byte()
+                && sanitizer.start_byte() <= source.start_byte()
+                && source.end_byte() <= sanitizer.end_byte()
+        })
     }
 
     /// The definitions of `decl` that reach a read at `use_node`, by reaching-definitions
@@ -822,6 +856,148 @@ mod tests {
             "redact",
         );
         assert!(flows.is_empty());
+    }
+
+    // --- #218: a sanitizer wrapping a source inside a compound sink expression cuts ---------
+    //
+    // The `is_member` cut fires only when the sink node *itself* is the sanitizer call. A source
+    // wrapped by a sanitizer *inside* a larger sink expression — `log(redact(getSecret()) + "x")`,
+    // or `` `…${describeBytes(account.secretKey)}…` `` in the corpus — bypassed it and reported on
+    // syntactic containment alone: a false positive on correctly-sanitized code (#195,
+    // migrateLegacyAccount.ts:81). `taint_of` now drops a contained source lying within a sanitizer
+    // call's range.
+
+    #[test]
+    fn a_sanitizer_wrapping_a_source_in_a_binary_sink_cuts() {
+        // `log(redact(getSecret()) + "x")`: the sink is a binary expression containing the
+        // sanitizer call, so `is_member` does not fire — the wrapped source must still be cut.
+        let flows = run(
+            "function f() { log(redact(getSecret()) + \"x\"); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "a sanitizer-wrapped source in a compound sink must not report"
+        );
+    }
+
+    #[test]
+    fn a_sanitizer_wrapping_a_source_in_a_template_sink_cuts() {
+        // The migrateLegacyAccount.ts:81 shape: the sink is a template literal containing
+        // `redact(getSecret())`; the sanitizer's result is what reaches the string, not the secret.
+        let flows = run(
+            "function f() { log(`x=${redact(getSecret())}`); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "a sanitizer-wrapped source in a template sink must not report"
+        );
+    }
+
+    #[test]
+    fn a_bare_source_beside_a_sanitized_one_in_a_compound_sink_reports_the_bare_one() {
+        // Per-source: `redact(getSecret()) + getSecret()` — the wrapped source is cut, the bare
+        // one is not. Exactly one flow, and it must be the *unwrapped* read — pinned by byte
+        // offset, since the two sources render identical text and a len==1 assert alone would pass
+        // even if the wrong (wrapped) source survived.
+        let src = "function f() { log(redact(getSecret()) + getSecret()); }";
+        let tree = parse(src);
+        let sources = calls_named(&tree, src, "getSecret");
+        assert_eq!(sources.len(), 2, "two source reads in the fixture");
+        let sanitizers = calls_named(&tree, src, "redact");
+        let bare = *sources
+            .iter()
+            .find(|s| {
+                !sanitizers
+                    .iter()
+                    .any(|z| z.start_byte() <= s.start_byte() && s.end_byte() <= z.end_byte())
+            })
+            .expect("one getSecret is outside redact");
+        let sinks = sink_args(&tree, src, "log");
+        let flows = JsFlowAnalyzer.analyze(&tree, src, &sources, &sinks, &sanitizers);
+        assert_eq!(flows.len(), 1, "only the unwrapped source reports");
+        assert_eq!(
+            flows[0].source.start_byte(),
+            bare.start_byte(),
+            "the surviving source is the bare one, not the sanitizer-wrapped one"
+        );
+    }
+
+    #[test]
+    fn a_source_leaking_out_of_a_sanitizer_via_a_side_effect_still_reports() {
+        // Soundness (found in adversarial review of #218): the sanitizer cleans redact's *return*,
+        // but the assignment `o.secret = getSecret()` nested in its argument taints `o` as a side
+        // effect — a def-use edge that bypasses the sanitizer's result. Reading `o.public` later
+        // must still report. A global "source is lexically inside a sanitizer" cut wrongly
+        // silences this; the cut must require the sanitizer to sit between the source and the
+        // expression being evaluated, which a self-contained `getSecret()` (the field write's rhs)
+        // has no room for.
+        let flows = run(
+            "function f() { const o = {}; redact(o.secret = getSecret()); log(o.public); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "a secret leaking via a side effect inside a sanitizer argument still reports"
+        );
+    }
+
+    #[test]
+    fn a_source_leaking_via_an_identifier_assignment_in_a_sanitizer_still_reports() {
+        // The strong-update sibling of the side-effect case: `x = getSecret()` nested in the
+        // sanitizer argument rebinds `x` to the raw secret (a reaching-definition, not a weak
+        // field write), which reaches `log(x)` without crossing the sanitizer's result.
+        let flows = run(
+            "function f() { let x; redact(x = getSecret()); log(x); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "an identifier rebind inside a sanitizer argument still reports"
+        );
+    }
+
+    #[test]
+    fn an_unsanitized_source_in_a_binary_sink_still_reports() {
+        // No-false-negative guard: no sanitizer wraps the source, so containment still reports.
+        let flows = run(
+            "function f() { log(getSecret() + \"x\"); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "an unsanitized contained source still reports"
+        );
+    }
+
+    #[test]
+    fn an_unsanitized_source_in_a_template_sink_still_reports() {
+        // No-false-negative guard for the template shape.
+        let flows = run(
+            "function f() { log(`${getSecret()}`); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "an unsanitized template source still reports"
+        );
     }
 
     #[test]
