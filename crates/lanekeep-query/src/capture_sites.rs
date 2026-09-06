@@ -103,20 +103,20 @@ impl Scanner<'_> {
                     // binds, so it is read and dropped.
                     self.ident();
                     self.sequence(Some(b')'));
-                    self.trailing(pending_field.take());
+                    self.trailing(pending_field.take().as_deref());
                 }
                 b'[' => {
                     self.pos += 1;
                     self.sequence(Some(b']'));
-                    self.trailing(pending_field.take());
+                    self.trailing(pending_field.take().as_deref());
                 }
                 b'"' => {
                     self.skip_string();
-                    self.trailing(pending_field.take());
+                    self.trailing(pending_field.take().as_deref());
                 }
-                // An anchor. Checked before the identifier arm because `.` is an identifier
-                // byte too.
-                b'.' => self.pos += 1,
+                // An anchor, or a quantifier with no pattern to attach to. The anchor is
+                // checked before the identifier arm because `.` is an identifier byte too.
+                b'.' | b'*' | b'+' | b'?' => self.pos += 1,
                 b'!' => {
                     self.pos += 1;
                     self.ident();
@@ -130,7 +130,6 @@ impl Scanner<'_> {
                     let name = self.ident();
                     self.push(name, None);
                 }
-                b'*' | b'+' | b'?' => self.pos += 1,
                 _ if is_ident(byte) => {
                     let ident = self.ident();
                     if self.peek() == Some(b':') {
@@ -139,7 +138,7 @@ impl Scanner<'_> {
                     } else {
                         // A bare `_` wildcard — or, in malformed text, a bare word — stands
                         // as a pattern of its own.
-                        self.trailing(pending_field.take());
+                        self.trailing(pending_field.take().as_deref());
                     }
                 }
                 _ => self.pos += 1,
@@ -149,14 +148,14 @@ impl Scanner<'_> {
 
     /// Consume the quantifiers and captures that follow a pattern, binding each capture to
     /// `field` — the slot the pattern just closed fills.
-    fn trailing(&mut self, field: Option<String>) {
+    fn trailing(&mut self, field: Option<&str>) {
         loop {
             self.skip_trivia();
             match self.peek() {
                 Some(b'@') => {
                     self.pos += 1;
                     let name = self.ident();
-                    self.push(name, field.clone());
+                    self.push(name, field.map(str::to_owned));
                 }
                 Some(b'*' | b'+' | b'?') => self.pos += 1,
                 _ => return,

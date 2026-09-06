@@ -568,3 +568,46 @@ fn a_type_parameter_on_a_member_is_not_a_violation() {
             .unwrap_or_else(|error| panic!("{source}: {error}"));
     }
 }
+
+// --- #205: `language` and `severity` are declared, and each survives a mutation silently ---
+//
+// `language: ['typescript', 'tsx']` and `severity: 'error'` on the rule card are both the
+// kind of fact nothing above exercises: every fixture in this file is a bare `.ts` source run
+// through `tester`'s default extension, and `reports_at`/`accepts` never look at severity at
+// all. A mutation to either survives every test above and needs its own.
+
+/// `.tsx` reaches the rule at all — pinned against `language: ['typescript']`, which parses a
+/// `.tsx` file with the TypeScript grammar and turns every JSX element into an `ERROR` node the
+/// query cannot match. The fixture is a component whose body is otherwise the rule's own money
+/// example, so the only thing that could make it silent is the grammar mismatch.
+#[test]
+fn a_forbidden_primitive_is_reported_inside_tsx() {
+    RuleTester::configured_with_extension(
+        "no-restricted-types",
+        lanekeep_rules::source("no-restricted-types").expect("the rule ships"),
+        "tsx",
+        MONEY,
+    )
+    .expect("builds")
+    .with_builtins(lanekeep_rules::source)
+    .reports_at(
+        "function Credit({ amount }: { amount: number }) { return <div>{amount}</div>; }\n",
+        &[(1, 31)],
+    )
+    .expect("`amount` is money and money is not a number, even inside a component");
+}
+
+/// The severity the engine reports at is `Error`, not the generic default `Warn` a mutation to
+/// `severity: 'warn'` would leave silently in place.
+#[test]
+fn the_violation_severity_is_error() {
+    let violations = tester(MONEY)
+        .run("function credit(amount: number) { return amount; }\n")
+        .expect("runs");
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(
+        violations[0].severity,
+        lanekeep_core::Severity::Error,
+        "the card declares severity: 'error'"
+    );
+}

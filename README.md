@@ -182,7 +182,9 @@ Known gaps, stated rather than implied:
 - **Two of the three performance budgets in [`docs/architecture.md`](docs/architecture.md)
   §15 are not met.** The cold budget is; they are targets, and that section says by how much
   and where the remaining time goes.
-- **No type-aware analysis**, by design. Name resolution is syntactic — see §1 non-goals.
+- **No general type inference**, by design. Name resolution is syntactic; a rule that opts in
+  (`requires: ['types']`) gets a bounded within-file oracle that answers `undefined` rather than
+  guess — see §1 non-goals and §6.10.
 
 ## Documentation
 

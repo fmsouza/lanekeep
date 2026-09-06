@@ -170,6 +170,10 @@ impl Language for JavaScript {
         Some(Arc::clone(&FLOW_ANALYZER))
     }
 
+    fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
+        Some(Arc::clone(&OBLIGATION))
+    }
+
     fn id(&self) -> LanguageId {
         LanguageId::new("javascript")
     }

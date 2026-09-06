@@ -680,8 +680,8 @@ or at an intermediate assignment.
 
 Declaring it is what makes `flow`/`checkFlow` legal at all: a rule with a `flow` and no
 `checkFlow`, a `checkFlow` and no `flow`, or either without `requires: ['dataflow']`, is refused
-at config load rather than silently doing nothing. The three refusals are config-loading
-concerns and are tested where the pairing is implemented
+at config load rather than silently doing nothing. Those refusals, and the capture-shape one
+below, are config-loading concerns and are tested where they are implemented
 (`crates/lanekeep-config/src/lib.rs`), not here.
 
 ### What counts as a source, a sink and a sanitizer
@@ -692,6 +692,23 @@ of secret origin or string sink — and each query must bind the capture its rol
 `getSecret`; a sink is the argument of any call to `log`; a sanitizer is any call to `redact`.
 A value is reported when some source's value reaches some sink's argument with no sanitizer
 call between the two along that path.
+
+Which node each capture binds is part of the contract. A `@sanitizer` is the **whole call**,
+`(call_expression function: (identifier) @fn (#eq? @fn "redact")) @sanitizer`: the analysis
+cuts a flow only where the sanitizer node is the value the sink reads or contains the source,
+and a call is the only node that is both. A `@sink` is the **value that must not arrive** — the
+argument, here `(arguments (_) @sink)` — never the call around it. A `@source` may be the call
+or its callee identifier; either sits inside the expression the sink reads, which is how a
+source is found. The natural misspelling, `@sanitizer` or `@sink` on the callee identifier,
+compiles and matches and does nothing — this rule shipped with it, and its `log(redact(…))`
+example reported until #222 — so config load refuses a `@sanitizer` or `@sink` bound in a
+call's callee slot, naming the rule and the remedy.
+
+### It runs under `--since` and `--staged`
+
+The analysis is per file and per function, so unlike a [cross-file rule](cross-file-rules.md)
+this one is never skipped by `--since` or `--staged`: a flow over three changed files is exactly
+as sound as one over the whole tree, and a pre-commit hook is where this rule does its best work.
 
 ### The analysis this rule rides on, and what a clean report does and does not mean
 
