@@ -213,6 +213,11 @@ export interface StructureFingerprint {
 /**
  * Where a name came from. Returned by {@link TypeApi.symbolOf} directly, and nested under a
  * {@link TypeInfo} whose `symbol` field is set.
+ *
+ * There is deliberately no `file` naming the declaring path. Within one file it would always be
+ * the file being checked, and across files it is only true once a declaration has actually been
+ * read from elsewhere — which is the cross-file oracle's to add (#189), beside the tracked read
+ * that makes it so.
  */
 export interface SymbolInfo {
   /**

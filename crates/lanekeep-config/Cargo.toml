@@ -16,6 +16,13 @@ blake3 = { workspace = true }
 lanekeep-core = { workspace = true }
 lanekeep-js = { workspace = true }
 
+# `lanekeep-query` for its lexical capture scanner, and nothing else: a `flow.sinks` or
+# `flow.sanitizers` query is refused at load when it binds its capture in a call's callee slot
+# (#223), and where a capture is bound is visible only in the query's text — neither this
+# crate nor tree-sitter's compiled `Query` can ask a capture which node it binds. Queries are
+# still compiled by the engine, against a grammar, later.
+lanekeep-query = { workspace = true }
+
 # `lanekeep-wasm` because a component describes itself: a `.wasm` rule reference is resolved by
 # instantiating the component and reading its `metadata` export, which is the only place its
 # id, query, card and gates exist. Config loading therefore runs guest code — once, here, for

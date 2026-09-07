@@ -502,3 +502,67 @@ fn built_ins_are_reachable_without_a_lanekeep_directory() {
     let output = project.check(&[]);
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
 }
+
+// --- #205: the doc and the rule tables have to name the same rules -----------------------
+
+/// Every rule heading in `docs/built-in-rules.md` — a level-two heading whose whole text is
+/// the backticked rule id — in the order they appear, as bare names.
+///
+/// Deliberately naive: a heading is a line that starts with two hashes, a space and a
+/// backticked `lanekeep/` prefix, and ends with the closing backtick — the exact shape every
+/// rule section in the file uses. Nothing here parses Markdown in general; the file is data
+/// for this one purpose, and a section written in any other shape shows up as "documented but
+/// not shipped" rather than being silently skipped.
+fn doc_headings(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("## `lanekeep/"))
+        .filter_map(|rest| rest.strip_suffix('`'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The set the doc claims to cover must equal the set the binary actually ships — in both
+/// directions. `lanekeep_rules::names()` is the union of `BUILT_IN_RULES` and
+/// `COMPONENT_RULES`, sorted, from `crates/lanekeep-rules/src/lib.rs`: a rule in
+/// either table and undocumented ships silently unexplained, and a documented rule in neither
+/// table describes something nobody can configure.
+#[test]
+fn every_documented_rule_matches_a_shipped_one_and_back() {
+    let doc_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/built-in-rules.md");
+    let doc_text = std::fs::read_to_string(&doc_path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", doc_path.display()));
+
+    let documented: std::collections::BTreeSet<String> =
+        doc_headings(&doc_text).into_iter().collect();
+    let shipped: std::collections::BTreeSet<String> =
+        lanekeep_rules::names().map(str::to_string).collect();
+
+    let missing: Vec<&String> = shipped.difference(&documented).collect();
+    let extra: Vec<&String> = documented.difference(&shipped).collect();
+
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "docs/built-in-rules.md and the rule tables disagree — \
+         shipped but undocumented: {missing:?}; documented but not shipped: {extra:?}"
+    );
+}
+
+mod doc_headings_tests {
+    use super::doc_headings;
+
+    #[test]
+    fn extracts_a_heading_between_the_backticks() {
+        assert_eq!(
+            doc_headings("## `lanekeep/no-default-export`\n\nsome text\n"),
+            vec!["no-default-export".to_string()],
+        );
+    }
+
+    #[test]
+    fn ignores_a_heading_at_a_different_level() {
+        assert_eq!(
+            doc_headings("### `lanekeep/no-default-export`\n"),
+            Vec::<String>::new(),
+        );
+    }
+}

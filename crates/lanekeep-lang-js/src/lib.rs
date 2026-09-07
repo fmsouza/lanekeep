@@ -9,11 +9,11 @@
 //!
 //! # The control-flow graph
 //!
-//! [`mod@cfg`] holds a per-function control-flow graph for TypeScript and TSX: basic blocks
-//! split at every branch — short-circuit operators included, since `&&`, `??` and `?.` are
-//! control flow inside an expression — and a `finally` emitted once per distinct
-//! continuation rather than special-cased. Nothing in the engine calls it. #193's obligation
-//! analysis and #194's taint analysis are its first two consumers; obligation analysis
+//! [`mod@cfg`] holds a per-function control-flow graph for TypeScript, TSX and JavaScript:
+//! basic blocks split at every branch — short-circuit operators included, since `&&`, `??`
+//! and `?.` are control flow inside an expression — and a `finally` emitted once per distinct
+//! continuation rather than special-cased. Nothing in the engine calls it directly. #193's
+//! obligation analysis and #194's taint analysis are its two consumers; obligation analysis
 //! consumes the all-paths and reachability queries (`on_all_paths_from_any`,
 //! `on_all_paths_within`, `reaches`, `reaches_avoiding`), which is why the graph and these
 //! queries are public from a module neither of them exists in yet.
@@ -168,6 +168,10 @@ impl Language for JavaScript {
 
     fn flow_analyzer(&self) -> Option<Arc<dyn FlowAnalyzer>> {
         Some(Arc::clone(&FLOW_ANALYZER))
+    }
+
+    fn obligation_analyzer(&self) -> Option<Arc<dyn ObligationAnalyzer>> {
+        Some(Arc::clone(&OBLIGATION))
     }
 
     fn id(&self) -> LanguageId {

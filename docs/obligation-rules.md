@@ -85,6 +85,9 @@ being present. The load-time refusals, all naming the rule:
 | `obligation` with no `checkObligation` | refused — it could never fire |
 | `checkObligation` with no `obligation` | refused — nothing drives it |
 | `obligation` with no `requires: ['dataflow']` | refused — the capability must be declared |
+| `acquire` or `release` empty or absent | refused — nothing to acquire, or nothing to discharge it, means `checkObligation` could never say anything true |
+| an `acquire` query with no `@acquire`, or a `release` query with no `@release` | refused — it would compile and match nothing forever |
+| `scope` missing | refused — the type declares it required, and the loader says the same rather than defaulting to `'function'` |
 | `scope` other than `'function'`/`'block'` | refused |
 | an acquire or release query that fails to compile | refused, naming the rule, at the same point a broken main `query` is |
 | neither `check` nor `obligation` | refused — a rule needs a handler |
@@ -158,7 +161,7 @@ Each of these is a stated v1 scope decision, not an oversight — see
 - **Nothing crosses a function boundary.** The unit of analysis is the function the acquire
   is in; a callback or a call passed the acquired value is invisible to it.
 - **Silent, not refused, on a language with no analyzer.** In v1 the analyzer exists only for
-  TypeScript and TSX. Declaring `obligation` for any other language is not a load-time
+  TypeScript, TSX and JavaScript. Declaring `obligation` for any other language is not a load-time
   mistake — the rule loads cleanly, and `checkObligation` is simply never invoked for that
   language's files, the same quiet-absence posture `ctx.types` takes when it has nothing to
   say. A `check` the same rule also declares is unaffected and still runs.

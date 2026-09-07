@@ -31,6 +31,9 @@
 
 use std::fmt;
 
+mod capture_sites;
+pub use capture_sites::{CaptureSite, capture_sites};
+
 use lanekeep_core::Position;
 use lanekeep_lang::{Language, LanguageId};
 use streaming_iterator::StreamingIterator;

@@ -445,3 +445,115 @@ fn the_reported_message_falls_back_with_no_reason() {
     )
     .expect("with no reason of its own the restriction has only the generic fallback");
 }
+
+// --- #205: `language` and `severity` are declared, and each survives a mutation silently ---
+//
+// Same gap as `no-restricted-types`: every fixture above is a bare `.ts` source through
+// `tester`'s default extension, and neither `reports_at` nor `accepts` looks at severity.
+
+/// `.tsx` reaches the rule at all — pinned against `language: ['typescript']`. A rule runs only
+/// on the languages it names, so dropping `'tsx'` parses nothing wrongly: the rule never sees the
+/// file, and the violation below goes unreported with nothing to say why.
+#[test]
+fn a_forbidden_argument_is_reported_inside_tsx() {
+    RuleTester::configured_with_extension(
+        "no-restricted-arguments",
+        lanekeep_rules::source("no-restricted-arguments").expect("the rule ships"),
+        "tsx",
+        MONEY,
+    )
+    .expect("builds")
+    .with_builtins(lanekeep_rules::source)
+    .reports_at(
+        "import { Decimal } from 'decimal.js';\n\
+         function Credit({ row }) { return <div>{new Decimal(parseFloat(row.amount))}</div>; }\n",
+        &[(2, 53)],
+    )
+    .expect(
+        "parseFloat gives a number and MONEY forbids one at position 0, even inside a component",
+    );
+}
+
+/// The severity the engine reports at is `Error`, pinned against a declaration downgraded to
+/// `'warn'` or `'off'`. A *deleted* declaration is not covered: the loader's fallback is
+/// `Error` too (`unwrap_or(Severity::Error)` in `crates/lanekeep-config/src/lib.rs`), so only
+/// an explicit downgrade can change what this asserts.
+#[test]
+fn the_violation_severity_is_error() {
+    let violations = tester(MONEY)
+        .run(
+            "import { Decimal } from 'decimal.js';\n\
+             new Decimal(parseFloat(row.amount));\n",
+        )
+        .expect("runs");
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(
+        violations[0].severity,
+        lanekeep_core::Severity::Error,
+        "the card declares severity: 'error'"
+    );
+}
+
+// --- #205: three documented silences, pinned with a control violation each -------------------
+//
+// `docs/built-in-rules.md`'s "What it stays silent on" table names three shapes with nothing
+// testing them. Each fixture below carries a plain `new Decimal(parseFloat(x))` alongside the
+// silent shape, so a rule that never ran at all — or whose `check` threw before reaching either
+// call — cannot pass: the control has to report, at an exact position, for the test to mean
+// anything about the shape beside it.
+
+/// (i) A namespace-qualified callee. The query's `new_expression`/`call_expression` clauses
+/// capture `constructor: (identifier) @callee`, which a `pkg.Decimal` member expression is not
+/// — so the restriction is never even reached for it, silently, regardless of `resolvesToImport`.
+#[test]
+fn a_namespace_qualified_callee_is_silent() {
+    tester(MONEY)
+        .reports_at(
+            "import * as pkg from 'decimal.js';\n\
+         import { Decimal } from 'decimal.js';\n\
+         new pkg.Decimal(parseFloat(x));\n\
+         new Decimal(parseFloat(y));\n",
+            &[(4, 13)],
+        )
+        .expect("the qualified callee is silent; the plain one at line 4 is the control");
+}
+
+/// (ii) `String(parseFloat(s))` types as `string` at the call site, not as the `number` that
+/// fed it two calls earlier — this rule judges the immediate type and does not follow a value
+/// backwards.
+#[test]
+fn a_nested_conversion_to_string_is_silent() {
+    tester(MONEY)
+        .reports_at(
+            "import { Decimal } from 'decimal.js';\n\
+         new Decimal(String(parseFloat(s)));\n\
+         new Decimal(parseFloat(x));\n",
+            &[(3, 13)],
+        )
+        .expect("String(...) is the immediate argument and it types as string, not number");
+}
+
+/// (iii) `module` is matched exactly, never as a glob — a restriction naming `decimal` governs
+/// an import of exactly `decimal`, and stays silent on `decimal.js`, of which `decimal` is a
+/// prefix. Both calls sit under the one restriction, in the one fixture: an import from the
+/// exact module (the control, reported) beside an import from the module it is a prefix of
+/// (the silent shape).
+#[test]
+fn the_module_match_is_exact_not_a_glob() {
+    let prefix_only = "{ restrictions: [{ \
+         call: { module: 'decimal', name: 'Decimal' }, \
+         forbid: ['number'], \
+         reason: 'r' }] }";
+    tester(prefix_only)
+        .reports_at(
+            "import { Decimal } from 'decimal';\n\
+             import { Decimal as Money } from 'decimal.js';\n\
+             new Decimal(parseFloat(a));\n\
+             new Money(parseFloat(b));\n",
+            &[(3, 13)],
+        )
+        .expect(
+            "'decimal' matches the exact import at line 3 and reports; 'decimal.js' at line 4 \
+             is silent even though 'decimal' is a prefix of it",
+        );
+}

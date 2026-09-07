@@ -351,9 +351,10 @@ The calibration harness is now committed (`just taint-calibration`, `scripts/cal
 `scripts/taint-calibration.sh`), so this re-run — and any future one — is a repeatable command
 rather than the manual procedure #195 documented.
 
-One footgun remains open as a follow-up, not fixed here: nothing validates that a `@sanitizer`
-capture is bound to a whole call rather than to an identifier inside it, so a rule can write the
-identifier-capture idiom and have its sanitizer silently do nothing — exactly the bug this pull
-request fixes in the calibration rule and in `no-secret-in-string`. The engine test fixture
-`crates/lanekeep-engine/src/lib.rs:5653` (`SECRET_FLOW_RULE`, a documented "copy-me" example)
-still uses the identifier-capture idiom and is inert today.
+One footgun was left open as a follow-up and has since closed: nothing validated that a
+`@sanitizer` capture was bound to a whole call rather than to an identifier inside it, so a rule
+could write the identifier-capture idiom and have its sanitizer silently do nothing — exactly the
+bug this re-run fixed in the calibration rule and in `no-secret-in-string`. Config load now
+refuses a `@sanitizer` bound in a call's callee slot (#223), and the engine's
+"copy-me" fixture `SECRET_FLOW_RULE` in `crates/lanekeep-engine/src/lib.rs`, which still carried
+the idiom, captures the whole call and exercises the cut (#224).

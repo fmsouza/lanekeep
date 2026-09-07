@@ -1330,6 +1330,41 @@ the language every shipped rule targets. `crates/lanekeep-lang/src/grammar.rs` f
 grammar exposes instead — node kinds, field names, supertypes and the three counts — which every
 ABI answers.
 
+**A `flow` query that compiles and matches is not a query that does anything; which node the
+capture binds decides.** `(call_expression function: (identifier) @sanitizer (#eq? @sanitizer
+"redact"))` is the natural spelling of "calls to `redact` sanitize", it loads, its predicate
+matches, and the sanitizer never cuts a flow: the analyzer cuts where the sanitizer node *is* the
+value read at the sink or *contains* the source, and a callee identifier is neither.
+`lanekeep/no-secret-in-string` shipped with exactly that shape, its documented-silent
+`log(redact(getSecret()))` reporting the whole time, and nothing noticed until the #220
+calibration re-run — `flow.rs`'s unit tests build sanitizer nodes by hand (`calls_named`, whole
+calls) and never went through query capture. Config load now refuses a `@sanitizer` bound in a
+call's callee slot (#223) — and not a `@sink` there, which looks like the same mistake and is
+not one: a callee sink reports when the callee's *binding* is tainted, `const h = getSecret();
+h()`, which no other capture can express, so that judgment stays in the docs rather than in a
+refusal. Two facts to keep beside it. Neither `lanekeep-config` nor
+tree-sitter's compiled `Query` can ask a capture which node it binds — the API has capture
+*names*, pattern byte ranges and predicates, and nothing under a capture — so the check is a
+lexical scan of the query text, `lanekeep-query`'s `capture_sites`, deliberately grammar-free.
+And a `@source` on the callee is fine, because a source is found by containment in the
+expression the sink reads. Measured on the way: the epic's own §B.2 example bound `@sanitizer`
+to an `(identifier)` *argument* of the sanitizing call, a pattern that does not match the
+flagship `redact(getSecret())` at all — the argument there is a call — so the example reports
+under its own sanitizer. Not refused, since an argument capture can participate in containment;
+not a shape to copy either.
+
+**A `Language` that wires one analyzer and not its sibling fails per file, silently, and four
+documents disagreed about it for a month.** `JavaScript` returned a `flow_analyzer` and no
+`obligation_analyzer`, so an obligation rule declared for `javascript` loaded cleanly and never
+fired while a flow rule beside it ran; `docs/architecture.md` and `lanekeep-lang-js`'s own module
+doc said the graph was TypeScript-and-TSX only, and `obligation.rs` said its one instance served
+all three languages. An audit reading them found it, not a test, because nothing ran either
+analysis over a `.js` file — `crates/lanekeep-testkit/tests/javascript_dataflow.rs` does now,
+over `.js` and `.jsx`. The general form: a
+capability that is a per-language `Option` on a trait needs a fixture for every language that
+claims it, or "declared for a language with no analyzer is silent, not refused" (§6.10) quietly
+covers a language that was meant to have one.
+
 ## What not to do
 
 - Do not add a dependency without checking `deny.toml`. Network crates are banned
