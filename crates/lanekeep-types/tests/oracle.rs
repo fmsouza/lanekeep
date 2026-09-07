@@ -392,19 +392,22 @@ fn a_named_type_is_nominal() {
             name: "Decimal".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "Decimal".to_owned(),
+                exported: Some("Decimal".to_owned()),
                 module: Some("decimal.js".to_owned()),
             }),
         })
     );
 }
 
-/// A renamed import's `Symbol.name` is the local alias, not the exported name.
+/// A renamed import's `Symbol.name` is the local alias, and `exported` is the name the
+/// module uses.
 ///
-/// `Symbol::name` is filled from the reference's own text, and the resolver's
-/// `ImportedName::Named` — which does carry `Decimal` — is never consulted for it. Nothing
-/// above catches this: `a_named_type_is_nominal` imports `Decimal` under its own name, so
-/// the use site and the export happen to read identically and the two provenances are
-/// indistinguishable from that test alone.
+/// `name` is filled from the reference's own text, deliberately: it is the spelling a
+/// message quotes. What used to be dropped one line later — the resolver's
+/// `ImportedName::Named("Decimal")` — is now the second field, and this is the fixture where
+/// the two differ. `a_named_type_is_nominal` above cannot stand in for it: it imports
+/// `Decimal` under its own name, so the use site and the export read identically and an
+/// implementation that copied `name` into `exported` would pass it.
 #[test]
 fn a_renamed_import_s_symbol_name_is_the_local_alias() {
     assert_eq!(
@@ -416,6 +419,7 @@ fn a_renamed_import_s_symbol_name_is_the_local_alias() {
             name: "Money".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "Money".to_owned(),
+                exported: Some("Decimal".to_owned()),
                 module: Some("decimal.js".to_owned()),
             }),
         })
@@ -431,6 +435,7 @@ fn a_locally_declared_type_is_nominal_with_no_module() {
             name: "Decimal".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "Decimal".to_owned(),
+                exported: None,
                 module: None,
             }),
         })
@@ -480,6 +485,7 @@ fn a_locally_declared_bigint_shadows_the_primitive() {
             name: "bigint".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "bigint".to_owned(),
+                exported: None,
                 module: None,
             }),
         })
@@ -634,6 +640,7 @@ fn a_local_annotated_with_a_named_type_is_nominal() {
             name: "Decimal".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "Decimal".to_owned(),
+                exported: Some("Decimal".to_owned()),
                 module: Some("decimal.js".to_owned()),
             }),
         })
@@ -799,6 +806,14 @@ fn symbol_of_use(source: &str, name: &str) -> Option<lanekeep_types::Symbol> {
     oracle.symbol_of(found.unwrap_or_else(|| panic!("no use of `{name}`")))
 }
 
+/// An unrenamed import copies the name rather than leaving `exported` empty.
+///
+/// The decision, asserted rather than left to fall out of the implementation. `None` here
+/// would mean "no alias" and read as the more meaningful contract, and it would make a
+/// consumer who forgot `?? name` silently accept every plain import — a false negative on
+/// the most ordinary spelling there is, invisible because an ignored requirement only ever
+/// removes reports. A copy has no such failure mode and costs one `String`, and it is copied
+/// even when nothing was renamed rather than left empty.
 #[test]
 fn an_imported_name_carries_the_module_it_came_from() {
     assert_eq!(
@@ -808,18 +823,21 @@ fn an_imported_name_carries_the_module_it_came_from() {
         ),
         Some(lanekeep_types::Symbol {
             name: "Decimal".to_owned(),
+            exported: Some("Decimal".to_owned()),
             module: Some("decimal.js".to_owned()),
         })
     );
 }
 
-/// The shadow pair: the same name, locally declared, carries no module.
+/// The shadow pair: the same name, locally declared, carries neither a module nor an
+/// exported name — nothing was imported, so there is nothing a module exports it under.
 #[test]
 fn a_locally_declared_name_carries_no_module() {
     assert_eq!(
         symbol_of_use("class Decimal {}\nconst x = Decimal;", "Decimal"),
         Some(lanekeep_types::Symbol {
             name: "Decimal".to_owned(),
+            exported: None,
             module: None,
         })
     );
@@ -828,6 +846,83 @@ fn a_locally_declared_name_carries_no_module() {
 #[test]
 fn a_name_nothing_declares_has_no_symbol() {
     assert_eq!(symbol_of_use("const x = missing;", "missing"), None);
+}
+
+/// A renamed import carries both names: the alias at the use site, and the name the module
+/// exports it under.
+///
+/// The whole point of the field. `a_renamed_import_s_symbol_name_is_the_local_alias` above
+/// pins the first half and passed for the entire life of a `Symbol` that had no second half
+/// at all — the resolver's `ImportedName::Named("Decimal")` reached `symbol_at` and was
+/// dropped one line later.
+#[test]
+fn a_renamed_import_carries_the_exported_name_beside_the_alias() {
+    assert_eq!(
+        symbol_of_use(
+            "import { Decimal as Money } from 'decimal.js';\nconst x = Money;",
+            "Money"
+        ),
+        Some(lanekeep_types::Symbol {
+            name: "Money".to_owned(),
+            exported: Some("Decimal".to_owned()),
+            module: Some("decimal.js".to_owned()),
+        })
+    );
+}
+
+/// A default import is exported under the literal name `default`.
+///
+/// Not the local name, which is chosen freely at the import site and says nothing about the
+/// module: `import D from 'm'` and `import Decimal from 'm'` are the same import. `default`
+/// is what the module actually exports it as, and Task 4's rule branches on exactly that
+/// string to avoid accusing conforming code.
+#[test]
+fn a_default_import_is_exported_under_the_name_default() {
+    assert_eq!(
+        symbol_of_use("import Money from 'decimal.js';\nconst x = Money;", "Money"),
+        Some(lanekeep_types::Symbol {
+            name: "Money".to_owned(),
+            exported: Some("default".to_owned()),
+            module: Some("decimal.js".to_owned()),
+        })
+    );
+}
+
+/// A namespace import has a module and no exported name at all.
+///
+/// `import * as d from 'm'` binds the module object, and no single export names it. `None`
+/// rather than `"*"`: a sentinel would be a string a comparison could match, and there is
+/// nothing here for a name comparison to be right about. This is the discriminating pair for
+/// the two tests above — an implementation that always answered `Some` of something, or that
+/// defaulted to the use-site name, passes both of them and fails this.
+#[test]
+fn a_namespace_import_has_a_module_and_no_exported_name() {
+    assert_eq!(
+        symbol_of_use("import * as d from 'decimal.js';\nconst x = d;", "d"),
+        Some(lanekeep_types::Symbol {
+            name: "d".to_owned(),
+            exported: None,
+            module: Some("decimal.js".to_owned()),
+        })
+    );
+}
+
+/// An import specifier may name the export as a string — `import { "Decimal" as D }` — and the
+/// exported name is the export's name, not its quoted spelling: a `require` comparing against
+/// `Decimal` would otherwise never match it and report conforming code.
+#[test]
+fn a_string_named_import_specifier_is_exported_without_its_quotes() {
+    assert_eq!(
+        symbol_of_use(
+            "import { \"Decimal\" as D } from 'decimal.js';\nconst x = D;",
+            "D"
+        ),
+        Some(lanekeep_types::Symbol {
+            name: "D".to_owned(),
+            exported: Some("Decimal".to_owned()),
+            module: Some("decimal.js".to_owned()),
+        })
+    );
 }
 
 /// Two runs over one input agree, byte for byte.

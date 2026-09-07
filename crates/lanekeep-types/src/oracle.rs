@@ -405,19 +405,36 @@ impl<'t> TypeScriptOracle<'t> {
     }
 
     /// Where the name at `node` came from, when the resolver can say.
+    ///
+    /// The match is written out per form rather than routed through `Binding::is_import_of`'s
+    /// vocabulary, because the three answers are three different decisions — copy, substitute
+    /// the literal `default`, or refuse to name one — and that predicate's `"*"` for a
+    /// namespace is a query spelling, not an answer ([`Symbol::exported`] says why).
     fn symbol_at(&self, node: Node<'t>) -> Option<Symbol> {
-        use lanekeep_lang::binding::Binding;
+        use lanekeep_lang::binding::{Binding, ImportedName};
 
         let name = self.text(node);
         if name.is_empty() {
             return None;
         }
-        let module = match self.resolver.resolve(self.tree, self.source, node)? {
-            Binding::Import { module, .. } => Some(module),
-            Binding::Local(_) => None,
+        let (module, exported) = match self.resolver.resolve(self.tree, self.source, node)? {
+            Binding::Import {
+                module,
+                name: ImportedName::Named(exported),
+            } => (Some(module), Some(exported)),
+            Binding::Import {
+                module,
+                name: ImportedName::Default,
+            } => (Some(module), Some("default".to_owned())),
+            Binding::Import {
+                module,
+                name: ImportedName::Namespace,
+            } => (Some(module), None),
+            Binding::Local(_) => (None, None),
         };
         Some(Symbol {
             name: name.to_owned(),
+            exported,
             module,
         })
     }

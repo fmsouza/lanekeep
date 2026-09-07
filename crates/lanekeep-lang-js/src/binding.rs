@@ -361,7 +361,7 @@ fn import_binding(node: Node<'_>, source: &str, name: &str) -> Option<Binding> {
                 {
                     let imported = specifier
                         .child_by_field_name("name")
-                        .map(|n| node_text(n, source).to_owned())?;
+                        .map(|n| trim_quotes(node_text(n, source)).to_owned())?;
                     // The alias is what the local name is; without one they are the same.
                     let local = specifier
                         .child_by_field_name("alias")
