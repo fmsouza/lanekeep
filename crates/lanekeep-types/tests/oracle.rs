@@ -917,3 +917,61 @@ fn an_ambient_functions_parameter_is_typed() {
         Some(Type::Primitive(Primitive::Number))
     );
 }
+
+// --- #208: the six carriers that were still not scopes --------------------------------
+//
+// The oracle's half. Anchored on a `type_annotation` whose text is `A`, never on a
+// `: void` — every source below writes `: A` as its return type, so whichever annotation
+// is last in the file resolves the name under test. A fixture that lands on `: void`
+// asserts nothing, which is the dead row #207 shipped twice.
+//
+// #208 and the design both say the reproducer is `typeOf(x) == number`. It is not: with
+// `method_signature` outside `SCOPE_KINDS` the walk from `x` finds no declaration at all
+// and the oracle answers `None`. The confident wrong answer is reached through the
+// *annotation*, which is what these tests read.
+
+/// A type parameter is whatever the call site chose, so the oracle says nothing about it.
+///
+/// Before this commit the walk escaped past `method_signature` to the outer alias and this
+/// answered `Some(Primitive(Number))` — identical in every byte to a declared `number`.
+#[test]
+fn a_type_parameter_on_a_method_signature_kind_gives_nothing() {
+    for source in [
+        "type A = number;\ninterface I { m<A>(x: A): A }",
+        "type A = number;\nabstract class C { abstract m<A>(x: A): A }",
+    ] {
+        assert_eq!(type_of_last(source, "type_annotation"), None, "{source}");
+    }
+}
+
+/// The must-not-move half: with nothing shadowing it, the alias still answers.
+#[test]
+fn without_a_type_parameter_a_method_signature_kind_reads_the_alias() {
+    for source in [
+        "type A = number;\ninterface I { m(x: A): A }",
+        "type A = number;\nabstract class C { abstract m(x: A): A }",
+    ] {
+        assert_eq!(
+            type_of_last(source, "type_annotation"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}
+
+/// The parameter-side widening, which is the half that is a behavior change rather than a
+/// bug fix: these kinds carry `parameters`, so their parameters become resolvable for the
+/// first time and an annotated one is typed where it used to give nothing.
+#[test]
+fn a_parameter_of_a_method_signature_kind_is_typed() {
+    for source in [
+        "interface I { m(a: number): void }",
+        "abstract class C { abstract m(a: number): void }",
+    ] {
+        assert_eq!(
+            type_of_use(source, "a"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}

@@ -333,13 +333,20 @@ scope walk escaped outward, and `type Amount = number; interface O<Amount> { x: 
 parameter had been passed over. `lanekeep/no-restricted-types` reported conforming code because of
 it, while the same program spelled `class` rather than `abstract class` was correctly silent.
 
-Six carriers are still missing: `abstract_method_signature`, `call_signature`,
-`construct_signature`, `constructor_type`, `function_type`, `method_signature`, tracked as
-[#208](https://github.com/fmsouza/lanekeep/issues/208). **All six also carry `parameters`**, so
-each would widen parameter resolution as `function_signature` did, and each needs its own
-before/after measurement. Until then,
-`type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`, because
-`method_signature` carries the type parameters and `interface_declaration` does not.
+Four carriers are still missing: `call_signature`, `construct_signature`, `constructor_type`
+and `function_type`, tracked as [#208](https://github.com/fmsouza/lanekeep/issues/208) with the
+two method signatures now landed. **All four also carry `parameters`**, so each would widen
+parameter resolution as `function_signature` and `method_signature` did, and each needs its own
+before and after measurement. Until then, `type A = number; type F = <A>(x: A) => A` still
+resolves the annotation to `number`, because `function_type` carries the type parameters and
+the enclosing `type_alias_declaration` does not.
+
+And the reproducer that has been written down here twice is not the one that reproduces. The
+issue and this entry both said `interface I { m<A>(x: A): A }` "types `x` as `number`". It does
+not: with the signature outside `SCOPE_KINDS` the walk from `x` finds no declaration at all and
+the oracle answers nothing. The confident wrong answer arrives through the **annotation**, which
+is what the fixtures assert — and it is why every one of them writes `: A` as the return type,
+so the last `type_annotation` in the file is never a dead `: void`.
 
 This entry has now carried four wrong claims about its own subject, and they are worth listing
 because the shape repeats: nine carriers, then twelve, then "four of the six carry `parameters`",

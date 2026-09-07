@@ -615,3 +615,57 @@ fn the_violation_severity_is_error() {
         "the card declares severity: 'error'"
     );
 }
+
+// --- #208: parameters inside a signature are governed values now -----------------------
+//
+// The query already matched these — `(required_parameter pattern: (identifier) @name)` does
+// not care what encloses the parameter — and `typeOf` answered `undefined`, which this rule
+// turns into silence. So the rule looked wired up and reported nothing, with no error
+// anywhere. Each pair below is a report and a control: without the control, a fix that made
+// every signature parameter report would pass.
+
+/// A parameter of an interface method signature is a governed value.
+#[test]
+fn a_forbidden_primitive_on_a_method_signature_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "interface Wallet {\n  credit(amount: number): void\n}\n",
+            &[(2, 10)],
+        )
+        .expect("`amount` is money, and a method signature's parameter is typed now");
+}
+
+/// The control: the same shape carrying the required type stays silent.
+#[test]
+fn the_required_type_on_a_method_signature_parameter_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             interface Wallet {\n  credit(amount: Decimal): void\n}\n",
+        )
+        .expect("a Decimal amount is what the convention asks for, wherever it is declared");
+}
+
+/// The abstract-member spelling of the pair above. `abstract class` against `class` is the
+/// exact divergence #207 found and fixed for the class's *own* type parameters; this is the
+/// same divergence one level down, on its members' parameters.
+#[test]
+fn a_forbidden_primitive_on_an_abstract_method_signature_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "abstract class Wallet {\n  abstract credit(amount: number): void\n}\n",
+            &[(2, 19)],
+        )
+        .expect("an abstract member's parameter is typed now too");
+}
+
+/// The control.
+#[test]
+fn the_required_type_on_an_abstract_method_signature_parameter_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             abstract class Wallet {\n  abstract credit(amount: Decimal): void\n}\n",
+        )
+        .expect("a Decimal amount conforms in an abstract member as anywhere else");
+}

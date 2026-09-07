@@ -291,6 +291,13 @@ a parameter's or a declarator's annotation are all governed on the same terms.
 Modifiers do not hide a field: `readonly`, `private`, `static`, `abstract` and a `declare class`
 body all report, as does a field carrying both an annotation and an initializer.
 
+**A parameter is governed wherever it is declared, including inside a signature that has no
+body.** An interface method's parameter and an abstract member's parameter are read exactly as an
+ordinary function's are, so `interface Wallet { credit(amount: number): void }` reports. That was
+silent until the resolver treated those signatures as scopes: the query matched the parameter all
+along and the oracle could not type it, so the rule ran and found nothing, which reads the same as
+a conforming file.
+
 A member is a candidate only when it is *annotated*. A class field written `amount = 1` has no
 type annotation to read, and typing it would mean reading the initializer — a different claim,
 and one the member path does not make.
@@ -303,7 +310,7 @@ than from the shape being out of scope. Which of the two it is matters, because 
 | Shape | Why not | Out of scope, or silent? |
 | --- | --- | --- |
 | `const o = { amount: 1 }` | an object literal's property types its *initializer*, not a declaration; whether a convention governs one at all is a separate question | out of scope — a `pair`, not a `property_signature` |
-| `interface O { amount(): number }` | a method signature is a different node kind | out of scope |
+| `interface O { amount(): number }` | the method's own name is not a governed value; its parameters are | out of scope |
 | `interface O { [k: string]: number }` | an index signature names no property | out of scope |
 | `interface O { 'amount': number }` | a string-literal key is not a `property_identifier` | out of scope |
 | `enum O { amount = 1 }` | an enum member is a different node kind | out of scope |

@@ -31,22 +31,21 @@ const SCOPE_KINDS: &[&str] = &[
     "method_definition",
     "class_declaration",
     "class",
-    // Four more kinds that carry a `type_parameters` field. `tree-sitter-typescript`
-    // 0.23.2's `typescript/src/node-types.json` declares the field on eighteen node kinds
-    // (that is the count to read, not to measure from a hand sample — see below); eight
-    // were already above, and these four were not, so a type parameter declared on any of
-    // them was invisible and the walk escaped outward — exactly the failure the
-    // `type_parameters` arm below was written to fix for functions, still live for these.
-    // `type A = number; interface O<A> { x: A }` answered `number`.
+    // Kinds that carry a `type_parameters` field and were not scopes.
+    // `tree-sitter-typescript` 0.23.2's `typescript/src/node-types.json` declares the field
+    // on eighteen node kinds — that is the count to read, not to measure from a hand sample,
+    // for the reason the last paragraph of this comment gives. Eight were already above;
+    // four landed in #207 and two more here.
     //
-    // Six carriers remain missing: `abstract_method_signature`, `call_signature`,
-    // `construct_signature`, `constructor_type`, `function_type`, `method_signature`, tracked
-    // as lanekeep#208. All six also carry `parameters`, so each would widen
-    // parameter resolution the way `function_signature` does below, and each needs its own
-    // before/after measurement. Until then,
-    // `type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`,
-    // because `method_signature` carries the type parameters and `interface_declaration`
-    // does not.
+    // A type parameter declared on any of them was invisible, so the walk escaped outward
+    // and an outer alias of the same name answered instead:
+    // `type A = number; interface I { m<A>(x: A): A }` typed the annotation `number`.
+    //
+    // Four carriers remain missing: `call_signature`, `construct_signature`,
+    // `constructor_type` and `function_type`, landing in the commit after this one. All four
+    // also carry `parameters`, so each widens parameter resolution the way
+    // `function_signature` and the two method signatures did, and each needs its own
+    // before and after measurement.
     //
     // Do not derive this list from a hand-written parse sample: the first attempt at this
     // fix did exactly that and reported twelve carriers, because the sample omitted every
@@ -64,6 +63,18 @@ const SCOPE_KINDS: &[&str] = &[
     "interface_declaration",
     "type_alias_declaration",
     "function_signature",
+    // #208's first two. `method_signature` and `abstract_method_signature` are ordinary
+    // members of a body the walk already descends, and they are the two that produce the
+    // reproducer: `type A = number; interface I { m<A>(x: A): A }` resolved `A` to the
+    // alias, because the type parameters are on the signature and `interface_declaration`
+    // — a scope since #207 — does not carry them.
+    //
+    // Both also carry `parameters`, so this widens as well as fixes: a parameter annotated
+    // inside an interface method or an abstract member is typed where it used to give
+    // nothing, and `lanekeep/no-restricted-types` reports it. Measured per kind, in the
+    // pull request body.
+    "method_signature",
+    "abstract_method_signature",
     "catch_clause",
     "for_statement",
     "for_in_statement",
@@ -808,8 +819,8 @@ mod tests {
     // `type_parameters` on eighteen node kinds; eight were already in `SCOPE_KINDS`, and
     // these four were not, so a type parameter declared on any of them was invisible and
     // the scope walk escaped outward — the exact failure the `type_parameters` arm was
-    // written to fix for functions. Six carriers remain missing (see `SCOPE_KINDS`'s own
-    // comment for the names and why); this task covers only the four below.
+    // written to fix for functions. Four carriers remain missing (see `SCOPE_KINDS`'s own
+    // comment); the section below this one covers the two that land in this commit.
     //
     // The sources are the same four in all three tests, deliberately. Splitting them across
     // tests would let one kind be covered in one direction and not the other, which is how
@@ -862,6 +873,62 @@ mod tests {
             "type A = number;\ntype O = { x: A };",
             "type A = number;\nabstract class C { m(x: A) { return x; } }",
             "type A = number;\ndeclare function f(x: A): void;",
+        ] {
+            assert_eq!(
+                declaration_use(source, "A"),
+                Some("type_alias_declaration".to_owned()),
+                "{source}"
+            );
+        }
+    }
+
+    // --- the six carriers #208 left, in two commits ------------------------------------
+    //
+    // Same three-test shape as the four above and for the same reason: splitting the
+    // sources across tests would let one kind be covered in one direction and not the
+    // other. `: A` is the return type in every source deliberately — a signature written
+    // `: void` puts a dead `type_annotation` last in the file, which is the row #207
+    // shipped twice and #208's acceptance names.
+
+    /// Each of these binds its type parameter rather than letting the walk escape.
+    #[test]
+    fn a_type_parameter_binds_on_a_method_signature_kind() {
+        for source in [
+            "type A = number;\ninterface I { m<A>(x: A): A }",
+            "type A = number;\nabstract class C { abstract m<A>(x: A): A }",
+        ] {
+            assert_eq!(
+                resolve_use(source, "A"),
+                Some(Binding::Local(BindingKind::TypeParam)),
+                "{source}"
+            );
+            assert_eq!(
+                declaration_use(source, "A"),
+                Some("type_parameter".to_owned()),
+                "{source}"
+            );
+        }
+    }
+
+    /// And shadows the outer alias rather than merely coexisting with it.
+    #[test]
+    fn a_type_parameter_on_a_method_signature_kind_shadows_an_outer_alias() {
+        for source in [
+            "type A = number;\ninterface I { m<A>(x: A): A }",
+            "type A = number;\nabstract class C { abstract m<A>(x: A): A }",
+        ] {
+            assert!(shadowed(source, "A"), "{source}");
+        }
+    }
+
+    /// The half that keeps the fix from over-reaching: with no type parameter to shadow it,
+    /// the outer alias is still what the annotation resolves to. This one passes before the
+    /// change as well as after — it is the guard, not the driver.
+    #[test]
+    fn without_a_type_parameter_a_method_signature_kind_reads_the_outer_alias() {
+        for source in [
+            "type A = number;\ninterface I { m(x: A): A }",
+            "type A = number;\nabstract class C { abstract m(x: A): A }",
         ] {
             assert_eq!(
                 declaration_use(source, "A"),
