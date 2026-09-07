@@ -975,3 +975,62 @@ fn a_parameter_of_a_method_signature_kind_is_typed() {
         );
     }
 }
+
+// --- #208's remaining four ------------------------------------------------------------
+//
+// `: A` as the return type again, and here it is doing more work than above: the four kinds
+// spell their result differently — `call_signature` and `construct_signature` wrap it in a
+// `type_annotation`, `constructor_type` and `function_type` hold a bare type after `=>` —
+// so which node `type_of_last(_, "type_annotation")` lands on differs by kind. Writing `A`
+// in both positions makes the assertion the same one either way.
+
+/// A type parameter is whatever the call site chose in these four kinds too, so the oracle
+/// says nothing about it — the same widening as `method_signature`'s pair above, one node
+/// kind further from anything with a name.
+#[test]
+fn a_type_parameter_in_signature_or_type_position_gives_nothing() {
+    for source in [
+        "type A = number;\ninterface F { <A>(x: A): A }",
+        "type A = number;\ninterface F { new <A>(x: A): A }",
+        "type A = number;\ntype F = new <A>(x: A) => A;",
+        "type A = number;\ntype F = <A>(x: A) => A;",
+    ] {
+        assert_eq!(type_of_last(source, "type_annotation"), None, "{source}");
+    }
+}
+
+/// The must-not-move half: with nothing shadowing it, the alias still answers, in each of
+/// the four kinds.
+#[test]
+fn without_a_type_parameter_signature_or_type_position_reads_the_alias() {
+    for source in [
+        "type A = number;\ninterface F { (x: A): A }",
+        "type A = number;\ninterface F { new (x: A): A }",
+        "type A = number;\ntype F = new (x: A) => A;",
+        "type A = number;\ntype F = (x: A) => A;",
+    ] {
+        assert_eq!(
+            type_of_last(source, "type_annotation"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}
+
+/// The parameter-side widening for these four kinds: each carries `parameters`, so an
+/// annotated one is typed where it used to give nothing.
+#[test]
+fn a_parameter_in_signature_or_type_position_is_typed() {
+    for source in [
+        "interface F { (a: number): void }",
+        "interface F { new (a: number): F }",
+        "type F = new (a: number) => F;",
+        "type F = (a: number) => void;",
+    ] {
+        assert_eq!(
+            type_of_use(source, "a"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}

@@ -322,31 +322,43 @@ you chose.
 the error is exactly that, "this pattern can never match", which is easy to read as "this
 node type does not exist". Check the grammar's child order before rewriting the node names.
 
-**Four of the eighteen node kinds that carry `type_parameters` were not scopes, and the wrong
+**Ten of the eighteen node kinds that carry `type_parameters` were not scopes, and the wrong
 answer they produced was a confident one.** `SCOPE_KINDS` in `crates/lanekeep-lang-js/src/binding.rs`
 decides which nodes `declaration_entry` asks for that field. `tree-sitter-typescript` 0.23.2's
 `typescript/src/node-types.json` declares the field on eighteen kinds; eight were already scopes.
-`abstract_class_declaration`, `interface_declaration`, `type_alias_declaration` and
-`function_signature` were missing, so a type parameter declared on any of them was invisible, the
-scope walk escaped outward, and `type Amount = number; interface O<Amount> { x: Amount }` typed
-`x` as **`number`** — identical in every byte to a declared `number`, with nothing to say a type
-parameter had been passed over. `lanekeep/no-restricted-types` reported conforming code because of
-it, while the same program spelled `class` rather than `abstract class` was correctly silent.
+The other ten were missing, so a type parameter declared on any of them was invisible, the scope
+walk escaped outward, and `type Amount = number; interface O<Amount> { x: Amount }` typed
+the annotation on `x` as **`number`** — identical in every byte to a declared `number`, with
+nothing to say a type parameter had been passed over. `lanekeep/no-restricted-types` reported
+conforming code because of it, while the same program spelled `class` rather than
+`abstract class` was correctly silent.
 
-Four carriers are still missing: `call_signature`, `construct_signature`, `constructor_type`
-and `function_type`, tracked as [#208](https://github.com/fmsouza/lanekeep/issues/208) with the
-two method signatures now landed. **All four also carry `parameters`**, so each would widen
-parameter resolution as `function_signature` and `method_signature` did, and each needs its own
-before and after measurement. Until then, `type A = number; type F = <A>(x: A) => A` still
-resolves the annotation to `number`, because `function_type` carries the type parameters and
-the enclosing `type_alias_declaration` does not.
+Nothing remains. #207 added `abstract_class_declaration`, `interface_declaration`,
+`type_alias_declaration` and `function_signature`; #208 added `abstract_method_signature`,
+`call_signature`, `construct_signature`, `constructor_type`, `function_type` and
+`method_signature`. Every kind the grammar declares the field on is a scope, and the reproducer
+answers honestly: `type A = number; interface I { m<A>(x: A): A }` types the annotation as
+nothing at all, because a type parameter is whatever the call site chose.
 
-And the reproducer that has been written down here twice is not the one that reproduces. The
-issue and this entry both said `interface I { m<A>(x: A): A }` "types `x` as `number`". It does
-not: with the signature outside `SCOPE_KINDS` the walk from `x` finds no declaration at all and
-the oracle answers nothing. The confident wrong answer arrives through the **annotation**, which
-is what the fixtures assert — and it is why every one of them writes `: A` as the return type,
-so the last `type_annotation` in the file is never a dead `: void`.
+**Every kind #208 added also carries `parameters`, and of #207's four only `function_signature`
+does** — `abstract_class_declaration`, `interface_declaration` and `type_alias_declaration`
+declare none, so for those three the fix was the whole change. For the other seven it was a
+widening as well: a parameter annotated inside an ambient function, a method or call or construct
+signature, an abstract member, a constructor type or a function type is typed where it used to
+give nothing, and `lanekeep/no-restricted-types` reports it. Each was measured before and after in
+the change that landed it; the counts are in those pull requests rather than here, because a
+number written out in prose is the spelling no pattern matches and no test covers.
+`every_carrier_the_grammar_declares_is_a_scope` in `binding.rs` reads both facts off
+`node-types.json` — which kinds carry the field, and which of those carry `parameters` — so the
+next drift fails a test instead of waiting for a reader.
+
+And the reproducer this entry carried for a while was not one. Both this file and #208 said
+`interface I { m<A>(x: A): A }` "types `x` as `number`". It did not — with the signature outside
+`SCOPE_KINDS` the walk from `x` found no declaration at all and the oracle answered nothing. The
+confident wrong answer arrived through the **annotation**, which is why the fixtures assert
+`type_of_last(source, "type_annotation")` and why every one of them writes `: A` as the return
+type: a signature written `: void` puts a dead annotation last in the file, and a fixture anchored
+there asserts nothing.
 
 This entry has now carried four wrong claims about its own subject, and they are worth listing
 because the shape repeats: nine carriers, then twelve, then "four of the six carry `parameters`",
@@ -356,8 +368,10 @@ reading `node-types.json`, which is where the field is declared and where no sam
 incomplete.
 
 The fourth was deleted rather than corrected, and that is the remedy worth copying. Each wrong
-claim was a *characterization* — a grouping, a proportion, a total — that nothing depended on. What
-the entry needs is three facts: six remain, all six carry `parameters`, and the reproducer above.
+claim was a *characterization* — a grouping, a proportion, a total — that nothing depended on.
+What the entry needs is three facts: which kinds carry the field, which of those also carry
+`parameters`, and the reproducer above — and the first two are now read off the declaration by a
+test rather than written down.
 When a replacement for a false claim keeps coming back false, stop replacing it and cut it.
 
 The measurement is the part worth copying, and it is also where the first pass at this entry went
@@ -371,6 +385,11 @@ generic construct — the sample looked complete and was not, and nothing about 
 sample either way, which is exactly why a wrong total survives review. Read `node-types.json`,
 where the field is *declared*, instead: a source-of-truth listing cannot omit a kind by accident
 the way a hand-written sample can.
+
+A fifth nearly shipped with #208's own change — "every one of the ten also carries `parameters`",
+wrong for the three declaration kinds — and review caught it before it merged. A near miss rather
+than a fifth instance, and the reason the test exists: a claim about `node-types.json` that a
+test reads off `node-types.json` cannot drift the way a sentence does.
 
 **A raw control character in a rule's source reports a parse failure somewhere else.** A NUL
 written into a template literal made the stripper report an error at the enclosing

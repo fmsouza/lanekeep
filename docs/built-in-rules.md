@@ -291,12 +291,13 @@ a parameter's or a declarator's annotation are all governed on the same terms.
 Modifiers do not hide a field: `readonly`, `private`, `static`, `abstract` and a `declare class`
 body all report, as does a field carrying both an annotation and an initializer.
 
-**A parameter is governed wherever it is declared, including inside a signature that has no
-body.** An interface method's parameter and an abstract member's parameter are read exactly as an
-ordinary function's are, so `interface Wallet { credit(amount: number): void }` reports. That was
-silent until the resolver treated those signatures as scopes: the query matched the parameter all
-along and the oracle could not type it, so the rule ran and found nothing, which reads the same as
-a conforming file.
+**A parameter is governed wherever it is declared, including in a signature or a type that has
+no body.** An interface method, a call signature, a construct signature, an abstract member, a
+constructor type and a function type all read their parameters exactly as an ordinary function
+does, so `interface Wallet { credit(amount: number): void }` and
+`type Credit = (amount: number) => void` both report. All of that was silent until the resolver
+treated those shapes as scopes: the query matched the parameters all along and the oracle could
+not type them, so the rule ran and found nothing, which reads the same as a conforming file.
 
 A member is a candidate only when it is *annotated*. A class field written `amount = 1` has no
 type annotation to read, and typing it would mean reading the initializer — a different claim,
@@ -317,6 +318,7 @@ than from the shape being out of scope. Which of the two it is matters, because 
 | `class O { get amount(): number }` | a getter is a method, not a field | out of scope |
 | `class O { amount = 1 }` | no `type:` annotation for the query to capture | out of scope |
 | `interface O { amount: () => number }` | a function type is one the oracle says nothing about | **matched** — the handler runs and `typeOf` answers `undefined` |
+| `type F = <A>(amount: A) => A` | a type parameter is whatever the call site chose | **matched** — the handler runs and `typeOf` answers `undefined` |
 | `function f({ amount }: Money)` | the destructured *binding* is not read, and `Money` is named elsewhere | out of scope — `{ amount }` is an `object_pattern`, not the `identifier` the parameter clause requires, and a bare `Money` holds no `property_signature` |
 
 The destructured parameter deserves its exact statement, because it is half covered.

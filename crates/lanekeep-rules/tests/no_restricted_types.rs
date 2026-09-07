@@ -562,6 +562,7 @@ fn a_type_parameter_on_a_member_is_not_a_violation() {
         "interface Order<T> { amount: T }\n",
         "type Order<T> = { amount: T };\n",
         "abstract class Order<T> { abstract amount: T }\n",
+        "type F = <A>(amount: A) => A;\n",
     ] {
         tester(MONEY)
             .accepts(source)
@@ -668,4 +669,95 @@ fn the_required_type_on_an_abstract_method_signature_parameter_is_accepted() {
              abstract class Wallet {\n  abstract credit(amount: Decimal): void\n}\n",
         )
         .expect("a Decimal amount conforms in an abstract member as anywhere else");
+}
+
+/// A call signature's parameter — an interface that is callable rather than one with a
+/// method. Same widening, one node kind further from anything with a name.
+#[test]
+fn a_forbidden_primitive_on_a_call_signature_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at("interface Fee {\n  (amount: number): void\n}\n", &[(2, 4)])
+        .expect("a callable interface's parameter is a governed value too");
+}
+
+/// The control.
+#[test]
+fn a_call_signature_parameter_outside_the_convention_is_accepted() {
+    tester(MONEY)
+        .accepts("interface Fee {\n  (retries: number): void\n}\n")
+        .expect("`retries` is not money, in a call signature as anywhere else");
+}
+
+/// A construct signature's parameter. Its result field is spelled `type` rather than
+/// `return_type` — the resolver reads neither, which is why the oracle fixtures in
+/// `crates/lanekeep-types/tests/oracle.rs` write the same name in both positions instead of
+/// relying on which one comes last.
+#[test]
+fn a_forbidden_primitive_on_a_construct_signature_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "interface Wallet {\n  new (amount: number): Wallet\n}\n",
+            &[(2, 8)],
+        )
+        .expect("a constructor described in an interface governs its parameters too");
+}
+
+/// The control.
+#[test]
+fn a_construct_signature_parameter_outside_the_convention_is_accepted() {
+    tester(MONEY)
+        .accepts("interface Wallet {\n  new (retries: number): Wallet\n}\n")
+        .expect("`retries` is not money");
+}
+
+/// The two type-position kinds, where the design predicted silence and the rule reports.
+///
+/// §1 of the epic design calls these "fix only", on the reasoning that a parameter in pure
+/// type position is never read. It is read here: this rule captures the parameter's own
+/// declaring identifier and asks `typeOf` about it, which is the same path that made
+/// `declare function credit(amount: number)` report when `function_signature` became a scope
+/// in #207. A callback type that declares money as a `number` is exactly the convention
+/// violation the rule exists for, so the answer is wanted — but it was predicted wrong, and
+/// the prediction is what these two fixtures exist to correct.
+#[test]
+fn a_forbidden_primitive_on_a_function_type_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at("type Credit = (amount: number) => void;\n", &[(1, 16)])
+        .expect("a function type's parameter is read at its declaration site");
+}
+
+#[test]
+fn a_forbidden_primitive_on_a_constructor_type_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "type MakeWallet = new (amount: number) => Wallet;\n",
+            &[(1, 24)],
+        )
+        .expect("a constructor type's parameter is read the same way");
+}
+
+/// The control for both.
+#[test]
+fn a_type_position_parameter_outside_the_convention_is_accepted() {
+    tester(MONEY)
+        .accepts("type Retry = (retries: number) => void;\n")
+        .expect("`retries` is not money in a type position either");
+}
+
+/// The must-not-accuse half for the four positions this change opened: a governed name carrying
+/// the required type stays silent in each. "A rule that accuses conforming code is the one failure
+/// this design forbids", and a widening is exactly where that failure would enter — the `retries`
+/// controls above pass whatever the oracle answers, so they cannot see it.
+#[test]
+fn the_required_type_in_signature_or_type_position_is_accepted() {
+    for source in [
+        "import { Decimal } from 'decimal.js';\ninterface Fee {\n  (amount: Decimal): void\n}\n",
+        "import { Decimal } from 'decimal.js';\ninterface Wallet {\n  new (amount: Decimal): Wallet\n}\n",
+        "import { Decimal } from 'decimal.js';\ntype Credit = (amount: Decimal) => void;\n",
+        "import { Decimal } from 'decimal.js';\ntype MakeWallet = new (amount: Decimal) => Wallet;\n",
+    ] {
+        tester(MONEY)
+            .accepts(source)
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
 }
