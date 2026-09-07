@@ -735,7 +735,8 @@ as sound as one over the whole tree, and a pre-commit hook is where this rule do
 
 The analysis is intra-procedural (per function), flow-sensitive with reaching-definitions-style
 kill (a later clean reassignment of the same binding cuts an earlier taint), but deliberately
-**path-insensitive** and **field-insensitive** — a may-analysis that leans toward false
+**path-insensitive** and **index-insensitive**, and **field-sensitive only to a depth of three
+segments** — a may-analysis that leans toward false
 positives rather than false negatives. Concretely, against this rule's own acceptance fixtures
 in `crates/lanekeep-rules/tests/no_secret_in_string.rs`:
 
@@ -750,7 +751,14 @@ in `crates/lanekeep-rules/tests/no_secret_in_string.rs`:
 | `const { x } = getSecret(); log(x);` | **no** — documented v1 false negative | a binding introduced by destructuring is not tracked in v1 |
 | `for (const x of getSecret()) { log(x); }` | **no** — documented v1 false negative | a binding introduced by a `for...of` header is not tracked in v1 |
 | `let msg = ""; msg += getSecret(); log(msg);` | yes | augmented assignment (`+=`, `\|\|=`, …) is a weak update — tainted-iff-RHS, and it never kills prior taint |
-| `o.secret = getSecret(); log(o.public);` | yes — documented over-approximation | field-insensitive: tainting one field taints the whole binding, and every field read from it |
+| `o.secret = getSecret(); log(o.public);` | **no** | field-sensitive: `o.public` and `o.secret` are incomparable access paths |
+| `o.secret = getSecret(); log(o.secret);` | yes | the read is the path that was written |
+| `o.a.b = getSecret(); log(o.a);` | yes | a read above a write covers everything under it |
+| `const s = getSecret(); log(s.length);` | **no** | `length`, `byteLength`, `byteOffset` and `size` describe a value rather than carrying it; `log(s.buffer)` and `log(s.mnemonic)` still report |
+| `a[0] = getSecret(); log(a[1]);` | yes — documented over-approximation | index-insensitive: every subscript is one access-path segment, so `a[0]` and `a[1]` are the same path; a subscript is an unknown key, so `o[k] = getSecret(); log(o.secret)` reports as it always did |
+| `o.a.b.c.d = getSecret(); log(o.a.b.c.e);` | yes — documented over-approximation | past three segments a path is widened, and the widened path is top for its subtree |
+| `const o = { secret: getSecret() }; log(o.public);` | yes — documented over-approximation | an object literal is one expression to the analysis: a contained source taints every path asked of the binding; field sensitivity applies to writes |
+| `o.length = getSecret(); log(o.length);` | **no** — documented v1 false negative | a shape property is cut on read whatever was written there; no `flow` lever restores it, a separate `query`/`check` can report the site |
 | `const s = getSecret(); if (isTest) { log(s); }` | yes — documented, path-insensitive | the analysis asks only whether some path reaches the read, never whether that branch runs |
 | two branches each doing `s = getSecret()`, one `log(s)` after | yes, **twice** | two distinct sources reaching one sink are two distinct findings, not deduplicated into one — deduplication only collapses a *single* source reaching one sink by more than one path |
 
