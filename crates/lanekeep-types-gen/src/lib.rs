@@ -647,12 +647,21 @@ const SYMBOL_INFO: &str = "\
 export interface SymbolInfo {
   /**
    * The name as it appears at the use site, not at the declaration. For a renamed import —
-   * `import { Decimal as Money }` — this is the local alias `Money`, never the exported
-   * name `Decimal`. Comparing this field against an expected export name therefore rejects
-   * a renamed import of the right type; `module` is the reliable field for \"did this come
-   * from there\".
+   * `import { Decimal as Money }` — this is the local alias `Money`. It is the spelling to
+   * quote in a message, because it is the spelling the reader has in front of them; compare
+   * `exported` when the question is which export of a module this is.
    */
   name: string
+  /**
+   * The name the module exports this under. `Decimal` for `import { Decimal }` and for
+   * `import { Decimal as Money }` alike — copied even when nothing was renamed, so a
+   * comparison never needs a fallback to `name` that would silently accept every plain
+   * import if it were forgotten. `default` for a default import, which is the name the
+   * module really exports it as and never the local one. Absent for a namespace import,
+   * which binds the module object and has no single exported name, and absent for a local
+   * declaration, which was not imported at all.
+   */
+  exported?: string
   /**
    * The module it was imported from. Absent for a local declaration — that absence is what
    * distinguishes an imported `Decimal` from a local class that happens to share the name.
