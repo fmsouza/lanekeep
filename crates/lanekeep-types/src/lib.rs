@@ -22,12 +22,14 @@
 mod builtin;
 mod oracle;
 mod provider;
+mod resolve;
 mod table;
 mod types;
 
 pub use builtin::BuiltinProvider;
 pub use oracle::{TypeScriptOracle, TypeScriptSupport};
 pub use provider::{BeginRunError, Query, TypeProvider};
+pub use resolve::resolve_specifier;
 pub use types::{Primitive, Symbol, Type};
 
 /// What this oracle *is*, as a digest of every source file that decides an answer.
