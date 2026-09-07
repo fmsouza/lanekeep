@@ -655,3 +655,342 @@ fn an_extension_probe_beats_the_index_fallback_when_both_exist() {
         Some(FilePath::new("src/x.ts"))
     );
 }
+
+use lanekeep_types::{Declaration, Exported};
+
+/// One parsed declaration file, read through the provider the way a real lookup does.
+fn declaration(test: &str, source: &str) -> (Project, std::sync::Arc<Declaration>) {
+    let project = Project::new(test, &[("d.d.ts", source)]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let decl = provider
+        .declaration(&files, &FilePath::new("d.d.ts"))
+        .expect("the fixture parses");
+    (project, decl)
+}
+
+/// Every export shape the grammar produces, one literal source each.
+///
+/// A table rather than ten functions because the assertion is identical and the *input* is
+/// the whole content of each case — and because a kind added to the walk without a row here
+/// would be untested in a way no coverage number shows.
+#[test]
+fn every_declaration_shape_is_found_by_name() {
+    for (index, (source, name)) in [
+        ("export declare function credit(): number;\n", "credit"),
+        ("export declare const rate: number;\n", "rate"),
+        ("export type Amount = number;\n", "Amount"),
+        ("export interface Order { amount: number }\n", "Order"),
+        ("export declare class Decimal {}\n", "Decimal"),
+        ("export declare abstract class Base {}\n", "Base"),
+        ("declare class Big {}\nexport { Big };\n", "Big"),
+        ("declare class Big {}\nexport { Big as Money };\n", "Money"),
+        ("export declare enum Currency { USD }\n", "Currency"),
+        ("export declare namespace Ns {}\n", "Ns"),
+        ("export declare module \"money\" {}\n", "money"),
+        ("export function* gen() {}\n", "gen"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_project, decl) = declaration(&format!("shape-{index}"), source);
+        assert!(
+            matches!(
+                lanekeep_types::find_export(&decl, name),
+                Some(Exported::Here(_))
+            ),
+            "`{name}` not declared here in: {source}"
+        );
+    }
+}
+
+/// A re-export names another module rather than a node in this file.
+#[test]
+fn a_named_re_export_points_at_another_module() {
+    let (_project, decl) = declaration(
+        "named-re-export",
+        "export { Decimal as Money } from './core';\n",
+    );
+    let Some(Exported::From { specifier, name }) = lanekeep_types::find_export(&decl, "Money")
+    else {
+        panic!("a named re-export is not a local declaration");
+    };
+    assert_eq!(specifier, "./core");
+    assert_eq!(
+        name, "Decimal",
+        "the walk follows the exported name, not the alias"
+    );
+}
+
+/// `export * from` is the fallback, and only the fallback.
+///
+/// Both halves: a name the file declares itself is **not** answered by the star, and a name
+/// it does not declare is. Without the first half, an implementation that always returned the
+/// star list would pass — and it would then walk into another file for a name that is right
+/// here, which is a different declaration with the same spelling.
+#[test]
+fn a_star_export_answers_only_a_name_this_file_does_not_declare() {
+    let (_project, decl) = declaration(
+        "star-export",
+        "export * from './a';\nexport * from './b';\nexport declare const rate: number;\n",
+    );
+    assert!(matches!(
+        lanekeep_types::find_export(&decl, "rate"),
+        Some(Exported::Here(_))
+    ));
+    let Some(Exported::Star(sources)) = lanekeep_types::find_export(&decl, "other") else {
+        panic!("a name nothing here declares falls to the star sources");
+    };
+    assert_eq!(
+        sources,
+        vec!["./a".to_owned(), "./b".to_owned()],
+        "source order"
+    );
+}
+
+#[test]
+fn a_namespace_re_export_is_recognized_and_has_no_declaration() {
+    let (_project, decl) = declaration("namespace-re-export", "export * as core from './core';\n");
+    assert!(matches!(
+        lanekeep_types::find_export(&decl, "core"),
+        Some(Exported::Namespace { .. })
+    ));
+}
+
+/// The two spellings of a default export, and the one that has a declared name.
+#[test]
+fn a_default_export_is_found_under_the_name_default() {
+    for (index, (source, declared)) in [
+        ("export default class Big {}\n", Some("Big")),
+        ("declare class Big {}\nexport default Big;\n", Some("Big")),
+        ("declare class Big {}\nexport = Big;\n", Some("Big")),
+        ("export default 1;\n", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (_project, decl) = declaration(&format!("default-export-{index}"), source);
+        let Some(Exported::Here(node)) = lanekeep_types::find_export(&decl, "default") else {
+            panic!("no default export in: {source}");
+        };
+        assert_eq!(
+            lanekeep_types::declared_name(&decl, node),
+            declared.map(str::to_owned),
+            "{source}"
+        );
+    }
+}
+
+/// `declared_name` unquotes a string-named module, matching `declares()`'s own comparison.
+///
+/// `declares()` already compares `unquote(text(decl, bound))` against the wanted name, so
+/// `find_export` locates `"money"` by its bare spelling either way. `declared_name` read the
+/// node's raw text, so asking it what the found declaration is *called* answered `"money"`
+/// with the quotes still on — a name nothing outside this file would ever ask for.
+#[test]
+fn declared_name_unquotes_a_string_named_module() {
+    let (_project, decl) =
+        declaration("string-module-name", "export declare module \"money\" {}\n");
+    let Some(Exported::Here(node)) = lanekeep_types::find_export(&decl, "money") else {
+        panic!("a string-named module is found by its unquoted name");
+    };
+    assert_eq!(
+        lanekeep_types::declared_name(&decl, node),
+        Some("money".to_owned()),
+        "the declared name must not carry the quotes `declares()` already stripped"
+    );
+}
+
+/// A barrel file: a re-export before a local declaration must not hide the declaration.
+///
+/// `declared_here` walks every top-level statement; a re-export carries no `declaration`
+/// field, and reading that field with `?` returned `None` for the whole file the moment one
+/// appeared — the first `export { X } from` in a `.d.ts` made every later local export
+/// invisible. Pinned with the shape real barrel files have.
+#[test]
+fn a_re_export_before_a_local_declaration_does_not_hide_it() {
+    let (_project, decl) = declaration(
+        "barrel-re-export",
+        "export { X } from './other';\ndeclare class Big {}\nexport { Big };\n",
+    );
+    let Some(Exported::Here(node)) = lanekeep_types::find_export(&decl, "Big") else {
+        panic!("a local export after a re-export must still be found");
+    };
+    assert_eq!(
+        lanekeep_types::declared_name(&decl, node),
+        Some("Big".to_owned())
+    );
+}
+
+/// The same barrel shape, reached through the default-export-by-identifier path rather than
+/// through `export { Big }` — a second call site into the same `declared_here` walk.
+#[test]
+fn a_re_export_before_a_default_export_by_identifier_does_not_hide_it() {
+    let (_project, decl) = declaration(
+        "barrel-re-export-default",
+        "export { X } from './other';\ndeclare class Big {}\nexport default Big;\n",
+    );
+    let Some(Exported::Here(node)) = lanekeep_types::find_export(&decl, "default") else {
+        panic!("a default export by identifier after a re-export must still be found");
+    };
+    assert_eq!(
+        lanekeep_types::declared_name(&decl, node),
+        Some("Big".to_owned())
+    );
+}
+
+/// A library `.d.ts` is parsed once per run whatever imports it.
+///
+/// The claim the declaration cache exists for, asserted through identity rather than through
+/// timing: two lookups of one path hand back the same allocation, so nothing between them
+/// re-parsed. A timing assertion would be a flake on a loaded machine.
+#[test]
+fn a_declaration_file_is_parsed_once_per_run() {
+    let project = Project::new(
+        "declaration-cache",
+        &[("lib.d.ts", "export declare const rate: number;\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let path = FilePath::new("lib.d.ts");
+
+    let first = provider.declaration(&files, &path).expect("parses");
+    let second = provider.declaration(&files, &path).expect("cached");
+    assert!(std::sync::Arc::ptr_eq(&first, &second), "parsed twice");
+    assert_eq!(files.dependencies().len(), 1, "read twice");
+}
+
+/// A path that is not there is remembered as absent, and remembered once.
+#[test]
+fn a_missing_declaration_file_is_memoized_as_a_miss() {
+    let project = Project::new("declaration-miss", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let path = FilePath::new("lib.d.ts");
+
+    assert!(provider.declaration(&files, &path).is_none());
+    assert!(provider.declaration(&files, &path).is_none());
+    let reads = files.dependencies();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(
+        reads[0].hash, None,
+        "an absence is a dependency with a null hash"
+    );
+}
+
+use lanekeep_types::ExportTarget;
+
+/// A chain of re-exports ends at the file and the name that declare the thing.
+#[test]
+fn a_re_export_chain_ends_at_the_declaring_file_and_name() {
+    let project = Project::new(
+        "chain",
+        &[
+            ("src/a.ts", ""),
+            (
+                "node_modules/money/package.json",
+                r#"{"types": "./index.d.ts"}"#,
+            ),
+            (
+                "node_modules/money/index.d.ts",
+                "export { Decimal as Big } from './core';\n",
+            ),
+            (
+                "node_modules/money/core.d.ts",
+                "export declare class Decimal {}\n",
+            ),
+        ],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let entry = resolve_specifier(&files, &FilePath::new("src/a.ts"), "money").expect("resolves");
+
+    assert_eq!(
+        provider.export_target(&files, &entry, "Big"),
+        Some(ExportTarget {
+            file: FilePath::new("node_modules/money/core.d.ts"),
+            name: "Decimal".to_owned(),
+        })
+    );
+}
+
+/// `export *` is followed, in source order, and the first file that has the name wins.
+#[test]
+fn a_star_re_export_is_followed_in_source_order() {
+    let project = Project::new(
+        "star-chain",
+        &[
+            ("src/a.ts", ""),
+            (
+                "node_modules/money/package.json",
+                r#"{"types": "./index.d.ts"}"#,
+            ),
+            (
+                "node_modules/money/index.d.ts",
+                "export * from './a';\nexport * from './b';\n",
+            ),
+            (
+                "node_modules/money/a.d.ts",
+                "export declare class Other {}\n",
+            ),
+            (
+                "node_modules/money/b.d.ts",
+                "export declare class Decimal {}\n",
+            ),
+        ],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let entry = resolve_specifier(&files, &FilePath::new("src/a.ts"), "money").expect("resolves");
+
+    assert_eq!(
+        provider.export_target(&files, &entry, "Decimal"),
+        Some(ExportTarget {
+            file: FilePath::new("node_modules/money/b.d.ts"),
+            name: "Decimal".to_owned(),
+        })
+    );
+}
+
+/// A cycle terminates rather than running away, and answers nothing.
+///
+/// `export * from` in both directions is a shape real packages ship, and the bound alone
+/// would only turn an infinite walk into a slow one — the visited set is what makes it fast.
+#[test]
+fn a_star_re_export_cycle_terminates() {
+    let project = Project::new(
+        "star-cycle",
+        &[
+            ("src/a.ts", ""),
+            (
+                "node_modules/money/package.json",
+                r#"{"types": "./index.d.ts"}"#,
+            ),
+            ("node_modules/money/index.d.ts", "export * from './a';\n"),
+            ("node_modules/money/a.d.ts", "export * from './index';\n"),
+        ],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let entry = resolve_specifier(&files, &FilePath::new("src/a.ts"), "money").expect("resolves");
+
+    assert_eq!(provider.export_target(&files, &entry, "Missing"), None);
+}
+
+/// A named re-export of a name that does not exist anywhere answers nothing.
+#[test]
+fn a_re_export_of_a_name_nothing_declares_answers_nothing() {
+    let project = Project::new(
+        "chain-dead-end",
+        &[
+            ("lib.d.ts", "export { Gone } from './core';\n"),
+            ("core.d.ts", "export declare class Decimal {}\n"),
+        ],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    assert_eq!(
+        provider.export_target(&files, &FilePath::new("lib.d.ts"), "Gone"),
+        None
+    );
+}

@@ -41,6 +41,29 @@ const REQUIRED_KINDS: &[&str] = &[
     "binary_expression",
     "unary_expression",
     "call_expression",
+    // The declaration walk's own vocabulary (`declarations.rs`). A grammar without these
+    // cannot answer a cross-file question, and probing for them here is what keeps the
+    // provider from opening a file it has no way to read.
+    "export_statement",
+    "export_clause",
+    "export_specifier",
+    "namespace_export",
+    "ambient_declaration",
+    "lexical_declaration",
+    "variable_declaration",
+    "function_signature",
+    "function_declaration",
+    "generator_function_declaration",
+    "class_declaration",
+    "abstract_class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "module",
+    "internal_module",
+    "class_heritage",
+    "extends_clause",
+    "extends_type_clause",
+    "import_statement",
 ];
 
 /// How far the oracle will follow a chain before giving up.

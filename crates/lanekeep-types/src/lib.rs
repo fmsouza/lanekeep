@@ -20,6 +20,7 @@
 //! bytes it was handed.
 
 mod builtin;
+mod declarations;
 mod oracle;
 mod provider;
 mod resolve;
@@ -27,6 +28,9 @@ mod table;
 mod types;
 
 pub use builtin::BuiltinProvider;
+pub use declarations::{
+    Declaration, ExportTarget, Exported, declared_here, declared_name, find_export,
+};
 pub use oracle::{TypeScriptOracle, TypeScriptSupport};
 pub use provider::{BeginRunError, Query, TypeProvider};
 pub use resolve::resolve_specifier;

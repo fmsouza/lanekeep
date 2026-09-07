@@ -13,14 +13,25 @@
 //! locks can panic, and refusing to answer because an unrelated worker died would turn a
 //! rule's question into a failure with nothing to do with it.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use lanekeep_core::{FileAccess, FilePath};
 use lanekeep_lang::Language;
 
+use crate::declarations::{Declaration, ExportTarget, Exported, declared_name, find_export};
 use crate::oracle::{TypeScriptOracle, TypeScriptSupport};
 use crate::provider::{Query, TypeProvider};
+use crate::resolve::resolve_specifier;
 use crate::types::{Symbol, Type};
+
+/// How far a chain of re-exports is followed.
+///
+/// The same figure the oracle's own recursion bound uses, for the same reason: exceeding it
+/// is indistinguishable from not knowing, which is already a first-class answer. Fixed rather
+/// than measured — a bound that depended on elapsed time would put the clock in the cache key.
+const MAX_EXPORT_DEPTH: u32 = 16;
 
 /// The provider that reads declaration files with this crate's own oracle.
 pub struct BuiltinProvider {
@@ -31,6 +42,19 @@ pub struct BuiltinProvider {
     /// and sibling declaration files, which are not in the corpus and have no shared tree.
     ///
     parser: Mutex<tree_sitter::Parser>,
+    /// Declaration files parsed so far this run, by path.
+    ///
+    /// A `BTreeMap`, per the ordering invariant, and behind a lock because rayon runs one
+    /// worker per file and they share this provider. A library's `.d.ts` is parsed once
+    /// whatever imports it, which is the difference between a 500 KB `typescript.d.ts` costing
+    /// tens of milliseconds once and costing them per importing file.
+    declarations: Mutex<BTreeMap<FilePath, Arc<Declaration>>>,
+    /// Paths that were not there.
+    ///
+    /// Separate from the map rather than an `Option` value in it, so the common lookup does
+    /// not allocate an `Option<Arc<_>>` per hit. The read itself is already recorded by
+    /// `FileAccess`; this only stops the provider re-asking within one run.
+    misses: Mutex<BTreeSet<FilePath>>,
 }
 
 impl fmt::Debug for BuiltinProvider {
@@ -59,11 +83,12 @@ impl BuiltinProvider {
         Some(Self {
             support,
             parser: Mutex::new(parser),
+            declarations: Mutex::new(BTreeMap::new()),
+            misses: Mutex::new(BTreeSet::new()),
         })
     }
 
     /// The parser, whether or not another thread died holding it.
-    #[expect(dead_code, reason = "called starting in Task 7's declaration walk")]
     fn parser(&self) -> MutexGuard<'_, tree_sitter::Parser> {
         self.parser.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -71,6 +96,104 @@ impl BuiltinProvider {
     /// An oracle over the file a question is about.
     fn oracle<'q>(&self, q: &Query<'q>) -> TypeScriptOracle<'q> {
         TypeScriptOracle::new(&self.support, q.tree, q.source)
+    }
+
+    /// The parsed declaration file at `path`, read and parsed once per run.
+    ///
+    /// `None` when nothing is there, when it is not text, or when the grammar refuses it —
+    /// three different reasons and one answer, because a rule can do nothing different with
+    /// any of them and a rule that branched on the difference would give different answers on
+    /// different machines.
+    #[must_use]
+    pub fn declaration(&self, files: &FileAccess, path: &FilePath) -> Option<Arc<Declaration>> {
+        if self.misses().contains(path) {
+            return None;
+        }
+        if let Some(found) = self.declarations().get(path) {
+            return Some(Arc::clone(found));
+        }
+
+        let Ok(Some(source)) = files.read(path.as_str()) else {
+            self.misses().insert(path.clone());
+            return None;
+        };
+        let Some(parsed) = Declaration::parse(path.clone(), source, &mut self.parser()) else {
+            self.misses().insert(path.clone());
+            return None;
+        };
+        let parsed = Arc::new(parsed);
+        self.declarations()
+            .insert(path.clone(), Arc::clone(&parsed));
+        Some(parsed)
+    }
+
+    fn declarations(&self) -> MutexGuard<'_, BTreeMap<FilePath, Arc<Declaration>>> {
+        self.declarations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn misses(&self) -> MutexGuard<'_, BTreeSet<FilePath>> {
+        self.misses.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Follow `name` from `file` through re-exports to the file and name that declare it.
+    ///
+    /// `None` when a link cannot be read, when the name is nowhere, or when the chain
+    /// exceeded `MAX_EXPORT_DEPTH` — one answer for the three, because a rule can do
+    /// nothing different with any of them.
+    #[must_use]
+    pub fn export_target(
+        &self,
+        files: &FileAccess,
+        file: &FilePath,
+        name: &str,
+    ) -> Option<ExportTarget> {
+        let mut visited = BTreeSet::new();
+        self.walk_export(files, file, name, 0, &mut visited)
+    }
+
+    fn walk_export(
+        &self,
+        files: &FileAccess,
+        file: &FilePath,
+        name: &str,
+        depth: u32,
+        visited: &mut BTreeSet<(FilePath, String)>,
+    ) -> Option<ExportTarget> {
+        if depth >= MAX_EXPORT_DEPTH {
+            return None;
+        }
+        // The visited set rather than the bound alone. `export * from` in both directions is
+        // a shape real packages ship, and a bound would turn an unbounded walk into a merely
+        // slow one — sixteen files opened and parsed per query, on a corpus, is not a cost
+        // worth paying to reach the same `None`.
+        if !visited.insert((file.clone(), name.to_owned())) {
+            return None;
+        }
+
+        let decl = self.declaration(files, file)?;
+        match find_export(&decl, name)? {
+            Exported::Here(node) => Some(ExportTarget {
+                file: file.clone(),
+                name: declared_name(&decl, node).unwrap_or_else(|| name.to_owned()),
+            }),
+            Exported::From {
+                specifier,
+                name: exported,
+            } => {
+                let next = resolve_specifier(files, file, &specifier)?;
+                self.walk_export(files, &next, &exported, depth.saturating_add(1), visited)
+            }
+            // A module object has no single declaration, so there is nothing to walk to.
+            Exported::Namespace { .. } => None,
+            // Source order, first hit wins: `find_map` short-circuits, so a corpus does not
+            // pay for every star source once one of them answers.
+            Exported::Star(sources) => sources.iter().find_map(|specifier| {
+                let next = resolve_specifier(files, file, specifier)?;
+                self.walk_export(files, &next, name, depth.saturating_add(1), visited)
+            }),
+        }
     }
 }
 
