@@ -190,6 +190,59 @@ fn augmented_assignment_from_a_source_reports() {
         .expect("`msg += getSecret()` taints `msg`, read at the sink");
 }
 
+/// #14 — a shape-property read off a tainted base is clean (#225, C2). `length`,
+/// `byteLength`, `byteOffset` and `size` describe a value rather than carrying it, so the
+/// read is clean while the base stays tainted. This is the whole of what the #220 corpus
+/// calibration measured — `${seed.length}` at `keystore/sign.ts:112` — and closing it is why
+/// that calibration now reports zero. Pinned at the analyzer layer by
+/// `crates/lanekeep-lang-js/src/flow.rs`'s `a_length_read_off_a_tainted_base_is_clean`.
+#[test]
+fn a_shape_property_read_is_clean() {
+    tester()
+        .accepts("function f() { const s = getSecret(); log(s.length); }\n")
+        .expect("`.length` of a secret is not the secret");
+}
+
+/// #14b — the corpus's own declaration shape: `s` is tainted at its root by a ternary of
+/// sources, and the sink still reads only its length.
+#[test]
+fn a_shape_property_read_off_a_ternary_source_is_clean() {
+    tester()
+        .accepts(
+            "function f(c) { const s = c ? getSecret().subarray(0, 32) : getSecret(); \
+             log(s.length); }\n",
+        )
+        .expect("a root taint read through `.length` is still clean");
+}
+
+/// #14c — CONTROL. A *named* field of a secret carries it, and must still report: the shape
+/// table is four names, not "any property". If this went silent, C2 would have closed the
+/// calibration finding by silencing the analysis.
+#[test]
+fn a_named_property_read_off_a_secret_still_reports() {
+    tester()
+        .reports_at(
+            "function f() { const s = getSecret(); log(s.mnemonic); }\n",
+            &[(1, 43)],
+        )
+        .expect("`s.mnemonic` carries the secret");
+}
+
+/// #14d — `byteLength` is in the table and `buffer` deliberately is not: one is the shape,
+/// the other is the bytes.
+#[test]
+fn byte_length_is_clean_and_buffer_is_not() {
+    tester()
+        .accepts("function f() { const s = getSecret(); log(s.byteLength); }\n")
+        .expect("`byteLength` is a shape property");
+    tester()
+        .reports_at(
+            "function f() { const s = getSecret(); log(s.buffer); }\n",
+            &[(1, 43)],
+        )
+        .expect("`buffer` is the value, not its shape");
+}
+
 /// #12 — determinism: two runs over the same input are byte-identical. The two-source fixture
 /// from #10 is the one that would expose a nondeterministic worklist or an unstable dedup/sort,
 /// since it is the only fixture here with more than one flow into the same sink.

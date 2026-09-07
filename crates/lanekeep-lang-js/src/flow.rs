@@ -54,6 +54,29 @@ use crate::cfg::{BlockId, Cfg};
 /// (`crates/lanekeep-types/src/oracle.rs`). Bounds a cyclic `const a = b; const b = a`.
 const MAX_DEPTH: u32 = 16;
 
+/// Property names that describe a value's *shape* rather than carrying the value. A read of
+/// one off a tainted base yields a clean value: `log(s.length)` is silent where `log(s)`,
+/// `log(s.buffer)` and `log(s.mnemonic)` report.
+///
+/// This is the whole of what the #220 calibration measured — `${seed.length}` at
+/// `extensions/keystore-chrome/src/keystore/sign.ts:112`, one logical site reported three
+/// times (`docs/taint-calibration.md`). It cleans the *read*, not the base: the binding stays
+/// tainted for every other read of it.
+///
+/// **Engine-owned and not configurable**, the same standing as [`MAX_DEPTH`]: a stated
+/// discrete bound rather than a similarity knob (#155). **Sorted**, because
+/// [`is_shape_property_read`] searches it with `binary_search`, which answers wrongly and
+/// silently on an unsorted slice — `the_shape_property_table_is_sorted` is what holds it.
+///
+/// **The unsoundness is documented and deliberate, and it has no project-facing lever.** A
+/// project that names a secret field `size` or `length` gets a false negative there —
+/// `o.length = getSecret(); log(o.length)` is silent — and nothing in a `flow` rule can undo
+/// it: a `@sanitizer` only ever cuts, and `checkFlow` runs once per flow the engine found, so a
+/// flow this table suppressed never reaches it. Reporting such a site takes a separate
+/// `query`/`check` beside the `flow` in the same rule. The table is engine-owned so the
+/// tradeoff is one stated fact rather than a knob (#155).
+const SHAPE_PROPERTIES: &[&str] = &["byteLength", "byteOffset", "length", "size"];
+
 /// The JS/TS taint analyzer, returned from [`crate::TypeScript::flow_analyzer`] and its
 /// siblings.
 pub(crate) struct JsFlowAnalyzer;
@@ -192,15 +215,27 @@ impl<'t> Taint<'_, 't> {
         }
         match expr.kind() {
             "identifier" => self.taint_of_identifier(expr, depth),
-            // A field or index read (`o.public`, `a[1]`) is tainted iff its base object is —
-            // the field-insensitive read side (spec §2). Resolve to the base identifier and
-            // reuse the identifier taint logic, which folds in the base's field/index writes
-            // (`weak_reaching_defs`). A read whose base is not a plain identifier (a call
-            // result, `this`) has no binding to consult, so it carries nothing.
-            "member_expression" | "subscript_expression" => match base_identifier(expr) {
-                Some(base) => self.taint_of_identifier(base, depth),
-                None => Vec::new(),
-            },
+            // A field or index read (`o.public`, `a[1]`) is tainted iff its base object is.
+            // Resolve to the base identifier and reuse the identifier taint logic, which folds
+            // in the base's field/index writes (`weak_reaching_defs`). A read whose base is not
+            // a plain identifier (a call result, `this`) has no binding to consult, so it
+            // carries nothing.
+            //
+            // A *shape*-property read is clean whatever the base carries (#225): `s.length`
+            // describes the value rather than being it. The cut is here rather than above the
+            // containment scan, so a source textually inside the read —
+            // `log(getSecret().length)` — is still reported; where the two disagree the
+            // may-taint bias wins, and `a_source_contained_in_a_shape_property_read_still_reports`
+            // pins it.
+            "member_expression" | "subscript_expression" => {
+                if is_shape_property_read(expr, self.source) {
+                    return Vec::new();
+                }
+                match base_identifier(expr) {
+                    Some(base) => self.taint_of_identifier(base, depth),
+                    None => Vec::new(),
+                }
+            }
             // A non-source, non-sanitizer call is opaque: v1 does not follow taint through a
             // call's arguments (the alias-through-call false negative, spec §13). Only a
             // direct source or a local identifier alias carries taint.
@@ -604,6 +639,28 @@ fn base_identifier(node: Node<'_>) -> Option<Node<'_>> {
             _ => return None,
         }
     }
+}
+
+/// Whether `expr` is a `member_expression` whose property names one of [`SHAPE_PROPERTIES`].
+///
+/// The guard on `property_identifier` is what keeps this to the dotted form. A
+/// `subscript_expression` — `s["length"]` — is not cleaned: its index is an arbitrary
+/// expression rather than a name, and reading a name out of it would mean partially
+/// evaluating the program. Pinned by `a_subscripted_shape_property_still_reports`. Only the
+/// outermost read is examined: `s.length.raw` is a read at `[length, raw]` and is not cut.
+fn is_shape_property_read(expr: Node<'_>, source: &str) -> bool {
+    if expr.kind() != "member_expression" {
+        return false;
+    }
+    let Some(property) = expr.child_by_field_name("property") else {
+        return false;
+    };
+    if property.kind() != "property_identifier" {
+        return false;
+    }
+    SHAPE_PROPERTIES
+        .binary_search(&&source[property.byte_range()])
+        .is_ok()
 }
 
 /// Whether `decl` is a value-parameter binding node — the declaration [`JsBindingResolver`] returns
@@ -1303,6 +1360,156 @@ mod tests {
         );
         assert_eq!(flows.len(), 1, "a subscript write taints the whole array");
         assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    // --- C2 (#225): a shape-property read off a tainted base is clean ----------------------
+    //
+    // The one false positive the #220 calibration measured: `${seed.length}` at
+    // extensions/keystore-chrome/src/keystore/sign.ts:112, where `seed` is tainted at its root
+    // and the sink reads its length. `length`, `byteLength`, `byteOffset` and `size` describe
+    // the shape of a value rather than carrying it, so the read is clean — the base is not.
+
+    #[test]
+    fn a_write_to_a_shape_named_property_is_a_documented_false_negative() {
+        // The sharpest case of the deliberate unsoundness above: the *write* lands at
+        // `Field("length")` like any other, and the read is cut before the path is consulted.
+        // Pinned so the cost is a stated fact; the control keeps the base itself reported.
+        for source in [
+            "function f(){ const o = {}; o.length = getSecret(); log(o.length); }",
+            "function f(){ const o = {}; o[\"length\"] = getSecret(); log(o.length); }",
+        ] {
+            let flows = run(source, "getSecret", "log", "redact");
+            assert!(flows.is_empty(), "{source}");
+        }
+        let control = run(
+            "function f(){ const o = {}; o.length = getSecret(); log(o); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(control.len(), 1, "the base still carries the value");
+    }
+
+    #[test]
+    fn a_length_read_off_a_tainted_base_is_clean() {
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s.length); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty(), "`.length` of a secret is not the secret");
+    }
+
+    #[test]
+    fn the_corpus_ternary_form_of_the_length_read_is_clean() {
+        // The measured site's own shape: `seed` is declared from a ternary whose branches are
+        // both sources, so it is tainted at its root by `sources_within` on the initializer —
+        // and the sink still reads only its length.
+        let flows = run(
+            "function f(c){ const s = c ? getSecret().subarray(0, 32) : getSecret(); \
+             log(s.length); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "a root taint read through `.length` is still clean"
+        );
+    }
+
+    #[test]
+    fn a_byte_length_read_off_a_tainted_base_is_clean() {
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s.byteLength); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty(), "`byteLength` is a shape property");
+    }
+
+    #[test]
+    fn a_named_property_read_off_a_tainted_base_still_reports() {
+        // CONTROL, and the reason the table is four names rather than "any property": this is
+        // the shape the corpus's own source query exists to catch. If it went silent, C2 would
+        // have closed the finding by silencing the analysis.
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s.mnemonic); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a named field of a secret carries it");
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn a_buffer_read_off_a_tainted_base_still_reports() {
+        // `buffer` is deliberately absent from the table: it is the bytes, not their shape.
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s.buffer); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "`.buffer` carries the value");
+    }
+
+    #[test]
+    fn a_subscripted_shape_property_still_reports() {
+        // Documented boundary: the cut is on `member_expression`'s `property` field, so the
+        // computed form `s["length"]` is not cleaned. Pinned so the asymmetry is a decision
+        // rather than a discovery.
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s[\"length\"]); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a computed shape property is not cut");
+    }
+
+    #[test]
+    fn a_source_contained_in_a_shape_property_read_still_reports() {
+        // Documented boundary: `taint_of` answers containment before it reaches the member
+        // arm, so a source textually inside the read is not cleaned by C2. The may-taint bias
+        // wins where the two disagree.
+        let flows = run(
+            "function f(){ log(getSecret().length); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "a directly contained source is reported whatever is read off it"
+        );
+    }
+
+    #[test]
+    fn the_shape_property_table_is_sorted() {
+        // `is_shape_property_read` searches it with `binary_search`, which answers wrongly and
+        // silently on an unsorted slice. This is the only thing holding the table in order.
+        let mut sorted = SHAPE_PROPERTIES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(SHAPE_PROPERTIES, sorted.as_slice());
+    }
+
+    #[test]
+    fn a_read_below_a_shape_property_still_reports() {
+        // The cut is on the outer read's own property and nowhere else: `s.length.raw` is a
+        // read at `[length, raw]`, and nothing describes a shape there. Pinned beside its
+        // mirror so the asymmetry is a decision rather than a discovery.
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s.length.raw); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "only the outermost shape read is cut");
     }
 
     // --- Augmented assignment as a weak update (#194 final review) -------------------------
