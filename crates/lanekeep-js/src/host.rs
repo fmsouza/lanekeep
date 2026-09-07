@@ -74,7 +74,12 @@ use lanekeep_types::{Symbol, Type, TypeScriptOracle, TypeScriptSupport};
 ///   the same reporting surface `check` does — so a build with them can produce a verdict a
 ///   build without them could not, which is why the version moves even though no `ctx`
 ///   function was added or changed.
-pub const HOST_API_VERSION: u32 = 5;
+/// - `6` — `ctx.types` widens. `symbolOf`, and the `symbol` nested under a nominal `typeOf`,
+///   carry `exported`: the name the module exports a value under, `default` for a default
+///   import, absent for a namespace import and for a local declaration. A rule can now match
+///   an import by its exported name without rejecting a renamed one, which is a verdict a
+///   build without the field could not reach.
+pub const HOST_API_VERSION: u32 = 6;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1169,12 +1174,16 @@ fn type_text(ty: &Type) -> String {
 /// Render a `Symbol` into the object `ctx.types.symbolOf` hands back, and the one nested
 /// under a rendered `Type`'s `symbol` field.
 ///
-/// `module` is absent for a local declaration rather than `null` — the same posture
-/// `Symbol`'s own doc comment describes: that absence is what distinguishes an imported
-/// `Decimal` from a local class that happens to share the name.
+/// `module` and `exported` are absent rather than `null` where they do not apply — the same
+/// posture `Symbol`'s own doc comment describes. Absence is the answer in both cases: it is
+/// what distinguishes an imported `Decimal` from a local class that happens to share the
+/// name, and a namespace import, which binds the module object, from a named one.
 fn render_symbol<'js>(ctx: &Ctx<'js>, symbol: &Symbol) -> rquickjs::Result<Object<'js>> {
     let object = Object::new(ctx.clone())?;
     object.set("name", symbol.name.clone())?;
+    if let Some(exported) = &symbol.exported {
+        object.set("exported", exported.clone())?;
+    }
     if let Some(module) = &symbol.module {
         object.set("module", module.clone())?;
     }
@@ -2314,6 +2323,47 @@ mod tests {
         assert_eq!(
             run::<String>(&host, &format!("ctx.types.symbolOf({handle}).module")),
             "decimal.js"
+        );
+    }
+
+    /// The exported name reaches a rule beside the use-site one, and a rename is where the
+    /// two differ — which is the whole reason the field exists.
+    ///
+    /// `JSON.stringify` of the whole object rather than a field read, for the reason
+    /// `types_renders_an_ambient_nominal_with_no_symbol_at_all` gives below: the bug worth
+    /// catching is a property being *present* when it should be absent, and no assertion
+    /// about a property's value can see that. It also pins key order, which is the order
+    /// `render_symbol` sets them in.
+    #[test]
+    fn types_exposes_the_exported_name_beside_the_use_site_one() {
+        let host =
+            host_with_types("import { Decimal as Money } from 'decimal.js';\nconst x = Money;");
+        let handle = handle_of(&host, "Money");
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("JSON.stringify(ctx.types.symbolOf({handle}))")
+            ),
+            "{\"name\":\"Money\",\"exported\":\"Decimal\",\"module\":\"decimal.js\"}"
+        );
+    }
+
+    /// A namespace import has a module and no `exported` property at all.
+    ///
+    /// The discriminating pair. A `render_symbol` that always wrote the property — as
+    /// `null`, or defaulting to the use-site name — passes the test above and fails this,
+    /// and a rule branching on `exported` would otherwise read the module object as a named
+    /// export and match a convention it does not satisfy.
+    #[test]
+    fn a_namespace_import_renders_with_no_exported_property() {
+        let host = host_with_types("import * as d from 'decimal.js';\nconst x = d;");
+        let handle = handle_of(&host, "d");
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("JSON.stringify(ctx.types.symbolOf({handle}))")
+            ),
+            "{\"name\":\"d\",\"module\":\"decimal.js\"}"
         );
     }
 
