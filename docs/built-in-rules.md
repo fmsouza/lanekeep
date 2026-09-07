@@ -253,7 +253,7 @@ Each convention:
 | --- | --- | --- |
 | `names` | `string[]` | Glob patterns a parameter's or variable's name must match to be governed. |
 | `forbid` | `string[]` | Primitive type names that are a violation on a governed value — `number`, `string`, `boolean`, `bigint`, `symbol`, `null` or `undefined`, the set the type oracle itself recognizes. |
-| `require` | `{ module: string, name: string }` | Optional. The type that satisfies the convention. Only `module` is matched — a governed value's type must have a symbol imported from it. `name` is what the message says to use instead, and is not checked; see below for why. |
+| `require` | `{ module: string, name: string }` | Optional. The type that satisfies the convention: a governed value's type must have a symbol imported from `module` and exported from it under `name`. A default import satisfies `module` alone — see below. Both fields are required; a `require` missing either is refused when the config loads. |
 | `reason` | `string` | What to tell the reader. Carried into the violation message; falls back to naming `require`, then to a generic message, when it is absent. |
 
 `require` is optional on its own terms: a convention may forbid a primitive without naming a
@@ -353,7 +353,8 @@ Every governed name is asked what its type is:
 | a union with a member whose primitive is in `forbid` | reports |
 | a union with no such member | silent |
 | a named type, when the convention sets no `require` | silent — nothing to check it against |
-| a named type whose symbol was imported from `require`'s module | silent |
+| a named type imported from `require`'s module and exported from it under `require.name`, or as its default export | silent |
+| a named type imported from `require`'s module under any other exported name | reports — a sibling export of the required module is not the required type |
 | a named type from a different module, or with no symbol at all | reports — a wrong or unresolved domain type is still wrong |
 | the oracle could not type it at all (`undefined`) | silent |
 
@@ -369,32 +370,40 @@ cannot attribute to any symbol at all — an ambient or global type such as `Dat
 local declaration or import — is reported on the same terms: a governed value whose type cannot be
 established is not evidence the convention is met.
 
-### `require` is matched on the module and nothing else
+### `require` is matched on the module and on the exported name
 
-`require.name` is not compared against the type. `import { Big } from 'decimal.js'` satisfies a
-convention requiring `Decimal`, because it came from the required module — a false negative, and a
-deliberate one.
+`require.name` is compared against the name the module exports the type under, never against
+the name at the use site. `import { Decimal as Money } from 'decimal.js'` is accepted by a
+convention requiring `Decimal`: the alias is the local spelling, the oracle carries both, and
+the check reads the exported one. `import { Big } from 'decimal.js'` is reported, because a
+sibling export of the required module is not the required type.
 
-The alternative is worse. The type oracle reports a type's name as it is written *at the use site*,
-not as the module exported it, so comparing that name rejects an alias of exactly the required
-type: `import { Decimal as Money } from 'decimal.js'` is conforming code, and a rule that compared
-names reported it with a message about `number`. **A rule that accuses conforming code is the one
-failure this design forbids**, and the whole posture of the type oracle is the same trade — say
-nothing rather than say something wrong. Matching the module alone is the version of the check that
-cannot produce that failure.
+Both halves are checked and neither is redundant, and the shadow is not what shows it: a local
+`class Decimal {}` has no module and no exported name, so it fails the name half first and is
+reported either way. The shape only the module half decides is the required name imported from
+the wrong module — `import { Decimal } from 'big.js'` is reported because `big.js` is not
+`decimal.js`. A `Big` from the right module cannot satisfy `name`, which is the half this rule
+shipped without — under the earlier version it was accepted, and that false negative is what
+`require` being "matched on the module and nothing else" used to mean.
 
-Two consequences to hold. Enabling this rule against a module that exports several types treats
-them as interchangeable, so it is worth pointing `require.module` at the narrowest module that
-exports the type you mean. And `require.name` is still load-bearing for the *message* — with no
-`reason` set it is what the violation says to use instead — so it is worth spelling correctly even
-though nothing checks it.
+**A default import is accepted on the module requirement alone.** `import Decimal from
+'decimal.js'` is exported under the name `default`, which is not what any convention writes in
+`require.name`, so demanding a name match there would report conforming code — and a rule that
+accuses conforming code is the one failure this design forbids. Following a default export to
+the name it is declared under means opening the declaration file, which this oracle does not
+do; until it does, the module is what can honestly be checked, and the narrower acceptance is
+the cost.
+
+`require.name` is load-bearing for the *message* as well as for the check — with no `reason`
+set it is what the violation says to use instead — so it is worth spelling exactly as the
+module exports it.
 
 **`undefined` produces false negatives and never false positives.** The oracle would rather say
 nothing than accuse code it could not read, so a value it cannot type is never reported — even
-when the name matches and the value really is a raw `number`. That silence is bounded by what the
-oracle can see from the parsed file alone: no `tsconfig.json`, no declaration files, no cross-file
-resolution. "No violations" from this rule is a narrower claim than "every governed value
-conforms," and a reader who conflates the two is trusting a report that never looked.
+when the name matches and the value really is a raw `number`. That silence is bounded by what
+the oracle can see from the parsed file alone: no `tsconfig.json`, no declaration files, no
+cross-file resolution. "No violations" from this rule is a narrower claim than "every governed
+value conforms," and a reader who conflates the two is trusting a report that never looked.
 
 ### It is one half of a pair
 
@@ -493,10 +502,10 @@ oracle types `parseFloat(...)` as `number`.
 
 **The callee is matched through the import that bound it, not by the text at the call site.**
 `import { Decimal as Money } from 'decimal.js'` followed by `new Money(parseFloat(x))` is
-reported, because the check follows the binding — which is the question `no-restricted-types`
-cannot ask at all, since the oracle reports a type's name as the use site spells it. `name` is
-the export's own name: `default` for a default import, `*` for a namespace import, and omitted
-to mean "anything from this module".
+reported, because the check follows the binding — which is the same question `no-restricted-types`
+asks of a *type* through the oracle's exported name; here it is asked of a callee, where there is
+no annotation to read. `name` is the export's own name: `default` for a default import, `*` for a
+namespace import, and omitted to mean "anything from this module".
 
 ### The default is the first argument, and that is a deliberate narrowing
 

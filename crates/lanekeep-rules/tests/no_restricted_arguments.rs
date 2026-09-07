@@ -90,8 +90,8 @@ fn a_plain_call_is_reported_too() {
         );
 }
 
-/// The alias — precision `no-restricted-types` cannot reach, because its `require` had to give
-/// up name comparison for the same reason.
+/// The alias, reached through the binding rather than the text — the same precision
+/// `no-restricted-types` gets from `symbol.exported`.
 #[test]
 fn an_aliased_import_of_the_restricted_callee_is_reported() {
     tester(MONEY)

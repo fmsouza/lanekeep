@@ -83,8 +83,9 @@ fn a_convention_listing_the_camel_case_spelling_reports_it() {
         .expect("`*Amount*` is the spelling that catches `totalAmount`");
 }
 
-/// The shadow case. `require` matches on the module a symbol came from, never on its name,
-/// so a local class sharing the name is not the imported type and is still a violation.
+/// The shadow case. `require` matches on the module a symbol came from and on the name that
+/// module exports it under; a local class satisfies neither, so sharing the required name
+/// does not make it the imported type, and it is still a violation.
 #[test]
 fn a_local_type_sharing_the_required_name_is_still_reported() {
     tester(MONEY)
@@ -95,14 +96,15 @@ fn a_local_type_sharing_the_required_name_is_still_reported() {
         .expect("a local Decimal is not decimal.js's");
 }
 
-/// The other half of "matched on the module, never on the name", and the one the shadow case
-/// above cannot stand in for: it is killed by the module comparison alone, so it stayed green
-/// for the whole life of a rule that also compared `symbol.name` and reported this.
+/// The alias half of the exported-name comparison, and the one the shadow case above cannot
+/// stand in for: it is killed by the module comparison alone, so it stayed green for the
+/// whole life of a rule that also compared `symbol.name` and reported this.
 ///
-/// `symbol.name` is the *use-site* name — the oracle fills it from the node's own text and
-/// discards the exported one — so an aliased import of exactly the required type read as a
-/// different type and was accused with a message about `number`. Conforming code, reported.
-/// Pinned here because it is the one failure this rule's whole design forbids.
+/// `symbol.name` is the *use-site* name — the oracle fills it from the node's own text and,
+/// before `Symbol.exported` existed, dropped the exported one, so an aliased import of
+/// exactly the required type read as a different type and was accused with a message about
+/// `number`. Conforming code, reported. Pinned here because it is the one failure this
+/// rule's whole design forbids.
 #[test]
 fn a_renamed_import_of_the_required_type_is_accepted() {
     tester(MONEY)
@@ -113,18 +115,100 @@ fn a_renamed_import_of_the_required_type_is_accepted() {
         .expect("an alias of decimal.js's Decimal is still decimal.js's Decimal");
 }
 
-/// The cost of the fixture above, asserted so nobody discovers it as a surprise: matching on
-/// the module alone accepts *any* export of that module, so a convention requiring `Decimal`
-/// takes a `Big` from the same package. A false negative, and the deliberate trade — the
-/// alternative is the false positive the test above pins.
+/// The false negative the module-only comparison bought, now closed. A sibling export of the
+/// required module is not the required type: `require` is matched on the module *and* on the
+/// name that module exports the type under, so a convention requiring `Decimal` reports a
+/// `Big` from the same package.
+///
+/// The pair for `a_renamed_import_of_the_required_type_is_accepted` above, and neither can
+/// stand in for the other. That one is killed by comparing the use-site name; this one is
+/// killed by comparing nothing but the module — which is precisely the state this rule
+/// shipped in, and why this test used to assert the opposite verdict.
 #[test]
-fn a_different_export_of_the_required_module_is_accepted_too() {
+fn a_different_export_of_the_required_module_is_reported() {
     tester(MONEY)
-        .accepts(
+        .reports_at(
             "import { Big } from 'decimal.js';\n\
              function credit(amount: Big) { return amount; }\n",
+            &[(2, 17)],
         )
-        .expect("the module is all that is matched, so a sibling export passes");
+        .expect("a sibling export of the required module is not the required type");
+}
+
+/// The half only the module comparison decides. The right name from the wrong module carries
+/// `module: 'big.js'` and `exported: 'Decimal'`, so the name half is satisfied and the module
+/// half is what reports it. The local-shadow fixture above cannot stand in for this: a shadow
+/// has neither a module nor an exported name, so it is caught by the name half first, and the
+/// module conjunct could be deleted with that fixture still green.
+#[test]
+fn the_required_name_imported_from_a_different_module_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "import { Decimal } from 'big.js';\n\
+             function credit(amount: Decimal) { return amount; }\n",
+            &[(2, 17)],
+        )
+        .expect("the right name from the wrong module is not the required type");
+}
+
+/// A default import satisfies the module requirement on its own, and the control violation
+/// in the same file is what stops that reading as a rule that simply went quiet.
+///
+/// `import Decimal from 'decimal.js'` is exported under the literal name `default`, which is
+/// not what any convention writes in `require.name`, so a comparison that demanded the name
+/// unconditionally would report conforming code — the one failure this rule's design
+/// forbids. `balance` two lines down is a raw `number` on a governed name and is still
+/// reported, so an implementation that accepted every named type to make the first half pass
+/// fails here. The local name is `Money`, not `Decimal`, so an implementation that copied the
+/// local name into `exported` for a default import fails here too.
+#[test]
+fn a_default_import_of_the_required_module_is_accepted_beside_a_control() {
+    tester(MONEY)
+        .reports_at(
+            "import Money from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n\
+             function settle(balance: number) { return balance; }\n",
+            &[(3, 17)],
+        )
+        .expect("the default import passes and the raw number beside it does not");
+}
+
+/// A `require` without `name` is refused at load, not run. Under the exported-name comparison
+/// a missing `name` would report every conforming import from the module with the message
+/// `use undefined from decimal.js` — the one failure this rule's design forbids — where the
+/// module-only comparison it replaced happened to stay silent. The docs always typed `name`
+/// as required; this is where that became true.
+#[test]
+fn a_require_without_a_name_is_refused_at_load() {
+    // `RuleTester::configured` only writes the fixture; the factory runs when the config is
+    // loaded, which is on the first `run` (here, through `accepts`) rather than here — so
+    // the refusal surfaces as a `TestError::Load` from that call, not from `configured`
+    // itself.
+    let source = lanekeep_rules::source("no-restricted-types").expect("the rule ships");
+    let tester = RuleTester::configured(
+        "no-restricted-types",
+        source,
+        "{ conventions: [{ names: ['*amount*'], forbid: ['number'], \
+         require: { module: 'decimal.js' } }] }",
+    )
+    .expect("configured writes the fixture without running the factory")
+    .with_builtins(lanekeep_rules::source);
+    let error = tester
+        .accepts("function credit(amount: number) { return amount; }\n")
+        .expect_err("a require without a name does not build");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("conventions[0].require needs both `module` and `name`"),
+        "the refusal names the convention and the missing field: {rendered}"
+    );
+}
+
+/// The mirror image, so the guard cannot be satisfied by refusing every `require`.
+#[test]
+fn a_require_with_both_fields_still_builds() {
+    tester(MONEY)
+        .accepts("import { Decimal } from 'decimal.js';\nfunction credit(amount: Decimal) { return amount; }\n")
+        .expect("a complete require builds and accepts the required type");
 }
 
 /// The oracle's initializer path, reached from a declaration-site identifier.

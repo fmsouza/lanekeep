@@ -34,11 +34,13 @@ import { defineRule } from 'lanekeep'
  * types as `undefined`, and reporting on it would accuse code the oracle could not read. False
  * negatives are the price; false positives are the one failure this design forbids.
  *
- * **The callee is resolved through the import, not by name**, which is where this rule is more
- * precise than its sibling. `no-restricted-types`'s `require` had to give up name comparison for
- * exactly this reason — the oracle's `symbol.name` is the use-site name, so comparing it would
- * reject a conforming alias. `ctx.resolvesToImport` answers the question `no-restricted-types`
- * cannot ask at all: `import { Decimal as Money } from 'decimal.js'; new Money(...)` still
+ * **The callee is resolved through the import, not by name**, which is what makes this rule
+ * precise on a value that is never named. `no-restricted-types` follows the same principle
+ * from the other side — its `require` compares the oracle's `symbol.exported`, not the
+ * use-site spelling — so an alias is resolved to what it aliases by both rules — accepted by
+ * `no-restricted-types` when it is the required export, reported here when it is the
+ * restricted callee. `ctx.resolvesToImport` is what lets this one ask the question at a call site:
+ * `import { Decimal as Money } from 'decimal.js'; new Money(...)` still
  * resolves to `decimal.js`'s `Decimal`, because the check follows the binding rather than the
  * text at the call site.
  *
