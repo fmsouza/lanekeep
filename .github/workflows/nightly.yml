@@ -39,7 +39,7 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
         with:
           tool: just,cargo-nextest,cargo-deny,cargo-machete,typos
 
@@ -62,7 +62,7 @@ jobs:
         with:
           toolchain: "1.95.0"
 
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
         with:
           tool: just,cargo-nextest
 
@@ -83,7 +83,7 @@ jobs:
         with:
           toolchain: "1.95.0"
 
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
         with:
           tool: cargo-deny
 
