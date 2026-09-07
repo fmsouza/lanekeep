@@ -19,11 +19,15 @@
 //! by this oracle must still be valid, so nothing here may observe anything outside the
 //! bytes it was handed.
 
+mod builtin;
 mod oracle;
+mod provider;
 mod table;
 mod types;
 
+pub use builtin::BuiltinProvider;
 pub use oracle::{TypeScriptOracle, TypeScriptSupport};
+pub use provider::{BeginRunError, Query, TypeProvider};
 pub use types::{Primitive, Symbol, Type};
 
 /// What this oracle *is*, as a digest of every source file that decides an answer.

@@ -1034,9 +1034,11 @@ name = "lanekeep-types"
 version = "0.8.1"
 dependencies = [
  "blake3",
+ "lanekeep-core",
  "lanekeep-lang",
  "lanekeep-lang-js",
  "lanekeep-lang-python",
+ "serde_json",
  "tree-sitter",
 ]
 

@@ -35,11 +35,12 @@ use rquickjs::{Ctx, Function, Object, Value};
 
 use lanekeep_lang::binding::BindingResolver;
 
+use lanekeep_core::FilePath;
 use lanekeep_core::files::FileAccess;
 use lanekeep_core::fix::Fix;
 use lanekeep_nodes::{Handle, NodeArena};
 use lanekeep_query::CompiledQuery;
-use lanekeep_types::{Symbol, Type, TypeScriptOracle, TypeScriptSupport};
+use lanekeep_types::{Query, Symbol, Type, TypeProvider};
 
 /// The version of the `ctx` surface this build exposes.
 ///
@@ -131,14 +132,14 @@ pub struct HostContext {
     files: Option<Arc<FileAccess>>,
     /// The grammar `querySubtree` and `closestAncestor` compile against.
     language: Option<Arc<dyn lanekeep_lang::Language>>,
-    /// The probe token behind `ctx.types`, present only for a rule that declared
-    /// `requires: ['types']`.
+    /// What answers `ctx.types`, present only for a rule that declared `requires: ['types']`.
     ///
-    /// Cloning this is cheap: `TypeScriptSupport` is one `Arc<dyn BindingResolver>`, so a
-    /// clone is a refcount bump and carries none of the grammar probe that built it. That is
-    /// what lets `install_types` build a fresh oracle inside every closure call rather than
-    /// storing one beside the tree it would have to borrow.
-    types: Option<TypeScriptSupport>,
+    /// An `Arc<dyn TypeProvider>` rather than a probe token: a provider owns run-scoped
+    /// state — a declaration cache here, a compiler process under A3 — that cannot be
+    /// rebuilt per query, and it is `Send + Sync` because rayon moves the run's copy between
+    /// workers. Cloning is a refcount bump, which is what lets the closures below capture
+    /// one each.
+    provider: Option<Arc<dyn TypeProvider>>,
     /// The date a rule sees as `ctx.today`, if the host supplied one.
     today: Option<Rc<str>>,
     /// Whether anything actually read `ctx.today` while checking this file.
@@ -173,7 +174,7 @@ impl std::fmt::Debug for HostContext {
             .field("has_resolver", &self.resolver.is_some())
             .field("has_file_access", &self.files.is_some())
             .field("has_language", &self.language.is_some())
-            .field("has_types", &self.types.is_some())
+            .field("has_provider", &self.provider.is_some())
             .field("has_today", &self.today.is_some())
             .field("date_read", &self.date_read.get())
             .field("compiled_queries", &self.queries.borrow().len())
@@ -193,7 +194,7 @@ impl HostContext {
             resolver: None,
             files: None,
             language: None,
-            types: None,
+            provider: None,
             today: None,
             date_read: Rc::new(Cell::new(false)),
             queries: Rc::new(RefCell::new(BTreeMap::new())),
@@ -240,7 +241,8 @@ impl HostContext {
         self
     }
 
-    /// Attach the type oracle's probe token, enabling `ctx.types`.
+    /// Attach the type provider and the access it reads other files through, enabling
+    /// `ctx.types`.
     ///
     /// Without one, `ctx.types` is absent rather than present-and-empty: reaching for it
     /// undeclared is a `TypeError` at the first call, not a silent `undefined` that would
@@ -249,12 +251,25 @@ impl HostContext {
     /// functions present but degraded — silence is exactly the failure mode this surface is
     /// arranged against, so the caller finds out immediately rather than from a clean report.
     ///
-    /// Takes the already-probed [`TypeScriptSupport`] rather than a language: probing is
-    /// 8.4 µs of the 9.2 µs a fresh oracle costs, and the caller is expected to pay that
-    /// once per run, not once per file.
+    /// **The access is a parameter rather than read off `self`, and that is the point.** A
+    /// provider opens declaration files, and every one of those reads has to land on *this*
+    /// file's dependency list or the cache serves an answer no key covers. Taking it here
+    /// makes "the provider and the recorder are the same access" a thing the signature says
+    /// rather than a thing two call sites have to agree about.
+    ///
+    /// It is the same `files` field [`Self::with_file_access`] sets, not a second one — which
+    /// is *how* they are one access, and also the whole of the guarantee: both setters write
+    /// it, last write wins, so calling the two with different accesses is a caller error the
+    /// type cannot catch. The engine calls `with_provider` after `with_file_access` with the
+    /// same `Arc`, so the write is a no-op there.
     #[must_use]
-    pub fn with_types(mut self, support: TypeScriptSupport) -> Self {
-        self.types = Some(support);
+    pub fn with_provider(
+        mut self,
+        provider: Arc<dyn TypeProvider>,
+        files: Arc<FileAccess>,
+    ) -> Self {
+        self.provider = Some(provider);
+        self.files = Some(files);
         self
     }
 
@@ -281,6 +296,10 @@ impl HostContext {
     /// component engine's context for the same file. Two memos over one file would let two
     /// rules see a file rewritten between them differently, which is the determinism invariant
     /// and not a tidiness question — see [`FileAccess`]'s own `seen` field.
+    ///
+    /// Writes the same field [`Self::with_provider`] does, and last write wins: a caller that
+    /// passes two different accesses gets whichever it named last, for the rule's own reads
+    /// *and* for the provider's.
     #[must_use]
     pub fn with_file_access(mut self, files: Arc<FileAccess>) -> Self {
         self.files = Some(files);
@@ -784,33 +803,33 @@ impl HostContext {
 
     /// The type surface, present only for a rule that declared `requires: ['types']`.
     ///
-    /// Each closure builds its own oracle: `TypeScriptOracle` borrows the tree, which lives
-    /// behind this context's `RefCell`, so it cannot be stored beside it. That is affordable
-    /// only because the grammar probe was hoisted into `TypeScriptSupport` — before that split
-    /// a construction cost 9.2 µs, about thirty host crossings, to serve one call.
+    /// Each closure builds one [`Query`] and hands it to the provider. The arena's tree is
+    /// borrowed for the length of the call and no longer, which is the borrow shape the
+    /// provider trait exists to allow: an oracle that borrowed the tree for its own life
+    /// could not be a run-scoped value at all.
     ///
     /// Answers cross as data rather than as handles, for the reason `structureFingerprint`
     /// does: a type handle would be one crossing per question about a type, which is the cost
     /// invariant 3 exists to prevent.
     fn install_types<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
-        let Some(support) = self.types.clone() else {
+        let (Some(provider), Some(files)) = (self.provider.clone(), self.files.clone()) else {
             return Ok(());
         };
         let types = Object::new(ctx.clone())?;
+        // Built once per rule per file rather than per call: `FilePath::new` normalizes
+        // separators and strips a leading `./`, which is an allocation this surface should
+        // not pay on every host crossing.
+        let file = FilePath::new(&*self.file_path);
 
         let arena = Rc::clone(&self.arena);
-        let type_support = support.clone();
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "typeOf",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
-                    let arena = arena.borrow();
-                    let Some(node) = arena.node(handle) else {
-                        return Ok(Value::new_undefined(ctx.clone()));
-                    };
-                    let oracle = TypeScriptOracle::new(&type_support, arena.tree(), arena.source());
-                    let Some(ty) = oracle.type_of(node) else {
+                    let answer = with_query(&arena, &at, &reader, handle, |q| asked.type_of(q));
+                    let Some(ty) = answer else {
                         return Ok(Value::new_undefined(ctx.clone()));
                     };
                     Ok(render_type(&ctx, &ty)?.into_value())
@@ -819,17 +838,14 @@ impl HostContext {
         )?;
 
         let arena = Rc::clone(&self.arena);
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "symbolOf",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
-                    let arena = arena.borrow();
-                    let Some(node) = arena.node(handle) else {
-                        return Ok(Value::new_undefined(ctx.clone()));
-                    };
-                    let oracle = TypeScriptOracle::new(&support, arena.tree(), arena.source());
-                    let Some(symbol) = oracle.symbol_of(node) else {
+                    let answer = with_query(&arena, &at, &reader, handle, |q| asked.symbol_of(q));
+                    let Some(symbol) = answer else {
                         return Ok(Value::new_undefined(ctx.clone()));
                     };
                     Ok(render_symbol(&ctx, &symbol)?.into_value())
@@ -1188,6 +1204,30 @@ fn render_symbol<'js>(ctx: &Ctx<'js>, symbol: &Symbol) -> rquickjs::Result<Objec
         object.set("module", module.clone())?;
     }
     Ok(object)
+}
+
+/// Answer one `ctx.types` question over the arena's tree, or nothing.
+///
+/// One place that builds a [`Query`], because the arena guard has to outlive the borrow the
+/// query holds and getting that wrong in five closures is five chances rather than one. A
+/// dead handle yields `None`, which every arm renders as `undefined` — the same posture
+/// `kind` and `loc` already take.
+fn with_query<T>(
+    arena: &Rc<RefCell<NodeArena>>,
+    file: &FilePath,
+    files: &FileAccess,
+    handle: Handle,
+    ask: impl FnOnce(Query<'_>) -> Option<T>,
+) -> Option<T> {
+    let arena = arena.borrow();
+    let node = arena.node(handle)?;
+    ask(Query {
+        file,
+        tree: arena.tree(),
+        source: arena.source(),
+        node,
+        files,
+    })
 }
 
 /// Merge a `file` into a fact's serialized payload.
@@ -2300,10 +2340,33 @@ mod tests {
         ));
     }
 
-    /// A host with the capability granted, built on this module's existing `host` helper.
+    /// A host with the capability granted through the provider seam.
+    ///
+    /// Replaces `with_types`. `with_provider` takes the file access too, because a provider
+    /// reaches other files and every one of those reads has to be recorded against *this*
+    /// file — an access supplied separately could be a different one, and two memos over one
+    /// file is the determinism failure `FileAccess`'s own `seen` field documents.
     fn host_with_types(source: &str) -> HostContext {
-        host(source)
-            .with_types(TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported"))
+        let provider =
+            lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript is supported");
+        // The builtin provider reads nothing beside the tree it is handed, so the tracked
+        // reader roots at a directory that already exists rather than creating one — a
+        // filesystem write from inside this crate is what `local/tracked-reads-only` refuses.
+        let root = std::env::temp_dir();
+        host(source).with_provider(Arc::new(provider), Arc::new(FileAccess::new(&root)))
+    }
+
+    /// The provider is what answers, and a host given none has no `types` namespace.
+    ///
+    /// Distinct from `types_is_absent_without_the_capability` above, which asserts the same
+    /// absence for a host built with neither. This one is the seam's own claim: the
+    /// namespace exists exactly when a provider was attached, so an engine that stopped
+    /// attaching one would be loud rather than silently answering `undefined`.
+    #[test]
+    fn types_is_absent_without_a_provider() {
+        let host = host("const a: number = 1;")
+            .with_file_access(Arc::new(FileAccess::new(&std::env::temp_dir())));
+        assert!(!run::<bool>(&host, "'types' in ctx"));
     }
 
     #[test]

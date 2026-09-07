@@ -12,8 +12,19 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# For `FilePath` and `FileAccess`: a cross-file answer is a *tracked read*, and the type
+# that records one lives below every engine on purpose. Reaching the filesystem any other
+# way would put a dependency outside the cache key.
+lanekeep-core = { workspace = true }
 lanekeep-lang = { workspace = true }
+# `package.json` is the only JSON this crate reads, and `exports` is a recursive shape of
+# strings, objects and condition names that hand-parsing would get subtly wrong.
+serde_json = { workspace = true }
 tree-sitter = { workspace = true }
+# Now a real dependency as well as a build one: a cached `Declaration` carries the content
+# hash its file was parsed at, which is what lets a server-resident provider (#191) drop a
+# stale entry without re-parsing.
+blake3 = { workspace = true }
 
 [build-dependencies]
 blake3 = { workspace = true }
@@ -30,12 +41,3 @@ harness = false
 
 [lints]
 workspace = true
-
-# `blake3` is used only by `build.rs`, which hashes this crate's own `src/` into
-# `oracle_identity`. cargo-machete does not scan build scripts, so it sees a
-# `[build-dependencies]` entry nothing in `src/` or `tests/` references and calls it unused
-# — the same class of blind spot as `tests/fixtures/metadata/Cargo.toml`'s `wit-bindgen-rt`,
-# one layer earlier: there it is generated source the tool cannot see, here it is a source
-# file the tool does not look at.
-[package.metadata.cargo-machete]
-ignored = ["blake3"]

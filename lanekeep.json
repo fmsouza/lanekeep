@@ -30,6 +30,7 @@
           "crates/lanekeep-lang-js/benches/*",
           "crates/lanekeep-rules/tests/*",
           "crates/lanekeep-types/benches/*",
+          "crates/lanekeep-types/src/builtin.rs",
           "crates/lanekeep-types/tests/*",
           "crates/lanekeep-wasm/tests/*"
         ]

@@ -30,7 +30,7 @@
 //! One parse per file, not per rule. Parsing is the dominant cost, and a file with twenty
 //! applicable rules must not pay it twenty times.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,7 +48,7 @@ use lanekeep_js::{
 };
 use lanekeep_lang::{Language, LanguageId, LanguageRegistry, ObligationAnalyzer, ObligationScope};
 use lanekeep_query::{CompileError, CompiledQuery};
-use lanekeep_types::TypeScriptSupport;
+use lanekeep_types::{BeginRunError, BuiltinProvider, TypeProvider};
 use lanekeep_wasm::bindings::types;
 use lanekeep_wasm::host::{CheckContext, ReduceContext as ComponentReduceContext};
 use lanekeep_wasm::{
@@ -183,6 +183,16 @@ pub enum RunError {
         budget: Duration,
         /// How long the run had actually been going.
         elapsed: Duration,
+    },
+
+    /// The configured type provider could not be started or would not answer.
+    ///
+    /// Not about any rule: a provider is a property of the configuration and of the machine,
+    /// found before a file is read. `RunError::Rule` is for a rule that ran and failed.
+    #[error("the type provider could not be used\n{detail}")]
+    Provider {
+        /// What the provider said.
+        detail: String,
     },
 
     /// The sandbox failed, including on a breached budget.
@@ -666,23 +676,28 @@ pub struct Engine {
     /// Lowercased keys, because the registry lowercases too — whether `Button.TSX` gets
     /// checked should not depend on how someone typed it.
     languages_by_extension: BTreeMap<String, String>,
-    /// Which registered languages speak TypeScript, probed once here rather than once per
-    /// file or per rule.
+    /// What answers `ctx.types` for every rule in this run that asked for it.
     ///
-    /// [`TypeScriptSupport::probe`] is the expensive part of building an oracle — probing
-    /// dominates construction — so paying it per query match rather than per run would add
-    /// that cost on top of a host crossing already measured at ~302 ns (architecture §15.1).
-    /// Nothing at the engine level rests on the exact split; the oracle's own documentation
-    /// carries the measured figures.
+    /// One per run, not one per language and not one per query. The builtin provider holds a
+    /// declaration cache, so a library's `.d.ts` is parsed once whatever imports it; the
+    /// `tsc` provider holds a process. Neither can be rebuilt per file, which is why this is
+    /// a field rather than something [`Self::run_rule`] constructs.
     ///
-    /// `BTreeMap`, not `HashMap`, per the ordering invariant: nothing here iterates this map
-    /// today, but a `HashMap` field is the one a later change reaches for without noticing it
+    /// `None` when nothing registered speaks TypeScript at all — a Python-only registry, or
+    /// a caller that supplied none — in which case `ctx.types` is absent for every rule and
+    /// [`analysis_hash`] folds an empty identity.
+    provider: Option<Arc<dyn TypeProvider>>,
+    /// Which registered languages have a grammar the provider can read, probed once here
+    /// rather than once per file or per rule.
+    ///
+    /// The gate is per *language* even though the provider is per run: a rule may declare
+    /// `requires: ['types']` for TypeScript and Python at once, and the Python file must get
+    /// no `ctx.types` — loud rather than silently wrong the moment that rule reaches for it.
+    ///
+    /// A `BTreeSet`, not a `HashSet`, per the ordering invariant: nothing iterates this
+    /// today, and a hash container is the one a later change reaches for without noticing it
     /// would put hash-seed order in front of output.
-    ///
-    /// A missing entry means this language's grammar does not speak TypeScript — `probe`
-    /// returned `None` for it — which [`Self::run_rule`] tells apart from "the rule did not
-    /// declare `requires: ['types']`": both have to hold before `ctx.types` is installed.
-    type_support: BTreeMap<LanguageId, TypeScriptSupport>,
+    type_languages: BTreeSet<LanguageId>,
 }
 
 /// The component half of a run, walled off so its one constructor cannot be gone around.
@@ -941,6 +956,43 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`RunError`] for an invalid query, gate, or language reference.
+    pub fn prepare(
+        config: &Config,
+        project_root: &Path,
+        rules_root: RuleRoot,
+        config_path: &Path,
+        registry: &LanguageRegistry,
+        typescript: Arc<dyn Language>,
+        javascript: Arc<dyn Language>,
+    ) -> Result<Self, RunError> {
+        Self::prepare_with_provider(
+            config,
+            project_root,
+            rules_root,
+            config_path,
+            registry,
+            typescript,
+            javascript,
+            None,
+        )
+    }
+
+    /// Prepare a run against a provider the caller already holds.
+    ///
+    /// `None` builds one — the bounded builtin provider today, whichever `config.types` names
+    /// once A3 lands. `Some` is for an embedder that holds a provider across requests: the
+    /// language server rebuilds an engine per request and must not rebuild the declaration
+    /// cache or respawn a compiler with it (#191).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::prepare`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every one is a distinct run input with no natural grouping, and a struct \
+                  around them would put the same eight names one indirection further from \
+                  the call site"
+    )]
     #[expect(
         clippy::too_many_lines,
         reason = "the per-language query compile loop belongs here — a broken query surfaces \
@@ -950,7 +1002,7 @@ impl Engine {
                   before the cache-key terms they serve were wired in; the loop is what keeps \
                   it long, and that has not changed"
     )]
-    pub fn prepare(
+    pub fn prepare_with_provider(
         config: &Config,
         project_root: &Path,
         rules_root: RuleRoot,
@@ -958,6 +1010,7 @@ impl Engine {
         registry: &LanguageRegistry,
         typescript: Arc<dyn Language>,
         javascript: Arc<dyn Language>,
+        provider: Option<Arc<dyn TypeProvider>>,
     ) -> Result<Self, RunError> {
         let discovery = Discovery::new(project_root, &config.include, &config.exclude)?;
 
@@ -969,17 +1022,24 @@ impl Engine {
 
         let mut languages_by_extension = BTreeMap::new();
         // Probed here, once per registered language for the whole run — never inside the
-        // per-file walk below, and never per rule. See the field.
-        let mut type_support = BTreeMap::new();
+        // per-file walk below, and never per rule. See the fields.
+        let mut type_languages = BTreeSet::new();
         for language in registry.languages() {
             for extension in language.extensions() {
                 languages_by_extension
                     .insert(extension.to_ascii_lowercase(), language.id().to_string());
             }
-            if let Some(support) = TypeScriptSupport::probe(language.as_ref()) {
-                type_support.insert(language.id(), support);
+            if BuiltinProvider::probe(language.as_ref()).is_some() {
+                type_languages.insert(language.id());
             }
         }
+        // One provider for the whole run, over one grammar, chosen by name — see
+        // `provider_language`. Every language that probes shares it, which is sound because a
+        // declaration file is TypeScript whatever dialect imported it.
+        let builtin: Option<Arc<dyn TypeProvider>> = provider_language(registry)
+            .and_then(|language| BuiltinProvider::probe(language.as_ref()))
+            .map(|probed| Arc::new(probed) as Arc<dyn TypeProvider>);
+        let provider = provider.or(builtin);
 
         // Compiled in parallel, because this is the single most expensive thing a run does
         // before it has looked at a file: a tree-sitter query costs a couple of milliseconds
@@ -1155,11 +1215,28 @@ impl Engine {
         let grammars = grammar_keys(registry);
         let languages = analysis_keys(registry);
 
+        let provider_identity = provider.as_ref().map(|p| p.identity()).unwrap_or_default();
+        // Once per run, before the key: a `tsc` provider builds its programs here and
+        // answers their hash; the builtin one answers nothing (plan 5, spec §5.6).
+        let programs = match provider.as_ref() {
+            // Lazy: the walk happens only if the provider asks for it, and the builtin one
+            // never does. Eager, this cost a second walk of the whole project on every warm
+            // run for a list nothing read.
+            Some(p) => p.begin_run(&|| discovery.walk()).map_err(|e| match e {
+                BeginRunError::Timeout(detail) | BeginRunError::Failed(detail) => {
+                    RunError::Provider { detail }
+                }
+            })?,
+            None => Vec::new(),
+        };
+
         let run_key = run_key(
             &config.ruleset_hash,
             &config.config_hash,
             &grammars,
             &languages,
+            &provider_identity,
+            &programs,
         )?;
 
         // On unless some rule's component carries bytes `ruleset_hash` never saw — see the
@@ -1196,7 +1273,8 @@ impl Engine {
             typescript,
             javascript,
             languages_by_extension,
-            type_support,
+            provider,
+            type_languages,
         })
     }
 
@@ -2601,33 +2679,36 @@ impl Engine {
         }
     }
 
-    /// The type oracle token to attach for this rule and language, if any.
+    /// The type provider to attach for this rule and language, if any.
     ///
     /// Both conditions have to hold: the rule declared `requires: ['types']`, and this
-    /// language actually has a probed oracle. A rule that declares the capability against a
-    /// language with no TypeScript-shaped grammar (Python, say) gets no `ctx.types` either —
-    /// it stays absent, which is loud rather than silently wrong the moment such a rule
-    /// reaches for it. See [`HostContext::with_types`].
-    fn types_for(
+    /// language's grammar is one the provider can read. A rule that declares the capability
+    /// against a language with no TypeScript-shaped grammar (Python, say) gets no `ctx.types`
+    /// either — it stays absent, which is loud rather than silently wrong the moment such a
+    /// rule reaches for it. See [`HostContext::with_provider`].
+    fn provider_for_rule(
         &self,
         rule: &Prepared,
         language: &Arc<dyn Language>,
-    ) -> Option<TypeScriptSupport> {
+    ) -> Option<Arc<dyn TypeProvider>> {
         if !rule.spec.requires.contains(&Capability::Types) {
             return None;
         }
-        self.type_support.get(&language.id()).cloned()
+        if !self.type_languages.contains(&language.id()) {
+            return None;
+        }
+        self.provider.clone()
     }
 
     /// The obligation analyzer to run for this rule and language, if any.
     ///
-    /// Mirrors [`Self::types_for`] immediately above on both conditions: the rule declared
-    /// `requires: ['dataflow']`, confirmed by `check_requires` at config load, and this
-    /// language actually implements one. A rule that requires the capability against a
+    /// Mirrors [`Self::provider_for_rule`] immediately above on both conditions: the rule
+    /// declared `requires: ['dataflow']`, confirmed by `check_requires` at config load, and
+    /// this language actually implements one. A rule that requires the capability against a
     /// language with no analyzer yet gets nothing back, the same honest absence
     /// [`Language::obligation_analyzer`] documents on itself, rather than a confidently wrong
-    /// answer. An associated function rather than a method, unlike `types_for` — it never
-    /// reads `self`.
+    /// answer. An associated function rather than a method, unlike `provider_for_rule` — it
+    /// never reads `self`.
     fn obligation_analyzer_for(
         rule: &Prepared,
         language: &Arc<dyn Language>,
@@ -2686,8 +2767,8 @@ impl Engine {
             .with_language(Arc::clone(language))
             .with_today(&self.today.to_string())
             .with_file_access(Arc::clone(files));
-        if let Some(support) = self.types_for(rule, language) {
-            host = host.with_types(support);
+        if let Some(provider) = self.provider_for_rule(rule, language) {
+            host = host.with_provider(provider, Arc::clone(files));
         }
 
         let query_started = clock(self.profiling);
@@ -2867,8 +2948,8 @@ impl Engine {
             .with_language(Arc::clone(language))
             .with_today(&self.today.to_string())
             .with_file_access(Arc::clone(files));
-        if let Some(support) = self.types_for(rule, language) {
-            host = host.with_types(support);
+        if let Some(provider) = self.provider_for_rule(rule, language) {
+            host = host.with_provider(provider, Arc::clone(files));
         }
 
         // Phase 1 — matching and analysis, all native Rust, under one immutable borrow of the
@@ -3584,6 +3665,8 @@ fn run_key(
     config_hash: &[u8],
     grammars: &[GrammarKey],
     languages: &[(String, [u8; 32])],
+    provider: &[u8],
+    programs: &[u8],
 ) -> Result<RunKey, RunError> {
     let compile_env = lanekeep_wasm::compile_env_hash().map_err(|e| RunError::WasmRuntime {
         detail: e.to_string(),
@@ -3595,11 +3678,34 @@ fn run_key(
         engine_version(),
         &host_api_hash(),
         &compile_env,
-        &analysis_hash(languages),
+        &analysis_hash(provider, programs, languages),
         ruleset_hash,
         config_hash,
         grammars,
     ))
+}
+
+/// The language whose grammar the builtin provider parses everything it opens with.
+///
+/// **`typescript` by name, never "the first language that probes".** `languages()` iterates a
+/// `BTreeMap` ordered by id, so the first grammar that answers `BuiltinProvider::probe` is
+/// `tsx` — and a `.ts` file parsed with the TSX grammar turns `<T>(x: T): T => x` into an
+/// `ERROR` subtree with nothing reported anywhere, which is the trap that produced 2218 false
+/// positives in one rule (AGENTS.md). Since a declaration file and a project source reached
+/// through an import are both `.ts`, that mismatch would reach every file the provider opens.
+///
+/// The fallback is the first language that probes, for a registry that has no `typescript` at
+/// all: `tsx` reads the same vocabulary, and answering from the wrong dialect is still better
+/// than a run with no type answers whatsoever.
+fn provider_language(registry: &LanguageRegistry) -> Option<&Arc<dyn Language>> {
+    registry
+        .by_id("typescript")
+        .filter(|language| BuiltinProvider::probe(language.as_ref()).is_some())
+        .or_else(|| {
+            registry
+                .languages()
+                .find(|language| BuiltinProvider::probe(language.as_ref()).is_some())
+        })
 }
 
 /// Every registered grammar, as the cache key sees it.
@@ -3677,58 +3783,68 @@ fn fold_host_api(ctx_version: u32, wasm_world: &[u8]) -> [u8; 32] {
 
 /// Everything the host analyses compute, in one cache-key field.
 ///
-/// The type oracle's own identity, the language-resolution crate's own identity, and every
-/// registered language's. A language's resolver decides where a name was declared, which is
-/// what `ctx.bindingKind` and `ctx.resolvesToImport` answer with and what the oracle reads
-/// before it can type anything — so a result computed by a resolver that no longer exists is
-/// not a valid result for a run that has a different one.
+/// The type provider's own identity, the type oracle's, the language-resolution crate's, and
+/// every registered language's. A language's resolver decides where a name was declared,
+/// which is what `ctx.bindingKind` and `ctx.resolvesToImport` answer with and what the oracle
+/// reads before it can type anything — so a result computed by a resolver that no longer
+/// exists is not a valid result for a run that has a different one.
 ///
-/// **The oracle alone was the whole of this field until now, and the gap was not theoretical.**
-/// `oracle_identity` digests `crates/lanekeep-types/src/`, and the scope list deciding which
-/// nodes carry type parameters lives in `lanekeep-lang-js`. Correcting it changed what the
-/// oracle answered — `type Amount = number; interface O<Amount> { x: Amount }` went from
-/// `number` to nothing at all — while every hash stayed identical. `engine_version` is no
+/// **The oracle alone was the whole of this field until #208, and the gap was not
+/// theoretical.** `oracle_identity` digests `crates/lanekeep-types/src/`, and the scope list
+/// deciding which nodes carry type parameters lives in `lanekeep-lang-js`. Correcting it
+/// changed what the oracle answered while every hash stayed identical. `engine_version` is no
 /// backstop either: it is major.minor on purpose, and a resolver fix ships as a patch.
+///
+/// **The provider term is the same argument one layer out.** Two providers over one corpus
+/// answer differently by design — that is what choosing one is for — and nothing else in the
+/// key moves when `types.provider` does: the ruleset is the same, the config hash covers the
+/// setting but not what the setting *selects*, and a `tsc` sidecar's own version lives
+/// outside this workspace entirely. Empty when a run has no provider, which is itself a
+/// distinguishable state because the field is length-prefixed.
 ///
 /// `lanekeep_lang::crate_identity()` is the resolver-core term: it digests
 /// `crates/lanekeep-lang`'s own sources — `glob_matches`, `Binding::is_import_of`,
 /// `is_imported_from` and `BindingKind::as_str` — which is the code every language's resolver
-/// answers *through*, not a per-language concern. It has no `Language` impl to hang a method
-/// on, and it does not vary with which languages are registered, so it is folded once, fixed,
-/// beside the oracle's identity, rather than per language.
+/// answers *through*, not a per-language concern.
 ///
-/// Per language rather than per crate, because the registry is what knows which languages a run
-/// has. Three of the six share one identity, since `typescript`, `tsx` and `javascript` come
-/// from one crate and one resolver; the ids are what keep those three from folding to the same
-/// bytes as one.
-fn analysis_hash(languages: &[(String, [u8; 32])]) -> [u8; 32] {
+/// Per language rather than per crate for the language identities, because the registry is
+/// what knows which languages a run has. Three of the six share one identity, since
+/// `typescript`, `tsx` and `javascript` come from one crate and one resolver; the ids are what
+/// keep those three from folding to the same bytes as one.
+fn analysis_hash(provider: &[u8], programs: &[u8], languages: &[(String, [u8; 32])]) -> [u8; 32] {
     fold_analysis(
         &lanekeep_types::oracle_identity(),
         &lanekeep_lang::crate_identity(),
+        provider,
+        programs,
         languages,
     )
 }
 
 /// The fold, separated from its inputs so a test can vary them.
 ///
-/// `oracle_identity()`, `crate_identity()` and every `analysis_identity()` are derived at build
-/// time, so none of them can be moved in a test against the real function — and "every
+/// `oracle_identity()`, `crate_identity()` and every `analysis_identity()` are derived at
+/// build time, so none of them can be moved in a test against the real function — and "every
 /// language's identity is in the key" is exactly the claim that is worth nothing unasserted.
 /// Same reasoning, and the same shape, as `fold_host_api` above.
 fn fold_analysis(
     oracle: &[u8],
     resolver_core: &[u8],
+    provider: &[u8],
+    programs: &[u8],
     languages: &[(String, [u8; 32])],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-analysis");
-    // Length-prefixed throughout. `oracle` and `resolver_core` are the only two adjacent
-    // variable-length fields in this fold — every other field is either a fixed 32-byte
-    // identity or itself the count prefix — so they are the one adjacency an unprefixed
-    // concatenation could actually collide on: `"oracle"` + `"resolver-core"` and
-    // `"oracleresolver"` + `"-core"` concatenate to the identical `"oracleresolver-core"`.
+    // Length-prefixed throughout. `oracle`, `resolver_core`, `provider` and `programs` are the
+    // four adjacent variable-length fields in this fold — every other field is either a fixed
+    // 32-byte identity or itself the count prefix — so they are the adjacencies an unprefixed
+    // concatenation could actually collide on. `programs` is what `begin_run` answered:
+    // empty for the builtin provider, the program listing's hash under `tsc` (plan 5).
     analysis_field(&mut hasher, oracle);
     analysis_field(&mut hasher, resolver_core);
+    analysis_field(&mut hasher, provider);
+    analysis_field(&mut hasher, programs);
     analysis_field(
         &mut hasher,
         &u64::try_from(languages.len())
@@ -3791,7 +3907,7 @@ pub fn rules_root_for(project_root: &Path) -> PathBuf {
 mod tests {
     use std::fs;
 
-    use lanekeep_lang_js::{JavaScript, TypeScript};
+    use lanekeep_lang_js::{JavaScript, Tsx, TypeScript};
 
     use super::*;
 
@@ -3832,11 +3948,15 @@ mod tests {
         let one = fold_analysis(
             b"oracle",
             b"resolver-core",
+            b"builtin",
+            b"",
             &[("typescript".to_owned(), [1; 32])],
         );
         let two = fold_analysis(
             b"oracle",
             b"resolver-core",
+            b"builtin",
+            b"",
             &[("typescript".to_owned(), [2; 32])],
         );
         assert_ne!(one, two);
@@ -3847,11 +3967,15 @@ mod tests {
         let one = fold_analysis(
             b"oracle",
             b"resolver-core",
+            b"builtin",
+            b"",
             &[("typescript".to_owned(), [1; 32])],
         );
         let two = fold_analysis(
             b"different-oracle",
             b"resolver-core",
+            b"builtin",
+            b"",
             &[("typescript".to_owned(), [1; 32])],
         );
         assert_ne!(one, two);
@@ -3865,11 +3989,15 @@ mod tests {
         let one = fold_analysis(
             b"oracle",
             b"resolver-core-one",
+            b"builtin",
+            b"",
             &[("typescript".to_owned(), [1; 32])],
         );
         let two = fold_analysis(
             b"oracle",
             b"resolver-core-two",
+            b"builtin",
+            b"",
             &[("typescript".to_owned(), [1; 32])],
         );
         assert_ne!(one, two);
@@ -3883,9 +4011,17 @@ mod tests {
         let one = fold_analysis(
             b"oracle",
             b"resolver-core",
+            b"builtin",
+            b"",
             &[("typescript".to_owned(), [1; 32])],
         );
-        let two = fold_analysis(b"oracle", b"resolver-core", &[("tsx".to_owned(), [1; 32])]);
+        let two = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            b"builtin",
+            b"",
+            &[("tsx".to_owned(), [1; 32])],
+        );
         assert_ne!(one, two);
     }
 
@@ -3894,11 +4030,15 @@ mod tests {
         let one = fold_analysis(
             b"oracle",
             b"resolver-core",
+            b"builtin",
+            b"",
             &[("typescript".to_owned(), [1; 32])],
         );
         let two = fold_analysis(
             b"oracle",
             b"resolver-core",
+            b"builtin",
+            b"",
             &[
                 ("typescript".to_owned(), [1; 32]),
                 ("tsx".to_owned(), [1; 32]),
@@ -3915,9 +4055,82 @@ mod tests {
         // strings can. Unprefixed, `"oracle"` + `"resolver-core"` and `"oracleresolver"` +
         // `"-core"` concatenate to the identical `"oracleresolver-core"`; prefixed, they must
         // differ.
-        let one = fold_analysis(b"oracle", b"resolver-core", &[]);
-        let two = fold_analysis(b"oracleresolver", b"-core", &[]);
+        let one = fold_analysis(b"oracle", b"resolver-core", b"builtin", b"", &[]);
+        let two = fold_analysis(b"oracleresolver", b"-core", b"builtin", b"", &[]);
         assert_ne!(one, two);
+    }
+
+    #[test]
+    fn a_providers_identity_reaches_the_analysis_fold() {
+        // The field A3 rests on. Two providers answering the same question differently must
+        // not share a cache entry, and `identity` is the only thing in the key that can say
+        // which one answered — `oracle_identity` moves with this crate's source and says
+        // nothing about a `tsc` sidecar that does not live in it.
+        let one = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            b"builtin",
+            b"",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        let two = fold_analysis(
+            b"oracle",
+            b"resolver-core",
+            b"tsc",
+            b"",
+            &[("typescript".to_owned(), [1; 32])],
+        );
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn the_provider_field_cannot_run_together_with_the_one_beside_it() {
+        // The reason it is length-prefixed like the two before it. `resolver_core` and
+        // `provider` are now adjacent variable-length fields, which is exactly the adjacency
+        // an unprefixed concatenation can collide on: `"resolver"` + `"-core-builtin"` and
+        // `"resolver-core"` + `"-builtin"` concatenate to one string either way.
+        let one = fold_analysis(b"oracle", b"resolver", b"-core-builtin", b"", &[]);
+        let two = fold_analysis(b"oracle", b"resolver-core", b"-builtin", b"", &[]);
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn the_provider_grammar_is_typescript_when_both_are_registered() {
+        // `languages()` iterates by id, so the first grammar that probes is `tsx` — and a
+        // `.ts` declaration file parsed with the TSX grammar makes `<T>(x: T): T => x` an
+        // `ERROR` subtree with nothing reported anywhere. The choice has to be by name.
+        let mut registry = LanguageRegistry::new();
+        registry.register(Arc::new(Tsx)).expect("tsx registers");
+        registry
+            .register(Arc::new(TypeScript))
+            .expect("typescript registers");
+        assert_eq!(
+            provider_language(&registry).map(|l| l.id().as_str()),
+            Some("typescript"),
+        );
+    }
+
+    #[test]
+    fn the_provider_grammar_falls_back_to_whatever_probes() {
+        // A registry without `typescript` still gets a provider: `tsx` reads the same
+        // vocabulary, and refusing to answer at all would be worse than the dialect mismatch.
+        let mut registry = LanguageRegistry::new();
+        registry.register(Arc::new(Tsx)).expect("tsx registers");
+        assert_eq!(
+            provider_language(&registry).map(|l| l.id().as_str()),
+            Some("tsx"),
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_provider_folds_differently_from_one_with_the_builtin() {
+        // `None` is a real configuration — a registry with no TypeScript-shaped grammar — and
+        // an empty identity must not hash the same as any provider's. The length prefix is
+        // what makes an absent field distinguishable from a zero-length one here.
+        assert_ne!(
+            fold_analysis(b"oracle", b"resolver-core", b"", b"", &[]),
+            fold_analysis(b"oracle", b"resolver-core", b"builtin:", b"", &[]),
+        );
     }
 
     #[test]
@@ -3926,11 +4139,16 @@ mod tests {
         // hash derived correctly and then not passed is the same stale-answer bug as one that
         // is never derived.
         let languages = [("typescript".to_owned(), [3; 32])];
+        let provider = BuiltinProvider::probe(&TypeScript)
+            .expect("TypeScript")
+            .identity();
         assert_eq!(
-            analysis_hash(&languages),
+            analysis_hash(&provider, b"", &languages),
             fold_analysis(
                 &lanekeep_types::oracle_identity(),
                 &lanekeep_lang::crate_identity(),
+                &provider,
+                b"",
                 &languages
             )
         );
@@ -3947,8 +4165,11 @@ mod tests {
             digest: [15; 32],
         }];
         let languages = [("typescript".to_owned(), [3; 32])];
+        let provider = BuiltinProvider::probe(&TypeScript)
+            .expect("TypeScript")
+            .identity();
         let content = lanekeep_core::ContentHash::new([7; 32]);
-        let real = run_key(b"ruleset", b"config", &grammars, &languages)
+        let real = run_key(b"ruleset", b"config", &grammars, &languages, &provider, b"")
             .expect("the runtime describes itself");
 
         for (label, host_api, compile_env) in [
@@ -3969,7 +4190,7 @@ mod tests {
                 engine_version(),
                 &host_api,
                 &compile_env,
-                &analysis_hash(&languages),
+                &analysis_hash(&provider, b"", &languages),
                 b"ruleset",
                 b"config",
                 &grammars,
@@ -4000,11 +4221,28 @@ mod tests {
             .collect();
 
         let languages = [("typescript".to_owned(), [3; 32])];
+        let provider = BuiltinProvider::probe(&TypeScript)
+            .expect("TypeScript")
+            .identity();
         let content = lanekeep_core::ContentHash::new([7; 32]);
-        let real = run_key(b"ruleset", b"config", &real_grammars, &languages)
-            .expect("the runtime describes itself");
-        let zeroed = run_key(b"ruleset", b"config", &zeroed_grammars, &languages)
-            .expect("the runtime describes itself");
+        let real = run_key(
+            b"ruleset",
+            b"config",
+            &real_grammars,
+            &languages,
+            &provider,
+            b"",
+        )
+        .expect("the runtime describes itself");
+        let zeroed = run_key(
+            b"ruleset",
+            b"config",
+            &zeroed_grammars,
+            &languages,
+            &provider,
+            b"",
+        )
+        .expect("the runtime describes itself");
 
         assert_ne!(
             real.for_file("src/a.ts", &content),
@@ -4028,11 +4266,28 @@ mod tests {
             .map(|(id, _)| (id.clone(), [0; 32]))
             .collect();
 
+        let provider = BuiltinProvider::probe(&TypeScript)
+            .expect("TypeScript")
+            .identity();
         let content = lanekeep_core::ContentHash::new([7; 32]);
-        let real = run_key(b"ruleset", b"config", &real_grammars, &real_languages)
-            .expect("the runtime describes itself");
-        let zeroed = run_key(b"ruleset", b"config", &real_grammars, &zeroed_languages)
-            .expect("the runtime describes itself");
+        let real = run_key(
+            b"ruleset",
+            b"config",
+            &real_grammars,
+            &real_languages,
+            &provider,
+            b"",
+        )
+        .expect("the runtime describes itself");
+        let zeroed = run_key(
+            b"ruleset",
+            b"config",
+            &real_grammars,
+            &zeroed_languages,
+            &provider,
+            b"",
+        )
+        .expect("the runtime describes itself");
 
         assert_ne!(
             real.for_file("src/a.ts", &content),
@@ -9368,7 +9623,7 @@ export default defineRule({
         /// Down here, beside the query test above, for the same reason: only this module's
         /// runner knows a language with no TypeScript-shaped grammar at all. Every fixture
         /// above this in the file is TypeScript-family, so none of them can tell
-        /// `Engine::types_for` apart from a version that handed back whichever oracle
+        /// `Engine::provider_for_rule` apart from a version that handed back whichever oracle
         /// happened to exist regardless of which language the file is — this test is what
         /// tells them apart.
         #[test]
