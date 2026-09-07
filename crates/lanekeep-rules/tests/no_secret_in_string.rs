@@ -124,18 +124,29 @@ fn alias_through_a_call_is_silent() {
         .expect("v1 does not follow taint through a call's own arguments — a known limit");
 }
 
-/// #8 — field-insensitivity. Writing `o.secret` taints the whole `o` binding, and reading a
-/// *different* field, `o.public`, is still tainted — a documented over-approximation (the
-/// sound-leaning direction for a may-analysis), not a bug. Mirrors the analyzer's own fixture
-/// at `crates/lanekeep-lang-js/src/flow.rs` (the §11 case in its test module).
+/// #8 — field sensitivity (#225). Writing `o.secret` taints that path and not its siblings, so
+/// reading `o.public` is clean while reading `o.secret` reports. This replaces the v1
+/// over-approximation `field_insensitive_write_taints_every_read_of_the_object` asserted, and
+/// it is a promise change: `docs/architecture.md` §4's sensitivity table and
+/// `docs/built-in-rules.md`'s fixture table move with it. Mirrors the analyzer's own
+/// `a_field_write_does_not_taint_a_sibling_field_read`.
 #[test]
-fn field_insensitive_write_taints_every_read_of_the_object() {
+fn a_field_write_does_not_taint_a_sibling_field_read() {
+    tester()
+        .accepts("function f() { const o = {}; o.secret = getSecret(); log(o.public); }\n")
+        .expect("`o.public` and `o.secret` are incomparable access paths");
+}
+
+/// #8b — the control for #8, and the half that would make the silence above worthless on its
+/// own: the written path itself still reports.
+#[test]
+fn a_field_write_reports_at_its_own_path() {
     tester()
         .reports_at(
-            "function f() { const o = {}; o.secret = getSecret(); log(o.public); }\n",
+            "function f() { const o = {}; o.secret = getSecret(); log(o.secret); }\n",
             &[(1, 58)],
         )
-        .expect("v1 is field-insensitive: a tainted base taints every field read from it");
+        .expect("`o.secret` is exactly what was written");
 }
 
 /// #9 — a sink guarded by `if (isTest)` still reports. Path-insensitivity, documented: the
@@ -248,14 +259,161 @@ fn byte_length_is_clean_and_buffer_is_not() {
 /// since it is the only fixture here with more than one flow into the same sink.
 #[test]
 fn two_runs_over_the_two_source_fixture_are_byte_identical() {
+    // Two independent testers, so each `run` is a cold run rather than a cache hit against the
+    // same tester's directory — `RuleTester` keeps one directory per instance and never
+    // disables the cache, so calling `run` twice on one tester compares a result with a copy
+    // of itself and proves nothing about the analysis running twice.
     let src = "function f(c) { let s; if (c) { s = getSecret(); } else { s = getSecret(); } \
                log(s); }\n";
-    let rule = tester();
-    let first = rule.run(src).expect("first run");
-    let second = rule.run(src).expect("second run");
+    let first = tester().run(src).expect("first run");
+    let second = tester().run(src).expect("second run");
     assert_eq!(
         first, second,
         "two runs over identical input must be byte-identical"
     );
     assert_eq!(first.len(), 2, "both distinct sources report, every run");
+}
+
+/// #15 — a nested write is read at its own path, and is silent at a sibling of its last
+/// segment. Depth is what distinguishes C1 from "one level of field awareness".
+#[test]
+fn a_nested_field_write_reports_at_its_own_path() {
+    tester()
+        .reports_at(
+            "function f() { const o = { a: {} }; o.a.b = getSecret(); log(o.a.b); }\n",
+            &[(1, 62)],
+        )
+        .expect("`o.a.b` is exactly what was written");
+}
+
+/// #15b — the sibling of #15.
+#[test]
+fn a_nested_field_write_is_silent_at_a_sibling() {
+    tester()
+        .accepts("function f() { const o = { a: {} }; o.a.b = getSecret(); log(o.a.c); }\n")
+        .expect("`[a, b]` and `[a, c]` diverge at the second segment");
+}
+
+/// #15c — a read *above* a nested write reports: `o.a` is a value carrying the secret at
+/// `.b`. Dropping this closure would silence `log(o)` after any write into `o`.
+#[test]
+fn a_read_above_a_nested_write_reports() {
+    tester()
+        .reports_at(
+            "function f() { const o = { a: {} }; o.a.b = getSecret(); log(o.a); }\n",
+            &[(1, 62)],
+        )
+        .expect("a read above a write covers it");
+}
+
+/// #16 — index sensitivity is explicitly not bought: every subscript collapses to one
+/// segment, so `a[0] = getSecret(); log(a[1])` still reports. `docs/architecture.md` §4 still
+/// says "Index-sensitive: no", and this is what holds it there.
+#[test]
+fn an_index_write_still_taints_every_index_read() {
+    tester()
+        .reports_at(
+            "function f() { const a = []; a[0] = getSecret(); log(a[1]); }\n",
+            &[(1, 54)],
+        )
+        .expect("`a[0]` and `a[1]` are one abstract path");
+}
+
+/// #17 — the alias pair. A local alias asks the aliased binding the same path question, so
+/// `p.secret` reports and `p.public` is silent.
+#[test]
+fn an_alias_reads_the_written_path() {
+    tester()
+        .reports_at(
+            "function f() { const o = {}; o.secret = getSecret(); const p = o; \
+             log(p.secret); }\n",
+            &[(1, 71)],
+        )
+        .expect("`p.secret` is `o.secret`");
+}
+
+/// #17b — the silent half of #17.
+#[test]
+fn an_alias_is_silent_at_a_sibling_path() {
+    tester()
+        .accepts(
+            "function f() { const o = {}; o.secret = getSecret(); const p = o; \
+             log(p.public); }\n",
+        )
+        .expect("`p.public` is `o.public`");
+}
+
+/// #18 — the widening. Paths longer than three segments truncate to their outermost three, and
+/// a truncated path is top for its subtree: it matches every extension of itself, which is
+/// today's whole-object behavior restored locally at depth. The bound is a stated number with
+/// a stated behavior when hit, not a tuning knob.
+#[test]
+fn a_write_past_the_widening_bound_taints_its_siblings_below_it() {
+    tester()
+        .reports_at(
+            "function f() { const o = { a: { b: { c: {} } } }; o.a.b.c.d = getSecret(); \
+             log(o.a.b.c.e); }\n",
+            &[(1, 80)],
+        )
+        .expect("`o.a.b.c.d` and `o.a.b.c.e` both truncate to `[a, b, c]`");
+}
+
+/// #19 — a cyclic object graph terminates and answers the same way every run. The cycle is a
+/// loop-carried self-referential write, which is the only shape whose recursion is not bounded
+/// by the read path shrinking; `MAX_DEPTH` is the backstop and nothing counts visits, so the
+/// answer cannot depend on how far the walk got.
+#[test]
+fn a_cyclic_object_graph_terminates_and_reports() {
+    tester()
+        .reports_at(
+            "function f(c) { const o = {}; o.secret = getSecret(); while (c) { o.next = o; } \
+             log(o.next); }\n",
+            &[(1, 85)],
+        )
+        .expect("the cycle terminates and the root taint is covered by the read");
+}
+
+/// #20 — determinism over the widening fixture: two runs byte-identical. The widening is where
+/// a visit-count-keyed bound would have made the answer depend on traversal order, so it is
+/// the fixture worth asserting this on rather than a shallow one.
+#[test]
+fn two_runs_over_the_widening_fixture_are_byte_identical() {
+    // Two independent testers, on the same grounds as the sibling above: a single tester's
+    // second `run` is a cache hit, not a second analysis. A second write is added so the
+    // fixture carries two flows into the sink — both `o.a.b.c.d` and `o.a.b.c.f` truncate to
+    // `[a, b, c]`, which meets the read at `o.a.b.c.e` — since a one-flow result cannot tell a
+    // stable sort from a reversed one, which is what this pin needs to be able to catch.
+    let src = "function f() { const o = { a: { b: { c: {} } } }; o.a.b.c.d = getSecret(); \
+               o.a.b.c.f = getSecret(); log(o.a.b.c.e); }\n";
+    let first = tester().run(src).expect("first run");
+    let second = tester().run(src).expect("second run");
+    assert_eq!(
+        first, second,
+        "two runs over identical input must be byte-identical"
+    );
+    assert_eq!(first.len(), 2, "both widened writes report, every run");
+}
+
+/// #21 — a computed-key write is read by name: `Index` is an unknown key, so it meets every
+/// field. The field-insensitive analysis reported this too; a known-segment `Index` silenced
+/// it (F1, review of #225's C1).
+#[test]
+fn a_computed_key_write_is_read_by_name() {
+    tester()
+        .reports_at(
+            "function f() { const o = {}; o[\"secret\"] = getSecret(); log(o.secret); }\n",
+            &[(1, 61)],
+        )
+        .expect("a secret stored under a computed key is still the secret");
+}
+
+/// #21b — the reverse direction, so neither arm of the comparison can be dropped alone.
+#[test]
+fn a_named_write_is_read_through_a_subscript() {
+    tester()
+        .reports_at(
+            "function f() { const o = {}; o.secret = getSecret(); log(o[\"secret\"]); }\n",
+            &[(1, 58)],
+        )
+        .expect("a secret read through a subscript is still the secret");
 }
