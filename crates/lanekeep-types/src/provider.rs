@@ -11,8 +11,8 @@
 //! produce a rule that accuses correct code, which is the one failure the whole surface is
 //! arranged against.
 
-use lanekeep_core::FilePath;
 use lanekeep_core::files::FileAccess;
+use lanekeep_core::{AnalysisBudget, FilePath};
 
 use crate::types::{Symbol, Type};
 
@@ -118,7 +118,10 @@ pub trait TypeProvider: Send + Sync {
     /// belong to and answer the hash over their file lists and contents — that provider's
     /// whole dependency mechanism (spec §5.6) — which is why the term is asked for through
     /// the trait rather than read off a concrete type the engine would have to downcast to.
-    /// Plan 5 adds the run's `AnalysisBudget` as a second parameter when that type exists.
+    /// The run's [`AnalysisBudget`] is the second parameter: a provider that spends wall
+    /// clock time preparing must spend the *run's* budget rather than one of its own, so a
+    /// breach here is the same breach `timeouts.analysis` names everywhere else. The default
+    /// body ignores it for the same reason it ignores the file list — it does no work.
     ///
     /// **The list is a closure, and the default body never calls it.** Producing it costs the
     /// engine a second walk of the whole project, on the warm path, for a provider that may
@@ -134,20 +137,84 @@ pub trait TypeProvider: Send + Sync {
     /// # Errors
     ///
     /// [`BeginRunError::Timeout`] when the work outlived its budget and
-    /// [`BeginRunError::Failed`] for anything else. Both cancel the run, and both are
-    /// reported as `RunError::Provider` until plan 5's `AnalysisTimeout` exists to tell them
-    /// apart — so the distinction is for the provider's own message today, not for the
-    /// engine's exit path.
-    fn begin_run(&self, files: &dyn Fn() -> Vec<FilePath>) -> Result<Vec<u8>, BeginRunError> {
-        let _ = files;
+    /// [`BeginRunError::Failed`] for anything else. Both cancel the run, and the engine takes
+    /// a different exit for each: `RunError::AnalysisTimeout`, which names `timeouts.analysis`,
+    /// and `RunError::Provider`, which names the toolchain.
+    fn begin_run(
+        &self,
+        files: &dyn Fn() -> Vec<FilePath>,
+        budget: AnalysisBudget,
+    ) -> Result<Vec<u8>, BeginRunError> {
+        let _ = (files, budget);
         Ok(Vec::new())
+    }
+
+    /// The first error this provider produced, if it has produced one.
+    ///
+    /// **Why this is on the trait at all.** Every arm above answers "I don't know" — `None`,
+    /// or `false` from [`Self::complete`] — when the provider is broken, because the trait has
+    /// nowhere to put an error. So a killed sidecar is indistinguishable, at this boundary,
+    /// from a compiler that simply has no type for that node: the file finishes *degraded* and
+    /// is committed under a valid cache key, which is a limit degrading a run instead of
+    /// cancelling it. This is the one way a caller can tell the two apart, so the engine asks
+    /// after every file and cancels the run when it is `Some`.
+    ///
+    /// It is answered through the trait rather than off a concrete type because the engine
+    /// holds an `Arc<dyn TypeProvider>` — a session's held provider (plan 6) included — and
+    /// the alternative is a downcast, which is the door plan 4 closed for the run key.
+    ///
+    /// [`BeginRunError`] rather than an enum of its own: its two arms are exactly the two
+    /// exits the engine has for a provider — a spent `timeouts.analysis`, and everything else
+    /// — and a second type with the same two arms would be two spellings of one decision.
+    ///
+    /// The default is `None`: a provider with no out-of-band state has nothing to report, and
+    /// the builtin one has no analogous failure.
+    fn failure(&self) -> Option<BeginRunError> {
+        None
+    }
+
+    /// Lines this provider wants said about the run it has just prepared.
+    ///
+    /// Asked once, after [`Self::begin_run`], and printed by the CLI on **stderr** — never on
+    /// stdout, which carries a run's report and is what a machine reads. The engine prints
+    /// nothing itself; it exposes these and the caller decides.
+    ///
+    /// What they are for is a decision a provider made silently that changes its answers. The
+    /// `tsc` provider's is the ad-hoc program: a file no `tsconfig.json` *under the project
+    /// root* claims is typed with this driver's own options rather than the project's, so
+    /// `strict` is off for it and the same file checked from one directory up answers
+    /// differently. That is not a failure — nothing is wrong and the run is correct — so it
+    /// cannot be an error, and it is not nothing either.
+    ///
+    /// The default is empty: a provider that made no such decision has nothing to say, and a
+    /// notice printed by every run is noise rather than information.
+    fn notices(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Whether this provider spends the run's [`AnalysisBudget`].
+    ///
+    /// The engine reads the accumulator between one file and the next and cancels the run when
+    /// it is past `timeouts.analysis`; this is what says whether that question is worth asking
+    /// at all. It used to be asked of the *configuration* — `types.provider == 'tsc'` — which
+    /// is the wrong thing twice over: a session that hands the engine a provider of its own
+    /// (#191) is not described by the config it was built from, and a builtin run whose config
+    /// happened to say `tsc` would be bounded by a budget that names work it never does.
+    ///
+    /// The default is `false`, which is the builtin oracle's answer: its cost is rule
+    /// execution, and the run clock already bounds that.
+    fn spends_analysis_budget(&self) -> bool {
+        false
     }
 }
 
-/// Why [`TypeProvider::begin_run`] could not prepare a run.
+/// Why a provider could not do its work — preparing a run in [`TypeProvider::begin_run`], or
+/// answering a question afterwards, which [`TypeProvider::failure`] reports in the same shape.
 ///
-/// Both variants are reported as `RunError::Provider` today; plan 5's `AnalysisTimeout`
-/// is what will separate them at the engine's boundary.
+/// The two arms are the engine's two exits: `Timeout` is `RunError::AnalysisTimeout`, which
+/// names `timeouts.analysis`, and `Failed` is `RunError::Provider`, which names the toolchain.
+/// Telling them apart matters because the remedies are different, and printing the wrong one
+/// is advice that cannot work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BeginRunError {
     /// The provider's work outlived the analysis budget.

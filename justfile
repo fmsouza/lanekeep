@@ -761,10 +761,17 @@ test-js:
     output="$(mktemp)"
     trap 'rm -f "${list}" "${output}"' EXIT
 
-    find packages/lanekeep/runtime -maxdepth 1 -name '*.test.js' -print0 > "${list}"
+    {
+        find packages/lanekeep/runtime -maxdepth 1 -name '*.test.js' -print0
+        # The `tsc` driver's own tests. A second `find` rather than a wider one: the two
+        # directories are unrelated and a single walk from the repository root would pick up
+        # anything a build ever leaves behind.
+        find crates/lanekeep-types/src/tsc -maxdepth 1 -name '*.test.mjs' -print0
+    } > "${list}"
     count="$(tr -cd '\0' < "${list}" | wc -c | tr -d ' ')"
     if [ "${count}" -eq 0 ]; then
-        echo "error: no test files under packages/lanekeep/runtime/." >&2
+        echo "error: no test files under packages/lanekeep/runtime/ or" >&2
+        echo "       crates/lanekeep-types/src/tsc/." >&2
         echo "       nothing ran, so nothing was checked." >&2
         exit 1
     fi

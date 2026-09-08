@@ -13,9 +13,18 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use lanekeep_core::{FileAccess, FilePath};
+use lanekeep_core::{AnalysisBudget, FileAccess, FilePath};
 use lanekeep_lang_js::TypeScript;
 use lanekeep_types::{Query, TypeProvider};
+
+/// A budget generous enough that nothing here can breach it.
+///
+/// `begin_run` takes one because a provider that spends wall clock preparing must spend the
+/// run's budget; the two providers exercised in this file do no work there, so the value only
+/// has to be a value.
+fn budget() -> AnalysisBudget {
+    AnalysisBudget::start(std::time::Duration::from_mins(10))
+}
 
 /// A throwaway project on disk, named after the test that built it.
 ///
@@ -162,7 +171,7 @@ fn the_default_begin_run_does_not_walk_the_corpus() {
         walked.set(true);
         Vec::new()
     };
-    assert_eq!(Silent.begin_run(&files), Ok(Vec::new()));
+    assert_eq!(Silent.begin_run(&files, budget()), Ok(Vec::new()));
     assert!(
         !walked.get(),
         "the default body must not ask for a file list it does not read"
@@ -195,7 +204,9 @@ fn a_path_that_was_absent_is_parsed_once_it_becomes_text() {
         .expect("a path that has become text is read rather than held at the old answer");
     assert!(lanekeep_types::declared_here(&parsed, "Big").is_some());
 
-    provider.begin_run(&Vec::new).expect("a run begins");
+    provider
+        .begin_run(&Vec::new, budget())
+        .expect("a run begins");
     assert!(
         provider.declaration(&project.files(), &path).is_some(),
         "and a run still starts cold"
@@ -234,7 +245,9 @@ fn begin_run_clears_a_held_providers_completeness_memo() {
         "the answer is memoized per file within a run"
     );
 
-    provider.begin_run(&Vec::new).expect("a run begins");
+    provider
+        .begin_run(&Vec::new, budget())
+        .expect("a run begins");
     assert!(
         question(&project.files()),
         "a run starts cold, so completeness is decided again against the filesystem now"
@@ -2843,7 +2856,7 @@ fn the_builtin_providers_begin_run_does_not_walk_the_corpus() {
         walked.set(true);
         Vec::new()
     };
-    assert_eq!(provider.begin_run(&files), Ok(Vec::new()));
+    assert_eq!(provider.begin_run(&files, budget()), Ok(Vec::new()));
     assert!(
         !walked.get(),
         "this provider's dependencies are the tracked reads on each entry, so there is \

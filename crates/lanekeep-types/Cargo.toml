@@ -17,9 +17,12 @@ categories.workspace = true
 # way would put a dependency outside the cache key.
 lanekeep-core = { workspace = true }
 lanekeep-lang = { workspace = true }
-# `package.json` is the only JSON this crate reads, and `exports` is a recursive shape of
-# strings, objects and condition names that hand-parsing would get subtly wrong.
+# Two readers, both of shapes hand-parsing would get subtly wrong. `package.json`'s `exports`
+# is a recursive tree of strings, objects and condition names; and the `tsc` sidecar's protocol
+# is newline-delimited JSON in both directions, where this crate is the one writing the
+# requests as well as reading the answers.
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tree-sitter = { workspace = true }
 # Now a real dependency as well as a build one: a cached `Declaration` carries the content
 # hash its file was parsed at, which is what lets a server-resident provider (#191) drop a

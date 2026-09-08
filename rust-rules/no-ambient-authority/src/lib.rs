@@ -2,10 +2,23 @@
 //!
 //! §13 says "no network. Ever, in any mode, with no configuration that enables it." `deny.toml`
 //! enforces that against *crates*, and says nothing about `std` — a `TcpStream` needs no
-//! dependency at all. Subprocess is a narrower claim and was never absolute: `--since` and
-//! `--staged` shell out to git from `crates/lanekeep-core/src/changed.rs`, which is the whole of
-//! it for the engine, and `allow` states it so a second one fails the gate rather than passing
-//! review as easily as the first did.
+//! dependency at all. Subprocess is a narrower claim and was never absolute, and `allow` is
+//! where each exception is stated, so a fourth one fails the gate rather than passing review as
+//! easily as the first did. There are three, and what makes each admissible is different:
+//!
+//! - `crates/lanekeep-core/src/changed.rs` runs `git` for `--since` and `--staged`. It reads
+//!   the repository the run is already about, and what it returns narrows *which* files are
+//!   checked rather than deciding any file's verdict.
+//! - `crates/lanekeep-types/src/tsc/mod.rs` runs the project's own toolchain as a sidecar under
+//!   `types.provider: 'tsc'`. This is the one that widens the trust boundary — it is off by
+//!   default, opt-in per project, and documented as a widening where it happens, in that
+//!   module's own header. Everything it reads reaches the run key through the program listing,
+//!   so an answer from it is still an answer some cache key accounts for.
+//! - `crates/lanekeep-rules/build.rs` runs `cargo component` to build the shipped rules. It is
+//!   a *build*, not a run: it happens before any project is checked and produces artifacts
+//!   whose bytes are themselves a cache-key input.
+//!
+//! None of the three is network, which has no exceptions at all.
 //!
 //! # A port, held to reporting identically
 //!
@@ -250,7 +263,60 @@ fn is_nested_in_path(ctx: &CheckContext, node: Node) -> bool {
 /// `std::net`, `std::process::Command` and a bare `process::Command` match on
 /// `process::Command`, and a `TcpStream` or `UdpSocket` matches on its own name.
 fn names_forbidden(text: &str) -> bool {
-    FORBIDDEN.iter().any(|forbidden| text.contains(forbidden))
+    expand_use_tree(text).iter().any(|spelled| {
+        FORBIDDEN
+            .iter()
+            .any(|forbidden| spelled.contains(forbidden))
+    })
+}
+
+/// A use tree's brace groups expanded into the paths it actually imports.
+///
+/// A substring test alone cannot see a braced import, and that is not a corner case: the plain
+/// `use std::process::Command;` this rule was written against is what nobody writes once a
+/// second name from the same module is needed. `use std::process::{Child, ChildStdin, Command,
+/// Stdio};` contains `process::{`, which is none of `FORBIDDEN`, so it reported nothing at all
+/// — silently, and in the direction that lets a capability in rather than the one that
+/// accuses. `crates/lanekeep-types/src/tsc/mod.rs` spawns a sidecar through exactly that
+/// spelling and this rule was blind to it.
+///
+/// Recursive, because a use tree nests: `use std::{process::Command, net::TcpStream};` has its
+/// brace at the first segment and both capabilities inside it. The original text is always in
+/// the result, so a `scoped_identifier` match — which has no braces at all — is unchanged.
+///
+/// A parser rather than a `split(',')`: a group's members can themselves be groups, and
+/// splitting on every comma would cut `{a, {b, c}}` in the middle of the inner one. Depth
+/// counting is what keeps the split at the top level.
+fn expand_use_tree(text: &str) -> Vec<String> {
+    let mut out = vec![text.to_owned()];
+    let Some(open) = text.find('{') else {
+        return out;
+    };
+    let prefix = &text[..open];
+    let mut depth = 0_usize;
+    let mut start = open + 1;
+    let mut member = |segment: &str| {
+        let segment = segment.trim();
+        if !segment.is_empty() {
+            out.extend(expand_use_tree(&format!("{prefix}{segment}")));
+        }
+    };
+    for (at, ch) in text.char_indices().skip(open + 1) {
+        match ch {
+            '{' => depth += 1,
+            '}' if depth == 0 => {
+                member(text.get(start..at).unwrap_or_default());
+                break;
+            }
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                member(text.get(start..at).unwrap_or_default());
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 // The rules this component hosts, and the dispatch the world's rule index drives.

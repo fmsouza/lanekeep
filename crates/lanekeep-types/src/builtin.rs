@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use lanekeep_core::{FileAccess, FilePath};
+use lanekeep_core::{AnalysisBudget, FileAccess, FilePath};
 use lanekeep_lang::Language;
 use lanekeep_lang::binding::ImportedName;
 
@@ -925,8 +925,14 @@ impl TypeProvider for BuiltinProvider {
     /// The file list is never asked for: this provider's dependencies are the tracked reads
     /// on each entry, so there is nothing to build up front. Answering an empty term is what
     /// keeps the builtin provider out of `analysis_hash`'s `programs` field.
-    fn begin_run(&self, files: &dyn Fn() -> Vec<FilePath>) -> Result<Vec<u8>, BeginRunError> {
-        let _ = files;
+    fn begin_run(
+        &self,
+        files: &dyn Fn() -> Vec<FilePath>,
+        budget: AnalysisBudget,
+    ) -> Result<Vec<u8>, BeginRunError> {
+        // Neither is read: there is nothing to build up front, so there is nothing for a
+        // budget to bound either.
+        let _ = (files, budget);
         self.declarations().clear();
         self.completeness().clear();
         Ok(Vec::new())

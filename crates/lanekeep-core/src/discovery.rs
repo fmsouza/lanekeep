@@ -86,9 +86,16 @@ impl Discovery {
     ///
     /// Exclusion wins over inclusion: a project listing a broad `include` and a narrow
     /// `exclude` means the exclusion, and the other order would make `exclude` useless.
+    ///
+    /// `.lanekeep/` at the root wins over both, and is not configurable: it is lanekeep's own
+    /// directory — the cache, the precompiled components, the `tsc` driver — and nothing in it
+    /// was written by the project. See `in_lanekeep_directory` below for the whole reasoning.
     #[must_use]
     pub fn selects(&self, relative: &FilePath) -> bool {
         let path = relative.as_str();
+        if in_lanekeep_directory(path) {
+            return false;
+        }
         if self.exclude.is_match(path) {
             return false;
         }
@@ -137,6 +144,26 @@ impl Discovery {
         out.dedup();
         out
     }
+}
+
+/// Whether a path relative to the root is inside lanekeep's own directory.
+///
+/// The walk sees hidden entries deliberately — a project's `.github/` is code someone may want
+/// checked — and `.lanekeep/` at the root is the one hidden directory that is never a subject.
+/// It is lanekeep's own: the cache, the precompiled components, and the `tsc` driver lanekeep
+/// writes there and then runs. Nothing in it was written by the project, and a rule reporting
+/// on it is reporting on lanekeep. Under `types.provider: 'tsc'` it was worse than noise — the
+/// driver is JavaScript, so with `allowJs` it entered the program listing and put lanekeep's
+/// own version into the key a second time, by a path that only looks like a project file.
+///
+/// Unconditional, and not something `exclude` can turn off: there is no configuration under
+/// which checking it is what someone meant. Matched on the leading path *component*, so
+/// `src/.lanekeep-notes.ts` and a project's own `vendor/.lanekeep/` are untouched.
+fn in_lanekeep_directory(relative: &str) -> bool {
+    relative
+        .split('/')
+        .next()
+        .is_some_and(|first| first == ".lanekeep")
 }
 
 fn build_set(patterns: &[String], field: &'static str) -> Result<GlobSet, DiscoveryError> {
@@ -205,6 +232,50 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// lanekeep's own directory is never a subject, whatever `include` says.
+    ///
+    /// The walk sees hidden entries on purpose, and nothing excluded `.lanekeep/` — so the
+    /// `tsc` driver lanekeep writes there was discovered as a project file, and under `allowJs`
+    /// it entered the compiler's program listing and the run key with it.
+    #[test]
+    fn lanekeeps_own_directory_is_never_selected() {
+        let fixture = Fixture::new(
+            "own-directory",
+            &[
+                "src/a.ts",
+                ".lanekeep/driver-abc.mjs",
+                ".lanekeep/components/x.wasm",
+                // A project's own file that merely starts the same way, and one nested under a
+                // directory of that name somewhere else: neither is lanekeep's.
+                "src/.lanekeep-notes.ts",
+                "vendor/.lanekeep/keep.ts",
+            ],
+        );
+        let found = fixture.walk(&["**/*"], &[]);
+        assert!(
+            !found.iter().any(|p| p.starts_with(".lanekeep/")),
+            "lanekeep's own directory reached the corpus: {found:?}"
+        );
+        assert!(found.contains(&"src/a.ts".to_owned()), "{found:?}");
+        assert!(
+            found.contains(&"src/.lanekeep-notes.ts".to_owned()),
+            "a project file whose name merely begins the same way is a subject: {found:?}"
+        );
+        assert!(
+            found.contains(&"vendor/.lanekeep/keep.ts".to_owned()),
+            "only the directory at the root is lanekeep's: {found:?}"
+        );
+    }
+
+    /// And `selects` agrees, which is the half `--since` and `--staged` go through.
+    #[test]
+    fn selects_refuses_lanekeeps_own_directory() {
+        let fixture = Fixture::new("own-directory-selects", &["src/a.ts"]);
+        let discovery = Discovery::new(&fixture.dir, &[], &[]).expect("builds");
+        assert!(!discovery.selects(&FilePath::new(".lanekeep/driver-abc.mjs")));
+        assert!(discovery.selects(&FilePath::new("src/a.ts")));
     }
 
     #[test]

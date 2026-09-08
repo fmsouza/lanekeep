@@ -32,6 +32,7 @@ mod oracle;
 mod provider;
 mod resolve;
 mod table;
+pub mod tsc;
 mod types;
 
 pub use builtin::BuiltinProvider;

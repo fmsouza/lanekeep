@@ -1039,6 +1039,7 @@ dependencies = [
  "lanekeep-lang-js",
  "lanekeep-lang-python",
  "serde_json",
+ "thiserror",
  "tree-sitter",
 ]
 

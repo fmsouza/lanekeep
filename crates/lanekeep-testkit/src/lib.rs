@@ -87,6 +87,12 @@ pub struct RuleTester {
     /// and friends — for a rule that imports one. [`no_builtins`] for every constructor,
     /// which is what [`RuleRoot::new`] starts with anyway.
     builtins: BuiltinSource,
+    /// What went in the config's `rules` array, kept so the config can be rewritten.
+    ///
+    /// A `String` rather than a `&'static str` because `configured` splices caller-supplied
+    /// options into it. Empty for a component or built-in tester, whose config is JSON and
+    /// which [`RuleTester::with_config_extra`] refuses for that reason.
+    rule_expr: String,
 }
 
 /// A build with no built-in components, which is what every tester but a built-in one wants.
@@ -108,6 +114,24 @@ const fn no_component_maps(_: &str) -> Option<&'static [u8]> {
 /// and a `fn` item is cheaper than widening its API for one caller.
 const fn no_builtins(_: &str) -> Option<&'static str> {
     None
+}
+
+/// The generated `lanekeep.config.ts`, in one place.
+///
+/// One function rather than a `format!` at each of the two sites that write this file —
+/// [`RuleTester::build`] and [`RuleTester::with_config_extra`] — because a second copy of the
+/// template is the duplication hazard a second copy of a fixture is: the two would drift, and
+/// a tester whose config had grown a different shape from the one every other test runs under
+/// would fail somewhere that names neither.
+///
+/// `extra` is spliced ahead of `rules` and carries its own trailing comma; it is empty for the
+/// ordinary case.
+fn config_source(extra: &str, rule_expr: &str) -> String {
+    format!(
+        "import {{ defineConfig }} from 'lanekeep';\n\
+         import rule from './rules/rule';\n\
+         export default defineConfig({{ include: ['subject/**'], {extra} rules: [{rule_expr}] }});\n"
+    )
 }
 
 /// What a source rule's project is configured by.
@@ -337,6 +361,31 @@ impl RuleTester {
         self
     }
 
+    /// Rewrite the generated `lanekeep.config.ts` with extra top-level config source.
+    ///
+    /// `extra` is TypeScript spliced into the `defineConfig` object literal, so it must end
+    /// with a comma — `"types: { provider: 'tsc' },"`. That is the same "options are
+    /// JavaScript" contract [`RuleTester::configured`] already has, and the same reason: a
+    /// structured parameter here would only be able to express the settings someone thought
+    /// of when they wrote it.
+    ///
+    /// # Errors
+    ///
+    /// [`TestError::Setup`] if the config cannot be written, or if this tester's config is a
+    /// `lanekeep.json` — a component or built-in tester. Refused rather than silently ignored,
+    /// which is the failure mode this crate exists to help find in rules.
+    pub fn with_config_extra(self, extra: &str) -> Result<Self, TestError> {
+        if self.config != TS_CONFIG {
+            return Err(TestError::Setup(format!(
+                "`with_config_extra` writes a `{TS_CONFIG}`, and this tester is configured by \
+                 `{}` — build it with `RuleTester::new` or `RuleTester::configured`",
+                self.config
+            )));
+        }
+        self.write(TS_CONFIG, &config_source(extra, &self.rule_expr))?;
+        Ok(self)
+    }
+
     /// Write the throwaway project for a built-in rule named by its specifier.
     fn build_built_in(
         name: &str,
@@ -367,7 +416,8 @@ impl RuleTester {
         extension: &str,
         rule_expr: &str,
     ) -> Result<Self, TestError> {
-        let tester = Self::empty(name, extension, TS_CONFIG);
+        let mut tester = Self::empty(name, extension, TS_CONFIG);
+        rule_expr.clone_into(&mut tester.rule_expr);
         // Nested one level rather than sitting at the fixture's own top, so a rule that
         // imports a sibling module the way this repository's local rules do — `../modules/x`
         // from `lanekeep/rules/some-rule.ts` — resolves inside the fixture instead of
@@ -375,14 +425,7 @@ impl RuleTester {
         // real rather than merely legal.
         tester.write("rules/rule.ts", rule_source)?;
         tester.mirror_modules()?;
-        tester.write(
-            TS_CONFIG,
-            &format!(
-                "import {{ defineConfig }} from 'lanekeep';\n\
-                 import rule from './rules/rule';\n\
-                 export default defineConfig({{ include: ['subject/**'], rules: [{rule_expr}] }});\n"
-            ),
-        )?;
+        tester.write(TS_CONFIG, &config_source("", rule_expr))?;
         Ok(tester)
     }
 
@@ -478,6 +521,11 @@ impl RuleTester {
             components: no_components,
             component_maps: no_component_maps,
             builtins: no_builtins,
+            // Empty rather than absent, and set by `build` immediately after this call. A
+            // JSON-config tester has no rule expression at all — `with_config_extra` refuses
+            // one — and a source tester that forgot to record its own would rewrite its config
+            // into one with no rules, whose failure would read as "the rule did not match".
+            rule_expr: String::new(),
         }
     }
 

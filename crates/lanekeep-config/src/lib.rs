@@ -455,7 +455,9 @@ struct RawTimeouts {
 /// `build`, where a malformed one becomes a diagnostic naming the field rather than a
 /// deserialization error naming a line of JSON the user never wrote.
 ///
-/// Not permissive about a *key*. `deny_unknown_fields` matches [`JsonConfig`] and the schema's
+/// Not permissive about a *key*. `deny_unknown_fields` matches `JsonConfig` in `json.rs` — a
+/// plain name rather than an intra-doc link, which cannot resolve into a private module — and
+/// the schema's
 /// `additionalProperties: false`, and it is the difference between `typescriptt` being refused
 /// and being silently ignored — which is a project believing it configured a compiler and
 /// running against whatever the default names, with nothing anywhere to say so.
@@ -622,17 +624,45 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Capabilities this build actually provides an analysis for.
+/// Capabilities this build actually provides an analysis for, under a given configuration.
 ///
-/// Which capabilities are implemented is a property of this build, not of the config, so it
-/// is expressed as a fact about [`Capability`] rather than read from anything a project
-/// writes. `Dataflow` is the one capability both dataflow analyses rest on: obligation
-/// (`obligation`/`checkObligation`, #193) and taint flow (`flow`/`checkFlow`, #194), paired
-/// at load by `build_rule`'s coherent-shape checks. It is every variant `Capability` has
-/// besides `Types`, so today this equals [`Capability::all`]. It will not stay that way the
-/// moment a third capability is declared and not yet implemented, which is what keeps this
-/// list here rather than replaced by that call.
-const IMPLEMENTED: &[Capability] = &[Capability::Types, Capability::Dataflow];
+/// Which capabilities are implemented was a property of the build alone until `types.provider`
+/// existed. It still is for `Dataflow`. `Types` now also depends on whether the configured
+/// provider could be reached: under `builtin` there is always an oracle, and under `tsc` there
+/// is one exactly when Node and the project's `typescript` package are both there.
+///
+/// # Why this is answered twice
+///
+/// Config load runs before any provider is spawned and cannot know, so it asks with
+/// `provider_ok: true` and refuses only what no build could honor. `Engine::prepare` asks again
+/// with the real answer, after the spawn. Both refuse through
+/// [`unavailable_capability`], so one mistake cannot produce two different messages — which
+/// matters more than it sounds, because the two fire on the same config and a reader who saw
+/// both would not know they were the same check.
+#[must_use]
+pub fn implemented(types: &TypesConfig, provider_ok: bool) -> Vec<Capability> {
+    let mut capabilities = Vec::with_capacity(2);
+    if types.provider == TypesProvider::Builtin || provider_ok {
+        capabilities.push(Capability::Types);
+    }
+    capabilities.push(Capability::Dataflow);
+    capabilities
+}
+
+/// The one wording for "this rule needs a capability this run does not have".
+#[must_use]
+pub fn unavailable_capability(
+    id: &RuleId,
+    capability: Capability,
+    implemented: &[Capability],
+) -> String {
+    format!(
+        "`{id}` requires the `{}` analysis, which this build does not provide — the \
+         implemented capabilities are {}",
+        capability.as_str(),
+        describe(implemented),
+    )
+}
 
 /// Render a set of capabilities as backtick-quoted names, comma separated.
 ///
@@ -668,6 +698,7 @@ fn describe(capabilities: &[Capability]) -> String {
 fn check_requires(
     requires: Option<&serde_json::Value>,
     id: &RuleId,
+    implemented: &[Capability],
 ) -> Result<Vec<Capability>, String> {
     // Absence is handled here rather than at the call site, because an absent `requires` and
     // an empty one say the same thing and there is one place to say so.
@@ -709,22 +740,16 @@ fn check_requires(
     // itself — the same ordering as before, kept so a config carrying both a typo and a real
     // capability still reports the typo.
     //
-    // **This loop's "walk every entry, do not stop at the first" behavior currently has no
-    // test that fails without it.** `an_unimplemented_capability_is_refused_beside_an_implemented_one`
-    // used to prove it with `['types', 'dataflow']` in both orders; now that `Dataflow` is
-    // implemented alongside `Types`, `IMPLEMENTED` covers every `Capability` variant and no
-    // combination of real names can reach this `return Err` at all. When a third capability
-    // is added unimplemented, restore that test with the new name paired with an implemented
-    // one, in both orders — a `capabilities.iter().take(1)` regression is invisible to every
-    // other test in this crate, because none of them declares more than one capability.
+    // `implemented` is no longer every `Capability` variant unconditionally — under
+    // `types.provider: 'tsc'` and no spawned provider yet (config load always asks with
+    // `provider_ok: true`, so this loop only ever refuses a capability no build could honor at
+    // all; the second, real-answer gate is `Engine::prepare`'s, through the same
+    // `unavailable_capability`). `check_requires_walks_every_entry_whatever_the_order` proves
+    // this loop walks every entry rather than stopping at the first, with `['types',
+    // 'dataflow']` in both orders against a caller-supplied `implemented` that omits `Types`.
     for capability in &capabilities {
-        if !IMPLEMENTED.contains(capability) {
-            return Err(format!(
-                "`{id}` requires the `{}` analysis, which this build does not provide — the \
-                 implemented capabilities are {}",
-                capability.as_str(),
-                describe(IMPLEMENTED),
-            ));
+        if !implemented.contains(capability) {
+            return Err(unavailable_capability(id, *capability, implemented));
         }
     }
 
@@ -1243,6 +1268,12 @@ fn build(
     // config can say to reach one of the two hashes on purpose.
     let types = parse_types(&raw.types, display)?;
 
+    // Config load asks the capability gate with `provider_ok: true`: it cannot know whether a
+    // `tsc` provider will start, so it refuses only a capability no build could honor at all.
+    // `Engine::prepare` asks `lanekeep_config::implemented` again, with the real answer, once
+    // the provider has been built.
+    let implemented_capabilities = implemented(&types, true);
+
     // Every component in the config, asked what it is. Once, here, before a `RuleSpec` exists
     // — not per worker: instantiation is 82 to 96 times the cost of not instantiating, which
     // is why `lanekeep_wasm::WasmRuntime::rule` defers it, and reading metadata through a
@@ -1271,6 +1302,7 @@ fn build(
                         &overrides,
                         &declared,
                         Some(rule.component),
+                        &implemented_capabilities,
                     )?);
                 }
             }
@@ -1281,6 +1313,7 @@ fn build(
                 &overrides,
                 &declared,
                 None,
+                &implemented_capabilities,
             )?),
         }
     }
@@ -2395,6 +2428,7 @@ fn build_rule(
     overrides: &BTreeMap<RuleId, Severity>,
     declared: &BTreeSet<String>,
     component: Option<ComponentRule>,
+    implemented: &[Capability],
 ) -> Result<RuleSpec, ConfigError> {
     let fail = |detail: String| ConfigError::Rule {
         position,
@@ -2443,7 +2477,7 @@ fn build_rule(
     // that coherent-shape proof, before the card and the query, because this is about whether
     // the rule can run at all rather than about whether it is well written.
     let has_flow = raw.flow.is_some();
-    let requires = check_requires(raw.requires.as_ref(), &id).map_err(fail)?;
+    let requires = check_requires(raw.requires.as_ref(), &id, implemented).map_err(fail)?;
     let declares_dataflow = requires.contains(&Capability::Dataflow);
 
     // Flow pairing: `flow` ⟺ `checkFlow`, and either one requires `dataflow`. Obligation is
@@ -4422,6 +4456,7 @@ mod tests {
             &BTreeMap::new(),
             &declared,
             Some(described.component),
+            Capability::all(),
         )
         .expect_err("a component that can never run must not load");
 
@@ -4672,6 +4707,7 @@ mod tests {
             &BTreeMap::new(),
             &declared,
             Some(described.component),
+            Capability::all(),
         )
         .expect_err("a language with no query of its own must not load");
 
@@ -4735,6 +4771,7 @@ mod tests {
             &BTreeMap::new(),
             &declared,
             Some(described.component),
+            Capability::all(),
         )
         .expect_err("a query for a language the rule does not target must not load");
 
@@ -6055,6 +6092,34 @@ mod tests {
         assert!(format!("{error}").contains("typescriptt"), "{error}");
     }
 
+    /// The `.ts` half of the unknown-key pair. See its partner above.
+    ///
+    /// The pairing is the point, on the `types`-block pair's own reasoning: the two formats
+    /// reach `RawTypes` by different routes — JSON straight through `serde`, `.ts` through
+    /// `EXTRACT`'s `types: c.types ?? {}` — and single-format coverage of a property both have
+    /// to satisfy is not coverage of the property. An `EXTRACT` that ever picked the `types`
+    /// keys apart instead of passing the object through would accept `typescriptt` silently,
+    /// with the JSON half of this pair still green.
+    #[test]
+    fn an_unknown_key_in_the_types_block_of_a_typescript_config_is_refused() {
+        let fixture = Fixture::new(
+            "types-unknown-key-ts",
+            &[(
+                "lanekeep.config.ts",
+                "import { defineConfig } from 'lanekeep';\n\
+                 export default defineConfig({\n\
+                   include: ['src/**'],\n\
+                   types: { provider: 'tsc', typescriptt: './vendor/typescript' },\n\
+                   rules: [],\n\
+                 });\n",
+            )],
+        );
+        let error = fixture
+            .load_config()
+            .expect_err("`typescriptt` is not a field of `types`");
+        assert!(format!("{error}").contains("typescriptt"), "{error}");
+    }
+
     /// The same for `timeouts`, which had the identical hole.
     #[test]
     fn an_unknown_key_in_the_timeouts_block_is_refused() {
@@ -6618,6 +6683,70 @@ mod tests {
         );
         let config = fixture.load_config().expect("loads");
         assert!(config.rules[0].requires.is_empty());
+    }
+
+    #[test]
+    fn types_are_implemented_under_the_builtin_provider_whatever_node_is_doing() {
+        // There is always an oracle under `builtin` — that is the whole point of it — so
+        // `provider_ok` cannot subtract a capability it does not gate.
+        let builtin = TypesConfig::default();
+        assert!(implemented(&builtin, false).contains(&Capability::Types));
+        assert!(implemented(&builtin, true).contains(&Capability::Types));
+    }
+
+    #[test]
+    fn types_are_unimplemented_under_a_tsc_provider_that_did_not_start() {
+        let tsc = TypesConfig {
+            provider: TypesProvider::Tsc,
+            ..TypesConfig::default()
+        };
+        assert!(!implemented(&tsc, false).contains(&Capability::Types));
+        assert!(implemented(&tsc, true).contains(&Capability::Types));
+        // Dataflow is not gated by any of this and must survive both.
+        assert!(implemented(&tsc, false).contains(&Capability::Dataflow));
+    }
+
+    #[test]
+    fn the_refusal_names_the_rule_and_what_is_left() {
+        let id: RuleId = "acme/typed".parse().expect("a valid id");
+        let message = unavailable_capability(&id, Capability::Types, &[Capability::Dataflow]);
+        assert!(message.contains("`acme/typed`"), "got: {message}");
+        assert!(message.contains("`types`"), "got: {message}");
+        assert!(message.contains("`dataflow`"), "got: {message}");
+    }
+
+    #[test]
+    fn check_requires_speaks_through_the_shared_message() {
+        // The two gates must not word one refusal two ways. Asserting equality rather than
+        // both containing some substring is what makes that true rather than likely.
+        let id: RuleId = "acme/typed".parse().expect("a valid id");
+        let error = check_requires(
+            Some(&serde_json::json!(["types"])),
+            &id,
+            &[Capability::Dataflow],
+        )
+        .expect_err("types is not implemented here");
+        assert_eq!(
+            error,
+            unavailable_capability(&id, Capability::Types, &[Capability::Dataflow])
+        );
+    }
+
+    #[test]
+    fn check_requires_walks_every_entry_whatever_the_order() {
+        // The loop above must reach an unimplemented entry wherever it sits in the list — a
+        // walk that stopped at the first implemented one would let `['dataflow', 'types']`
+        // through while refusing `['types', 'dataflow']`.
+        let id: RuleId = "acme/typed".parse().expect("a valid id");
+        for list in [["types", "dataflow"], ["dataflow", "types"]] {
+            let error =
+                check_requires(Some(&serde_json::json!(list)), &id, &[Capability::Dataflow])
+                    .expect_err("types is not implemented here, wherever it is listed");
+            assert_eq!(
+                error,
+                unavailable_capability(&id, Capability::Types, &[Capability::Dataflow])
+            );
+        }
     }
 
     /// A card valid enough to load, for the flow tests below — none of them are testing the

@@ -109,6 +109,34 @@ const CASES: &[Case] = &[
         options: None,
         expected: Expected::Accepts,
     },
+    // The spelling nobody avoids once a second name from the same module is needed, and the one
+    // the substring test could not see: `std::process::{Child, ChildStdin, Command, Stdio}`
+    // contains `process::{`, which is none of the forbidden names, so this reported nothing at
+    // all — silently, and in the direction that lets a capability in.
+    // `crates/lanekeep-types/src/tsc/mod.rs` spawns its sidecar through exactly this form.
+    Case {
+        name: "a_braced_subprocess_import_is_reported",
+        source: "use std::process::{Child, ChildStdin, Command, Stdio};\n",
+        options: None,
+        expected: Expected::ReportsAt(&[(1, 1)]),
+    },
+    // A use tree nests, so the expansion has to as well: the brace here is at the first segment
+    // and both capabilities are inside it.
+    Case {
+        name: "a_nested_use_tree_is_reported_once",
+        source: "use std::{process::Command, net::TcpStream};\n",
+        options: None,
+        expected: Expected::ReportsAt(&[(1, 1)]),
+    },
+    // And the negative half, which is what keeps the widening from being a wildcard: a braced
+    // import of names that reach nothing outside the process is still silent, `ExitCode`
+    // included.
+    Case {
+        name: "a_braced_import_of_innocuous_names_passes",
+        source: "use std::process::{Child, ExitCode, Stdio};\n",
+        options: None,
+        expected: Expected::Accepts,
+    },
     // `std::process` alone would also match `std::process::ExitCode`, which is how `main()`
     // reports its own exit status and reaches nothing outside the process. `process::Command`
     // is the capability the rule is actually about, and it still catches the qualified path.
