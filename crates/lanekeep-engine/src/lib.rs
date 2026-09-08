@@ -995,6 +995,28 @@ pub struct Outcome {
     pub dependencies: BTreeMap<FilePath, Vec<TrackedRead>>,
 }
 
+impl Outcome {
+    /// Every path any file's rules recorded as a tracked read this run.
+    ///
+    /// The union across files rather than the per-file map, because the one consumer —
+    /// `--watch`'s allowlist — asks "is this path an input to anything?" and never "to what?".
+    ///
+    /// **An absent read counts.** A rule told a declaration file is not there has depended on
+    /// that answer as much as one that read it (`lanekeep_core::tracked`), so the file
+    /// appearing has to wake the loop; dropping the null-hash reads here would make "add the
+    /// missing `.d.ts`" the one edit `--watch` never notices. A refused read counts too, for a
+    /// weaker reason: it never resolves to a path under the watched root, so including it is
+    /// harmless rather than useful.
+    #[must_use]
+    pub fn dependency_paths(&self) -> BTreeSet<FilePath> {
+        self.dependencies
+            .values()
+            .flatten()
+            .map(|read| read.path.clone())
+            .collect()
+    }
+}
+
 /// How a caller wants a run prepared, and what it wants to be told while that happens.
 ///
 /// A struct rather than more positional parameters to [`Engine::prepare_with_provider`], for
@@ -4327,6 +4349,63 @@ mod tests {
     use lanekeep_lang_js::{JavaScript, Tsx, TypeScript};
 
     use super::*;
+
+    #[test]
+    fn dependency_paths_are_the_union_across_files_including_absences() {
+        use lanekeep_core::TrackedRead;
+
+        let mut dependencies = BTreeMap::new();
+        // `b.ts` shares one path with `a.ts` and adds one of its own: a union that read only
+        // the first file's entries would still produce every path `a.ts` recorded, so the
+        // path only `b.ts` recorded is what makes this a test of the union rather than of one
+        // file's list.
+        dependencies.insert(
+            FilePath::new("src/b.ts"),
+            vec![
+                TrackedRead::absent(FilePath::new("node_modules/@acme/rates/index.d.ts")),
+                TrackedRead::found(
+                    FilePath::new("src/shared/money.d.ts"),
+                    lanekeep_core::ContentHash::new([9; 32]),
+                ),
+            ],
+        );
+        dependencies.insert(
+            FilePath::new("src/a.ts"),
+            vec![
+                TrackedRead::found(
+                    FilePath::new("node_modules/@acme/rates/package.json"),
+                    lanekeep_core::ContentHash::new([7; 32]),
+                ),
+                TrackedRead::absent(FilePath::new("node_modules/@acme/rates/index.d.ts")),
+                TrackedRead::refused(FilePath::new("../outside-root/leaked.d.ts")),
+            ],
+        );
+
+        let outcome = Outcome {
+            violations: Vec::new(),
+            files_discovered: 2,
+            files_parsed: 2,
+            timings: None,
+            dependencies,
+        };
+
+        let paths: Vec<String> = outcome
+            .dependency_paths()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "../outside-root/leaked.d.ts",
+                "node_modules/@acme/rates/index.d.ts",
+                "node_modules/@acme/rates/package.json",
+                "src/shared/money.d.ts",
+            ],
+            "one entry per path, in path order, whichever file recorded it and whatever the \
+             read's outcome"
+        );
+    }
 
     #[test]
     fn both_host_surfaces_reach_the_cache_key() {
