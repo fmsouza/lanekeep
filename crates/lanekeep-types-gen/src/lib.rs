@@ -920,7 +920,12 @@ export interface Config {
     rule?: number
     /** Wall-clock, for the whole run. */
     global?: number
-    /** Wall-clock for host-side type-provider work, across the whole run. */
+    /**
+     * Host-side type-provider work, across the whole run.
+     *
+     * Analysis time rather than elapsed time: only what the provider spends building
+     * programs and answering requests is charged against it.
+     */
     analysis?: number
   }
   /** Policy for suppression directives. All off by default. */

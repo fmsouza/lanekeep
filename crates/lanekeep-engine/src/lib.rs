@@ -2809,6 +2809,14 @@ impl Engine {
         // query matching — is Rust, and a file that matches nothing never starts one.
         let sandbox = worker.sandbox()?;
 
+        // The provider's own time is not the rule's, so `ctx.types` pauses the rule's clock
+        // while the host answers. Attached here rather than beside `with_provider` above,
+        // because the sandbox is built lazily and deliberately — a file that matches nothing
+        // must not start one — and this is the first point where there is a budget to hand
+        // over. Unconditional: only the `ctx.types` closures read it, and those exist only
+        // when a provider was attached, so a condition here could drift out of step with them.
+        host = host.with_rule_clock(sandbox.budget());
+
         let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
 
         for captures in matches {
@@ -3000,6 +3008,9 @@ impl Engine {
         // Only now, with flows in hand, is a sandbox needed — the same lazy build the check
         // path makes, so a file with no flow never starts one.
         let sandbox = worker.sandbox()?;
+
+        // The rule's clock pauses while a provider answers; see `Engine::run_rule`.
+        host = host.with_rule_clock(sandbox.budget());
         let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
 
         for flow_path in flows {

@@ -145,6 +145,14 @@ pub struct HostContext {
     /// workers. Cloning is a refcount bump, which is what lets the closures below capture
     /// one each.
     provider: Option<Arc<dyn TypeProvider>>,
+    /// The interrupt budget to stop while a provider answers, when the host supplied one.
+    ///
+    /// `None` in a unit test that builds a context without a sandbox, and in the reduce phase.
+    /// `eval_with_reduce_host` (`sandbox.rs`) does arm a per-invocation clock there, same as
+    /// for `check` — this field is `None` regardless, because `ReduceContext` has no `types`
+    /// surface to pause around. Absent means "do not pause", which is the same behavior a
+    /// disarmed budget already has.
+    rule_clock: Option<Arc<lanekeep_core::limits::Budget>>,
     /// The date a rule sees as `ctx.today`, if the host supplied one.
     today: Option<Rc<str>>,
     /// Whether anything actually read `ctx.today` while checking this file.
@@ -180,6 +188,7 @@ impl std::fmt::Debug for HostContext {
             .field("has_file_access", &self.files.is_some())
             .field("has_language", &self.language.is_some())
             .field("has_provider", &self.provider.is_some())
+            .field("has_rule_clock", &self.rule_clock.is_some())
             .field("has_today", &self.today.is_some())
             .field("date_read", &self.date_read.get())
             .field("compiled_queries", &self.queries.borrow().len())
@@ -200,6 +209,7 @@ impl HostContext {
             files: None,
             language: None,
             provider: None,
+            rule_clock: None,
             today: None,
             date_read: Rc::new(Cell::new(false)),
             queries: Rc::new(RefCell::new(BTreeMap::new())),
@@ -308,6 +318,22 @@ impl HostContext {
     #[must_use]
     pub fn with_file_access(mut self, files: Arc<FileAccess>) -> Self {
         self.files = Some(files);
+        self
+    }
+
+    /// Hand this context the sandbox's interrupt budget, so a `ctx.types` call can stop the
+    /// rule's clock while the host answers.
+    ///
+    /// Without it a provider's own time is charged to whichever rule happened to ask first,
+    /// which would make a rule's timeout depend on the order the config listed it in — the
+    /// determinism invariant, not a nicety.
+    ///
+    /// The engine attaches one unconditionally, provider or not: only the `ctx.types`
+    /// closures read it, and those exist only when a provider was attached, so a condition at
+    /// the call site would be a second copy of that rule free to drift out of step with it.
+    #[must_use]
+    pub fn with_rule_clock(mut self, budget: Arc<lanekeep_core::limits::Budget>) -> Self {
+        self.rule_clock = Some(budget);
         self
     }
 
@@ -816,6 +842,24 @@ impl HostContext {
     /// Answers cross as data rather than as handles, for the reason `structureFingerprint`
     /// does: a type handle would be one crossing per question about a type, which is the cost
     /// invariant 3 exists to prevent.
+    ///
+    /// # The pause below, in every arm
+    ///
+    /// Each arm wraps only the provider call in `rule_clock.pause()` — not the arena borrow,
+    /// the handle lookup, or the `render_*` call that turns the answer into a JS value. Those
+    /// are the rule's own boundary cost and stay charged to it; only the provider's own
+    /// program build is host work the rule did not write. Charging that work to whichever
+    /// rule happened to ask first would make a rule's timeout depend on the order the config
+    /// listed it in — and which arm triggers a build is not knowable from the call site, so
+    /// every arm pauses, not only the expensive-looking ones.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "five parallel arms, each pausing around its own provider call the same way \
+                  for the same reason — splitting one arm into its own function would separate \
+                  it from the doc above that explains why every arm does this identically, and \
+                  from the four siblings a reader needs beside it to see that the pause is \
+                  narrowed consistently rather than in one arm only"
+    )]
     fn install_types<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
         let (Some(provider), Some(files)) = (self.provider.clone(), self.files.clone()) else {
             return Ok(());
@@ -825,15 +869,18 @@ impl HostContext {
         // separators and strips a leading `./`, which is an allocation this surface should
         // not pay on every host crossing.
         let file = FilePath::new(&*self.file_path);
-
         let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
         let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "typeOf",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
-                    let answer = with_query(&arena, &at, &reader, handle, |q| asked.type_of(q));
+                    let answer =
+                        paused_query(clock.as_deref(), &arena, &at, &reader, handle, |q| {
+                            asked.type_of(q)
+                        });
                     let Some(ty) = answer else {
                         return Ok(Value::new_undefined(ctx.clone()));
                     };
@@ -843,13 +890,17 @@ impl HostContext {
         )?;
 
         let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
         let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "symbolOf",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
-                    let answer = with_query(&arena, &at, &reader, handle, |q| asked.symbol_of(q));
+                    let answer =
+                        paused_query(clock.as_deref(), &arena, &at, &reader, handle, |q| {
+                            asked.symbol_of(q)
+                        });
                     let Some(symbol) = answer else {
                         return Ok(Value::new_undefined(ctx.clone()));
                     };
@@ -859,6 +910,7 @@ impl HostContext {
         )?;
 
         let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
         let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "returnTypeOf",
@@ -866,7 +918,9 @@ impl HostContext {
                 ctx.clone(),
                 move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
                     let answer =
-                        with_query(&arena, &at, &reader, handle, |q| asked.return_type_of(q));
+                        paused_query(clock.as_deref(), &arena, &at, &reader, handle, |q| {
+                            asked.return_type_of(q)
+                        });
                     let Some(ty) = answer else {
                         return Ok(Value::new_undefined(ctx.clone()));
                     };
@@ -876,6 +930,7 @@ impl HostContext {
         )?;
 
         let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
         let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "isAssignableTo",
@@ -886,13 +941,14 @@ impl HostContext {
                       module: String,
                       name: String|
                       -> rquickjs::Result<Value<'js>> {
+                    let answer =
+                        paused_query(clock.as_deref(), &arena, &at, &reader, handle, |q| {
+                            asked.is_assignable_to(q, &module, &name)
+                        });
                     // `undefined` for "could not read", never `false`. The two are different
                     // answers and a rule branching on the wrong one reports on code the
                     // provider never saw — which is why this arm returns a value rather than
                     // a bare `bool` the boundary would coerce.
-                    let answer = with_query(&arena, &at, &reader, handle, |q| {
-                        asked.is_assignable_to(q, &module, &name)
-                    });
                     match answer {
                         Some(verdict) => Ok(Value::new_bool(ctx.clone(), verdict)),
                         None => Ok(Value::new_undefined(ctx.clone())),
@@ -902,6 +958,7 @@ impl HostContext {
         )?;
 
         let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
         let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "complete",
@@ -910,13 +967,15 @@ impl HostContext {
                 // and no handle is taken, because a rule asking "did I see everything" is
                 // asking about the file it is checking and there is only one.
                 let arena = arena.borrow();
-                asked.complete(Query {
+                let query = Query {
                     file: &at,
                     tree: arena.tree(),
                     source: arena.source(),
                     node: arena.tree().root_node(),
                     files: &reader,
-                })
+                };
+                let _paused = clock.as_ref().map(|budget| budget.pause());
+                asked.complete(query)
             })?,
         )?;
 
@@ -1294,6 +1353,25 @@ fn with_query<T>(
         source: arena.source(),
         node,
         files,
+    })
+}
+
+/// [`with_query`], with the rule's clock paused around `ask` alone.
+///
+/// The arena borrow and handle lookup inside `with_query` run before this pauses and are
+/// charged to the rule; only `ask` — the provider call each `install_types` arm makes — runs
+/// with the clock stopped. See `install_types`'s doc for why that boundary and not a wider one.
+fn paused_query<T>(
+    clock: Option<&lanekeep_core::limits::Budget>,
+    arena: &Rc<RefCell<NodeArena>>,
+    file: &FilePath,
+    files: &FileAccess,
+    handle: Handle,
+    ask: impl FnOnce(Query<'_>) -> Option<T>,
+) -> Option<T> {
+    with_query(arena, file, files, handle, |q| {
+        let _paused = clock.map(lanekeep_core::limits::Budget::pause);
+        ask(q)
     })
 }
 
@@ -2421,6 +2499,134 @@ mod tests {
         // filesystem write from inside this crate is what `local/tracked-reads-only` refuses.
         let root = std::env::temp_dir();
         host(source).with_provider(Arc::new(provider), Arc::new(FileAccess::new(&root)))
+    }
+
+    /// A provider that spends real host time on every question, and counts the questions.
+    ///
+    /// Real time rather than a mocked clock, because the thing under test is the interaction
+    /// between a sleeping host call and the interrupt handler's own reading of the run clock —
+    /// which is exactly what a mock would paper over.
+    #[derive(Debug, Default)]
+    struct SlowProvider {
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlowProvider {
+        const HOST_WORK: std::time::Duration = std::time::Duration::from_millis(120);
+        const RULE_BUDGET: std::time::Duration = std::time::Duration::from_millis(80);
+
+        fn dawdle(&self) {
+            self.asked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(Self::HOST_WORK);
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl TypeProvider for SlowProvider {
+        fn type_of(&self, _q: Query<'_>) -> Option<Type> {
+            self.dawdle();
+            None
+        }
+        fn symbol_of(&self, _q: Query<'_>) -> Option<Symbol> {
+            self.dawdle();
+            None
+        }
+        fn return_type_of(&self, _q: Query<'_>) -> Option<Type> {
+            self.dawdle();
+            None
+        }
+        fn is_assignable_to(&self, _q: Query<'_>, _module: &str, _name: &str) -> Option<bool> {
+            self.dawdle();
+            None
+        }
+        fn complete(&self, _q: Query<'_>) -> bool {
+            self.dawdle();
+            true
+        }
+        fn identity(&self) -> Vec<u8> {
+            b"slow-provider".to_vec()
+        }
+    }
+
+    /// Enough bytecode after the provider call for the interrupt handler to actually run.
+    ///
+    /// QuickJS polls the handler every `JS_INTERRUPT_COUNTER_INIT` operations (10,000, from
+    /// `rquickjs-sys`'s vendored `quickjs.c`) rather than after every one, so a rule that
+    /// returns immediately after a host call is never asked whether it should stop — which
+    /// made the first version of the control test below pass while asserting nothing. Twenty
+    /// thousand iterations clears that several times over while staying cheap: measured on an
+    /// Apple M3 Max, `cargo nextest run` debug build, this loop alone takes about 4 ms against
+    /// `SlowProvider::RULE_BUDGET`'s 80 ms — roughly 20× headroom, not the "thousands of
+    /// times" this comment used to claim for the hundred-thousand-iteration version.
+    const POLL_THE_HANDLER: &str = "; let s = 0; for (let i = 0; i < 20000; i++) s += i; \
+                                    'survived'";
+
+    /// Every `ctx.types` arm, spelled so each one reaches the provider exactly once.
+    const EVERY_TYPES_ARM: [&str; 5] = [
+        "ctx.types.typeOf(ctx.root)",
+        "ctx.types.symbolOf(ctx.root)",
+        "ctx.types.returnTypeOf(ctx.root)",
+        "ctx.types.isAssignableTo(ctx.root, 'decimal.js', 'Decimal')",
+        "ctx.types.complete()",
+    ];
+
+    /// The pause reaches every arm, not only the expensive-looking ones.
+    ///
+    /// The trap this is written against: a `pause` that is constructed and never installed on
+    /// a closure looks implemented and enforces nothing. Each arm is asked for a question the
+    /// provider spends `SlowProvider::HOST_WORK` on, under a `SlowProvider::RULE_BUDGET` rule
+    /// budget; the rule survives only because the host's time was not charged to it. The
+    /// companion test below removes the clock and shows the same code timing out, so this one
+    /// cannot be passing because the host's time went unnoticed.
+    #[test]
+    fn types_a_provider_call_is_not_charged_to_the_rules_own_budget() {
+        for arm in EVERY_TYPES_ARM {
+            let provider = Arc::new(SlowProvider::default());
+            let sandbox = Sandbox::with_limits(Limits::default()).expect("sandbox builds");
+            let host = host("const a: number = 1;")
+                .with_provider(
+                    Arc::clone(&provider) as Arc<dyn TypeProvider>,
+                    Arc::new(FileAccess::new(&std::env::temp_dir())),
+                )
+                .with_rule_clock(sandbox.budget());
+
+            let source = format!("{arm}{POLL_THE_HANDLER}");
+            let answer: String = sandbox
+                .eval_with_host_timeout(&host, &source, SlowProvider::RULE_BUDGET)
+                .unwrap_or_else(|err| panic!("{arm} must not be charged the host's time: {err:?}"));
+
+            assert_eq!(answer, "survived");
+            assert_eq!(provider.asked(), 1, "{arm} must reach the provider");
+        }
+    }
+
+    /// The control for the test above: with no rule clock attached, the same work times out.
+    ///
+    /// Without this pair, a `pause` that did nothing at all would still be green —
+    /// `SlowProvider::HOST_WORK` would simply have to be shown to matter, and nothing would
+    /// show it.
+    #[test]
+    fn types_a_provider_call_without_a_rule_clock_is_charged_to_the_rule() {
+        for arm in EVERY_TYPES_ARM {
+            let provider = Arc::new(SlowProvider::default());
+            let sandbox = Sandbox::with_limits(Limits::default()).expect("sandbox builds");
+            let host = host("const a: number = 1;").with_provider(
+                Arc::clone(&provider) as Arc<dyn TypeProvider>,
+                Arc::new(FileAccess::new(&std::env::temp_dir())),
+            );
+
+            let source = format!("{arm}{POLL_THE_HANDLER}");
+            let outcome =
+                sandbox.eval_with_host_timeout::<String>(&host, &source, SlowProvider::RULE_BUDGET);
+            assert!(
+                matches!(outcome, Err(crate::SandboxError::RuleTimeout { .. })),
+                "{arm} unpaused must breach the rule budget, got {outcome:?}"
+            );
+        }
     }
 
     /// The provider is what answers, and a host given none has no `types` namespace.

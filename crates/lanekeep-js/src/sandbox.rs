@@ -196,6 +196,17 @@ impl Sandbox {
         &self.limits
     }
 
+    /// The budget the interrupt handler polls.
+    ///
+    /// Handed to a [`crate::HostContext`] so a host function that calls out to a type
+    /// provider can stop the rule's clock for the duration. There is exactly one of these per
+    /// sandbox and the handler holds a clone of it, so this is the same object rather than an
+    /// equivalent one — which is the whole point: pausing a copy would pause nothing.
+    #[must_use]
+    pub fn budget(&self) -> Arc<Budget> {
+        Arc::clone(&self.budget)
+    }
+
     /// Evaluate source, enforcing the per-invocation budget.
     ///
     /// # Errors
