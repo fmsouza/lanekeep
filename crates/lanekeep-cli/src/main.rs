@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+mod session;
 mod watch;
 
 use clap::{Parser, Subcommand};
@@ -302,7 +303,7 @@ fn fix_and_recheck(
     // a cache miss on the handful of files a fix rewrote. `begin_run` gives the held provider a
     // fresh analysis budget and rebuilds its programs from the fixed bytes, so this is a second
     // run with its own budget rather than a continuation of the first (architecture §6.7).
-    let (engine, _) = prepare(
+    let (engine, _) = prepare_with_session(
         project_root,
         config,
         caching,
@@ -312,6 +313,7 @@ fn fix_and_recheck(
         // announce a cost that is not about to be paid.
         PrepareOptions::default(),
         held,
+        None,
     )?;
     engine.run().map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -985,13 +987,45 @@ const METADATA_ONLY: PrepareOptions<'static> = PrepareOptions {
 /// before the engine spawns anything, and `rules` and `explain` are the two that need no
 /// provider spawned at all. Both are engine-side decisions, and passing the struct is what
 /// keeps a new one from arriving here as a bare `bool` beside `caching`.
+///
+/// A one-shot run: no session is held, so [`Engine::prepare_with_provider`] builds its own
+/// provider and drops it with the engine.
 fn prepare(
     project_root: &Path,
     config: Option<&Path>,
     caching: bool,
     global_timeout: Option<u64>,
     options: PrepareOptions<'_>,
+) -> anyhow::Result<(Engine, usize)> {
+    prepare_with_session(
+        project_root,
+        config,
+        caching,
+        global_timeout,
+        options,
+        None,
+        None,
+    )
+}
+
+/// [`prepare`], optionally reusing an already-built provider or a session's held one.
+///
+/// `held` is the narrower, older reuse: `fix_and_recheck` passes the *first* run's provider
+/// back in directly, unconditionally, because a fix-and-recheck pair shares one config within
+/// one CLI invocation and there is nothing to compare. `session` is broader — it may build, or
+/// rebuild, depending on whether `config.types` moved since the session's last request — and
+/// is `Some` only from `server`, where the provider is the state a session keeps between
+/// requests and the engine is not (see [`crate::session`]). `held` wins when both are given,
+/// though in practice they never are: `fix_and_recheck` runs one-shot and has no session, and
+/// a session-held provider always reaches here as `session`, never pre-extracted into `held`.
+fn prepare_with_session(
+    project_root: &Path,
+    config: Option<&Path>,
+    caching: bool,
+    global_timeout: Option<u64>,
+    options: PrepareOptions<'_>,
     held: Option<Arc<dyn lanekeep_engine::TypeProvider>>,
+    session: Option<&session::SessionProvider>,
 ) -> anyhow::Result<(Engine, usize)> {
     let root = RuleRoot::new(project_root)
         .map_err(|e| anyhow::anyhow!("cannot use `{}`: {e}", project_root.display()))?
@@ -1047,6 +1081,42 @@ fn prepare(
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     let declared = loaded.rules.len();
+
+    // An explicit `held` wins outright — that is `fix_and_recheck` handing back the provider it
+    // already built for this exact run. Otherwise a session builds or reuses one, unless this
+    // is a metadata-only prepare: neither `rules` nor `explain` runs a file, so neither can ask
+    // a provider anything, and a session passed to either would build one for a listing.
+    let held = match held {
+        Some(provider) => Some(provider),
+        None => match session {
+            Some(session) if !options.without_provider => {
+                match session.for_request(&loaded, project_root) {
+                    Ok(provider) => Some(provider),
+                    // A spent `timeouts.analysis` is a limit, and a limit cancels the request
+                    // — the same exit the engine's own path takes for it, and the one error
+                    // from here that must not be re-worded into "your build does not provide
+                    // `types`", which sends the reader to install a toolchain they have.
+                    Err(timeout @ lanekeep_engine::RunError::AnalysisTimeout { .. }) => {
+                        return Err(anyhow::anyhow!("{timeout}"));
+                    }
+                    // **Anything else falls through with no held provider, deliberately.** A
+                    // session that raised it instead failed every request that `lanekeep
+                    // check` over the same project answers: under `types.provider: 'tsc'` with
+                    // an unstartable command and no enabled rule that needs `types`, the
+                    // engine's own path keeps the spawn failure in `tsc_spawn_error`, lets the
+                    // capability gate find that nobody asked, and reports normally. Only that
+                    // gate can decide, and only the engine holds it — so the engine is where
+                    // this has to be decided, which means arriving there with `None` and
+                    // letting it make the same cheap spawn attempt and reach the same verdict.
+                    Err(error) => {
+                        let _ = writeln!(std::io::stderr(), "lanekeep: {error}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        },
+    };
 
     let engine = Engine::prepare_with_provider(
         &loaded,
@@ -1109,9 +1179,13 @@ struct Switches {
 
 /// Serve LSP or MCP over stdio until the client disconnects.
 ///
-/// The engine is rebuilt on every call rather than held: a rule file or the config can change
-/// while the session is open, and a server answering from the ruleset it started with would
-/// report violations the project no longer has.
+/// The engine is rebuilt on every request rather than held: a rule file or the config can
+/// change while the session is open, and a server answering from the ruleset it started with
+/// would report violations the project no longer has.
+///
+/// The type provider is the exception, and it is one for the opposite reason: it is the
+/// expensive state, and it is content-keyed, so it can be held without being able to go stale
+/// unnoticed. See [`crate::session`].
 fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow::Result<ExitCode> {
     let root = project_root
         .canonicalize()
@@ -1122,18 +1196,21 @@ fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow:
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
 
+    let session = session::SessionProvider::new();
+
     match protocol {
         "lsp" => {
             lanekeep_server::serve_lsp(&mut input, &mut output, &root, || {
                 // Every failure becomes a string the server logs and carries on from. An
                 // editor session should survive a config typo, not end on one.
-                let (engine, _) = prepare(
+                let (engine, _) = prepare_with_session(
                     project_root,
                     config,
                     true,
                     None,
                     PrepareOptions::default(),
                     None,
+                    Some(&session),
                 )
                 .map_err(|e| e.to_string())?;
                 engine
@@ -1146,6 +1223,7 @@ fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow:
             let mut tools = Project {
                 project_root,
                 config,
+                session: &session,
             };
             lanekeep_server::mcp::serve(&mut input, &mut output, &mut tools)?;
         }
@@ -1156,20 +1234,29 @@ fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow:
 }
 
 /// The MCP tools, run against a real project.
+#[expect(
+    clippy::struct_field_names,
+    reason = "`project_root` sharing a prefix with `Project` only became a third field once \
+              `session` was added here for #191; renaming it would make this struct disagree \
+              with every other `project_root` parameter in the crate"
+)]
 struct Project<'a> {
     project_root: &'a Path,
     config: Option<&'a Path>,
+    /// Shared with the session, so `check` reuses what previous calls built.
+    session: &'a session::SessionProvider,
 }
 
 impl lanekeep_server::mcp::Tools for Project<'_> {
     fn check(&mut self) -> Result<String, String> {
-        let (engine, _) = prepare(
+        let (engine, _) = prepare_with_session(
             self.project_root,
             self.config,
             true,
             None,
             PrepareOptions::default(),
             None,
+            Some(self.session),
         )
         .map_err(|e| e.to_string())?;
         let outcome = engine.run().map_err(|e| e.to_string())?;
@@ -1198,15 +1285,8 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
     fn rules(&mut self) -> Result<String, String> {
         use std::fmt::Write as _;
 
-        let (engine, _) = prepare(
-            self.project_root,
-            self.config,
-            false,
-            None,
-            METADATA_ONLY,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
+        let (engine, _) = prepare(self.project_root, self.config, false, None, METADATA_ONLY)
+            .map_err(|e| e.to_string())?;
 
         let mut out = String::new();
         for spec in engine.rules() {
@@ -1225,15 +1305,8 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
     fn explain(&mut self, rule: &str) -> Result<String, String> {
         use std::fmt::Write as _;
 
-        let (engine, _) = prepare(
-            self.project_root,
-            self.config,
-            false,
-            None,
-            METADATA_ONLY,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
+        let (engine, _) = prepare(self.project_root, self.config, false, None, METADATA_ONLY)
+            .map_err(|e| e.to_string())?;
 
         let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
             // The list, not only the miss. A rule id is easy to mistype and the answer is
@@ -1378,7 +1451,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         on_config,
         ..PrepareOptions::default()
     };
-    let (engine, _) = prepare(project_root, config, !no_cache, timeout, prepared, None)?;
+    let (engine, _) = prepare(project_root, config, !no_cache, timeout, prepared)?;
 
     note_provider(&engine)?;
 
@@ -1466,7 +1539,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
 }
 
 fn rules(project_root: &Path, config: Option<&Path>, as_json: bool) -> anyhow::Result<ExitCode> {
-    let (engine, declared) = prepare(project_root, config, false, None, METADATA_ONLY, None)?;
+    let (engine, declared) = prepare(project_root, config, false, None, METADATA_ONLY)?;
     let mut stdout = std::io::stdout();
 
     if as_json {
@@ -1540,7 +1613,7 @@ fn explain(
     config: Option<&Path>,
     as_json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let (engine, _) = prepare(project_root, config, false, None, METADATA_ONLY, None)?;
+    let (engine, _) = prepare(project_root, config, false, None, METADATA_ONLY)?;
 
     let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
         // Naming what is configured, rather than only what is missing. A rule id is easy to

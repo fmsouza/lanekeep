@@ -827,6 +827,24 @@ impl TypeProvider for TscProvider {
         self.identity.clone()
     }
 
+    /// True once the sidecar is gone, which for this provider is unrecoverable in place.
+    ///
+    /// Every failure path that leaves the protocol out of step kills the child (see `stop`),
+    /// and nothing here starts another: the `Session` holds one `Child`, and a provider is
+    /// shared behind an `Arc` across the run's workers, so respawning under them would be a
+    /// second sidecar answering questions the first was asked. A session builds a new provider
+    /// instead — see [`TypeProvider::needs_rebuild`].
+    ///
+    /// `try_wait` rather than a flag set where the child is killed: the child may also have
+    /// died on its own — out of memory building a program is the realistic one — and a flag
+    /// would only ever know about the deaths lanekeep caused.
+    fn needs_rebuild(&self) -> bool {
+        let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        // An error from `try_wait` is a child whose state cannot be established, which is not a
+        // child this provider can go on using either.
+        !matches!(session.child.try_wait(), Ok(None))
+    }
+
     fn revalidate(&self, _files: &FileAccess) {
         // Nothing to do: the sidecar's state is the programs it built, and `begin_run`
         // re-answers `programs` — re-reading every config's file set and rebuilding with

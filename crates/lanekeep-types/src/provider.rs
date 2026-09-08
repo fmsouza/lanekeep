@@ -209,6 +209,25 @@ pub trait TypeProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Whether this provider is past repair and has to be built again.
+    ///
+    /// Asked by a session that holds a provider across requests
+    /// (`crates/lanekeep-cli/src/session.rs`), before it hands the held one back. It is the
+    /// difference between state that is *stale* and state that is *gone*: [`Self::revalidate`]
+    /// repairs the first, and nothing repairs the second.
+    ///
+    /// The `tsc` provider is the one that answers `true`: a breached `timeouts.analysis` kills
+    /// its sidecar, and nothing respawns it, so every later request in that session failed with
+    /// "the sidecar exited without answering" for the life of the editor — one slow build
+    /// bricking the session, where `lanekeep check` over the same project spawns a sidecar and
+    /// succeeds. A limit must cancel the run it breached and nothing after it.
+    ///
+    /// The default is `false`: a provider whose state is ordinary memory cannot be gone while
+    /// the process that holds it is running.
+    fn needs_rebuild(&self) -> bool {
+        false
+    }
+
     /// Whether this provider spends the run's [`AnalysisBudget`].
     ///
     /// The engine reads the accumulator between one file and the next and cancels the run when

@@ -1022,3 +1022,45 @@ fn a_held_providers_revalidate_answers_the_edit_begin_run_rebuilt() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A breached budget kills the sidecar, and the provider says so rather than answering
+/// nothing forever.
+///
+/// The session that holds a provider across requests has no other way to tell "the compiler
+/// has no type for that node" from "there is no compiler": every arm answers `None` on a
+/// failure. Without this, one slow build ended an editor session — every later request failed
+/// with "the sidecar exited without answering" while `lanekeep check` over the same project
+/// spawned a sidecar and succeeded.
+#[test]
+fn a_breach_leaves_the_provider_asking_to_be_rebuilt() {
+    if !tsc_available() {
+        eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+        return;
+    }
+    let root = fixture("needs-rebuild");
+    let provider = TscProvider::spawn_with_env(
+        &root,
+        &tsc_config(),
+        AnalysisBudget::start(Duration::from_mins(2)),
+        &[("LANEKEEP_TSC_DRIVER_DELAY_MS", "2000")],
+    )
+    .expect("the sidecar starts");
+    assert!(
+        !provider.needs_rebuild(),
+        "a serving sidecar is not a provider to throw away"
+    );
+
+    let error = provider
+        .begin_run(
+            &|| vec![FilePath::new("src/a.ts")],
+            AnalysisBudget::start(Duration::from_millis(200)),
+        )
+        .expect_err("the request outlives the run's budget");
+    assert!(matches!(error, BeginRunError::Timeout(_)), "got: {error:?}");
+    assert!(
+        provider.needs_rebuild(),
+        "the breach killed the sidecar and the provider still offers itself for the next request"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
