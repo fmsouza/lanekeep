@@ -1961,8 +1961,11 @@ mod tests {
 
     #[test]
     fn a_write_to_a_shape_named_property_is_a_documented_false_negative() {
-        // The sharpest case of the deliberate unsoundness above: the *write* lands at
-        // `Field("length")` like any other, and the read is cut before the path is consulted.
+        // The sharpest case of the deliberate unsoundness above: the read is cut before the
+        // path is consulted, so what the write landed at makes no difference to the answer.
+        // The two rows do not even land at the same segment — `o.length` writes
+        // `Field("length")` and `o["length"]` writes `Seg::Index`, since every subscript
+        // collapses to it — which is exactly why the cut has to be at the read.
         // Pinned so the cost is a stated fact; the control keeps the base itself reported.
         for source in [
             "function f(){ const o = {}; o.length = getSecret(); log(o.length); }",

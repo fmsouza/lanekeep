@@ -10,6 +10,7 @@
               helper in an integration-test crate is neither — see AGENTS.md"
 )]
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use lanekeep_core::{FileAccess, FilePath};
@@ -124,6 +125,120 @@ fn a_query_carries_one_calls_context() {
 fn the_provider_trait_is_shareable_and_object_safe() {
     const fn assert_shareable<T: Send + Sync + ?Sized>() {}
     assert_shareable::<dyn TypeProvider>();
+}
+
+/// The default `begin_run` never walks the corpus.
+///
+/// The file list is lazy — `&dyn Fn() -> Vec<FilePath>` rather than `&[FilePath]` — because
+/// the engine's only way to produce one is a second walk of the whole project, and the only
+/// provider that ships ignores it. A warm run paying for a corpus walk nothing reads is a cost
+/// with no answer attached to it.
+#[test]
+fn the_default_begin_run_does_not_walk_the_corpus() {
+    struct Silent;
+    impl TypeProvider for Silent {
+        fn type_of(&self, _: Query<'_>) -> Option<lanekeep_types::Type> {
+            None
+        }
+        fn symbol_of(&self, _: Query<'_>) -> Option<lanekeep_types::Symbol> {
+            None
+        }
+        fn return_type_of(&self, _: Query<'_>) -> Option<lanekeep_types::Type> {
+            None
+        }
+        fn is_assignable_to(&self, _: Query<'_>, _: &str, _: &str) -> Option<bool> {
+            None
+        }
+        fn complete(&self, _: Query<'_>) -> bool {
+            true
+        }
+        fn identity(&self) -> Vec<u8> {
+            Vec::new()
+        }
+    }
+
+    let walked = std::cell::Cell::new(false);
+    let files = || {
+        walked.set(true);
+        Vec::new()
+    };
+    assert_eq!(Silent.begin_run(&files), Ok(Vec::new()));
+    assert!(
+        !walked.get(),
+        "the default body must not ask for a file list it does not read"
+    );
+}
+
+/// A path that answered nothing is parsed once it becomes text, within one run.
+///
+/// A memo of the failures was consulted *before* the read, so a path probed while it was
+/// absent stayed absent for the rest of the run however the filesystem moved under it — and a
+/// miss carries no hash, so nothing about the entry could ever say otherwise. Asking for the
+/// hash first is what closes it, and it is why nothing memoizes a failure at all now: a second
+/// probe is one `hash_of`, which the access answers from its own memo.
+///
+/// The two halves of the same rule: a `.d.ts` installed mid-run is read, and `begin_run` still
+/// starts the next run cold for the memo that has no hash to compare at all.
+#[test]
+fn a_path_that_was_absent_is_parsed_once_it_becomes_text() {
+    let project = Project::new("miss-becomes-text", &[]);
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let path = FilePath::new("lib.d.ts");
+
+    assert!(
+        provider.declaration(&project.files(), &path).is_none(),
+        "nothing is there yet"
+    );
+    project.write("lib.d.ts", "export declare class Big {}\n");
+    let parsed = provider
+        .declaration(&project.files(), &path)
+        .expect("a path that has become text is read rather than held at the old answer");
+    assert!(lanekeep_types::declared_here(&parsed, "Big").is_some());
+
+    provider.begin_run(&Vec::new).expect("a run begins");
+    assert!(
+        provider.declaration(&project.files(), &path).is_some(),
+        "and a run still starts cold"
+    );
+}
+
+/// And the completeness memo with them.
+///
+/// Separate from the declaration memo above because it is the one a rule reads directly: a
+/// file that was incomplete because a declaration was missing must be re-decided once the
+/// declaration exists, and nothing but this clearing can make that happen for a held provider.
+#[test]
+fn begin_run_clears_a_held_providers_completeness_memo() {
+    let project = Project::new("begin-run-clears-completeness", &[]);
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { rate } from './money';\nconst x = rate;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let question = |files: &FileAccess| {
+        provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files,
+        })
+    };
+
+    assert!(
+        !question(&project.files()),
+        "the import resolves to nothing"
+    );
+    project.write("src/money.d.ts", "export declare const rate: number;\n");
+    assert!(
+        !question(&project.files()),
+        "the answer is memoized per file within a run"
+    );
+
+    provider.begin_run(&Vec::new).expect("a run begins");
+    assert!(
+        question(&project.files()),
+        "a run starts cold, so completeness is decided again against the filesystem now"
+    );
 }
 
 /// The provider answers what the oracle answered, through the new door.
@@ -324,7 +439,7 @@ fn every_relative_probe_is_recorded_in_a_fixed_order() {
     let recorded: Vec<(String, bool)> = files
         .dependencies()
         .into_iter()
-        .map(|read| (read.path.as_str().to_owned(), read.hash.is_some()))
+        .map(|read| (read.path.as_str().to_owned(), read.hash().is_some()))
         .collect();
     assert_eq!(
         recorded,
@@ -371,6 +486,47 @@ fn a_bare_specifier_resolves_through_the_exports_types_condition() {
     assert_eq!(
         resolve_specifier(&files, &FilePath::new("src/a.ts"), "money"),
         Some(FilePath::new("node_modules/money/build/index.d.ts"))
+    );
+}
+
+/// A `types` condition that is itself a conditions object resolves through it.
+///
+/// `{"types": {"import": "./index.d.mts", "require": "./index.d.ts"}}` is the shape a package
+/// shipping both module systems publishes, and it answered nothing: the nested search only
+/// recursed into further objects, so an object of string leaves fell through both arms. The
+/// package then resolved by the `index.d.ts` fallback or not at all, and a package whose
+/// declarations live anywhere else was simply unreadable.
+#[test]
+fn a_types_condition_holding_conditions_resolves_to_a_string_leaf() {
+    let project = project_with(
+        "bare-nested-types",
+        &package(
+            r#"{"exports": {".": {"types": {"import": "./build/index.d.ts", "require": "./nope.d.ts"}}}}"#,
+        ),
+    );
+    let files = project.files();
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/a.ts"), "money"),
+        Some(FilePath::new("node_modules/money/build/index.d.ts")),
+        "the conditions under `types` are read in the fixed key order the whole function uses"
+    );
+}
+
+/// And a conditions object with no `types` anywhere still answers nothing.
+///
+/// The half that must not move: `default` and `import` outside a `types` condition name the
+/// *emitted JavaScript*, and following one would hand this provider a `.js` file to parse as
+/// TypeScript. A confidently wrong type is worse than none.
+#[test]
+fn conditions_with_no_types_condition_still_resolve_to_nothing() {
+    let project = project_with(
+        "bare-no-types-condition",
+        &package(r#"{"exports": {".": {"import": "./build/index.d.ts", "default": "./x.js"}}}"#),
+    );
+    let files = project.files();
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/a.ts"), "money"),
+        None
     );
 }
 
@@ -604,7 +760,7 @@ fn a_hoisted_node_modules_is_unresolvable_and_probes_nothing_above_the_root() {
             "probed outside the root: {}",
             read.path
         );
-        assert_eq!(read.hash, None, "every in-root candidate is absent");
+        assert_eq!(read.hash(), None, "every in-root candidate is absent");
     }
     let _ = std::fs::remove_dir_all(&outer);
 }
@@ -873,7 +1029,8 @@ fn a_missing_declaration_file_is_memoized_as_a_miss() {
     let reads = files.dependencies();
     assert_eq!(reads.len(), 1);
     assert_eq!(
-        reads[0].hash, None,
+        reads[0].hash(),
+        None,
         "an absence is a dependency with a null hash"
     );
 }
@@ -952,6 +1109,51 @@ fn a_star_re_export_is_followed_in_source_order() {
     );
 }
 
+/// When two `export *` sources both declare the same name, the first in source order wins.
+///
+/// Addendum E (task 4.16, from Task 8's review, optional). The test above shows the first
+/// source that *has* the name winning over one that lacks it entirely — which a walk that
+/// stopped at the first star clause regardless of content would also pass. This is the case
+/// that actually needs the "first" half of the claim: both `a.d.ts` and `b.d.ts` declare
+/// `Decimal`, so only checking source order — not merely presence — tells them apart.
+#[test]
+fn a_collision_between_two_star_sources_is_won_by_the_first_in_source_order() {
+    let project = Project::new(
+        "star-collision",
+        &[
+            ("src/a.ts", ""),
+            (
+                "node_modules/money/package.json",
+                r#"{"types": "./index.d.ts"}"#,
+            ),
+            (
+                "node_modules/money/index.d.ts",
+                "export * from './a';\nexport * from './b';\n",
+            ),
+            (
+                "node_modules/money/a.d.ts",
+                "export declare class Decimal {}\n",
+            ),
+            (
+                "node_modules/money/b.d.ts",
+                "export declare class Decimal {}\n",
+            ),
+        ],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let entry = resolve_specifier(&files, &FilePath::new("src/a.ts"), "money").expect("resolves");
+
+    assert_eq!(
+        provider.export_target(&files, &entry, "Decimal"),
+        Some(ExportTarget {
+            file: FilePath::new("node_modules/money/a.d.ts"),
+            name: "Decimal".to_owned(),
+        }),
+        "both files declare `Decimal`; the first `export *` clause in source order wins"
+    );
+}
+
 /// A cycle terminates rather than running away, and answers nothing.
 ///
 /// `export * from` in both directions is a shape real packages ship, and the bound alone
@@ -1011,9 +1213,14 @@ fn a_self_importing_declaration_file_terminates() {
 ///
 /// `a.d.ts` says `A` is `B`, `b.d.ts` says `B` is `A`; nothing here ever bottoms out at a
 /// concrete type. `MAX_DEPTH` is what stops it — a real bound, not a performance claim, so
-/// this asserts it returns promptly rather than merely asserting it returns an answer. The
-/// bound does not answer `None`: it stops mid-chain and reports the last alias reached as a
-/// nominal type, exactly as running out of budget partway through a same-file chain would.
+/// this asserts it returns promptly rather than merely asserting it returns an answer.
+///
+/// Addendum B (task 4.16) changed what the bound answers. Before: it stopped mid-chain and
+/// reported the last alias reached as a nominal type — a *confident* answer carrying an
+/// intermediate file's own specifier, which `lanekeep/no-restricted-types` then reported as
+/// a false positive, because that specifier is not what the program actually named. Now: a
+/// chain cut by the bound answers `None`, on the same reasoning a same-file chain already
+/// used running out of budget partway through — a cut answer is unknown, never a guess.
 #[test]
 fn a_mutual_alias_cycle_across_two_files_terminates() {
     let project = Project::new(
@@ -1037,17 +1244,93 @@ fn a_mutual_alias_cycle_across_two_files_terminates() {
         "`MAX_DEPTH` must stop the walk well inside the budget, not merely before it hangs"
     );
     assert_eq!(
-        result,
-        Some(lanekeep_types::Type::Nominal {
-            name: "B".to_owned(),
-            symbol: Some(lanekeep_types::Symbol {
-                name: "B".to_owned(),
-                module: Some("./b".to_owned()),
-                exported: Some("B".to_owned()),
-            }),
-        }),
-        "the bound stops mid-chain rather than resolving to a concrete type"
+        result, None,
+        "the bound cuts the chain, and a cut answer is unknown rather than a guess"
     );
+}
+
+/// A single alias chain, twenty files deep, answers nothing rather than a guess.
+///
+/// Addendum B. Unlike the mutual cycle above, this chain is acyclic and really does bottom
+/// out at a concrete type (`export type X = number;` in the last file) — but only after more
+/// hops than `MAX_DEPTH` allows, so the walk never gets there. The pre-fix code would have
+/// answered a nominal type naming whichever file the sixteenth hop happened to land in; this
+/// asserts the honest answer instead.
+#[test]
+fn an_alias_chain_past_the_depth_bound_answers_nothing() {
+    const HOPS: usize = 20;
+    let mut files: Vec<(String, String)> = (0..HOPS)
+        .map(|i| {
+            (
+                format!("src/a{i}.d.ts"),
+                format!("import {{ X }} from './a{}';\nexport type X = X;\n", i + 1),
+            )
+        })
+        .collect();
+    files.push((
+        format!("src/a{HOPS}.d.ts"),
+        "export type X = number;\n".to_owned(),
+    ));
+    let owned: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect();
+    let project = Project::new("alias-chain-too-deep", &owned);
+    let subject = "import { X } from './a0';\nlet x: X;\n";
+    let started = std::time::Instant::now();
+    let result = ask(&project, subject, TypeProvider::type_of);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "`MAX_DEPTH` must stop the walk well inside the budget, not merely before it hangs"
+    );
+    assert_eq!(
+        result, None,
+        "twenty hops exceeds `MAX_DEPTH`, so the concrete `number` at the end is never reached"
+    );
+}
+
+/// The depth bound alone, with no cycle anywhere to reach it.
+///
+/// `walk_export` has two stopping conditions and the tests around it exercise the *visited*
+/// set — `export *` in both directions, a self-import, a mutual alias. A chain of distinct
+/// files trips neither of those: only the bound stops it, and a bound deleted from a walk that
+/// still has a cycle guard leaves every one of those tests green while an over-long chain
+/// walks the whole way. Both sides are asserted, one hop apart, so the rows pin the bound's
+/// value rather than merely its existence.
+#[test]
+fn a_chain_longer_than_the_export_depth_bound_answers_nothing() {
+    for (test, declared_at, expected) in [
+        ("chain-depth-inside", 15, true),
+        ("chain-depth-outside", 16, false),
+    ] {
+        let mut files: Vec<(String, String)> = (0..declared_at)
+            .map(|hop| {
+                (
+                    format!("src/hop{hop}.d.ts"),
+                    format!("export {{ Decimal }} from './hop{}';\n", hop + 1),
+                )
+            })
+            .collect();
+        files.push((
+            format!("src/hop{declared_at}.d.ts"),
+            "export declare class Decimal {}\n".to_owned(),
+        ));
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let project = Project::new(test, &borrowed);
+        let files = project.files();
+        let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+
+        assert_eq!(
+            provider
+                .export_target(&files, &FilePath::new("src/hop0.d.ts"), "Decimal")
+                .is_some(),
+            expected,
+            "a chain of {declared_at} distinct hops, with no cycle in it anywhere"
+        );
+    }
 }
 
 /// A named re-export of a name that does not exist anywhere answers nothing.
@@ -1336,5 +1619,1441 @@ fn a_re_export_chain_within_the_bound_answers_the_renamed_declaration() {
         symbol.exported.as_deref(),
         Some("Real"),
         "within the bound the walk crosses the rename and answers the real declaration"
+    );
+}
+
+/// `returnTypeOf` over one file, one case per rule in §3.5.
+///
+/// A table, because the rule is stated as five clauses and each needs its own row: an
+/// annotated signature, a single inferred return, several returns that agree, several that
+/// cannot all be typed, and a function with no return at all.
+#[test]
+fn return_type_of_reads_a_signature_or_infers_one() {
+    for (subject, expected) in [
+        (
+            "function rate(): number { return compute(); }\nrate();\n",
+            Some(lanekeep_types::Type::Primitive(
+                lanekeep_types::Primitive::Number,
+            )),
+        ),
+        (
+            "function rate() { return 1; }\nrate();\n",
+            Some(lanekeep_types::Type::Primitive(
+                lanekeep_types::Primitive::Number,
+            )),
+        ),
+        (
+            "function rate(f) { if (f) { return 1; } return 'a'; }\nrate(1);\n",
+            lanekeep_types::Type::union(vec![
+                lanekeep_types::Type::Primitive(lanekeep_types::Primitive::Number),
+                lanekeep_types::Type::Primitive(lanekeep_types::Primitive::String),
+            ]),
+        ),
+        // One member the oracle cannot type sinks the whole union, exactly as an annotation's
+        // union already does: a partial answer is byte-identical to a complete one, and a
+        // rule reporting on it would accuse code a member of which it never read.
+        (
+            "function rate(f) { if (f) { return 1; } return f ?? 2; }\nrate(1);\n",
+            None,
+        ),
+        // No `return` at all answers nothing rather than `void`: this oracle has no `void`,
+        // and inventing one would be a claim about a function it read only the shape of.
+        ("function rate() { compute(); }\nrate();\n", None),
+        // A concise arrow body is the returned expression itself.
+        (
+            "const rate = () => 1;\nrate();\n",
+            Some(lanekeep_types::Type::Primitive(
+                lanekeep_types::Primitive::Number,
+            )),
+        ),
+    ] {
+        let project = Project::new("return-local", &[]);
+        let files = project.files();
+        let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+        let tree = parse(subject);
+        let file = FilePath::new("src/a.ts");
+        let node = last_of(&tree, "call_expression");
+        assert_eq!(
+            provider.return_type_of(Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node,
+                files: &files
+            }),
+            expected,
+            "{subject}"
+        );
+    }
+}
+
+/// A method's own declaration answers its return type directly, with no call needed.
+///
+/// Addendum A1: `return_type_at`'s dispatch already lists `method_definition` among the
+/// function-like kinds `signature_return` reads — this is the row that was missing to prove
+/// it, since the table above only ever asks through a `call_expression`.
+#[test]
+fn return_type_of_reads_a_method_definitions_own_declaration() {
+    let project = Project::new("return-method-definition", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "class C { m(): number { return 1; } }\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "method_definition");
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// A `method_signature` inside an interface answers its declared return type.
+///
+/// Addendum A1. An interface member has no body, so the annotation is the only source
+/// `signature_return` can read — this is the row that proves the arm is reached at all.
+#[test]
+fn return_type_of_reads_a_method_signature_inside_an_interface() {
+    let project = Project::new("return-method-signature", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "interface I { m(): number; }\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "method_signature");
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// An `abstract_method_signature` inside an abstract class answers its declared return type.
+///
+/// Addendum A1, the pair of the interface row above — an abstract member has no body either.
+#[test]
+fn return_type_of_reads_an_abstract_method_signature() {
+    let project = Project::new("return-abstract-method-signature", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "abstract class A { abstract m(): number; }\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "abstract_method_signature");
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// An arrow function's explicit return annotation wins over what its body would infer.
+///
+/// Addendum A1. The table above has an arrow row with no annotation at all
+/// (`const rate = () => 1`), so the annotation-wins precedence — already asserted for a
+/// `function_declaration` two rows up — was never asserted for an arrow specifically. The
+/// body here returns a `string`; only the annotation winning explains the `number` answer.
+#[test]
+fn return_type_of_prefers_an_arrow_functions_own_annotation() {
+    let project = Project::new("return-arrow-annotation", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "const rate = (): number => 'a';\nrate();\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "call_expression");
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// Calling a value that is not a function answers nothing, rather than guessing.
+///
+/// Addendum A1. `x`'s declaration is a number literal, which is none of the kinds
+/// `return_type_at` recognizes as function-like — the fall-through `_ => None` is what a
+/// rule sees, not a panic and not a number that was never returned.
+#[test]
+fn return_type_of_a_call_to_a_non_function_value_answers_nothing() {
+    let project = Project::new("return-non-function", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "const x = 5;\nx();\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "call_expression");
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        None
+    );
+}
+
+/// A generator function *expression*, bound to a name, answers nothing without an annotation.
+///
+/// Addendum A1's second half is still what the fixture is for: `is_function_like` already
+/// lists `generator_function` (the expression form assigned by `const g = function*() {...}`),
+/// but `return_type_at`'s own dispatch listed only `generator_function_declaration` — so a
+/// call to a generator bound this way fell through to `_ => None` despite the oracle
+/// considering it function-like everywhere else. The *answer* changed: a generator's declared
+/// value is a `Generator<…>` and the body's `return` is not it, so an unannotated generator
+/// answers nothing rather than the body's type. The annotated row below is what still pins the
+/// dispatch.
+#[test]
+fn return_type_of_reads_a_generator_function_expression() {
+    let project = Project::new("return-generator-expression", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "const g = function*() { return 1; };\ng();\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "call_expression");
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        None,
+        "calling a generator yields a generator object, not what its body returns"
+    );
+}
+
+/// An annotated one answers its annotation, which is what pins the dispatch.
+#[test]
+fn return_type_of_reads_an_annotated_generator_function_expression() {
+    let project = Project::new("return-generator-annotated", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "const g = function*(): number { return 1; };\ng();\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "call_expression");
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        )),
+        "the annotation is what the program means, generator or not"
+    );
+}
+
+/// An `async` function with no annotation answers nothing rather than the body's type.
+///
+/// `async function rate() { return 1 }` returns a `Promise<number>`, and this oracle has no
+/// variant that can say so — no type arguments, no `Promise`. Answering `number` would be a
+/// claim about a value a rule can compare against a `number` and be wrong every time, and the
+/// failure is silent: nothing about the answer says a wrapper was dropped. Three spellings,
+/// because the marker sits on three different node kinds.
+#[test]
+fn return_type_of_an_unannotated_async_function_answers_nothing() {
+    for subject in [
+        "async function rate() { return 1; }\nrate();\n",
+        "const rate = async () => 1;\nrate();\n",
+        "const rate = async function () { return 1; };\nrate();\n",
+        "async function* rate() { return 1; }\nrate();\n",
+    ] {
+        let project = Project::new("return-async", &[]);
+        let files = project.files();
+        let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+        let tree = parse(subject);
+        let file = FilePath::new("src/a.ts");
+        let node = last_of(&tree, "call_expression");
+        assert_eq!(
+            provider.return_type_of(Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node,
+                files: &files
+            }),
+            None,
+            "{subject}"
+        );
+    }
+}
+
+/// And an annotated `async` function answers its annotation, exactly as written.
+///
+/// The pair the row above needs: the refusal is about the *absence* of an annotation, not
+/// about `async`, so a rule that annotates its promises still gets an answer.
+#[test]
+fn return_type_of_an_annotated_async_function_answers_the_annotation() {
+    let project = Project::new("return-async-annotated", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "async function rate(): number { return 1; }\nrate();\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "call_expression");
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// The case `no-query-result-leak` needs: a call into a library, resolved through its
+/// `function_signature`, answered by name with type arguments dropped.
+#[test]
+fn return_type_of_resolves_an_imported_signature() {
+    let project = Project::new(
+        "return-imported",
+        &[
+            (
+                "node_modules/@tanstack/react-query/package.json",
+                r#"{"exports": {".": {"types": "./build/index.d.ts"}}}"#,
+            ),
+            (
+                "node_modules/@tanstack/react-query/build/index.d.ts",
+                "export declare class UseQueryResult {}\n\
+                 export declare function useQuery(o: unknown): UseQueryResult;\n",
+            ),
+        ],
+    );
+    let subject = "import { useQuery } from '@tanstack/react-query';\nuseQuery({});\n";
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "call_expression");
+    let Some(lanekeep_types::Type::Nominal { name, symbol }) = provider.return_type_of(Query {
+        file: &file,
+        tree: &tree,
+        source: subject,
+        node,
+        files: &files,
+    }) else {
+        panic!("the library's signature names a class");
+    };
+    assert_eq!(name, "UseQueryResult");
+    // Declared in the library file rather than imported into it, so it carries no module —
+    // which is the honest report: the name is the library's own, at its own site.
+    assert_eq!(symbol.and_then(|s| s.module), None);
+}
+
+/// One package exporting a base class and a base interface, for the heritage cases.
+const HERITAGE_PACKAGE: &[(&str, &str)] = &[
+    (
+        "node_modules/money/package.json",
+        r#"{"types": "./index.d.ts"}"#,
+    ),
+    (
+        "node_modules/money/index.d.ts",
+        "export declare class Decimal {}\n\
+         export declare interface Amountish { amount: number }\n\
+         export type Money = Decimal;\n\
+         export type Amount = number;\n",
+    ),
+];
+
+/// Ask `isAssignableTo` about the last annotated declarator in `subject`, against `("money",
+/// "Decimal")`.
+fn assignable(test: &str, extra: &[(&str, &str)], subject: &str) -> Option<bool> {
+    assignable_target(test, extra, subject, "money", "Decimal")
+}
+
+/// Ask `isAssignableTo` about the last annotated declarator in `subject`, against an
+/// arbitrary `(module, name)` target.
+fn assignable_target(
+    test: &str,
+    extra: &[(&str, &str)],
+    subject: &str,
+    module: &str,
+    name: &str,
+) -> Option<bool> {
+    let mut files: Vec<(&str, &str)> = HERITAGE_PACKAGE.to_vec();
+    files.extend_from_slice(extra);
+    let project = Project::new(test, &files);
+    let access = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "type_annotation");
+    provider.is_assignable_to(
+        Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &access,
+        },
+        module,
+        name,
+    )
+}
+
+/// A heritage graph that re-converges is walked once per node, not once per path.
+///
+/// The `visited` set is path-scoped — deliberately, so a sibling branch reaching the same
+/// ancestor is not told it was already walked — and that cuts cycles without cutting
+/// *re-convergence*: twelve levels of four parents each is 4^12 ≈ 16.8 million paths through
+/// forty-eight declarations. A host call cannot be interrupted, so a run would sit inside one
+/// `isAssignableTo` with nothing able to stop it. A per-call memo makes it forty-eight.
+///
+/// **The graph must not reach the target.** `heritage_assignable` returns on the first parent
+/// that answers `true`, so an assignable diamond is answered by one path and pins nothing at
+/// all — measured: the `Some(true)` shape this was first written as ran in 20 ms against the
+/// unmemoized walk. Only the negative answer has to visit every path, which is why the
+/// assertion below is `Some(false)` rather than the `Some(true)` the review proposed.
+///
+/// A termination line rather than a benchmark: the figure is orders of magnitude away from
+/// either answer, so it says "polynomial" without pinning a machine's speed.
+#[test]
+fn a_reconverging_heritage_graph_is_walked_once_per_declaration() {
+    const WIDTH: usize = 4;
+    const DEPTH: usize = 12;
+
+    let mut source = String::from("import { Decimal } from 'money';\ninterface Base {}\n");
+    for level in 0..DEPTH {
+        for node in 0..WIDTH {
+            let parents: Vec<String> = if level + 1 == DEPTH {
+                vec!["Base".to_owned()]
+            } else {
+                (0..WIDTH).map(|p| format!("N{}_{p}", level + 1)).collect()
+            };
+            let _ = writeln!(
+                source,
+                "interface N{level}_{node} extends {} {{}}",
+                parents.join(", ")
+            );
+        }
+    }
+    source.push_str("let x: N0_0;\n");
+
+    let started = std::time::Instant::now();
+    let answer = assignable("assignable-reconverging", &[], &source);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        answer,
+        Some(false),
+        "the graph is fully readable and reaches `Base` rather than the named type"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the walk must be per declaration rather than per path: took {elapsed:?}"
+    );
+}
+
+/// And the same graph rooted at the named type is still assignable.
+///
+/// The memo must not turn a reachable target into a miss: an entry answered `true` anywhere is
+/// the answer everywhere it recurs.
+#[test]
+fn a_reconverging_heritage_graph_that_reaches_the_target_is_assignable() {
+    const WIDTH: usize = 4;
+    const DEPTH: usize = 6;
+
+    let mut source = String::from("import { Decimal } from 'money';\n");
+    for level in 0..DEPTH {
+        for node in 0..WIDTH {
+            let parents: Vec<String> = if level + 1 == DEPTH {
+                vec!["Decimal".to_owned()]
+            } else {
+                (0..WIDTH).map(|p| format!("N{}_{p}", level + 1)).collect()
+            };
+            let _ = writeln!(
+                source,
+                "interface N{level}_{node} extends {} {{}}",
+                parents.join(", ")
+            );
+        }
+    }
+    source.push_str("let x: N0_0;\n");
+
+    assert_eq!(
+        assignable("assignable-reconverging-true", &[], &source),
+        Some(true)
+    );
+}
+
+/// The direct match: the symbol's module and exported name are the ones asked about.
+#[test]
+fn a_type_imported_from_the_named_module_is_assignable() {
+    assert_eq!(
+        assignable(
+            "assignable-direct",
+            &[],
+            "import { Decimal } from 'money';\nlet x: Decimal;\n"
+        ),
+        Some(true)
+    );
+}
+
+/// A subclass reaches it through `class_heritage` → `extends_clause` (field `value`).
+#[test]
+fn a_subclass_of_the_named_type_is_assignable() {
+    assert_eq!(
+        assignable(
+            "assignable-subclass",
+            &[],
+            "import { Decimal } from 'money';\nclass Big extends Decimal {}\nlet x: Big;\n"
+        ),
+        Some(true)
+    );
+}
+
+/// An interface reaches it through `extends_type_clause` (field `type`) — a *different* node
+/// kind, and a walk that handles one is the obvious bug.
+///
+/// Several parents, because `extends_type_clause`'s `type` field is `"multiple": true` and a
+/// walk reading only the first would answer `false` for the second.
+#[test]
+fn an_interface_extending_several_parents_reaches_the_named_type() {
+    assert_eq!(
+        assignable(
+            "assignable-interface",
+            &[],
+            "import { Decimal, Amountish } from 'money';\n\
+             interface Both extends Amountish, Decimal {}\n\
+             let x: Both;\n"
+        ),
+        Some(true)
+    );
+}
+
+/// An alias is transparent, on the same terms `typeOf` already follows one.
+#[test]
+fn an_alias_of_the_named_type_is_assignable() {
+    assert_eq!(
+        assignable(
+            "assignable-alias",
+            &[],
+            "import { Money } from 'money';\nlet x: Money;\n"
+        ),
+        Some(true)
+    );
+}
+
+/// A union is assignable only if every member is.
+#[test]
+fn a_union_is_assignable_only_when_every_member_is() {
+    assert_eq!(
+        assignable(
+            "assignable-union-yes",
+            &[],
+            "import { Decimal, Money } from 'money';\nlet x: Decimal | Money;\n"
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        assignable(
+            "assignable-union-no",
+            &[],
+            "import { Decimal } from 'money';\nlet x: Decimal | number;\n"
+        ),
+        Some(false)
+    );
+}
+
+/// A primitive is not a nominal type, so the answer is a real `false` rather than nothing.
+#[test]
+fn a_primitive_is_not_assignable_to_a_nominal_type() {
+    assert_eq!(
+        assignable("assignable-primitive", &[], "let x: number;\n"),
+        Some(false)
+    );
+}
+
+/// A type the oracle could not read answers `undefined`, which a rule must not read as `false`.
+///
+/// Two shapes: a type with no symbol at all (an ambient global), and one whose declaration
+/// file is not there. Both are "a link could not be read", and both must be distinguishable
+/// from "the walk completed and found nothing".
+#[test]
+fn a_type_the_oracle_could_not_read_answers_nothing() {
+    assert_eq!(
+        assignable("assignable-ambient", &[], "let x: Date;\n"),
+        None
+    );
+    assert_eq!(
+        assignable(
+            "assignable-unreadable",
+            &[],
+            "import { Gone } from 'not-installed';\nlet x: Gone;\n"
+        ),
+        None
+    );
+}
+
+/// A heritage cycle terminates rather than running away.
+#[test]
+fn a_heritage_cycle_terminates() {
+    assert_eq!(
+        assignable(
+            "assignable-cycle",
+            &[],
+            "interface A extends B {}\ninterface B extends A {}\nlet x: A;\n"
+        ),
+        Some(false)
+    );
+}
+
+/// The second member of a union re-encounters an ancestor the first member already walked,
+/// through a different path. `visited` has to be path-scoped — removed once a node's own
+/// answer is known — or the second member finds the ancestor already marked "seen" by the
+/// first and gets `Some(false)` for a program that really does reach the named type.
+#[test]
+fn a_union_whose_members_share_an_assignable_ancestor_is_assignable() {
+    assert_eq!(
+        assignable(
+            "assignable-union-shared-class",
+            &[],
+            "import { Decimal } from 'money';\n\
+             class Base extends Decimal {}\n\
+             class Cash extends Base {}\n\
+             class Coin extends Base {}\n\
+             let x: Cash | Coin;\n"
+        ),
+        Some(true)
+    );
+}
+
+/// The interface shape of the same bug: two siblings extending one shared parent, asked
+/// about together in a union.
+#[test]
+fn a_union_of_interfaces_sharing_an_assignable_parent_is_assignable() {
+    assert_eq!(
+        assignable(
+            "assignable-union-shared-interface",
+            &[],
+            "import { Decimal } from 'money';\n\
+             interface Sh extends Decimal {}\n\
+             interface L extends Sh {}\n\
+             interface R2 extends Sh {}\n\
+             let x: L | R2;\n"
+        ),
+        Some(true)
+    );
+}
+
+/// A local class sharing the target's *name* is not the target: nominality is by declaring
+/// file and export name, never by spelling.
+#[test]
+fn a_local_class_with_the_targets_name_is_not_the_target() {
+    assert_eq!(
+        assignable(
+            "assignable-shadow-name",
+            &[],
+            "class Decimal {}\nlet x: Decimal;\n"
+        ),
+        Some(false)
+    );
+}
+
+/// A second installed package that happens to export a same-named `Decimal` is not the
+/// `money` package's `Decimal` either — the declaring *file* has to match, not only the name.
+#[test]
+fn the_targets_name_from_a_different_module_is_not_the_target() {
+    assert_eq!(
+        assignable(
+            "assignable-other-module",
+            &[
+                (
+                    "node_modules/other/package.json",
+                    r#"{"types": "./index.d.ts"}"#,
+                ),
+                (
+                    "node_modules/other/index.d.ts",
+                    "export declare class Decimal {}\n",
+                ),
+            ],
+            "import { Decimal } from 'other';\nlet x: Decimal;\n"
+        ),
+        Some(false)
+    );
+}
+
+/// An imported alias of a primitive is a completed walk that finds nothing nominal, not an
+/// unreadable link: `export type Amount = number` is `number`, and `number` is not the named
+/// type — so this is `Some(false)`, distinct from the `None` an unreadable alias would give.
+#[test]
+fn an_imported_alias_of_a_primitive_is_not_assignable() {
+    assert_eq!(
+        assignable(
+            "assignable-alias-primitive",
+            &[],
+            "import { Amount } from 'money';\nlet x: Amount;\n"
+        ),
+        Some(false)
+    );
+}
+
+/// A declared `implements` is a nominal relationship too, on the same terms `extends` is.
+#[test]
+fn a_class_implementing_the_named_interface_is_assignable() {
+    assert_eq!(
+        assignable_target(
+            "assignable-implements",
+            &[],
+            "import { Amountish } from 'money';\nclass C implements Amountish {}\nlet x: C;\n",
+            "money",
+            "Amountish"
+        ),
+        Some(true)
+    );
+}
+
+/// Documents a real limitation rather than asserting the true answer: declarations are
+/// looked up at a file's *top level* only, so `f`'s function-local `interface Wrapper` is
+/// invisible to the walk and the top-level `Wrapper extends Decimal` answers in its place.
+/// The honest answer for `x`'s own type is `Some(false)` — the local `Wrapper` has no
+/// heritage at all — and this asserts today's `Some(true)` instead, which is the documented
+/// cost of the `(file, name)` model rather than the truth. See `is_assignable_to`'s doc.
+#[test]
+fn a_function_local_shadow_is_a_documented_limitation() {
+    assert_eq!(
+        assignable(
+            "assignable-local-shadow",
+            &[],
+            "import { Decimal } from 'money';\n\
+             interface Wrapper extends Decimal {}\n\
+             function f() {\n\
+                 interface Wrapper { amount: number }\n\
+                 let x: Wrapper;\n\
+             }\n"
+        ),
+        Some(true)
+    );
+}
+
+/// A comment written between `implements` clause members is a named child of the same
+/// kind as a real one — `node-types.json` gives `implements_clause` no field for its
+/// members, so a naive walk over `named_children` cannot tell a `/* x */` from an interface
+/// name. `class C implements A, /* x */ B {}` must still answer `Some(true)` for `B`.
+///
+/// Addendum C1 (task 4.16, from Task 14's review): the `B` assertion alone proves nothing
+/// about comment filtering — `heritage_of` walking the comment *unfiltered* would still find
+/// `B` right after it and answer `Some(true)` regardless, since a comment node interspersed
+/// between real members does not hide the member that follows it. What a broken filter would
+/// actually surface is a *spurious* member: `inner_type_name` called on a `comment` node has
+/// no `name` field, answers the comment node itself, and `assignable`'s walk over that would
+/// find no declaration and degrade the whole answer to `None`. `D` — a third interface `C`
+/// does not implement at all — is what makes that visible: filtered, the walk correctly
+/// establishes `C` has no relationship to `D` and answers `Some(false)`; unfiltered, the
+/// bogus comment-derived member turns that same honest "no" into "unreadable".
+#[test]
+fn a_comment_inside_an_implements_clause_is_skipped() {
+    let fixtures = [
+        (
+            "node_modules/ab/package.json",
+            r#"{"types": "./index.d.ts"}"#,
+        ),
+        (
+            "node_modules/ab/index.d.ts",
+            "export declare interface A { a: number }\n\
+             export declare interface B { b: number }\n\
+             export declare interface D { d: number }\n",
+        ),
+    ];
+    let subject = "import { A, B } from 'ab';\nclass C implements A, /* x */ B {}\nlet x: C;\n";
+    assert_eq!(
+        assignable_target(
+            "assignable-implements-comment",
+            &fixtures,
+            subject,
+            "ab",
+            "B"
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        assignable_target(
+            "assignable-implements-comment-unrelated",
+            &fixtures,
+            subject,
+            "ab",
+            "D"
+        ),
+        Some(false),
+        "C implements neither A-via-comment nor D, and a comment leaking into the walk as a \
+         member would degrade this honest `false` to `None`"
+    );
+}
+
+/// A file every import of which resolves is complete; one with a dead import is not.
+///
+/// Addendum C2 (task 4.16) widens this table with the import shapes `import_specifiers`
+/// had not exercised: a default import, a namespace import, `import type`, a side-effect
+/// `import 'm'` with no bound name at all, and — separately, since it needs its own
+/// assertion below rather than a boolean here — a file with two imports where only one
+/// misses.
+#[test]
+fn completeness_is_decided_by_whether_every_import_resolved() {
+    for (test, fixtures, subject, expected) in [
+        ("complete-none", vec![], "const x = 1;\n", true),
+        (
+            "complete-all",
+            vec![("src/money.d.ts", "export declare const rate: number;\n")],
+            "import { rate } from './money';\nconst x = rate;\n",
+            true,
+        ),
+        (
+            "complete-missing",
+            vec![],
+            "import { rate } from './dist/money';\nconst x = rate;\n",
+            false,
+        ),
+        (
+            "complete-default",
+            vec![(
+                "src/money.d.ts",
+                "declare const rate: number;\nexport default rate;\n",
+            )],
+            "import rate from './money';\nconst x = rate;\n",
+            true,
+        ),
+        (
+            "complete-default-missing",
+            vec![],
+            "import rate from './dist/money';\nconst x = rate;\n",
+            false,
+        ),
+        (
+            "complete-namespace",
+            vec![("src/money.d.ts", "export declare const rate: number;\n")],
+            "import * as money from './money';\nconst x = money.rate;\n",
+            true,
+        ),
+        (
+            "complete-namespace-missing",
+            vec![],
+            "import * as money from './dist/money';\nconst x = money.rate;\n",
+            false,
+        ),
+        (
+            "complete-type",
+            vec![("src/money.d.ts", "export type Amount = number;\n")],
+            "import type { Amount } from './money';\nlet x: Amount;\n",
+            true,
+        ),
+        (
+            "complete-type-missing",
+            vec![],
+            "import type { Amount } from './dist/money';\nlet x: Amount;\n",
+            false,
+        ),
+        (
+            "complete-side-effect",
+            vec![("src/setup.d.ts", "export {};\n")],
+            "import './setup';\n",
+            true,
+        ),
+        (
+            "complete-side-effect-missing",
+            vec![],
+            "import './dist/setup';\n",
+            false,
+        ),
+    ] {
+        let project = Project::new(test, &fixtures);
+        let files = project.files();
+        let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+        let tree = parse(subject);
+        let file = FilePath::new("src/a.ts");
+        assert_eq!(
+            provider.complete(Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node: tree.root_node(),
+                files: &files,
+            }),
+            expected,
+            "{subject}"
+        );
+    }
+}
+
+/// A file with two imports, only one of which misses, is incomplete — and both files' probes
+/// are recorded, not only the one that failed.
+///
+/// Addendum C2's other half: the boolean table above cannot show that a resolved import is
+/// still probed (and recorded) even once an earlier import has already made the file
+/// incomplete — the eager pass this docs on `complete` promises.
+#[test]
+fn completeness_with_two_imports_only_one_missing_records_both_probes() {
+    let project = Project::new(
+        "complete-two-imports-one-missing",
+        &[("src/money.d.ts", "export declare const rate: number;\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { rate } from './money';\n\
+                   import { gone } from './dist/absent';\n\
+                   const x = rate;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    assert!(!provider.complete(Query {
+        file: &file,
+        tree: &tree,
+        source: subject,
+        node: tree.root_node(),
+        files: &files,
+    }));
+
+    let reads = files.dependencies();
+    assert!(
+        reads
+            .iter()
+            .any(|read| read.path.as_str() == "src/money.ts"
+                || read.path.as_str() == "src/money.d.ts"),
+        "the resolving import is still probed and recorded: {reads:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|read| read.path.as_str() == "src/dist/absent.d.ts"),
+        "the missing import is recorded too, with a null hash: {reads:?}"
+    );
+}
+
+/// `import x = require('m')` is counted, even though its `source` lives on the nested
+/// `import_require_clause` rather than on the `import_statement` itself.
+///
+/// Addendum C3. `import_specifiers` reads `statement.child_by_field_name("source")` directly
+/// on the `import_statement`; for this shape that field is unset — `node-types.json` marks it
+/// `required: false` on `import_statement` and puts the *actual* required `source` field on
+/// `import_require_clause`, its child. Missed, `import x = require('./dist/money')` would
+/// count as zero imports and this file would answer complete despite depending on a module
+/// that resolves to nothing.
+#[test]
+fn completeness_counts_an_import_equals_require_clause() {
+    let project = Project::new("complete-import-require", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import money = require('./dist/money');\nconst x = money;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    assert!(
+        !provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "the only import is this one, and it resolves to nothing"
+    );
+}
+
+/// And the same shape resolving is complete, which is what says the row above measures the
+/// clause rather than the fixture.
+///
+/// Addendum C3's missing pair: `completeness_counts_an_import_equals_require_clause` asserts
+/// `false` for an `import x = require('m')` that resolves to nothing — an answer a provider
+/// that dropped the shape entirely would also give, since a file with no imports at all is
+/// complete only when the count is right. This one resolves, so it can only be `true` if the
+/// clause was both found and followed.
+#[test]
+fn completeness_counts_a_resolving_import_equals_require_clause() {
+    let project = Project::new(
+        "complete-import-require-resolving",
+        &[("src/money.d.ts", "export declare const rate: number;\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import money = require('./money');\nconst x = money;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    assert!(
+        provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "the only import is this one, and it resolves to a declaration file"
+    );
+    assert!(
+        files
+            .dependencies()
+            .iter()
+            .any(|read| read.path.as_str() == "src/money.d.ts"),
+        "and it was really probed: {:?}",
+        files.dependencies()
+    );
+}
+
+/// The pass is eager: asking about completeness records every probe, absences included.
+///
+/// This is the half the cache rests on. A rule that stayed silent because a declaration was
+/// missing must be reconsidered the moment it appears, and the only thing that can make that
+/// happen is a recorded read with a null hash.
+#[test]
+fn deciding_completeness_records_every_probe_including_the_misses() {
+    let project = Project::new("complete-records", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { rate } from './dist/money';\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+
+    assert!(!provider.complete(Query {
+        file: &file,
+        tree: &tree,
+        source: subject,
+        node: tree.root_node(),
+        files: &files,
+    }));
+
+    let reads = files.dependencies();
+    assert!(!reads.is_empty(), "an absent import records nothing");
+    assert!(
+        reads.iter().all(|read| read.hash().is_none()),
+        "every candidate was absent, so every one is a null-hash dependency: {reads:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|read| read.path.as_str() == "src/dist/money.d.ts"),
+        "the declaration spelling has to be among the probes: {reads:?}"
+    );
+}
+
+/// A file rewritten between two accesses is re-parsed rather than served from the run cache.
+///
+/// The declaration cache is keyed by path alone, so a `Declaration` parsed for one importing
+/// file was handed to the next one whatever its bytes now say — while that importer's own
+/// `FileAccess` recorded the *new* hash. The entry written then describes neither version: it
+/// carries the new bytes' hash and an answer computed from the old ones, and it validates
+/// forever. Routine under `--watch`, where a file is rewritten mid-run by construction.
+#[test]
+fn a_declaration_rewritten_between_two_accesses_is_reparsed() {
+    let project = Project::new(
+        "declaration-rewritten",
+        &[("lib.d.ts", "export declare class Before {}\n")],
+    );
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let path = FilePath::new("lib.d.ts");
+
+    let first = project.files();
+    let before = provider.declaration(&first, &path).expect("reads");
+    assert!(
+        lanekeep_types::declared_here(&before, "Before").is_some(),
+        "the first access sees the first version"
+    );
+
+    project.write("lib.d.ts", "export declare class After {}\n");
+    // A fresh access, which is what the next file in the run gets.
+    let second = project.files();
+    let after = provider.declaration(&second, &path).expect("reads");
+    assert!(
+        lanekeep_types::declared_here(&after, "After").is_some(),
+        "the second access must see what its own read hashed"
+    );
+    assert_ne!(before.hash, after.hash);
+}
+
+/// A stylesheet, a JSON asset and an image are not modules this provider reads.
+///
+/// `import './app.css'` fails every probe, so an eager completeness pass counted the file
+/// incomplete and recorded six absent reads for it — on a React codebase that is most files,
+/// and the label "incomplete" then means "this project has CSS" rather than "a type answer is
+/// missing". A specifier whose final segment carries an extension the resolver cannot answer
+/// is not a module the oracle reads, so it is skipped entirely: no probe, no dependency, no
+/// bearing on completeness.
+#[test]
+fn completeness_skips_a_specifier_that_is_not_code() {
+    for (test, subject) in [
+        ("complete-css", "import './app.css';\n"),
+        ("complete-json", "import data from './x.json';\n"),
+        ("complete-svg", "import logo from './logo.svg';\n"),
+        ("complete-css-package", "import 'bootstrap/dist/x.css';\n"),
+    ] {
+        let project = Project::new(test, &[]);
+        let files = project.files();
+        let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+        let tree = parse(subject);
+        let file = FilePath::new("src/a.ts");
+        assert!(
+            provider.complete(Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node: tree.root_node(),
+                files: &files,
+            }),
+            "{subject}"
+        );
+        assert!(
+            files.dependencies().is_empty(),
+            "nothing was probed for it: {:?}",
+            files.dependencies()
+        );
+    }
+}
+
+/// A package whose *name* carries a dot is still a module.
+///
+/// The extension test is applied to a subpath, never to a bare package root: `lodash.debounce`
+/// and `socket.io` are real packages, and reading `debounce` or `io` as a file extension would
+/// skip them — which answers `complete()` `true` for a file whose imports were never resolved
+/// at all, the exact failure the flag exists to prevent.
+#[test]
+fn completeness_still_counts_a_package_whose_name_has_a_dot() {
+    let project = Project::new("complete-dotted-package", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { debounce } from 'lodash.debounce';\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    assert!(
+        !provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "the package is not installed, so the file is incomplete"
+    );
+}
+
+/// A declaration file that resolves but does not parse cleanly makes the importer incomplete.
+///
+/// `tree_sitter::Parser::parse` answers a tree for any UTF-8 input, `ERROR` nodes included, so
+/// `Declaration::parse` never fails on a broken file and the importer counted as complete
+/// while every name inside the `ERROR` span answered `undefined`. That is the one combination
+/// a rule cannot defend against: a confident silence with a `complete()` that says the silence
+/// is meaningful.
+#[test]
+fn completeness_is_false_when_a_resolved_declaration_does_not_parse() {
+    for (test, declaration, expected) in [
+        (
+            "complete-broken-declaration",
+            "export declare class Big {} garbage )(\n",
+            false,
+        ),
+        (
+            "complete-sound-declaration",
+            "export declare class Big {}\n",
+            true,
+        ),
+    ] {
+        let project = Project::new(test, &[("src/big.d.ts", declaration)]);
+        let files = project.files();
+        let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+        let subject = "import { Big } from './big';\nlet x: Big;\n";
+        let tree = parse(subject);
+        let file = FilePath::new("src/a.ts");
+        assert_eq!(
+            provider.complete(Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node: tree.root_node(),
+                files: &files,
+            }),
+            expected,
+            "{declaration}"
+        );
+    }
+}
+
+/// The answer is memoized per file, so a rule asking twice costs one pass.
+#[test]
+fn completeness_is_decided_once_per_file() {
+    let project = Project::new("complete-once", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { rate } from './dist/money';\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let query = Query {
+        file: &file,
+        tree: &tree,
+        source: subject,
+        node: tree.root_node(),
+        files: &files,
+    };
+
+    assert!(!provider.complete(query));
+    let after_first = files.dependencies().len();
+    assert!(!provider.complete(query));
+    assert_eq!(
+        files.dependencies().len(),
+        after_first,
+        "the pass ran twice"
+    );
+}
+
+/// The builtin provider's `begin_run` never asks for the corpus either.
+///
+/// The default body is pinned above; this pins the override, which is the one an engine
+/// actually calls. Answering an empty key term is only half the contract — the other half is
+/// that nothing here *walks* the file list, because building the list is work every run would
+/// pay for an answer this provider does not use. A closure that records being called is the
+/// only way to see the difference, since both spellings return the same `Ok(Vec::new())`.
+#[test]
+fn the_builtin_providers_begin_run_does_not_walk_the_corpus() {
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let walked = std::cell::Cell::new(false);
+    let files = || {
+        walked.set(true);
+        Vec::new()
+    };
+    assert_eq!(provider.begin_run(&files), Ok(Vec::new()));
+    assert!(
+        !walked.get(),
+        "this provider's dependencies are the tracked reads on each entry, so there is \
+         nothing to build up front"
+    );
+}
+
+/// A dotted *module* — `./user.service` — is probed, because only asset extensions are skipped.
+///
+/// The skip was an allowlist of code extensions applied to the last dotted run, so
+/// `./user.service` read as an extension `service`, matched nothing in the list, and was
+/// skipped entirely — `complete()` answered `true` for a file whose imports were never
+/// resolved, which is the one thing the flag exists not to say. The NestJS and Angular
+/// conventions are all of this shape: `.service`, `.component`, `.module`, `.dto`, `.entity`,
+/// `.guard`, `.pipe`, `.config`.
+#[test]
+fn completeness_probes_a_dotted_module_specifier() {
+    let project = Project::new(
+        "complete-dotted-module",
+        &[("src/user.service.ts", "export const user = 1;\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { user } from './user.service';\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    assert!(
+        provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "the module is there, so the file is complete"
+    );
+    assert!(
+        files
+            .dependencies()
+            .iter()
+            .any(|read| read.path.as_str() == "src/user.service.ts"),
+        "and it was really probed rather than skipped: {:?}",
+        files.dependencies()
+    );
+}
+
+/// And the same specifier with nothing behind it is incomplete.
+///
+/// The pair the row above needs: skipping a specifier also answers `true`, so only the
+/// missing case can say the probe happened at all.
+#[test]
+fn completeness_is_false_when_a_dotted_module_is_missing() {
+    let project = Project::new("complete-dotted-module-missing", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { user } from './user.service';\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    assert!(
+        !provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "nothing answers the specifier, so the file is incomplete"
+    );
+}
+
+/// A subtree the depth bound cut must not memoize its `None` for a shallower reach.
+///
+/// The bound returns before anything is counted, so a declaration whose walk was truncated
+/// wrote `None` into the per-call memo — and the *same* declaration, reached one hop from the
+/// root where the bound is nowhere near, then read that `None` back instead of the `Some(true)`
+/// the walk would have produced. `Root extends C1, D` is exactly that shape: the `C1` chain
+/// spends the bound on the way down to `D`, and `D` is also Root's own second parent.
+#[test]
+fn a_subtree_cut_by_the_depth_bound_is_not_memoized() {
+    let mut source =
+        String::from("import { Decimal } from 'money';\ninterface D extends Decimal {}\n");
+    for level in (1..=14).rev() {
+        let parent = if level == 14 {
+            "D".to_owned()
+        } else {
+            format!("C{}", level + 1)
+        };
+        let _ = writeln!(source, "interface C{level} extends {parent} {{}}");
+    }
+    source.push_str("interface Root extends C1, D {}\nlet x: Root;\n");
+
+    assert_eq!(
+        assignable("assignable-depth-memo", &[], &source),
+        Some(true),
+        "`D` extends the named type, and Root extends `D` directly"
+    );
+}
+
+/// And the same, for a subtree the *oracle* truncated rather than the walk.
+///
+/// `heritage_assignable` reads a `type` alias's right-hand side with
+/// [`TypeScriptOracle::type_of_from`], threading the depth the walk has already spent — and
+/// that oracle has a bound of its own. When it gives up on it, the alias branch falls through
+/// to the heritage loop, which for an alias has no parents at all, so the walk answered
+/// `Some(false)` and memoized it as a property of the declaration. Only the walk's *own*
+/// `MAX_EXPORT_DEPTH` return was counted before, so nothing knew that answer described a
+/// prefix of the graph rather than the alias.
+///
+/// The shape is the sibling test's, with the alias chain doing the truncating. The chain has
+/// to live in the *declaration file*: a same-file `extends` on an alias goes through
+/// `type_named_by`, which starts a fresh depth on every call, so no local chain can ever spend
+/// a depth the walk brought with it. Twelve `extends` hops reach the imported `A0`, its four
+/// alias hops to `Decimal` spend what is left of the oracle's bound, and `A0` is also `Root`'s
+/// own second parent — where the bound is nowhere near and the walk would answer `true`.
+#[test]
+fn a_subtree_the_oracle_truncated_is_not_memoized() {
+    let mut declarations =
+        String::from("export declare class Decimal {}\nexport type A4 = Decimal;\n");
+    for level in (0..4).rev() {
+        let _ = writeln!(declarations, "export type A{level} = A{};", level + 1);
+    }
+    let mut source = String::from("import { A0 } from 'money';\n");
+    for level in (1..=12).rev() {
+        let parent = if level == 12 {
+            "A0".to_owned()
+        } else {
+            format!("C{}", level + 1)
+        };
+        let _ = writeln!(source, "interface C{level} extends {parent} {{}}");
+    }
+    source.push_str("interface Root extends C1, A0 {}\nlet x: Root;\n");
+
+    let project = Project::new(
+        "assignable-oracle-depth-memo",
+        &[
+            (
+                "node_modules/money/package.json",
+                r#"{"types": "./index.d.ts"}"#,
+            ),
+            ("node_modules/money/index.d.ts", &declarations),
+        ],
+    );
+    let access = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let tree = parse(&source);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "type_annotation");
+
+    assert_eq!(
+        provider.is_assignable_to(
+            Query {
+                file: &file,
+                tree: &tree,
+                source: &source,
+                node,
+                files: &access,
+            },
+            "money",
+            "Decimal",
+        ),
+        Some(true),
+        "`A0` aliases the named type, and Root extends `A0` directly"
+    );
+}
+
+/// One cycle must not disable the memo for every declaration above it.
+///
+/// The memo was guarded by a single counter of cycles cut anywhere in the call, so a mutual
+/// pair at the bottom of a graph poisoned its whole ancestor chain and a re-converging graph
+/// went back to `width^depth` paths. Lowlink is what scopes the poison to the declarations
+/// really inside the cycle: a node memoizes when nothing under it reached back past it.
+///
+/// A termination line rather than a benchmark, like its sibling above: 4^12 is millions of
+/// paths and forty-eight declarations, orders of magnitude either side of the bound.
+#[test]
+fn a_cycle_at_the_bottom_does_not_disable_the_memo_above_it() {
+    const WIDTH: usize = 4;
+    const DEPTH: usize = 12;
+
+    let mut source = String::from(
+        "import { Decimal } from 'money';\n\
+         interface L extends L2 {}\n\
+         interface L2 extends L {}\n",
+    );
+    for level in 0..DEPTH {
+        for node in 0..WIDTH {
+            let parents: Vec<String> = if level + 1 == DEPTH {
+                vec!["L".to_owned()]
+            } else {
+                (0..WIDTH).map(|p| format!("N{}_{p}", level + 1)).collect()
+            };
+            let _ = writeln!(
+                source,
+                "interface N{level}_{node} extends {} {{}}",
+                parents.join(", ")
+            );
+        }
+    }
+    source.push_str("let x: N0_0;\n");
+
+    let started = std::time::Instant::now();
+    let answer = assignable("assignable-cycle-below", &[], &source);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        answer,
+        Some(false),
+        "the graph is fully readable and bottoms out in a cycle rather than the named type"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "one cycle must not cost the memo for everything above it: took {elapsed:?}"
     );
 }

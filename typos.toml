@@ -9,6 +9,10 @@ extend-exclude = [
 [default.extend-words]
 # tree-sitter node kinds and query syntax that read as typos but are not.
 ba = "ba"
+# A file extension, not a truncated word: Stylus writes `.styl`, and the asset denylist in
+# `crates/lanekeep-types/src/builtin.rs` has to spell it the way the filesystem does. This
+# version of `typos` honors no inline suppression, so the exemption is global or nothing.
+styl = "styl"
 
 [default]
 locale = "en-us"

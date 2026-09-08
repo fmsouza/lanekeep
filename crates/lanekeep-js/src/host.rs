@@ -80,7 +80,12 @@ use lanekeep_types::{Query, Symbol, Type, TypeProvider};
 ///   import, absent for a namespace import and for a local declaration. A rule can now match
 ///   an import by its exported name without rejecting a renamed one, which is a verdict a
 ///   build without the field could not reach.
-pub const HOST_API_VERSION: u32 = 6;
+/// - `7` — the cross-file oracle (#189). `typeOf` and `symbolOf` follow an import into the
+///   file that declares it, so an answer now depends on a second file's bytes — tracked as a
+///   read, so the cache sees it — and `ctx.types` gains `returnTypeOf`, `isAssignableTo` and
+///   `complete`. A build without them can answer a question this build answers differently,
+///   which is what a generation is for.
+pub const HOST_API_VERSION: u32 = 7;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -851,6 +856,68 @@ impl HostContext {
                     Ok(render_symbol(&ctx, &symbol)?.into_value())
                 },
             )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
+        types.set(
+            "returnTypeOf",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
+                    let answer =
+                        with_query(&arena, &at, &reader, handle, |q| asked.return_type_of(q));
+                    let Some(ty) = answer else {
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+                    Ok(render_type(&ctx, &ty)?.into_value())
+                },
+            )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
+        types.set(
+            "isAssignableTo",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      handle: Handle,
+                      module: String,
+                      name: String|
+                      -> rquickjs::Result<Value<'js>> {
+                    // `undefined` for "could not read", never `false`. The two are different
+                    // answers and a rule branching on the wrong one reports on code the
+                    // provider never saw — which is why this arm returns a value rather than
+                    // a bare `bool` the boundary would coerce.
+                    let answer = with_query(&arena, &at, &reader, handle, |q| {
+                        asked.is_assignable_to(q, &module, &name)
+                    });
+                    match answer {
+                        Some(verdict) => Ok(Value::new_bool(ctx.clone(), verdict)),
+                        None => Ok(Value::new_undefined(ctx.clone())),
+                    }
+                },
+            )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
+        types.set(
+            "complete",
+            Function::new(ctx.clone(), move || -> bool {
+                // The whole file rather than a node, so the root is what a `Query` carries —
+                // and no handle is taken, because a rule asking "did I see everything" is
+                // asking about the file it is checking and there is only one.
+                let arena = arena.borrow();
+                asked.complete(Query {
+                    file: &at,
+                    tree: arena.tree(),
+                    source: arena.source(),
+                    node: arena.tree().root_node(),
+                    files: &reader,
+                })
+            })?,
         )?;
 
         object.set("types", types)?;
@@ -2511,6 +2578,63 @@ mod tests {
         let handle = handle_of(&host, "q");
         assert_eq!(
             run::<String>(&host, &format!("typeof ctx.types.typeOf({handle})")),
+            "undefined"
+        );
+    }
+
+    /// The three new arms are present and answer through the provider.
+    ///
+    /// One host, three questions, because the assertion each makes is about the *plumbing* —
+    /// that a `Query` reaches the provider and its answer is rendered — and the answers
+    /// themselves are pinned in `lanekeep-types`' own suite where the fixtures live.
+    #[test]
+    fn types_exposes_the_three_cross_file_arms() {
+        let host = host_with_types("function rate(): number { return 1; }\nrate();\n");
+        let handle = handle_of(&host, "rate");
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("ctx.types.returnTypeOf({handle}).primitive")
+            ),
+            "number"
+        );
+        // No declaration file anywhere, so nothing is assignable to anything named — and the
+        // answer is `undefined` rather than `false`, which is the distinction a rule must be
+        // able to make.
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("typeof ctx.types.isAssignableTo({handle}, 'm', 'T')")
+            ),
+            "undefined"
+        );
+        // A file with no imports is complete.
+        assert!(run::<bool>(&host, "ctx.types.complete()"));
+    }
+
+    /// A file with an import nothing resolves is incomplete, and says so.
+    #[test]
+    fn types_reports_an_unresolvable_import_as_incomplete() {
+        let host = host_with_types("import { rate } from './dist/money';\nconst y = rate;\n");
+        assert!(!run::<bool>(&host, "ctx.types.complete()"));
+    }
+
+    /// `returnTypeOf` on a node that is not a function renders `undefined`, never `null`.
+    ///
+    /// Addendum F (task 4.16, from Task 15's review). The provider answers `None` for a call
+    /// through a non-function value exactly as it does for any other "cannot be sure" case —
+    /// `return_type_of_a_call_to_a_non_function_value_answers_nothing` in `lanekeep-types`
+    /// pins that — and this is the host-side half: `render_type` is never reached, so the
+    /// `Some`/`None` branch above has to be the one QuickJS actually takes. Asserted through
+    /// real JS rather than the Rust closure directly, the same reason every other case in
+    /// this module is: `typeof` is what a rule author's own code would write, and it is the
+    /// one check that tells "no such answer" apart from "an answer that happens to be null".
+    #[test]
+    fn types_returns_undefined_for_return_type_of_a_non_function() {
+        let host = host_with_types("const x = 5;\nx();\n");
+        let handle = handle_of(&host, "x");
+        assert_eq!(
+            run::<String>(&host, &format!("typeof ctx.types.returnTypeOf({handle})")),
             "undefined"
         );
     }

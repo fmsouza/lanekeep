@@ -214,10 +214,11 @@ export interface StructureFingerprint {
  * Where a name came from. Returned by {@link TypeApi.symbolOf} directly, and nested under a
  * {@link TypeInfo} whose `symbol` field is set.
  *
- * There is deliberately no `file` naming the declaring path. Within one file it would always be
- * the file being checked, and across files it is only true once a declaration has actually been
- * read from elsewhere — which is the cross-file oracle's to add (#189), beside the tracked read
- * that makes it so.
+ * There is deliberately no `file` naming the declaring path, even now that declarations are
+ * read across files. It would be where a package happens to be installed —
+ * `node_modules/@types/money/index.d.ts` on one machine and a workspace path on another —
+ * so a rule branching on it would give different answers for one program. `module` is the
+ * stable identity, and `exported` is the name that module declares it under.
  */
 export interface SymbolInfo {
   /**
@@ -261,8 +262,10 @@ export interface SymbolInfo {
  * not assume the final branch of `if (primitive) … else if (symbol) … else` is unreachable
  * — for this shape, it is not.
  *
- * There is deliberately no `complete` field. Nothing in this milestone can make the oracle's
- * answer partial, and a field that never varies would only teach a rule to stop checking it.
+ * There is deliberately no `complete` field on a *type*. Whether the oracle had a full view
+ * is a property of the file rather than of any one answer — `TypeApi.complete()` is where it
+ * is asked — and putting it here would invite a rule to read it per type and conclude
+ * something different on each.
  */
 export interface TypeInfo {
   /** What TypeScript would call this type. Display-only — branch on the fields below instead. */
@@ -279,13 +282,18 @@ export interface TypeInfo {
 }
 
 /**
- * The bounded within-file type oracle, reached through `ctx.types`.
+ * The type oracle, reached through `ctx.types`.
  *
  * Every question can come back with no answer, and no answer is a first-class result rather
  * than a failure to work around: the oracle is conservative on purpose, and it would rather
  * say nothing than say something wrong, because a rule reporting on a wrong type accuses
  * correct code. A rule is expected to check for `undefined` and quietly stay silent, the same
  * posture the rest of the navigation surface already takes on a dead handle.
+ *
+ * It reads the file in front of it **and the declaration files that file imports**, through
+ * the same tracked, confined reads `ctx.readFile` uses — so a `node_modules` above the
+ * project root is unreadable, and a run started from the workspace root sees more than one
+ * started from a package directory. Nothing above the root is read, ever.
  */
 export interface TypeApi {
   /**
@@ -295,6 +303,40 @@ export interface TypeApi {
   typeOf(n: Node): TypeInfo | undefined
   /** Where the identifier at `n` was declared. `undefined` on the same terms as `typeOf`. */
   symbolOf(n: Node): SymbolInfo | undefined
+  /**
+   * What calling the function at `n` yields.
+   *
+   * Separate from `typeOf` because a function declaration is not an expression. Accepts a
+   * call expression, a function-like declaration, or an identifier bound to one. An
+   * annotated signature answers its annotation; an unannotated one with a single `return`
+   * answers that expression's type; several returns answer their union when every member is
+   * known and `undefined` otherwise; a function with no `return` answers `undefined` rather
+   * than guessing `void`. Type arguments are dropped throughout — `useQuery<Balance[]>`
+   * answers by the result type's name, never by the argument.
+   */
+  returnTypeOf(n: Node): TypeInfo | undefined
+  /**
+   * Whether the type at `n` is the type `module` exports as `name`, or inherits from it.
+   *
+   * Nominal, never structural: a class reaches it through `extends`, an interface through
+   * `extends`, an alias by being transparent, and a union only when *every* member does. A
+   * primitive answers `false`.
+   *
+   * **`undefined` is not `false`.** `false` means the walk completed and reached nothing;
+   * `undefined` means a link could not be read — an unresolvable import, a package that is
+   * not installed, a type with no symbol at all. A rule treating the two alike reports on
+   * code the oracle never saw.
+   */
+  isAssignableTo(n: Node, module: string, name: string): boolean | undefined
+  /**
+   * Whether every import in the file being checked resolved to something readable.
+   *
+   * `false` is the honest label on a partial view: some name in this file came from a module
+   * the oracle could not open, so an `undefined` anywhere in it may be ignorance rather than
+   * a considered answer. A rule that reports only on what it established does not need to
+   * ask; a rule that wants to say "I could not check this file" does.
+   */
+  complete(): boolean
 }
 
 /** A rule's RuleContext surface. */
@@ -326,8 +368,9 @@ export interface RuleContext {
   /** Facts emitted so far, optionally filtered by `kind`. */
   facts(kind?: string): EmittedFact[]
   /**
-   * The bounded within-file type oracle, present only for a rule that declared
-   * `requires: ['types']`.
+   * The type oracle, present only for a rule that declared `requires: ['types']`.
+   * Bounded by `MAX_DEPTH` rather than by file: it follows an import into the
+   * declaration file that answers it, and the file after that.
    *
    * Typed as always present because there is no way to spell "present when
    * this rule's own `requires` says so" as a type — so a rule that forgets the

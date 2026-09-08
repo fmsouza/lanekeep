@@ -38,7 +38,7 @@ pub use builtin::BuiltinProvider;
 pub use declarations::{
     Declaration, ExportTarget, Exported, declared_here, declared_name, find_export,
 };
-pub use oracle::{ImportResolution, TypeScriptOracle, TypeScriptSupport};
+pub use oracle::{Followed, ImportResolution, TypeScriptOracle, TypeScriptSupport};
 pub use provider::{BeginRunError, Query, TypeProvider};
 pub use resolve::resolve_specifier;
 pub use types::{Primitive, Symbol, Type};

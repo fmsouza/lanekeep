@@ -64,12 +64,26 @@ pub trait TypeProvider: Send + Sync {
     /// identifier bound to one.
     fn return_type_of(&self, q: Query<'_>) -> Option<Type>;
 
-    /// Whether the type at `q.node` is the type `module` exports as `name`, or something
-    /// that inherits from it.
+    /// Whether the type at `q.node` is the type `module` exports as `name`, or declares a
+    /// relationship to it — `extends` or `implements` — across files, through aliases of the
+    /// named type.
     ///
     /// Nominal, never structural. `Some(false)` is a real answer — the walk completed and
     /// found nothing — and `None` is "a link in the chain could not be read", which a rule
-    /// must not treat as a negative.
+    /// must not treat as a negative. A union is assignable only when every member is.
+    ///
+    /// Three narrowings of what "found nothing" honestly covers: declaration merging is not
+    /// followed, so when a name is declared more than once at a file's top level only the
+    /// first declaration is consulted; a generic annotation at the use site (`let x:
+    /// Box<number>`) answers `None`, since type arguments are not read; and a `name` the
+    /// named `module` does not export answers `None` rather than `Some(false)`, because
+    /// `Some(false)` there would make a requirement rule report on every value the module
+    /// never claimed to type.
+    ///
+    /// One documented gap: declarations are looked up at a file's top level only, so a
+    /// declaration that shadows the target's name inside a function body is not
+    /// distinguished from the top-level one with that name — the walk answers as if the
+    /// shadow were the top-level declaration.
     fn is_assignable_to(&self, q: Query<'_>, module: &str, name: &str) -> Option<bool>;
 
     /// Whether every import in `q`'s file resolved to something this provider could read.

@@ -194,7 +194,17 @@ pub fn find_export<'d>(decl: &'d Declaration, name: &str) -> Option<Exported<'d>
 /// and lose the second.
 #[must_use]
 pub fn declared_here<'d>(decl: &'d Declaration, name: &str) -> Option<Node<'d>> {
-    let root = decl.tree.root_node();
+    declared_in(&decl.tree, &decl.source, name)
+}
+
+/// The declaration of `name` at a parsed file's top level, exported or not.
+///
+/// [`declared_here`] is this over a [`Declaration`]; this is the same walk over a tree the
+/// provider does not own — the file under check, which the engine already parsed and which
+/// must not be parsed a second time.
+#[must_use]
+pub(crate) fn declared_in<'t>(tree: &'t Tree, source: &'t str, name: &str) -> Option<Node<'t>> {
+    let root = tree.root_node();
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
         let candidate = if statement.kind() == "export_statement" {
@@ -207,7 +217,7 @@ pub fn declared_here<'d>(decl: &'d Declaration, name: &str) -> Option<Node<'d>> 
         } else {
             statement
         };
-        if let Some(found) = declares(decl, candidate, name) {
+        if let Some(found) = declares_in(source, candidate, name) {
             return Some(found);
         }
     }
@@ -228,6 +238,12 @@ pub fn declared_name(decl: &Declaration, node: Node<'_>) -> Option<String> {
 
 /// Whether `declaration` declares `name`, and where.
 fn declares<'d>(decl: &'d Declaration, declaration: Node<'d>, name: &str) -> Option<Node<'d>> {
+    declares_in(&decl.source, declaration, name)
+}
+
+/// Whether `declaration` declares `name`, and where — over a source string rather than a
+/// [`Declaration`], so [`declared_here`] and [`declared_in`] share one walk.
+fn declares_in<'t>(source: &'t str, declaration: Node<'t>, name: &str) -> Option<Node<'t>> {
     let declaration = unwrap_ambient(declaration);
     match declaration.kind() {
         "lexical_declaration" | "variable_declaration" => {
@@ -238,7 +254,7 @@ fn declares<'d>(decl: &'d Declaration, declaration: Node<'d>, name: &str) -> Opt
                 .find(|declarator| {
                     declarator
                         .child_by_field_name("name")
-                        .is_some_and(|bound| text(decl, bound) == name)
+                        .is_some_and(|bound| text_of(source, bound) == name)
                 })
         }
         "function_signature"
@@ -252,7 +268,7 @@ fn declares<'d>(decl: &'d Declaration, declaration: Node<'d>, name: &str) -> Opt
         | "module"
         | "internal_module" => declaration
             .child_by_field_name("name")
-            .is_some_and(|bound| unquote(text(decl, bound)) == name)
+            .is_some_and(|bound| unquote(text_of(source, bound)) == name)
             .then_some(declaration),
         _ => None,
     }
@@ -355,7 +371,14 @@ fn anonymous_child(node: Node<'_>, token: &str) -> bool {
 
 /// The source text of a node.
 fn text<'d>(decl: &'d Declaration, node: Node<'_>) -> &'d str {
-    decl.source.get(node.byte_range()).unwrap_or("")
+    text_of(&decl.source, node)
+}
+
+/// The source text of a node, read from a source string directly rather than a
+/// [`Declaration`] — what [`declares_in`] and [`declared_in`] need over a tree they do not
+/// own.
+fn text_of<'t>(source: &'t str, node: Node<'_>) -> &'t str {
+    source.get(node.byte_range()).unwrap_or("")
 }
 
 /// Drop the quotes a string module name or a string export name carries.
@@ -369,4 +392,31 @@ fn unquote(text: &str) -> &str {
         (Some(b'"' | b'\''), Some(b'"' | b'\'')) if text.len() >= 2 => &text[1..text.len() - 1],
         _ => text,
     }
+}
+
+/// Every module specifier this file imports from, in source order.
+///
+/// `import_statement`'s `source` field, plus `export_statement`'s: a barrel file re-exporting
+/// what it never imports is exactly as dependent on those modules, and a completeness answer
+/// that ignored them would call such a file complete while knowing nothing about it.
+///
+/// `import x = require('m')` needs its own fallback: `node-types.json` marks
+/// `import_statement`'s own `source` field `required: false` and puts the field this shape
+/// actually carries on its `import_require_clause` child instead — so a bare
+/// `child_by_field_name("source")` on the statement itself answers nothing for exactly this
+/// one shape, silently dropping it from the count.
+#[must_use]
+pub(crate) fn import_specifiers(tree: &Tree, source: &str) -> Vec<String> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .filter(|statement| matches!(statement.kind(), "import_statement" | "export_statement"))
+        .filter_map(|statement| {
+            statement.child_by_field_name("source").or_else(|| {
+                named_child_of_kind(statement, "import_require_clause")
+                    .and_then(|clause| clause.child_by_field_name("source"))
+            })
+        })
+        .map(|node| unquote(text_of(source, node)).to_owned())
+        .collect()
 }

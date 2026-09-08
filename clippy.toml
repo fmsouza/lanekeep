@@ -25,6 +25,7 @@ doc-valid-idents = [
     "JavaScript",
     "TinyGo",
     "DefinitelyTyped",
+    "NestJS",
     "..",
 ]
 

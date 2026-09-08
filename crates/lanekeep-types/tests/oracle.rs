@@ -1080,8 +1080,10 @@ fn a_parameter_of_a_method_signature_kind_is_typed() {
 // in both positions makes the assertion the same one either way.
 
 /// A type parameter is whatever the call site chose in these four kinds too, so the oracle
-/// says nothing about it — the same widening as `method_signature`'s pair above, one node
-/// kind further from anything with a name.
+/// says nothing about it — the same *pair* as `method_signature`'s above, one node kind
+/// further from anything with a name. Not the same widening: this half is the bug fix, where
+/// the walk used to escape to the outer alias and answer confidently. The widening for these
+/// kinds is the parameter-side test below.
 #[test]
 fn a_type_parameter_in_signature_or_type_position_gives_nothing() {
     for source in [
