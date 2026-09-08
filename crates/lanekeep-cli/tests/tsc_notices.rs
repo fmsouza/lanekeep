@@ -6,8 +6,9 @@
 
 #![expect(
     clippy::expect_used,
+    clippy::panic,
     reason = "`clippy.toml`'s allow-*-in-tests only reaches `#[test]` functions and \
-              `#[cfg(test)]` modules. The helpers below are neither, so the grant it \
+              `#[cfg(test)]` modules. The `corpus` helpers are neither, so the grant it \
               already makes for unit tests has to be restated for them."
 )]
 #![expect(
@@ -19,6 +20,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+mod corpus;
+
+use corpus::tsc_available;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -110,14 +115,6 @@ fn describe(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     )
-}
-
-/// Whether the authoring package's `typescript` is installed — same three-line check
-/// `tsc_provider.rs` uses, repeated here because integration tests share no module.
-fn tsc_available() -> bool {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../packages/lanekeep/node_modules/typescript/package.json")
-        .is_file()
 }
 
 const RULE_TYPED: &str = "import { defineRule } from 'lanekeep';\n\

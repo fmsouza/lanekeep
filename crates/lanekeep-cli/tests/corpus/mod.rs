@@ -26,9 +26,22 @@
     reason = "one module shared by several test crates, each using the part it needs"
 )]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Whether the authoring package's `typescript` is installed.
+///
+/// The **package** rather than `.bin/tsc`, because the driver loads the package through
+/// `createRequire` and never runs the binary; a machine with the shim and no package would
+/// skip nothing and fail. Moved here from `tsc_provider.rs` and `tsc_notices.rs`, which
+/// duplicated it verbatim — each `tests/*.rs` is its own crate, so it could not otherwise be
+/// shared.
+pub(crate) fn tsc_available() -> bool {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/lanekeep/node_modules/typescript/package.json")
+        .is_file()
+}
 
 /// Distinguishes projects built in the same process.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);

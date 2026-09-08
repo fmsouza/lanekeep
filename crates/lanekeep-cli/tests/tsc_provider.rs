@@ -20,8 +20,10 @@
 
 #![expect(
     clippy::expect_used,
+    clippy::panic,
     reason = "`clippy.toml`'s allow-*-in-tests only reaches `#[test]` functions and \
-              `#[cfg(test)]` modules. The fixture helpers below are neither."
+              `#[cfg(test)]` modules. The fixture helpers below, and the `corpus` \
+              helpers this file also compiles, are neither."
 )]
 #![expect(
     clippy::print_stderr,
@@ -33,6 +35,10 @@ use std::path::{Path, PathBuf};
 
 use lanekeep_core::Violation;
 use lanekeep_testkit::RuleTester;
+
+mod corpus;
+
+use corpus::tsc_available;
 
 /// One-based lines in the subject, so an assertion names positions rather than counts.
 ///
@@ -46,11 +52,6 @@ const CONDITIONAL_LINE: u32 = 5;
 enum Provider {
     Builtin,
     Tsc,
-}
-
-/// Whether the authoring package's `typescript` is installed.
-fn tsc_available() -> bool {
-    typescript_package().join("package.json").is_file()
 }
 
 fn typescript_package() -> PathBuf {
