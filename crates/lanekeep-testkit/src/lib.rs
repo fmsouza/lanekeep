@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use lanekeep_core::Violation;
-use lanekeep_engine::Engine;
+use lanekeep_engine::{Engine, PrepareOptions};
 use lanekeep_js::{BuiltinComponent, BuiltinComponentMap, BuiltinSource, RuleRoot};
 use lanekeep_lang_js::{JavaScript, TypeScript};
 use thiserror::Error;
@@ -602,6 +602,7 @@ impl RuleTester {
             &lanekeep_languages::registry(),
             Arc::new(TypeScript),
             Arc::new(JavaScript),
+            PrepareOptions::default(),
         )
         .map_err(|e| TestError::Load(e.to_string()))?;
 
@@ -961,6 +962,35 @@ mod tests {
             err.to_string().contains("`options` is not valid JSON"),
             "{err}"
         );
+    }
+
+    /// `with_config_extra` writes a `lanekeep.config.ts`, and a JSON-configured tester has none.
+    ///
+    /// The refusal was written and never asserted, so a tester built by `for_component` would
+    /// have had its `lanekeep.json` ignored and a second config file written beside it — the
+    /// rule under test would then run under the *other* config, silently, and the extra the
+    /// caller asked for would have applied to nothing.
+    #[test]
+    fn with_config_extra_refuses_a_json_configured_tester() {
+        let err = RuleTester::for_component("extra-on-json", NOT_A_COMPONENT, "rs")
+            .expect("builds")
+            .with_config_extra("types: { provider: 'tsc' },")
+            .expect_err("a component tester is configured by JSON");
+
+        assert!(matches!(err, TestError::Setup(_)), "{err:?}");
+        let rendered = err.to_string();
+        assert!(rendered.contains(JSON_CONFIG), "{rendered}");
+        assert!(rendered.contains(TS_CONFIG), "{rendered}");
+    }
+
+    /// And the positive half: on a tester it does fit, the extra reaches the written config.
+    #[test]
+    fn with_config_extra_writes_what_it_was_given() {
+        let tester = tester("extra-on-ts")
+            .with_config_extra("types: { provider: 'builtin' },")
+            .expect("a source tester is configured by TypeScript");
+        let text = std::fs::read_to_string(tester.dir.join(TS_CONFIG)).expect("config written");
+        assert!(text.contains("types: { provider: 'builtin' },"), "{text}");
     }
 
     #[test]

@@ -182,7 +182,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lanekeep_engine::Engine;
+use lanekeep_engine::{Engine, PrepareOptions};
 use lanekeep_js::RuleRoot;
 use lanekeep_lang::Language;
 use lanekeep_lang_js::{JavaScript, TypeScript};
@@ -793,6 +793,7 @@ impl Project {
             &lanekeep_languages::registry(),
             Arc::new(TypeScript),
             Arc::new(JavaScript),
+            PrepareOptions::default(),
         )
         .expect("engine prepares")
     }

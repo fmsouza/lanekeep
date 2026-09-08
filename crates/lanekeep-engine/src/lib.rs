@@ -727,8 +727,10 @@ pub struct Engine {
     /// Which oracle this run is using, copied off the config so the CLI's notices can say so
     /// without reloading it.
     ///
-    /// Also what decides whether [`Self::analysis`] is asked at a file boundary: it is the
-    /// only thing that knows whether anything in this run spends that budget.
+    /// **Not** what decides whether [`Self::analysis`] is asked at a file boundary. That is
+    /// `TypeProvider::spends_analysis_budget`, on the provider actually in use: this field
+    /// describes what the configuration asked for, and a caller that supplies its own provider
+    /// (#191) makes the two different things.
     types_provider: TypesProvider,
     /// The run's analysis budget: the sum of what the provider spends building programs and
     /// answering requests, and nothing else.
@@ -993,6 +995,57 @@ pub struct Outcome {
     pub dependencies: BTreeMap<FilePath, Vec<TrackedRead>>,
 }
 
+/// How a caller wants a run prepared, and what it wants to be told while that happens.
+///
+/// A struct rather than more positional parameters to [`Engine::prepare_with_provider`], for
+/// the reason `lanekeep_config::LoadOptions` gives: that function already takes eight, and a
+/// ninth of a shape nothing else in the signature has would be exactly the kind of parameter
+/// that gets silently dropped or transposed at a call site.
+#[derive(Clone, Copy, Default)]
+pub struct PrepareOptions<'a> {
+    /// Called once, from the configuration this run was given, before a `tsc` provider is ever
+    /// spawned.
+    ///
+    /// The engine stays print-free — nothing under `lanekeep-engine` writes to stdout or
+    /// stderr — so this is the seam a caller uses to say something about the run before it
+    /// costs anything. It exists because the obvious place to print a warning about `tsc`
+    /// being slow, "after `prepare` returns", is wrong twice over: `prepare` has by then
+    /// already spawned the sidecar and built the whole program, so the warning arrives after
+    /// the expense it describes; and `prepare` returns `Err` when the spawn fails at all, so
+    /// on a machine without Node the warning never prints. Calling this before the spawn is
+    /// attempted, from `config` alone, means it prints in both cases.
+    pub on_config: Option<&'a dyn Fn(&Config)>,
+    /// Prepare with no type provider at all, whatever `types` says.
+    ///
+    /// For a command that reads a run's *metadata* rather than running it — `lanekeep rules`
+    /// and `lanekeep explain`. Both used to prepare in full, which under `types.provider:
+    /// 'tsc'` meant writing `.lanekeep/driver.mjs` into the project, spawning Node, building
+    /// every program in the repository and then exiting 2 when the sidecar could not be
+    /// started — all to print a rule's card, which no provider contributes a byte to.
+    ///
+    /// It skips `provider_for` and [`TypeProvider::begin_run`], and with them the prepare-time
+    /// half of the capability gate, which exists only to report a spawn that failed. The
+    /// config-load half still runs, so a rule requiring a capability *no build* provides is
+    /// still refused here exactly as it is for `check`.
+    ///
+    /// A run's answers must never depend on this, which is why nothing that reports violations
+    /// sets it: with no provider the run key would fold an empty provider identity and no
+    /// program listing, and a cache entry written under that key is not one a `tsc` run may be
+    /// served. `rules` and `explain` write no entries.
+    pub without_provider: bool,
+}
+
+impl std::fmt::Debug for PrepareOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closure itself carries no `Debug`; whether one was given is the only part of
+        // this that is ever worth printing.
+        f.debug_struct("PrepareOptions")
+            .field("on_config", &self.on_config.is_some())
+            .field("without_provider", &self.without_provider)
+            .finish()
+    }
+}
+
 impl Engine {
     /// Prepare a run.
     ///
@@ -1003,6 +1056,11 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`RunError`] for an invalid query, gate, or language reference.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every one is a distinct run input with no natural grouping, same as \
+                  `prepare_with_provider`, which this forwards to unchanged"
+    )]
     pub fn prepare(
         config: &Config,
         project_root: &Path,
@@ -1011,6 +1069,7 @@ impl Engine {
         registry: &LanguageRegistry,
         typescript: Arc<dyn Language>,
         javascript: Arc<dyn Language>,
+        hooks: PrepareOptions<'_>,
     ) -> Result<Self, RunError> {
         Self::prepare_with_provider(
             config,
@@ -1021,6 +1080,7 @@ impl Engine {
             typescript,
             javascript,
             None,
+            hooks,
         )
     }
 
@@ -1058,7 +1118,14 @@ impl Engine {
         typescript: Arc<dyn Language>,
         javascript: Arc<dyn Language>,
         provider: Option<Arc<dyn TypeProvider>>,
+        hooks: PrepareOptions<'_>,
     ) -> Result<Self, RunError> {
+        // Before `Discovery` even walks the tree, and unconditionally — a held provider
+        // (`Some` above) still spawned nothing itself, but the caller does not know that from
+        // here, and the config is the only input this hook is documented to read from.
+        if let Some(on_config) = hooks.on_config {
+            on_config(config);
+        }
         let discovery = Discovery::new(project_root, &config.include, &config.exclude)?;
 
         let known = registry
@@ -1076,7 +1143,14 @@ impl Engine {
                 languages_by_extension
                     .insert(extension.to_ascii_lowercase(), language.id().to_string());
             }
-            if BuiltinProvider::probe(language.as_ref()).is_some() {
+            let typed = match config.types.provider {
+                // The sidecar parses nothing of lanekeep's, so a grammar probe says nothing
+                // about what it can answer for. What decides is whether the driver has a
+                // `ts.ScriptKind` for the file, which is what `TSC_LANGUAGES` names.
+                TypesProvider::Tsc => TSC_LANGUAGES.contains(&language.id().as_str()),
+                TypesProvider::Builtin => BuiltinProvider::probe(language.as_ref()).is_some(),
+            };
+            if typed {
                 type_languages.insert(language.id());
             }
         }
@@ -1099,6 +1173,9 @@ impl Engine {
         let mut tsc_spawn_error: Option<RunError> = None;
         let provider: Option<Arc<dyn TypeProvider>> = match provider {
             Some(held) => Some(held),
+            // A metadata command. Nothing is spawned, nothing is built, and the gate below is
+            // skipped with it — see `PrepareOptions::without_provider`.
+            None if hooks.without_provider => None,
             // The configured provider is consulted *before* the grammar, because only the
             // builtin arm needs one: the `tsc` sidecar parses nothing itself, so a registry
             // that speaks no TypeScript is no reason for a `tsc` run to have no provider.
@@ -1106,6 +1183,12 @@ impl Engine {
                 TypesProvider::Tsc => {
                     match provider_for(&config.types, project_root, None, analysis.clone()) {
                         Ok(started) => Some(started),
+                        // A spent budget is a limit, not a missing toolchain, and it is the
+                        // one error from here the capability gate must not re-word: the
+                        // sidecar *was* found and started, and telling the reader their build
+                        // does not provide `types` sends them to install something they
+                        // already have instead of to `timeouts.analysis`.
+                        Err(timeout @ RunError::AnalysisTimeout { .. }) => return Err(timeout),
                         Err(error) => {
                             tsc_spawn_error = Some(error);
                             None
@@ -1130,7 +1213,14 @@ impl Engine {
         // because it never ran. Config load already refused whatever no build could ever
         // honor — this refuses what only a real spawn attempt could settle.
         let available = lanekeep_config::implemented(&config.types, provider.is_some());
-        for spec in &config.rules {
+        // Empty under `without_provider`: this gate asks whether a real spawn failed, and a
+        // metadata command makes none — see `PrepareOptions::without_provider`.
+        let capability_gate = if hooks.without_provider {
+            [].as_slice()
+        } else {
+            config.rules.as_slice()
+        };
+        for spec in capability_gate {
             if !spec.severity.is_enabled() {
                 continue;
             }
@@ -1432,6 +1522,33 @@ impl Engine {
         self.languages_by_extension
             .get(extension.as_str())
             .map(String::as_str)
+    }
+
+    /// The provider this run prepared, for a caller that has to prepare a second time.
+    ///
+    /// `check --fix` is the one: it applies the fixes and then checks again, because what a
+    /// fix leaves behind is a different file. That second preparation used to build a second
+    /// provider — under `tsc`, a second Node process and a second copy of every program in the
+    /// project, for a pass that is a cache miss on the handful of files that changed. Handing
+    /// the first one back through [`Self::prepare_with_provider`] is the same seam a session
+    /// uses (#191), and `begin_run` already gives a held provider a fresh analysis budget and
+    /// clears its sticky failure, so the recheck is a second run rather than a continuation.
+    #[must_use]
+    pub fn provider(&self) -> Option<Arc<dyn TypeProvider>> {
+        self.provider.clone()
+    }
+
+    /// What the provider wants said about the run it prepared, for a caller that can print.
+    ///
+    /// The engine writes to neither stream, so this is the only way one of these lines reaches
+    /// a terminal. Empty for every provider that made no silent decision, which is every run
+    /// under `builtin` and most runs under `tsc`.
+    #[must_use]
+    pub fn provider_notices(&self) -> Vec<String> {
+        self.provider
+            .as_ref()
+            .map(|provider| provider.notices())
+            .unwrap_or_default()
     }
 
     /// Which oracle this run is using, for the CLI's notices.
@@ -1998,7 +2115,16 @@ impl Engine {
         // `timeouts.analysis` would cap every builtin run at a budget that names work it never
         // does — a one-minute default silently becoming the run limit for a corpus that has no
         // sidecar at all.
-        if self.types_provider == TypesProvider::Tsc
+        //
+        // Asked of the *provider* rather than of `types.provider`. The config describes what
+        // this run would have built, and a session that hands the engine a provider of its own
+        // (#191) is not described by it — a held builtin oracle under a `tsc` config would be
+        // bounded by a budget nothing was charging, and a held `tsc` sidecar under a `builtin`
+        // one by nothing at all.
+        if self
+            .provider
+            .as_ref()
+            .is_some_and(|provider| provider.spends_analysis_budget())
             && let Some(detail) = self.analysis.overrun()
         {
             return Err(RunError::AnalysisTimeout { detail });
@@ -3858,10 +3984,26 @@ fn declared_bindings_match(bound: &[ExternalBinding]) -> Result<(), RunError> {
     })
 }
 
+/// The registered language ids the `tsc` sidecar can type.
+///
+/// The driver's `scriptKindOf` in `crates/lanekeep-types/src/tsc/driver.mjs` is the source of
+/// truth for this list, and the two are kept in step by hand: a language whose files that
+/// function hands a `ts.ScriptKind` belongs here, and one it does not must not, or a rule
+/// declaring `requires: ['types']` for it would get a `ctx.types` that answers `undefined` to
+/// everything. `jsx` is listed although nothing registers it under that id today — the
+/// extension lives under `javascript` here — because the driver types `.jsx` and a registry
+/// that later splits the id must not silently lose the capability.
+///
+/// Deliberately **not** the builtin oracle's grammar probe. That probe asks whether lanekeep's
+/// own parser can read a grammar, which decides nothing about a compiler that parses the file
+/// itself: the JavaScript grammar fails it, and under `allowJs` the sidecar answers for a `.js`
+/// file exactly as it does for a `.ts` one.
+const TSC_LANGUAGES: &[&str] = &["typescript", "tsx", "javascript", "jsx"];
+
 /// The type provider a config asks for.
 ///
-/// Public because a server session builds one and holds it across requests
-/// (`crates/lanekeep-cli/src/session.rs`, #191), while a one-shot run lets [`Engine::prepare`]
+/// Public because a server session is to build one and hold it across requests — #191, which is
+/// future work and has no file here yet — while a one-shot run lets [`Engine::prepare`]
 /// build one and throw it away. Both have to reach the *same* decision about what `types`
 /// names: two constructions would be two answers to one question, and the second answer would
 /// only ever be found by a user whose editor disagreed with their terminal.
@@ -4807,6 +4949,7 @@ mod tests {
                 Arc::new(TypeScript),
                 Arc::new(JavaScript),
                 provider,
+                PrepareOptions::default(),
             )
         }
     }
@@ -8719,7 +8862,12 @@ export default defineRule({
         ///
         /// The seam item 2 needs: the check between files reads an accumulator, so a fixture
         /// for it has to *charge* the budget rather than let time pass.
-        struct Spendthrift(Duration);
+        ///
+        /// The second field is what it answers to `TypeProvider::spends_analysis_budget`, which
+        /// is what the engine gates the between-files check on. It is a parameter rather than a
+        /// constant because the two interesting fixtures are the ones the *configuration* gets
+        /// wrong: a spending provider under a `builtin` config, and a frugal one under `tsc`.
+        struct Spendthrift(Duration, bool);
 
         impl TypeProvider for Spendthrift {
             fn type_of(&self, _: lanekeep_types::Query<'_>) -> Option<lanekeep_types::Type> {
@@ -8744,6 +8892,9 @@ export default defineRule({
             }
             fn identity(&self) -> Vec<u8> {
                 b"spendthrift-fixture".to_vec()
+            }
+            fn spends_analysis_budget(&self) -> bool {
+                self.1
             }
             fn begin_run(
                 &self,
@@ -8777,7 +8928,7 @@ export default defineRule({
                 ],
             );
             let engine = project
-                .prepare_with_provider_stub(Arc::new(Spendthrift(Duration::from_millis(50))))
+                .prepare_with_provider_stub(Arc::new(Spendthrift(Duration::from_millis(50), true)))
                 .expect("the engine prepares; nothing has failed");
             assert_eq!(
                 engine.types_provider(),
@@ -8812,11 +8963,259 @@ export default defineRule({
                 ],
             );
             let outcome = project
-                .prepare_with_provider_stub(Arc::new(Spendthrift(Duration::ZERO)))
+                .prepare_with_provider_stub(Arc::new(Spendthrift(Duration::ZERO, true)))
                 .expect("the engine prepares")
                 .run()
                 .expect("nothing charged the analysis budget");
             assert_eq!(outcome.violations.len(), 2, "both files were checked");
+        }
+
+        /// Nothing under `.lanekeep/` is ever a subject, through a whole run.
+        ///
+        /// `Discovery` owns the exclusion and asserts it on its own terms; this is the half
+        /// that shows it holds where it matters — a rule declaring `language: ['javascript']`
+        /// reports nothing inside lanekeep's own directory, which is where the `tsc` driver
+        /// lanekeep writes and then runs lives.
+        #[test]
+        fn no_rule_reports_inside_lanekeeps_own_directory() {
+            let project = Project::new(
+                "own-directory-run",
+                &[
+                    (
+                        "rule.ts",
+                        "import { defineRule } from 'lanekeep';\n\
+                        export default defineRule({\n\
+                          id: 'local/no-debugger',\n\
+                          language: ['javascript'],\n\
+                          query: '(debugger_statement) @stmt',\n\
+                          card: { message: 'm', remediation: 'r', \
+                            examples: { bad: 'a', good: 'b' } },\n\
+                          check(ctx, m) { ctx.report(m.stmt); },\n\
+                        });\n",
+                    ),
+                    (
+                        "lanekeep.config.ts",
+                        "import { defineConfig } from 'lanekeep';\n\
+                         import rule from './rule';\n\
+                         export default defineConfig({ include: ['**/*.mjs'], \
+                         rules: [rule] });\n",
+                    ),
+                    (".lanekeep/driver-abc.mjs", "function f() { debugger; }\n"),
+                    ("src/own.mjs", "function g() { debugger; }\n"),
+                ],
+            );
+            let outcome = project.run().expect("runs");
+            let files: Vec<&str> = outcome
+                .violations
+                .iter()
+                .map(|v| v.location.file.as_str())
+                .collect();
+            assert_eq!(files, ["src/own.mjs"], "{files:?}");
+        }
+
+        /// Under `tsc`, a `.js` file is a file the sidecar types, so `ctx.types` is there.
+        ///
+        /// The gate used to be the *builtin* oracle's grammar probe for every provider alike,
+        /// and the JavaScript grammar fails that probe — it has no `type_annotation` and no
+        /// `predefined_type` — so a rule declaring `requires: ['types']` for `javascript` got
+        /// no `ctx.types` at all and threw on its first question. Under `allowJs` the compiler
+        /// answers for that file perfectly well, which is what makes the old gate wrong rather
+        /// than merely conservative. The rule below asks its question unguarded, so a run that
+        /// reaches this file with `ctx.types` absent fails with `RunError::Rule`.
+        #[test]
+        fn a_tsc_run_gives_ctx_types_to_a_javascript_file() {
+            let project = Project::new(
+                "tsc-types-on-javascript",
+                &[
+                    (
+                        "rule.ts",
+                        "import { defineRule } from 'lanekeep';\n\
+                        export default defineRule({\n\
+                          id: 'local/js-typed',\n\
+                          language: ['javascript'],\n\
+                          requires: ['types'],\n\
+                          query: '(identifier) @id',\n\
+                          card: { message: 'm', remediation: 'r', \
+                            examples: { bad: 'a', good: 'b' } },\n\
+                          check(ctx, m) { ctx.types.typeOf(m.id); },\n\
+                        });\n",
+                    ),
+                    (
+                        "lanekeep.config.ts",
+                        "import { defineConfig } from 'lanekeep';\n\
+                         import rule from './rule';\n\
+                         export default defineConfig({ include: ['src/**/*.js'], \
+                         rules: [rule], types: { provider: 'tsc' } });\n",
+                    ),
+                    ("src/a.js", "const a = 1;\n"),
+                ],
+            );
+            project
+                .prepare_with_provider_stub(Arc::new(Spendthrift(Duration::ZERO, true)))
+                .expect("the engine prepares")
+                .run()
+                .expect("`ctx.types` is present for a file the sidecar types");
+        }
+
+        /// And the builtin arm keeps the grammar probe, which is the half that makes the
+        /// change above a widening rather than a removal: nothing but the compiler can answer
+        /// for a `.js` file, so a `builtin` run must still leave `ctx.types` absent there.
+        #[test]
+        fn a_builtin_run_still_withholds_ctx_types_from_a_javascript_file() {
+            let project = Project::new(
+                "builtin-types-on-javascript",
+                &[
+                    (
+                        "rule.ts",
+                        "import { defineRule } from 'lanekeep';\n\
+                        export default defineRule({\n\
+                          id: 'local/js-typed',\n\
+                          language: ['javascript'],\n\
+                          requires: ['types'],\n\
+                          query: '(identifier) @id',\n\
+                          card: { message: 'm', remediation: 'r', \
+                            examples: { bad: 'a', good: 'b' } },\n\
+                          check(ctx, m) { ctx.types.typeOf(m.id); },\n\
+                        });\n",
+                    ),
+                    (
+                        "lanekeep.config.ts",
+                        "import { defineConfig } from 'lanekeep';\n\
+                         import rule from './rule';\n\
+                         export default defineConfig({ include: ['src/**/*.js'], \
+                         rules: [rule] });\n",
+                    ),
+                    ("src/a.js", "const a = 1;\n"),
+                ],
+            );
+            let error = project
+                .prepare_with("lanekeep.config.ts")
+                .expect("the engine prepares")
+                .run()
+                .expect_err("the builtin oracle cannot read the JavaScript grammar");
+            assert!(error.to_string().contains("typeOf"), "{error}");
+        }
+
+        /// The check is gated on the provider in use, not on what the config asked for.
+        ///
+        /// A caller that supplies its own provider (#191) is not described by the config it was
+        /// built from: a session holding a `tsc` sidecar can serve a project whose file says
+        /// `builtin`, and the budget that sidecar spends still has to be bounded. Gated on the
+        /// config, this run overspends its budget and finishes green.
+        #[test]
+        fn a_spending_provider_under_a_builtin_config_is_still_bounded() {
+            let project = Project::new(
+                "analysis-budget-held-provider",
+                &[
+                    ("rule.ts", DEBUGGER_RULE),
+                    (
+                        "lanekeep.config.ts",
+                        &config(", types: { provider: 'builtin' }, timeouts: { analysis: 1 }"),
+                    ),
+                    ("src/a.ts", "export function a() {\n  debugger;\n}\n"),
+                    ("src/b.ts", "export function b() {\n  debugger;\n}\n"),
+                ],
+            );
+            let engine = project
+                .prepare_with_provider_stub(Arc::new(Spendthrift(Duration::from_millis(50), true)))
+                .expect("the engine prepares; nothing has failed");
+            assert_eq!(
+                engine.types_provider(),
+                TypesProvider::Builtin,
+                "the config says builtin, which is the whole point of the fixture"
+            );
+            let error = engine
+                .run()
+                .expect_err("fifty milliseconds of analysis against a one-millisecond budget");
+            assert!(matches!(error, RunError::AnalysisTimeout { .. }), "{error}");
+        }
+
+        /// And the mirror, which is what keeps the change a correction rather than a widening: a
+        /// provider that spends nothing is not bounded by a budget it never charges, whatever
+        /// the config says. Charging one would cap a run at a budget that names work it does not
+        /// do — a one-minute default silently becoming the run limit.
+        #[test]
+        fn a_frugal_provider_under_a_tsc_config_is_not_bounded() {
+            let project = Project::new(
+                "analysis-budget-frugal-provider",
+                &[
+                    ("rule.ts", DEBUGGER_RULE),
+                    (
+                        "lanekeep.config.ts",
+                        &config(", types: { provider: 'tsc' }, timeouts: { analysis: 1 }"),
+                    ),
+                    ("src/a.ts", "export function a() {\n  debugger;\n}\n"),
+                    ("src/b.ts", "export function b() {\n  debugger;\n}\n"),
+                ],
+            );
+            let outcome = project
+                .prepare_with_provider_stub(Arc::new(Spendthrift(Duration::from_millis(50), false)))
+                .expect("the engine prepares")
+                .run()
+                .expect("this provider does not spend the analysis budget");
+            assert_eq!(outcome.violations.len(), 2, "both files were checked");
+        }
+
+        /// A provider's notices reach the caller, which is the only way they reach a terminal.
+        ///
+        /// The engine writes to neither stream, so a notice it did not expose would be one the
+        /// provider computed and nobody could ever read.
+        #[test]
+        fn a_providers_notices_reach_the_caller() {
+            struct Talkative;
+            impl TypeProvider for Talkative {
+                fn type_of(&self, _: lanekeep_types::Query<'_>) -> Option<lanekeep_types::Type> {
+                    None
+                }
+                fn symbol_of(
+                    &self,
+                    _: lanekeep_types::Query<'_>,
+                ) -> Option<lanekeep_types::Symbol> {
+                    None
+                }
+                fn return_type_of(
+                    &self,
+                    _: lanekeep_types::Query<'_>,
+                ) -> Option<lanekeep_types::Type> {
+                    None
+                }
+                fn is_assignable_to(
+                    &self,
+                    _: lanekeep_types::Query<'_>,
+                    _: &str,
+                    _: &str,
+                ) -> Option<bool> {
+                    None
+                }
+                fn complete(&self, _: lanekeep_types::Query<'_>) -> bool {
+                    false
+                }
+                fn identity(&self) -> Vec<u8> {
+                    b"talkative-fixture".to_vec()
+                }
+                fn notices(&self) -> Vec<String> {
+                    vec!["something was decided quietly".to_owned()]
+                }
+            }
+
+            let project = project("provider-notices");
+            let engine = project
+                .prepare_with_provider_stub(Arc::new(Talkative))
+                .expect("the engine prepares");
+            assert_eq!(
+                engine.provider_notices(),
+                vec!["something was decided quietly".to_owned()]
+            );
+
+            // And a provider with nothing to say says nothing: a line printed by every run is
+            // noise rather than information.
+            assert_eq!(
+                project
+                    .prepare_with_provider_stub(Arc::new(Spendthrift(Duration::ZERO, true)))
+                    .expect("the engine prepares")
+                    .provider_notices(),
+                Vec::<String>::new()
+            );
         }
 
         #[test]
@@ -8863,6 +9262,20 @@ export default defineRule({
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
         }
 
+        /// A rule that declares the capability, so the capability gate has something to gate.
+        ///
+        /// `DEBUGGER_RULE` requires nothing, and a config naming a provider no enabled rule
+        /// needs is deliberately allowed to fail its spawn quietly — so a fixture built on it
+        /// cannot reach the gate at all.
+        const TYPED_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/typed', requires: ['types'],\n\
+              query: '(variable_declarator name: (identifier) @name)',\n\
+              card: { message: 'm', remediation: 'r', \
+                examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { ctx.types.typeOf(m.name); },\n\
+            });\n";
+
         /// A `tsc` fixture, and the file whose key the tests below compare.
         fn tsc_project(name: &str, typescript: &str, tsconfig: &str) -> Project {
             Project::new(
@@ -8880,6 +9293,40 @@ export default defineRule({
                     ("src/a.ts", "export function a() {\n  debugger;\n}\n"),
                 ],
             )
+        }
+
+        /// A budget spent during the handshake is a budget breach, not a missing toolchain.
+        ///
+        /// `provider_for` answers `RunError::AnalysisTimeout` for it, and `prepare` used to
+        /// store *any* error from that call as the spawn failure — so the capability gate
+        /// reported "the configured `tsc` command could not be started … this build does not
+        /// provide", naming a toolchain that was found, started and answering. The remedy the
+        /// two errors print are different and only one of them can work.
+        #[test]
+        fn a_budget_spent_during_the_handshake_is_an_analysis_timeout() {
+            let Some(typescript) = typescript_package() else {
+                eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+                return;
+            };
+            let project = Project::new(
+                "tsc-handshake-budget",
+                &[
+                    ("rule.ts", TYPED_RULE),
+                    (
+                        "lanekeep.config.ts",
+                        &config(&format!(
+                            ", types: {{ provider: 'tsc', typescript: '{typescript}' }}, \
+                             timeouts: {{ analysis: 1 }}"
+                        )),
+                    ),
+                    ("package.json", "{\"name\":\"f\",\"private\":true}\n"),
+                    ("src/a.ts", "const a = 1;\n"),
+                ],
+            );
+            let error = project
+                .prepare_with("lanekeep.config.ts")
+                .expect_err("one millisecond is below a Node start, let alone a handshake");
+            assert!(matches!(error, RunError::AnalysisTimeout { .. }), "{error}");
         }
 
         #[test]
@@ -9050,6 +9497,7 @@ export default defineRule({
                     &lanekeep_lang_js::registry(),
                     Arc::new(TypeScript),
                     Arc::new(JavaScript),
+                    PrepareOptions::default(),
                 )
             }
 
@@ -9111,6 +9559,7 @@ export default defineRule({
                     &lanekeep_languages::registry(),
                     Arc::new(TypeScript),
                     Arc::new(JavaScript),
+                    PrepareOptions::default(),
                 )?
                 .without_cache()
                 .run()

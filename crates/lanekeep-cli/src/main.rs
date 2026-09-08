@@ -10,10 +10,10 @@ use std::sync::Arc;
 mod watch;
 
 use clap::{Parser, Subcommand};
-use lanekeep_core::FilePath;
+use lanekeep_core::{Capability, FilePath, TypesProvider};
 use std::collections::BTreeMap;
 
-use lanekeep_engine::{Engine, Outcome};
+use lanekeep_engine::{Engine, Outcome, PrepareOptions};
 use lanekeep_js::RuleRoot;
 use lanekeep_lang_js::{JavaScript, TypeScript};
 use lanekeep_report::{Color, Format, Summary};
@@ -274,6 +274,7 @@ fn fix_and_recheck(
     caching: bool,
     global_timeout: Option<u64>,
     outcome: Outcome,
+    held: Option<Arc<dyn lanekeep_engine::TypeProvider>>,
 ) -> anyhow::Result<Outcome> {
     let written = apply_fixes(project_root, &outcome)?;
     if written.files == 0 {
@@ -296,7 +297,22 @@ fn fix_and_recheck(
         )?;
     }
 
-    let (engine, _) = prepare(project_root, config, caching, global_timeout)?;
+    // The first run's provider, not a second one. Under `tsc` building one costs a Node
+    // process and a copy of every program in the project, and the recheck needs neither: it is
+    // a cache miss on the handful of files a fix rewrote. `begin_run` gives the held provider a
+    // fresh analysis budget and rebuilds its programs from the fixed bytes, so this is a second
+    // run with its own budget rather than a continuation of the first (architecture §6.7).
+    let (engine, _) = prepare(
+        project_root,
+        config,
+        caching,
+        global_timeout,
+        // `on_config` stays `None`: the note it prints says this run builds the project's
+        // TypeScript program, and this one does not build a second one. Printing it again would
+        // announce a cost that is not about to be paid.
+        PrepareOptions::default(),
+        held,
+    )?;
     engine.run().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -952,11 +968,30 @@ fn config_path(project_root: &Path, given: Option<&Path>) -> anyhow::Result<Path
 }
 
 /// Load the config and prepare an engine. Shared by every command that needs rules.
+///
+/// How `rules` and `explain` prepare: read the configuration, build nothing.
+///
+/// Both print a rule's own metadata — its id, severity and card — and no provider contributes
+/// a byte of that. Under `types.provider: 'tsc'` an ordinary prepare would write the driver
+/// into the project, spawn Node, build every program in it and then exit 2 if the sidecar
+/// could not start, all before printing a card. See [`PrepareOptions::without_provider`].
+const METADATA_ONLY: PrepareOptions<'static> = PrepareOptions {
+    on_config: None,
+    without_provider: true,
+};
+
+/// `options` is [`PrepareOptions`] threaded through, rather than its fields spread across this
+/// signature: `check` is the one caller that needs to say something from the configuration
+/// before the engine spawns anything, and `rules` and `explain` are the two that need no
+/// provider spawned at all. Both are engine-side decisions, and passing the struct is what
+/// keeps a new one from arriving here as a bare `bool` beside `caching`.
 fn prepare(
     project_root: &Path,
     config: Option<&Path>,
     caching: bool,
     global_timeout: Option<u64>,
+    options: PrepareOptions<'_>,
+    held: Option<Arc<dyn lanekeep_engine::TypeProvider>>,
 ) -> anyhow::Result<(Engine, usize)> {
     let root = RuleRoot::new(project_root)
         .map_err(|e| anyhow::anyhow!("cannot use `{}`: {e}", project_root.display()))?
@@ -1013,7 +1048,7 @@ fn prepare(
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     let declared = loaded.rules.len();
 
-    let engine = Engine::prepare(
+    let engine = Engine::prepare_with_provider(
         &loaded,
         project_root,
         root,
@@ -1021,6 +1056,8 @@ fn prepare(
         &lanekeep_languages::registry(),
         Arc::new(TypeScript),
         Arc::new(JavaScript),
+        held,
+        options,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -1090,8 +1127,15 @@ fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow:
             lanekeep_server::serve_lsp(&mut input, &mut output, &root, || {
                 // Every failure becomes a string the server logs and carries on from. An
                 // editor session should survive a config typo, not end on one.
-                let (engine, _) =
-                    prepare(project_root, config, true, None).map_err(|e| e.to_string())?;
+                let (engine, _) = prepare(
+                    project_root,
+                    config,
+                    true,
+                    None,
+                    PrepareOptions::default(),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
                 engine
                     .run()
                     .map(|outcome| outcome.violations)
@@ -1119,8 +1163,15 @@ struct Project<'a> {
 
 impl lanekeep_server::mcp::Tools for Project<'_> {
     fn check(&mut self) -> Result<String, String> {
-        let (engine, _) =
-            prepare(self.project_root, self.config, true, None).map_err(|e| e.to_string())?;
+        let (engine, _) = prepare(
+            self.project_root,
+            self.config,
+            true,
+            None,
+            PrepareOptions::default(),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
         let outcome = engine.run().map_err(|e| e.to_string())?;
 
         let cards: lanekeep_report::Cards = engine
@@ -1147,8 +1198,15 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
     fn rules(&mut self) -> Result<String, String> {
         use std::fmt::Write as _;
 
-        let (engine, _) =
-            prepare(self.project_root, self.config, false, None).map_err(|e| e.to_string())?;
+        let (engine, _) = prepare(
+            self.project_root,
+            self.config,
+            false,
+            None,
+            METADATA_ONLY,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
 
         let mut out = String::new();
         for spec in engine.rules() {
@@ -1167,8 +1225,15 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
     fn explain(&mut self, rule: &str) -> Result<String, String> {
         use std::fmt::Write as _;
 
-        let (engine, _) =
-            prepare(self.project_root, self.config, false, None).map_err(|e| e.to_string())?;
+        let (engine, _) = prepare(
+            self.project_root,
+            self.config,
+            false,
+            None,
+            METADATA_ONLY,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
 
         let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
             // The list, not only the miss. A rule id is easy to mistype and the answer is
@@ -1191,6 +1256,91 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
         let _ = writeln!(out, "Bad:  {}", spec.card.examples.bad);
         let _ = writeln!(out, "Good: {}", spec.card.examples.good);
         Ok(out)
+    }
+}
+
+/// Said at prepare, on stderr, because it changes what running lanekeep costs rather than
+/// what it reports — and because the shape it warns about is a pre-commit hook someone
+/// configured without knowing it now builds their whole program first.
+///
+/// Takes the loaded [`Config`](lanekeep_config::Config) rather than the prepared [`Engine`],
+/// and is passed as `prepare`'s `on_config` hook rather than called after it returns:
+/// `prepare` is what spawns the `tsc` sidecar and builds the whole program, and it returns
+/// `Err` outright when the spawn fails — so a note printed after it either arrives too late to
+/// warn about the cost, or never prints at all on a machine without Node. `on_config` fires
+/// from the configuration, before any of that, in both cases.
+///
+/// The closure shape a hook takes has no way to propagate a write failure, so this discards one
+/// the way every other best-effort stderr write in this file does.
+fn note_slow_hook(config: &lanekeep_config::Config) {
+    if config.types.provider == TypesProvider::Tsc {
+        let _ = writeln!(
+            std::io::stderr(),
+            "note: types.provider is tsc: this run builds the project's TypeScript program \
+             before checking; a pre-commit hook using it is a slow hook"
+        );
+    }
+}
+
+/// A type-aware rule is *not* skipped by a narrowed selection: its answers are per file, and
+/// the provider reads whatever it needs beyond the selection. Under `tsc` that is worth
+/// saying, because the whole program is built either way, so `--staged` does not make the
+/// expensive part smaller. Naming the rules is what makes the note actionable.
+fn note_narrowed_type_aware(selection: &Selection, engine: &Engine) -> anyhow::Result<()> {
+    let type_aware: Vec<String> = engine
+        .rules()
+        .filter(|spec| spec.requires.contains(&Capability::Types))
+        .map(|spec| spec.id.to_string())
+        .collect();
+    if selection.is_narrowed()
+        && engine.types_provider() == TypesProvider::Tsc
+        && !type_aware.is_empty()
+    {
+        writeln!(
+            std::io::stderr(),
+            "note: {} still runs type-aware rules, and the whole TypeScript program is built \
+             for them either way\n               still run: {}",
+            selection.flag(),
+            type_aware.join(", "),
+        )?;
+    }
+    Ok(())
+}
+
+/// Whatever the provider decided quietly, on stderr and after prepare.
+///
+/// After prepare because that is the one moment it is known: it takes a built program to find
+/// out which files no `tsconfig.json` claimed. Never stdout, which carries the report. Empty
+/// under `builtin`, and under `tsc` for a project whose files are all claimed by a config under
+/// its root — so an ordinary run says nothing, which is what makes the line information.
+fn note_provider(engine: &Engine) -> anyhow::Result<()> {
+    for notice in engine.provider_notices() {
+        writeln!(std::io::stderr(), "note: {notice}")?;
+    }
+    Ok(())
+}
+
+/// Run the engine over a selection, or over everything when there is none.
+///
+/// Extracted from `check` for its length; the reason it is not a one-liner is the
+/// intersection.
+fn run_selected(
+    engine: &Engine,
+    selected: Option<Vec<FilePath>>,
+) -> Result<Outcome, lanekeep_engine::RunError> {
+    match selected {
+        // Intersected with discovery rather than used directly, so `include` and `exclude`
+        // stay in force — `--staged` must not check a file the config excluded.
+        Some(selected) => {
+            let wanted: std::collections::BTreeSet<&FilePath> = selected.iter().collect();
+            let files: Vec<FilePath> = engine
+                .discover()
+                .into_iter()
+                .filter(|file| wanted.contains(file))
+                .collect();
+            engine.run_over(&files)
+        }
+        None => engine.run(),
     }
 }
 
@@ -1223,7 +1373,14 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         "--timeout must be greater than zero"
     );
 
-    let (engine, _) = prepare(project_root, config, !no_cache, timeout)?;
+    let on_config: Option<&dyn Fn(&lanekeep_config::Config)> = Some(&note_slow_hook);
+    let prepared = PrepareOptions {
+        on_config,
+        ..PrepareOptions::default()
+    };
+    let (engine, _) = prepare(project_root, config, !no_cache, timeout, prepared, None)?;
+
+    note_provider(&engine)?;
 
     let selected = selection.resolve(project_root)?;
     let cross_file: Vec<String> = engine
@@ -1257,24 +1414,13 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         engine
     };
 
-    let outcome = match selected {
-        // Intersected with discovery rather than used directly, so `include` and `exclude`
-        // stay in force — `--staged` must not check a file the config excluded.
-        Some(selected) => {
-            let wanted: std::collections::BTreeSet<&FilePath> = selected.iter().collect();
-            let files: Vec<FilePath> = engine
-                .discover()
-                .into_iter()
-                .filter(|file| wanted.contains(file))
-                .collect();
-            engine.run_over(&files)
-        }
-        None => engine.run(),
-    }
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    note_narrowed_type_aware(&selection, &engine)?;
+
+    let outcome = run_selected(&engine, selected).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let outcome = if fix {
-        fix_and_recheck(project_root, config, !no_cache, timeout, outcome)?
+        let held = engine.provider();
+        fix_and_recheck(project_root, config, !no_cache, timeout, outcome, held)?
     } else {
         outcome
     };
@@ -1320,7 +1466,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
 }
 
 fn rules(project_root: &Path, config: Option<&Path>, as_json: bool) -> anyhow::Result<ExitCode> {
-    let (engine, declared) = prepare(project_root, config, false, None)?;
+    let (engine, declared) = prepare(project_root, config, false, None, METADATA_ONLY, None)?;
     let mut stdout = std::io::stdout();
 
     if as_json {
@@ -1394,7 +1540,7 @@ fn explain(
     config: Option<&Path>,
     as_json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let (engine, _) = prepare(project_root, config, false, None)?;
+    let (engine, _) = prepare(project_root, config, false, None, METADATA_ONLY, None)?;
 
     let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
         // Naming what is configured, rather than only what is missing. A rule id is easy to
@@ -1454,6 +1600,17 @@ fn explain(
         writeln!(
             stdout,
             "\nThis rule reads the whole corpus, so --since and --staged skip it."
+        )?;
+    }
+
+    if spec.requires.contains(&Capability::Types) {
+        // Worth stating for the same reason the cross-file line is: it changes what running
+        // this rule costs, and which oracle answers it is a project-level setting rather than
+        // anything the rule said.
+        writeln!(
+            stdout,
+            "\nThis rule asks for types. Which oracle answers is `types.provider`: `builtin` \
+             needs no toolchain, `tsc` builds the project's own program."
         )?;
     }
 

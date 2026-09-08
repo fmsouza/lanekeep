@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lanekeep_config::TypesProvider;
-use lanekeep_engine::Engine;
+use lanekeep_engine::{Engine, PrepareOptions};
 use lanekeep_js::RuleRoot;
 use lanekeep_lang_js::{JavaScript, TypeScript};
 
@@ -60,7 +60,12 @@ struct Project {
 
 impl Project {
     fn new(name: &str, files: &[(&str, &str)]) -> Self {
-        let dir = std::env::temp_dir().join(format!("lanekeep-engine-{name}"));
+        // The process id is part of the name, as `tsc_notices.rs` does it and for its reason:
+        // two test binaries running at once — `just test` runs every crate's in parallel —
+        // otherwise share one directory, and the first `remove_dir_all` above deletes the
+        // other's fixture out from under it.
+        let dir =
+            std::env::temp_dir().join(format!("lanekeep-engine-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("creates the project directory");
         let project = Self { dir };
@@ -91,6 +96,7 @@ impl Project {
             &lanekeep_languages::registry(),
             Arc::new(TypeScript),
             Arc::new(JavaScript),
+            PrepareOptions::default(),
         )
         .expect("the sidecar starts and its programs build")
     }
