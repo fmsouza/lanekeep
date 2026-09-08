@@ -19,9 +19,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lanekeep_core::{FileAccess, FilePath};
 use lanekeep_lang::Language;
+use lanekeep_lang::binding::ImportedName;
 
-use crate::declarations::{Declaration, ExportTarget, Exported, declared_name, find_export};
-use crate::oracle::{TypeScriptOracle, TypeScriptSupport};
+use crate::declarations::{
+    Declaration, ExportTarget, Exported, declared_name, find_export, target_node,
+};
+use crate::oracle::{ImportResolution, TypeScriptOracle, TypeScriptSupport};
 use crate::provider::{Query, TypeProvider};
 use crate::resolve::resolve_specifier;
 use crate::types::{Symbol, Type};
@@ -93,9 +96,9 @@ impl BuiltinProvider {
         self.parser.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// An oracle over the file a question is about.
-    fn oracle<'q>(&self, q: &Query<'q>) -> TypeScriptOracle<'q> {
-        TypeScriptOracle::new(&self.support, q.tree, q.source)
+    /// An oracle over a question's own file, able to follow imports out of it.
+    fn oracle_with<'q>(&'q self, q: &Query<'q>, imports: &'q Imports<'q>) -> TypeScriptOracle<'q> {
+        TypeScriptOracle::new(&self.support, q.tree, q.source).with_imports(q.file, imports)
     }
 
     /// The parsed declaration file at `path`, read and parsed once per run.
@@ -195,15 +198,126 @@ impl BuiltinProvider {
             }),
         }
     }
+
+    /// The declaring file and node for an imported name, or nothing readable.
+    ///
+    /// One place, because all four hook methods start here and the difference between them is
+    /// only what they do with the node.
+    fn imported(
+        &self,
+        files: &FileAccess,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+    ) -> Option<(Arc<Declaration>, ExportTarget)> {
+        // A namespace import binds the whole module object, which has no declaration to walk
+        // to — the same `None` `Exported::Namespace` produces one layer down.
+        let wanted = match name {
+            ImportedName::Named(exported) => exported.clone(),
+            ImportedName::Default => "default".to_owned(),
+            ImportedName::Namespace => return None,
+        };
+        let entry = resolve_specifier(files, from, module)?;
+        let target = self.export_target(files, &entry, &wanted)?;
+        let decl = self.declaration(files, &target.file)?;
+        Some((decl, target))
+    }
+}
+
+/// One call's worth of a provider, so the oracle can ask it questions.
+///
+/// `ImportResolution`'s methods take no [`FileAccess`], because an oracle has no business
+/// knowing there is one — but a provider needs the caller's, and the caller's changes per
+/// question. Pairing the two in a value that lives exactly as long as the call is what lets
+/// the trait stay narrow.
+struct Imports<'a> {
+    provider: &'a BuiltinProvider,
+    files: &'a FileAccess,
+}
+
+impl ImportResolution for Imports<'_> {
+    fn imported_value_type(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+        depth: u32,
+    ) -> Option<Type> {
+        let (decl, target) = self.provider.imported(self.files, from, module, name)?;
+        let node = target_node(&decl, &target.name)?;
+        // Typed in the *declaring* file's own context, with the same resolver and the same
+        // resolution, so a chain of re-exports and aliases is one recursion under one bound.
+        let nested = Imports {
+            provider: self.provider,
+            files: self.files,
+        };
+        let oracle = TypeScriptOracle::new(&self.provider.support, &decl.tree, &decl.source)
+            .with_imports(&decl.path, &nested);
+        oracle.declaration_type_from(node, depth)
+    }
+
+    fn imported_alias_type(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+        depth: u32,
+    ) -> Option<Type> {
+        let (decl, target) = self.provider.imported(self.files, from, module, name)?;
+        let node = target_node(&decl, &target.name)?;
+        // Only an alias. A class or an interface keeps its use-site symbol, which is what the
+        // caller does when this answers `None` — see `ImportResolution`'s own documentation.
+        if node.kind() != "type_alias_declaration" {
+            return None;
+        }
+        let value = node.child_by_field_name("value")?;
+        let nested = Imports {
+            provider: self.provider,
+            files: self.files,
+        };
+        let oracle = TypeScriptOracle::new(&self.provider.support, &decl.tree, &decl.source)
+            .with_imports(&decl.path, &nested);
+        oracle.type_of_from(value, depth)
+    }
+
+    /// Nothing yet — Task 12 fills this in, together with `return_type_of` itself.
+    fn imported_return_type(
+        &self,
+        _from: &FilePath,
+        _module: &str,
+        _name: &ImportedName,
+        _depth: u32,
+    ) -> Option<Type> {
+        None
+    }
+
+    fn imported_export(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+    ) -> Option<ExportTarget> {
+        self.provider
+            .imported(self.files, from, module, name)
+            .map(|(_, target)| target)
+    }
 }
 
 impl TypeProvider for BuiltinProvider {
     fn type_of(&self, q: Query<'_>) -> Option<Type> {
-        self.oracle(&q).type_of(q.node)
+        let imports = Imports {
+            provider: self,
+            files: q.files,
+        };
+        self.oracle_with(&q, &imports).type_of(q.node)
     }
 
     fn symbol_of(&self, q: Query<'_>) -> Option<Symbol> {
-        self.oracle(&q).symbol_of(q.node)
+        let imports = Imports {
+            provider: self,
+            files: q.files,
+        };
+        self.oracle_with(&q, &imports).symbol_of(q.node)
     }
 
     /// Nothing yet — Task 12 fills this in.
@@ -220,9 +334,10 @@ impl TypeProvider for BuiltinProvider {
         None
     }
 
-    /// Nothing crosses a file boundary yet, so nothing can make an answer partial.
-    ///
-    /// Task 14 replaces this with the eager import pass.
+    /// `type_of` and `symbol_of` now follow an import into the declaring file, so an
+    /// unresolvable import does make an answer partial; this still answers `true` because the
+    /// file-level walk that decides it is Task 14's, and until then a partial answer is
+    /// indistinguishable here.
     fn complete(&self, _q: Query<'_>) -> bool {
         true
     }

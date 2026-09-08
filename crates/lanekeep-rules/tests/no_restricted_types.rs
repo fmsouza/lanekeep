@@ -845,3 +845,78 @@ fn the_required_type_in_signature_or_type_position_is_accepted() {
             .unwrap_or_else(|error| panic!("{source}: {error}"));
     }
 }
+
+/// The fixture package both default-import cases resolve through.
+///
+/// `decimal.js`'s real shape, minimally: a manifest naming its declarations, and a
+/// declaration file whose default export is a class with a name of its own. Written through
+/// `write_fixture` because the tester's project root is what the resolver walks up to, and a
+/// `node_modules` beside the subject is the only thing a bare specifier can find.
+fn with_decimal_package<'a>(tester: &'a RuleTester, default_export: &str) -> &'a RuleTester {
+    tester
+        .write_fixture(
+            "node_modules/decimal.js/package.json",
+            r#"{"types": "./decimal.d.ts"}"#,
+        )
+        .expect("writes the manifest");
+    tester
+        .write_fixture("node_modules/decimal.js/decimal.d.ts", default_export)
+        .expect("writes the declarations");
+    tester
+}
+
+/// A default import of the *wrong* export is reported once the declaration file says so.
+///
+/// Before A2 a default import could only say `exported: 'default'`, so the rule accepted it
+/// on the module requirement alone — a false negative it took on purpose rather than accuse
+/// a conforming `import Decimal from 'decimal.js'`. With the package on disk the default
+/// export's declared name is readable, so the comparison the rule already makes for a named
+/// import happens here too.
+///
+/// The fixture's default export is deliberately **not** the required name: `Big`, under a
+/// convention requiring `Decimal`. A fixture whose default export happened to be `Decimal`
+/// would pass against a rule that never compared anything.
+#[test]
+fn a_default_import_of_a_differently_named_export_is_reported() {
+    let tester = tester(MONEY);
+    with_decimal_package(&tester, "export default class Big {}\n");
+    tester
+        .reports_at(
+            "import Money from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n",
+            &[(2, 17)],
+        )
+        .expect("`decimal.js`'s default export is `Big`, and the convention wants `Decimal`");
+}
+
+/// The half that denies a rule reporting every default import.
+///
+/// The identical program against a package whose default export *is* `Decimal`. Without this,
+/// the test above passes against a rule that simply stopped accepting default imports —
+/// which would accuse the conforming spelling this whole rule is arranged not to accuse.
+#[test]
+fn a_default_import_of_the_required_export_is_accepted() {
+    let tester = tester(MONEY);
+    with_decimal_package(&tester, "export default class Decimal {}\n");
+    tester
+        .accepts(
+            "import Money from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n",
+        )
+        .expect("the default export is the required type, whatever the importer called it");
+}
+
+/// And with no package on disk, the pre-A2 acceptance stands.
+///
+/// The silence posture where it matters most: a project whose `node_modules` is not installed
+/// gets the weaker guarantee rather than a wall of false positives. `exported` falls back to
+/// `default`, the rule accepts on the module, and the run reports nothing new.
+#[test]
+fn a_default_import_with_no_declaration_file_is_still_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import Money from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n",
+        )
+        .expect("nothing readable said otherwise, so nothing is accused");
+}

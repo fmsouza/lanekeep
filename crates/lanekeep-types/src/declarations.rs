@@ -323,6 +323,19 @@ pub struct ExportTarget {
     pub name: String,
 }
 
+/// The node an already-resolved [`ExportTarget`] names, in its own file.
+///
+/// `declared_here` first, because a chain ends at whichever spelling the declaring file
+/// used and `declare class Big {}` is not an `export_statement` at all. `find_export` is
+/// the fallback for the one shape that has no name to look up: an anonymous default.
+#[must_use]
+pub(crate) fn target_node<'d>(decl: &'d Declaration, name: &str) -> Option<Node<'d>> {
+    declared_here(decl, name).or_else(|| match find_export(decl, name) {
+        Some(Exported::Here(node)) => Some(node),
+        _ => None,
+    })
+}
+
 /// The first named child of `kind`, when there is one.
 fn named_child_of_kind<'d>(node: Node<'d>, kind: &str) -> Option<Node<'d>> {
     let mut cursor = node.walk();

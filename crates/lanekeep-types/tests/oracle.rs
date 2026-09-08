@@ -1129,3 +1129,21 @@ fn a_parameter_in_signature_or_type_position_is_typed() {
         );
     }
 }
+
+/// Without a provider attached, an imported value still has no type.
+///
+/// The pair for `an_imported_value_has_no_type_yet` above rather than a replacement for it:
+/// that test is now specifically the *no-provider* path, and this names the reason so nobody
+/// later reads it as "cross-file resolution does not work". An oracle built by
+/// `TypeScriptOracle::new` alone opens no files, by construction — there is nothing attached
+/// that could.
+#[test]
+fn an_oracle_with_no_import_resolution_answers_nothing_for_an_import() {
+    assert_eq!(
+        type_of_use(
+            "import { Decimal } from 'm';\nconst y = Decimal;",
+            "Decimal"
+        ),
+        None
+    );
+}

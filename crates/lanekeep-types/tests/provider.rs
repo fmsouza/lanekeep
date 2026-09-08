@@ -977,6 +977,79 @@ fn a_star_re_export_cycle_terminates() {
     assert_eq!(provider.export_target(&files, &entry, "Missing"), None);
 }
 
+/// A file that imports its own name terminates rather than looping.
+///
+/// `export_target`'s visited set is what stops it: the walk marks `(src/a.d.ts, "A")` visited
+/// before it can be asked for again, so a second visit answers `None` instead of recursing.
+/// This never actually reaches that second visit here — `find_export` finds `A` declared
+/// locally (`export type A = number`) on the first visit and returns it directly, so the
+/// self-import statement is never followed at all — but it is the visited set, not the depth
+/// bound, that would stop it if a future declaration shape made the walk revisit the file.
+#[test]
+fn a_self_importing_declaration_file_terminates() {
+    let project = Project::new(
+        "self-import",
+        &[(
+            "src/a.d.ts",
+            "import { A } from './a';\nexport type A = number;\n",
+        )],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let file = FilePath::new("src/a.d.ts");
+
+    assert_eq!(
+        provider.export_target(&files, &file, "A"),
+        Some(ExportTarget {
+            file: FilePath::new("src/a.d.ts"),
+            name: "A".to_owned(),
+        })
+    );
+}
+
+/// Two files whose type aliases name each other terminates rather than looping.
+///
+/// `a.d.ts` says `A` is `B`, `b.d.ts` says `B` is `A`; nothing here ever bottoms out at a
+/// concrete type. `MAX_DEPTH` is what stops it — a real bound, not a performance claim, so
+/// this asserts it returns promptly rather than merely asserting it returns an answer. The
+/// bound does not answer `None`: it stops mid-chain and reports the last alias reached as a
+/// nominal type, exactly as running out of budget partway through a same-file chain would.
+#[test]
+fn a_mutual_alias_cycle_across_two_files_terminates() {
+    let project = Project::new(
+        "mutual-alias-cycle",
+        &[
+            (
+                "src/a.d.ts",
+                "import { B } from './b';\nexport type A = B;\n",
+            ),
+            (
+                "src/b.d.ts",
+                "import { A } from './a';\nexport type B = A;\n",
+            ),
+        ],
+    );
+    let subject = "import { A } from './a';\nlet x: A;\n";
+    let started = std::time::Instant::now();
+    let result = ask(&project, subject, TypeProvider::type_of);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "`MAX_DEPTH` must stop the walk well inside the budget, not merely before it hangs"
+    );
+    assert_eq!(
+        result,
+        Some(lanekeep_types::Type::Nominal {
+            name: "B".to_owned(),
+            symbol: Some(lanekeep_types::Symbol {
+                name: "B".to_owned(),
+                module: Some("./b".to_owned()),
+                exported: Some("B".to_owned()),
+            }),
+        }),
+        "the bound stops mid-chain rather than resolving to a concrete type"
+    );
+}
+
 /// A named re-export of a name that does not exist anywhere answers nothing.
 #[test]
 fn a_re_export_of_a_name_nothing_declares_answers_nothing() {
@@ -992,5 +1065,276 @@ fn a_re_export_of_a_name_nothing_declares_answers_nothing() {
     assert_eq!(
         provider.export_target(&files, &FilePath::new("lib.d.ts"), "Gone"),
         None
+    );
+}
+
+/// A project, a provider, and one question about `src/a.ts`.
+///
+/// Every cross-file case below is the same three lines otherwise, and the interesting part of
+/// each is its fixture — so the harness is one helper and the tests are their sources.
+fn ask<T>(
+    project: &Project,
+    subject: &str,
+    ask: impl FnOnce(&lanekeep_types::BuiltinProvider, Query<'_>) -> T,
+) -> T {
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "identifier");
+    ask(
+        &provider,
+        Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files,
+        },
+    )
+}
+
+/// An imported value is typed from its declaration file.
+#[test]
+fn an_imported_value_is_typed_through_its_declaration_file() {
+    let project = Project::new(
+        "imported-value",
+        &[("src/money.d.ts", "export declare const rate: number;\n")],
+    );
+    let subject = "import { rate } from './money';\nconst y = rate;\n";
+    assert_eq!(
+        ask(&project, subject, TypeProvider::type_of),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// An imported alias is transparent, exactly as a same-file one is.
+#[test]
+fn an_imported_type_alias_resolves_to_what_it_aliases() {
+    let project = Project::new(
+        "imported-alias",
+        &[("src/money.d.ts", "export type Amount = number;\n")],
+    );
+    let subject = "import { Amount } from './money';\nlet x: Amount;\n";
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "type_annotation");
+    assert_eq!(
+        provider.type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// An imported *class* keeps its use-site module, and gains its declared name.
+///
+/// The half that would be a false positive if the arm answered with the declaration's own
+/// symbol: `lanekeep/no-restricted-types` matches on `module`, and a declaration read out of
+/// `node_modules` is a local declaration in *that* file with no module at all.
+#[test]
+fn an_imported_class_keeps_its_module_and_gains_its_exported_name() {
+    let project = Project::new(
+        "imported-class",
+        &[
+            (
+                "node_modules/money/package.json",
+                r#"{"types": "./index.d.ts"}"#,
+            ),
+            (
+                "node_modules/money/index.d.ts",
+                "export { Decimal as Big } from './core';\n",
+            ),
+            (
+                "node_modules/money/core.d.ts",
+                "export declare class Decimal {}\n",
+            ),
+        ],
+    );
+    let subject = "import { Big } from 'money';\nlet x: Big;\n";
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "type_annotation");
+    assert_eq!(
+        provider.type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files
+        }),
+        Some(lanekeep_types::Type::Nominal {
+            name: "Big".to_owned(),
+            symbol: Some(lanekeep_types::Symbol {
+                name: "Big".to_owned(),
+                module: Some("money".to_owned()),
+                exported: Some("Decimal".to_owned()),
+            }),
+        })
+    );
+}
+
+/// `symbolOf` follows the chain to the declared name and keeps the specifier as written.
+#[test]
+fn symbol_of_reports_the_declared_name_and_the_specifier_as_written() {
+    let project = Project::new(
+        "symbol-chain",
+        &[
+            (
+                "node_modules/money/package.json",
+                r#"{"types": "./index.d.ts"}"#,
+            ),
+            (
+                "node_modules/money/index.d.ts",
+                "export { Decimal as Big } from './core';\n",
+            ),
+            (
+                "node_modules/money/core.d.ts",
+                "export declare class Decimal {}\n",
+            ),
+        ],
+    );
+    let subject = "import { Big } from 'money';\nconst y = Big;\n";
+    assert_eq!(
+        ask(&project, subject, TypeProvider::symbol_of),
+        Some(lanekeep_types::Symbol {
+            name: "Big".to_owned(),
+            module: Some("money".to_owned()),
+            exported: Some("Decimal".to_owned()),
+        })
+    );
+}
+
+/// An unreadable declaration file leaves the import exactly where it was.
+///
+/// The silence posture, asserted head-on: `module` still comes from the import statement, and
+/// `exported` falls back to what that statement says rather than to nothing. A rule matching
+/// on the module keeps working on a project whose `node_modules` is not installed.
+#[test]
+fn an_unresolvable_import_falls_back_to_what_the_import_statement_says() {
+    let project = Project::new("symbol-unresolvable", &[]);
+    let subject = "import { Decimal } from 'money';\nconst y = Decimal;\n";
+    assert_eq!(
+        ask(&project, subject, TypeProvider::symbol_of),
+        Some(lanekeep_types::Symbol {
+            name: "Decimal".to_owned(),
+            module: Some("money".to_owned()),
+            exported: Some("Decimal".to_owned()),
+        })
+    );
+}
+
+/// A namespace import binds the module object, which has no one exported name.
+#[test]
+fn a_namespace_import_has_no_exported_name() {
+    let project = Project::new(
+        "symbol-namespace",
+        &[
+            (
+                "node_modules/money/package.json",
+                r#"{"types": "./index.d.ts"}"#,
+            ),
+            (
+                "node_modules/money/index.d.ts",
+                "export declare class Decimal {}\n",
+            ),
+        ],
+    );
+    let subject = "import * as money from 'money';\nconst y = money;\n";
+    let symbol = ask(&project, subject, TypeProvider::symbol_of).expect("a symbol");
+    assert_eq!(symbol.module.as_deref(), Some("money"));
+    assert_eq!(symbol.exported, None);
+}
+
+/// A chain deeper than the bound stops rather than running away.
+///
+/// Every hop forwards `Decimal` under the same name except the last-but-one, which renames it
+/// to `Real` on the way to a final hop that declares `Real`. That rename is load-bearing: with
+/// every hop keeping the same name, the bounded walk's fallback (`Decimal`, the import
+/// statement's own spelling) and the unbounded walk's true answer (also `Decimal`) coincide, so
+/// the assertion below would pass whether or not the bound did anything at all — confirmed by
+/// setting `MAX_EXPORT_DEPTH` to `100_000` and watching this test fail once the rename is in
+/// place, since the walk then reaches the real declaration and answers `Real`.
+#[test]
+fn a_re_export_chain_past_the_bound_answers_nothing() {
+    let mut files: Vec<(String, String)> = Vec::new();
+    // Twenty hops, four past `MAX_EXPORT_DEPTH`. Every hop up to hop19 only forwards `Decimal`;
+    // hop19 renames it to `Real` on the way to hop20, which declares `Real`.
+    for hop in 0..19 {
+        files.push((
+            format!("src/hop{hop}.d.ts"),
+            format!("export {{ Decimal }} from './hop{}';\n", hop + 1),
+        ));
+    }
+    files.push((
+        "src/hop19.d.ts".to_owned(),
+        "export { Real as Decimal } from './hop20';\n".to_owned(),
+    ));
+    files.push((
+        "src/hop20.d.ts".to_owned(),
+        "export declare class Real {}\n".to_owned(),
+    ));
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    let project = Project::new("chain-bound", &borrowed);
+
+    let subject = "import { Decimal } from './hop0';\nconst y = Decimal;\n";
+    let symbol = ask(&project, subject, TypeProvider::symbol_of).expect("a symbol");
+    assert_eq!(
+        symbol.exported.as_deref(),
+        Some("Decimal"),
+        "the bound stops the walk before the rename, and the fallback is what the import \
+         statement says"
+    );
+}
+
+/// The same shape, short enough to finish: the walk crosses the rename and reports it.
+///
+/// The half that proves the test above is measuring the bound and not just a broken walk —
+/// with the identical rename-then-declare shape but only five hops, the answer is the real
+/// declared name rather than the fallback.
+#[test]
+fn a_re_export_chain_within_the_bound_answers_the_renamed_declaration() {
+    let mut files: Vec<(String, String)> = Vec::new();
+    for hop in 0..3 {
+        files.push((
+            format!("src/hop{hop}.d.ts"),
+            format!("export {{ Decimal }} from './hop{}';\n", hop + 1),
+        ));
+    }
+    files.push((
+        "src/hop3.d.ts".to_owned(),
+        "export { Real as Decimal } from './hop4';\n".to_owned(),
+    ));
+    files.push((
+        "src/hop4.d.ts".to_owned(),
+        "export declare class Real {}\n".to_owned(),
+    ));
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_str()))
+        .collect();
+    let project = Project::new("chain-within-bound", &borrowed);
+
+    let subject = "import { Decimal } from './hop0';\nconst y = Decimal;\n";
+    let symbol = ask(&project, subject, TypeProvider::symbol_of).expect("a symbol");
+    assert_eq!(
+        symbol.exported.as_deref(),
+        Some("Real"),
+        "within the bound the walk crosses the rename and answers the real declaration"
     );
 }

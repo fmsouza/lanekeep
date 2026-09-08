@@ -172,12 +172,15 @@ export default function noRestrictedTypes(options) {
         // `import { Decimal } from 'big.js'` — and dropping the name comparison is the false
         // negative this rule shipped with.
         //
-        // A default import is accepted on the module requirement alone. Its `exported` is
-        // the literal `'default'` — the name the module really exports it as — which no
-        // `require.name` a convention writes will equal, so demanding the name here would
-        // accuse `import Decimal from 'decimal.js'`: conforming code, and the one failure
-        // this design forbids. Following a default export to the name it is declared under
-        // means reading the declaration file, which is not something this oracle does today.
+        // A default import is accepted on the module requirement alone, as the *fallback*
+        // for a package the oracle could not read. With the declaration file readable, the
+        // cross-file oracle already follows the default export to the name that file declares
+        // it under, and `exported` is that name — so the ordinary comparison happens and a
+        // package whose default export is `Big` no longer satisfies a convention requiring
+        // `Decimal`. What is left is the unresolvable case: an uninstalled package answers the
+        // literal `'default'`, which no `require.name` a convention writes will equal, and
+        // demanding the name there would accuse `import Decimal from 'decimal.js'` —
+        // conforming code, and the one failure this design forbids.
         //
         // A nominal type the oracle could not attribute carries no symbol at all, so it
         // cannot match and is reported: a governed value whose type cannot be established

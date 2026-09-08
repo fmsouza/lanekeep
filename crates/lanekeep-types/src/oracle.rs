@@ -3,12 +3,68 @@
 use std::fmt;
 use std::sync::Arc;
 
+use lanekeep_core::FilePath;
 use lanekeep_lang::Language;
-use lanekeep_lang::binding::BindingResolver;
+use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 use tree_sitter::{Node, Tree};
 
+use crate::declarations::ExportTarget;
 use crate::table;
 use crate::types::{Primitive, Symbol, Type};
+
+/// What an oracle asks its host when a name comes from another file.
+///
+/// A trait rather than a concrete provider, so this crate's layering holds: the oracle reads
+/// **one** tree and nothing else, and every question about *which other file* and *how deep*
+/// belongs to the value that owns the declaration cache and the budget. An oracle with no
+/// implementation attached answers exactly what it answered before cross-file resolution
+/// existed, which is what keeps `TypeScriptOracle::new` a within-file oracle.
+///
+/// Every method takes the *importing* file, because a relative specifier means nothing
+/// without one, and a `depth` already spent, because a bound reset at every file boundary is
+/// not a bound.
+pub trait ImportResolution {
+    /// The type an imported *value* has, computed in its declaring file's own context.
+    fn imported_value_type(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+        depth: u32,
+    ) -> Option<Type>;
+
+    /// The type an imported *type alias* names, when the imported name is one.
+    ///
+    /// Deliberately not "the type of the imported type". An imported class or interface keeps
+    /// its own nominal identity and its use-site symbol — replacing it with whatever its
+    /// declaration file says would drop the module the name was imported from, which is the
+    /// one field `lanekeep/no-restricted-types` matches on. Only an alias is transparent,
+    /// exactly as a same-file `type Amount = number` already is.
+    fn imported_alias_type(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+        depth: u32,
+    ) -> Option<Type>;
+
+    /// What calling an imported function yields.
+    fn imported_return_type(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+        depth: u32,
+    ) -> Option<Type>;
+
+    /// Where an imported name is actually declared, after every re-export.
+    fn imported_export(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+    ) -> Option<ExportTarget>;
+}
 
 /// Node kinds the dispatch below reads, which the constructor requires the grammar to know.
 ///
@@ -81,6 +137,13 @@ pub struct TypeScriptOracle<'t> {
     tree: &'t Tree,
     source: &'t str,
     resolver: Arc<dyn BindingResolver>,
+    /// Which file this parse is of, when the caller could say.
+    ///
+    /// Required for cross-file resolution and for nothing else, which is why it is optional:
+    /// a within-file question does not need to know where the file lives, and demanding one
+    /// would make every existing caller supply a value it has no use for.
+    file: Option<&'t FilePath>,
+    imports: Option<&'t dyn ImportResolution>,
 }
 
 /// Hand-written because `Arc<dyn BindingResolver>` is not `Debug` — the trait answers
@@ -102,6 +165,7 @@ impl fmt::Debug for TypeScriptOracle<'_> {
         f.debug_struct("TypeScriptOracle")
             .field("tree", &self.tree)
             .field("source_len", &self.source.len())
+            .field("has_imports", &self.imports.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -159,7 +223,46 @@ impl<'t> TypeScriptOracle<'t> {
             tree,
             source,
             resolver: Arc::clone(&support.resolver),
+            file: None,
+            imports: None,
         }
+    }
+
+    /// Let this oracle follow a name into the file that declares it.
+    ///
+    /// Without it every arm behaves exactly as it did before cross-file resolution existed —
+    /// an import is a name with a module and no type — which is what makes a within-file
+    /// oracle still a thing this crate can hand out.
+    #[must_use]
+    pub fn with_imports(mut self, file: &'t FilePath, imports: &'t dyn ImportResolution) -> Self {
+        self.file = Some(file);
+        self.imports = Some(imports);
+        self
+    }
+
+    /// The type of `node`, starting from a depth already spent.
+    ///
+    /// For a provider that has followed an import: the recursion crosses files, and a bound
+    /// reset at every boundary is not a bound at all.
+    #[must_use]
+    pub fn type_of_from(&self, node: Node<'t>, depth: u32) -> Option<Type> {
+        self.type_of_at(node, depth)
+    }
+
+    /// The type a declaration gives the name it declares, from a depth already spent.
+    #[must_use]
+    pub fn declaration_type_from(&self, declaration: Node<'t>, depth: u32) -> Option<Type> {
+        self.declaration_type(declaration, depth)
+    }
+
+    /// The type a name *in type position* denotes: an alias followed, a nominal otherwise.
+    ///
+    /// [`Self::type_of`] cannot stand in for it. In expression position an `identifier` is a
+    /// value, so `class A extends B {}`'s `B` would be typed as whatever value `B` holds —
+    /// which for a class declaration is nothing at all — rather than as the type it names.
+    #[must_use]
+    pub fn type_named_by(&self, node: Node<'t>) -> Option<Type> {
+        self.named_type(node, 0)
     }
 
     /// The type of the expression at `node`, or `None` when the oracle cannot be sure.
@@ -242,6 +345,25 @@ impl<'t> TypeScriptOracle<'t> {
             }
 
             "identifier" => {
+                // An imported value's declaration is in another file. With resolution
+                // attached, that file is opened and the declaration typed in its own context;
+                // without it, this is the `None` it always was.
+                //
+                // Asked here rather than in `declaration_type`'s `import_statement` arm — the
+                // seam the design named — because the module specifier and *which* export was
+                // imported are what `resolve` answers, and the `import_statement` node alone
+                // does not say which of its specifiers bound this use.
+                if let Some(Binding::Import { module, name }) =
+                    self.resolver.resolve(self.tree, self.source, node)
+                    && let (Some(file), Some(imports)) = (self.file, self.imports)
+                {
+                    return imports.imported_value_type(
+                        file,
+                        &module,
+                        &name,
+                        depth.saturating_add(1),
+                    );
+                }
                 let declaration = self.resolver.declaration_of(self.tree, self.source, node)?;
                 self.declaration_type(declaration, depth.saturating_add(1))
             }
@@ -396,8 +518,9 @@ impl<'t> TypeScriptOracle<'t> {
     /// A type named by an identifier: a same-file alias followed, or a nominal type.
     ///
     /// An alias is followed because `type Amount = number` means a rule asking "is this a
-    /// number" should hear yes. Nothing follows it across a file boundary — an imported
-    /// alias is nominal here, and stays that way until cross-file resolution lands.
+    /// number" should hear yes. An imported alias is followed too, through the
+    /// [`ImportResolution`] hook, when one is installed; with none installed it stays nominal,
+    /// since there is nothing here to cross the file boundary with.
     ///
     /// A *type parameter* is the one declaration that is neither. `Nominal` is a claim —
     /// that this is a distinct named type — and `f<number>(1)` makes it false, so the `T`
@@ -421,6 +544,23 @@ impl<'t> TypeScriptOracle<'t> {
             }
         }
 
+        // An imported *alias* is followed across the boundary exactly as a same-file one is
+        // above: `export type Amount = number` means a rule asking "is this a number" should
+        // hear yes wherever the alias was written. Everything else keeps its own nominal
+        // identity and gains only a better `symbol` — see `ImportResolution`'s own doc for
+        // why replacing an imported class with its declaration would be a false positive
+        // rather than a better answer.
+        if let Some(Binding::Import {
+            module,
+            name: imported,
+        }) = self.resolver.resolve(self.tree, self.source, node)
+            && let (Some(file), Some(imports)) = (self.file, self.imports)
+            && let Some(aliased) =
+                imports.imported_alias_type(file, &module, &imported, depth.saturating_add(1))
+        {
+            return Some(aliased);
+        }
+
         Some(Type::Nominal {
             name: name.to_owned(),
             symbol: self.symbol_at(node),
@@ -429,13 +569,14 @@ impl<'t> TypeScriptOracle<'t> {
 
     /// Where the name at `node` came from, when the resolver can say.
     ///
-    /// The match is written out per form rather than routed through `Binding::is_import_of`'s
-    /// vocabulary, because the three answers are three different decisions — copy, substitute
-    /// the literal `default`, or refuse to name one — and that predicate's `"*"` for a
-    /// namespace is a query spelling, not an answer ([`Symbol::exported`] says why).
+    /// `exported` is the name the *declaring* module uses. With resolution attached it is
+    /// followed through every re-export to the file that declares the thing, so
+    /// `import Big from 'decimal.js'` reports `Big`'s real declared name rather than the
+    /// placeholder `default` — which is what lets a rule compare against a required export
+    /// name without accusing a conforming default import. Without resolution, or when the
+    /// declaration file is unreadable, it falls back to what the import statement itself
+    /// says.
     fn symbol_at(&self, node: Node<'t>) -> Option<Symbol> {
-        use lanekeep_lang::binding::{Binding, ImportedName};
-
         let name = self.text(node);
         if name.is_empty() {
             return None;
@@ -443,22 +584,30 @@ impl<'t> TypeScriptOracle<'t> {
         let (module, exported) = match self.resolver.resolve(self.tree, self.source, node)? {
             Binding::Import {
                 module,
-                name: ImportedName::Named(exported),
-            } => (Some(module), Some(exported)),
-            Binding::Import {
-                module,
-                name: ImportedName::Default,
-            } => (Some(module), Some("default".to_owned())),
-            Binding::Import {
-                module,
-                name: ImportedName::Namespace,
-            } => (Some(module), None),
+                name: imported,
+            } => {
+                let declared = self
+                    .file
+                    .zip(self.imports)
+                    .and_then(|(file, imports)| imports.imported_export(file, &module, &imported))
+                    .map(|target| target.name);
+                let exported = declared.or(match &imported {
+                    // Copied even when no rename happened: the consumer compares
+                    // `exported === require.name`, and a `None`-when-unrenamed contract makes
+                    // a forgotten fallback a silent false negative on every plain import.
+                    ImportedName::Named(exported) => Some(exported.clone()),
+                    ImportedName::Default => Some("default".to_owned()),
+                    // `import * as D` binds the module object; there is no one exported name.
+                    ImportedName::Namespace => None,
+                });
+                (Some(module), exported)
+            }
             Binding::Local(_) => (None, None),
         };
         Some(Symbol {
             name: name.to_owned(),
-            exported,
             module,
+            exported,
         })
     }
 
