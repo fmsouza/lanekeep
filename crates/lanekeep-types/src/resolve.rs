@@ -41,12 +41,19 @@ use lanekeep_core::files::{FileAccess, normalize};
 /// The source file before the declaration file: a `.d.ts` beside a `.ts` in one tree is a
 /// build artifact that can be stale, and the source is what the program means.
 ///
-/// **`.tsx` and `.jsx` are deliberately absent.** A declaration file is never TSX, which is
-/// what makes leaving them out cost nothing that matters; and this provider parses everything
-/// it opens with the TypeScript grammar — chosen by name, see `provider_language` in
-/// `lanekeep-engine` — under which every JSX element is an `ERROR` node with no error reported
-/// anywhere, the trap that produced 2218 false positives in one rule. A file this cannot read
-/// honestly is one it does not read.
+/// **`.tsx` and `.jsx` are deliberately absent, and that costs more than a declaration file.**
+/// This provider parses everything it opens with the TypeScript grammar — chosen by name, see
+/// `provider_language` in `lanekeep-engine` — under which every JSX element is an `ERROR` node
+/// with no error reported anywhere, the trap that produced 2218 false positives in one rule. A
+/// file this cannot read honestly is one it does not read.
+///
+/// What that gives up is **project sources**, not declaration files. A declaration file is
+/// never TSX, so nothing is lost in `node_modules`; but `import { Button } from './Button'`
+/// with `Button.tsx` beside it matches none of the suffixes above, records six absent reads,
+/// answers `undefined` for every name it brought in, and makes the importing file
+/// `complete() == false`. On a React codebase that is most sibling imports. A stated
+/// limitation rather than a bug to be surprised by — the refinement is filed with the
+/// resolver's own issue.
 const RELATIVE_SUFFIXES: &[&str] = &[".ts", ".mts", ".cts", ".d.ts", "/index.ts", "/index.d.ts"];
 
 /// Resolve `specifier`, written in `from`, to a file inside the project root.

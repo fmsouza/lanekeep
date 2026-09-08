@@ -92,6 +92,13 @@ pub trait TypeProvider: Send + Sync {
     /// type would accuse code the provider never saw. Takes a whole [`Query`] rather than a
     /// path because the question is about the file's *imports*, which cannot be enumerated
     /// without its tree.
+    ///
+    /// **A whole-file verdict, deliberately coarse.** One unreadable import makes the whole
+    /// file `false`, and an import whose declaration file carries a single `ERROR` node
+    /// anywhere counts as unreadable — so one unparsed construct in a fifty-thousand-line
+    /// `@types` bundle makes every file that imports it incomplete, project-wide. Silence is
+    /// the safe direction, and a narrower verdict (an `ERROR` covering the *asked* name) is a
+    /// refinement filed with the resolver's own issue rather than a promise made here.
     fn complete(&self, q: Query<'_>) -> bool;
 
     /// What this provider *is*, for the cache key.

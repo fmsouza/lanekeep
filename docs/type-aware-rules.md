@@ -1,10 +1,240 @@
 # Type-aware rules
 
-<!--
-  Plan 4 adds the authoring, provider-selection and configuration sections ABOVE this one.
-  This file starts life carrying the A3 measurement alone, because the measurement is spec
-  §5.1's commit 1 and it lands before any A3 code exists.
--->
+## Writing a type-aware rule
+
+A rule that needs to know what a value *is* rather than what it is spelled. This is the
+playbook for `requires: ['types']`; [`architecture.md`](architecture.md) §6.10 is the
+contract, and this is how to work within it.
+
+### Declare the capability
+
+```ts
+export default defineRule({
+  id: 'acme/no-raw-money',
+  requires: ['types'],
+  query: { typescript: '(required_parameter pattern: (identifier) @name)' },
+  card: { /* … */ },
+  check(ctx, m) {
+    const type = ctx.types.typeOf(m.name)
+    if (type?.primitive !== 'number') return
+    ctx.report(m.name)
+  },
+})
+```
+
+`requires: ['types']` is what puts `ctx.types` on the context at all. A rule that forgets it
+still compiles — TypeScript has no way to see that a rule's own `requires` is what makes the
+namespace exist — and finds out at the first call, where `ctx.types` is `undefined` and
+`ctx.types.typeOf(...)` throws a `TypeError`. That loudness is deliberate: the alternative is a
+rule that reports nothing and reads as a clean codebase.
+
+## The five questions
+
+| Ask | When |
+| --- | --- |
+| `typeOf(n)` | "Is this a `number`?" — a primitive, a union of them, or a named type with a symbol |
+| `symbolOf(n)` | "Did this come from that package?" — `module` is the specifier as written, `exported` the name that module declares it under |
+| `returnTypeOf(n)` | "What does calling this give back?" — a call expression, a function-like declaration, or an identifier bound to one |
+| `isAssignableTo(n, module, name)` | "Is this that library's type, or something that extends it?" |
+| `complete()` | "Did I see everything this file imports?" |
+
+`returnTypeOf` is separate from `typeOf` because a function declaration is not an expression.
+Folding it in would have meant a function-type variant every rule asking a simpler question
+would then have to unpack, for one question rules actually ask.
+
+`symbolOf`'s two name fields are not interchangeable. `name` is the spelling at the *use site*
+— `import { Decimal as Money }` gives `Money` — and is what a message quotes. `exported` is
+what the declaring module calls it, which is what a rule compares against a required export
+name. Comparing `name` rejects a renamed import of exactly the right type, which is a false
+positive on conforming code.
+
+## The silence posture
+
+**Every question can answer `undefined`, and that is a result rather than a failure.** The
+provider would rather say nothing than say something wrong, because a rule reporting on a wrong
+type accuses correct code. A rule is expected to check for `undefined` and stay silent.
+
+`isAssignableTo` is where the distinction is sharpest, because it has three answers:
+
+| Answer | Means |
+| --- | --- |
+| `true` | the type is that export, or reaches it through `extends` |
+| `false` | the walk completed and reached nothing |
+| `undefined` | a link could not be read — an unresolvable import, a package that is not installed, a type with no symbol at all |
+
+A rule writing `if (!ctx.types.isAssignableTo(n, m, t)) report()` reports on every file whose
+`node_modules` is absent. Write the three arms.
+
+## What stays `undefined`
+
+Under the builtin provider, always:
+
+- **Generic instantiation.** `useQuery<Balance[]>` answers by the result type's *name*; the
+  type argument is dropped everywhere in this crate.
+- **Conditional, mapped, function and object types.** Each would need an abstraction the
+  bounded oracle does not have, and guessing is worse than silence.
+- **Declaration merging**, and ambient `declare module` blocks as a resolution source.
+- **`.tsx` files reached through an import**, project sources included. The provider parses
+  everything it opens with the TypeScript grammar, under which every JSX element is an `ERROR`
+  node with nothing reported anywhere, so a file it cannot read honestly is one it does not
+  read. The grammar is selected by name rather than by taking whichever registered language
+  answers first — `tsx` sorts before `typescript`, and picking it would parse every `.ts` file
+  the provider opens with the wrong dialect. A declaration file is never TSX, so nothing is
+  lost in `node_modules` — but a **project source** is another matter: `import { Button } from
+  './Button'` with `Button.tsx` beside it resolves to nothing, records six absent reads, and
+  makes the importing file `complete() === false`. On a React codebase that is most sibling
+  imports, so a rule there should expect `complete()` to answer `false` far more often than
+  the missing-`node_modules` case suggests. A stated limitation of this release; the
+  refinement is filed with the resolver's own issue.
+- **A destructured binding.** `function f({ amount }: Money)` types `amount` as nothing —
+  reading the pattern's own annotation would hand every name the whole thing's type.
+- **A type parameter.** `interface O<T> { x: T }` types `x` as nothing, because `T` is whatever
+  the call site chose.
+
+And, situationally: anything behind an import that did not resolve. `complete()` is how a rule
+finds out that happened — with two deliberate exclusions. An import that resolves to a file
+which does not *parse* counts as unread, because the names outside the broken span answer while
+the ones inside it come back `undefined` and nothing on either answer says which. And an import
+of something that is not code — `./app.css`, `./data.json`, `./logo.svg` — is not counted at
+all: it is not a module the oracle reads, and counting it would label most of a bundler's
+project incomplete for having stylesheets. A specifier is skipped only when its last segment
+carries a known asset extension, never when it merely looks like one: `./user.service`,
+`./auth.guard` and the rest of the NestJS and Angular vocabulary are modules and are probed.
+
+**The verdict is the whole file's, and a parse fault is the whole declaration file's.** One
+`ERROR` node anywhere in a fifty-thousand-line `@types` bundle makes every file that imports it
+`complete() === false`, however far that span is from the names the rule asked about. Silence is
+the safe direction — a rule told the view is partial stays quiet, where a narrower verdict that
+was wrong would let it report — so the coarse answer is what this release gives; an `ERROR`
+covering the *asked* name is a refinement filed with the resolver's own issue.
+
+Two further limits, specific to individual questions:
+
+- **An alias chain cut by the depth bound answers nothing**, never a type from an intermediate
+  file in the chain.
+- **`returnTypeOf` reads a declared return annotation or, absent one, the body's `return`
+  expressions; an `async` function or generator with no annotation answers nothing.**
+
+And two specific to `symbolOf` and `isAssignableTo`:
+
+- **A relative import re-exported through an intermediate file reports that intermediate
+  file's own specifier in `symbol.module`**, not the original module the value came from — a
+  bare package name, by contrast, is reported exactly as written at the use site.
+- **`isAssignableTo` is nominal**: `extends`/`implements` and aliases of the named type,
+  followed across files. A same-named local declaration is never the target regardless of
+  shape, declaration merging is not followed, a generic annotation at the use site answers
+  nothing, a target the requested module does not export answers nothing, and a function-local
+  shadow of the name is looked up at the top level rather than in its own scope.
+
+## What it reads, and confinement
+
+The file under check, and the declaration files its imports resolve to:
+
+1. A **relative** specifier tries `x.ts`, `x.mts`, `x.cts`, `x.d.ts`, `x/index.ts`,
+   `x/index.d.ts`, in that order. A specifier naming the emitted JavaScript — `./money.js`,
+   TypeScript's own ESM spelling — is tried at the same stem.
+2. A **bare** specifier walks `node_modules` upward from the importing file's directory. In a
+   package it reads `package.json`: `exports` under the `types` condition (subpath maps and
+   `*` patterns included), then `types`, then `typings`, then `index.d.ts`; then the same for
+   `@types/<name>`, with a scoped package flattened as `@types/scope__name`.
+
+Every one of those probes is a **tracked read**, hit or miss, so an absent file is recorded
+with a null hash and its later appearance recomputes exactly the files that noticed it was
+missing.
+
+**The walk stops at the project root, and nothing above it is ever read.** The two ways past
+the root fail differently, and both are unresolvable rather than an error:
+
+- A `node_modules` **hoisted above the root** is never probed at all — the walk stops, so no
+  path above the root is read and none is recorded.
+- A package **symlinked out of the root**, which is what a pnpm store is, *is* probed: the path
+  names something inside the root. The read is refused after canonicalizing and recorded as a
+  **refused** dependency — a third outcome distinct from absence, because the validator
+  re-resolves it under the same confinement rather than looking for the file — so the day that
+  path becomes a real in-root file every answer that rested on the refusal is recomputed rather
+  than served from the cache forever.
+
+For the hoisted case nothing is recorded at all, since the walk never reaches it; for the
+symlinked-out case a refusal is recorded, not an absence. Either way every answer that needed
+the package is `undefined`, and `complete()` is `false`. **The remedy is to point lanekeep at
+the workspace root** — the directory `node_modules` lives in — rather than at a package inside
+it. `--config` does not move the root.
+
+## What it costs
+
+Declaration files are parsed once per run, whatever imports them, and cached for the run.
+
+**Project sources reached through an import are parsed a second time**, by the provider's own
+parser: a relative specifier prefers `x.ts` over `x.d.ts`, so importing a sibling source means
+the engine parses it for its own check and the provider parses it again to answer about it.
+Once per run per file rather than once per importer, so the bill is the number of distinct
+files reached through imports, not the number of imports — with one exception at the margin:
+the provider's parser is behind a plain mutex held across a whole parse, so two workers that
+reach the same uncached file at the same moment both parse it and the second write wins. At
+most one extra parse per worker that races, of the same bytes, for the same answer. Sharing the engine's node arena would
+remove it and is a separate seam — the arena is keyed by the run's file list, and a `.d.ts`
+under `node_modules` is not in it at all.
+
+The cost that shows up in a cache is the *dependency list*: a file importing three packages
+records every probe those three took, and a package that resolves on its first candidate
+records one read rather than six.
+
+**Measured**, 2026-09-08, on a `pera-corpus` clone at
+`3b17bb2ed15e4fcd113b962b2ab26e2347b22dcd` — 6,556 files checked, one `requires: ['types']`
+rule configured (`lanekeep/no-restricted-types` with the `Decimal` money convention from
+[`built-in-rules.md`](built-in-rules.md), passed as `--config`), each binary a release build
+run cold with `.lanekeep/` removed first, on an Apple M3 Max (14 cores), macOS 26.6.2:
+
+| binary | `.lanekeep/cache` | violations | wall clock |
+| --- | --- | --- | --- |
+| `7416b00`, the plan-3 base — the within-file oracle | 378,092 bytes | 107 | 1.70 s, 1.73 s |
+| `639288b`, this branch — the cross-file oracle | 438,015 bytes | 110 | 1.74 s, 1.67 s |
+
+**+59,923 bytes, about 9 bytes per file checked, +15.8%** — and three violations the within-file
+oracle could not reach, which is what the bytes bought. The byte and violation figures
+reproduced exactly on a second cold run of each binary; the two wall-clock figures are both
+runs rather than an average, because at this size the spread between them is larger than the
+difference between the binaries. This is the cost *when the oracle is used*; task 17 measured the cost when it is
+not, over the same corpus with the project's own config, and found a **0-byte delta**, because
+a run that asks the oracle nothing opens no declaration file and records no probe.
+
+`639288b` is the commit *below* this file's own — the docs commit adds prose and doc comments
+only, so it compiles to the same behavior and measuring at it would measure the same run.
+
+Two earlier versions of this table named SHAs this history no longer has — `b448677`, a
+pre-rebase working commit, and then `dd8e563`, which a later rebase rewrote into `639288b`.
+Neither row was reproducible by anyone, which is why the whole table is re-measured at a live
+SHA rather than carried forward whenever the commit under it moves.
+
+What survived every re-measurement is the pair the argument rests on: **378,092 / 107 and
+438,015 / 110 came back byte-identical at `b448677`, at `dd8e563` and at `639288b`**, over the
+corpus at the SHA named above. The file count moved once, 6,557 to 6,556, and this method gives
+6,556 on every run since — nothing here explains the earlier figure, so read the count as this
+row's rather than as a constant of the corpus.
+
+The wall clock is the column that did **not** reproduce, and it is reported rather than
+smoothed. The `dd8e563` run recorded 0.90 s / 1.06 s for the base and 1.21 s / 1.04 s for the
+branch; the `639288b` run above, same machine and same method, gives 1.70 s / 1.73 s and
+1.74 s / 1.67 s — every figure slower, and the two binaries now indistinguishable from each
+other. Nothing in the code between those two commits could account for it (the rebase moved
+none of the engine), so what the two runs really measure is the machine at two moments. That
+is the column's own caveat arriving in earnest: at this size the spread between runs is larger
+than the difference between the binaries, and only the byte and violation figures should be
+read as properties of the change. The sentence that once read "about three seconds" named
+neither a machine nor a run and is replaced by the column.
+
+One thing the numbers do not cover: neither run's config resolves a package outside the corpus,
+so a project whose imports reach deep into `node_modules` records more probes per file than
+this.
+
+<!-- Do not rewrite a recorded figure — if a later measurement disagrees, add it beside this
+     one with its own SHA and date. A figure measured against a working tree rather than a
+     named commit is reproducible by nobody who lacks that tree. -->
+
+## Rules that ship with this
+
+`lanekeep/no-restricted-types` and `lanekeep/no-restricted-arguments`; see
+[`built-in-rules.md`](built-in-rules.md) for what each stays silent on.
 
 ## Provider measurement
 

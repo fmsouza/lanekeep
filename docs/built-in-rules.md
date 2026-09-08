@@ -386,14 +386,6 @@ the wrong module — `import { Decimal } from 'big.js'` is reported because `big
 shipped without — under the earlier version it was accepted, and that false negative is what
 `require` being "matched on the module and nothing else" used to mean.
 
-**A default import is accepted on the module requirement alone.** `import Decimal from
-'decimal.js'` is exported under the name `default`, which is not what any convention writes in
-`require.name`, so demanding a name match there would report conforming code — and a rule that
-accuses conforming code is the one failure this design forbids. Following a default export to
-the name it is declared under means opening the declaration file, which this oracle does not
-do; until it does, the module is what can honestly be checked, and the narrower acceptance is
-the cost.
-
 `require.name` is load-bearing for the *message* as well as for the check — with no `reason`
 set it is what the violation says to use instead — so it is worth spelling exactly as the
 module exports it.
@@ -401,9 +393,25 @@ module exports it.
 **`undefined` produces false negatives and never false positives.** The oracle would rather say
 nothing than accuse code it could not read, so a value it cannot type is never reported — even
 when the name matches and the value really is a raw `number`. That silence is bounded by what
-the oracle can see from the parsed file alone: no `tsconfig.json`, no declaration files, no
-cross-file resolution. "No violations" from this rule is a narrower claim than "every governed
-value conforms," and a reader who conflates the two is trusting a report that never looked.
+the oracle can read: the parsed file, and the declaration files its imports resolve to — no
+`tsconfig.json`, no path mapping, no compiler. "No violations" from this rule is a narrower
+claim than "every governed value conforms," and a reader who conflates the two is trusting a
+report that never looked.
+
+An earlier version of this section said "no declaration files, no cross-file resolution", and
+that was true of the within-file oracle it was written for. It is history now: the paragraph
+below is the behavior, and a project whose `node_modules` is absent is what the older sentence
+still describes.
+
+**A default import is resolved by name once the declaration file is readable.** `import Decimal
+from 'decimal.js'` says only `exported: 'default'` on its own — `default` is the name the module
+exports it under, and comparing that against `require.name` would accuse conforming code — so a
+default import is accepted on the module requirement alone whenever nothing better is known.
+With `decimal.js` installed, the cross-file oracle follows the default export to the name its
+declaration file declares it under, and the ordinary comparison happens: a package whose default
+export is `Big` no longer satisfies a convention requiring `Decimal`. **A project whose
+`node_modules` is not installed gets the weaker guarantee rather than a wall of false
+positives** — which is the same trade the rest of this rule makes, one file further out.
 
 ### It is one half of a pair
 
@@ -549,9 +557,10 @@ positive is the one failure this design forbids.
 
 The rule declares `requires: ['types']`, which is what puts `ctx.types` on its context at all —
 see [`architecture.md`](architecture.md) §6.10. Everything it can say is bounded by what the
-oracle can see from the parsed file alone: no `tsconfig.json`, no declaration files, no
-cross-file resolution. A clean run means the governed positions this rule could type were fine,
-which is a narrower claim than "no forbidden value reaches that callee".
+oracle can read: the parsed file, and the declaration files its imports resolve to — no
+`tsconfig.json`, no path mapping, no compiler. A clean run means the governed positions this
+rule could type were fine, which is a narrower claim than "no forbidden value reaches that
+callee".
 
 ### It is one half of a pair
 

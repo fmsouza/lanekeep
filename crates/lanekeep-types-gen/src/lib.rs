@@ -316,7 +316,7 @@ fn render_context(
             "   * The type oracle, present only for a rule that declared `requires: ['types']`.\n",
         );
         out.push_str(
-            "   * Bounded by `MAX_DEPTH` rather than by file: it follows an import into the\n",
+            "   * Bounded by a fixed depth rather than by file: it follows an import into the\n",
         );
         out.push_str("   * declaration file that answers it, and the file after that.\n");
         out.push_str("   *\n");
@@ -723,9 +723,9 @@ const TYPE_API: &str = "\
  * posture the rest of the navigation surface already takes on a dead handle.
  *
  * It reads the file in front of it **and the declaration files that file imports**, through
- * the same tracked, confined reads `ctx.readFile` uses — so a `node_modules` above the
- * project root is unreadable, and a run started from the workspace root sees more than one
- * started from a package directory. Nothing above the root is read, ever.
+ * the same tracked, confined reads `ctx.readFile` uses. Nothing above the project root is read,
+ * ever — so point lanekeep at the workspace root, the directory `node_modules` lives in,
+ * rather than at a package inside it. `--config` does not move the root.
  */
 export interface TypeApi {
   /**
@@ -750,9 +750,10 @@ export interface TypeApi {
   /**
    * Whether the type at `n` is the type `module` exports as `name`, or inherits from it.
    *
-   * Nominal, never structural: a class reaches it through `extends`, an interface through
-   * `extends`, an alias by being transparent, and a union only when *every* member does. A
-   * primitive answers `false`.
+   * Nominal, never structural: a class reaches it through `extends` or `implements`, an
+   * interface through `extends`, an alias by being transparent, and a union only when *every*
+   * member does. A primitive answers `false` — but only when `module` and `name` resolve to a
+   * declaration; a target that does not resolve answers `undefined` whatever `n` is.
    *
    * **`undefined` is not `false`.** `false` means the walk completed and reached nothing;
    * `undefined` means a link could not be read — an unresolvable import, a package that is
@@ -767,6 +768,17 @@ export interface TypeApi {
    * the oracle could not open, so an `undefined` anywhere in it may be ignorance rather than
    * a considered answer. A rule that reports only on what it established does not need to
    * ask; a rule that wants to say \"I could not check this file\" does.
+   *
+   * An import that resolves to a file which does not *parse* counts as unreadable too: the
+   * names outside the broken span still answer, the ones inside it come back `undefined`, and
+   * nothing on either answer says which. An import of something that is not code — a
+   * stylesheet, a JSON asset, an image — is not counted at all, since it is not a module the
+   * oracle reads.
+   *
+   * **The verdict is the whole file's, and a parse fault is the whole declaration file's.**
+   * One `ERROR` node anywhere in a fifty-thousand-line `@types` bundle makes every file that
+   * imports it `false`, however far that span is from the names the rule asked about. Silence
+   * is the safe direction; a narrower verdict is a refinement rather than a promise.
    */
   complete(): boolean
 }

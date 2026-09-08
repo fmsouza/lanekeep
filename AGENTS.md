@@ -137,7 +137,8 @@ crates/
   lanekeep-lang-go      Go grammar, binding resolution
   lanekeep-lang-rust    Rust grammar, binding resolution
   lanekeep-languages    the set of supported languages, assembled in one place
-  lanekeep-types     the bounded type oracle: a node's type and symbol, from one parsed file
+  lanekeep-types     the bounded type oracle: a node's type and symbol, from the parsed file
+                     and the declaration files its imports resolve to, through tracked reads
                      — not lanekeep-types-gen, which renders TypeScript definitions
   lanekeep-config    config loading, rule graph resolution, hashing
   lanekeep-cache     content-addressed store with dependency tracking
@@ -457,6 +458,39 @@ working form names files — `node --test 'packages/lanekeep/runtime/*.test.js'`
 carries three guards for the same reason: no directory argument, an empty glob is an error, and
 node's own reported test count is asserted nonzero. "It exited 0" is precisely what this failure
 looks like.
+
+**`just test -- <the name of a test binary>` runs nothing, and the only sign is a warning.**
+nextest's bare filter matches a substring of a *test name*, never a binary name. `just test --
+cache::` works because that is a module path inside the names it matches; `just test --
+type_cache` — the name of the integration-test *file* `crates/lanekeep-cli/tests/type_cache.rs`
+— matches no test name at all and prints `Starting 0 tests across 93 binaries (2154 tests
+skipped)` followed by `Summary … 0 tests run: 0 passed, 2154 skipped`, and exits **0**. The
+`--no-tests=warn` entry below is what keeps that from being an error, so "I ran the type_cache
+tests and they passed" is exactly what running none of them looks like.
+
+**And the filterset is not a `just` spelling at all — both obvious forms fail, neither of them
+where you would look.** A filterset always carries parentheses, and `{{ ARGS }}` in the `test`
+recipe is unquoted, so both spellings die in bash before nextest is reached. Measured
+2026-09-08, just 1.58.0, cargo-nextest 0.9.140:
+
+| what was typed | what happened |
+| --- | --- |
+| `just test -- -E 'binary(type_cache)'` | ``bash: -c: line 1: syntax error near unexpected token `('``, exit 2 |
+| `just test -E 'binary(type_cache)'` | the same syntax error, for the same reason: the quotes are the *outer* shell's and are gone by the time just interpolates |
+| `just test -- -E 'binary\(type_cache\)'` | past bash, and now nextest refuses it: ``error: failed to parse test binary arguments `-E`: arguments are unsupported``, exit 96 — `--` is nextest's passthrough to the test binary, so a post-`--` `-E` is never nextest's own flag |
+| `just test -E 'binary\(type_cache\)'` | **runs**, 5 tests — but it works by carrying backslashes through two layers, which is not a form to write down |
+
+`just --dry-run test …` shows the interpolation before it is run and is the cheap way to see
+this: it prints `-E binary(type_cache)`, unquoted, for every one of the four.
+
+So call the tool directly, with the flags the recipe would have added:
+
+```
+cargo nextest run -p lanekeep-cli --all-features --no-tests=warn -E 'binary(type_cache)'
+```
+
+`-p <crate>` in place of `--workspace` because a filterset that names one binary has no reason
+to build the other ninety-two. The count in the summary is the thing to read.
 
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.
@@ -1076,6 +1110,30 @@ one dependency took three profile stanzas and an unrelated workspace-dependency 
 Put beside the entry above, that is the 6× given back without a word — the stanza vanishes, the
 build stays green, and the only symptom is a gate that got slow again. Diff the root manifest
 after any `cargo add` or `cargo remove`, or make the edit by hand.
+
+**A `CARGO_TARGET_DIR` set for a build that includes `lanekeep-rules` breaks that build, in one
+of two ways depending on the profile.** `crates/lanekeep-rules/build.rs` shells out to
+`cargo component build --release --target wasm32-unknown-unknown` for each Rust rule crate
+(`build_rust_component`) and clears nothing from the environment it inherits, so the nested
+cargo takes the *outer* target directory. Measured 2026-09-08 on a tree with one
+`components/*.wasm` deleted, so the script actually runs:
+
+| outer build | what happens |
+| --- | --- |
+| `cargo build -p lanekeep-rules` (debug) | the nested build **succeeds** into the outer directory, and then the copy fails: ``failed to copy the built `no-unwrap.wasm` into components/: No such file or directory`` |
+| `cargo build --release -p lanekeep-rules` | **hangs**, silently, with no output after `Compiling lanekeep-rules` — killed at 300 s |
+
+The copy is the second half of the same bug: it reads from a hardcoded
+`rust-rules/target/wasm32-unknown-unknown/release/<name>.wasm`, which is where the nested build
+would have written with the variable unset. So the debug case fails loudly at the wrong place —
+the message names a missing file rather than an inherited environment variable — and the
+release case, where the two builds want the same profile directory, produces no message at all.
+
+Where a separate target directory is genuinely wanted — building an older commit beside the
+working tree to compare two binaries — extract that commit with `git archive <sha> | tar -x -C
+<dir>`, copy `crates/lanekeep-rules/components/*` into it so the script is a no-op, and build
+there with `CARGO_TARGET_DIR` **unset**. It costs a full dependency build once; a shared target
+directory costs the one above.
 
 **`just mutants -- --file <path>` does not narrow anything, and does not fail in a way that says
 so.** `just` keeps the `--` inside a recipe's variadic arguments rather than consuming it, so the
