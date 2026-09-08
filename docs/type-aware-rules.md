@@ -236,6 +236,119 @@ this.
 `lanekeep/no-restricted-types` and `lanekeep/no-restricted-arguments`; see
 [`built-in-rules.md`](built-in-rules.md) for what each stays silent on.
 
+## Providers
+
+Which oracle answers `ctx.types` is a project-level setting, not something a rule says. A rule
+declares `requires: ['types']` and asks its question; the config decides who answers.
+
+```jsonc
+"types": {
+  "provider": "builtin",                    // the default
+  "command": ["node"],                      // how to launch the sidecar; tsc only
+  "typescript": "./node_modules/typescript" // the package it loads; tsc only
+}
+```
+
+**Each of the two `tsc` values is resolved differently, and neither against the directory
+lanekeep was invoked from.** `command[0]` is a program name, found by the operating system on
+`PATH` — it is never joined to the project root, so `node` means whichever `node` a shell in
+that project would run. `typescript` is resolved the way Node resolves a `require` from the
+project root's own `package.json`: `./node_modules/typescript` is that project's copy, and a
+bare name is a package looked up through that project's `node_modules` rather than through
+lanekeep's. The project root itself is made absolute once, before the sidecar is started, so
+`lanekeep check .` and `lanekeep check ../app` mean what they say.
+
+### `builtin`
+
+lanekeep's own oracle, over the files it parsed. No toolchain, no process, nothing to install,
+and it runs under the ordinary run budget without coming near it. It resolves imports, walks
+declaration files and answers by name. What it does not compute is listed in the section above
+and is worth reading before choosing the other one: generic instantiation, conditional and
+mapped types, and declaration merging all answer `undefined`.
+
+### `tsc`
+
+The project's own `typescript` package, loaded by a driver script lanekeep writes into
+`.lanekeep/` and runs with the project's own Node. It answers everything the compiler answers,
+and it costs what the compiler costs.
+
+**Which files it answers for.** TypeScript, TSX, JavaScript and JSX — `.ts`, `.mts`, `.cts`,
+`.d.ts`, `.tsx`, `.js`, `.mjs`, `.cjs` and `.jsx`. A `.js` file is typed under the project's own
+`allowJs`, so a rule declaring `requires: ['types']` for `javascript` gets `ctx.types` under
+this provider and not under `builtin`, which reads a grammar lanekeep parses itself and has no
+type annotations to read there.
+
+**It builds the project's programs before it checks anything**, at prepare, so that the run key
+can be computed before any file is checked. What it folds is not "the program's source files":
+the driver records every file the compiler host was asked to read while building that program
+and answering every question put to it — `tsconfig.json` and its `extends` chain, every
+`package.json` module resolution consulted, and every source and declaration file — each with
+the hash of the bytes read, listed relative to the realpathed project root, minus the
+`typescript` package's own directory, whose version is covered separately (architecture §8.1).
+A pre-commit hook using it is a slow hook, and lanekeep says so on stderr every time.
+
+**The project root bounds which `tsconfig.json` is used, and a file no config under it claims
+is typed without one.** The driver walks up from a file looking for a `tsconfig.json` and stops
+at the project root: a config *above* the root would pull a program together out of files
+lanekeep is not checking, and lanekeep's confinement stops at that directory. A file no config
+under the root claims falls to an ad-hoc program with the driver's own options — `allowJs` and
+`skipLibCheck` on, `strict` off, and nothing the project configured — so its answers depend on
+where the root was pointed rather than on the project. Nothing is wrong when that happens and
+the run is correct, so it is not an error; it is a line on stderr naming how many files it
+happened to, and which files fell that way is part of the run key, since two programs over one
+file with `strict` on and off have byte-identical listings. If you see it and did not mean it,
+point lanekeep at the directory the `tsconfig.json` lives in.
+
+**Any change anywhere recomputes every type-aware file.** That listing is this provider's whole
+dependency mechanism, so one hash over the whole set, folded into the run key, invalidates
+everything on any change — an edit to one file invalidates the corpus. That is deliberate: this
+provider's answers are whole-program, a `.d.ts` edit anywhere can change the type of an
+expression anywhere else, and a per-file dependency list would run to hundreds of paths per
+cache entry the way the builtin oracle's does. Results stay correct either way; only the
+recompute is bigger.
+
+**`timeouts.analysis` bounds it**, at 60 s by default. It is not a wall-clock deadline measured
+from when the run starts — it is an accumulator, charged only while the run's single sidecar is
+doing the work of an answer, under that provider's session lock, so what it bounds is the
+sidecar's own busy time rather than how long the run has been going. Under `types.provider:
+'builtin'` nothing spends it. A breach cancels the run with exit 2, naming analysis rather than
+a rule, because no rule is executing when it fires; a monorepo will need to raise it.
+
+**A breach, or a sidecar that has died, makes every later question in that run answer the same
+way.** Once the budget is spent, or the sidecar is gone, the provider keeps its first error and
+answers `undefined` to everything the engine asks after — one question per remaining file, each
+discarded rather than trusted. The run itself is still cancelled, with exit 2, naming
+`timeouts.analysis` or whatever the sidecar's own refusal said. Files that had already completed
+keep their cache entries, and a provider a future long-lived session holds across runs is
+cleared at the start of the next one rather than carrying the failure forward.
+
+If Node or the `typescript` package cannot be reached, a rule declaring `requires: ['types']`
+fails the run at prepare, naming itself and the command that failed, rather than loading and
+quietly answering `undefined` — which would read as a codebase with nothing to report:
+
+```
+the type provider could not be used
+`acme/typed` requires the `types` analysis, which this build does not provide — the implemented capabilities are `dataflow`
+  the configured `tsc` command (`definitely-not-node`) could not be started: cannot start the type provider: No such file or directory (os error 2)
+  `types.provider` is `tsc`, which runs the project's own toolchain, so it needs `types.command` on PATH
+```
+
+**Which TypeScript.** The driver is written against the TypeScript 5.x compiler API
+(`createProgram` and its neighbors) and measured against 5.9.3. It probes for that API in its
+handshake and refuses, naming the version and the missing function, when the package does not
+provide it — the reference corpus is on TypeScript 7.0.2, whose package need not, and this
+provider was not measured against it. Two layouts to know about: a pnpm workspace has no root
+`node_modules/typescript`, so `types.typescript` names a workspace package's copy; and a
+project using `compilerOptions.paths` needs nothing from lanekeep under this provider, since
+the project's own compiler resolves them — the builtin provider is the one that does not.
+
+**Where the two providers agree, and where they do not.** Both answer the same primitives from
+the same annotations. Where they part is reduction, not correctness: on a generic or a wrapped
+alias the builtin oracle is silent, and `tsc` answers with the *written* type — `Box<Amount>`,
+`Unwrap<Promise<Amount>>` — the same way it erases `type Amount = number` down to `number`
+where the builtin oracle keeps the alias. Neither provider is wrong about code the other one
+also answers; they disagree about how far a type is reduced before a rule ever sees it.
+
 ## Provider measurement
 
 What the `tsc` provider (`types.provider: 'tsc'`, spec §5) has to pay for on a real
@@ -360,4 +473,55 @@ error in this commit of the corpus and does not invalidate the timing.
 `timeouts.analysis`'s 60 s default (§5.2) has to be defended against or moved for. The
 slowest single config, `apps/mobile/tsconfig.json`, is 1.71 s cold, about 6% of that total.
 The 60 s default survives contact with this commit of the corpus: the 55-config sweep uses
-49% of it, and the slowest config alone is roughly 35× under it.
+49% of it, and the slowest config alone is roughly 35× under it. This table sums a
+single-threaded program build, which is what the default was sized against; under parallel
+queries `timeouts.analysis` grows with the sidecar's total busy time rather than with wall
+clock, as the Providers section above states, so a run's rule phase adds only what the sidecar
+actually spent answering, not the wall time several workers spent waiting for it.
+
+### End to end, through `lanekeep check` itself
+
+The table above times `tsc` directly, one config at a time. This one times `lanekeep check`
+over the whole corpus (the same commit, same machine), with a single rule declaring `requires:
+['types']` — a query on every `type_annotation` calling `ctx.types.typeOf` and reporting
+nothing, so what is measured is the cost of asking rather than the cost of finding. Commits:
+baseline `7416b00`, head `b22d280`. (`b22d280` was `70fe7b3` when these were taken; the rebase
+that landed plan 5 replaced it, and it is plan 5's last *code* commit — the docs commit above it
+adds prose only, so the binary these numbers describe is the one `b22d280` builds.) Machine:
+macOS 26.6.2, Apple M3 Max. Full method, every
+command and every deviation from the plan that produced these numbers: `.superpowers/sdd/
+2026-09-07-epic-185-completion/task-5.14-measurement3-report.md`.
+
+| configuration | wall clock (cold, s) | cache after (KB) | violations |
+|---|---|---|---|
+| baseline, no rules | 0.08 / 0.08 | 4 | 0 |
+| head, `types.provider: 'builtin'` | 0.84 / 0.80 | 4,380 | 1 |
+| head, `types.provider: 'tsc'` | 16.15 / 18.27 (warm 10.86) | 288 | 1 |
+
+The one violation under the two type-aware configurations is `lanekeep/suppression`, not the
+measurement rule (which never reports) — an existing undocumented suppression in the corpus's
+own rule sources, present under every configuration that runs at least one rule.
+
+The `tsc` provider's whole-program cost at `b22d280` (16.15/18.27, warm 10.86) sits close to the
+`9f70706` measurement's (17.44/16.42, warm 11.02) — within the same run-to-run noise band this
+run's own two cold runs show against each other (a ~13% spread between two runs of the identical
+binary and config back to back), not a clear directional move. This is consistent with what was
+anticipated going in: the driver change landed between `9f70706` and `b22d280` (as part of
+`a9f97ad`, "an opt-in `tsc` provider behind `types.provider`") only skips rebuilding a program on
+a *second or later* `programs` call within one run when none of its roots have moved — a root the
+compiler declined (e.g. a `.js` file outside `allowJs`) is no longer compared against nothing on
+every call, and a root gone from disk is dropped rather than compared forever. On a corpus run
+cold each time except the warm row — and a warm row that still rebuilds every program to compute
+the run key before any cache entry can be trusted, as this section already states — the code path
+that change improves is not the dominant cost in either shape measured here. The `86d469a` →
+`9f70706` drop (~45%, from changing `ts.createProgram` to run once per `tsconfig.json` rather than
+once per file) remains the change that moved this figure; `b22d280` did not move it further. The
+cache directory is smaller under `tsc` than under `builtin` (288 KB against 4,380 KB) — expected
+from the Providers section above: one whole-corpus hash rather than a per-file dependency list.
+
+`crates/lanekeep-types/src/tsc/driver.mjs`'s `programs` request, run by hand over the same
+4,159 files: **10,384 rows** (unchanged from `9f70706`), **1,827,048 bytes** of listing JSON (up
+from `9f70706`'s 1,806,281 despite the identical row count — not chased further, since `a9f97ad`
+is a large feature commit and the figure this section tracks, the `tsc` wall clock, did not move
+outside noise), **16** ad-hoc (unconfigured) files — the read-set a whole-program build folds
+into one cache term.
