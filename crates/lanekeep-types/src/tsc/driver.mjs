@@ -40,7 +40,38 @@
 // bounded by the project root, plus one ad-hoc program for files no config claims. Source
 // files are cached by `(path, content hash)` and reused across programs and across rebuilds,
 // and a rebuild passes the previous program as `oldProgram` — which is what makes the plan-6
-// server case affordable and what makes a re-answered `programs` cheap.
+// server case affordable.
+//
+// A re-answered `programs` is not free. It reads and hashes everything the programs this
+// request's files fall under read — their roots, the declaration files they reached by
+// resolution, the `package.json`s that resolution consulted, the `tsconfig.json` and its
+// `extends` chain — once per such program that read it, and rebuilds only the ones something
+// moved under. The memo `refreshProgram` carries is per program and not per request, because
+// the read set a refresh compares is per program: a file P of them read is read and hashed P
+// times. That read is what a held driver costs to keep honest: the alternative is a session
+// answering out of bytes that are gone, and a listing that is the run's own cache key naming
+// them.
+//
+// A held program no file of the request falls under is left alone: it keeps its program and
+// its reads, contributes no row to the listing, and is refreshed by the request that next
+// names one of its files. It is the listing that forces this rather than the cost — the
+// listing is the run key, and a fresh driver over the same request holds no such program at
+// all, so contributing its rows would key a held session differently from `lanekeep check`
+// over identical bytes.
+//
+// **A known divergence from a fresh `tsc`, documented rather than fixed.** A config's own
+// roots are re-expanded only when the config chain itself moved (see `buildProgram`'s
+// `refreshOptions`), so a file newly created on disk that the config's `include` glob would
+// match does not become a root of a held program until something forces an options reparse.
+// It becomes one as soon as lanekeep's discovery names it — the request list is the other
+// half of the root set — which is the path every file a rule is asked about takes; what is
+// left over is a file discovery does not name and `include` does.
+//
+// **And that reaches the answers, not only the listing.** An extra root is not merely an extra
+// row in the key: a `declare global` in one augments what every other root in the program
+// sees, so for such a file a fresh `tsc` and a held driver answer *different types* for the
+// same unchanged bytes. Stated at full strength here because "the listing differs" reads as a
+// cache-key nuisance and this is a wrong `typeOf`.
 
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
@@ -179,7 +210,32 @@ function delayIfAsked() {
 }
 
 function digest(text) {
-  return createHash('sha256').update(text, 'utf8').digest('hex')
+  // The BOM is stripped here as well as by `readCanonical` below, so that the two sides of a
+  // staleness comparison agree even if some later reader hands over raw bytes. A hash that
+  // depends on which reader produced the text is a program that rebuilds forever.
+  return createHash('sha256')
+    .update(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text, 'utf8')
+    .digest('hex')
+}
+
+/**
+ * A file's text as *the compiler* reads it, which is the only form anything here hashes.
+ *
+ * `ts.sys.readFile` strips a leading UTF-8 byte-order mark and transcodes a UTF-16 file to a
+ * JavaScript string; `fs.readFileSync(name, 'utf8')` does neither. Both readers were in use —
+ * `recordRead` saw the compiler's text for a `tsconfig.json` or a `package.json` while
+ * `diskHash` re-read the raw bytes — so a marked file never matched the hash recorded for it
+ * and every `programs` call rebuilt every program it decided, forever. Nothing answered
+ * wrongly, which is what made it invisible: the only symptom was a held session paying a full
+ * build per request.
+ *
+ * `ts.sys.readFile` rather than a BOM strip written here, because the canonical form worth
+ * agreeing on is the compiler's own — a UTF-16 source file is text to it and mojibake to a raw
+ * UTF-8 read, and hashing the mojibake would be one more form to keep in step by hand.
+ * `undefined` where the file cannot be read, exactly as that reader answers.
+ */
+function readCanonical(fileName) {
+  return ts.sys.readFile(fileName)
 }
 
 /** `path` -> `{ hash, text, sourceFile }`, keyed by content so a rebuild reuses what it can. */
@@ -205,13 +261,115 @@ const sourceFiles = new Map()
  */
 const reads = new Map()
 
+/**
+ * The read set of the program currently being built, or `null` outside a build.
+ *
+ * This is how a read is attributed to a program. `reads` above is one map for the whole
+ * driver, so on its own it cannot say *which* config's answers a file decides — and a refresh
+ * that rebuilt every program whenever any recorded file moved would make one package's edit
+ * cost a rebuild of every other config in the corpus. Every read a build makes happens
+ * synchronously inside `buildProgram`, which is what makes a single module-level slot enough:
+ * `optionsFor`'s config chain, module resolution's `package.json`s and `getSourceFile`'s
+ * sources all land in the map of the build that caused them.
+ */
+let buildReads = null
+
+/**
+ * The absences of the program currently being built, or `null` outside a build.
+ *
+ * `{ files, directories }`, two sets of absolute paths: every path a compiler host asked this
+ * build about and was *denied* — `fileExists` false, `directoryExists` false, `readFile`
+ * undefined. Kept apart by which question was asked, because a path probed as a file that
+ * later appears as a directory is not an answer that changed, and merging the two would
+ * rebuild the program on every later call for as long as the directory existed.
+ *
+ * **Why an absence has to be remembered at all.** A refresh compares what a program *read*, so
+ * a resolution that changes because a file appeared is invisible to it: nothing the program
+ * read has moved, the listing and the run key are byte-identical, and the held program keeps
+ * answering out of the failed resolution while `lanekeep check` over the same bytes answers
+ * from the new one. `npm install`, a `.d.ts` landing beside a `.js`, a link flipped — all three
+ * are that shape. This is the tracked-absence the builtin provider already has, spelled for a
+ * provider whose reads happen inside a compiler.
+ *
+ * Bounded by `withinBoundary` — everything but the `typescript` package's own directory, whose
+ * contents are a function of the compiler version that `TscProvider::identity` already folds.
+ * Not the project root: a monorepo's hoisted install lands one level above it, in the
+ * workspace's shared `node_modules`, and a boundary that discarded that denial left it
+ * unrecorded (see `withinBoundary`).
+ *
+ * The set's size is linear in the number of imports a build resolves, not flat: each import
+ * that does not resolve costs one denied file probe per candidate extension and ancestor
+ * `node_modules` directory tried along the way, and every import adds to that. Measured on an
+ * 80-package fixture — 5, 20 and 80 imports gave 15, 60 and 240 absent files, while the denied
+ * *directories* stayed flat at 66 regardless, because ancestor `node_modules` lookup walks the
+ * same directory chain whatever is being resolved.
+ */
+let buildAbsences = null
+
+/**
+ * The reads made answering the request in flight, or `null` between requests.
+ *
+ * A query resolves specifiers of its own — `exportedType`'s module, `complete`'s every import
+ * — outside any program's host, and a `package.json` consulted there decides what the query
+ * answers exactly as one consulted during `createProgram` does. Recorded into the driver-wide
+ * `reads` those became listing rows: the run key then carried a file no program built, so a
+ * held session's key differed from `lanekeep check`'s over the same request and depended on
+ * which files happened to be cache misses last time. They are reported back with the answer
+ * instead, and `TscProvider` records each through the asking query's own `FileAccess` — a
+ * per-entry tracked read, the way every builtin-provider read already is, so the *file's* cache
+ * entry depends on them and nothing else does.
+ *
+ * A read a query makes inside a build is a build's read and lands in `reads` as before:
+ * `buildReads` wins below, because that file is a program's input and belongs in the listing.
+ */
+let queryReads = null
+
+/**
+ * Whether a path is one this driver is willing to remember anything about.
+ *
+ * `recordRead`'s own rule: excludes only the `typescript` package's own directory, whose contents are
+ * a function of the compiler version that `TscProvider::identity` already folds. Not confined
+ * to the project root — a monorepo's hoisted `npm install` lands the dependency a sibling
+ * package's build was denied one level *above* the project root, in the workspace's shared
+ * `node_modules`, and a boundary that discarded that denial left it unrecorded: `refreshAbsences`
+ * had nothing to re-probe, so a held session kept answering out of the failed resolution after
+ * the very install a fresh run would see.
+ */
+function withinBoundary(absolute) {
+  return typescriptRoot === '' || !absolute.startsWith(typescriptRoot + path.sep)
+}
+
 /** Record one read and hand back what was read, so this can wrap a `readFile` in place. */
 function recordRead(fileName, text) {
   if (typeof text !== 'string') return text
   const absolute = boundaryPath(fileName)
   if (typescriptRoot !== '' && absolute.startsWith(typescriptRoot + path.sep)) return text
-  reads.set(absolute, digest(text))
+  const hash = digest(text)
+  if (buildReads) {
+    reads.set(absolute, hash)
+    buildReads.set(absolute, hash)
+  } else if (queryReads) {
+    queryReads.set(absolute, hash)
+  } else {
+    reads.set(absolute, hash)
+  }
   return text
+}
+
+/**
+ * Record one denied probe, and hand back the denial so this can wrap a predicate in place.
+ *
+ * Outside a build this is nothing at all: a query's own probes are not a program's, and
+ * remembering them would rebuild a program for a resolution no program made. Absences are not
+ * listing rows either — the run key is recomputed from the fresh build's read set once the
+ * rebuild happens, so an absence has no hash to carry and needs none.
+ */
+function recordAbsence(kind, fileName, answer) {
+  if (answer) return answer
+  if (!buildAbsences) return answer
+  const absolute = boundaryPath(fileName)
+  if (withinBoundary(absolute)) buildAbsences[kind].add(absolute)
+  return answer
 }
 
 /**
@@ -234,9 +392,10 @@ function listedPath(absolute) {
  */
 function recordingResolutionHost() {
   return {
-    fileExists: (name) => ts.sys.fileExists(name),
-    readFile: (name) => recordRead(name, ts.sys.readFile(name)),
-    directoryExists: (name) => ts.sys.directoryExists(name),
+    fileExists: (name) => recordAbsence('files', name, ts.sys.fileExists(name)),
+    readFile: (name) => recordRead(name, recordAbsence('files', name, ts.sys.readFile(name))),
+    directoryExists: (name) =>
+      recordAbsence('directories', name, ts.sys.directoryExists(name)),
     getCurrentDirectory: () => ts.sys.getCurrentDirectory(),
     getDirectories: (name) => ts.sys.getDirectories(name),
     realpath: ts.sys.realpath ? (name) => ts.sys.realpath(name) : undefined,
@@ -250,12 +409,22 @@ function recordingParseHost() {
     useCaseSensitiveFileNames: ts.sys.useCaseSensitiveFileNames,
     readDirectory: (rootDir, extensions, excludes, includes, depth) =>
       ts.sys.readDirectory(rootDir, extensions, excludes, includes, depth),
-    fileExists: (name) => ts.sys.fileExists(name),
-    readFile: (name) => recordRead(name, ts.sys.readFile(name)),
+    fileExists: (name) => recordAbsence('files', name, ts.sys.fileExists(name)),
+    readFile: (name) => recordRead(name, recordAbsence('files', name, ts.sys.readFile(name))),
   }
 }
 
-/** `configPath` (`''` for the ad-hoc program) -> `{ options, fileNames, host, program }`. */
+/**
+ * `configPath` (`''` for the ad-hoc program) -> the program and what it was built from.
+ *
+ * `{ options, fileNames, configFileNames, configPaths, hashes, reads, host, program }`:
+ * `hashes` is the content hash each root was built with and `reads` is every file this build
+ * read, which is the set a refresh compares. They are not the same set — a root the compiler
+ * declined has no hash, and a declaration file reached by resolution is a read and never a
+ * root. `configFileNames` is the subset of `fileNames` the config's own `include` produced,
+ * which is what survives a request list that shrank; the rest of `fileNames` arrived because
+ * some request named it, and leaves with the request that stops naming it.
+ */
 const programs = new Map()
 
 /**
@@ -277,6 +446,12 @@ let createProgramCalls = 0
  * the project root was pointed rather than on the project. Silence about that is the defect:
  * the same file, checked from one directory up, is typed differently and nothing says so.
  * Reported to the host, which prints one line naming the count.
+ *
+ * Cleared at the top of every `programs` call rather than accumulated: the request's file list
+ * is the run's own discovery list, so it is the whole answer and not an addition to the
+ * previous one. A held driver that kept the union named a file deleted two runs ago, which is
+ * a session keying differently from `lanekeep check` over identical bytes — and the notice
+ * itself naming a file that is not there.
  */
 const adhocFiles = new Set()
 
@@ -304,14 +479,21 @@ function makeHost(options) {
   // way to a specifier — and none of those files is in any program. Wrapped rather than
   // replaced, so whatever the compiler host does with them is unchanged.
   const readFile = host.readFile.bind(host)
-  host.readFile = (fileName) => recordRead(fileName, readFile(fileName))
+  host.readFile = (fileName) => recordRead(fileName, recordAbsence('files', fileName, readFile(fileName)))
+  // And the two predicates module resolution asks before it reads anything. A denial here is
+  // what decides where a specifier lands, so it is as much an input to the answer as any byte
+  // — see `buildAbsences`.
+  const fileExists = host.fileExists.bind(host)
+  host.fileExists = (fileName) => recordAbsence('files', fileName, fileExists(fileName))
+  if (typeof host.directoryExists === 'function') {
+    const directoryExists = host.directoryExists.bind(host)
+    host.directoryExists = (name) => recordAbsence('directories', name, directoryExists(name))
+  }
   host.getSourceFile = (fileName, languageVersionOrOptions) => {
-    let text
-    try {
-      text = fs.readFileSync(fileName, 'utf8')
-    } catch {
-      return undefined
-    }
+    // The compiler's own reader, so the text a source file is built from — and the hash the
+    // refresh compares it against — is the one canonical form `readCanonical` describes.
+    const text = readCanonical(fileName)
+    if (text === undefined) return recordAbsence('files', fileName, undefined)
     recordRead(fileName, text)
     const hash = digest(text)
     const cached = sourceFiles.get(fileName)
@@ -363,7 +545,9 @@ function configFor(file) {
 }
 
 function optionsFor(configPath, files) {
-  if (configPath === '') return { options: adhocOptions(), fileNames: files }
+  if (configPath === '') {
+    return { options: adhocOptions(), fileNames: files, configFileNames: [] }
+  }
   // Both reads are recorded: `readConfigFile` sees the `tsconfig.json` itself, and the parse
   // host sees every file its `extends` chain pulls in. Neither ends up in a program.
   const read = ts.readConfigFile(configPath, (name) => recordRead(name, ts.sys.readFile(name)))
@@ -381,7 +565,15 @@ function optionsFor(configPath, files) {
   // `include` is still typed in that config's options rather than falling to the ad-hoc
   // program with different ones.
   const fileNames = [...new Set([...parsed.fileNames, ...files])].sort()
-  return { options: { ...parsed.options, noEmit: true }, fileNames }
+  // `configFileNames` is the first half alone, and it is what `ensureProgram` keeps when a
+  // request's list shrinks: those roots are the config's own and belong to the program however
+  // few of them this run names, where a root that arrived only because some request named it
+  // must leave with that request.
+  return {
+    options: { ...parsed.options, noEmit: true },
+    fileNames,
+    configFileNames: parsed.fileNames,
+  }
 }
 
 /**
@@ -394,7 +586,7 @@ function optionsFor(configPath, files) {
  * treating a missing hash as a difference no rebuild could ever close.
  *
  * The cache is not pruned by a rebuild, so an entry may outlive the root it was made for. The
- * one case where that matters is a root deleted between two runs, and `forgetRoot` handles it
+ * one case where that matters is a root deleted between two runs, and `forgetFile` handles it
  * where the deletion is noticed.
  */
 function builtRootHashes(fileNames) {
@@ -406,26 +598,91 @@ function builtRootHashes(fileNames) {
   return hashes
 }
 
-/** The hash of a file's bytes on disk now, or `undefined` where it cannot be read. */
-function diskHash(fileName) {
-  try {
-    return digest(fs.readFileSync(fileName, 'utf8'))
-  } catch {
-    return undefined
-  }
+/**
+ * The hash of a file's text on disk now, or `undefined` where it cannot be read.
+ *
+ * `memo` is one refresh's own map, so a path that is both a root and a read of the same program
+ * is read and hashed once rather than twice — `refreshRoots` and `refreshReads` between them
+ * name every root twice on a project whose config `include`s its sources, which measured +50%
+ * of a refresh's reads at four thousand roots. Per call rather than driver-wide: the whole
+ * point of the read is to see what is on disk *now*.
+ */
+function diskHash(fileName, memo) {
+  if (memo && memo.has(fileName)) return memo.get(fileName)
+  const text = readCanonical(fileName)
+  const hash = text === undefined ? undefined : digest(text)
+  if (memo) memo.set(fileName, hash)
+  return hash
 }
 
 /**
- * Forget a root that is no longer on disk, so nothing remembered about it outlives it.
+ * Forget a file that is no longer on disk, so nothing remembered about it outlives it.
  *
  * Both maps are keyed by absolute path and neither is pruned anywhere else: `sourceFiles`
  * would otherwise hand the next `builtRootHashes` the hash of a file that is gone, and `reads`
  * would keep listing it — putting bytes that no longer exist into the run's own cache key. A
  * path that comes back is read afresh and recorded again, as any first read is.
+ *
+ * A root reaches this from `refreshRoots` and a file the program merely read from
+ * `refreshReads`; the bookkeeping is the same either way, which is why this is not named for
+ * roots alone.
  */
-function forgetRoot(name) {
+function forgetFile(name) {
   sourceFiles.delete(name)
   reads.delete(boundaryPath(name))
+}
+
+/**
+ * Forget a program whose `tsconfig.json` has left the disk.
+ *
+ * Every held program is refreshed where a run begins, including one this request never named,
+ * and the config that decides a program's options is a file like any other. Deleted or
+ * renamed, the refresh calls it moved; `ensureProgram` then re-parses the options for the
+ * rebuild, and `ts.readConfigFile` cannot read it. That throws — on this request and on every
+ * later one, for the sidecar's whole life — while `lanekeep check` over the same bytes
+ * succeeds, because a fresh provider holds no program to refresh. A program whose config is
+ * gone contributes no rows and can never be built again, since `configFor` cannot return a
+ * path that is not there, so it is dropped rather than rebuilt.
+ *
+ * Only what no *other* held program still names is forgotten — see `forgetUnclaimed`.
+ */
+function dropProgram(configPath) {
+  const entry = programs.get(configPath)
+  if (!entry) return
+  programs.delete(configPath)
+  forgetUnclaimed([...entry.reads.keys(), ...entry.fileNames])
+}
+
+/** Every path some held program still names, as a root or as a read. */
+function heldPaths() {
+  const held = new Set()
+  for (const entry of programs.values()) {
+    for (const name of entry.reads.keys()) held.add(boundaryPath(name))
+    for (const name of entry.fileNames) held.add(boundaryPath(name))
+  }
+  return held
+}
+
+/**
+ * Forget each of these paths that no held program still names.
+ *
+ * The guard is the whole point. The project's own `package.json` is read by every config's
+ * build, and dropping its row because one config went away — or because one program stopped
+ * naming it as a root — would move the run key over a file nothing touched. Called after the
+ * program that was giving these up is already out of `programs`, or already rebuilt without
+ * them, so `heldPaths` answers about the state that remains.
+ *
+ * The scan is per call and not an index kept in step: K drops in one run cost K walks of every
+ * remaining program's reads. That is the trade taken deliberately — a run where no config and
+ * no root leaves pays nothing at all, drops are the rare case, and a second structure mirroring
+ * `reads` would be one more thing to leave stale exactly where staleness is the bug.
+ */
+function forgetUnclaimed(names) {
+  if (names.length === 0) return
+  const held = heldPaths()
+  for (const name of names) {
+    if (!held.has(boundaryPath(name))) forgetFile(name)
+  }
 }
 
 /**
@@ -446,13 +703,13 @@ function forgetRoot(name) {
  * than a read the compiler's answer depends on, and the read set is rebuilt by the build it
  * triggers.
  */
-function refreshRoots(entry) {
+function refreshRoots(entry, memo) {
   const kept = []
   let moved = false
   for (const name of entry.fileNames) {
-    const disk = diskHash(name)
+    const disk = diskHash(name, memo)
     if (disk === undefined) {
-      forgetRoot(name)
+      forgetFile(name)
       moved = true
       continue
     }
@@ -460,6 +717,122 @@ function refreshRoots(entry) {
     if (entry.program.getSourceFile(name) && entry.hashes.get(name) !== disk) moved = true
   }
   return { kept, moved }
+}
+
+/**
+ * Whether anything this program *read* has moved since it was built.
+ *
+ * The roots are only the files a config names. Everything else a program's answers depend on
+ * is reached by resolution: the declaration file behind an import, the `package.json`s
+ * resolution consulted on the way to it, the `tsconfig.json` and its `extends` chain. Root-only
+ * comparison left every one of them invisible to a refresh, so a held driver — a session holds
+ * one across runs — kept answering out of the old declaration while a fresh provider, having
+ * no cached program to return early from, answered the new one. That divergence is `lanekeep
+ * server` disagreeing with `lanekeep check` about the same bytes.
+ *
+ * `entry.reads` is this program's own read set rather than the driver-wide one, so an edit
+ * under one `tsconfig.json` rebuilds that config's program and leaves the others alone.
+ *
+ * A moved file's hash is written back here and into `reads`, rather than left for the rebuild
+ * to re-record. A rebuild does not necessarily read every file again: `buildProgram` carries
+ * the previous read set forward so that nothing is silently unwatched, and a read the new
+ * build does not make — a manifest whose import the same edit removed, a `tsconfig.json` whose
+ * options are reused — keeps whatever hash the entry holds for it. Left at the pre-edit hash
+ * it answers "moved" on every later call, rebuilding the program forever for an edit already
+ * absorbed. `programs settles when the rebuild does not re-read the moved file` is the fixture
+ * that pins this; the two rebuild fixtures beside it do not, because there the rebuild reads
+ * the moved file again and its own `collected` writes the fresh hash back regardless. The
+ * listing takes the fresh hash for the same reason: those are the bytes on disk now.
+ *
+ * `optionsMoved` is the subset of `moved` that matters to `buildProgram`: whether any of
+ * `entry.configPaths` — the `tsconfig.json` and its `extends` chain, recorded by `optionsFor`
+ * — is among what moved. A rebuild otherwise reuses `entry.options` outright, so a config edit
+ * moved the run key and rebuilt the program with the options it had before the edit.
+ */
+function refreshReads(entry, memo) {
+  let moved = false
+  let optionsMoved = false
+  let resolutionMoved = false
+  const noteMover = (name) => {
+    if (entry.configPaths.has(name)) optionsMoved = true
+    // A moved read the program does not hold as a source file is something resolution
+    // consulted on its way to one — a `package.json`, the config chain — rather than a file
+    // whose text the checker reads. See `buildProgram`'s `reuseOldProgram`.
+    if (!entry.program.getSourceFile(name)) resolutionMoved = true
+  }
+  for (const [name, hash] of entry.reads) {
+    const disk = diskHash(name, memo)
+    if (disk === undefined) {
+      noteMover(name)
+      forgetFile(name)
+      entry.reads.delete(name)
+      moved = true
+      continue
+    }
+    if (disk === hash) continue
+    noteMover(name)
+    entry.reads.set(name, disk)
+    reads.set(name, disk)
+    moved = true
+  }
+  return { moved, optionsMoved, resolutionMoved }
+}
+
+/**
+ * Whether anything this program was *denied* is there now.
+ *
+ * The half of a refresh that no comparison of read bytes can do. `npm install` puts a package
+ * where resolution found none; a `.d.ts` lands beside the `.js` resolution fell back to; a
+ * link flips. In every one of them nothing the program read has moved, so without this the
+ * held program keeps answering out of the failed resolution — `typeOf` stays unknown while
+ * `complete()` flips to `true`, because that op re-resolves per question — and `lanekeep
+ * check` over identical bytes answers from the new file.
+ *
+ * Probed with the predicate the build asked, not with a general "is it there": a path probed
+ * as a file that appears as a directory is the same denial it always was, and answering
+ * `moved` for it would rebuild the program on every later call.
+ *
+ * An appearance leaves the set as it is noticed. The rebuild it forces re-probes whatever it
+ * still asks about, so an absence that is genuinely still an absence comes back, and one that
+ * has been absorbed does not. Nothing here reaches the listing: an absence has no bytes to
+ * hash, and the key is recomputed from the rebuild's own read set.
+ */
+function refreshAbsences(entry) {
+  let moved = false
+  for (const name of entry.absences.files) {
+    if (!ts.sys.fileExists(name)) continue
+    entry.absences.files.delete(name)
+    moved = true
+  }
+  for (const name of entry.absences.directories) {
+    if (!ts.sys.directoryExists(name)) continue
+    entry.absences.directories.delete(name)
+    moved = true
+  }
+  return moved
+}
+
+/** A program's roots and reads as they are now: what is kept, and whether anything moved. */
+function refreshProgram(entry) {
+  // One hash per distinct path per refresh: a config that `include`s its sources names every
+  // root in both halves below, and hashing each of them twice is a read of the whole corpus
+  // for nothing.
+  const memo = new Map()
+  const roots = refreshRoots(entry, memo)
+  // Both, always: `refreshReads` prunes a vanished read and writes back a moved hash, and
+  // short-circuiting on a moved root would leave that bookkeeping undone until the next call.
+  const readsRefresh = refreshReads(entry, memo)
+  // And the appearances, always for the same reason. An appearance is a resolution input by
+  // definition — it is what resolution asked for and was refused — so it costs the
+  // `oldProgram` reuse exactly as a moved `package.json` does: reusing the previous
+  // resolutions would rebuild the program straight back onto the fallback it took before.
+  const appeared = refreshAbsences(entry)
+  return {
+    kept: roots.kept,
+    moved: roots.moved || readsRefresh.moved || appeared,
+    optionsMoved: readsRefresh.optionsMoved,
+    resolutionMoved: readsRefresh.resolutionMoved || appeared,
+  }
 }
 
 /** Whether two sorted root lists name the same files. */
@@ -480,44 +853,157 @@ function sameRoots(a, b) {
  * than an optimization. This driver outlives a run — `check --fix` re-checks through the same
  * sidecar, and a session holds one across runs — and a cached program answering out of bytes
  * that are gone is both a wrong `typeOf` and a listing carrying the previous hash, which is
- * the run's own cache key. Comparing hashes costs a read of every root, so it happens once
- * where a run begins and never on the path a rule's question takes.
+ * the run's own cache key. Comparing hashes costs a read of everything the program read — the
+ * roots, and every file it reached by resolution — so it happens once where a run begins and
+ * never on the path a rule's question takes.
  */
 function ensureProgram(configPath, files, refresh = false) {
   const existing = programs.get(configPath)
-  // Hoisted, and computed at most once. It used to be called twice for every program built
-  // from scratch — once for the file list and once for the options — which parses the
-  // `tsconfig.json`, walks its whole `extends` chain and expands its `include` globs twice.
-  const fresh = existing ? null : optionsFor(configPath, files)
+  if (!existing) return buildProgram(configPath, null, files)
   // A refresh is also where a deleted root leaves the set, so the roots this compares against
   // are the refreshed ones rather than the ones the program was built from.
-  const refreshed = existing && refresh ? refreshRoots(existing) : null
-  const wanted = existing
-    ? [...new Set([...(refreshed ? refreshed.kept : existing.fileNames), ...files])].sort()
-    : fresh.fileNames
+  const refreshed = refresh ? refreshProgram(existing) : null
+  // The root set follows the request list, and only on a refresh — a `programs` call, whose
+  // file list is the run's own discovery list. It used to be a union with what the program
+  // already held, so a root named by one run stayed one for the sidecar's life; a held session
+  // then compiled a file a fresh provider over the same request would not have, and an extra
+  // root is not merely an extra row in the key — a `declare global` in it augments what every
+  // other root sees, so the two disagreed about the *type*. What the config itself names stays
+  // whatever this run asks about: those roots are the program's own, and a fresh build over the
+  // same request would expand the same `include`.
+  //
+  // A query (`refresh` false) widens as it always did: `contextFor` asks about one file, and
+  // shrinking to it would rebuild the program on every question.
+  const wanted = [
+    ...new Set(
+      refreshed
+        ? [...refreshed.kept.filter((name) => existing.configFileNames.has(name)), ...files]
+        : [...existing.fileNames, ...files],
+    ),
+  ].sort()
   // Element-wise rather than by length: a refresh that drops one root while the caller asks
   // about another leaves the count alone and the set different.
-  const changed = existing && !sameRoots(wanted, existing.fileNames)
-  if (existing && !changed && !(refreshed && refreshed.moved)) return existing
-
-  const options = existing ? existing.options : fresh.options
-  createProgramCalls += 1
-  const host = makeHost(options)
-  const program = ts.createProgram({
-    rootNames: wanted,
-    options,
-    host,
-    oldProgram: existing ? existing.program : undefined,
+  const changed = !sameRoots(wanted, existing.fileNames)
+  if (!changed && !(refreshed && refreshed.moved)) return existing
+  // The tsconfig chain moving is what forces `buildProgram` to re-parse options rather than
+  // reuse them — everything else about a rebuild (roots widened, a dependency's bytes moved)
+  // leaves the options exactly as they were. A moved *resolution* input costs the `oldProgram`
+  // reuse instead: see `buildProgram`.
+  const rebuilt = buildProgram(configPath, existing, wanted, {
+    refreshOptions: Boolean(refreshed && refreshed.optionsMoved),
+    reuseOldProgram: !(refreshed && refreshed.resolutionMoved),
   })
-  const entry = {
-    options,
-    fileNames: wanted,
-    hashes: builtRootHashes(wanted),
-    host,
-    program,
+  // A root that left the set is forgotten unless the rebuilt program reached it anyway — an
+  // import from a root that stayed makes it a source file still, and one the checker holds is
+  // one whose bytes the answers depend on. Without this the row survives in `reads`, which
+  // `buildProgram` carries forward on purpose, and the listing — the run's own key — keeps
+  // naming a file this run did not compile.
+  const dropped = existing.fileNames.filter(
+    (name) => !wanted.includes(name) && !rebuilt.program.getSourceFile(name),
+  )
+  for (const name of dropped) rebuilt.reads.delete(boundaryPath(name))
+  forgetUnclaimed(dropped)
+  return rebuilt
+}
+
+/**
+ * Build a config's program, recording what the build read.
+ *
+ * `optionsFor` runs inside the same attribution window as `ts.createProgram`, and not only to
+ * keep the window in one place: it is what puts the `tsconfig.json` and its `extends` chain
+ * into the program's own read set, and those are files a refresh has to watch as much as any
+ * source. It is called once — it used to be called twice for every program built from scratch,
+ * once for the file list and once for the options, parsing the config and expanding its
+ * `include` globs both times.
+ *
+ * A rebuild carries the previous read set forward and lets this build's reads win. Carrying it
+ * is what keeps the watched set from narrowing: `oldProgram` reuse means the compiler need not
+ * ask for every file again, and a dependency dropped from the set because one rebuild happened
+ * not to re-read it would stop being watched from then on. The cost of carrying is a file that
+ * is no longer imported staying watched until it is deleted, which is an extra rebuild and
+ * never a wrong answer.
+ *
+ * `refreshOptions` is `ensureProgram`'s `refreshed.optionsMoved` — whether the tsconfig chain
+ * itself is among what moved. A rebuild otherwise reuses `existing.options` outright: without
+ * this, an edit to the `tsconfig.json` moved the run key (its hash reaches `entry.reads` and
+ * the listing) and rebuilt the program, but with the options it had before the edit — a `strict`
+ * flipped on stayed off for the life of the held program. `configPaths` is snapshotted right
+ * after `optionsFor` returns, before `ts.createProgram` adds source reads to the same
+ * `collected` map, so it names exactly the config chain and nothing a rebuild would re-read for
+ * an unrelated reason.
+ *
+ * `reuseOldProgram` is the other half of that, and it is about resolution rather than options.
+ * `oldProgram` carries the previous build's *resolved modules* forward, which is most of what
+ * makes a rebuild cheap and is exactly wrong when the file that decided a resolution is the one
+ * that moved: a `package.json` whose `types` now names a different declaration rebuilt the
+ * program straight back onto the file it named before, so the held driver answered `number`
+ * where a fresh one answered `string`. A moved read the program holds as a source file is not
+ * such a case — the checker re-reads it, and `getSourceFile` is hash-checked — so a source-only
+ * move keeps the reuse and only a resolution input pays for a build from nothing.
+ */
+function buildProgram(configPath, existing, files, how = {}) {
+  // Named `how` rather than `options`, which in this function means the compiler's.
+  const { refreshOptions = false, reuseOldProgram = true } = how
+  const previous = buildReads
+  const previousAbsences = buildAbsences
+  const collected = new Map()
+  const denied = { files: new Set(), directories: new Set() }
+  buildReads = collected
+  buildAbsences = denied
+  try {
+    let options
+    let fileNames
+    let configPaths
+    let configFileNames
+    if (existing && !refreshOptions) {
+      options = existing.options
+      fileNames = files
+      configPaths = existing.configPaths
+      // Not re-expanded here, because the config was not re-parsed: the `include` globs this
+      // came from are the ones still in force.
+      configFileNames = existing.configFileNames
+    } else {
+      let named
+      ;({ options, fileNames, configFileNames: named } = optionsFor(configPath, files))
+      configPaths = new Set(collected.keys())
+      configFileNames = new Set(named)
+    }
+    createProgramCalls += 1
+    const host = makeHost(options)
+    const program = ts.createProgram({
+      rootNames: fileNames,
+      options,
+      host,
+      oldProgram: existing && reuseOldProgram ? existing.program : undefined,
+    })
+    const entry = {
+      options,
+      fileNames,
+      configPaths,
+      configFileNames,
+      hashes: builtRootHashes(fileNames),
+      reads: new Map([...(existing ? existing.reads : []), ...collected]),
+      // Carried forward for the reason the read set is, and with the same cost: `oldProgram`
+      // reuse means a rebuild need not re-probe every candidate it probed before, and an
+      // absence dropped because one rebuild happened not to ask about it would stop being
+      // watched from then on. What a refresh finds has appeared leaves the set there, so a
+      // carried absence cannot re-trigger once it is absorbed.
+      absences: {
+        files: new Set([...(existing ? existing.absences.files : []), ...denied.files]),
+        directories: new Set([
+          ...(existing ? existing.absences.directories : []),
+          ...denied.directories,
+        ]),
+      },
+      host,
+      program,
+    }
+    programs.set(configPath, entry)
+    return entry
+  } finally {
+    buildReads = previous
+    buildAbsences = previousAbsences
   }
-  programs.set(configPath, entry)
-  return entry
 }
 
 /** The program, source file and checker a query is answered from, or `null`. */
@@ -742,20 +1228,48 @@ function nominallyAssignable(checker, source, target) {
 }
 
 /**
- * `[relativePath, contentHash]` over every file the compiler read, sorted, `lib/` excluded.
+ * `[relativePath, contentHash]` over every file the *contributing* programs read, sorted,
+ * `lib/` excluded.
+ *
+ * `contributing` is the set of configs at least one file of this request falls under, and the
+ * listing is theirs alone. A fresh driver over the same request holds no program for any other
+ * config, so rows from one a held driver still has are rows `lanekeep check` would not have —
+ * and the listing is the run key, which the two have to agree on. A held program outside the
+ * set keeps its rows; they return with the request that next names one of its files.
  *
  * The union of two sets, not one. `reads` is every path a host was asked for — the configs,
  * the `extends` chain, the `package.json`s resolution consulted, and the source files, since
- * `getSourceFile` records too. Every program's `getSourceFiles()` is folded in as well, so a
- * file the checker kept from an `oldProgram` without re-reading it is still listed.
+ * `getSourceFile` records too. Each contributing program's `getSourceFiles()` is folded in as
+ * well, so a file the checker kept from an `oldProgram` without re-reading it is still listed.
+ *
+ * Withholding is by path and subtractive rather than by taking the contributing programs'
+ * `reads` maps directly, so that a path claimed by both a contributing and a non-contributing
+ * program — the project's own `package.json`, read by every config's build — keeps its row. A
+ * path is dropped only when some non-contributing program claims it and no contributing one
+ * does.
+ *
+ * A query's own resolution reads belong to no build and are not in `reads` at all: they are
+ * reported with the answer and recorded as per-entry tracked reads (see `queryReads`).
  */
-function programListing() {
+function programListing(contributing) {
+  const withheld = new Set()
+  for (const [configPath, entry] of programs) {
+    if (contributing.has(configPath)) continue
+    for (const name of entry.reads.keys()) withheld.add(boundaryPath(name))
+  }
+  for (const configPath of contributing) {
+    const entry = programs.get(configPath)
+    if (!entry) continue
+    for (const name of entry.reads.keys()) withheld.delete(boundaryPath(name))
+  }
   const listing = new Map()
   for (const [absolute, hash] of reads) {
+    if (withheld.has(absolute)) continue
     listing.set(listedPath(absolute), hash)
   }
-  for (const configPath of [...programs.keys()].sort()) {
+  for (const configPath of [...contributing].sort()) {
     const entry = programs.get(configPath)
+    if (!entry) continue
     for (const sourceFile of entry.program.getSourceFiles()) {
       const absolute = boundaryPath(sourceFile.fileName)
       if (typescriptRoot !== '' && absolute.startsWith(typescriptRoot + path.sep)) continue
@@ -780,6 +1294,8 @@ const handlers = {
   // each one throwing away and rebuilding the last. Grouping first makes it one per config,
   // whatever the corpus size.
   programs(request) {
+    // See `adhocFiles`: this list is the run's discovery list, not an addition to the last.
+    adhocFiles.clear()
     const byConfig = new Map()
     for (const file of request.files ?? []) {
       const absolute = boundaryPath(file)
@@ -789,14 +1305,33 @@ const handlers = {
       if (group) group.push(absolute)
       else byConfig.set(configPath, [absolute])
     }
+    // The configs at least one file of this request falls under, and no others. The listing
+    // below is the run's own cache key, and a fresh driver over the same request builds
+    // exactly these programs — so a held driver that refreshed every program it holds put
+    // rows into the key that `lanekeep check` over the same request has no way to produce,
+    // which is the divergence the whole refresh exists to close. A held program outside the
+    // set stays cached, contributes no rows and is not refreshed; the request that next names
+    // one of its files refreshes it then, and rebuilds it if something moved meanwhile.
+    //
     // Sorted, so two runs over one corpus build their programs in one order — `oldProgram`
     // reuse and the read set both depend on which program was built first.
-    for (const configPath of [...byConfig.keys()].sort()) {
+    for (const configPath of [...new Set([...programs.keys(), ...byConfig.keys()])].sort()) {
+      const files = byConfig.get(configPath)
+      if (!files) {
+        // Held, and outside the set: nothing to refresh — except that a program whose
+        // `tsconfig.json` has gone from disk can never be reached by a later request, since
+        // `configFor` cannot return a path that is not there, so it would be held for the
+        // sidecar's whole life. It is dropped instead, which is also what frees the reads no
+        // other held program still names. The probe is not recorded, as no absence probe is:
+        // the key is recomputed from the reads of the run that is beginning.
+        if (configPath !== '' && !ts.sys.fileExists(configPath)) dropProgram(configPath)
+        continue
+      }
       // `refresh`: this op is where a run begins, and a run may be the second one this
       // sidecar serves — see `ensureProgram`.
-      ensureProgram(configPath, byConfig.get(configPath), true)
+      ensureProgram(configPath, files, true)
     }
-    return { listing: programListing(), adhoc: [...adhocFiles].sort() }
+    return { listing: programListing(new Set(byConfig.keys())), adhoc: [...adhocFiles].sort() }
   },
 
   // Test-only, and answering nothing about a project: what it reports is this process's own
@@ -903,10 +1438,17 @@ input.on('line', (line) => {
     return
   }
 
+  const previousQueryReads = queryReads
+  const collected = new Map()
+  queryReads = collected
   try {
     const value = handler(request)
+    // Every op, not only the query ones: `programs` makes its reads inside builds, where
+    // `buildReads` claims them, so its collected set is empty and the field is an empty list
+    // the host ignores. Uniform is one rule rather than a table of which ops report.
+    const answered = [...collected.keys()].map(listedPath).sort()
     process.stdout.write(
-      `${JSON.stringify({ id: request.id, ok: true, value: value ?? null })}\n`,
+      `${JSON.stringify({ id: request.id, ok: true, value: value ?? null, reads: answered })}\n`,
     )
   } catch (error) {
     // The stack, because a failure here is lanekeep's bug or the project's tsconfig, and both
@@ -915,5 +1457,7 @@ input.on('line', (line) => {
     process.stdout.write(
       `${JSON.stringify({ id: request.id, ok: false, error: detail })}\n`,
     )
+  } finally {
+    queryReads = previousQueryReads
   }
 })

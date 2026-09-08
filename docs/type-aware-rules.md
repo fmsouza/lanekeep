@@ -287,6 +287,15 @@ the hash of the bytes read, listed relative to the realpathed project root, minu
 `typescript` package's own directory, whose version is covered separately (architecture §8.1).
 A pre-commit hook using it is a slow hook, and lanekeep says so on stderr every time.
 
+**And where a sidecar outlives a run** — `check --fix`, or a session that holds the provider —
+every later prepare re-reads and re-hashes everything the programs this run's files fall under
+read, once per such program that read it, so that a program answering out of bytes that have
+since changed is rebuilt rather than trusted. The read set a refresh compares is per program,
+so a file that P of them read is read and hashed P times. A held program no file of the run
+falls under is left alone and contributes no row to the listing — a fresh provider over the
+same files holds no such program, and the listing is the key both have to agree on — and its
+rows return, refreshed, with the run that next names one of its files.
+
 **The project root bounds which `tsconfig.json` is used, and a file no config under it claims
 is typed without one.** The driver walks up from a file looking for a `tsconfig.json` and stops
 at the project root: a config *above* the root would pull a program together out of files

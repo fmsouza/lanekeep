@@ -24,7 +24,8 @@
 //! Not through [`Query::files`]. The compiler reads what a `tsconfig.json` tells it to read,
 //! which is a *program* rather than a per-question set of files, so recording those reads one
 //! question at a time would record them after the answers that depended on them. Instead
-//! [`TscProvider::programs`] asks the driver for its whole read set and
+//! [`TscProvider::programs`] asks the driver for the read set of the programs this run's files
+//! fall under and
 //! [`TypeProvider::begin_run`] folds that listing into the run key before any answer exists
 //! (spec §5.6).
 //!
@@ -47,35 +48,35 @@
 //! `../shared/b.ts`, which encodes the root's depth relative to that file and nothing else
 //! about where either sits.
 //!
-//! Two things are deliberately outside the listing. The `typescript` package's own directory is
-//! excluded whole, because its bytes are a function of the compiler version, which
+//! Three things are deliberately outside the listing. The `typescript` package's own directory
+//! is excluded whole, because its bytes are a function of the compiler version, which
 //! [`TscProvider::identity`] already folds — the package rather than only its `lib/`, since
 //! `types.typescript` may point outside the root and the manifest resolution reads on the way
-//! there would be `../`-prefixed. And absence probes — `fileExists`, `directoryExists` — are not
-//! recorded: the key is recomputed from the current run's read set, so a file that appears and
-//! changes what resolution finds changes what is *read*, and so changes the key.
+//! there would be `../`-prefixed.
+//!
+//! Absence probes — `fileExists`, `directoryExists`, a `readFile` that answered nothing — are
+//! not rows either, because an absence has no bytes to hash. They are not forgotten: a build
+//! records every one it was denied under the project root, and a refresh re-probes them, so a
+//! package that *appears* rebuilds the program that was denied it and the key is then recomputed
+//! from that build's own read set. Without that half a resolution that changed because a file
+//! arrived was invisible — `npm install` left the listing byte-identical while `lanekeep check`
+//! over the same bytes answered from the new package. See `buildAbsences` in `driver.mjs`.
+//!
+//! And a read a *query* makes outside any program is not a row. `isAssignableTo` resolves a
+//! module argument written by a rule rather than by the file, and `complete` re-resolves every
+//! import; the `package.json`s consulted on the way are inputs to that one answer and to no
+//! program the run built. As listing rows they made the run key depend on which questions the
+//! session happened to be asked — so a held session keyed differently from `lanekeep check`
+//! over identical bytes, and differently again depending on which files were cache misses last
+//! request, and such a row was never revalidated because no program held it. The driver reports
+//! them with the answer instead and [`TscProvider`] records each through the asking [`Query`]'s
+//! own [`FileAccess`]: a per-entry tracked read, exactly as every builtin-provider read is, so
+//! that file's cache entry depends on it and nothing else does. See
+//! `TscProvider::ask_recording`.
 //!
 //! Any file the compiler read whose bytes moved therefore changes the key for the whole run,
-//! which is stricter than per-file tracked reads rather than weaker than them.
-//!
-//! **A read first made by a *query* reaches the key on the following run, not on this one.**
-//! `programs` is asked once, in `begin_run`, before any answer exists, so a file the compiler
-//! reaches for the first time while answering `isAssignableTo` or `complete` joins the read set
-//! after the key that run committed under. It is in the answer `programs` gives next, which for
-//! a provider a session holds across runs (plan 6) is the following run's key — and a run that
-//! spawns its own sidecar starts from an empty read set, so for that shape the following run
-//! carries it only if the same read happens again before `begin_run` returns.
-//!
-//! That is nearly always so, and the residue is worth naming rather than rounding off.
-//! `createProgram` resolves every import of every root file, so every `package.json`
-//! `complete` consults has already been read while the programs were being built — `complete`
-//! resolves exactly that file's own specifiers. The one shape not covered is
-//! `isAssignableTo`'s `module` argument, which is written by a *rule* rather than by the file
-//! and may name a module the file does not import: the `package.json`s on the way to it are
-//! read only by the query. A change to one of those, with nothing else moving, does not move
-//! the key. The alternative — re-asking `programs` after every file and rekeying — would make
-//! the key depend on which files a run happened to check and in what order, which is a worse
-//! bargain than a narrow, stated gap.
+//! which is stricter than per-file tracked reads rather than weaker than them; and any file a
+//! question read moves that question's file alone.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -597,7 +598,7 @@ impl TscProvider {
 
     /// One position-taking request, and its answer.
     fn ask_about(&self, op: &str, q: &Query<'_>) -> Result<serde_json::Value, ProviderError> {
-        self.request(op, &self.locate(q))
+        self.ask_recording(op, &self.locate(q), q)
     }
 
     /// One request, under whatever is left of the analysis budget.
@@ -610,13 +611,54 @@ impl TscProvider {
         op: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, ProviderError> {
+        Ok(self.request_reporting(op, body)?.0)
+    }
+
+    /// [`Self::request`], keeping the paths the driver read while answering.
+    fn request_reporting(
+        &self,
+        op: &str,
+        body: &serde_json::Value,
+    ) -> Result<(serde_json::Value, Vec<String>), ProviderError> {
         let error = match self.exchange(op, body) {
-            Ok(value) => return Ok(value),
+            Ok(answer) => return Ok(answer),
             Err(Failure::Timeout) => ProviderError::Timeout,
             Err(Failure::Refused(detail, sidecar)) => self.refused(&detail, sidecar),
         };
         self.remember(&error);
         Err(error)
+    }
+
+    /// One question about a node, with what answering it read recorded against that node's file.
+    ///
+    /// **This is the whole of a query's dependency mechanism, and it is deliberately not the
+    /// listing's.** A read a query makes outside any program — `isAssignableTo` resolving a
+    /// module the file does not import, `complete` re-resolving every import — is not an input
+    /// to any program the run built, so putting it in the `programs` listing made the run key
+    /// depend on which questions the session happened to be asked, and therefore on which files
+    /// were cache misses last request. Recorded here instead, through the asking [`Query`]'s own
+    /// [`FileAccess`], it is an ordinary per-file tracked read: exactly that file's cache entry
+    /// depends on it, and it is revalidated the way every other tracked read is.
+    ///
+    /// A path outside the project root — a pnpm store, a sibling package in a monorepo — cannot
+    /// be recorded: `FileAccess` confines reads to the root and refuses it. The refusal is
+    /// dropped rather than raised, because the alternative is failing a question over a file the
+    /// compiler was always allowed to read (see this module's header on what `tsc` widens). Such
+    /// a file reaches the key only when some program read it, which is where the listing already
+    /// covers it.
+    fn ask_recording(
+        &self,
+        op: &str,
+        body: &serde_json::Value,
+        q: &Query<'_>,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let (value, read) = self.request_reporting(op, body)?;
+        for path in read {
+            // The hash is not wanted here — recording the read is — and an escaping path is
+            // simply not recordable.
+            let _ = q.files.hash_of(&path);
+        }
+        Ok(value)
     }
 
     /// The locked half of a request: write the line, wait for the matching answer, read it.
@@ -625,7 +667,11 @@ impl TscProvider {
     /// session lock released — [`TscProvider::refused`] joins a thread and takes a second
     /// mutex — and because a failure that leaves the protocol out of step has to kill the
     /// child here, while the lock that owns it is still held.
-    fn exchange(&self, op: &str, body: &serde_json::Value) -> Result<serde_json::Value, Failure> {
+    fn exchange(
+        &self,
+        op: &str,
+        body: &serde_json::Value,
+    ) -> Result<(serde_json::Value, Vec<String>), Failure> {
         let budget = self.current_budget();
         let mut body = body.clone();
         let Ok(mut session) = self.session.lock() else {
@@ -732,10 +778,26 @@ impl TscProvider {
                 .unwrap_or("no reason given");
             return Err(Failure::Refused(detail.to_owned(), Sidecar::Live));
         }
-        Ok(parsed
-            .get("value")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null))
+        // The paths the driver read answering *this* request and attributed to no program —
+        // see `ask_recording`. Absent or malformed is an empty list rather than a failure: the
+        // field is additive, and a driver that reported none has made no claim about any file.
+        let read = parsed
+            .get("reads")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((
+            parsed
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            read,
+        ))
     }
 
     /// A refusal carrying whatever the sidecar said on the way down.
@@ -767,10 +829,10 @@ fn stop(session: &mut Session) -> Sidecar {
     Sidecar::Gone
 }
 
-/// The `FileAccess` on a [`Query`] is deliberately unused here — see this module's
-/// documentation. This provider's dependencies are the program listing, folded into the run
-/// key by [`TypeProvider::begin_run`] before any answer exists, not per-question tracked
-/// reads.
+/// A program's own reads reach the key through [`TypeProvider::begin_run`]'s listing, folded
+/// before any answer exists. A query's reads — a resolution made outside any program's host,
+/// answering a single question — are the other half: `TscProvider::ask_recording` records each
+/// through the asking [`Query`]'s own `FileAccess`, as an ordinary per-entry tracked read.
 impl TypeProvider for TscProvider {
     fn notices(&self) -> Vec<String> {
         let count = self.adhoc.lock().map_or(0, |slot| *slot);
@@ -807,16 +869,19 @@ impl TypeProvider for TscProvider {
         let object = body.as_object_mut()?;
         object.insert("module".to_owned(), serde_json::json!(module));
         object.insert("name".to_owned(), serde_json::json!(name));
-        self.request("isAssignableTo", &body).ok()?.as_bool()
+        self.ask_recording("isAssignableTo", &body, &q)
+            .ok()?
+            .as_bool()
     }
 
     fn complete(&self, q: Query<'_>) -> bool {
         // `false` on a failure, which is the honest answer: a provider that could not say
         // whether every import resolved has not established that they did, and a rule reading
         // `complete` is deciding whether to stay silent.
-        self.request(
+        self.ask_recording(
             "complete",
             &serde_json::json!({ "file": self.absolute(q.file) }),
+            &q,
         )
         .ok()
         .and_then(|value| value.as_bool())
@@ -838,6 +903,13 @@ impl TypeProvider for TscProvider {
     /// `try_wait` rather than a flag set where the child is killed: the child may also have
     /// died on its own — out of memory building a program is the realistic one — and a flag
     /// would only ever know about the deaths lanekeep caused.
+    ///
+    /// `SessionProvider::for_request_with` calls this holding its own lock, so what could block
+    /// here is not `try_wait` — it does not wait — but acquiring `self.session`'s mutex. That is
+    /// sound only because no request is in flight when `for_request_with` runs: the session's
+    /// `held` lock serializes callers, and each one either returns before touching the sidecar
+    /// or acquires `self.session` itself, so this call never contends with a request already
+    /// holding it.
     fn needs_rebuild(&self) -> bool {
         let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
         // An error from `try_wait` is a child whose state cannot be established, which is not a
@@ -847,9 +919,20 @@ impl TypeProvider for TscProvider {
 
     fn revalidate(&self, _files: &FileAccess) {
         // Nothing to do: the sidecar's state is the programs it built, and `begin_run`
-        // re-answers `programs` — re-reading every config's file set and rebuilding with
-        // `oldProgram` — on every prepare, held provider or not. The program hash the run key
-        // folds is therefore already current per request without this method's help.
+        // re-answers `programs` on every prepare, held provider or not. That op refreshes
+        // every program a file of the request falls under — re-hashing everything each of
+        // them read, roots and resolved dependencies alike, and rebuilding where something
+        // moved — and those programs are exactly the ones the listing is built from. A held
+        // program no file of the request falls under is neither refreshed nor listed: a fresh
+        // provider over the same request holds no such program, so contributing its rows
+        // would key a held session differently from `lanekeep check` over identical bytes.
+        // Its rows return, refreshed, with the request that next names one of its files. The
+        // program hash is therefore already current per request without this method's help.
+        //
+        // That claim used to hold only for a program's *root* files: the driver compared roots
+        // alone, so a held session kept answering out of a stale `.d.ts` reached by resolution
+        // and `lanekeep server` disagreed with `lanekeep check` about the same bytes. See
+        // `refreshReads` in `driver.mjs`.
     }
 
     fn begin_run(

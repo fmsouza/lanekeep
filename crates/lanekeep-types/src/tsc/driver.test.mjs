@@ -9,6 +9,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
+import { createHash } from 'node:crypto'
 import {
   existsSync,
   mkdtempSync,
@@ -682,6 +683,788 @@ test('programs forgets a root that has been deleted', TIMEOUT, async (t) => {
   }
 })
 
+/** The one root of the fixture below, whose import is the non-root read the tests move. */
+const DEPENDENT_SOURCE = "import { rate } from '../types/dep'\nexport const v = rate\n"
+
+/** A project whose one root imports a declaration file that no config lists as a root. */
+function writeDependentRoot(root, declaration) {
+  mkdirSync(path.join(root, 'src'), { recursive: true })
+  mkdirSync(path.join(root, 'types'), { recursive: true })
+  writeFileSync(path.join(root, 'package.json'), '{"name":"dependency","private":true}\n')
+  // `include` names `src` alone, so `types/dep.d.ts` is reached by module resolution and is
+  // never a root — which is the whole shape of the drift below.
+  writeFileSync(
+    path.join(root, 'tsconfig.json'),
+    '{"compilerOptions":{"strict":true,"target":"ES2022","moduleResolution":"bundler","module":"ESNext"},"include":["src"]}\n',
+  )
+  writeFileSync(path.join(root, 'types/dep.d.ts'), declaration)
+  writeFileSync(path.join(root, 'src/a.ts'), DEPENDENT_SOURCE)
+}
+
+test('programs rebuilds a program whose dependency moved under it', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The root-only comparison this replaces was blind to every file a program reaches by
+  // resolution rather than by root membership: a `.d.ts` outside `include`, the
+  // `tsconfig.json` itself, a `package.json` resolution consulted. A held driver — the plan-6
+  // server holds one across runs — kept answering out of the old declaration, so `lanekeep
+  // server`'s diagnostics drifted from `lanekeep check`'s, whose provider is fresh every run
+  // and so has no cached program to return early from.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-dependency-'))
+  const session = spawnDriver(root)
+  try {
+    writeDependentRoot(root, 'export declare const rate: number\n')
+    const file = path.join(root, 'src/a.ts')
+
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    const firstType = await session.ask('typeOf', { file, ...spanOf(DEPENDENT_SOURCE, 'v') })
+    assert.equal(firstType.value.primitive, 'number', JSON.stringify(firstType))
+
+    writeFileSync(path.join(root, 'types/dep.d.ts'), 'export declare const rate: string\n')
+    const second = await session.ask('programs', { files: [file] })
+    assert.equal(second.ok, true, JSON.stringify(second))
+    const row = ([p]) => p === 'types/dep.d.ts'
+    assert.notDeepEqual(
+      second.value.listing.find(row),
+      first.value.listing.find(row),
+      'the listing carries the pre-edit hash, so the run keys on bytes that are gone',
+    )
+    const secondType = await session.ask('typeOf', { file, ...spanOf(DEPENDENT_SOURCE, 'v') })
+    assert.equal(
+      secondType.value.primitive,
+      'string',
+      `answered from the pre-edit program: ${JSON.stringify(secondType)}`,
+    )
+    const stats = await session.ask('stats')
+    assert.equal(stats.value.createProgram, 2, JSON.stringify(stats.value))
+    assert.equal(stats.value.programs, 1, 'rebuilt in place, not added beside')
+
+    // Settled: a third call over the same bytes finds nothing to do. What this pins is the
+    // rebuild absorbing the edit and not repeating — not `refreshReads`' write-back, which it
+    // cannot: the rebuild here re-reads the moved declaration, so its own `collected` writes
+    // the fresh hash into the entry whatever the refresh wrote. `programs settles when the
+    // rebuild does not re-read the moved file`, below, is the fixture for that.
+    const third = await session.ask('programs', { files: [file] })
+    assert.deepEqual(third.value, second.value, 'the settled listing disagrees with the second')
+    const settled = await session.ask('stats')
+    assert.equal(
+      settled.value.createProgram,
+      2,
+      `the absorbed edit is still being re-noticed: ${JSON.stringify(settled.value)}`,
+    )
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('programs leaves a program alone when its dependency did not move', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The negative twin of the rebuild above, and what keeps widening the comparison from every
+  // root to every read from becoming "rebuild always": the read set holds the `tsconfig.json`,
+  // the project's `package.json` and the declaration file, and an unchanged corpus must pay
+  // for none of them a second time.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-dependency-still-'))
+  const session = spawnDriver(root)
+  try {
+    writeDependentRoot(root, 'export declare const rate: number\n')
+    const file = path.join(root, 'src/a.ts')
+    const first = await session.ask('programs', { files: [file] })
+    const second = await session.ask('programs', { files: [file] })
+    const third = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    assert.deepEqual(second.value, first.value)
+    assert.deepEqual(third.value, first.value)
+    const stats = await session.ask('stats')
+    assert.equal(stats.value.createProgram, 1, JSON.stringify(stats.value))
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('programs re-parses compiler options when the tsconfig itself moved', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // `ensureProgram`'s rebuild reused `entry.options` unconditionally: a `tsconfig.json` edit
+  // moves the run key — its hash reaches `entry.reads` and the listing, both fixed above — and
+  // rebuilds the program, but with the *previous* options. A held session's provider then kept
+  // answering out of a `strict: false` build after the project turned `strict` on, which no
+  // fresh provider — `lanekeep check`'s, built once per run — could ever do, since it has no
+  // stale options to carry forward.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-options-'))
+  const session = spawnDriver(root)
+  try {
+    mkdirSync(path.join(root, 'src'), { recursive: true })
+    writeFileSync(path.join(root, 'package.json'), '{"name":"options","private":true}\n')
+    const tsconfig = path.join(root, 'tsconfig.json')
+    const configFor = (strict) =>
+      `{"compilerOptions":{"strict":${strict},"target":"ES2022","moduleResolution":"bundler","module":"ESNext"},"include":["src"]}\n`
+    writeFileSync(tsconfig, configFor(false))
+    const SOURCE = 'declare const a: string | undefined\nexport const b = a\n'
+    const file = path.join(root, 'src/a.ts')
+    writeFileSync(file, SOURCE)
+
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    const firstType = await session.ask('typeOf', { file, ...spanOf(SOURCE, 'b') })
+    // `strict: false` turns `strictNullChecks` off, and TypeScript drops `undefined` from a
+    // union under that setting — this is the pre-flip answer the fix has to move away from.
+    assert.equal(firstType.value.primitive, 'string', JSON.stringify(firstType))
+
+    writeFileSync(tsconfig, configFor(true))
+    const second = await session.ask('programs', { files: [file] })
+    assert.equal(second.ok, true, JSON.stringify(second))
+    const secondType = await session.ask('typeOf', { file, ...spanOf(SOURCE, 'b') })
+    assert.equal(
+      secondType.value.text,
+      'string | undefined',
+      `answered from the pre-edit options: ${JSON.stringify(secondType)}`,
+    )
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/**
+ * A project whose `tsconfig.json` and whose resolved `package.json` both begin with a UTF-8
+ * byte-order mark.
+ *
+ * The root `package.json` is plain: nothing resolves through it here, so a mark on it would be
+ * dead weight in a fixture whose whole point is that both marked files are read.
+ */
+function writeMarkedRoot(root) {
+  mkdirSync(path.join(root, 'src'), { recursive: true })
+  writeFileSync(path.join(root, 'package.json'), '{"name":"marked","private":true}\n')
+  writeFileSync(
+    path.join(root, 'tsconfig.json'),
+    '﻿{"compilerOptions":{"strict":true,"target":"ES2022","moduleResolution":"bundler","module":"ESNext"},"include":["src"]}\n',
+  )
+  // A directory package rather than a relative file, so module resolution really does read a
+  // `package.json` on the way to the declaration — a relative `./lib` reads none, and a fixture
+  // whose marked file is never read settles for the uninteresting reason that nothing watches
+  // it.
+  mkdirSync(path.join(root, 'src/pkg'), { recursive: true })
+  writeFileSync(path.join(root, 'src/pkg/package.json'), '\ufeff{"name":"pkg","types":"index.d.ts"}\n')
+  writeFileSync(path.join(root, 'src/pkg/index.d.ts'), 'export declare const rate: number\n')
+  writeFileSync(path.join(root, 'src/a.ts'), "import { rate } from './pkg'\nexport const v = rate\n")
+}
+
+test('programs settles over a tsconfig and package.json carrying a byte-order mark', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // Two readers, two answers. `recordRead` hashed the text the compiler's reader returned —
+  // `ts.sys.readFile` strips a leading BOM — while the refresh hashed the raw bytes, so a
+  // marked `tsconfig.json` or `package.json` never matched its recorded hash and every
+  // `programs` call rebuilt every program, forever. Nothing is wrong with the answers, so the
+  // only symptom is a session that pays a full build per request.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-bom-'))
+  const session = spawnDriver(root)
+  try {
+    writeMarkedRoot(root)
+    const file = path.join(root, 'src/a.ts')
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    // The fixture is only a fixture if both marked files are actually read: a listing without
+    // them would settle for the uninteresting reason that neither is watched at all.
+    const listed = first.value.listing.map(([p]) => p)
+    assert.ok(listed.includes('tsconfig.json'), JSON.stringify(listed))
+    assert.ok(listed.includes('src/pkg/package.json'), JSON.stringify(listed))
+    for (let call = 0; call < 4; call += 1) {
+      const again = await session.ask('programs', { files: [file] })
+      assert.deepEqual(again.value, first.value, `call ${call + 2} disagrees with the first`)
+    }
+    const stats = await session.ask('stats')
+    assert.equal(stats.value.createProgram, 1, JSON.stringify(stats.value))
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/** `text` as UTF-16LE with a byte-order mark, which is the encoding `ts.sys.readFile` decodes. */
+function utf16le(text) {
+  return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')])
+}
+
+test('programs settles over a UTF-16LE tsconfig.json', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The other half of the byte-order-mark case above, and the reason `readCanonical` hashes
+  // what `ts.sys.readFile` returns rather than a BOM strip written by hand: a UTF-16 file is
+  // text to the compiler's reader and mojibake to a raw UTF-8 one, so a driver hashing the
+  // raw bytes never matches the hash it recorded and rebuilds every program on every call.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-utf16-'))
+  const session = spawnDriver(root)
+  try {
+    mkdirSync(path.join(root, 'src'), { recursive: true })
+    writeFileSync(path.join(root, 'package.json'), '{"name":"utf16","private":true}\n')
+    writeFileSync(
+      path.join(root, 'tsconfig.json'),
+      utf16le(
+        '{"compilerOptions":{"strict":true,"target":"ES2022","moduleResolution":"bundler","module":"ESNext"},"include":["src"]}\n',
+      ),
+    )
+    const SOURCE = 'declare const a: string | undefined\nexport const b = a\n'
+    const file = path.join(root, 'src/a.ts')
+    writeFileSync(file, SOURCE)
+
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    // The fixture is only a fixture if the marked config is both read and in force: `strict`
+    // is what keeps `undefined` in the union, and a config that failed to decode would be no
+    // config at all.
+    assert.ok(
+      first.value.listing.some(([p]) => p === 'tsconfig.json'),
+      JSON.stringify(first.value.listing),
+    )
+    const typed = await session.ask('typeOf', { file, ...spanOf(SOURCE, 'b') })
+    assert.equal(typed.value.text, 'string | undefined', JSON.stringify(typed))
+
+    for (let call = 0; call < 4; call += 1) {
+      const again = await session.ask('programs', { files: [file] })
+      assert.deepEqual(again.value, first.value, `call ${call + 2} disagrees with the first`)
+    }
+    const stats = await session.ask('stats')
+    assert.equal(stats.value.createProgram, 1, JSON.stringify(stats.value))
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/** The one root of the redirect fixture below, importing a directory package by its manifest. */
+const REDIRECT_SOURCE = "import { rate } from './pkg'\nexport const v = rate\n"
+
+/** A project whose root reaches its declaration through a `package.json` `types` field. */
+function writeRedirectRoot(root, types) {
+  mkdirSync(path.join(root, 'src'), { recursive: true })
+  mkdirSync(path.join(root, 'src/pkg'), { recursive: true })
+  writeFileSync(path.join(root, 'package.json'), '{"name":"redirect","private":true}\n')
+  writeFileSync(
+    path.join(root, 'tsconfig.json'),
+    '{"compilerOptions":{"strict":true,"target":"ES2022","moduleResolution":"bundler","module":"ESNext"},"include":["src"]}\n',
+  )
+  writeFileSync(path.join(root, 'src/pkg/package.json'), `{"name":"pkg","types":"${types}"}\n`)
+  writeFileSync(path.join(root, 'src/pkg/index.d.ts'), 'export declare const rate: number\n')
+  writeFileSync(path.join(root, 'src/pkg/alt.d.ts'), 'export declare const rate: string\n')
+  writeFileSync(path.join(root, 'src/a.ts'), REDIRECT_SOURCE)
+}
+
+test('programs follows a package.json that redirects resolution elsewhere', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // A moved read the refresh notices and the rebuild then ignores. `oldProgram` carries the
+  // previous build's *resolutions*, so a `package.json` whose `types` now names a different
+  // declaration file rebuilt the program straight back onto the old answer — the held driver
+  // says `number` where a fresh one says `string`, which is `lanekeep server` disagreeing with
+  // `lanekeep check` about the same bytes. A moved read that is not a source file of the
+  // program is a resolution input, and a rebuild for one cannot reuse the old resolutions.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-redirect-'))
+  const session = spawnDriver(root)
+  try {
+    writeRedirectRoot(root, 'index.d.ts')
+    const file = path.join(root, 'src/a.ts')
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    const firstType = await session.ask('typeOf', { file, ...spanOf(REDIRECT_SOURCE, 'v') })
+    assert.equal(firstType.value.primitive, 'number', JSON.stringify(firstType))
+
+    writeFileSync(path.join(root, 'src/pkg/package.json'), '{"name":"pkg","types":"alt.d.ts"}\n')
+    const second = await session.ask('programs', { files: [file] })
+    assert.equal(second.ok, true, JSON.stringify(second))
+    const held = await session.ask('typeOf', { file, ...spanOf(REDIRECT_SOURCE, 'v') })
+
+    // The comparison that makes this a drift test rather than a guess about TypeScript: a
+    // provider with no cached program is what `lanekeep check` runs, and its answer is the
+    // one the held session has to match.
+    const fresh = spawnDriver(root)
+    try {
+      await fresh.ask('programs', { files: [file] })
+      const freshType = await fresh.ask('typeOf', { file, ...spanOf(REDIRECT_SOURCE, 'v') })
+      assert.equal(freshType.value.primitive, 'string', JSON.stringify(freshType))
+      assert.equal(
+        held.value.primitive,
+        freshType.value.primitive,
+        `the held driver answers ${JSON.stringify(held.value)} where a fresh one answers ${JSON.stringify(freshType.value)}`,
+      )
+    } finally {
+      fresh.close()
+    }
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('programs settles when the rebuild does not re-read the moved file', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // What pins `refreshReads`' write-back, which neither rebuild test above does: there the
+  // rebuild re-reads the moved file — `oldProgram` reuse compares every source file it kept,
+  // and a build from nothing re-resolves the same import — so `buildProgram`'s own `collected`
+  // writes the fresh hash back whatever the refresh did, and both settle either way.
+  //
+  // Here the import goes in the same window as the edit, so the rebuild resolves nothing
+  // through `src/pkg/package.json` and never asks for it again. `buildProgram` carries the
+  // previous read set forward — deliberately, so a watched file is not silently unwatched —
+  // and an entry left holding the pre-edit hash answers "moved" on every later call, rebuilding
+  // the program forever for one edit that has already been absorbed.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-writeback-'))
+  const session = spawnDriver(root)
+  try {
+    writeRedirectRoot(root, 'index.d.ts')
+    const file = path.join(root, 'src/a.ts')
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    assert.ok(
+      first.value.listing.some(([p]) => p === 'src/pkg/package.json'),
+      `the manifest is not watched at all: ${JSON.stringify(first.value.listing)}`,
+    )
+
+    // Both at once: the root stops importing the package and the manifest moves. The rebuild
+    // the root's own edit forces resolves nothing through the manifest, so nothing re-reads it.
+    writeFileSync(file, 'export const v = 1\n')
+    const moved = '{"name":"pkg","types":"alt.d.ts"}\n'
+    writeFileSync(path.join(root, 'src/pkg/package.json'), moved)
+    const second = await session.ask('programs', { files: [file] })
+    assert.equal(second.ok, true, JSON.stringify(second))
+    // The write-back is a value and not only a settle. `refreshReads` puts the fresh hash into
+    // the driver-wide `reads`, which is what the listing — the run's own cache key — is built
+    // from, and this manifest is in no program's `getSourceFiles()`, so the listing has no
+    // second source for its row. Left at the pre-edit hash, the key names bytes that are not on
+    // disk: a warm run keyed on a file it has already re-read and found different.
+    assert.deepEqual(
+      second.value.listing.find(([p]) => p === 'src/pkg/package.json'),
+      ['src/pkg/package.json', createHash('sha256').update(moved, 'utf8').digest('hex')],
+      `the row carries a hash that is not the bytes on disk: ${JSON.stringify(second.value.listing)}`,
+    )
+    const built = await session.ask('stats')
+    assert.equal(built.value.createProgram, 2, JSON.stringify(built.value))
+
+    const third = await session.ask('programs', { files: [file] })
+    assert.deepEqual(third.value, second.value)
+    const settled = await session.ask('stats')
+    assert.equal(
+      settled.value.createProgram,
+      2,
+      `the absorbed edit is re-noticed on every call: ${JSON.stringify(settled.value)}`,
+    )
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/** The one root of the appearance fixtures below: an import that does not resolve yet. */
+const APPEARING_SOURCE = "import { rate } from '@acme/rates'\nexport const v = rate\n"
+
+/** A project importing a package that is not installed. */
+function writeAppearingRoot(root) {
+  mkdirSync(path.join(root, 'src'), { recursive: true })
+  writeFileSync(path.join(root, 'package.json'), '{"name":"appearing","private":true}\n')
+  writeFileSync(
+    path.join(root, 'tsconfig.json'),
+    '{"compilerOptions":{"strict":true,"target":"ES2022","moduleResolution":"bundler","module":"ESNext"},"include":["src"]}\n',
+  )
+  writeFileSync(path.join(root, 'src/a.ts'), APPEARING_SOURCE)
+}
+
+/** Install the package the fixture above imports, as `npm install` would. */
+function installAppearingPackage(root, declared) {
+  const dir = path.join(root, 'node_modules/@acme/rates')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(path.join(dir, 'package.json'), '{"name":"@acme/rates","types":"index.d.ts"}\n')
+  writeFileSync(path.join(dir, 'index.d.ts'), declared)
+}
+
+test('programs notices a package installed between two runs', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The mirror image of every refresh fixture above, and invisible to all of them: a
+  // resolution that changes because a file *appeared*. `refreshProgram` compares what the
+  // program read, and a package that was not installed was never read — so the listing and the
+  // run key are byte-identical, the held program keeps answering out of the failed resolution,
+  // and `lanekeep check` over the same bytes answers `number`. `complete()` is the loud half:
+  // it re-resolves per question and flips to `true` while `typeOf` stays unknown, so one
+  // request says every import resolved and cannot say to what.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-appearing-'))
+  const session = spawnDriver(root)
+  try {
+    writeAppearingRoot(root)
+    const file = path.join(root, 'src/a.ts')
+    const at = spanOf(APPEARING_SOURCE, 'v')
+
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    const before = await session.ask('complete', { file })
+    assert.equal(before.value, false, 'the import resolves before it is installed')
+
+    installAppearingPackage(root, 'export declare const rate: number\n')
+
+    const second = await session.ask('programs', { files: [file] })
+    assert.equal(second.ok, true, JSON.stringify(second))
+    const held = await session.ask('typeOf', { file, ...at })
+    const heldComplete = await session.ask('complete', { file })
+
+    // A provider with no history is what `lanekeep check` runs, and its answers are the ones
+    // the held session has to match — all three of them.
+    const fresh = spawnDriver(root)
+    try {
+      const clean = await fresh.ask('programs', { files: [file] })
+      const freshType = await fresh.ask('typeOf', { file, ...at })
+      assert.equal(freshType.value.primitive, 'number', JSON.stringify(freshType))
+      assert.equal(
+        held.value?.primitive,
+        freshType.value.primitive,
+        `the held driver answers ${JSON.stringify(held.value)} where a fresh one answers ${JSON.stringify(freshType.value)}`,
+      )
+      assert.equal(heldComplete.value, true, 'complete disagrees with typeOf about one file')
+      assert.deepEqual(
+        second.value.listing,
+        clean.value.listing,
+        `the held driver lists ${JSON.stringify(second.value.listing)} where a fresh one lists ${JSON.stringify(clean.value.listing)}`,
+      )
+    } finally {
+      fresh.close()
+    }
+
+    // Settled: the appearance is absorbed once, not re-noticed on every later call.
+    const third = await session.ask('programs', { files: [file] })
+    assert.deepEqual(third.value, second.value, 'the absorbed appearance is re-noticed')
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('programs notices a declaration file appearing beside its source', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The same fault reached without a package manager: a `.d.ts` landing where resolution had
+  // fallen back. Nothing about the root changed and nothing the program read moved, so only a
+  // re-probe of what the build was denied can see it.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-beside-'))
+  const session = spawnDriver(root)
+  try {
+    mkdirSync(path.join(root, 'src'), { recursive: true })
+    writeFileSync(path.join(root, 'package.json'), '{"name":"beside","private":true}\n')
+    writeFileSync(
+      path.join(root, 'tsconfig.json'),
+      '{"compilerOptions":{"strict":true,"target":"ES2022","moduleResolution":"bundler","module":"ESNext"},"include":["src"]}\n',
+    )
+    writeFileSync(path.join(root, 'src/dep.js'), 'export const rate = 1\n')
+    const source = "import { rate } from './dep'\nexport const v = rate\n"
+    writeFileSync(path.join(root, 'src/a.ts'), source)
+    const file = path.join(root, 'src/a.ts')
+    const at = spanOf(source, 'v')
+
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+
+    writeFileSync(path.join(root, 'src/dep.d.ts'), 'export declare const rate: string\n')
+    const second = await session.ask('programs', { files: [file] })
+    assert.equal(second.ok, true, JSON.stringify(second))
+    const held = await session.ask('typeOf', { file, ...at })
+
+    const fresh = spawnDriver(root)
+    try {
+      await fresh.ask('programs', { files: [file] })
+      const freshType = await fresh.ask('typeOf', { file, ...at })
+      assert.equal(freshType.value.primitive, 'string', JSON.stringify(freshType))
+      assert.equal(
+        held.value?.primitive,
+        freshType.value.primitive,
+        `the held driver answers ${JSON.stringify(held.value)} where a fresh one answers ${JSON.stringify(freshType.value)}`,
+      )
+    } finally {
+      fresh.close()
+    }
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+/** Two configs side by side, each owning one root, so a refresh can be shown to be per config. */
+function writeTwoConfigs(root) {
+  for (const name of ['a', 'b']) {
+    mkdirSync(path.join(root, name, 'src'), { recursive: true })
+    writeFileSync(
+      path.join(root, name, 'tsconfig.json'),
+      '{"compilerOptions":{"strict":true,"target":"ES2022","moduleResolution":"bundler","module":"ESNext"},"include":["src"]}\n',
+    )
+    writeFileSync(path.join(root, name, `src/${name}.ts`), `export const ${name} = 1\n`)
+  }
+  writeFileSync(path.join(root, 'package.json'), '{"name":"two","private":true}\n')
+  // A directory package under `b`, reached by no import at all: its declaration is a root
+  // because the config `include`s `src`, and its manifest is read only when something asks a
+  // question that resolves `./pkg`. That is what makes a query's own reads visible in the test
+  // below — a build never touches this file.
+  mkdirSync(path.join(root, 'b/src/pkg'), { recursive: true })
+  writeFileSync(path.join(root, 'b/src/pkg/package.json'), '{"name":"pkg","types":"index.d.ts"}\n')
+  writeFileSync(path.join(root, 'b/src/pkg/index.d.ts'), 'export declare const rate: number\n')
+}
+
+/** A hoisted-workspace fixture: `<mono>/proj` importing a package installed at `<mono>/node_modules`. */
+function writeHoistedRoot(monoRoot, projRoot) {
+  mkdirSync(path.join(projRoot, 'src'), { recursive: true })
+  writeFileSync(path.join(projRoot, 'package.json'), '{"name":"proj","private":true}\n')
+  writeFileSync(
+    path.join(projRoot, 'tsconfig.json'),
+    '{"compilerOptions":{"strict":true,"target":"ES2022","moduleResolution":"node10","module":"CommonJS"},"include":["src"]}\n',
+  )
+  writeFileSync(path.join(projRoot, 'src/a.ts'), APPEARING_SOURCE)
+}
+
+test('programs notices a package hoisted above the project root', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The monorepo shape `withinBoundary` used to miss: `npm install` at the workspace root
+  // hoists a shared dependency into `<mono>/node_modules`, one level above the project root a
+  // session is held for. The build's own resolution probes there and is denied, but the old
+  // `withinBoundary` discarded every absence outside `projectRoot` — so the denial was never
+  // remembered, `refreshAbsences` had nothing to re-probe, and the held session kept answering
+  // `any` after the very install a fresh run would see. `recordRead` never had this narrowing:
+  // reads outside the root are recorded (this is the sibling-import fixture's own case above),
+  // and the ruling is to give absences the same rule, typescript's own lib/ aside.
+  const monoRoot = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-hoisted-'))
+  const projRoot = path.join(monoRoot, 'proj')
+  mkdirSync(projRoot, { recursive: true })
+  const session = spawnDriver(projRoot)
+  try {
+    writeHoistedRoot(monoRoot, projRoot)
+    const file = path.join(projRoot, 'src/a.ts')
+    const at = spanOf(APPEARING_SOURCE, 'v')
+
+    const first = await session.ask('programs', { files: [file] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    const before = await session.ask('complete', { file })
+    assert.equal(before.value, false, 'the import resolves before it is installed')
+
+    // A hoisted install: the package lands beside the workspace root, not under `projRoot`.
+    installAppearingPackage(monoRoot, 'export declare const rate: number\n')
+
+    const second = await session.ask('programs', { files: [file] })
+    assert.equal(second.ok, true, JSON.stringify(second))
+    const held = await session.ask('typeOf', { file, ...at })
+
+    const fresh = spawnDriver(projRoot)
+    try {
+      await fresh.ask('programs', { files: [file] })
+      const freshType = await fresh.ask('typeOf', { file, ...at })
+      assert.equal(freshType.value.primitive, 'number', JSON.stringify(freshType))
+      assert.equal(
+        held.value?.primitive,
+        freshType.value.primitive,
+        `the held driver answers ${JSON.stringify(held.value)} where a fresh one answers ${JSON.stringify(freshType.value)}`,
+      )
+    } finally {
+      fresh.close()
+    }
+  } finally {
+    session.close()
+    rmSync(monoRoot, { recursive: true, force: true })
+  }
+})
+
+test('the listing names only the configs the request names', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The listing is the run's own cache key, and the key a held session commits under has to be
+  // the one `lanekeep check` would compute over the same request. A fresh driver holds no
+  // program for a config no file of the request falls under, so a held one contributes no rows
+  // for it either: it stays cached, is not refreshed, and comes back — refreshed, and rebuilt
+  // if something moved — with the request that next names one of its files. Refreshing every
+  // held program instead kept the key current for a config the run never asked about, which is
+  // a row `lanekeep check` over the same request does not have at all.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-unnamed-'))
+  const session = spawnDriver(root)
+  try {
+    writeTwoConfigs(root)
+    const fileA = path.join(root, 'a/src/a.ts')
+    const fileB = path.join(root, 'b/src/b.ts')
+    const first = await session.ask('programs', { files: [fileA, fileB] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    assert.ok(
+      first.value.listing.some(([p]) => p === 'a/src/a.ts'),
+      `config a never reached the listing, so its absence below pins nothing: ${JSON.stringify(first.value.listing)}`,
+    )
+    const built = await session.ask('stats')
+    assert.equal(built.value.createProgram, 2, JSON.stringify(built.value))
+
+    // Edited while config `a` is out of the request. What the held driver does with this is the
+    // whole question: nothing at all now, and its own rows when a request next names it.
+    const edited = 'export const a = "two"\n'
+    writeFileSync(fileA, edited)
+
+    // A query between the two `programs` calls, which is what an editor session does all day.
+    // Its own resolution reads a `package.json` no program built — residue in the driver-wide
+    // read map — and a listing built from that map carries a row `lanekeep check` over the same
+    // request has no way to produce, and which depends on which questions the session happened
+    // to be asked. Query-time reads are per-entry tracked reads instead; the listing is
+    // program builds' reads and nothing else.
+    const queried = await session.ask('isAssignableTo', {
+      file: fileB,
+      ...spanOf('export const b = 1\n', 'b'),
+      module: './pkg',
+      name: 'rate',
+    })
+    assert.equal(queried.ok, true, JSON.stringify(queried))
+    assert.deepEqual(
+      queried.reads,
+      ['b/src/pkg/package.json'],
+      `the answer does not report what answering it read: ${JSON.stringify(queried)}`,
+    )
+
+    const held = await session.ask('programs', { files: [fileB] })
+    assert.equal(held.ok, true, JSON.stringify(held))
+    // A provider with no history is what `lanekeep check` runs, and its listing is the one the
+    // held session has to match.
+    const fresh = spawnDriver(root)
+    try {
+      const clean = await fresh.ask('programs', { files: [fileB] })
+      assert.equal(clean.ok, true, JSON.stringify(clean))
+      assert.ok(
+        !clean.value.listing.some(([p]) => p.startsWith('a/')),
+        `the fresh driver already names config a, so the comparison below is not discriminating: ${JSON.stringify(clean.value.listing)}`,
+      )
+      assert.deepEqual(
+        held.value.listing,
+        clean.value.listing,
+        `the held driver lists ${JSON.stringify(held.value.listing)} where a fresh one lists ${JSON.stringify(clean.value.listing)}`,
+      )
+    } finally {
+      fresh.close()
+    }
+    const untouched = await session.ask('stats')
+    assert.equal(
+      untouched.value.createProgram,
+      2,
+      `a program no file of the request falls under was rebuilt: ${JSON.stringify(untouched.value)}`,
+    )
+
+    // Named again: the rows come back, carrying the bytes on disk now rather than the ones the
+    // program was built from, and the program is rebuilt because a root moved under it.
+    const back = await session.ask('programs', { files: [fileA, fileB] })
+    assert.equal(back.ok, true, JSON.stringify(back))
+    assert.deepEqual(
+      back.value.listing.find(([p]) => p === 'a/src/a.ts'),
+      ['a/src/a.ts', createHash('sha256').update(edited, 'utf8').digest('hex')],
+      `the returning rows do not carry the bytes on disk: ${JSON.stringify(back.value.listing)}`,
+    )
+    const rebuilt = await session.ask('stats')
+    assert.equal(rebuilt.value.createProgram, 3, JSON.stringify(rebuilt.value))
+
+    // Rebuilt only where something moved: the same request again refreshes and builds nothing.
+    const again = await session.ask('programs', { files: [fileA, fileB] })
+    assert.deepEqual(again.value, back.value, 'settled: the edit is absorbed')
+    const settled = await session.ask('stats')
+    assert.equal(settled.value.createProgram, 3, JSON.stringify(settled.value))
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('programs answers after a tsconfig.json has left the disk', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // Refreshing every held program means refreshing one whose `tsconfig.json` has since been
+  // deleted or renamed, and that config is what `optionsFor` re-parses when the refresh says
+  // the config chain moved — `ts.readConfigFile` cannot read it, the driver throws, and every
+  // later `programs` call throws the same way for the sidecar's whole life. A session then
+  // fails every run while `lanekeep check`, whose provider is fresh, succeeds. A program whose
+  // config is gone contributes no rows, so it is dropped rather than rebuilt.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-configgone-'))
+  const session = spawnDriver(root)
+  try {
+    writeTwoConfigs(root)
+    const fileA = path.join(root, 'a/src/a.ts')
+    const fileB = path.join(root, 'b/src/b.ts')
+    const first = await session.ask('programs', { files: [fileA, fileB] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    assert.ok(
+      first.value.listing.some(([p]) => p === 'a/tsconfig.json'),
+      JSON.stringify(first.value.listing),
+    )
+
+    rmSync(path.join(root, 'a/tsconfig.json'))
+    const second = await session.ask('programs', { files: [fileB] })
+    assert.equal(
+      second.ok,
+      true,
+      `a deleted tsconfig.json killed the op: ${JSON.stringify(second)}`,
+    )
+    assert.ok(
+      !second.value.listing.some(([p]) => p.startsWith('a/')),
+      `the run key still names the gone config's program: ${JSON.stringify(second.value.listing)}`,
+    )
+    const third = await session.ask('programs', { files: [fileB] })
+    assert.deepEqual(third.value, second.value, 'settled: the drop is not re-noticed')
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('programs answers after a whole config directory has been removed', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The same fault reached the other way, which is the way a branch switch reaches it: the
+  // config goes with its sources rather than alone, so the refresh finds no roots left *and*
+  // no config to re-parse.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-configdir-'))
+  const session = spawnDriver(root)
+  try {
+    writeTwoConfigs(root)
+    const fileA = path.join(root, 'a/src/a.ts')
+    const fileB = path.join(root, 'b/src/b.ts')
+    const first = await session.ask('programs', { files: [fileA, fileB] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+
+    rmSync(path.join(root, 'a'), { recursive: true, force: true })
+    const second = await session.ask('programs', { files: [fileB] })
+    assert.equal(
+      second.ok,
+      true,
+      `a removed config directory killed the op: ${JSON.stringify(second)}`,
+    )
+    assert.ok(
+      !second.value.listing.some(([p]) => p.startsWith('a/')),
+      `the run key still names files that are gone: ${JSON.stringify(second.value.listing)}`,
+    )
+    const third = await session.ask('programs', { files: [fileB] })
+    assert.deepEqual(third.value, second.value, 'settled: the drop is not re-noticed')
+    const stats = await session.ask('stats')
+    assert.equal(stats.value.programs, 1, JSON.stringify(stats.value))
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an edit under one tsconfig rebuilds that program alone', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // Per-config isolation, which is what `entry.reads` being per program buys: refreshing on
+  // the driver-wide read map instead would make one package's edit cost a rebuild of every
+  // other config in the corpus.
+  const root = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-isolation-'))
+  const session = spawnDriver(root)
+  try {
+    writeTwoConfigs(root)
+    const fileA = path.join(root, 'a/src/a.ts')
+    const fileB = path.join(root, 'b/src/b.ts')
+    const files = [fileA, fileB]
+    await session.ask('programs', { files })
+    const built = await session.ask('stats')
+    assert.equal(built.value.programs, 2, JSON.stringify(built.value))
+    assert.equal(built.value.createProgram, 2, JSON.stringify(built.value))
+
+    writeFileSync(fileA, 'export const a = "moved"\n')
+    await session.ask('programs', { files })
+    const after = await session.ask('stats')
+    assert.equal(
+      after.value.createProgram,
+      3,
+      `one edit rebuilt more than its own config's program: ${JSON.stringify(after.value)}`,
+    )
+  } finally {
+    session.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('a file no tsconfig under the root claims is reported as ad-hoc', TIMEOUT, async (t) => {
   if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
   // A `tsconfig.json` *above* the root is refused — lanekeep's confinement stops at the root —
@@ -716,6 +1499,132 @@ test('a file a tsconfig under the root claims is not reported as ad-hoc', TIMEOU
   const answer = await ask('programs', { files })
   assert.equal(answer.ok, true, JSON.stringify(answer))
   assert.deepEqual(answer.value.adhoc, [], JSON.stringify(answer.value))
+})
+
+test('the ad-hoc notice does not outlive the file it named', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // `adhocFiles` is a set that only ever grew, so a held session's notice — and the `adhoc`
+  // half of what the host folds into the run key — named a file that had since been deleted,
+  // while `lanekeep check` over the identical bytes named it not at all. The request's file
+  // list is the run's discovery list, so it is the whole answer and not an addition to the
+  // previous one.
+  const outer = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-adhoc-stale-'))
+  const root = path.join(outer, 'app')
+  mkdirSync(path.join(root, 'src'), { recursive: true })
+  const session = spawnDriver(root)
+  try {
+    // A config above the root, which lanekeep's confinement refuses — so both files below fall
+    // to the ad-hoc program, as in the notice test further down.
+    writeFileSync(
+      path.join(outer, 'tsconfig.json'),
+      '{"compilerOptions":{"strict":true},"include":["app/src"]}\n',
+    )
+    writeFileSync(path.join(root, 'package.json'), '{"name":"app","private":true}\n')
+    const kept = path.join(root, 'src/a.ts')
+    const gone = path.join(root, 'src/b.ts')
+    writeFileSync(kept, 'export const n: number = 1\n')
+    writeFileSync(gone, 'export const m: number = 2\n')
+    const first = await session.ask('programs', { files: [kept, gone] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    assert.deepEqual(first.value.adhoc, ['src/a.ts', 'src/b.ts'], JSON.stringify(first.value))
+
+    rmSync(gone)
+    const held = await session.ask('programs', { files: [kept] })
+    assert.equal(held.ok, true, JSON.stringify(held))
+    // A provider with no history is what `lanekeep check` runs, and its answer is the one the
+    // held session has to match.
+    const fresh = spawnDriver(root)
+    try {
+      const clean = await fresh.ask('programs', { files: [kept] })
+      assert.deepEqual(clean.value.adhoc, ['src/a.ts'], JSON.stringify(clean.value))
+      assert.deepEqual(
+        held.value.adhoc,
+        clean.value.adhoc,
+        `the held driver reports ${JSON.stringify(held.value.adhoc)} where a fresh one reports ${JSON.stringify(clean.value.adhoc)}`,
+      )
+    } finally {
+      fresh.close()
+    }
+  } finally {
+    session.close()
+    rmSync(outer, { recursive: true, force: true })
+  }
+})
+
+test('a root the request no longer names leaves the program', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // The root set only ever widened: `ensureProgram` unioned the request's files into the held
+  // ones, so a file named by one run stayed a root for the sidecar's whole life even though a
+  // later run's discovery list no longer named it. That is not merely a stale row in the key —
+  // an extra root changes answers, because a `declare global` in it augments what every other
+  // root sees. So the held session typed `a.ts` out of a file `lanekeep check` over the same
+  // request would not have compiled at all.
+  const outer = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-rootshrink-'))
+  const root = path.join(outer, 'app')
+  mkdirSync(path.join(root, 'src'), { recursive: true })
+  const session = spawnDriver(root)
+  try {
+    // A config above the root, which lanekeep's confinement refuses, so both files fall to the
+    // ad-hoc program — where the root set is the request's list and nothing else.
+    writeFileSync(
+      path.join(outer, 'tsconfig.json'),
+      '{"compilerOptions":{"strict":true},"include":["app/src"]}\n',
+    )
+    writeFileSync(path.join(root, 'package.json'), '{"name":"app","private":true}\n')
+    const kept = path.join(root, 'src/a.ts')
+    const dropped = path.join(root, 'src/b.ts')
+    const source = 'export const v = lanekeepMark\n'
+    writeFileSync(kept, source)
+    writeFileSync(dropped, 'export {}\ndeclare global {\n  var lanekeepMark: string\n}\n')
+
+    const first = await session.ask('programs', { files: [kept, dropped] })
+    assert.equal(first.ok, true, JSON.stringify(first))
+    const augmented = await session.ask('typeOf', { file: kept, ...spanOf(source, 'v') })
+    assert.equal(
+      augmented.value.primitive,
+      'string',
+      `the augmentation never reached the answer, so its removal pins nothing: ${JSON.stringify(augmented)}`,
+    )
+
+    // The second request names one of the two, and `b.ts` is still on disk — this is a
+    // discovery list that shrank, not a deletion.
+    const held = await session.ask('programs', { files: [kept] })
+    assert.equal(held.ok, true, JSON.stringify(held))
+    const heldType = await session.ask('typeOf', { file: kept, ...spanOf(source, 'v') })
+
+    // A provider with no history is what `lanekeep check` runs, and its answer is the one the
+    // held session has to match — in the listing, which is the run key, and in the type.
+    const fresh = spawnDriver(root)
+    try {
+      const clean = await fresh.ask('programs', { files: [kept] })
+      assert.equal(clean.ok, true, JSON.stringify(clean))
+      const freshType = await fresh.ask('typeOf', { file: kept, ...spanOf(source, 'v') })
+      assert.ok(
+        !clean.value.listing.some(([p]) => p === 'src/b.ts'),
+        `the fresh driver already names the dropped root: ${JSON.stringify(clean.value.listing)}`,
+      )
+      assert.notEqual(
+        freshType.value?.primitive,
+        'string',
+        `the augmentation still reaches a fresh run, so the comparison below is not discriminating: ${JSON.stringify(freshType)}`,
+      )
+      assert.deepEqual(
+        heldType.value,
+        freshType.value,
+        `the held driver answers ${JSON.stringify(heldType.value)} where a fresh one answers ${JSON.stringify(freshType.value)}`,
+      )
+      assert.deepEqual(
+        held.value.listing,
+        clean.value.listing,
+        `the held driver lists ${JSON.stringify(held.value.listing)} where a fresh one lists ${JSON.stringify(clean.value.listing)}`,
+      )
+    } finally {
+      fresh.close()
+    }
+  } finally {
+    session.close()
+    rmSync(outer, { recursive: true, force: true })
+  }
 })
 
 test('an op naming a prototype method is unknown, not called', TIMEOUT, async (t) => {

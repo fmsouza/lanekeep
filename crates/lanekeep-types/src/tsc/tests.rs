@@ -1023,6 +1023,72 @@ fn a_held_providers_revalidate_answers_the_edit_begin_run_rebuilt() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The same claim for a file the program never lists as a root.
+///
+/// The test above edits the checked source itself, which is a root of its config's program, and
+/// passes against a driver that compares only roots. Everything a program reaches by
+/// resolution — the declaration file behind an import, the `package.json`s consulted on the way
+/// to it — is invisible to that comparison, and a held provider kept answering out of the old
+/// declaration while a fresh one (what `lanekeep check` builds every run) answered the new. That
+/// is `lanekeep server`'s diagnostics drifting from `lanekeep check`'s over identical bytes,
+/// which is what `crates/lanekeep-cli/tests/server_agreement.rs` reproduces end to end.
+#[test]
+fn a_held_provider_answers_an_edit_to_a_file_its_program_only_read() {
+    if !tsc_available() {
+        eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+        return;
+    }
+    // No annotation on `n`, so the answer comes from the dependency's declaration and from
+    // nothing written in the checked file.
+    let source = "import { d } from \"dep\"\nexport const n = d\n";
+    let root = fixture_with("revalidate-dependency", STRICT, &[("src/a.ts", source)]);
+    let provider = TscProvider::spawn(
+        &root,
+        &tsc_config(),
+        AnalysisBudget::start(Duration::from_mins(2)),
+    )
+    .expect("the sidecar starts");
+    let file = FilePath::new("src/a.ts");
+    let files = || vec![file.clone()];
+    let tree = parse(source);
+    let ask = || {
+        provider.type_of(Query {
+            file: &file,
+            tree: &tree,
+            source,
+            node: last_of(&tree, "identifier"),
+            files: &FileAccess::new(&root),
+        })
+    };
+
+    provider
+        .begin_run(&files, AnalysisBudget::start(Duration::from_mins(2)))
+        .expect("the first run's programs build");
+    assert_eq!(
+        ask(),
+        Some(Type::Primitive(Primitive::Number)),
+        "the first run answers the declaration as it was written"
+    );
+
+    std::fs::write(
+        root.join("node_modules/dep/index.d.ts"),
+        "export declare const d: string\n",
+    )
+    .expect("rewrites the dependency's declaration");
+    provider.revalidate(&FileAccess::new(&root));
+    provider
+        .begin_run(&files, AnalysisBudget::start(Duration::from_mins(2)))
+        .expect("the second run's programs rebuild over the edit");
+    assert_eq!(
+        ask(),
+        Some(Type::Primitive(Primitive::String)),
+        "the held provider is still answering out of the pre-edit declaration, which no run of \
+         `lanekeep check` ever does — its provider is fresh and has no cached program"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A breached budget kills the sidecar, and the provider says so rather than answering
 /// nothing forever.
 ///
@@ -1060,6 +1126,99 @@ fn a_breach_leaves_the_provider_asking_to_be_rebuilt() {
     assert!(
         provider.needs_rebuild(),
         "the breach killed the sidecar and the provider still offers itself for the next request"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A query's own reads are the asking file's tracked reads, and not listing rows.
+///
+/// `isAssignableTo`'s `module` is written by a *rule*, so it may name a module the file does
+/// not import — and the `package.json`s resolution consults on the way to it are read by
+/// nothing else. As listing rows they moved the run key, which made the key depend on which
+/// questions a session happened to be asked; recorded through the query's own [`FileAccess`]
+/// they are what they are, an input to that one file's answer.
+///
+/// Both halves, because either alone passes against a wrong answer: an implementation that
+/// recorded nothing keeps the listing clean, and one that kept both would satisfy the
+/// dependency assertion.
+#[test]
+fn a_query_records_its_own_reads_against_the_asking_file() {
+    if !tsc_available() {
+        eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+        return;
+    }
+    // `src/pkg` is reached by no import at all: its declaration is a root because the config
+    // `include`s `src`, and its manifest is read only by a question that resolves `./pkg`.
+    let root = fixture_with(
+        "query-reads",
+        STRICT,
+        &[
+            ("src/a.ts", "export const n: number = 1;\n"),
+            ("src/pkg", ""),
+        ],
+    );
+    let _ = std::fs::remove_file(root.join("src/pkg"));
+    std::fs::create_dir_all(root.join("src/pkg")).expect("creates the package directory");
+    std::fs::write(
+        root.join("src/pkg/package.json"),
+        "{\"name\":\"pkg\",\"types\":\"index.d.ts\"}\n",
+    )
+    .expect("writes the package manifest");
+    std::fs::write(
+        root.join("src/pkg/index.d.ts"),
+        "export declare class Rate {}\n",
+    )
+    .expect("writes the package types");
+
+    let provider = TscProvider::spawn(
+        &root,
+        &tsc_config(),
+        AnalysisBudget::start(Duration::from_mins(2)),
+    )
+    .expect("the sidecar starts");
+    let file = FilePath::new("src/a.ts");
+    let files = || vec![file.clone()];
+
+    provider
+        .begin_run(&files, AnalysisBudget::start(Duration::from_mins(2)))
+        .expect("the first run's programs build");
+    let before = provider.dependency_paths();
+
+    let source = "export const n: number = 1;\n";
+    let tree = parse(source);
+    let access = FileAccess::new(&root);
+    provider.is_assignable_to(
+        Query {
+            file: &file,
+            tree: &tree,
+            source,
+            node: last_of(&tree, "identifier"),
+            files: &access,
+        },
+        "./pkg",
+        "Rate",
+    );
+
+    let read: Vec<String> = access
+        .dependencies()
+        .into_iter()
+        .map(|read| read.path.as_str().to_owned())
+        .collect();
+    assert!(
+        read.iter().any(|path| path == "src/pkg/package.json"),
+        "the question's own resolution read is not a tracked read of the file that asked it: \
+         {read:?}"
+    );
+
+    provider
+        .begin_run(&files, AnalysisBudget::start(Duration::from_mins(2)))
+        .expect("the second run's programs build");
+    assert_eq!(
+        provider.dependency_paths(),
+        before,
+        "a question the session was asked moved the listing, so the run key depends on which \
+         files were cache misses last request"
     );
 
     let _ = std::fs::remove_dir_all(&root);
