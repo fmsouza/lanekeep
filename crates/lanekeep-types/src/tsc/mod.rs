@@ -78,6 +78,7 @@
 //! which is stricter than per-file tracked reads rather than weaker than them; and any file a
 //! question read moves that question's file alone.
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -235,6 +236,14 @@ pub struct TscProvider {
     /// Set by `programs`, per run, so a provider a session holds across runs reports what the
     /// current run found rather than what the first one did.
     adhoc: Mutex<usize>,
+    /// The last `programs` listing's paths, as the driver spelled them — relative to the
+    /// project root, `adhoc` entries included.
+    ///
+    /// Set by [`Self::programs`], which is `begin_run`'s only caller, so this always reflects
+    /// the run `begin_run` most recently prepared. [`TypeProvider::dependency_paths`] answers
+    /// it, which is what puts a declaration file the compiler read — never a tracked read on
+    /// any [`Query`] — into `--watch`'s allowlist.
+    dependency_paths: Mutex<BTreeSet<FilePath>>,
 }
 
 impl std::fmt::Debug for TscProvider {
@@ -386,6 +395,7 @@ impl TscProvider {
             identity: Vec::new(),
             programs_hash: Mutex::new([0; 32]),
             adhoc: Mutex::new(0),
+            dependency_paths: Mutex::new(BTreeSet::new()),
         };
 
         // The handshake, before anything else and before `run_key`. Its answer is a cache-key
@@ -466,6 +476,10 @@ impl TscProvider {
         let adhoc = adhoc_count(&answer).inspect_err(|e| self.remember(e))?;
         if let Ok(mut slot) = self.adhoc.lock() {
             *slot = adhoc;
+        }
+        let paths = programs_paths(&answer).inspect_err(|e| self.remember(e))?;
+        if let Ok(mut slot) = self.dependency_paths.lock() {
+            *slot = paths;
         }
         Ok(())
     }
@@ -917,6 +931,16 @@ impl TypeProvider for TscProvider {
         !matches!(session.child.try_wait(), Ok(None))
     }
 
+    fn dependency_paths(&self) -> BTreeSet<FilePath> {
+        // Poison-tolerant for the same reason `failure` is: a panic elsewhere while this lock
+        // was held must not turn a real listing into an empty one, which is the answer that
+        // makes `--watch` miss every declaration file this run's programs read.
+        self.dependency_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn revalidate(&self, _files: &FileAccess) {
         // Nothing to do: the sidecar's state is the programs it built, and `begin_run`
         // re-answers `programs` on every prepare, held provider or not. That op refreshes
@@ -1185,6 +1209,51 @@ fn fold_programs(answer: &serde_json::Value) -> Result<[u8; 32], ProviderError> 
         hasher.update(path.as_bytes());
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+/// The listing's own paths — the half of `programs`' answer [`fold_programs`] hashes rather
+/// than keeps, kept here as [`TypeProvider::dependency_paths`]'s answer instead of being
+/// folded away with the rest.
+///
+/// `adhoc` entries are unioned in explicitly rather than trusted to already be present in
+/// `listing`: a file the ad hoc program typed is a dependency of the run's answers exactly as
+/// much as one a `tsconfig.json` owns, and a `BTreeSet` makes the union free if the driver
+/// already lists it twice.
+///
+/// # Errors
+///
+/// [`ProviderError::Refused`] on any shape [`fold_programs`] would also refuse — a listing
+/// this cannot read as `[path, hash]` pairs. A dropped row here would silently understate the
+/// dependency set the next `--watch` iteration relies on, which is the same reasoning
+/// `fold_programs` gives for refusing rather than skipping.
+fn programs_paths(answer: &serde_json::Value) -> Result<BTreeSet<FilePath>, ProviderError> {
+    let listing = answer.get("listing").unwrap_or(answer);
+    let rows = listing.as_array().ok_or_else(|| {
+        ProviderError::Refused(format!(
+            "`programs` answered {answer}, whose `listing` is not a list of `[path, hash]` pairs"
+        ))
+    })?;
+    let mut paths = BTreeSet::new();
+    for row in rows {
+        let pair = row
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or_else(|| {
+                ProviderError::Refused(format!(
+                    "`programs` answered a row {row} that is not a `[path, hash]` pair"
+                ))
+            })?;
+        let path = pair[0].as_str().ok_or_else(|| {
+            ProviderError::Refused(format!(
+                "`programs` answered a row {row} whose fields are not both strings"
+            ))
+        })?;
+        paths.insert(FilePath::new(path));
+    }
+    for path in adhoc_paths(answer)? {
+        paths.insert(FilePath::new(path));
+    }
+    Ok(paths)
 }
 
 /// The files `programs` said no `tsconfig.json` under the root claims, as it spelled them.

@@ -235,6 +235,56 @@ fn the_default_relative_typescript_resolves_against_the_project_root() {
     drop(provider);
 }
 
+/// `TypeProvider::dependency_paths` answers the last `programs` listing's paths — nothing
+/// before `begin_run` builds one, and after it, every path the listing named, `adhoc` included.
+///
+/// This is the fix for the bug the allowlist's own tests could not see: those call
+/// `is_interesting` with hand-built sets and never ask a real provider anything, so an
+/// allowlist that stayed empty under `tsc` looked identical to one that worked. Under `tsc`
+/// the compiler reads through `ts.sys.readFile` rather than through `Query::files`, so nothing
+/// about a declaration file it consulted ever became a tracked read on `Outcome` — the listing
+/// this method now exposes was, until this change, folded into the run key and thrown away.
+#[test]
+fn dependency_paths_answers_the_last_listings_paths() {
+    if !tsc_available() {
+        eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+        return;
+    }
+    let root = fixture("dependency-paths");
+    let provider = TscProvider::spawn(
+        &root,
+        &tsc_config(),
+        AnalysisBudget::start(Duration::from_mins(2)),
+    )
+    .expect("the sidecar starts");
+
+    assert!(
+        provider.dependency_paths().is_empty(),
+        "a fresh provider has run no `programs` yet, so it has nothing to answer"
+    );
+
+    provider
+        .begin_run(
+            &|| vec![FilePath::new("src/a.ts")],
+            AnalysisBudget::start(Duration::from_mins(2)),
+        )
+        .expect("the programs build");
+
+    let paths = provider.dependency_paths();
+    assert!(paths.contains(&FilePath::new("src/a.ts")), "got: {paths:?}");
+    // The whole point: this is the declaration file the fixture's import resolves to, and it
+    // is read by the compiler alone — never through `FileAccess` — so it is the one path that
+    // was invisible to `--watch` before this method existed.
+    assert!(
+        paths.contains(&FilePath::new("node_modules/dep/index.d.ts")),
+        "an edit to the resolved declaration must wake `--watch`, or a stale answer would \
+         look like a rule that stopped working: got {paths:?}"
+    );
+
+    drop(provider);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The per-run key term `begin_run` answers for such a fixture.
 fn run_key(name: &str, tsconfig: &str, extra: &[(&str, &str)]) -> Vec<u8> {
     let root = fixture_with(name, tsconfig, extra);

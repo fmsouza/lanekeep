@@ -11,6 +11,8 @@
 //! produce a rule that accuses correct code, which is the one failure the whole surface is
 //! arranged against.
 
+use std::collections::BTreeSet;
+
 use lanekeep_core::files::FileAccess;
 use lanekeep_core::{AnalysisBudget, FilePath};
 
@@ -108,6 +110,26 @@ pub trait TypeProvider: Send + Sync {
     /// too — the builtin one derives it from `oracle_identity`, which digests this crate's
     /// `src/`, for exactly that reason.
     fn identity(&self) -> Vec<u8>;
+
+    /// Every path this provider's own dependency mechanism named for the run it last prepared.
+    ///
+    /// `--watch`'s allowlist unions this with `Outcome::dependency_paths`, because the two
+    /// cover different providers' dependencies and neither can stand in for the other. A
+    /// provider whose reads travel through [`Query::files`] — the builtin oracle — already
+    /// lands in `Outcome::dependency_paths` as per-file tracked reads, so its default here is
+    /// empty rather than a duplicate of what the engine already collects. The `tsc` provider
+    /// overrides it: the compiler reads through its own host, never through `Query::files`, so
+    /// nothing it consults is a tracked read on any file, and without this override an edit to
+    /// a linked package's declaration file would wake `--watch` for nothing at all.
+    ///
+    /// Answered after [`Self::begin_run`], from whatever it last built — a provider held across
+    /// runs (plan 6) reports the run it most recently prepared, not the run before it.
+    ///
+    /// The default is empty, matching every provider that has no dependency mechanism outside
+    /// tracked reads.
+    fn dependency_paths(&self) -> BTreeSet<FilePath> {
+        BTreeSet::new()
+    }
 
     /// Drop whatever this provider holds that the files no longer support.
     ///

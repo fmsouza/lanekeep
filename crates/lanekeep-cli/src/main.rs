@@ -5,14 +5,14 @@
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 mod session;
 mod watch;
 
 use clap::{Parser, Subcommand};
 use lanekeep_core::{Capability, FilePath, TypesProvider};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lanekeep_engine::{Engine, Outcome, PrepareOptions};
 use lanekeep_js::RuleRoot;
@@ -224,13 +224,25 @@ fn run() -> anyhow::Result<ExitCode> {
                     fix,
                     profile,
                 },
+                dependencies: None,
             };
 
             if watch {
+                // Shared between the loop's filter and the check that fills it. The first
+                // iteration runs with an empty one, which is correct: nothing has been read
+                // yet, so nothing under an ignored directory can be an input.
+                let allowlist = Arc::new(Mutex::new(BTreeSet::new()));
+                let sink = Arc::clone(&allowlist);
                 // The exit code of any single pass is not the loop's: a violation is
                 // something to show and wait past, not a reason to stop watching. What the
                 // loop reports is whether it could watch at all.
-                return watch::watch(&path, || check(options()).map(|_| ()));
+                return watch::watch_with(&path, allowlist, || {
+                    check(CheckOptions {
+                        dependencies: Some(&sink),
+                        ..options()
+                    })
+                    .map(|_| ())
+                });
             }
 
             check(CheckOptions {
@@ -246,6 +258,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     fix,
                     profile,
                 },
+                dependencies: None,
             })
         }
         Command::Server {
@@ -1140,6 +1153,47 @@ fn prepare_with_session(
     Ok((engine, declared))
 }
 
+/// Empty the watcher's allowlist, before anything in a run can fail.
+///
+/// Called at the top of [`check`], and the set is written again only where the run finished.
+/// An iteration that ends early — a rule that threw, a config that no longer loads, a breached
+/// limit — read some unknown prefix of what a whole run reads, and leaving the previous
+/// iteration's set in place makes the watcher confident about a list it no longer has any
+/// evidence for: the file whose edit broke the run may be exactly the one that has left it. An
+/// empty set wakes for anything outside an ignored directory, which is the right posture until
+/// a run succeeds and can say what it read.
+fn forget_dependencies(sink: Option<&Mutex<BTreeSet<PathBuf>>>) {
+    if let Some(sink) = sink {
+        sink.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
+}
+
+/// Record what this run read, for the watcher's next iteration.
+///
+/// Replaced rather than merged: a path the last run did not read is no longer an input, and
+/// merging would grow the set for the life of the session. Stored project-relative, which is
+/// how [`watch::is_interesting`] compares it — anchored at the root, by equality. Called at the
+/// end of [`check`], so that only a run which got that far describes what it read;
+/// [`forget_dependencies`] at the top is the other half.
+///
+/// `engine.dependency_paths`, not `outcome.dependency_paths` alone: the latter is only the
+/// tracked reads on `Query::files`, which under `types.provider: 'tsc'` never carries a
+/// declaration file the compiler read on its own — see `Engine::dependency_paths`.
+fn record_dependencies(
+    sink: Option<&Mutex<BTreeSet<PathBuf>>>,
+    engine: &Engine,
+    outcome: &Outcome,
+) {
+    if let Some(sink) = sink {
+        let paths: BTreeSet<PathBuf> = engine
+            .dependency_paths(outcome)
+            .iter()
+            .map(|path| PathBuf::from(path.as_str()))
+            .collect();
+        *sink.lock().unwrap_or_else(PoisonError::into_inner) = paths;
+    }
+}
+
 /// Everything `check` was asked for.
 ///
 /// A struct rather than eight parameters: the flags are all independent booleans and paths,
@@ -1155,6 +1209,11 @@ struct CheckOptions<'a> {
     /// Four bare booleans in a row is the shape that gets silently transposed, and the
     /// compiler cannot help — every one of them is the same type.
     switches: Switches,
+    /// Where to record what this run read beyond the files it checked.
+    ///
+    /// `Some` only under `--watch`, which turns it into the watcher's allowlist. A one-shot
+    /// run has nobody to read it back.
+    dependencies: Option<&'a Mutex<BTreeSet<PathBuf>>>,
 }
 
 /// `check`'s boolean flags.
@@ -1405,7 +1464,7 @@ fn run_selected(
         // Intersected with discovery rather than used directly, so `include` and `exclude`
         // stay in force — `--staged` must not check a file the config excluded.
         Some(selected) => {
-            let wanted: std::collections::BTreeSet<&FilePath> = selected.iter().collect();
+            let wanted: BTreeSet<&FilePath> = selected.iter().collect();
             let files: Vec<FilePath> = engine
                 .discover()
                 .into_iter()
@@ -1432,6 +1491,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
                 fix,
                 profile,
             },
+        dependencies,
     } = options;
 
     let format = Format::parse(format).map_err(|got| {
@@ -1446,6 +1506,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         "--timeout must be greater than zero"
     );
 
+    forget_dependencies(dependencies);
     let on_config: Option<&dyn Fn(&lanekeep_config::Config)> = Some(&note_slow_hook);
     let prepared = PrepareOptions {
         on_config,
@@ -1497,6 +1558,8 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     } else {
         outcome
     };
+
+    record_dependencies(dependencies, &engine, &outcome);
 
     let color = Color::resolve(
         std::io::stdout().is_terminal(),
@@ -1689,4 +1752,61 @@ fn explain(
 
     stdout.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed iteration clears the watcher's allowlist rather than leaving the last good
+    /// one in place.
+    ///
+    /// The set is what the *previous successful* run read. An iteration that ends early read
+    /// some unknown prefix of what a whole run reads — the file whose edit broke the run may
+    /// be exactly the one that has left the set — so carrying it forward makes the watcher
+    /// confident about a list it has no evidence for, and it stays that way until a run
+    /// succeeds. Cleared, the loop wakes for anything outside an ignored directory, which is
+    /// the right posture while nothing can say what an input is.
+    ///
+    /// Here rather than through a real `--watch` loop, because through the loop this is not
+    /// observable: the iteration a stale allowlist wakes fails for the same reason the
+    /// previous one did, so it prints no report either way and the two behaviors produce the
+    /// same bytes on stdout.
+    #[test]
+    fn a_failed_check_clears_the_dependency_sink() {
+        let dir = std::env::temp_dir().join(format!("lanekeep-sink-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creates the fixture");
+        // Not valid JSON, so the run fails in config load — before anything could have written
+        // the sink, which is the whole point: the clear has to happen ahead of every exit.
+        std::fs::write(dir.join("lanekeep.json"), "{ not json").expect("writes the config");
+
+        let sink = Mutex::new(BTreeSet::from([PathBuf::from(
+            "node_modules/@acme/rates/index.d.ts",
+        )]));
+        let failed = check(CheckOptions {
+            project_root: &dir,
+            config: None,
+            format: "json",
+            timeout: None,
+            selection: Selection::All,
+            switches: Switches {
+                warn_only: false,
+                no_cache: true,
+                report_unused_suppressions: false,
+                fix: false,
+                profile: false,
+            },
+            dependencies: Some(&sink),
+        });
+
+        assert!(failed.is_err(), "the fixture's config must not load");
+        assert!(
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "the failed run left the previous iteration's allowlist in place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

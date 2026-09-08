@@ -1560,6 +1560,29 @@ impl Engine {
         self.provider.clone()
     }
 
+    /// Every path this run depended on, for `--watch`'s allowlist.
+    ///
+    /// The union of [`Outcome::dependency_paths`] — the tracked reads recorded on
+    /// `Query::files` (`lanekeep_types::Query`), which is how the builtin oracle's declaration
+    /// files reach it, and how a `tsc` query's own resolution reads do — and
+    /// [`TypeProvider::dependency_paths`] on the provider this engine holds, which is how the
+    /// `tsc` provider's do: the compiler reads through its own host rather than through
+    /// `Query::files`, so nothing it consults is ever a tracked read on any file, and without
+    /// this half an edit to a linked package's `.d.ts` would wake `--watch` for nothing at all
+    /// under `types.provider: 'tsc'`.
+    ///
+    /// On the engine rather than folded into `Outcome` itself, because the provider is the
+    /// engine's own state — an `Outcome` does not hold one, and a caller with only an
+    /// `Outcome` (the cache's stored answer, say) has no provider to ask.
+    #[must_use]
+    pub fn dependency_paths(&self, outcome: &Outcome) -> BTreeSet<FilePath> {
+        let mut paths = outcome.dependency_paths();
+        if let Some(provider) = self.provider.as_ref() {
+            paths.extend(provider.dependency_paths());
+        }
+        paths
+    }
+
     /// What the provider wants said about the run it prepared, for a caller that can print.
     ///
     /// The engine writes to neither stream, so this is the only way one of these lines reaches
