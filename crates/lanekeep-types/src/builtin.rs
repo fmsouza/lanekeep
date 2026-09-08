@@ -1,9 +1,13 @@
 //! The bounded provider: this crate's own oracle, plus the files it is allowed to open.
 //!
 //! Run-scoped state lives here rather than on [`TypeScriptOracle`](crate::TypeScriptOracle),
-//! which owns exactly one parse and must stay that way. What this holds is a parser, a cache
-//! of parsed declaration files and the memo of paths that were not there — so a library's
-//! `.d.ts` is parsed once per run whatever imports it, and a miss is not re-probed per query.
+//! which owns exactly one parse and must stay that way. What this holds is a parser and a
+//! cache of parsed declaration files, keyed by content hash — so a library's `.d.ts` is
+//! parsed once per version of its bytes, not once per run: a provider a session holds across
+//! requests (#191) keeps every entry whose file has not moved, and
+//! [`TypeProvider::begin_run`] no longer throws that cache away. [`TypeProvider::revalidate`]
+//! is what drops a hash-mismatched entry proactively, ahead of a query finding out the hard
+//! way.
 //!
 //! # Locks
 //!
@@ -65,16 +69,22 @@ pub struct BuiltinProvider {
     /// has no comments. The rule is right about what it sees; the second parser is deliberate,
     /// and the entry is what says a reviewer has already weighed it.
     parser: Mutex<tree_sitter::Parser>,
-    /// Declaration files parsed so far this run, by path.
+    /// Declaration files parsed so far, by path — kept across `begin_run`, not cleared by it.
     ///
     /// A `BTreeMap`, per the ordering invariant, and behind a lock because rayon runs one
-    /// worker per file and they share this provider. A library's `.d.ts` is parsed once
-    /// whatever imports it, which is the difference between a 500 KB `typescript.d.ts` costing
-    /// tens of milliseconds once and costing them per importing file.
+    /// worker per file and they share this provider. A library's `.d.ts` is parsed once per
+    /// version of its bytes, which is the difference between a 500 KB `typescript.d.ts`
+    /// costing tens of milliseconds once and costing them per importing file — and, for a
+    /// provider a session holds across requests (#191), the difference between costing them
+    /// once per session and once per request.
     ///
     /// Entries carry the hash their bytes had, and [`Self::declaration`] compares it against
     /// what the *asking* access read — see that method for why serving by path alone writes an
-    /// entry describing neither version of a file rewritten mid-run.
+    /// entry describing neither version of a file rewritten mid-run. That same hash check is
+    /// what makes it safe for [`TypeProvider::begin_run`] to leave this memo alone: a stale
+    /// entry is never served, so nothing here needs a cold start. [`TypeProvider::revalidate`]
+    /// drops a mismatched entry ahead of time, so a held provider is not carrying a parse
+    /// tree for a version of a file it will never answer about again.
     declarations: Mutex<BTreeMap<FilePath, Arc<Declaration>>>,
     /// Whether each file's imports all resolved, decided once per file.
     ///
@@ -88,6 +98,13 @@ pub struct BuiltinProvider {
     /// entry with nothing in it to invalidate. A provider held across runs must clear this
     /// one rather than drop by hash: a `bool` has no hash to drop by.
     completeness: Mutex<BTreeMap<FilePath, bool>>,
+    /// How many times [`Self::declaration`] has actually parsed a file, this process.
+    ///
+    /// Test-only: the seam that lets a pin distinguish "answered from the memo" from
+    /// "parsed again" without inferring it from timing, which would flake on a loaded
+    /// machine. Nothing outside `#[cfg(test)]` reads it, so it costs nothing in a real run.
+    #[cfg(test)]
+    parses: std::sync::atomic::AtomicUsize,
 }
 
 impl fmt::Debug for BuiltinProvider {
@@ -171,6 +188,8 @@ impl BuiltinProvider {
             parser: Mutex::new(parser),
             declarations: Mutex::new(BTreeMap::new()),
             completeness: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            parses: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -184,7 +203,8 @@ impl BuiltinProvider {
         TypeScriptOracle::new(&self.support, q.tree, q.source).with_imports(q.file, imports)
     }
 
-    /// The parsed declaration file at `path`, parsed once per run per version of its bytes.
+    /// The parsed declaration file at `path`, parsed once per version of its bytes — kept
+    /// across `begin_run` now, not cleared to force a re-parse per run.
     ///
     /// `None` when nothing is there, when it is not text, or when the grammar refuses it —
     /// three different reasons and one answer, because a rule can do nothing different with
@@ -227,6 +247,9 @@ impl BuiltinProvider {
         let Ok(Some(source)) = files.read(path.as_str()) else {
             return None;
         };
+        #[cfg(test)]
+        self.parses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let parsed = Declaration::parse(path.clone(), source, &mut self.parser())?;
         let parsed = Arc::new(parsed);
         // Replaces rather than keeps: the bytes this access read are the ones the run is
@@ -246,6 +269,12 @@ impl BuiltinProvider {
         self.completeness
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many times [`Self::declaration`] has parsed a file, so far.
+    #[cfg(test)]
+    fn parses(&self) -> usize {
+        self.parses.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Follow `name` from `file` through re-exports to the file and name that declare it.
@@ -914,13 +943,18 @@ impl TypeProvider for BuiltinProvider {
         complete
     }
 
-    /// Start a run cold, and answer no key term.
+    /// Start a run, and answer no key term.
     ///
-    /// Both memos are keyed by path with nothing beside them — see their field documentation
-    /// — so a provider held across requests (#191) would otherwise answer a second run from
-    /// the first run's filesystem: a file whose imports did not resolve would stay incomplete
-    /// forever. Clearing is coarse and certainly correct; dropping by hash is plan 6's
-    /// refinement, and `completeness` carries no hash to drop by today.
+    /// **Only `completeness` is cleared here.** It carries no hash to compare against — a
+    /// verdict over a whole file's imports, not a single read — so a provider held across
+    /// requests (#191) would otherwise answer a second run from the first run's filesystem: a
+    /// file whose imports did not resolve would stay incomplete forever. `declarations` is
+    /// *not* cleared: it is keyed by content hash, [`Self::declaration`] compares that hash on
+    /// every access, and a stale entry is therefore never served whether or not this method
+    /// touched it. Clearing it here would only cost the parse back — and for a held provider,
+    /// re-paying that cost every request is the exact overhead holding the provider exists to
+    /// remove. [`Self::revalidate`] is what drops a hash-mismatched entry proactively, ahead
+    /// of `declaration()` finding out the hard way.
     ///
     /// The file list is never asked for: this provider's dependencies are the tracked reads
     /// on each entry, so there is nothing to build up front. Answering an empty term is what
@@ -933,7 +967,6 @@ impl TypeProvider for BuiltinProvider {
         // Neither is read: there is nothing to build up front, so there is nothing for a
         // budget to bound either.
         let _ = (files, budget);
-        self.declarations().clear();
         self.completeness().clear();
         Ok(Vec::new())
     }
@@ -946,6 +979,18 @@ impl TypeProvider for BuiltinProvider {
         out.extend_from_slice(b"builtin:");
         out.extend_from_slice(&crate::oracle_identity());
         out
+    }
+
+    fn revalidate(&self, files: &FileAccess) {
+        // Every held declaration is keyed by the content hash it was parsed from; one whose
+        // bytes moved, or which is gone, is dropped and re-parsed on its next `declaration()`
+        // call. Completeness carries no hash to compare against — it is a verdict over a
+        // whole file's imports, not a single read — so it is simply forgotten, the same
+        // coarse-but-correct move `begin_run` already makes for it.
+        self.declarations().retain(|path, decl| {
+            matches!(files.hash_of(path.as_str()), Ok(Some(hash)) if hash == decl.hash)
+        });
+        self.completeness().clear();
     }
 }
 
@@ -961,9 +1006,44 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    use lanekeep_lang::Language as _;
     use lanekeep_lang_js::TypeScript;
 
-    use super::{BuiltinProvider, FileAccess, FilePath};
+    use super::{AnalysisBudget, BuiltinProvider, FileAccess, FilePath, Query, Type, TypeProvider};
+    use crate::types::Primitive;
+
+    /// Parse `source` with the TypeScript grammar, for building a `Query` by hand.
+    ///
+    /// A local copy of `tests/provider.rs`'s helper of the same name: that one is compiled
+    /// into a separate integration-test binary and cannot be reached from a unit test, which
+    /// is exactly what the parse-count seam below needs — it is a private field.
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&TypeScript.grammar())
+            .expect("the TypeScript grammar loads");
+        parser.parse(source, None).expect("the source parses")
+    }
+
+    /// The last node of `kind` in the tree, in source order — a use rather than a declaration.
+    fn last_of<'t>(tree: &'t tree_sitter::Tree, kind: &str) -> tree_sitter::Node<'t> {
+        let mut best: Option<tree_sitter::Node<'t>> = None;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == kind && best.is_none_or(|b| node.start_byte() > b.start_byte()) {
+                best = Some(node);
+            }
+            let mut cursor = node.walk();
+            let children: Vec<tree_sitter::Node<'t>> = node.children(&mut cursor).collect();
+            stack.extend(children);
+        }
+        best.unwrap_or_else(|| panic!("no `{kind}` node in the tree"))
+    }
+
+    /// A budget generous enough that nothing here can breach it.
+    fn budget() -> AnalysisBudget {
+        AnalysisBudget::start(std::time::Duration::from_mins(10))
+    }
 
     /// The mirror of `a_path_that_was_absent_is_parsed_once_it_becomes_text`: a path that has
     /// stopped answering does not keep its parse.
@@ -1002,6 +1082,167 @@ mod tests {
             provider.declarations().len(),
             0,
             "and the parse it can no longer serve is not held either"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `revalidate` drops only the entry whose bytes moved, and clears completeness wholesale.
+    ///
+    /// Two declaration files are parsed and memoized; one is rewritten between calls. The
+    /// changed entry is dropped — a stale parse must not be served again — and the unchanged
+    /// one is kept, which is the whole point of holding a provider across requests (#191):
+    /// revalidation that dropped everything would cost exactly what never holding it at all
+    /// costs.
+    #[test]
+    fn revalidate_drops_only_the_rewritten_declaration() {
+        let dir = std::env::temp_dir().join(format!(
+            "lanekeep-builtin-revalidate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creates the project directory");
+        std::fs::write(
+            dir.join("stable.d.ts"),
+            "export declare const rate: number;\n",
+        )
+        .expect("writes the stable declaration file");
+        std::fs::write(
+            dir.join("moved.d.ts"),
+            "export declare const rate: number;\n",
+        )
+        .expect("writes the declaration file that will move");
+
+        let provider = BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+        let files = FileAccess::new(&dir);
+        let stable = FilePath::new("stable.d.ts");
+        let moved = FilePath::new("moved.d.ts");
+        assert!(provider.declaration(&files, &stable).is_some());
+        assert!(provider.declaration(&files, &moved).is_some());
+        assert_eq!(provider.declarations().len(), 2, "both are held");
+        // A file completeness would have been decided over, so the clearing this test also
+        // asserts has something in it to clear.
+        provider
+            .completeness()
+            .insert(FilePath::new("src/a.ts"), true);
+
+        std::fs::write(
+            dir.join("moved.d.ts"),
+            "export declare const rate: string;\n",
+        )
+        .expect("rewrites the declaration file");
+        provider.revalidate(&FileAccess::new(&dir));
+
+        assert_eq!(
+            provider.declarations().len(),
+            1,
+            "the rewritten entry is dropped, the unchanged one is not"
+        );
+        assert!(
+            provider.declarations().contains_key(&stable),
+            "the file whose bytes did not move is still held"
+        );
+        assert!(
+            !provider.declarations().contains_key(&moved),
+            "the file whose bytes moved is not"
+        );
+        assert!(
+            provider.completeness().is_empty(),
+            "completeness carries no hash to compare against, so it is simply forgotten"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The point of holding a provider: `begin_run` no longer throws its parses away, and a
+    /// held declaration answers across two runs without being read from disk a second time —
+    /// but a rewrite between them is still caught, because `revalidate` is what a session
+    /// calls to catch it.
+    #[test]
+    fn a_held_declaration_survives_begin_run_and_is_reparsed_after_a_revalidated_rewrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "lanekeep-builtin-parse-once-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creates the project directory");
+        std::fs::write(
+            dir.join("money.d.ts"),
+            "export declare const rate: number;\n",
+        )
+        .expect("writes the declaration file");
+
+        let provider = BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+        let subject = "import { rate } from './money';\nconst y = rate;\n";
+        let tree = parse(subject);
+        let file = FilePath::new("a.ts");
+        let node = last_of(&tree, "identifier");
+
+        // Each "request" below builds its own `FileAccess`, exactly as `SessionProvider` does
+        // per request in `crates/lanekeep-cli/src/session.rs` — a `FileAccess` memoizes the
+        // hashes it reads for its own lifetime, so reusing one across requests would hide a
+        // rewrite behind that memo rather than testing what `begin_run`/`revalidate` do.
+        let request_one = FileAccess::new(&dir);
+        assert_eq!(
+            provider.type_of(Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node,
+                files: &request_one,
+            }),
+            Some(Type::Primitive(Primitive::Number)),
+            "the first request reads and parses the declaration file"
+        );
+        assert_eq!(provider.parses(), 1, "one read, one parse");
+
+        provider
+            .begin_run(&Vec::new, budget())
+            .expect("a second run begins");
+        let request_two = FileAccess::new(&dir);
+        assert_eq!(
+            provider.type_of(Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node,
+                files: &request_two,
+            }),
+            Some(Type::Primitive(Primitive::Number)),
+            "still answers across the run boundary"
+        );
+        assert_eq!(
+            provider.parses(),
+            1,
+            "the declaration is held across `begin_run` now — its bytes did not move, so it \
+             is not parsed again"
+        );
+
+        std::fs::write(
+            dir.join("money.d.ts"),
+            "export declare const rate: string;\n",
+        )
+        .expect("rewrites the declaration file");
+        let request_three = FileAccess::new(&dir);
+        provider.revalidate(&request_three);
+        provider
+            .begin_run(&Vec::new, budget())
+            .expect("a third run begins");
+        assert_eq!(
+            provider.type_of(Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node,
+                files: &request_three,
+            }),
+            Some(Type::Primitive(Primitive::String)),
+            "revalidate dropped the stale entry, so the rewrite is seen"
+        );
+        assert_eq!(
+            provider.parses(),
+            2,
+            "the rewritten file is re-parsed exactly once, on the request that revalidated it"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

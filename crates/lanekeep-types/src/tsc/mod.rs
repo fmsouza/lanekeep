@@ -83,7 +83,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Mutex, PoisonError};
 
-use lanekeep_core::{AnalysisBudget, FilePath, TypesConfig, analysis_overrun_fallback};
+use lanekeep_core::{AnalysisBudget, FileAccess, FilePath, TypesConfig, analysis_overrun_fallback};
 
 use crate::provider::{BeginRunError, Query, TypeProvider};
 use crate::types::{Primitive, Symbol, Type};
@@ -825,6 +825,13 @@ impl TypeProvider for TscProvider {
 
     fn identity(&self) -> Vec<u8> {
         self.identity.clone()
+    }
+
+    fn revalidate(&self, _files: &FileAccess) {
+        // Nothing to do: the sidecar's state is the programs it built, and `begin_run`
+        // re-answers `programs` — re-reading every config's file set and rebuilding with
+        // `oldProgram` — on every prepare, held provider or not. The program hash the run key
+        // folds is therefore already current per request without this method's help.
     }
 
     fn begin_run(

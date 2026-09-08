@@ -919,3 +919,106 @@ fn no_provider_error_renders_a_run_of_spaces() {
         }
     }
 }
+
+/// A parsed tree for building a `Query`'s node by hand.
+///
+/// `TscProvider` never reads `q.tree` or `q.source` — see this module's doc comment on
+/// `impl TypeProvider for TscProvider` — but a real byte-offset node is still needed for
+/// `q.node`, which `locate` reads. A hand-rolled grammar load rather than pulling in
+/// `tests/provider.rs`'s helper of the same name: that one lives in a separate integration
+/// test binary this file cannot reach.
+///
+/// This is the second parser `local/one-parser-per-file` sees in this file, over fixture
+/// source rather than the engine's own corpus — the same shape `tests/provider.rs`'s helper
+/// and `builtin.rs`'s declaration parser are, and the reason `lanekeep.json`'s `allow` list
+/// names `crates/lanekeep-types/src/tsc/tests.rs` explicitly, since JSON carries no comment
+/// to say so there.
+fn parse(source: &str) -> tree_sitter::Tree {
+    use lanekeep_lang::Language as _;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&lanekeep_lang_js::TypeScript.grammar())
+        .expect("the TypeScript grammar loads");
+    parser.parse(source, None).expect("the source parses")
+}
+
+/// The last node of `kind` in the tree, in source order.
+fn last_of<'t>(tree: &'t tree_sitter::Tree, kind: &str) -> tree_sitter::Node<'t> {
+    let mut best: Option<tree_sitter::Node<'t>> = None;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind && best.is_none_or(|b| node.start_byte() > b.start_byte()) {
+            best = Some(node);
+        }
+        let mut cursor = node.walk();
+        let children: Vec<tree_sitter::Node<'t>> = node.children(&mut cursor).collect();
+        stack.extend(children);
+    }
+    best.unwrap_or_else(|| panic!("no `{kind}` node in the tree"))
+}
+
+/// `revalidate` is a documented no-op for this provider (see its body in `mod.rs`) — the
+/// programs it would revalidate are already rebuilt by `begin_run` on every prepare, held
+/// provider or not. This pins the claim rather than trusting the comment: a held provider,
+/// asked the same question across two `revalidate` + `begin_run` cycles with a real edit to
+/// the typed source between them, answers the *new* type both times, never the first run's.
+#[test]
+fn a_held_providers_revalidate_answers_the_edit_begin_run_rebuilt() {
+    if !tsc_available() {
+        eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+        return;
+    }
+    let root = fixture_with(
+        "revalidate-typeof",
+        STRICT,
+        &[("src/a.ts", "export const n: number = 1;\n")],
+    );
+    let provider = TscProvider::spawn(
+        &root,
+        &tsc_config(),
+        AnalysisBudget::start(Duration::from_mins(2)),
+    )
+    .expect("the sidecar starts");
+    let file = FilePath::new("src/a.ts");
+    let files = || vec![file.clone()];
+
+    provider
+        .begin_run(&files, AnalysisBudget::start(Duration::from_mins(2)))
+        .expect("the first run's programs build");
+    let first_source = "export const n: number = 1;\n";
+    let first_tree = parse(first_source);
+    assert_eq!(
+        provider.type_of(Query {
+            file: &file,
+            tree: &first_tree,
+            source: first_source,
+            node: last_of(&first_tree, "identifier"),
+            files: &FileAccess::new(&root),
+        }),
+        Some(Type::Primitive(Primitive::Number)),
+        "the first run answers the number annotation"
+    );
+
+    std::fs::write(root.join("src/a.ts"), "export const n: string = \"x\";\n")
+        .expect("rewrites the typed source");
+    provider.revalidate(&FileAccess::new(&root));
+    provider
+        .begin_run(&files, AnalysisBudget::start(Duration::from_mins(2)))
+        .expect("the second run's programs rebuild over the edit");
+    let second_source = "export const n: string = \"x\";\n";
+    let second_tree = parse(second_source);
+    assert_eq!(
+        provider.type_of(Query {
+            file: &file,
+            tree: &second_tree,
+            source: second_source,
+            node: last_of(&second_tree, "identifier"),
+            files: &FileAccess::new(&root),
+        }),
+        Some(Type::Primitive(Primitive::String)),
+        "revalidate is a no-op, and begin_run's own program rebuild is what makes the edit \
+         visible — this is the claim its doc comment makes, pinned"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

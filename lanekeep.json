@@ -31,6 +31,7 @@
           "crates/lanekeep-rules/tests/*",
           "crates/lanekeep-types/benches/*",
           "crates/lanekeep-types/src/builtin.rs",
+          "crates/lanekeep-types/src/tsc/tests.rs",
           "crates/lanekeep-types/tests/*",
           "crates/lanekeep-wasm/tests/*"
         ]

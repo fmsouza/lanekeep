@@ -186,8 +186,13 @@ fn the_default_begin_run_does_not_walk_the_corpus() {
 /// hash first is what closes it, and it is why nothing memoizes a failure at all now: a second
 /// probe is one `hash_of`, which the access answers from its own memo.
 ///
-/// The two halves of the same rule: a `.d.ts` installed mid-run is read, and `begin_run` still
-/// starts the next run cold for the memo that has no hash to compare at all.
+/// `begin_run` no longer forces a reparse: the declaration answers a second run without ever
+/// having been dropped, because it is kept by hash rather than cleared wholesale (Task 6.1's
+/// fix round). Before that, the assertion below passed for a different reason — `begin_run`
+/// cleared the memo and a *cold* re-read happened to find the same file — so this is the same
+/// black-box check the earlier version made, retitled to the contract it actually exercises;
+/// `crates/lanekeep-types/src/builtin.rs`'s own unit tests are what can see the memo directly
+/// and assert the file is not reparsed.
 #[test]
 fn a_path_that_was_absent_is_parsed_once_it_becomes_text() {
     let project = Project::new("miss-becomes-text", &[]);
@@ -209,15 +214,18 @@ fn a_path_that_was_absent_is_parsed_once_it_becomes_text() {
         .expect("a run begins");
     assert!(
         provider.declaration(&project.files(), &path).is_some(),
-        "and a run still starts cold"
+        "and a held declaration answers a second run, whether by surviving begin_run or by \
+         being re-read cold — either way, nothing here can stay missing forever"
     );
 }
 
-/// And the completeness memo with them.
+/// Unlike the declaration memo above, completeness *is* cleared every run.
 ///
-/// Separate from the declaration memo above because it is the one a rule reads directly: a
-/// file that was incomplete because a declaration was missing must be re-decided once the
-/// declaration exists, and nothing but this clearing can make that happen for a held provider.
+/// It carries no hash to compare against — a verdict over a whole file's imports, not a
+/// single read — so a held provider (#191) has no way to tell a stale entry from a current
+/// one except by forgetting it. It is the one a rule reads directly, too: a file that was
+/// incomplete because a declaration was missing must be re-decided once the declaration
+/// exists, and nothing but this clearing can make that happen for a held provider.
 #[test]
 fn begin_run_clears_a_held_providers_completeness_memo() {
     let project = Project::new("begin-run-clears-completeness", &[]);

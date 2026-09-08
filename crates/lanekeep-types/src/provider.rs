@@ -109,6 +109,23 @@ pub trait TypeProvider: Send + Sync {
     /// `src/`, for exactly that reason.
     fn identity(&self) -> Vec<u8>;
 
+    /// Drop whatever this provider holds that the files no longer support.
+    ///
+    /// Called once per request by a session that holds this provider across several of them
+    /// (`crates/lanekeep-cli/src/session.rs`). A one-shot run builds a provider and throws it
+    /// away, so for that path this is a no-op that costs a virtual call.
+    ///
+    /// The default body is empty because a provider with no cache has nothing to revalidate,
+    /// and requiring every implementor to write that down would be noise. The two that do
+    /// hold something override it: the builtin provider re-hashes each declaration it parsed
+    /// and forgets its memoized completeness, and the `tsc` provider does nothing here because
+    /// `begin_run` already re-answers `programs` on every prepare, held provider or not.
+    /// **Nothing here reads an mtime** — held state is keyed by content hash, which is the
+    /// only reason it is allowed to be held at all (architecture §8.2).
+    fn revalidate(&self, files: &FileAccess) {
+        let _ = files;
+    }
+
     /// Prepare for a run over the corpus `files` yields, and answer the per-run key term.
     ///
     /// Called by the engine once per run, after discovery and before the run key is
@@ -221,4 +238,92 @@ pub enum BeginRunError {
     Timeout(String),
     /// The provider could not do its work at all.
     Failed(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// A provider that answers nothing and counts revalidations.
+    ///
+    /// Nothing here needs a parsed tree: the property under test is that the call reaches an
+    /// implementor through the trait object a session holds, which is exactly what a
+    /// concrete-typed test could not establish.
+    #[derive(Default)]
+    struct Counting(AtomicUsize);
+
+    impl TypeProvider for Counting {
+        fn type_of(&self, _q: Query<'_>) -> Option<Type> {
+            None
+        }
+        fn symbol_of(&self, _q: Query<'_>) -> Option<Symbol> {
+            None
+        }
+        fn return_type_of(&self, _q: Query<'_>) -> Option<Type> {
+            None
+        }
+        fn is_assignable_to(&self, _q: Query<'_>, _module: &str, _name: &str) -> Option<bool> {
+            None
+        }
+        fn complete(&self, _q: Query<'_>) -> bool {
+            false
+        }
+        fn identity(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn revalidate(&self, _files: &FileAccess) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A provider that overrides nothing, to prove the default body exists.
+    #[derive(Default)]
+    struct Silent;
+
+    impl TypeProvider for Silent {
+        fn type_of(&self, _q: Query<'_>) -> Option<Type> {
+            None
+        }
+        fn symbol_of(&self, _q: Query<'_>) -> Option<Symbol> {
+            None
+        }
+        fn return_type_of(&self, _q: Query<'_>) -> Option<Type> {
+            None
+        }
+        fn is_assignable_to(&self, _q: Query<'_>, _module: &str, _name: &str) -> Option<bool> {
+            None
+        }
+        fn complete(&self, _q: Query<'_>) -> bool {
+            false
+        }
+        fn identity(&self) -> Vec<u8> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn revalidate_reaches_an_implementor_through_the_trait_object() {
+        let counting = std::sync::Arc::new(Counting::default());
+        let held: std::sync::Arc<dyn TypeProvider> = counting.clone();
+        let files = FileAccess::new(std::path::Path::new("."));
+
+        held.revalidate(&files);
+        held.revalidate(&files);
+
+        assert_eq!(
+            counting.0.load(Ordering::Relaxed),
+            2,
+            "a session revalidates once per request, through the trait object it holds"
+        );
+    }
+
+    #[test]
+    fn a_provider_that_holds_nothing_need_not_override_revalidate() {
+        // The default body is what keeps every other implementor compiling — a provider with
+        // no cache has nothing to drop, and requiring it to say so would be noise.
+        let held: std::sync::Arc<dyn TypeProvider> = std::sync::Arc::new(Silent);
+        held.revalidate(&FileAccess::new(std::path::Path::new(".")));
+    }
 }
