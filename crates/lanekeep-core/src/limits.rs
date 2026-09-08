@@ -34,6 +34,15 @@ pub const DEFAULT_GLOBAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default memory ceiling per JavaScript runtime, which means per worker.
 pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Default wall-clock budget for host-side type-provider work across a whole run.
+///
+/// A minute rather than the fifteen seconds `DEFAULT_GLOBAL_TIMEOUT` gives guest execution,
+/// because what this bounds is the user's own TypeScript program being built — a cost that
+/// belongs to their project and scales with it, not with anything a rule did. That is also
+/// why it is configurable where `COMPILE_BUDGET_PER_COMPONENT` is not: lanekeep's own
+/// artifacts are lanekeep's problem, and a monorepo's `tsc` is not.
+pub const DEFAULT_ANALYSIS_TIMEOUT: Duration = Duration::from_mins(1);
+
 /// The three budgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -50,6 +59,15 @@ pub struct Limits {
     /// a thousand rules each taking twenty milliseconds.
     pub global_timeout: Duration,
 
+    /// Wall-clock budget for host-side type-provider work across the whole run.
+    ///
+    /// Separate from `global_timeout` because it bounds host work rather than guest
+    /// execution, and the two must not subsidize each other: a program build charged to the
+    /// run budget would make a cold `tsc` run and a warm one take different exits over
+    /// identical input, which is exactly the reasoning architecture §6.8 gives for taking
+    /// component compilation off the run clock.
+    pub analysis_timeout: Duration,
+
     /// Memory ceiling per runtime.
     pub memory_bytes: usize,
 }
@@ -59,6 +77,7 @@ impl Default for Limits {
         Self {
             rule_timeout: DEFAULT_RULE_TIMEOUT,
             global_timeout: DEFAULT_GLOBAL_TIMEOUT,
+            analysis_timeout: DEFAULT_ANALYSIS_TIMEOUT,
             memory_bytes: DEFAULT_MEMORY_BYTES,
         }
     }
@@ -86,6 +105,13 @@ impl Limits {
     #[must_use]
     pub const fn with_memory_bytes(mut self, bytes: usize) -> Self {
         self.memory_bytes = bytes;
+        self
+    }
+
+    /// Set the analysis budget.
+    #[must_use]
+    pub const fn with_analysis_timeout(mut self, timeout: Duration) -> Self {
+        self.analysis_timeout = timeout;
         self
     }
 }
@@ -354,5 +380,19 @@ mod tests {
     #[test]
     fn a_zero_global_budget_is_immediately_expired() {
         assert!(RunClock::start(Duration::ZERO).is_expired());
+    }
+
+    #[test]
+    fn the_analysis_budget_defaults_to_a_minute() {
+        assert_eq!(Limits::default().analysis_timeout, Duration::from_mins(1));
+        assert_eq!(DEFAULT_ANALYSIS_TIMEOUT, Duration::from_mins(1));
+    }
+
+    #[test]
+    fn the_analysis_budget_is_settable_without_moving_the_others() {
+        let limits = Limits::default().with_analysis_timeout(Duration::from_secs(5));
+        assert_eq!(limits.analysis_timeout, Duration::from_secs(5));
+        assert_eq!(limits.rule_timeout, DEFAULT_RULE_TIMEOUT);
+        assert_eq!(limits.global_timeout, DEFAULT_GLOBAL_TIMEOUT);
     }
 }

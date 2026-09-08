@@ -74,6 +74,38 @@
           "type": "integer",
           "minimum": 1,
           "description": "Wall-clock budget for the whole run."
+        },
+        "analysis": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Wall-clock budget for host-side type-provider work across the whole run. Only the tsc provider spends it; the built-in oracle never comes near it."
+        }
+      }
+    },
+    "types": {
+      "type": "object",
+      "description": "Which type oracle answers ctx.types. The built-in one needs no toolchain; the tsc one spawns the project's own TypeScript compiler, which makes a run slower and its answers wider.",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["builtin", "tsc"],
+          "default": "builtin",
+          "description": "builtin is lanekeep's own bounded oracle. tsc drives the project's typescript package through a sidecar process."
+        },
+        "command": {
+          "type": "array",
+          "description": "How to launch the sidecar. tsc only; ignored under builtin.",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "default": ["node"],
+          "examples": [["node"], ["node", "--max-old-space-size=8192"]]
+        },
+        "typescript": {
+          "type": "string",
+          "description": "The typescript package the sidecar loads, resolved from the project root. tsc only; ignored under builtin.",
+          "default": "./node_modules/typescript",
+          "examples": ["./node_modules/typescript"]
         }
       }
     },

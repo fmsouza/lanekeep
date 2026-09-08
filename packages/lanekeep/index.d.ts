@@ -553,6 +553,8 @@ export interface Config {
     rule?: number
     /** Wall-clock, for the whole run. */
     global?: number
+    /** Wall-clock for host-side type-provider work, across the whole run. */
+    analysis?: number
   }
   /** Policy for suppression directives. All off by default. */
   suppressions?: {
@@ -562,6 +564,19 @@ export interface Config {
     maxExpiryDays?: number
     /** Any whole-file directive is reported. */
     forbidFileScope?: boolean
+  }
+  /** Which type oracle answers `ctx.types`. */
+  types?: {
+    /**
+     * `builtin` is lanekeep's own bounded oracle and needs no toolchain. `tsc` drives the
+     * project's own `typescript` package through a sidecar process: wider answers, a slower
+     * run, and a pre-commit hook that builds the project's program before it checks anything.
+     */
+    provider?: 'builtin' | 'tsc'
+    /** How to launch the sidecar. `tsc` only. */
+    command?: string[]
+    /** The `typescript` package the sidecar loads, resolved from the project root. `tsc` only. */
+    typescript?: string
   }
   /** The rules to run, in order. */
   rules: Rule[]
