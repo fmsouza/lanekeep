@@ -59,7 +59,7 @@ pub use location::{FilePath, Location, Position};
 pub use rule_id::{Namespace, ParseRuleIdError, RuleId};
 pub use severity::{ParseSeverityError, Severity};
 pub use suppression::{Suppression, Suppressions};
-pub use tracked::{ContentHash, TrackedRead};
+pub use tracked::{ContentHash, ReadOutcome, TrackedRead};
 pub use violation::{Violation, any_failing, sort};
 
 /// A host analysis a rule can declare it needs.

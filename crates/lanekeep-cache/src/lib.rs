@@ -31,7 +31,7 @@ pub mod store;
 
 use std::path::Path;
 
-use lanekeep_core::ContentHash;
+use lanekeep_core::{ContentHash, ReadOutcome};
 
 pub use entry::Entry;
 pub use key::{CacheKey, FORMAT_VERSION, GrammarKey, RunKey};
@@ -50,23 +50,60 @@ pub fn hash_bytes(bytes: &[u8]) -> ContentHash {
 /// A dependency that cannot be read now counts as changed, whether it was recorded as
 /// present or absent. Permissions, a vanished directory, a race — none of them are grounds
 /// for trusting a cached answer, and the cost of being wrong is a recompute.
+///
+/// # It reproduces the decision `FileAccess` made, rather than making a simpler one
+///
+/// Reads here go through the same confinement a rule's read went through: resolve, and only
+/// then look at what is there. A bare `std::fs::read(root.join(path))` is the obvious
+/// spelling and is wrong twice over. It **follows a symlink out of the project**, so a
+/// validator reads bytes the rule was refused — and it cannot tell a path that is still
+/// refused from one that has appeared, so every importer of a store-linked package (pnpm's
+/// `node_modules/pkg`, a workspace link) missed the cache on every run, forever, with nothing
+/// in the output to say why.
+///
+/// So each recorded outcome is checked against the outcome the same path would produce now,
+/// and they have to be the same one: refused *and still escaping* holds; refused and now a
+/// real in-root directory does not, because `npm install` replacing the link is exactly the
+/// change the entry depended on.
 #[must_use]
 pub fn validate(entry: &Entry, root: &Path) -> bool {
-    entry.dependencies.iter().all(|read| {
-        let current = std::fs::read(root.join(read.path.as_str()))
-            .ok()
-            .map(|bytes| hash_bytes(&bytes));
+    // Canonical, because every containment check compares against it: a symlinked checkout
+    // would otherwise fail every one of them and invalidate the whole cache. The same
+    // fallback `FileAccess::new` uses, for the same reason — a root that cannot be
+    // canonicalized is a root nothing resolves under, and the reads below then answer absent.
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // One equality rather than a table, because the three cases really are one question. It
+    // was there and still hashes the same; it was not there and still is not, which is the
+    // case a cache is wrong without; or it left the root through a symlink and still does, so
+    // a rule would be refused again. Everything else — appeared, vanished, became unreadable,
+    // stopped escaping, started escaping — is a change, and every one of those is a `!=`.
+    entry
+        .dependencies
+        .iter()
+        .all(|read| read.outcome == current(&root, read.path.as_str()))
+}
 
-        match (read.hash, current) {
-            // It was there and still hashes the same.
-            (Some(recorded), Some(now)) => recorded == now,
-            // It was not there and still is not. This is the case a cache is wrong without:
-            // a rule that branched on absence has to be reconsidered when the file appears.
-            (None, None) => true,
-            // Appeared, or vanished, or became unreadable.
-            _ => false,
-        }
-    })
+/// What reading `path` under `root` would answer now, confined as a rule's read is.
+///
+/// Deliberately the same three answers a tracked read carries, so validation is an equality
+/// rather than a table of special cases. This is the one place `lanekeep-cache` touches the
+/// filesystem directly: `canonicalize`, a containment check, and a read of what is inside.
+fn current(root: &Path, path: &str) -> ReadOutcome {
+    let Ok(canonical) = root.join(path).canonicalize() else {
+        // Nothing there — or nothing reachable, which a rule's own read cannot tell apart
+        // either.
+        return ReadOutcome::Absent;
+    };
+    if !canonical.starts_with(root) {
+        // A symlink out of the project. Refused unread, exactly as `FileAccess::load` refuses
+        // it, and *before* any bytes are touched: this is what keeps the validator inside the
+        // root even when the filesystem does not.
+        return ReadOutcome::Refused;
+    }
+    match std::fs::read(&canonical) {
+        Ok(bytes) => ReadOutcome::Found(hash_bytes(&bytes)),
+        Err(_) => ReadOutcome::Absent,
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +207,29 @@ mod tests {
         assert!(!validate(&entry, &project.dir));
     }
 
+    /// A binary dependency holds while its bytes are unchanged, and invalidates when they
+    /// are not.
+    ///
+    /// `FileAccess` cannot hand a rule the text of a binary file, but the file is still a
+    /// dependency — replace an image with text and a rule's answer can change. It is recorded
+    /// with the digest of its bytes, which is exactly what `current` recomputes: for a while a
+    /// zero placeholder stood there instead, a value no real file hashes to, so an entry
+    /// naming a binary dependency was invalid on every run however still the file lay.
+    #[test]
+    fn a_binary_dependency_holds_until_its_bytes_change() {
+        let project = Project::new("binary", &[]);
+        let bytes = [0xff_u8, 0xfe, 0x00, 0x01];
+        std::fs::write(project.dir.join("logo.png"), bytes).expect("writes");
+        let entry = entry_depending_on(vec![TrackedRead::found(
+            FilePath::new("logo.png"),
+            hash_bytes(&bytes),
+        )]);
+        assert!(validate(&entry, &project.dir), "the bytes are unchanged");
+
+        std::fs::write(project.dir.join("logo.png"), [0xff_u8, 0xfe, 0x00, 0x02]).expect("writes");
+        assert!(!validate(&entry, &project.dir), "and now they are not");
+    }
+
     #[test]
     fn one_changed_dependency_among_many_invalidates() {
         let project = Project::new(
@@ -194,6 +254,103 @@ mod tests {
             hash_bytes(b"{}"),
         )]);
         assert!(!validate(&entry, &project.dir));
+    }
+
+    /// A refusal that still escapes the root holds, and the validator never reads the target.
+    ///
+    /// The case the third outcome exists for. `node_modules/pkg` as pnpm links it resolves out
+    /// of the project, so every read under it was refused unread; recorded as an absence, the
+    /// validator looked for the file, followed the link, found it, and invalidated — on every
+    /// run, for every importer of a linked package, with nothing in the output to say why.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_dependency_that_still_escapes_holds() {
+        let project = Project::new("refused-still-escaping", &[]);
+        let outside = std::env::temp_dir().join(format!(
+            "lanekeep-validate-refused-target-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).expect("creates the target directory");
+        std::fs::write(
+            outside.join("index.d.ts"),
+            "export declare const x: number;\n",
+        )
+        .expect("writes the target");
+        std::fs::create_dir_all(project.dir.join("node_modules")).expect("creates node_modules");
+        std::os::unix::fs::symlink(&outside, project.dir.join("node_modules/pkg"))
+            .expect("creates the link");
+
+        let entry = entry_depending_on(vec![TrackedRead::refused(FilePath::new(
+            "node_modules/pkg/index.d.ts",
+        ))]);
+        assert!(
+            validate(&entry, &project.dir),
+            "the read would be refused again, so the answer that rested on it stands"
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// And `npm install` replacing the link with a real directory invalidates.
+    ///
+    /// The half that says the row above measures the refusal rather than a validator that
+    /// holds everything: the path is now inside the root and readable, so the `undefined` the
+    /// refusal produced is no longer the answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_dependency_that_became_a_real_file_invalidates() {
+        let project = Project::new("refused-now-real", &[]);
+        project.write(
+            "node_modules/pkg/index.d.ts",
+            "export declare const x: number;\n",
+        );
+
+        let entry = entry_depending_on(vec![TrackedRead::refused(FilePath::new(
+            "node_modules/pkg/index.d.ts",
+        ))]);
+        assert!(!validate(&entry, &project.dir));
+    }
+
+    /// And a refusal whose link is gone entirely invalidates too.
+    ///
+    /// Absent is not refused: a rule reading this path now would be told "nothing there"
+    /// rather than be refused, and that is a different answer from the one recorded.
+    #[test]
+    fn a_refused_dependency_that_vanished_invalidates() {
+        let project = Project::new("refused-vanished", &[]);
+        let entry = entry_depending_on(vec![TrackedRead::refused(FilePath::new(
+            "node_modules/pkg/index.d.ts",
+        ))]);
+        assert!(!validate(&entry, &project.dir));
+    }
+
+    /// A dependency that was read and now leaves the root invalidates.
+    ///
+    /// The mirror of the refusal rows: a path replaced by a symlink out of the project is a
+    /// path a rule can no longer read, so an entry that read it is answering about bytes
+    /// nothing would hand it now — and the validator must decide that without reading them.
+    #[cfg(unix)]
+    #[test]
+    fn a_found_dependency_that_now_escapes_the_root_invalidates() {
+        let project = Project::new("found-now-escaping", &[]);
+        let outside = std::env::temp_dir().join(format!(
+            "lanekeep-validate-escaped-target-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&outside, "{}").expect("writes the target");
+        std::os::unix::fs::symlink(&outside, project.dir.join("package.json"))
+            .expect("creates the link");
+
+        let entry = entry_depending_on(vec![TrackedRead::found(
+            FilePath::new("package.json"),
+            hash_bytes(b"{}"),
+        )]);
+        assert!(
+            !validate(&entry, &project.dir),
+            "the bytes are identical and the read is not one a rule could make"
+        );
+
+        let _ = std::fs::remove_file(&outside);
     }
 
     #[test]

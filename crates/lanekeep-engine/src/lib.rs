@@ -6219,7 +6219,7 @@ export default defineRule({
                 let deps = deps.unwrap_or_else(|| panic!("src/f{i:02}.ts should have read"));
                 assert_eq!(deps.len(), 1);
                 assert_eq!(deps[0].path.as_str(), "policy.json");
-                assert!(deps[0].hash.is_some());
+                assert!(deps[0].hash().is_some());
             }
         }
     }
@@ -6256,7 +6256,7 @@ export default defineRule({
             .expect("the miss is a dependency");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].path.as_str(), "tsconfig.json");
-        assert_eq!(deps[0].hash, None, "absence is recorded as absence");
+        assert_eq!(deps[0].hash(), None, "absence is recorded as absence");
     }
 
     #[test]
@@ -6313,7 +6313,7 @@ export default defineRule({
         // dependencies on one file.
         let a = &outcome.dependencies[&FilePath::new("src/a.ts")][0];
         let b = &outcome.dependencies[&FilePath::new("src/b.ts")][0];
-        assert_eq!(a.hash, b.hash);
+        assert_eq!(a.hash(), b.hash());
     }
 
     #[test]
@@ -9381,7 +9381,7 @@ export default defineRule({
                 "one path read once must be one dependency, not one per engine: {reads:?}"
             );
             assert_eq!(reads[0].path.as_str(), "shared.json");
-            assert!(reads[0].hash.is_some(), "the file was there and was read");
+            assert!(reads[0].hash().is_some(), "the file was there and was read");
         }
 
         #[test]

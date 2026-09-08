@@ -21,7 +21,7 @@
 use lanekeep_core::fact::Fact;
 use lanekeep_core::fix::Fix;
 use lanekeep_core::suppression::{Date, Scope, Suppression};
-use lanekeep_core::tracked::{ContentHash, TrackedRead};
+use lanekeep_core::tracked::{ContentHash, ReadOutcome, TrackedRead};
 use lanekeep_core::{FilePath, Location, Position, RuleId, Severity, Violation};
 
 /// Everything one file's pass produced.
@@ -116,15 +116,19 @@ impl Entry {
         write_len(out, self.dependencies.len());
         for read in &self.dependencies {
             write_str(out, read.path.as_str());
-            match read.hash {
-                // A present/absent flag rather than a sentinel hash: "this file was not
-                // there" is a distinct answer from any possible digest, and encoding it as
-                // one would make an unlucky file collide with absence.
-                Some(hash) => {
+            match read.outcome {
+                // A tagged outcome rather than a sentinel hash: "this file was not there" is a
+                // distinct answer from any possible digest, and encoding it as one would make
+                // an unlucky file collide with absence. Three tags rather than two, because a
+                // refusal is checked against the filesystem differently from an absence — see
+                // `lanekeep_core::tracked::ReadOutcome` — and a reader that could not tell
+                // them apart would have to guess.
+                ReadOutcome::Absent => out.push(0),
+                ReadOutcome::Found(hash) => {
                     out.push(1);
                     out.extend_from_slice(hash.as_bytes());
                 }
-                None => out.push(0),
+                ReadOutcome::Refused => out.push(2),
             }
         }
     }
@@ -224,12 +228,13 @@ impl Entry {
         let mut dependencies = Vec::with_capacity(cursor.peek_len()?);
         for _ in 0..cursor.read_len()? {
             let path = FilePath::new(cursor.read_str()?);
-            let hash = match cursor.read_u8()? {
-                0 => None,
-                1 => Some(ContentHash::new(cursor.read_hash()?)),
+            let outcome = match cursor.read_u8()? {
+                0 => ReadOutcome::Absent,
+                1 => ReadOutcome::Found(ContentHash::new(cursor.read_hash()?)),
+                2 => ReadOutcome::Refused,
                 _ => return None,
             };
-            dependencies.push(TrackedRead { path, hash });
+            dependencies.push(TrackedRead { path, outcome });
         }
 
         // Trailing bytes mean this is not the entry it claims to be. Accepting them would
@@ -509,7 +514,37 @@ mod tests {
             ..Entry::default()
         };
         let decoded = round_trip(&entry).expect("decodes");
-        assert_eq!(decoded.dependencies[0].hash, None);
+        assert_eq!(decoded.dependencies[0].hash(), None);
+    }
+
+    #[test]
+    fn a_refusal_survives_as_a_refusal() {
+        // The third outcome, and the one with no hash to tell it apart from an absence: a
+        // read the confinement rule turned away must not come back as "this file was not
+        // there", because the two invalidate on opposite events.
+        let entry = Entry {
+            dependencies: vec![TrackedRead::refused(FilePath::new("node_modules/money"))],
+            ..Entry::default()
+        };
+        let decoded = round_trip(&entry).expect("decodes");
+        assert_eq!(decoded.dependencies[0].outcome, ReadOutcome::Refused);
+    }
+
+    #[test]
+    fn an_unknown_dependency_tag_is_rejected() {
+        // Three tags are defined. A fourth was written by something else, and guessing which
+        // outcome it meant would put an invented dependency into a validated entry.
+        let mut bytes = Vec::new();
+        Entry {
+            dependencies: vec![TrackedRead::absent(FilePath::new("tsconfig.json"))],
+            ..Entry::default()
+        }
+        .encode(&mut bytes);
+
+        let tag = bytes.len() - 1;
+        assert_eq!(bytes[tag], 0, "the absent tag is the last byte written");
+        bytes[tag] = 3;
+        assert_eq!(Entry::decode(&bytes), None);
     }
 
     #[test]
