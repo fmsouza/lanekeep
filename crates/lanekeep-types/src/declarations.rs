@@ -4,22 +4,27 @@
 //! `node-types.json`, which is where the fields are *declared*. A hand-written sample cannot
 //! stand in for that: a sample with zero `ERROR` nodes still omits whatever the author did not
 //! think to write, and AGENTS.md records four wrong claims about this grammar produced exactly
-//! that way. The kinds a statement can declare with are now read through
-//! `JsBindingResolver::declares`, which owns that walk — this file's own table, kept in
-//! parallel with it, drifted once already (#229).
+//! that way. The kinds a statement can declare with are read through the resolver's
+//! [`BindingResolver::declares`], which owns that walk — this file's own table, kept in
+//! parallel with it, drifted once already (#229) — and the resolver is reached through the
+//! trait, the way the oracle reaches `declaration_of`, so this crate names no language crate.
 
 use std::fmt;
+use std::sync::Arc;
 
 use lanekeep_core::FilePath;
 use lanekeep_core::tracked::ContentHash;
-use lanekeep_lang::binding::ImportedName;
-use lanekeep_lang_js::binding::JsBindingResolver;
+use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 use tree_sitter::{Node, Tree};
 
 /// A declaration file this run has read and parsed.
 pub struct Declaration {
     /// Where it was read from, relative to the project root.
     pub path: FilePath,
+    /// The resolver this file's declarations are read with: the one the provider was probed
+    /// with, so a declaration file and the file that imported it agree on what declares a
+    /// name.
+    resolver: Arc<dyn BindingResolver>,
     /// Its text, which every byte range in `tree` indexes.
     pub source: String,
     /// Its parse.
@@ -33,25 +38,20 @@ pub struct Declaration {
     /// version. See `BuiltinProvider::declaration`. Load-bearing across requests too: a
     /// provider held for a session (#191) drops an entry whose hash moved.
     pub hash: ContentHash,
-    /// Whether its parse carries an `ERROR` node anywhere.
+    /// Whether its parse carries a fault anywhere — an `ERROR` node, or a `MISSING` token
+    /// the parser inserted where one was expected. `Node::has_error` at the root counts
+    /// both; an unclosed brace produces the second and no `ERROR` at all.
     ///
     /// `tree_sitter::Parser::parse` answers a tree for any UTF-8 input, so a file this
     /// provider could not really read is indistinguishable from one it read cleanly unless
     /// the question is asked here. The arms still answer whatever the tree does hold — a
-    /// declaration outside the `ERROR` span is a real declaration — and it is `complete()`
+    /// declaration outside the damaged span is a real declaration — and it is `complete()`
     /// that turns this into the honest label on a partial answer.
     ///
-    /// **The per-declaration granularity lives in [`Self::error_covers`]**, which is what
-    /// the named-import arms of `complete()` ask instead of this whole-file flag; this
-    /// field is what the nameless ones keep.
+    /// **The per-declaration granularity is the reached node's own `has_error()`**, asked
+    /// by the walk of the declaration it ends at; this whole-file flag is what a nameless
+    /// import keeps, and what a name the walk cannot follow to a declaration falls back to.
     pub has_error: bool,
-    /// Every `ERROR` node's byte range in the parse, in source order, recorded with the
-    /// one walk [`Self::parse`] already paid for.
-    ///
-    /// [`Self::error_covers`] answers from this list, so a question about a node never
-    /// re-walks the tree. A linear scan over it needs no memo on top — an `ERROR` count is
-    /// small in any file a rule reaches, and the list is already the memo.
-    errors: Vec<(usize, usize)>,
 }
 
 impl fmt::Debug for Declaration {
@@ -75,61 +75,24 @@ impl Declaration {
     /// a constructor that made its own would put a second parser behind an API that reads
     /// like it could not.
     #[must_use]
-    pub fn parse(path: FilePath, source: String, parser: &mut tree_sitter::Parser) -> Option<Self> {
+    pub fn parse(
+        path: FilePath,
+        source: String,
+        parser: &mut tree_sitter::Parser,
+        resolver: Arc<dyn BindingResolver>,
+    ) -> Option<Self> {
         let hash = ContentHash::new(*blake3::hash(source.as_bytes()).as_bytes());
         let tree = parser.parse(&source, None)?;
         let has_error = tree.root_node().has_error();
-        let errors = error_ranges(&tree);
         Some(Self {
             path,
+            resolver,
             source,
             tree,
             hash,
             has_error,
-            errors,
         })
     }
-
-    /// Whether an `ERROR` node's span intersects `node`'s.
-    ///
-    /// The issue's "ancestor or a sibling-in-body" predicate, spelled as the span check it
-    /// is: an `ERROR` that swallowed the declaration wraps its bytes, and an `ERROR` the
-    /// parser recovered *inside* the declaration's own body intersects them — both leave a
-    /// declaration whose shape is only partly read. An `ERROR` in a sibling statement
-    /// intersects nothing: that statement's names answer `undefined`, but this
-    /// declaration's answers are real, and the whole-file verdict would have thrown them
-    /// away with it.
-    ///
-    /// A linear scan over the recorded ranges — no memo, see the field's own note.
-    #[must_use]
-    pub fn error_covers(&self, node: Node<'_>) -> bool {
-        let range = node.byte_range();
-        self.errors
-            .iter()
-            .any(|(start, end)| *start < range.end && range.start < *end)
-    }
-}
-
-/// Every `ERROR` node's byte range in `tree`, in source order.
-///
-/// The order matters to nothing that reads the list — `error_covers` is an `any` over it —
-/// but source order keeps the vector deterministic, which is what a test diff wants. A
-/// nested `ERROR` is recorded before the `ERROR` wrapped around it: a depth-first walk
-/// meets the inner span first, and `any` makes the difference irrelevant.
-fn error_ranges(tree: &Tree) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "ERROR" {
-            let range = node.byte_range();
-            out.push((range.start, range.end));
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.children(&mut cursor));
-    }
-    // A stack walk visits right-to-left; reversed, that is source order.
-    out.reverse();
-    out
 }
 
 /// Where a file that declares an export sends the name it was asked about.
@@ -201,12 +164,34 @@ pub fn find_export<'d>(decl: &'d Declaration, name: &str) -> Option<Exported<'d>
             continue;
         }
 
-        // A local re-export, `export { A }` or `export { A as B }`.
+        // A local re-export, `export { A }` or `export { A as B }`. The local name is either
+        // declared in this file or bound by one of its imports — `import { A } from './a';
+        // export { A };` is the two-statement barrel, and the chain continues into `./a`
+        // under the module's own spelling of the name. The resolver says which, the way it
+        // answers a use anywhere else: a walk outward from the specifier's own identifier.
         if let Some(clause) = named_child_of_kind(statement, "export_clause")
-            && let Some(local) = local_clause_name(decl, clause, name)
-            && let Some(node) = declared_here(decl, &local)
+            && let Some(local) = local_clause_node(decl, clause, name)
         {
-            return Some(Exported::Here(node));
+            if let Some(node) = declared_here(decl, unquote(text(decl, local))) {
+                return Some(Exported::Here(node));
+            }
+            if let Some(Binding::Import {
+                module,
+                name: imported,
+            }) = decl.resolver.resolve(&decl.tree, &decl.source, local)
+            {
+                return Some(match imported {
+                    ImportedName::Named(exported) => Exported::From {
+                        specifier: module,
+                        name: exported,
+                    },
+                    ImportedName::Default => Exported::From {
+                        specifier: module,
+                        name: "default".to_owned(),
+                    },
+                    ImportedName::Namespace => Exported::Namespace { specifier: module },
+                });
+            }
         }
 
         let is_default = anonymous_child(statement, "default");
@@ -252,16 +237,22 @@ pub fn find_export<'d>(decl: &'d Declaration, name: &str) -> Option<Exported<'d>
 /// and lose the second.
 #[must_use]
 pub fn declared_here<'d>(decl: &'d Declaration, name: &str) -> Option<Node<'d>> {
-    declared_in(&decl.tree, &decl.source, name)
+    declared_in(decl.resolver.as_ref(), &decl.tree, &decl.source, name)
 }
 
 /// The declaration of `name` at a parsed file's top level, exported or not.
 ///
 /// [`declared_here`] is this over a [`Declaration`]; this is the same walk over a tree the
 /// provider does not own — the file under check, which the engine already parsed and which
-/// must not be parsed a second time.
+/// must not be parsed a second time — so the resolver comes in from the caller, which holds
+/// the provider's.
 #[must_use]
-pub(crate) fn declared_in<'t>(tree: &'t Tree, source: &'t str, name: &str) -> Option<Node<'t>> {
+pub(crate) fn declared_in<'t>(
+    resolver: &dyn BindingResolver,
+    tree: &'t Tree,
+    source: &'t str,
+    name: &str,
+) -> Option<Node<'t>> {
     let root = tree.root_node();
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
@@ -275,7 +266,7 @@ pub(crate) fn declared_in<'t>(tree: &'t Tree, source: &'t str, name: &str) -> Op
         } else {
             statement
         };
-        if let Some(found) = JsBindingResolver.declares(source, candidate, name) {
+        if let Some(found) = resolver.declares(source, candidate, name) {
             return Some(found);
         }
     }
@@ -293,6 +284,9 @@ pub(crate) fn declared_in<'t>(tree: &'t Tree, source: &'t str, name: &str) -> Op
 /// put `exported: "{ e }"` on a `Symbol`, which a rule comparing against a required export
 /// name would read as a mismatch on conforming code. `walk_export` falls back to the name
 /// the chain was asked for, which is what a shorthand destructuring exports.
+///
+/// A dotted namespace's name is its first segment: `namespace A.B {}` declares `A`, the
+/// same name the resolver binds for it, and `A.B` is a spelling no `import` can write.
 #[must_use]
 pub fn declared_name(decl: &Declaration, node: Node<'_>) -> Option<String> {
     let node = unwrap_ambient(node);
@@ -303,7 +297,25 @@ pub fn declared_name(decl: &Declaration, node: Node<'_>) -> Option<String> {
                 "identifier" | "type_identifier" | "nested_identifier" | "string"
             )
         })
-        .map(|name| unquote(text(decl, name)).to_owned())
+        .map(|name| unquote(text(decl, first_segment(name))).to_owned())
+}
+
+/// The node whose text is the declared name: the leftmost segment of a `nested_identifier`.
+///
+/// `namespace A.B {}` is shorthand for `namespace A { namespace B {} }` — the enclosing
+/// scope sees `A`, and `lanekeep-lang-js` binds it so. The grammar aliases every inner level
+/// of a dotted name to `member_expression`, so `google.maps.places` is a `nested_identifier`
+/// over the member expression `google.maps`; both kinds carry an `object` field. Anything
+/// that is not nested is its own name.
+fn first_segment(name: Node<'_>) -> Node<'_> {
+    let mut node = name;
+    while matches!(node.kind(), "nested_identifier" | "member_expression") {
+        match node.child_by_field_name("object") {
+            Some(object) => node = object,
+            None => break,
+        }
+    }
+    node
 }
 
 /// Whether `declaration` declares `name`, and where.
@@ -312,16 +324,22 @@ pub fn declared_name(decl: &Declaration, node: Node<'_>) -> Option<String> {
 /// Imports are filtered out on the resolver's side, so an `import_statement` never answers
 /// as a declaration here.
 fn declares<'d>(decl: &'d Declaration, declaration: Node<'d>, name: &str) -> Option<Node<'d>> {
-    JsBindingResolver.declares(&decl.source, declaration, name)
+    decl.resolver.declares(&decl.source, declaration, name)
 }
 
 /// Step through `ambient_declaration`, which wraps the declaration `declare` applies to.
+///
+/// The first named child that is not a `comment`: a comment is a named extra in this
+/// grammar, so `declare /** doc */ class C {}` puts one ahead of the class, and a `.d.ts`
+/// writes that shape all the time.
 fn unwrap_ambient(node: Node<'_>) -> Node<'_> {
-    if node.kind() == "ambient_declaration" {
-        node.named_child(0).unwrap_or(node)
-    } else {
-        node
+    if node.kind() != "ambient_declaration" {
+        return node;
     }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() != "comment")
+        .unwrap_or(node)
 }
 
 /// The re-export target for `name` inside `export { … } from 'm'`.
@@ -350,8 +368,12 @@ fn clause_target<'d>(
     None
 }
 
-/// The local name behind `export { A }` or `export { A as B }`, asked about the visible one.
-fn local_clause_name(decl: &Declaration, clause: Node<'_>, name: &str) -> Option<String> {
+/// The `name` node of the `export_specifier` in a local `export { … }` that exports `name`.
+///
+/// The node rather than its text, because the resolver resolves a *node* by walking outward
+/// from it — which is what lets [`find_export`] ask whether the local name is an import
+/// binding rather than a declaration.
+fn local_clause_node<'d>(decl: &Declaration, clause: Node<'d>, name: &str) -> Option<Node<'d>> {
     let mut cursor = clause.walk();
     for specifier in clause.named_children(&mut cursor) {
         if specifier.kind() != "export_specifier" {
@@ -360,7 +382,7 @@ fn local_clause_name(decl: &Declaration, clause: Node<'_>, name: &str) -> Option
         let local = specifier.child_by_field_name("name")?;
         let visible = specifier.child_by_field_name("alias").unwrap_or(local);
         if unquote(text(decl, visible)) == name {
-            return Some(unquote(text(decl, local)).to_owned());
+            return Some(local);
         }
     }
     None
@@ -386,10 +408,11 @@ pub struct ExportTarget {
 /// used and `declare class Big {}` is not an `export_statement` at all. `find_export` is
 /// the fallback for the one shape that has no name to look up: an anonymous default.
 ///
-/// A node an `ERROR` span covers answers `None` rather than the node: a declaration the
-/// parser only partly read has no shape worth typing, and every `imported_*` hook routes
-/// through here — so `typeOf`, `symbolOf` and `returnTypeOf` answer `None` rather than
-/// type a damaged node.
+/// A node the parser only partly read — `has_error()`, which counts a `MISSING` token as
+/// well as an `ERROR` — answers `None` rather than the node: a damaged declaration has no
+/// shape worth typing. `walk_export` makes the same refusal for the chain it walks; this is
+/// the refusal for the callers that look a name up here directly, so the two cannot
+/// disagree about one node.
 #[must_use]
 pub(crate) fn target_node<'d>(decl: &'d Declaration, name: &str) -> Option<Node<'d>> {
     declared_here(decl, name)
@@ -397,7 +420,7 @@ pub(crate) fn target_node<'d>(decl: &'d Declaration, name: &str) -> Option<Node<
             Some(Exported::Here(node)) => Some(node),
             _ => None,
         })
-        .filter(|node| !decl.error_covers(*node))
+        .filter(|node| !node.has_error())
 }
 
 /// The first named child of `kind`, when there is one.

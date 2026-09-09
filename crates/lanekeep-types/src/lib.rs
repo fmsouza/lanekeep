@@ -14,10 +14,11 @@
 //!
 //! # Why this is its own crate
 //!
-//! It reaches declarations through [`lanekeep_lang::binding::BindingResolver::declaration_of`],
-//! a language-neutral question, so it never needs a language crate's internals. Only its
-//! knowledge of TypeScript *syntax* is language-specific, and that is held in one type whose
-//! constructor refuses a grammar that does not speak it.
+//! It reaches declarations through [`lanekeep_lang::binding::BindingResolver::declaration_of`]
+//! and [`lanekeep_lang::binding::BindingResolver::declares`], two language-neutral questions,
+//! so it never needs a language crate's internals — `lanekeep-lang-js` is a dependency of its
+//! tests alone. Only its knowledge of TypeScript *syntax* is language-specific, and that is
+//! held in one type whose constructor refuses a grammar that does not speak it.
 //!
 //! # What is deliberately absent
 //!

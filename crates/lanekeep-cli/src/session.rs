@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use lanekeep_config::{Config, TypesConfig};
 use lanekeep_core::FileAccess;
 use lanekeep_engine::RunError;
-use lanekeep_lang_js::{Tsx, TypeScript};
 use lanekeep_types::TypeProvider;
 
 /// One provider, held for the length of a session.
@@ -74,14 +73,18 @@ impl SessionProvider {
         project_root: &Path,
     ) -> Result<Arc<dyn TypeProvider>, RunError> {
         self.for_request_with(&config.types, project_root, || {
+            // The grammars come from the registry and the function the engine's own run path
+            // reads them from, so a session-held provider is built over exactly what a
+            // one-shot run's is and folds the same identity — the editor and the terminal
+            // cannot disagree about what `types` names.
+            let registry = lanekeep_languages::registry();
+            let (language, tsx) = lanekeep_engine::builtin_grammars(&registry)
+                .map_or((None, None), |(language, tsx)| (Some(language), tsx));
             lanekeep_engine::provider_for(
                 &config.types,
                 project_root,
-                Some(&TypeScript),
-                // The second grammar beside the first, the way the engine's own run path
-                // reads both out of its registry: a session's provider answers a `.tsx`
-                // sibling the same honest parse a one-shot run's does.
-                Some(&Tsx),
+                language,
+                tsx,
                 lanekeep_core::AnalysisBudget::start(config.limits.analysis_timeout),
             )
         })

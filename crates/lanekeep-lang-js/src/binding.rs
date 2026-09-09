@@ -105,35 +105,6 @@ impl JsBindingResolver {
         Self::declaration_entry(scope, source, name).map(|(node, _)| node)
     }
 
-    /// Whether `node` declares `name` locally, and the node that binds it.
-    ///
-    /// The resolver's own entry walk, projected for callers that hold a *candidate
-    /// declaration* rather than a use: `lanekeep-types`' export lookup asks exactly this
-    /// question of every top-level statement, and a second kind table there drifted from
-    /// this one once already (#229). Imports are filtered out — an `import_statement` binds
-    /// a name for the resolver's own walk, but it does not *declare* one, and a caller
-    /// asking "what declares this name here" must not be answered with a node the name
-    /// merely passes through.
-    #[must_use]
-    #[expect(
-        clippy::unused_self,
-        clippy::trivially_copy_pass_by_ref,
-        reason = "the resolver is zero-sized and stateless, so the receiver can be neither \
-                  used nor passed efficiently; the method form is the point — a caller \
-                  holds a resolver and asks it, beside `declaration_of`"
-    )]
-    pub fn declares<'t>(&self, source: &'t str, node: Node<'t>, name: &str) -> Option<Node<'t>> {
-        Self::declares_local(node, source, name)
-    }
-
-    /// The walk behind [`JsBindingResolver::declares`], free of the receiver it does not
-    /// read.
-    fn declares_local<'t>(node: Node<'t>, source: &str, name: &str) -> Option<Node<'t>> {
-        declaration_entry_of(node, source, name)
-            .filter(|(_, binding)| matches!(binding, Binding::Local(_)))
-            .map(|(node, _)| node)
-    }
-
     /// The declaration of `name` in this scope: the node, and what it binds.
     ///
     /// One walk with two projections above it, rather than two walks. Two would be free to
@@ -316,9 +287,9 @@ fn declaration_entry_of<'t>(
         // as a const, `declare function f(): void` as a function. The wrapped declaration
         // is the first *named* child — the `declare` token itself is anonymous, and
         // `node-types.json` gives the kind no fields at all.
-        "ambient_declaration" => node
-            .named_child(0)
-            .and_then(|inner| declaration_entry_of(inner, source, name)),
+        "ambient_declaration" => {
+            wrapped_declaration(node).and_then(|inner| declaration_entry_of(inner, source, name))
+        }
 
         // A top-level `namespace` is the one declaration that is not a statement in this
         // grammar: measured against 0.23.2, `namespace P {}` parses as an
@@ -354,7 +325,38 @@ fn named_as(node: Node<'_>, source: &str, name: &str) -> bool {
 /// through, for the same reason.
 fn named_unquoted_as(node: Node<'_>, source: &str, name: &str) -> bool {
     node.child_by_field_name("name")
-        .is_some_and(|n| trim_quotes(node_text(n, source)) == name)
+        .is_some_and(|n| trim_quotes(node_text(declared_segment(n), source)) == name)
+}
+
+/// The node whose text is the name a `module` or `internal_module` declares.
+///
+/// `namespace A.B {}` is shorthand for `namespace A { namespace B {} }`: the enclosing scope
+/// sees `A`, and the dotted spelling binds nothing. The grammar hands the whole `A.B` over as
+/// a `nested_identifier` whose `object` is the left part — and every level *inside* that is
+/// aliased to `member_expression` (`grammar.json`'s `nested_identifier` rule), so
+/// `google.maps.places` is a `nested_identifier` over the member expression `google.maps`.
+/// Both kinds carry an `object` field, and the declared name is the leftmost segment.
+fn declared_segment(name: Node<'_>) -> Node<'_> {
+    let mut node = name;
+    while matches!(node.kind(), "nested_identifier" | "member_expression") {
+        match node.child_by_field_name("object") {
+            Some(object) => node = object,
+            None => break,
+        }
+    }
+    node
+}
+
+/// The declaration a `declare` applies to: the first named child that is not a comment.
+///
+/// `ambient_declaration` has no fields at all, and a comment is a named extra in this
+/// grammar, so `named_child(0)` of `declare /* c */ const r` is the comment. A JSDoc block
+/// between `declare` and the declaration is an ordinary shape in a `.d.ts`, and skipping it
+/// is what keeps such a file's declarations bound.
+fn wrapped_declaration(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() != "comment")
 }
 
 /// `const` or `let` for a lexical declaration, `var` otherwise.
@@ -499,6 +501,17 @@ impl BindingResolver for JsBindingResolver {
             .filter(|scope| Self::declaration_in(*scope, source, name).is_some())
             .count()
             > 1
+    }
+
+    /// The resolver's own entry walk, projected for a caller that holds a candidate
+    /// declaration: `lanekeep-types`' export lookup asks this of every top-level statement,
+    /// and a second kind table there drifted from this one once already (#229). The
+    /// `Binding::Local` filter is what keeps an `import_statement` from answering as a
+    /// declaration.
+    fn declares<'t>(&self, source: &str, node: Node<'t>, name: &str) -> Option<Node<'t>> {
+        declaration_entry_of(node, source, name)
+            .filter(|(_, binding)| matches!(binding, Binding::Local(_)))
+            .map(|(node, _)| node)
     }
 
     fn declaration_of<'t>(
@@ -1324,5 +1337,129 @@ mod tests {
         let statement = tree.root_node().named_child(0).expect("one statement");
         assert_eq!(statement.kind(), "import_statement");
         assert_eq!(JsBindingResolver.declares(source, statement, "Big"), None);
+    }
+
+    // --- #232 review: arms that bound the wrong name, or none at all ----------------------
+
+    /// `namespace A.B {}` is shorthand for `namespace A { namespace B {} }`: `A` is the name
+    /// the enclosing scope sees, and the dotted spelling is no binding at all.
+    #[test]
+    fn resolves_a_dotted_namespace_by_its_first_segment() {
+        assert_eq!(
+            resolve_use(
+                "namespace Payments.Rates { export const rate = 1 }\nlet r = Payments.Rates.rate;",
+                "Payments"
+            ),
+            Some(Binding::Local(BindingKind::Module))
+        );
+    }
+
+    /// The grammar aliases every inner level of a dotted name to `member_expression`, so
+    /// `google.maps.places` is a `nested_identifier` whose `object` is the member expression
+    /// `google.maps` — one more level than a two-segment fixture ever exercises.
+    #[test]
+    fn resolves_a_three_segment_namespace_by_its_first_segment() {
+        assert_eq!(
+            resolve_use(
+                "declare namespace google.maps.places { const q: number }\nlet g = google;",
+                "google"
+            ),
+            Some(Binding::Local(BindingKind::Module))
+        );
+        assert_eq!(
+            declares_at_top("namespace google.maps.places {}", "google.maps"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dotted_namespace_does_not_bind_its_own_spelling() {
+        assert_eq!(
+            declares_at_top("namespace A.B { export const q = 1 }", "A.B"),
+            None
+        );
+        assert_eq!(
+            declares_at_top("namespace A.B { export const q = 1 }", "A"),
+            Some("internal_module".to_owned())
+        );
+    }
+
+    /// A comment is a named extra, so `named_child(0)` of an `ambient_declaration` is the
+    /// comment rather than the declaration `declare` applies to.
+    #[test]
+    fn resolves_through_an_ambient_declaration_carrying_a_comment() {
+        assert_eq!(
+            resolve_use("declare /* c */ const rate: number;\nlet x = rate;", "rate"),
+            Some(Binding::Local(BindingKind::Const))
+        );
+        assert_eq!(
+            resolve_use("declare /** doc */ namespace N {}\nlet x = N;", "N"),
+            Some(Binding::Local(BindingKind::Module))
+        );
+    }
+
+    /// The question `lanekeep-types` asks of every top-level statement, reached the way that
+    /// crate reaches it: through the trait, with no knowledge of which resolver answers.
+    #[test]
+    fn declares_is_reachable_through_the_trait() {
+        let source = "export declare class Big {}\nimport { Small } from './small';";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&TypeScript.grammar())
+            .expect("grammar loads");
+        let tree = parser.parse(source, None).expect("parses");
+        let root = tree.root_node();
+        let resolver: &dyn BindingResolver = &JsBindingResolver;
+        let class = root.named_child(0).expect("the export");
+        let import = root.named_child(1).expect("the import");
+        assert_eq!(
+            resolver
+                .declares(source, class, "Big")
+                .map(|node| node.kind().to_owned()),
+            Some("class_declaration".to_owned())
+        );
+        assert_eq!(resolver.declares(source, import, "Small"), None);
+    }
+
+    /// A resolver that answers the two required questions and nothing else.
+    struct Bare;
+
+    impl BindingResolver for Bare {
+        fn resolve(&self, _tree: &Tree, _source: &str, _node: Node<'_>) -> Option<Binding> {
+            None
+        }
+
+        fn is_shadowed(&self, _tree: &Tree, _source: &str, _node: Node<'_>) -> bool {
+            false
+        }
+    }
+
+    /// The trait's default is silence, on the same terms as `declaration_of`: a language
+    /// whose resolver cannot yet say which statement declares a name hands back nothing
+    /// rather than a guess.
+    #[test]
+    fn declares_defaults_to_nothing() {
+        let source = "const x = 1;";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&TypeScript.grammar())
+            .expect("grammar loads");
+        let tree = parser.parse(source, None).expect("parses");
+        let statement = tree.root_node().named_child(0).expect("one statement");
+        assert_eq!(Bare.declares(source, statement, "x"), None);
+    }
+
+    /// `declares` on the first top-level statement, projected to the kind of the node it
+    /// answers with.
+    fn declares_at_top(source: &str, name: &str) -> Option<String> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&TypeScript.grammar())
+            .expect("grammar loads");
+        let tree = parser.parse(source, None).expect("parses");
+        let statement = tree.root_node().named_child(0).expect("one statement");
+        JsBindingResolver
+            .declares(source, statement, name)
+            .map(|node| node.kind().to_owned())
     }
 }

@@ -247,6 +247,16 @@ impl TypeScriptSupport {
             resolver: language.resolver()?,
         })
     }
+
+    /// The resolver the probe took.
+    ///
+    /// Handed to every [`crate::declarations::Declaration`] this support's provider parses,
+    /// and to the walks over the asking file's own tree, so that "which statement declares
+    /// this name" is answered by the one resolver the run was probed with — through the
+    /// trait, never through a language crate this one would otherwise have to name.
+    pub(crate) fn resolver(&self) -> &Arc<dyn BindingResolver> {
+        &self.resolver
+    }
 }
 
 impl<'t> TypeScriptOracle<'t> {

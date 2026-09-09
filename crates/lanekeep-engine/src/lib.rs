@@ -1217,16 +1217,15 @@ impl Engine {
                         }
                     }
                 }
-                TypesProvider::Builtin => match provider_language(registry) {
+                // Both grammars from `builtin_grammars`, the one function every construction
+                // site reads — see its doc for why there is exactly one.
+                TypesProvider::Builtin => match builtin_grammars(registry) {
                     None => None,
-                    // The second grammar read out of the same registry the main one was:
-                    // `by_id("tsx")` beside `provider_language`'s `by_id("typescript")`, so a
-                    // run's provider can read the `.tsx` siblings its resolver reaches.
-                    Some(language) => Some(provider_for(
+                    Some((language, tsx)) => Some(provider_for(
                         &config.types,
                         project_root,
-                        Some(language.as_ref()),
-                        registry.by_id("tsx").map(AsRef::as_ref),
+                        Some(language),
+                        tsx,
                         analysis.clone(),
                     )?),
                 },
@@ -1295,8 +1294,8 @@ impl Engine {
         // nothing, not to let one run warm the other's cache. Folding an empty identity
         // instead would be equally sound and would split that cache for no gain.
         let provider = if provider.is_none() && tsc_spawn_error.is_some() {
-            provider_language(registry)
-                .and_then(|language| BuiltinProvider::probe(language.as_ref()))
+            builtin_grammars(registry)
+                .and_then(|(language, tsx)| BuiltinProvider::probe_with(language, tsx))
                 .map(|p| Arc::new(p) as Arc<dyn TypeProvider>)
         } else {
             provider
@@ -4180,6 +4179,27 @@ fn provider_language(registry: &LanguageRegistry) -> Option<&Arc<dyn Language>> 
         })
 }
 
+/// The grammars the builtin provider is built over, read from one registry: the main one
+/// `provider_language` picks, and the `tsx` one beside it, for the `.tsx` siblings the
+/// resolver reaches. `None` when nothing registered speaks TypeScript at all.
+///
+/// Public because the three places that build a provider read from here — the run's builtin
+/// arm, the `tsc`-fallback identity beneath it, and the CLI's session-held provider — so no
+/// two of them can decide differently what a provider is built over. Three sites reaching
+/// that decision three ways is what the #232 review found: a session hardcoding its grammars
+/// while a run read them from its registry, and a fallback taking one grammar where the run
+/// took two, folding a different identity for the same corpus. `provider_for`'s own doc says
+/// why the editor and the terminal have to agree. The capability gate above them still
+/// probes each language on its own, by design: it decides which *languages* get `types`,
+/// not what the provider is built over.
+#[must_use]
+pub fn builtin_grammars(
+    registry: &LanguageRegistry,
+) -> Option<(&dyn Language, Option<&dyn Language>)> {
+    let language = provider_language(registry)?;
+    Some((language.as_ref(), registry.by_id("tsx").map(AsRef::as_ref)))
+}
+
 /// Every registered grammar, as the cache key sees it.
 ///
 /// A function rather than an inline `map` so that a test can call the assembly the run actually
@@ -4686,6 +4706,22 @@ mod tests {
             "the remedy has to reach the terminal, got: {error}"
         );
         assert!(!error.contains("rule `"), "got: {error}");
+    }
+
+    /// What the three construction sites read: the main grammar `provider_language` picks
+    /// and the `tsx` one beside it. That they all read it is a fact about their source, not
+    /// something a test over the shipped registry can tell from a hardcoded pair — the
+    /// registry's `TypeScript` and `Tsx` are the same values — so this pins the function
+    /// and the review left the rest to reading.
+    #[test]
+    fn builtin_grammars_reads_both_grammars_from_one_registry() {
+        let registry = lanekeep_languages::registry();
+        let (main, tsx) = builtin_grammars(&registry).expect("the registry speaks TypeScript");
+        assert_eq!(main.id().as_str(), "typescript");
+        assert_eq!(
+            tsx.map(|language| language.id().to_string()).as_deref(),
+            Some("tsx")
+        );
     }
 
     #[test]
