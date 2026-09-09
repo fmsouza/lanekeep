@@ -864,13 +864,44 @@ real `feat` landed in the window, matched the filter, and proposed a duplicate o
 already publishing. Worth remembering generally: when a fix works by excluding the example you
 have rather than by describing the fault, expect the next instance to walk straight past it.
 
-Not `git_only` either, which reads versions from tags and would strand the fourteen crates this
+Not `git_only` either, which reads versions from tags and would strand the crates this
 repository deliberately leaves untagged.
 
 The mirror-image trap is worth holding at the same time: **a change that ships different bytes
 without touching crate source proposes nothing at all.** The glibc fix lived entirely in build
 tooling, so release-plz saw no package change while every binary it shipped was different. That
 one needs a version bump by hand; `docs/releasing.md` has the steps.
+
+**`version.workspace = true` makes the crates share a version, and release-plz still plans one
+per crate — so a crate nothing touched can land at a version its own dependency line refuses.**
+release-plz decides per package: a `feat` makes a crate 0.10.0, a crate depending on a bumped
+crate gets a patch, and a crate with neither — no commit matching `release_commits`, no changed
+dependency — is left out of the update altogether. It then raises `[workspace.package] version`
+to the highest plan, which every crate inherits, but rewrites a `[workspace.dependencies]` line
+only for a crate *in* the update. The first two runs after v0.9.0 died in the
+`cargo update --workspace` release-plz runs last — "candidate versions found which didn't match:
+0.10.0". At cc38adc fourteen crates were left out and the requirement it tripped on was
+`lanekeep-core = "^0.9.0"`; at 92d1964, one `feat` later, six were — `lanekeep-lang`, the four
+grammar crates over it and `lanekeep-languages`, a closed subgraph no bumped crate reaches — and
+it tripped on `lanekeep-lang-js`. Which crates are left out is whatever the window happens not to
+touch. v0.9.0 went through the same code with every crate in the update — eighteen bumped, two
+patched for a changed dependency — so its manifest came out consistent by luck rather than by
+design. A `fix`-only window does not show it either, because `^0.9.0` admits 0.9.1; it takes a
+minor or breaking bump to bite.
+
+`version_group = "lanekeep"` on every `[[package]]` in `release-plz.toml` is the fix: once any
+member has a releasing commit, every member is planned, and one inheriting the workspace version
+is planned *at* the workspace version. It changes membership and nothing else — the version is a
+maximum over every inheriting crate either way, and tagging, the changelog and the semver check
+never read the group. It has to name every publishable crate, so `scripts/test-release-config.sh`
+compares it against `cargo metadata` the way it already does for `changelog_include`. The whole
+thing reproduces without a push, given network access to crates.io: release-plz 0.3.164 — the
+version `release-plz/action` v0.5.135 installs — from its GitHub release, a clone of `main`
+checked out on a branch with an upstream (it refuses a detached HEAD with "cannot determine
+current branch"), and `release-plz update --no-changelog --config <a copy of release-plz.toml
+with semver_check = false>`. Before the fix that fails with the CI message word for word; after
+it, `git diff Cargo.toml` shows the workspace version and all twenty dependency lines at the new
+version, which is the shape every release commit has had.
 
 **`gates.fileContains` is an *and*, not an *or*.** Every listed substring has to be present,
 so a rule matching either of two tokens — `unwrap` or `expect` — cannot express its gate as

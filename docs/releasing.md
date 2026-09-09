@@ -109,8 +109,8 @@ would teach it to.
 So a release-tooling change that alters the shipped artifacts needs a version bump written by
 hand:
 
-1. `[workspace.package] version` in `Cargo.toml`, and the nineteen internal dependency lines
-   beneath it — they carry the version too.
+1. `[workspace.package] version` in `Cargo.toml`, and the internal dependency lines beneath
+   it, one per crate — they carry the version too.
 2. `cargo update --workspace` to refresh `Cargo.lock`.
 3. A `CHANGELOG.md` entry, since release-plz is not writing one.
 4. Open it as an ordinary pull request titled `chore: release vX.Y.Z`.
@@ -158,8 +158,32 @@ about. It is just not what closes this window. `scripts/test-release-config.sh` 
 commit types it admits, by matching real subjects rather than comparing the regex to a literal.
 
 `git_only = true` fixes the same lag by reading versions from tags instead of the registry, and
-is the wrong fix here: only `lanekeep-cli` is tagged, deliberately, so the other fourteen crates
+is the wrong fix here: only `lanekeep-cli` is tagged, deliberately, so the other crates
 would have no tag to read and release-plz would treat them as never released.
+
+### Every crate in one version group
+
+`version.workspace = true` makes the crates *share* a version; `version_group = "lanekeep"` on
+every `[[package]]` in `release-plz.toml` makes release-plz *plan* one. Without the second,
+release-plz plans per crate and leaves out any crate with no releasing commit and no changed
+dependency — then raises the shared version, which that crate inherits, without rewriting its
+dependency line, and its own final `cargo update --workspace` refuses the manifest. The two runs
+after v0.9.0 failed that way, each on whichever crates that window had not touched; `AGENTS.md`
+has the mechanism. `scripts/test-release-config.sh` checks the group against `cargo metadata`, so a
+crate added later cannot be left out of it.
+
+A release-plz change can be checked without a push, given network access to crates.io. Take the
+release-plz version that `release-plz/action` installs from its GitHub release, clone `main` onto
+a branch that has an upstream, and run:
+
+```bash
+release-plz update --no-changelog --config <a copy of release-plz.toml with semver_check = false>
+```
+
+It prints the version it would propose for every crate and leaves the bump in the working tree;
+`git diff Cargo.toml` should show the workspace version and every internal dependency line at
+one new version. The semver check is off because it needs cargo-semver-checks and a full build.
+It can still promote a `fix` to a minor bump in CI, so read the local plan as the floor.
 
 ## The changelog
 
