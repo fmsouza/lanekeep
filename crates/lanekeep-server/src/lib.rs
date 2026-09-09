@@ -45,7 +45,7 @@ pub fn serve_lsp(
     root: &Path,
     mut check: impl FnMut() -> Checked,
 ) -> std::io::Result<()> {
-    let mut open: Vec<PathBuf> = Vec::new();
+    let mut open: Vec<Document> = Vec::new();
     let mut shutting_down = false;
 
     while let Some(raw) = jsonrpc::read(input, Framing::Headers)? {
@@ -67,10 +67,10 @@ pub fn serve_lsp(
             "initialized" => {}
 
             "textDocument/didOpen" | "textDocument/didSave" => {
-                if let Some(path) = document_path(&message.params)
-                    && !open.contains(&path)
+                if let Some(document) = document(&message.params)
+                    && !open.iter().any(|candidate| candidate.uri == document.uri)
                 {
-                    open.push(path);
+                    open.push(document);
                 }
                 publish(output, root, &open, &mut check)?;
             }
@@ -78,8 +78,8 @@ pub fn serve_lsp(
             "textDocument/didClose" => {
                 // Diagnostics for a closed document are the client's to forget, and a server
                 // that kept publishing them would grow its list without bound.
-                if let Some(path) = document_path(&message.params) {
-                    open.retain(|candidate| candidate != &path);
+                if let Some(uri) = document_uri(&message.params) {
+                    open.retain(|candidate| candidate.uri != uri);
                 }
             }
 
@@ -135,7 +135,7 @@ fn reply(
 fn publish(
     output: &mut impl Write,
     root: &Path,
-    open: &[PathBuf],
+    open: &[Document],
     check: &mut impl FnMut() -> Checked,
 ) -> std::io::Result<()> {
     let violations = match check() {
@@ -157,15 +157,15 @@ fn publish(
 
     let grouped = lsp::by_file(root, &violations);
 
-    for path in open {
-        let diagnostics = grouped.get(path).cloned().unwrap_or_default();
+    for document in open {
+        let diagnostics = grouped.get(&document.path).cloned().unwrap_or_default();
         jsonrpc::write(
             output,
             Framing::Headers,
             &Outgoing::notification(
                 "textDocument/publishDiagnostics",
                 json!({
-                    "uri": lsp::uri_from_path(path),
+                    "uri": document.uri,
                     "diagnostics": diagnostics,
                 }),
             ),
@@ -175,9 +175,36 @@ fn publish(
     Ok(())
 }
 
-/// The path a `textDocument` parameter refers to.
-fn document_path(params: &Value) -> Option<PathBuf> {
-    lsp::path_from_uri(params["textDocument"]["uri"].as_str()?)
+/// An open document: the URI the client used for it, and the file it names.
+///
+/// Both, because each serves a different side. A document is *identified* by its URI — that
+/// is what the client opens, closes and matches a publish against, so one file open under two
+/// spellings is two documents, each published to. It is *matched* to violations by its path,
+/// canonicalized so that it meets the root's spelling: `lanekeep server` canonicalizes the
+/// root at startup, so the keys `by_file` builds carry `/private/var` where the editor said
+/// `/var`, and on Windows a `\\?\` prefix and a long name where it said `C:\Users\RUNNER~1`.
+struct Document {
+    uri: String,
+    path: PathBuf,
+}
+
+/// The URI a `textDocument` parameter names.
+fn document_uri(params: &Value) -> Option<&str> {
+    params["textDocument"]["uri"].as_str()
+}
+
+/// The document a `textDocument` parameter refers to.
+///
+/// A path that cannot be canonicalized — one that does not exist, or that a test made up —
+/// keeps its given spelling, since there is nothing on disk to resolve it against.
+fn document(params: &Value) -> Option<Document> {
+    let uri = document_uri(params)?;
+    let path = lsp::path_from_uri(uri)?;
+    let path = path.canonicalize().unwrap_or(path);
+    Some(Document {
+        uri: uri.to_owned(),
+        path,
+    })
 }
 
 #[cfg(test)]
@@ -199,10 +226,15 @@ mod tests {
 
     /// Every message the server wrote back, parsed.
     fn exchange(messages: &[Value], check: impl FnMut() -> Checked) -> Vec<Value> {
+        exchange_at(Path::new("/project"), messages, check)
+    }
+
+    /// [`exchange`], against a root of the test's choosing.
+    fn exchange_at(root: &Path, messages: &[Value], check: impl FnMut() -> Checked) -> Vec<Value> {
         let wire = framed(messages);
         let mut input = std::io::BufReader::new(wire.as_bytes());
         let mut output = Vec::new();
-        serve_lsp(&mut input, &mut output, Path::new("/project"), check).expect("serves");
+        serve_lsp(&mut input, &mut output, root, check).expect("serves");
 
         let text = String::from_utf8(output).expect("utf-8");
         let mut cursor = std::io::BufReader::new(text.as_bytes());
@@ -229,6 +261,94 @@ mod tests {
             "method": "textDocument/didOpen",
             "params": { "textDocument": { "uri": uri } }
         })
+    }
+
+    /// A document opened under another spelling of a real file is matched to the root's
+    /// spelling, and published under the client's own.
+    ///
+    /// The root is canonical because `lanekeep server` canonicalizes it, and the editor's
+    /// spelling is whatever it had: `/var/folders/...` on macOS for a root that resolves under
+    /// `/private/var`, `C:\Users\RUNNER~1\...` on Windows for a root spelled
+    /// `\\?\C:\Users\runneradmin\...`, a symlinked checkout anywhere. Without the match the
+    /// server publishes an empty list for every document, which reads as a clean file — that
+    /// is what `server_agreement.rs` found on Windows, as a read that never came back.
+    #[test]
+    fn an_alias_of_an_open_file_is_matched_to_the_root_and_published_as_sent() {
+        let dir =
+            std::env::temp_dir().join(format!("lanekeep-server-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real/src")).expect("creates the tree");
+        std::fs::write(dir.join("real/src/a.ts"), "").expect("writes the file");
+        let root = dir.join("real").canonicalize().expect("a canonical root");
+
+        // On Unix the alias is a symlink to the project — the shape a symlinked home or
+        // checkout hands an editor — and on Windows the temp path as given, which differs from
+        // the canonical spelling by its `\\?\` prefix and, on a hosted runner, by its short
+        // name. Either way it must differ, or the test asserts nothing about aliasing.
+        #[cfg(unix)]
+        let alias = {
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(dir.join("real"), &link).expect("links the alias");
+            link
+        };
+        #[cfg(not(unix))]
+        let alias = dir.join("real");
+        assert_ne!(
+            alias, root,
+            "the alias has to be another spelling of the root"
+        );
+
+        let uri = lsp::uri_from_path(&alias.join("src/a.ts"));
+        let replies = exchange_at(&root, &[open(&uri)], || Ok(vec![a_violation()]));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let published = replies
+            .iter()
+            .find(|m| m["method"] == "textDocument/publishDiagnostics")
+            .expect("published");
+        assert_eq!(
+            published["params"]["uri"], uri,
+            "published under the client's spelling"
+        );
+        assert_eq!(
+            published["params"]["diagnostics"]
+                .as_array()
+                .expect("an array")
+                .len(),
+            1,
+            "the alias met the root's spelling of the file"
+        );
+    }
+
+    /// One file open under two spellings is two documents to the client, and each gets its
+    /// list — matched by the path they share, published under the URI each was opened with.
+    #[test]
+    fn a_file_open_under_two_spellings_is_published_under_each() {
+        let replies = exchange(
+            &[
+                open("file:///project/src/a.ts"),
+                open("file:///project/./src/a.ts"),
+            ],
+            || Ok(vec![a_violation()]),
+        );
+
+        let published: Vec<&Value> = replies
+            .iter()
+            .filter(|m| m["method"] == "textDocument/publishDiagnostics")
+            .collect();
+        // One publish after the first open, two after the second.
+        assert_eq!(published.len(), 3);
+        assert_eq!(published[1]["params"]["uri"], "file:///project/src/a.ts");
+        assert_eq!(published[2]["params"]["uri"], "file:///project/./src/a.ts");
+        for message in &published[1..] {
+            assert_eq!(
+                message["params"]["diagnostics"]
+                    .as_array()
+                    .expect("an array")
+                    .len(),
+                1
+            );
+        }
     }
 
     #[test]

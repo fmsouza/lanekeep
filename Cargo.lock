@@ -816,6 +816,7 @@ dependencies = [
  "lanekeep-rules",
  "lanekeep-server",
  "lanekeep-testkit",
+ "lanekeep-types",
  "notify",
  "notify-debouncer-mini",
  "serde_json",
@@ -912,6 +913,7 @@ version = "0.8.1"
 dependencies = [
  "blake3",
  "lanekeep-lang",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
@@ -1033,9 +1035,12 @@ name = "lanekeep-types"
 version = "0.8.1"
 dependencies = [
  "blake3",
+ "lanekeep-core",
  "lanekeep-lang",
  "lanekeep-lang-js",
  "lanekeep-lang-python",
+ "serde_json",
+ "thiserror",
  "tree-sitter",
 ]
 

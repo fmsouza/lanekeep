@@ -80,8 +80,38 @@ enum Outcome {
     Text(String, ContentHash),
     /// Nothing was there.
     Absent,
-    /// It was there and is not text.
-    Binary,
+    /// It was there and is not text, and these are its bytes' digest.
+    ///
+    /// The hash is carried even though nothing can parse these bytes, because a *dependency*
+    /// on a binary file is a real one — replace an image with text and a rule's answer can
+    /// change — and the validator recomputes the digest of whatever is at the path now. A
+    /// zero placeholder was recorded here once, which no real file ever hashes to, so every
+    /// entry naming a binary dependency invalidated on every run.
+    Binary(ContentHash),
+    /// It resolved out of the root through a symlink, so it was refused unread.
+    ///
+    /// Recorded rather than discarded, and this is the whole reason the enum has a fourth
+    /// variant: a refusal is an answer a cached result depends on. A provider probing
+    /// `node_modules/pkg/index.d.ts`, where `node_modules/pkg` is a pnpm symlink out of the
+    /// tree, is refused, answers `undefined`, and that `undefined` has to be reconsidered the
+    /// day the path becomes a real in-root file. With the refusal unrecorded the path is in no
+    /// dependency list and nothing ever invalidates.
+    ///
+    /// Only the symlink case, and the difference is whether the answer can ever change — for
+    /// two different reasons, which the two other refusals do not share. A lexically escaping
+    /// path (`../secrets`) names nothing inside the root under any state of the filesystem: no
+    /// rename, install or `mkdir` can make it resolve in-root. An absolute path may well name
+    /// an in-root file — `/home/me/project/a.ts` under that very root does — and is refused
+    /// anyway, by a rule of [`Self::load`]'s that no state of the filesystem can change. So
+    /// for both the answer is fixed, and recording them would add a path to every entry that
+    /// nothing could ever invalidate on. A symlink escape is the opposite: `npm install`
+    /// replacing the link with a real directory is the ordinary case, and that is a change the
+    /// entry depends on.
+    ///
+    /// Recorded as its own outcome rather than folded into [`Outcome::Absent`], because a
+    /// validator has to reproduce *this* decision: it re-resolves the path under the same
+    /// confinement and holds the entry while it still escapes. See `lanekeep_cache::validate`.
+    Refused,
 }
 
 /// Tracked, confined access to the project's files.
@@ -184,7 +214,47 @@ impl FileAccess {
         match self.resolve(path)? {
             Outcome::Text(text, _) => Ok(Some(text)),
             Outcome::Absent => Ok(None),
-            Outcome::Binary => Err(ReadError::NotText {
+            Outcome::Binary(_) => Err(ReadError::NotText {
+                path: path.to_owned(),
+            }),
+            // Never reached: `resolve` turns a refusal into `ReadError::EscapesRoot` before
+            // it returns. Spelled out rather than left to a wildcard so that a fifth outcome
+            // has to be decided here rather than silently reading as absent.
+            Outcome::Refused => Err(ReadError::EscapesRoot {
+                path: path.to_owned(),
+            }),
+        }
+    }
+
+    /// The hash of a file's bytes, or `None` if nothing readable is there.
+    ///
+    /// Goes through the same resolution every other read does, so it is confined the
+    /// same way and **recorded as a dependency exactly as [`Self::read`] would be** — a caller
+    /// that asked only for the hash still depended on the file, and an entry that did not list
+    /// it would validate after the file changed.
+    ///
+    /// What it saves is the *text*: a caller holding a parse of these bytes wants to know
+    /// whether the parse is still the right one, and that is a comparison against a digest the
+    /// memo already computed. Returning the `String` for it would clone a whole declaration
+    /// file per importer to answer a question about thirty-two bytes.
+    ///
+    /// `None` covers absence and a file that is there but is not text. A binary file *is*
+    /// hashed — the dependency it becomes carries that digest — but it cannot be parsed, and
+    /// this method answers a caller asking whether it holds the current parse of these bytes.
+    /// For a file no parse can be made of, the answer is no however the bytes hash.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError`] if the path escapes the root or is absolute — the same refusals
+    /// [`Self::read`] makes, for the same reasons.
+    pub fn hash_of(&self, path: &str) -> Result<Option<ContentHash>, ReadError> {
+        match self.resolve(path)? {
+            Outcome::Text(_, hash) => Ok(Some(hash)),
+            Outcome::Absent | Outcome::Binary(_) => Ok(None),
+            // Never reached: `resolve` turns a refusal into `ReadError::EscapesRoot` before it
+            // returns. Spelled out rather than left to a wildcard, so that a fifth outcome has
+            // to be decided here rather than silently reading as absent.
+            Outcome::Refused => Err(ReadError::EscapesRoot {
                 path: path.to_owned(),
             }),
         }
@@ -211,11 +281,24 @@ impl FileAccess {
             .map(|(path, outcome)| {
                 let file = FilePath::new(path);
                 match outcome {
-                    Outcome::Text(_, hash) => TrackedRead::found(file, *hash),
-                    // A file that is there but unreadable as text is still a dependency: if
-                    // it is replaced with text, the rule's answer changes.
-                    Outcome::Binary => TrackedRead::found(file, ContentHash::new([0; 32])),
+                    // One arm for both, because both were read and both hashed. A file that
+                    // is there but unreadable as text is a dependency exactly as a readable
+                    // one is: replace it with text and the rule's answer changes, and the
+                    // digest of the bytes is what says whether it has been. Clippy refuses
+                    // the two written separately as `match_same_arms`, and they are.
+                    Outcome::Text(_, hash) | Outcome::Binary(hash) => {
+                        TrackedRead::found(file, *hash)
+                    }
+                    // Nothing was read, so there is no hash — and the entry has to be
+                    // reconsidered if the path ever becomes readable, which is exactly what an
+                    // absent dependency means.
                     Outcome::Absent => TrackedRead::absent(file),
+                    // Recorded as *refused* rather than as absent, because the two are checked
+                    // differently: absence is rechecked by looking for the file, and a
+                    // validator that did that here would follow the symlink, find the target,
+                    // and invalidate on every run — after reading bytes outside the root to
+                    // decide it. See `lanekeep_cache::validate`.
+                    Outcome::Refused => TrackedRead::refused(file),
                 }
             })
             .collect();
@@ -249,12 +332,28 @@ impl FileAccess {
     fn resolve(&self, path: &str) -> Result<Outcome, ReadError> {
         let key = normalize_key(path);
         if let Some(outcome) = self.memo().get(&key) {
-            return Ok(outcome.clone());
+            return Self::answer(path, outcome.clone());
         }
 
         let outcome = self.load(path)?;
         self.memo().insert(key, outcome.clone());
-        Ok(outcome)
+        Self::answer(path, outcome)
+    }
+
+    /// Turn a recorded outcome into what the caller asked for.
+    ///
+    /// [`Outcome::Refused`] is recorded and *then* refused, in that order: the memo is what
+    /// puts the path into [`Self::dependencies`], and the error is what the caller has always
+    /// been told. Doing it the other way round — returning the error from [`Self::load`]
+    /// before the insert — is the bug this exists to close, and it is invisible from the
+    /// caller's side, since the message it gets is identical either way.
+    fn answer(path: &str, outcome: Outcome) -> Result<Outcome, ReadError> {
+        match outcome {
+            Outcome::Refused => Err(ReadError::EscapesRoot {
+                path: path.to_owned(),
+            }),
+            other => Ok(other),
+        }
     }
 
     /// Do the actual filesystem work, having decided the path is allowed.
@@ -289,11 +388,12 @@ impl FileAccess {
         };
 
         // And again after canonicalizing, which is what catches a symlink inside the root
-        // pointing outside it. The lexical check above cannot see through one.
+        // pointing outside it. The lexical check above cannot see through one. Refused, and
+        // recorded as refused — see `Outcome::Refused`: this path is one the filesystem can
+        // later make readable, so the answer that rested on the refusal has to be
+        // invalidated when it does.
         if !canonical.starts_with(&self.root) {
-            return Err(ReadError::EscapesRoot {
-                path: path.to_owned(),
-            });
+            return Ok(Outcome::Refused);
         }
 
         let Ok(bytes) = std::fs::read(&canonical) else {
@@ -303,7 +403,7 @@ impl FileAccess {
 
         match String::from_utf8(bytes) {
             Ok(text) => Ok(Outcome::Text(text, hash)),
-            Err(_) => Ok(Outcome::Binary),
+            Err(_) => Ok(Outcome::Binary(hash)),
         }
     }
 }
@@ -468,7 +568,92 @@ mod tests {
         let deps = access.dependencies();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].path.as_str(), "a.json");
-        assert!(deps[0].hash.is_some(), "a file that was read has a hash");
+        assert!(deps[0].hash().is_some(), "a file that was read has a hash");
+    }
+
+    #[test]
+    fn a_hash_lookup_is_recorded_exactly_as_a_read_is() {
+        // The whole reason it goes through `resolve`: a caller that asked only for the hash
+        // still depended on the file, and an entry that did not list it would validate after
+        // the file changed.
+        let fixture = Fixture::new("hash-recorded", &[("a.json", "{}")]);
+        let access = fixture.access();
+        let hashed = access
+            .hash_of("a.json")
+            .expect("allowed")
+            .expect("is there");
+
+        let deps = access.dependencies();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].path.as_str(), "a.json");
+        assert_eq!(
+            deps[0].hash(),
+            Some(hashed),
+            "the recorded dependency carries the hash that was answered"
+        );
+    }
+
+    #[test]
+    fn a_hash_lookup_answers_what_a_read_would_hash() {
+        // A caller compares this against the digest of a parse it already holds, so the two
+        // have to be the same function of the same bytes.
+        let fixture = Fixture::new("hash-agrees", &[("a.json", "{\"a\": 1}")]);
+        let access = fixture.access();
+        let hashed = access.hash_of("a.json").expect("allowed");
+        let text = access.read("a.json").expect("allowed").expect("is there");
+        assert_eq!(
+            hashed,
+            Some(ContentHash::new(*blake3::hash(text.as_bytes()).as_bytes()))
+        );
+    }
+
+    #[test]
+    fn a_binary_file_is_recorded_with_the_hash_of_its_bytes() {
+        // It is a dependency — replace an image with text and a rule's answer can change — so
+        // it is recorded as found, and what it is found with has to be the digest a validator
+        // recomputes from the same bytes. A zero placeholder stood here, which no real file
+        // hashes to, so every entry naming a binary dependency invalidated on every run.
+        let fixture = Fixture::new("binary-hash", &[]);
+        let bytes = [0xff_u8, 0xfe, 0x00, 0x01];
+        std::fs::write(fixture.dir.join("logo.png"), bytes).expect("writes");
+        let access = fixture.access();
+
+        access.read("logo.png").expect_err("is not text");
+
+        let recorded = access
+            .dependencies()
+            .into_iter()
+            .find(|read| read.path.as_str() == "logo.png")
+            .expect("the binary file is a dependency");
+        assert_eq!(
+            recorded.outcome,
+            tracked::ReadOutcome::Found(ContentHash::new(*blake3::hash(&bytes).as_bytes()))
+        );
+    }
+
+    #[test]
+    fn a_hash_lookup_answers_nothing_for_what_cannot_be_parsed() {
+        // Absent and binary alike: neither can be the input to a parse, so neither has a hash
+        // a caller could compare its parse against.
+        let fixture = Fixture::new("hash-absent", &[]);
+        std::fs::write(fixture.dir.join("image.png"), [0xff, 0xfe, 0x00]).expect("writes");
+        let access = fixture.access();
+        assert_eq!(access.hash_of("nothing.json").expect("allowed"), None);
+        assert_eq!(access.hash_of("image.png").expect("allowed"), None);
+        assert_eq!(
+            access.dependencies().len(),
+            2,
+            "both are still dependencies: {:?}",
+            access.dependencies()
+        );
+    }
+
+    #[test]
+    fn a_hash_lookup_is_confined_like_every_other_read() {
+        let fixture = Fixture::new("hash-confined", &[]);
+        let access = fixture.access();
+        let error = access.hash_of("../outside.json").expect_err("is refused");
+        assert!(matches!(error, ReadError::EscapesRoot { .. }), "{error:?}");
     }
 
     #[test]
@@ -482,7 +667,7 @@ mod tests {
         let deps = access.dependencies();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].path.as_str(), "tsconfig.json");
-        assert_eq!(deps[0].hash, None);
+        assert_eq!(deps[0].hash(), None);
     }
 
     #[test]
@@ -582,6 +767,60 @@ mod tests {
         assert!(matches!(error, ReadError::EscapesRoot { .. }), "{error:?}");
 
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_root_is_recorded_as_a_refusal() {
+        // The refusal above is the whole answer only if nothing depends on it. A provider
+        // probing `node_modules/pkg/index.d.ts` where `node_modules/pkg` is a pnpm symlink out
+        // of the tree gets `EscapesRoot`, answers `undefined`, and — with the refusal
+        // unrecorded — that answer is cached against a dependency list the path does not
+        // appear in. The day the symlink becomes a real in-root directory, nothing
+        // invalidates.
+        let fixture = Fixture::new("symlink-recorded", &[]);
+        let outside = std::env::temp_dir().join("lanekeep-symlink-recorded-target.json");
+        std::fs::write(&outside, "secrets").expect("writes target");
+        std::os::unix::fs::symlink(&outside, fixture.dir.join("escape.json"))
+            .expect("creates symlink");
+
+        let access = fixture.access();
+        access.read("escape.json").expect_err("is refused");
+        access.exists("escape.json").expect_err("is refused");
+
+        let reads = access.dependencies();
+        let recorded = reads
+            .iter()
+            .find(|read| read.path.as_str() == "escape.json")
+            .expect("the refused path is a dependency");
+        assert_eq!(
+            recorded.outcome,
+            tracked::ReadOutcome::Refused,
+            concat!(
+                "refused, not absent: a validator rechecking absence would follow the link, ",
+                "find the target and invalidate on every run — see `lanekeep_cache::validate`"
+            )
+        );
+
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn a_path_that_can_never_be_in_root_is_not_recorded() {
+        // The other half, on the two grounds `Outcome::Refused` separates: `../secrets` names
+        // nothing inside the root under any future state of the filesystem, and an absolute
+        // path — which may perfectly well name an in-root file — is refused by a rule instead.
+        // Either way the answer is fixed, so recording them would put a path in every cache
+        // entry that the validator would then have to read on every run.
+        let fixture = Fixture::new("refused-unrecorded", &[]);
+        let access = fixture.access();
+        access.read("../secrets.json").expect_err("is refused");
+        access.read("/etc/passwd").expect_err("is refused");
+        assert!(
+            access.dependencies().is_empty(),
+            "{:?}",
+            access.dependencies()
+        );
     }
 
     #[test]

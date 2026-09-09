@@ -28,12 +28,14 @@ import { matches } from 'lanekeep/patterns'
  * is optional money and none of its members is a forbidden primitive, so it stays silent;
  * `number | Decimal` can still be a bare `number` at run time, so it reports.
  *
- * **`require` is matched on the module a type came from and on nothing else, so a different
- * export of that module is accepted.** `import { Big } from 'decimal.js'` satisfies a
- * convention requiring `Decimal`. That is a false negative and it is the deliberate trade:
- * the type's name as the oracle reports it is the *use-site* name, so comparing it would
- * report `import { Decimal as Money } from 'decimal.js'` — conforming code — as a violation,
- * and a rule that accuses conforming code is the one failure this design forbids.
+ * **`require` is matched on the module a type came from and on the name that module exports
+ * it under.** The comparison reads the exported name and never the use-site spelling, so
+ * `import { Decimal as Money } from 'decimal.js'` is accepted by a convention requiring
+ * `Decimal`, and `import { Big } from 'decimal.js'` is reported: a sibling export of the
+ * required module is not the required type. A default import,
+ * `import Decimal from 'decimal.js'`, is accepted on the module alone — what the module
+ * exports it under is the literal `default`, so comparing names there would accuse
+ * conforming code.
  *
  * @example
  * ```ts
@@ -57,6 +59,26 @@ import { matches } from 'lanekeep/patterns'
  */
 export default function noRestrictedTypes(options) {
   const conventions = options?.conventions ?? []
+
+  for (const [index, convention] of conventions.entries()) {
+    const require = convention.require
+    if (require === undefined) continue
+    if (
+      require === null ||
+      typeof require !== 'object' ||
+      typeof require.module !== 'string' ||
+      typeof require.name !== 'string'
+    ) {
+      // A `require` is matched on `module` *and* `name`, and `name` is what the message tells
+      // the reader to use — so a convention missing either has nothing to check against, and
+      // running it would accuse every conforming import from that module with a message that
+      // says `use undefined`. Refusing here, at load, is the loud version of that failure.
+      throw new Error(
+        `no-restricted-types: conventions[${index}].require needs both \`module\` and \`name\` ` +
+          `as strings — got ${JSON.stringify(require)}`,
+      )
+    }
+  }
 
   return defineRule({
     id: 'lanekeep/no-restricted-types',
@@ -136,30 +158,39 @@ export default function noRestrictedTypes(options) {
           return
         }
 
-        // A named type. It satisfies the convention only when it is the *required* one,
-        // matched on the module its symbol came from and **never on the type's name** — a
-        // local `class Decimal {}` carries no module at all, so the module comparison alone
-        // is what keeps the shadow out.
+        // A named type. It satisfies the convention when it came from the required module
+        // *and* is the required export of it — matched on `symbol.exported`, the name the
+        // module exports it under, which is `Decimal` for `import { Decimal }` and for
+        // `import { Decimal as Money }` alike. The alias is accepted because the comparison
+        // never touches the use-site spelling, and a sibling export, `import { Big } from
+        // 'decimal.js'`, is reported, which the module comparison alone used to accept.
         //
-        // Comparing `symbol.name` too is the false positive this design is arranged against.
-        // The oracle's `symbol_at` fills `name` from the node's own text, discarding the
-        // `ImportedName::Named` the resolver carries, so it is the *use-site* name: with the
-        // name compared, `import { Decimal as Money } from 'decimal.js'` — conforming code —
-        // was reported with a message about `number`.
+        // Both halves are load-bearing, and the shadow is not what pins the module half: a
+        // local `class Decimal {}` carries no module and no `exported`, so it fails the name
+        // comparison first and is reported either way. What only the module comparison
+        // catches is the required name imported from the wrong module —
+        // `import { Decimal } from 'big.js'` — and dropping the name comparison is the false
+        // negative this rule shipped with.
         //
-        // The trade is a false negative, and it is the right one here: matching the module
-        // alone accepts a *different* export of the required module, so `import { Big } from
-        // 'decimal.js'` passes a convention requiring `Decimal`. False negatives are the
-        // price this rule pays; false positives are the thing it forbids. The better fix is
-        // for the oracle to carry the *exported* name alongside the use-site one, which
-        // belongs in `lanekeep-types` rather than here.
+        // A default import is accepted on the module requirement alone, as the *fallback*
+        // for a package the oracle could not read. With the declaration file readable, the
+        // cross-file oracle already follows the default export to the name that file declares
+        // it under, and `exported` is that name — so the ordinary comparison happens and a
+        // package whose default export is `Big` no longer satisfies a convention requiring
+        // `Decimal`. What is left is the unresolvable case: an uninstalled package answers the
+        // literal `'default'`, which no `require.name` a convention writes will equal, and
+        // demanding the name there would accuse `import Decimal from 'decimal.js'` —
+        // conforming code, and the one failure this design forbids.
         //
         // A nominal type the oracle could not attribute carries no symbol at all, so it
         // cannot match and is reported: a governed value whose type cannot be established
         // is not evidence the convention is met.
         if (convention.require === undefined) continue
         const symbol = type.symbol
-        const satisfied = symbol !== undefined && symbol.module === convention.require.module
+        const satisfied =
+          symbol !== undefined &&
+          symbol.module === convention.require.module &&
+          (symbol.exported === convention.require.name || symbol.exported === 'default')
         if (!satisfied) {
           ctx.report(m.name, { message: reasonFor(convention) })
           return

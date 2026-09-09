@@ -35,11 +35,12 @@ use rquickjs::{Ctx, Function, Object, Value};
 
 use lanekeep_lang::binding::BindingResolver;
 
+use lanekeep_core::FilePath;
 use lanekeep_core::files::FileAccess;
 use lanekeep_core::fix::Fix;
 use lanekeep_nodes::{Handle, NodeArena};
 use lanekeep_query::CompiledQuery;
-use lanekeep_types::{Symbol, Type, TypeScriptOracle, TypeScriptSupport};
+use lanekeep_types::{Query, Symbol, Type, TypeProvider};
 
 /// The version of the `ctx` surface this build exposes.
 ///
@@ -74,7 +75,17 @@ use lanekeep_types::{Symbol, Type, TypeScriptOracle, TypeScriptSupport};
 ///   the same reporting surface `check` does — so a build with them can produce a verdict a
 ///   build without them could not, which is why the version moves even though no `ctx`
 ///   function was added or changed.
-pub const HOST_API_VERSION: u32 = 5;
+/// - `6` — `ctx.types` widens. `symbolOf`, and the `symbol` nested under a nominal `typeOf`,
+///   carry `exported`: the name the module exports a value under, `default` for a default
+///   import, absent for a namespace import and for a local declaration. A rule can now match
+///   an import by its exported name without rejecting a renamed one, which is a verdict a
+///   build without the field could not reach.
+/// - `7` — the cross-file oracle (#189). `typeOf` and `symbolOf` follow an import into the
+///   file that declares it, so an answer now depends on a second file's bytes — tracked as a
+///   read, so the cache sees it — and `ctx.types` gains `returnTypeOf`, `isAssignableTo` and
+///   `complete`. A build without them can answer a question this build answers differently,
+///   which is what a generation is for.
+pub const HOST_API_VERSION: u32 = 7;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,14 +137,22 @@ pub struct HostContext {
     files: Option<Arc<FileAccess>>,
     /// The grammar `querySubtree` and `closestAncestor` compile against.
     language: Option<Arc<dyn lanekeep_lang::Language>>,
-    /// The probe token behind `ctx.types`, present only for a rule that declared
-    /// `requires: ['types']`.
+    /// What answers `ctx.types`, present only for a rule that declared `requires: ['types']`.
     ///
-    /// Cloning this is cheap: `TypeScriptSupport` is one `Arc<dyn BindingResolver>`, so a
-    /// clone is a refcount bump and carries none of the grammar probe that built it. That is
-    /// what lets `install_types` build a fresh oracle inside every closure call rather than
-    /// storing one beside the tree it would have to borrow.
-    types: Option<TypeScriptSupport>,
+    /// An `Arc<dyn TypeProvider>` rather than a probe token: a provider owns run-scoped
+    /// state — a declaration cache here, a compiler process under A3 — that cannot be
+    /// rebuilt per query, and it is `Send + Sync` because rayon moves the run's copy between
+    /// workers. Cloning is a refcount bump, which is what lets the closures below capture
+    /// one each.
+    provider: Option<Arc<dyn TypeProvider>>,
+    /// The interrupt budget to stop while a provider answers, when the host supplied one.
+    ///
+    /// `None` in a unit test that builds a context without a sandbox, and in the reduce phase.
+    /// `eval_with_reduce_host` (`sandbox.rs`) does arm a per-invocation clock there, same as
+    /// for `check` — this field is `None` regardless, because `ReduceContext` has no `types`
+    /// surface to pause around. Absent means "do not pause", which is the same behavior a
+    /// disarmed budget already has.
+    rule_clock: Option<Arc<lanekeep_core::limits::Budget>>,
     /// The date a rule sees as `ctx.today`, if the host supplied one.
     today: Option<Rc<str>>,
     /// Whether anything actually read `ctx.today` while checking this file.
@@ -168,7 +187,8 @@ impl std::fmt::Debug for HostContext {
             .field("has_resolver", &self.resolver.is_some())
             .field("has_file_access", &self.files.is_some())
             .field("has_language", &self.language.is_some())
-            .field("has_types", &self.types.is_some())
+            .field("has_provider", &self.provider.is_some())
+            .field("has_rule_clock", &self.rule_clock.is_some())
             .field("has_today", &self.today.is_some())
             .field("date_read", &self.date_read.get())
             .field("compiled_queries", &self.queries.borrow().len())
@@ -188,7 +208,8 @@ impl HostContext {
             resolver: None,
             files: None,
             language: None,
-            types: None,
+            provider: None,
+            rule_clock: None,
             today: None,
             date_read: Rc::new(Cell::new(false)),
             queries: Rc::new(RefCell::new(BTreeMap::new())),
@@ -235,7 +256,8 @@ impl HostContext {
         self
     }
 
-    /// Attach the type oracle's probe token, enabling `ctx.types`.
+    /// Attach the type provider and the access it reads other files through, enabling
+    /// `ctx.types`.
     ///
     /// Without one, `ctx.types` is absent rather than present-and-empty: reaching for it
     /// undeclared is a `TypeError` at the first call, not a silent `undefined` that would
@@ -244,12 +266,25 @@ impl HostContext {
     /// functions present but degraded — silence is exactly the failure mode this surface is
     /// arranged against, so the caller finds out immediately rather than from a clean report.
     ///
-    /// Takes the already-probed [`TypeScriptSupport`] rather than a language: probing is
-    /// 8.4 µs of the 9.2 µs a fresh oracle costs, and the caller is expected to pay that
-    /// once per run, not once per file.
+    /// **The access is a parameter rather than read off `self`, and that is the point.** A
+    /// provider opens declaration files, and every one of those reads has to land on *this*
+    /// file's dependency list or the cache serves an answer no key covers. Taking it here
+    /// makes "the provider and the recorder are the same access" a thing the signature says
+    /// rather than a thing two call sites have to agree about.
+    ///
+    /// It is the same `files` field [`Self::with_file_access`] sets, not a second one — which
+    /// is *how* they are one access, and also the whole of the guarantee: both setters write
+    /// it, last write wins, so calling the two with different accesses is a caller error the
+    /// type cannot catch. The engine calls `with_provider` after `with_file_access` with the
+    /// same `Arc`, so the write is a no-op there.
     #[must_use]
-    pub fn with_types(mut self, support: TypeScriptSupport) -> Self {
-        self.types = Some(support);
+    pub fn with_provider(
+        mut self,
+        provider: Arc<dyn TypeProvider>,
+        files: Arc<FileAccess>,
+    ) -> Self {
+        self.provider = Some(provider);
+        self.files = Some(files);
         self
     }
 
@@ -276,9 +311,29 @@ impl HostContext {
     /// component engine's context for the same file. Two memos over one file would let two
     /// rules see a file rewritten between them differently, which is the determinism invariant
     /// and not a tidiness question — see [`FileAccess`]'s own `seen` field.
+    ///
+    /// Writes the same field [`Self::with_provider`] does, and last write wins: a caller that
+    /// passes two different accesses gets whichever it named last, for the rule's own reads
+    /// *and* for the provider's.
     #[must_use]
     pub fn with_file_access(mut self, files: Arc<FileAccess>) -> Self {
         self.files = Some(files);
+        self
+    }
+
+    /// Hand this context the sandbox's interrupt budget, so a `ctx.types` call can stop the
+    /// rule's clock while the host answers.
+    ///
+    /// Without it a provider's own time is charged to whichever rule happened to ask first,
+    /// which would make a rule's timeout depend on the order the config listed it in — the
+    /// determinism invariant, not a nicety.
+    ///
+    /// The engine attaches one unconditionally, provider or not: only the `ctx.types`
+    /// closures read it, and those exist only when a provider was attached, so a condition at
+    /// the call site would be a second copy of that rule free to drift out of step with it.
+    #[must_use]
+    pub fn with_rule_clock(mut self, budget: Arc<lanekeep_core::limits::Budget>) -> Self {
+        self.rule_clock = Some(budget);
         self
     }
 
@@ -779,33 +834,54 @@ impl HostContext {
 
     /// The type surface, present only for a rule that declared `requires: ['types']`.
     ///
-    /// Each closure builds its own oracle: `TypeScriptOracle` borrows the tree, which lives
-    /// behind this context's `RefCell`, so it cannot be stored beside it. That is affordable
-    /// only because the grammar probe was hoisted into `TypeScriptSupport` — before that split
-    /// a construction cost 9.2 µs, about thirty host crossings, to serve one call.
+    /// Each closure builds one [`Query`] and hands it to the provider. The arena's tree is
+    /// borrowed for the length of the call and no longer, which is the borrow shape the
+    /// provider trait exists to allow: an oracle that borrowed the tree for its own life
+    /// could not be a run-scoped value at all.
     ///
     /// Answers cross as data rather than as handles, for the reason `structureFingerprint`
     /// does: a type handle would be one crossing per question about a type, which is the cost
     /// invariant 3 exists to prevent.
+    ///
+    /// # The pause below, in every arm
+    ///
+    /// Each arm wraps only the provider call in `rule_clock.pause()` — not the arena borrow,
+    /// the handle lookup, or the `render_*` call that turns the answer into a JS value. Those
+    /// are the rule's own boundary cost and stay charged to it; only the provider's own
+    /// program build is host work the rule did not write. Charging that work to whichever
+    /// rule happened to ask first would make a rule's timeout depend on the order the config
+    /// listed it in — and which arm triggers a build is not knowable from the call site, so
+    /// every arm pauses, not only the expensive-looking ones.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "five parallel arms, each pausing around its own provider call the same way \
+                  for the same reason — splitting one arm into its own function would separate \
+                  it from the doc above that explains why every arm does this identically, and \
+                  from the four siblings a reader needs beside it to see that the pause is \
+                  narrowed consistently rather than in one arm only"
+    )]
     fn install_types<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
-        let Some(support) = self.types.clone() else {
+        let (Some(provider), Some(files)) = (self.provider.clone(), self.files.clone()) else {
             return Ok(());
         };
         let types = Object::new(ctx.clone())?;
-
+        // Built once per rule per file rather than per call: `FilePath::new` normalizes
+        // separators and strips a leading `./`, which is an allocation this surface should
+        // not pay on every host crossing.
+        let file = FilePath::new(&*self.file_path);
         let arena = Rc::clone(&self.arena);
-        let type_support = support.clone();
+        let clock = self.rule_clock.clone();
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "typeOf",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
-                    let arena = arena.borrow();
-                    let Some(node) = arena.node(handle) else {
-                        return Ok(Value::new_undefined(ctx.clone()));
-                    };
-                    let oracle = TypeScriptOracle::new(&type_support, arena.tree(), arena.source());
-                    let Some(ty) = oracle.type_of(node) else {
+                    let answer =
+                        paused_query(clock.as_deref(), &arena, &at, &reader, handle, |q| {
+                            asked.type_of(q)
+                        });
+                    let Some(ty) = answer else {
                         return Ok(Value::new_undefined(ctx.clone()));
                     };
                     Ok(render_type(&ctx, &ty)?.into_value())
@@ -814,22 +890,93 @@ impl HostContext {
         )?;
 
         let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
         types.set(
             "symbolOf",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
-                    let arena = arena.borrow();
-                    let Some(node) = arena.node(handle) else {
-                        return Ok(Value::new_undefined(ctx.clone()));
-                    };
-                    let oracle = TypeScriptOracle::new(&support, arena.tree(), arena.source());
-                    let Some(symbol) = oracle.symbol_of(node) else {
+                    let answer =
+                        paused_query(clock.as_deref(), &arena, &at, &reader, handle, |q| {
+                            asked.symbol_of(q)
+                        });
+                    let Some(symbol) = answer else {
                         return Ok(Value::new_undefined(ctx.clone()));
                     };
                     Ok(render_symbol(&ctx, &symbol)?.into_value())
                 },
             )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
+        types.set(
+            "returnTypeOf",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, handle: Handle| -> rquickjs::Result<Value<'js>> {
+                    let answer =
+                        paused_query(clock.as_deref(), &arena, &at, &reader, handle, |q| {
+                            asked.return_type_of(q)
+                        });
+                    let Some(ty) = answer else {
+                        return Ok(Value::new_undefined(ctx.clone()));
+                    };
+                    Ok(render_type(&ctx, &ty)?.into_value())
+                },
+            )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
+        types.set(
+            "isAssignableTo",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      handle: Handle,
+                      module: String,
+                      name: String|
+                      -> rquickjs::Result<Value<'js>> {
+                    let answer =
+                        paused_query(clock.as_deref(), &arena, &at, &reader, handle, |q| {
+                            asked.is_assignable_to(q, &module, &name)
+                        });
+                    // `undefined` for "could not read", never `false`. The two are different
+                    // answers and a rule branching on the wrong one reports on code the
+                    // provider never saw — which is why this arm returns a value rather than
+                    // a bare `bool` the boundary would coerce.
+                    match answer {
+                        Some(verdict) => Ok(Value::new_bool(ctx.clone(), verdict)),
+                        None => Ok(Value::new_undefined(ctx.clone())),
+                    }
+                },
+            )?,
+        )?;
+
+        let arena = Rc::clone(&self.arena);
+        let clock = self.rule_clock.clone();
+        let (asked, at, reader) = (Arc::clone(&provider), file.clone(), Arc::clone(&files));
+        types.set(
+            "complete",
+            Function::new(ctx.clone(), move || -> bool {
+                // The whole file rather than a node, so the root is what a `Query` carries —
+                // and no handle is taken, because a rule asking "did I see everything" is
+                // asking about the file it is checking and there is only one.
+                let arena = arena.borrow();
+                let query = Query {
+                    file: &at,
+                    tree: arena.tree(),
+                    source: arena.source(),
+                    node: arena.tree().root_node(),
+                    files: &reader,
+                };
+                let _paused = clock.as_ref().map(|budget| budget.pause());
+                asked.complete(query)
+            })?,
         )?;
 
         object.set("types", types)?;
@@ -1169,16 +1316,63 @@ fn type_text(ty: &Type) -> String {
 /// Render a `Symbol` into the object `ctx.types.symbolOf` hands back, and the one nested
 /// under a rendered `Type`'s `symbol` field.
 ///
-/// `module` is absent for a local declaration rather than `null` — the same posture
-/// `Symbol`'s own doc comment describes: that absence is what distinguishes an imported
-/// `Decimal` from a local class that happens to share the name.
+/// `module` and `exported` are absent rather than `null` where they do not apply — the same
+/// posture `Symbol`'s own doc comment describes. Absence is the answer in both cases: it is
+/// what distinguishes an imported `Decimal` from a local class that happens to share the
+/// name, and a namespace import, which binds the module object, from a named one.
 fn render_symbol<'js>(ctx: &Ctx<'js>, symbol: &Symbol) -> rquickjs::Result<Object<'js>> {
     let object = Object::new(ctx.clone())?;
     object.set("name", symbol.name.clone())?;
+    if let Some(exported) = &symbol.exported {
+        object.set("exported", exported.clone())?;
+    }
     if let Some(module) = &symbol.module {
         object.set("module", module.clone())?;
     }
     Ok(object)
+}
+
+/// Answer one `ctx.types` question over the arena's tree, or nothing.
+///
+/// One place that builds a [`Query`], because the arena guard has to outlive the borrow the
+/// query holds and getting that wrong in five closures is five chances rather than one. A
+/// dead handle yields `None`, which every arm renders as `undefined` — the same posture
+/// `kind` and `loc` already take.
+fn with_query<T>(
+    arena: &Rc<RefCell<NodeArena>>,
+    file: &FilePath,
+    files: &FileAccess,
+    handle: Handle,
+    ask: impl FnOnce(Query<'_>) -> Option<T>,
+) -> Option<T> {
+    let arena = arena.borrow();
+    let node = arena.node(handle)?;
+    ask(Query {
+        file,
+        tree: arena.tree(),
+        source: arena.source(),
+        node,
+        files,
+    })
+}
+
+/// [`with_query`], with the rule's clock paused around `ask` alone.
+///
+/// The arena borrow and handle lookup inside `with_query` run before this pauses and are
+/// charged to the rule; only `ask` — the provider call each `install_types` arm makes — runs
+/// with the clock stopped. See `install_types`'s doc for why that boundary and not a wider one.
+fn paused_query<T>(
+    clock: Option<&lanekeep_core::limits::Budget>,
+    arena: &Rc<RefCell<NodeArena>>,
+    file: &FilePath,
+    files: &FileAccess,
+    handle: Handle,
+    ask: impl FnOnce(Query<'_>) -> Option<T>,
+) -> Option<T> {
+    with_query(arena, file, files, handle, |q| {
+        let _paused = clock.map(lanekeep_core::limits::Budget::pause);
+        ask(q)
+    })
 }
 
 /// Merge a `file` into a fact's serialized payload.
@@ -2291,10 +2485,161 @@ mod tests {
         ));
     }
 
-    /// A host with the capability granted, built on this module's existing `host` helper.
+    /// A host with the capability granted through the provider seam.
+    ///
+    /// Replaces `with_types`. `with_provider` takes the file access too, because a provider
+    /// reaches other files and every one of those reads has to be recorded against *this*
+    /// file — an access supplied separately could be a different one, and two memos over one
+    /// file is the determinism failure `FileAccess`'s own `seen` field documents.
     fn host_with_types(source: &str) -> HostContext {
-        host(source)
-            .with_types(TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported"))
+        let provider =
+            lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript is supported");
+        // The builtin provider reads nothing beside the tree it is handed, so the tracked
+        // reader roots at a directory that already exists rather than creating one — a
+        // filesystem write from inside this crate is what `local/tracked-reads-only` refuses.
+        let root = std::env::temp_dir();
+        host(source).with_provider(Arc::new(provider), Arc::new(FileAccess::new(&root)))
+    }
+
+    /// A provider that spends real host time on every question, and counts the questions.
+    ///
+    /// Real time rather than a mocked clock, because the thing under test is the interaction
+    /// between a sleeping host call and the interrupt handler's own reading of the run clock —
+    /// which is exactly what a mock would paper over.
+    #[derive(Debug, Default)]
+    struct SlowProvider {
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SlowProvider {
+        const HOST_WORK: std::time::Duration = std::time::Duration::from_millis(120);
+        const RULE_BUDGET: std::time::Duration = std::time::Duration::from_millis(80);
+
+        fn dawdle(&self) {
+            self.asked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(Self::HOST_WORK);
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl TypeProvider for SlowProvider {
+        fn type_of(&self, _q: Query<'_>) -> Option<Type> {
+            self.dawdle();
+            None
+        }
+        fn symbol_of(&self, _q: Query<'_>) -> Option<Symbol> {
+            self.dawdle();
+            None
+        }
+        fn return_type_of(&self, _q: Query<'_>) -> Option<Type> {
+            self.dawdle();
+            None
+        }
+        fn is_assignable_to(&self, _q: Query<'_>, _module: &str, _name: &str) -> Option<bool> {
+            self.dawdle();
+            None
+        }
+        fn complete(&self, _q: Query<'_>) -> bool {
+            self.dawdle();
+            true
+        }
+        fn identity(&self) -> Vec<u8> {
+            b"slow-provider".to_vec()
+        }
+    }
+
+    /// Enough bytecode after the provider call for the interrupt handler to actually run.
+    ///
+    /// QuickJS polls the handler every `JS_INTERRUPT_COUNTER_INIT` operations (10,000, from
+    /// `rquickjs-sys`'s vendored `quickjs.c`) rather than after every one, so a rule that
+    /// returns immediately after a host call is never asked whether it should stop — which
+    /// made the first version of the control test below pass while asserting nothing. Twenty
+    /// thousand iterations clears that several times over while staying cheap: measured on an
+    /// Apple M3 Max, `cargo nextest run` debug build, this loop alone takes about 4 ms against
+    /// `SlowProvider::RULE_BUDGET`'s 80 ms — roughly 20× headroom, not the "thousands of
+    /// times" this comment used to claim for the hundred-thousand-iteration version.
+    const POLL_THE_HANDLER: &str = "; let s = 0; for (let i = 0; i < 20000; i++) s += i; \
+                                    'survived'";
+
+    /// Every `ctx.types` arm, spelled so each one reaches the provider exactly once.
+    const EVERY_TYPES_ARM: [&str; 5] = [
+        "ctx.types.typeOf(ctx.root)",
+        "ctx.types.symbolOf(ctx.root)",
+        "ctx.types.returnTypeOf(ctx.root)",
+        "ctx.types.isAssignableTo(ctx.root, 'decimal.js', 'Decimal')",
+        "ctx.types.complete()",
+    ];
+
+    /// The pause reaches every arm, not only the expensive-looking ones.
+    ///
+    /// The trap this is written against: a `pause` that is constructed and never installed on
+    /// a closure looks implemented and enforces nothing. Each arm is asked for a question the
+    /// provider spends `SlowProvider::HOST_WORK` on, under a `SlowProvider::RULE_BUDGET` rule
+    /// budget; the rule survives only because the host's time was not charged to it. The
+    /// companion test below removes the clock and shows the same code timing out, so this one
+    /// cannot be passing because the host's time went unnoticed.
+    #[test]
+    fn types_a_provider_call_is_not_charged_to_the_rules_own_budget() {
+        for arm in EVERY_TYPES_ARM {
+            let provider = Arc::new(SlowProvider::default());
+            let sandbox = Sandbox::with_limits(Limits::default()).expect("sandbox builds");
+            let host = host("const a: number = 1;")
+                .with_provider(
+                    Arc::clone(&provider) as Arc<dyn TypeProvider>,
+                    Arc::new(FileAccess::new(&std::env::temp_dir())),
+                )
+                .with_rule_clock(sandbox.budget());
+
+            let source = format!("{arm}{POLL_THE_HANDLER}");
+            let answer: String = sandbox
+                .eval_with_host_timeout(&host, &source, SlowProvider::RULE_BUDGET)
+                .unwrap_or_else(|err| panic!("{arm} must not be charged the host's time: {err:?}"));
+
+            assert_eq!(answer, "survived");
+            assert_eq!(provider.asked(), 1, "{arm} must reach the provider");
+        }
+    }
+
+    /// The control for the test above: with no rule clock attached, the same work times out.
+    ///
+    /// Without this pair, a `pause` that did nothing at all would still be green —
+    /// `SlowProvider::HOST_WORK` would simply have to be shown to matter, and nothing would
+    /// show it.
+    #[test]
+    fn types_a_provider_call_without_a_rule_clock_is_charged_to_the_rule() {
+        for arm in EVERY_TYPES_ARM {
+            let provider = Arc::new(SlowProvider::default());
+            let sandbox = Sandbox::with_limits(Limits::default()).expect("sandbox builds");
+            let host = host("const a: number = 1;").with_provider(
+                Arc::clone(&provider) as Arc<dyn TypeProvider>,
+                Arc::new(FileAccess::new(&std::env::temp_dir())),
+            );
+
+            let source = format!("{arm}{POLL_THE_HANDLER}");
+            let outcome =
+                sandbox.eval_with_host_timeout::<String>(&host, &source, SlowProvider::RULE_BUDGET);
+            assert!(
+                matches!(outcome, Err(crate::SandboxError::RuleTimeout { .. })),
+                "{arm} unpaused must breach the rule budget, got {outcome:?}"
+            );
+        }
+    }
+
+    /// The provider is what answers, and a host given none has no `types` namespace.
+    ///
+    /// Distinct from `types_is_absent_without_the_capability` above, which asserts the same
+    /// absence for a host built with neither. This one is the seam's own claim: the
+    /// namespace exists exactly when a provider was attached, so an engine that stopped
+    /// attaching one would be loud rather than silently answering `undefined`.
+    #[test]
+    fn types_is_absent_without_a_provider() {
+        let host = host("const a: number = 1;")
+            .with_file_access(Arc::new(FileAccess::new(&std::env::temp_dir())));
+        assert!(!run::<bool>(&host, "'types' in ctx"));
     }
 
     #[test]
@@ -2314,6 +2659,47 @@ mod tests {
         assert_eq!(
             run::<String>(&host, &format!("ctx.types.symbolOf({handle}).module")),
             "decimal.js"
+        );
+    }
+
+    /// The exported name reaches a rule beside the use-site one, and a rename is where the
+    /// two differ — which is the whole reason the field exists.
+    ///
+    /// `JSON.stringify` of the whole object rather than a field read, for the reason
+    /// `types_renders_an_ambient_nominal_with_no_symbol_at_all` gives below: the bug worth
+    /// catching is a property being *present* when it should be absent, and no assertion
+    /// about a property's value can see that. It also pins key order, which is the order
+    /// `render_symbol` sets them in.
+    #[test]
+    fn types_exposes_the_exported_name_beside_the_use_site_one() {
+        let host =
+            host_with_types("import { Decimal as Money } from 'decimal.js';\nconst x = Money;");
+        let handle = handle_of(&host, "Money");
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("JSON.stringify(ctx.types.symbolOf({handle}))")
+            ),
+            "{\"name\":\"Money\",\"exported\":\"Decimal\",\"module\":\"decimal.js\"}"
+        );
+    }
+
+    /// A namespace import has a module and no `exported` property at all.
+    ///
+    /// The discriminating pair. A `render_symbol` that always wrote the property — as
+    /// `null`, or defaulting to the use-site name — passes the test above and fails this,
+    /// and a rule branching on `exported` would otherwise read the module object as a named
+    /// export and match a convention it does not satisfy.
+    #[test]
+    fn a_namespace_import_renders_with_no_exported_property() {
+        let host = host_with_types("import * as d from 'decimal.js';\nconst x = d;");
+        let handle = handle_of(&host, "d");
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("JSON.stringify(ctx.types.symbolOf({handle}))")
+            ),
+            "{\"name\":\"d\",\"module\":\"decimal.js\"}"
         );
     }
 
@@ -2398,6 +2784,63 @@ mod tests {
         let handle = handle_of(&host, "q");
         assert_eq!(
             run::<String>(&host, &format!("typeof ctx.types.typeOf({handle})")),
+            "undefined"
+        );
+    }
+
+    /// The three new arms are present and answer through the provider.
+    ///
+    /// One host, three questions, because the assertion each makes is about the *plumbing* —
+    /// that a `Query` reaches the provider and its answer is rendered — and the answers
+    /// themselves are pinned in `lanekeep-types`' own suite where the fixtures live.
+    #[test]
+    fn types_exposes_the_three_cross_file_arms() {
+        let host = host_with_types("function rate(): number { return 1; }\nrate();\n");
+        let handle = handle_of(&host, "rate");
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("ctx.types.returnTypeOf({handle}).primitive")
+            ),
+            "number"
+        );
+        // No declaration file anywhere, so nothing is assignable to anything named — and the
+        // answer is `undefined` rather than `false`, which is the distinction a rule must be
+        // able to make.
+        assert_eq!(
+            run::<String>(
+                &host,
+                &format!("typeof ctx.types.isAssignableTo({handle}, 'm', 'T')")
+            ),
+            "undefined"
+        );
+        // A file with no imports is complete.
+        assert!(run::<bool>(&host, "ctx.types.complete()"));
+    }
+
+    /// A file with an import nothing resolves is incomplete, and says so.
+    #[test]
+    fn types_reports_an_unresolvable_import_as_incomplete() {
+        let host = host_with_types("import { rate } from './dist/money';\nconst y = rate;\n");
+        assert!(!run::<bool>(&host, "ctx.types.complete()"));
+    }
+
+    /// `returnTypeOf` on a node that is not a function renders `undefined`, never `null`.
+    ///
+    /// Addendum F (task 4.16, from Task 15's review). The provider answers `None` for a call
+    /// through a non-function value exactly as it does for any other "cannot be sure" case —
+    /// `return_type_of_a_call_to_a_non_function_value_answers_nothing` in `lanekeep-types`
+    /// pins that — and this is the host-side half: `render_type` is never reached, so the
+    /// `Some`/`None` branch above has to be the one QuickJS actually takes. Asserted through
+    /// real JS rather than the Rust closure directly, the same reason every other case in
+    /// this module is: `typeof` is what a rule author's own code would write, and it is the
+    /// one check that tells "no such answer" apart from "an answer that happens to be null".
+    #[test]
+    fn types_returns_undefined_for_return_type_of_a_non_function() {
+        let host = host_with_types("const x = 5;\nx();\n");
+        let handle = handle_of(&host, "x");
+        assert_eq!(
+            run::<String>(&host, &format!("typeof ctx.types.returnTypeOf({handle})")),
             "undefined"
         );
     }

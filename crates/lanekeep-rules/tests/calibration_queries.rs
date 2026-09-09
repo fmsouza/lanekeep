@@ -52,16 +52,18 @@ fn a_property_read_flows_to_a_sink() {
 }
 
 #[test]
-fn field_insensitivity_still_reports_dot_length() {
-    // The documented over-approximation: `.length` of a secret is not the secret, but a
-    // field-insensitive analysis taints every property read. This asserts the FP the doc
-    // attributes to field-insensitivity is still present (it is the candidate B4).
+fn a_shape_property_read_of_a_secret_is_clean() {
+    // Was `field_insensitivity_still_reports_dot_length`, asserting the false positive the
+    // #220 re-run measured. B4/C2 (#225) closes it: `.length` describes the secret rather
+    // than carrying it. This is the exact corpus shape — `obj.secretKey` read through
+    // `${k.length}` — so this fixture and the corpus re-run assert the same thing, one in
+    // milliseconds and one over 3,984 files.
     tester()
-        .reports_at(
-            "const k = obj.secretKey; console.log(`${k.length}`)\n",
-            &[(1, 41)],
-        )
-        .expect("field-insensitive taint still reports .length");
+        .accepts("const k = obj.secretKey; console.log(`${k.length}`)\n")
+        .expect("a shape-property read of a secret is clean");
+    // The control is the test above this one, `a_property_read_flows_to_a_sink`
+    // (`calibration_queries.rs:47-52`): the same binding read whole reports at (1, 38), so
+    // the silence here is the shape cut and not a rule that stopped matching.
 }
 
 #[test]

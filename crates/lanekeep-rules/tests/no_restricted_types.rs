@@ -83,8 +83,9 @@ fn a_convention_listing_the_camel_case_spelling_reports_it() {
         .expect("`*Amount*` is the spelling that catches `totalAmount`");
 }
 
-/// The shadow case. `require` matches on the module a symbol came from, never on its name,
-/// so a local class sharing the name is not the imported type and is still a violation.
+/// The shadow case. `require` matches on the module a symbol came from and on the name that
+/// module exports it under; a local class satisfies neither, so sharing the required name
+/// does not make it the imported type, and it is still a violation.
 #[test]
 fn a_local_type_sharing_the_required_name_is_still_reported() {
     tester(MONEY)
@@ -95,14 +96,15 @@ fn a_local_type_sharing_the_required_name_is_still_reported() {
         .expect("a local Decimal is not decimal.js's");
 }
 
-/// The other half of "matched on the module, never on the name", and the one the shadow case
-/// above cannot stand in for: it is killed by the module comparison alone, so it stayed green
-/// for the whole life of a rule that also compared `symbol.name` and reported this.
+/// The alias half of the exported-name comparison, and the one the shadow case above cannot
+/// stand in for: it is killed by the module comparison alone, so it stayed green for the
+/// whole life of a rule that also compared `symbol.name` and reported this.
 ///
-/// `symbol.name` is the *use-site* name — the oracle fills it from the node's own text and
-/// discards the exported one — so an aliased import of exactly the required type read as a
-/// different type and was accused with a message about `number`. Conforming code, reported.
-/// Pinned here because it is the one failure this rule's whole design forbids.
+/// `symbol.name` is the *use-site* name — the oracle fills it from the node's own text and,
+/// before `Symbol.exported` existed, dropped the exported one, so an aliased import of
+/// exactly the required type read as a different type and was accused with a message about
+/// `number`. Conforming code, reported. Pinned here because it is the one failure this
+/// rule's whole design forbids.
 #[test]
 fn a_renamed_import_of_the_required_type_is_accepted() {
     tester(MONEY)
@@ -113,18 +115,100 @@ fn a_renamed_import_of_the_required_type_is_accepted() {
         .expect("an alias of decimal.js's Decimal is still decimal.js's Decimal");
 }
 
-/// The cost of the fixture above, asserted so nobody discovers it as a surprise: matching on
-/// the module alone accepts *any* export of that module, so a convention requiring `Decimal`
-/// takes a `Big` from the same package. A false negative, and the deliberate trade — the
-/// alternative is the false positive the test above pins.
+/// The false negative the module-only comparison bought, now closed. A sibling export of the
+/// required module is not the required type: `require` is matched on the module *and* on the
+/// name that module exports the type under, so a convention requiring `Decimal` reports a
+/// `Big` from the same package.
+///
+/// The pair for `a_renamed_import_of_the_required_type_is_accepted` above, and neither can
+/// stand in for the other. That one is killed by comparing the use-site name; this one is
+/// killed by comparing nothing but the module — which is precisely the state this rule
+/// shipped in, and why this test used to assert the opposite verdict.
 #[test]
-fn a_different_export_of_the_required_module_is_accepted_too() {
+fn a_different_export_of_the_required_module_is_reported() {
     tester(MONEY)
-        .accepts(
+        .reports_at(
             "import { Big } from 'decimal.js';\n\
              function credit(amount: Big) { return amount; }\n",
+            &[(2, 17)],
         )
-        .expect("the module is all that is matched, so a sibling export passes");
+        .expect("a sibling export of the required module is not the required type");
+}
+
+/// The half only the module comparison decides. The right name from the wrong module carries
+/// `module: 'big.js'` and `exported: 'Decimal'`, so the name half is satisfied and the module
+/// half is what reports it. The local-shadow fixture above cannot stand in for this: a shadow
+/// has neither a module nor an exported name, so it is caught by the name half first, and the
+/// module conjunct could be deleted with that fixture still green.
+#[test]
+fn the_required_name_imported_from_a_different_module_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "import { Decimal } from 'big.js';\n\
+             function credit(amount: Decimal) { return amount; }\n",
+            &[(2, 17)],
+        )
+        .expect("the right name from the wrong module is not the required type");
+}
+
+/// A default import satisfies the module requirement on its own, and the control violation
+/// in the same file is what stops that reading as a rule that simply went quiet.
+///
+/// `import Decimal from 'decimal.js'` is exported under the literal name `default`, which is
+/// not what any convention writes in `require.name`, so a comparison that demanded the name
+/// unconditionally would report conforming code — the one failure this rule's design
+/// forbids. `balance` two lines down is a raw `number` on a governed name and is still
+/// reported, so an implementation that accepted every named type to make the first half pass
+/// fails here. The local name is `Money`, not `Decimal`, so an implementation that copied the
+/// local name into `exported` for a default import fails here too.
+#[test]
+fn a_default_import_of_the_required_module_is_accepted_beside_a_control() {
+    tester(MONEY)
+        .reports_at(
+            "import Money from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n\
+             function settle(balance: number) { return balance; }\n",
+            &[(3, 17)],
+        )
+        .expect("the default import passes and the raw number beside it does not");
+}
+
+/// A `require` without `name` is refused at load, not run. Under the exported-name comparison
+/// a missing `name` would report every conforming import from the module with the message
+/// `use undefined from decimal.js` — the one failure this rule's design forbids — where the
+/// module-only comparison it replaced happened to stay silent. The docs always typed `name`
+/// as required; this is where that became true.
+#[test]
+fn a_require_without_a_name_is_refused_at_load() {
+    // `RuleTester::configured` only writes the fixture; the factory runs when the config is
+    // loaded, which is on the first `run` (here, through `accepts`) rather than here — so
+    // the refusal surfaces as a `TestError::Load` from that call, not from `configured`
+    // itself.
+    let source = lanekeep_rules::source("no-restricted-types").expect("the rule ships");
+    let tester = RuleTester::configured(
+        "no-restricted-types",
+        source,
+        "{ conventions: [{ names: ['*amount*'], forbid: ['number'], \
+         require: { module: 'decimal.js' } }] }",
+    )
+    .expect("configured writes the fixture without running the factory")
+    .with_builtins(lanekeep_rules::source);
+    let error = tester
+        .accepts("function credit(amount: number) { return amount; }\n")
+        .expect_err("a require without a name does not build");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("conventions[0].require needs both `module` and `name`"),
+        "the refusal names the convention and the missing field: {rendered}"
+    );
+}
+
+/// The mirror image, so the guard cannot be satisfied by refusing every `require`.
+#[test]
+fn a_require_with_both_fields_still_builds() {
+    tester(MONEY)
+        .accepts("import { Decimal } from 'decimal.js';\nfunction credit(amount: Decimal) { return amount; }\n")
+        .expect("a complete require builds and accepts the required type");
 }
 
 /// The oracle's initializer path, reached from a declaration-site identifier.
@@ -562,6 +646,7 @@ fn a_type_parameter_on_a_member_is_not_a_violation() {
         "interface Order<T> { amount: T }\n",
         "type Order<T> = { amount: T };\n",
         "abstract class Order<T> { abstract amount: T }\n",
+        "type F = <A>(amount: A) => A;\n",
     ] {
         tester(MONEY)
             .accepts(source)
@@ -614,4 +699,224 @@ fn the_violation_severity_is_error() {
         lanekeep_core::Severity::Error,
         "the card declares severity: 'error'"
     );
+}
+
+// --- #208: parameters inside a signature are governed values now -----------------------
+//
+// The query already matched these — `(required_parameter pattern: (identifier) @name)` does
+// not care what encloses the parameter — and `typeOf` answered `undefined`, which this rule
+// turns into silence. So the rule looked wired up and reported nothing, with no error
+// anywhere. Each pair below is a report and a control: without the control, a fix that made
+// every signature parameter report would pass.
+
+/// A parameter of an interface method signature is a governed value.
+#[test]
+fn a_forbidden_primitive_on_a_method_signature_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "interface Wallet {\n  credit(amount: number): void\n}\n",
+            &[(2, 10)],
+        )
+        .expect("`amount` is money, and a method signature's parameter is typed now");
+}
+
+/// The control: the same shape carrying the required type stays silent.
+#[test]
+fn the_required_type_on_a_method_signature_parameter_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             interface Wallet {\n  credit(amount: Decimal): void\n}\n",
+        )
+        .expect("a Decimal amount is what the convention asks for, wherever it is declared");
+}
+
+/// The abstract-member spelling of the pair above. `abstract class` against `class` is the
+/// exact divergence #207 found and fixed for the class's *own* type parameters; this is the
+/// same divergence one level down, on its members' parameters.
+#[test]
+fn a_forbidden_primitive_on_an_abstract_method_signature_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "abstract class Wallet {\n  abstract credit(amount: number): void\n}\n",
+            &[(2, 19)],
+        )
+        .expect("an abstract member's parameter is typed now too");
+}
+
+/// The control.
+#[test]
+fn the_required_type_on_an_abstract_method_signature_parameter_is_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import { Decimal } from 'decimal.js';\n\
+             abstract class Wallet {\n  abstract credit(amount: Decimal): void\n}\n",
+        )
+        .expect("a Decimal amount conforms in an abstract member as anywhere else");
+}
+
+/// A call signature's parameter — an interface that is callable rather than one with a
+/// method. Same widening, one node kind further from anything with a name.
+#[test]
+fn a_forbidden_primitive_on_a_call_signature_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at("interface Fee {\n  (amount: number): void\n}\n", &[(2, 4)])
+        .expect("a callable interface's parameter is a governed value too");
+}
+
+/// The control.
+#[test]
+fn a_call_signature_parameter_outside_the_convention_is_accepted() {
+    tester(MONEY)
+        .accepts("interface Fee {\n  (retries: number): void\n}\n")
+        .expect("`retries` is not money, in a call signature as anywhere else");
+}
+
+/// A construct signature's parameter. Its result field is spelled `type` rather than
+/// `return_type` — the resolver reads neither, which is why the oracle fixtures in
+/// `crates/lanekeep-types/tests/oracle.rs` write the same name in both positions instead of
+/// relying on which one comes last.
+#[test]
+fn a_forbidden_primitive_on_a_construct_signature_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "interface Wallet {\n  new (amount: number): Wallet\n}\n",
+            &[(2, 8)],
+        )
+        .expect("a constructor described in an interface governs its parameters too");
+}
+
+/// The control.
+#[test]
+fn a_construct_signature_parameter_outside_the_convention_is_accepted() {
+    tester(MONEY)
+        .accepts("interface Wallet {\n  new (retries: number): Wallet\n}\n")
+        .expect("`retries` is not money");
+}
+
+/// The two type-position kinds, where the design predicted silence and the rule reports.
+///
+/// §1 of the epic design calls these "fix only", on the reasoning that a parameter in pure
+/// type position is never read. It is read here: this rule captures the parameter's own
+/// declaring identifier and asks `typeOf` about it, which is the same path that made
+/// `declare function credit(amount: number)` report when `function_signature` became a scope
+/// in #207. A callback type that declares money as a `number` is exactly the convention
+/// violation the rule exists for, so the answer is wanted — but it was predicted wrong, and
+/// the prediction is what these two fixtures exist to correct.
+#[test]
+fn a_forbidden_primitive_on_a_function_type_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at("type Credit = (amount: number) => void;\n", &[(1, 16)])
+        .expect("a function type's parameter is read at its declaration site");
+}
+
+#[test]
+fn a_forbidden_primitive_on_a_constructor_type_parameter_is_reported() {
+    tester(MONEY)
+        .reports_at(
+            "type MakeWallet = new (amount: number) => Wallet;\n",
+            &[(1, 24)],
+        )
+        .expect("a constructor type's parameter is read the same way");
+}
+
+/// The control for both.
+#[test]
+fn a_type_position_parameter_outside_the_convention_is_accepted() {
+    tester(MONEY)
+        .accepts("type Retry = (retries: number) => void;\n")
+        .expect("`retries` is not money in a type position either");
+}
+
+/// The must-not-accuse half for the four positions this change opened: a governed name carrying
+/// the required type stays silent in each. "A rule that accuses conforming code is the one failure
+/// this design forbids", and a widening is exactly where that failure would enter — the `retries`
+/// controls above pass whatever the oracle answers, so they cannot see it.
+#[test]
+fn the_required_type_in_signature_or_type_position_is_accepted() {
+    for source in [
+        "import { Decimal } from 'decimal.js';\ninterface Fee {\n  (amount: Decimal): void\n}\n",
+        "import { Decimal } from 'decimal.js';\ninterface Wallet {\n  new (amount: Decimal): Wallet\n}\n",
+        "import { Decimal } from 'decimal.js';\ntype Credit = (amount: Decimal) => void;\n",
+        "import { Decimal } from 'decimal.js';\ntype MakeWallet = new (amount: Decimal) => Wallet;\n",
+    ] {
+        tester(MONEY)
+            .accepts(source)
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+    }
+}
+
+/// The fixture package both default-import cases resolve through.
+///
+/// `decimal.js`'s real shape, minimally: a manifest naming its declarations, and a
+/// declaration file whose default export is a class with a name of its own. Written through
+/// `write_fixture` because the tester's project root is what the resolver walks up to, and a
+/// `node_modules` beside the subject is the only thing a bare specifier can find.
+fn with_decimal_package<'a>(tester: &'a RuleTester, default_export: &str) -> &'a RuleTester {
+    tester
+        .write_fixture(
+            "node_modules/decimal.js/package.json",
+            r#"{"types": "./decimal.d.ts"}"#,
+        )
+        .expect("writes the manifest");
+    tester
+        .write_fixture("node_modules/decimal.js/decimal.d.ts", default_export)
+        .expect("writes the declarations");
+    tester
+}
+
+/// A default import of the *wrong* export is reported once the declaration file says so.
+///
+/// Before A2 a default import could only say `exported: 'default'`, so the rule accepted it
+/// on the module requirement alone — a false negative it took on purpose rather than accuse
+/// a conforming `import Decimal from 'decimal.js'`. With the package on disk the default
+/// export's declared name is readable, so the comparison the rule already makes for a named
+/// import happens here too.
+///
+/// The fixture's default export is deliberately **not** the required name: `Big`, under a
+/// convention requiring `Decimal`. A fixture whose default export happened to be `Decimal`
+/// would pass against a rule that never compared anything.
+#[test]
+fn a_default_import_of_a_differently_named_export_is_reported() {
+    let tester = tester(MONEY);
+    with_decimal_package(&tester, "export default class Big {}\n");
+    tester
+        .reports_at(
+            "import Money from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n",
+            &[(2, 17)],
+        )
+        .expect("`decimal.js`'s default export is `Big`, and the convention wants `Decimal`");
+}
+
+/// The half that denies a rule reporting every default import.
+///
+/// The identical program against a package whose default export *is* `Decimal`. Without this,
+/// the test above passes against a rule that simply stopped accepting default imports —
+/// which would accuse the conforming spelling this whole rule is arranged not to accuse.
+#[test]
+fn a_default_import_of_the_required_export_is_accepted() {
+    let tester = tester(MONEY);
+    with_decimal_package(&tester, "export default class Decimal {}\n");
+    tester
+        .accepts(
+            "import Money from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n",
+        )
+        .expect("the default export is the required type, whatever the importer called it");
+}
+
+/// And with no package on disk, the pre-A2 acceptance stands.
+///
+/// The silence posture where it matters most: a project whose `node_modules` is not installed
+/// gets the weaker guarantee rather than a wall of false positives. `exported` falls back to
+/// `default`, the rule accepts on the module, and the run reports nothing new.
+#[test]
+fn a_default_import_with_no_declaration_file_is_still_accepted() {
+    tester(MONEY)
+        .accepts(
+            "import Money from 'decimal.js';\n\
+             function credit(amount: Money) { return amount; }\n",
+        )
+        .expect("nothing readable said otherwise, so nothing is accused");
 }

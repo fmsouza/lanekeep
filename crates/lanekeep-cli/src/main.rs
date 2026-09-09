@@ -5,15 +5,16 @@
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
+mod session;
 mod watch;
 
 use clap::{Parser, Subcommand};
-use lanekeep_core::FilePath;
-use std::collections::BTreeMap;
+use lanekeep_core::{Capability, FilePath, TypesProvider};
+use std::collections::{BTreeMap, BTreeSet};
 
-use lanekeep_engine::{Engine, Outcome};
+use lanekeep_engine::{Engine, Outcome, PrepareOptions};
 use lanekeep_js::RuleRoot;
 use lanekeep_lang_js::{JavaScript, TypeScript};
 use lanekeep_report::{Color, Format, Summary};
@@ -223,13 +224,25 @@ fn run() -> anyhow::Result<ExitCode> {
                     fix,
                     profile,
                 },
+                dependencies: None,
             };
 
             if watch {
+                // Shared between the loop's filter and the check that fills it. The first
+                // iteration runs with an empty one, which is correct: nothing has been read
+                // yet, so nothing under an ignored directory can be an input.
+                let allowlist = Arc::new(Mutex::new(BTreeSet::new()));
+                let sink = Arc::clone(&allowlist);
                 // The exit code of any single pass is not the loop's: a violation is
                 // something to show and wait past, not a reason to stop watching. What the
                 // loop reports is whether it could watch at all.
-                return watch::watch(&path, || check(options()).map(|_| ()));
+                return watch::watch_with(&path, allowlist, || {
+                    check(CheckOptions {
+                        dependencies: Some(&sink),
+                        ..options()
+                    })
+                    .map(|_| ())
+                });
             }
 
             check(CheckOptions {
@@ -245,6 +258,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     fix,
                     profile,
                 },
+                dependencies: None,
             })
         }
         Command::Server {
@@ -274,6 +288,7 @@ fn fix_and_recheck(
     caching: bool,
     global_timeout: Option<u64>,
     outcome: Outcome,
+    held: Option<Arc<dyn lanekeep_engine::TypeProvider>>,
 ) -> anyhow::Result<Outcome> {
     let written = apply_fixes(project_root, &outcome)?;
     if written.files == 0 {
@@ -296,7 +311,23 @@ fn fix_and_recheck(
         )?;
     }
 
-    let (engine, _) = prepare(project_root, config, caching, global_timeout)?;
+    // The first run's provider, not a second one. Under `tsc` building one costs a Node
+    // process and a copy of every program in the project, and the recheck needs neither: it is
+    // a cache miss on the handful of files a fix rewrote. `begin_run` gives the held provider a
+    // fresh analysis budget and rebuilds its programs from the fixed bytes, so this is a second
+    // run with its own budget rather than a continuation of the first (architecture §6.7).
+    let (engine, _) = prepare_with_session(
+        project_root,
+        config,
+        caching,
+        global_timeout,
+        // `on_config` stays `None`: the note it prints says this run builds the project's
+        // TypeScript program, and this one does not build a second one. Printing it again would
+        // announce a cost that is not about to be paid.
+        PrepareOptions::default(),
+        held,
+        None,
+    )?;
     engine.run().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -952,11 +983,62 @@ fn config_path(project_root: &Path, given: Option<&Path>) -> anyhow::Result<Path
 }
 
 /// Load the config and prepare an engine. Shared by every command that needs rules.
+///
+/// How `rules` and `explain` prepare: read the configuration, build nothing.
+///
+/// Both print a rule's own metadata — its id, severity and card — and no provider contributes
+/// a byte of that. Under `types.provider: 'tsc'` an ordinary prepare would write the driver
+/// into the project, spawn Node, build every program in it and then exit 2 if the sidecar
+/// could not start, all before printing a card. See [`PrepareOptions::without_provider`].
+const METADATA_ONLY: PrepareOptions<'static> = PrepareOptions {
+    on_config: None,
+    without_provider: true,
+};
+
+/// `options` is [`PrepareOptions`] threaded through, rather than its fields spread across this
+/// signature: `check` is the one caller that needs to say something from the configuration
+/// before the engine spawns anything, and `rules` and `explain` are the two that need no
+/// provider spawned at all. Both are engine-side decisions, and passing the struct is what
+/// keeps a new one from arriving here as a bare `bool` beside `caching`.
+///
+/// A one-shot run: no session is held, so [`Engine::prepare_with_provider`] builds its own
+/// provider and drops it with the engine.
 fn prepare(
     project_root: &Path,
     config: Option<&Path>,
     caching: bool,
     global_timeout: Option<u64>,
+    options: PrepareOptions<'_>,
+) -> anyhow::Result<(Engine, usize)> {
+    prepare_with_session(
+        project_root,
+        config,
+        caching,
+        global_timeout,
+        options,
+        None,
+        None,
+    )
+}
+
+/// [`prepare`], optionally reusing an already-built provider or a session's held one.
+///
+/// `held` is the narrower, older reuse: `fix_and_recheck` passes the *first* run's provider
+/// back in directly, unconditionally, because a fix-and-recheck pair shares one config within
+/// one CLI invocation and there is nothing to compare. `session` is broader — it may build, or
+/// rebuild, depending on whether `config.types` moved since the session's last request — and
+/// is `Some` only from `server`, where the provider is the state a session keeps between
+/// requests and the engine is not (see [`crate::session`]). `held` wins when both are given,
+/// though in practice they never are: `fix_and_recheck` runs one-shot and has no session, and
+/// a session-held provider always reaches here as `session`, never pre-extracted into `held`.
+fn prepare_with_session(
+    project_root: &Path,
+    config: Option<&Path>,
+    caching: bool,
+    global_timeout: Option<u64>,
+    options: PrepareOptions<'_>,
+    held: Option<Arc<dyn lanekeep_engine::TypeProvider>>,
+    session: Option<&session::SessionProvider>,
 ) -> anyhow::Result<(Engine, usize)> {
     let root = RuleRoot::new(project_root)
         .map_err(|e| anyhow::anyhow!("cannot use `{}`: {e}", project_root.display()))?
@@ -1013,7 +1095,43 @@ fn prepare(
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     let declared = loaded.rules.len();
 
-    let engine = Engine::prepare(
+    // An explicit `held` wins outright — that is `fix_and_recheck` handing back the provider it
+    // already built for this exact run. Otherwise a session builds or reuses one, unless this
+    // is a metadata-only prepare: neither `rules` nor `explain` runs a file, so neither can ask
+    // a provider anything, and a session passed to either would build one for a listing.
+    let held = match held {
+        Some(provider) => Some(provider),
+        None => match session {
+            Some(session) if !options.without_provider => {
+                match session.for_request(&loaded, project_root) {
+                    Ok(provider) => Some(provider),
+                    // A spent `timeouts.analysis` is a limit, and a limit cancels the request
+                    // — the same exit the engine's own path takes for it, and the one error
+                    // from here that must not be re-worded into "your build does not provide
+                    // `types`", which sends the reader to install a toolchain they have.
+                    Err(timeout @ lanekeep_engine::RunError::AnalysisTimeout { .. }) => {
+                        return Err(anyhow::anyhow!("{timeout}"));
+                    }
+                    // **Anything else falls through with no held provider, deliberately.** A
+                    // session that raised it instead failed every request that `lanekeep
+                    // check` over the same project answers: under `types.provider: 'tsc'` with
+                    // an unstartable command and no enabled rule that needs `types`, the
+                    // engine's own path keeps the spawn failure in `tsc_spawn_error`, lets the
+                    // capability gate find that nobody asked, and reports normally. Only that
+                    // gate can decide, and only the engine holds it — so the engine is where
+                    // this has to be decided, which means arriving there with `None` and
+                    // letting it make the same cheap spawn attempt and reach the same verdict.
+                    Err(error) => {
+                        let _ = writeln!(std::io::stderr(), "lanekeep: {error}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        },
+    };
+
+    let engine = Engine::prepare_with_provider(
         &loaded,
         project_root,
         root,
@@ -1021,6 +1139,8 @@ fn prepare(
         &lanekeep_languages::registry(),
         Arc::new(TypeScript),
         Arc::new(JavaScript),
+        held,
+        options,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -1031,6 +1151,47 @@ fn prepare(
     };
 
     Ok((engine, declared))
+}
+
+/// Empty the watcher's allowlist, before anything in a run can fail.
+///
+/// Called at the top of [`check`], and the set is written again only where the run finished.
+/// An iteration that ends early — a rule that threw, a config that no longer loads, a breached
+/// limit — read some unknown prefix of what a whole run reads, and leaving the previous
+/// iteration's set in place makes the watcher confident about a list it no longer has any
+/// evidence for: the file whose edit broke the run may be exactly the one that has left it. An
+/// empty set wakes for anything outside an ignored directory, which is the right posture until
+/// a run succeeds and can say what it read.
+fn forget_dependencies(sink: Option<&Mutex<BTreeSet<PathBuf>>>) {
+    if let Some(sink) = sink {
+        sink.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
+}
+
+/// Record what this run read, for the watcher's next iteration.
+///
+/// Replaced rather than merged: a path the last run did not read is no longer an input, and
+/// merging would grow the set for the life of the session. Stored project-relative, which is
+/// how [`watch::is_interesting`] compares it — anchored at the root, by equality. Called at the
+/// end of [`check`], so that only a run which got that far describes what it read;
+/// [`forget_dependencies`] at the top is the other half.
+///
+/// `engine.dependency_paths`, not `outcome.dependency_paths` alone: the latter is only the
+/// tracked reads on `Query::files`, which under `types.provider: 'tsc'` never carries a
+/// declaration file the compiler read on its own — see `Engine::dependency_paths`.
+fn record_dependencies(
+    sink: Option<&Mutex<BTreeSet<PathBuf>>>,
+    engine: &Engine,
+    outcome: &Outcome,
+) {
+    if let Some(sink) = sink {
+        let paths: BTreeSet<PathBuf> = engine
+            .dependency_paths(outcome)
+            .iter()
+            .map(|path| PathBuf::from(path.as_str()))
+            .collect();
+        *sink.lock().unwrap_or_else(PoisonError::into_inner) = paths;
+    }
 }
 
 /// Everything `check` was asked for.
@@ -1048,6 +1209,11 @@ struct CheckOptions<'a> {
     /// Four bare booleans in a row is the shape that gets silently transposed, and the
     /// compiler cannot help — every one of them is the same type.
     switches: Switches,
+    /// Where to record what this run read beyond the files it checked.
+    ///
+    /// `Some` only under `--watch`, which turns it into the watcher's allowlist. A one-shot
+    /// run has nobody to read it back.
+    dependencies: Option<&'a Mutex<BTreeSet<PathBuf>>>,
 }
 
 /// `check`'s boolean flags.
@@ -1072,9 +1238,13 @@ struct Switches {
 
 /// Serve LSP or MCP over stdio until the client disconnects.
 ///
-/// The engine is rebuilt on every call rather than held: a rule file or the config can change
-/// while the session is open, and a server answering from the ruleset it started with would
-/// report violations the project no longer has.
+/// The engine is rebuilt on every request rather than held: a rule file or the config can
+/// change while the session is open, and a server answering from the ruleset it started with
+/// would report violations the project no longer has.
+///
+/// The type provider is the exception, and it is one for the opposite reason: it is the
+/// expensive state, and it is content-keyed, so it can be held without being able to go stale
+/// unnoticed. See [`crate::session`].
 fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow::Result<ExitCode> {
     let root = project_root
         .canonicalize()
@@ -1085,13 +1255,23 @@ fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow:
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
 
+    let session = session::SessionProvider::new();
+
     match protocol {
         "lsp" => {
             lanekeep_server::serve_lsp(&mut input, &mut output, &root, || {
                 // Every failure becomes a string the server logs and carries on from. An
                 // editor session should survive a config typo, not end on one.
-                let (engine, _) =
-                    prepare(project_root, config, true, None).map_err(|e| e.to_string())?;
+                let (engine, _) = prepare_with_session(
+                    project_root,
+                    config,
+                    true,
+                    None,
+                    PrepareOptions::default(),
+                    None,
+                    Some(&session),
+                )
+                .map_err(|e| e.to_string())?;
                 engine
                     .run()
                     .map(|outcome| outcome.violations)
@@ -1102,6 +1282,7 @@ fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow:
             let mut tools = Project {
                 project_root,
                 config,
+                session: &session,
             };
             lanekeep_server::mcp::serve(&mut input, &mut output, &mut tools)?;
         }
@@ -1112,15 +1293,31 @@ fn server(project_root: &Path, config: Option<&Path>, protocol: &str) -> anyhow:
 }
 
 /// The MCP tools, run against a real project.
+#[expect(
+    clippy::struct_field_names,
+    reason = "`project_root` sharing a prefix with `Project` only became a third field once \
+              `session` was added here for #191; renaming it would make this struct disagree \
+              with every other `project_root` parameter in the crate"
+)]
 struct Project<'a> {
     project_root: &'a Path,
     config: Option<&'a Path>,
+    /// Shared with the session, so `check` reuses what previous calls built.
+    session: &'a session::SessionProvider,
 }
 
 impl lanekeep_server::mcp::Tools for Project<'_> {
     fn check(&mut self) -> Result<String, String> {
-        let (engine, _) =
-            prepare(self.project_root, self.config, true, None).map_err(|e| e.to_string())?;
+        let (engine, _) = prepare_with_session(
+            self.project_root,
+            self.config,
+            true,
+            None,
+            PrepareOptions::default(),
+            None,
+            Some(self.session),
+        )
+        .map_err(|e| e.to_string())?;
         let outcome = engine.run().map_err(|e| e.to_string())?;
 
         let cards: lanekeep_report::Cards = engine
@@ -1147,8 +1344,8 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
     fn rules(&mut self) -> Result<String, String> {
         use std::fmt::Write as _;
 
-        let (engine, _) =
-            prepare(self.project_root, self.config, false, None).map_err(|e| e.to_string())?;
+        let (engine, _) = prepare(self.project_root, self.config, false, None, METADATA_ONLY)
+            .map_err(|e| e.to_string())?;
 
         let mut out = String::new();
         for spec in engine.rules() {
@@ -1167,8 +1364,8 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
     fn explain(&mut self, rule: &str) -> Result<String, String> {
         use std::fmt::Write as _;
 
-        let (engine, _) =
-            prepare(self.project_root, self.config, false, None).map_err(|e| e.to_string())?;
+        let (engine, _) = prepare(self.project_root, self.config, false, None, METADATA_ONLY)
+            .map_err(|e| e.to_string())?;
 
         let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
             // The list, not only the miss. A rule id is easy to mistype and the answer is
@@ -1194,6 +1391,91 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
     }
 }
 
+/// Said at prepare, on stderr, because it changes what running lanekeep costs rather than
+/// what it reports — and because the shape it warns about is a pre-commit hook someone
+/// configured without knowing it now builds their whole program first.
+///
+/// Takes the loaded [`Config`](lanekeep_config::Config) rather than the prepared [`Engine`],
+/// and is passed as `prepare`'s `on_config` hook rather than called after it returns:
+/// `prepare` is what spawns the `tsc` sidecar and builds the whole program, and it returns
+/// `Err` outright when the spawn fails — so a note printed after it either arrives too late to
+/// warn about the cost, or never prints at all on a machine without Node. `on_config` fires
+/// from the configuration, before any of that, in both cases.
+///
+/// The closure shape a hook takes has no way to propagate a write failure, so this discards one
+/// the way every other best-effort stderr write in this file does.
+fn note_slow_hook(config: &lanekeep_config::Config) {
+    if config.types.provider == TypesProvider::Tsc {
+        let _ = writeln!(
+            std::io::stderr(),
+            "note: types.provider is tsc: this run builds the project's TypeScript program \
+             before checking; a pre-commit hook using it is a slow hook"
+        );
+    }
+}
+
+/// A type-aware rule is *not* skipped by a narrowed selection: its answers are per file, and
+/// the provider reads whatever it needs beyond the selection. Under `tsc` that is worth
+/// saying, because the whole program is built either way, so `--staged` does not make the
+/// expensive part smaller. Naming the rules is what makes the note actionable.
+fn note_narrowed_type_aware(selection: &Selection, engine: &Engine) -> anyhow::Result<()> {
+    let type_aware: Vec<String> = engine
+        .rules()
+        .filter(|spec| spec.requires.contains(&Capability::Types))
+        .map(|spec| spec.id.to_string())
+        .collect();
+    if selection.is_narrowed()
+        && engine.types_provider() == TypesProvider::Tsc
+        && !type_aware.is_empty()
+    {
+        writeln!(
+            std::io::stderr(),
+            "note: {} still runs type-aware rules, and the whole TypeScript program is built \
+             for them either way\n               still run: {}",
+            selection.flag(),
+            type_aware.join(", "),
+        )?;
+    }
+    Ok(())
+}
+
+/// Whatever the provider decided quietly, on stderr and after prepare.
+///
+/// After prepare because that is the one moment it is known: it takes a built program to find
+/// out which files no `tsconfig.json` claimed. Never stdout, which carries the report. Empty
+/// under `builtin`, and under `tsc` for a project whose files are all claimed by a config under
+/// its root — so an ordinary run says nothing, which is what makes the line information.
+fn note_provider(engine: &Engine) -> anyhow::Result<()> {
+    for notice in engine.provider_notices() {
+        writeln!(std::io::stderr(), "note: {notice}")?;
+    }
+    Ok(())
+}
+
+/// Run the engine over a selection, or over everything when there is none.
+///
+/// Extracted from `check` for its length; the reason it is not a one-liner is the
+/// intersection.
+fn run_selected(
+    engine: &Engine,
+    selected: Option<Vec<FilePath>>,
+) -> Result<Outcome, lanekeep_engine::RunError> {
+    match selected {
+        // Intersected with discovery rather than used directly, so `include` and `exclude`
+        // stay in force — `--staged` must not check a file the config excluded.
+        Some(selected) => {
+            let wanted: BTreeSet<&FilePath> = selected.iter().collect();
+            let files: Vec<FilePath> = engine
+                .discover()
+                .into_iter()
+                .filter(|file| wanted.contains(file))
+                .collect();
+            engine.run_over(&files)
+        }
+        None => engine.run(),
+    }
+}
+
 fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     let CheckOptions {
         project_root,
@@ -1209,6 +1491,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
                 fix,
                 profile,
             },
+        dependencies,
     } = options;
 
     let format = Format::parse(format).map_err(|got| {
@@ -1223,7 +1506,15 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         "--timeout must be greater than zero"
     );
 
-    let (engine, _) = prepare(project_root, config, !no_cache, timeout)?;
+    forget_dependencies(dependencies);
+    let on_config: Option<&dyn Fn(&lanekeep_config::Config)> = Some(&note_slow_hook);
+    let prepared = PrepareOptions {
+        on_config,
+        ..PrepareOptions::default()
+    };
+    let (engine, _) = prepare(project_root, config, !no_cache, timeout, prepared)?;
+
+    note_provider(&engine)?;
 
     let selected = selection.resolve(project_root)?;
     let cross_file: Vec<String> = engine
@@ -1257,27 +1548,18 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         engine
     };
 
-    let outcome = match selected {
-        // Intersected with discovery rather than used directly, so `include` and `exclude`
-        // stay in force — `--staged` must not check a file the config excluded.
-        Some(selected) => {
-            let wanted: std::collections::BTreeSet<&FilePath> = selected.iter().collect();
-            let files: Vec<FilePath> = engine
-                .discover()
-                .into_iter()
-                .filter(|file| wanted.contains(file))
-                .collect();
-            engine.run_over(&files)
-        }
-        None => engine.run(),
-    }
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    note_narrowed_type_aware(&selection, &engine)?;
+
+    let outcome = run_selected(&engine, selected).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let outcome = if fix {
-        fix_and_recheck(project_root, config, !no_cache, timeout, outcome)?
+        let held = engine.provider();
+        fix_and_recheck(project_root, config, !no_cache, timeout, outcome, held)?
     } else {
         outcome
     };
+
+    record_dependencies(dependencies, &engine, &outcome);
 
     let color = Color::resolve(
         std::io::stdout().is_terminal(),
@@ -1320,7 +1602,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
 }
 
 fn rules(project_root: &Path, config: Option<&Path>, as_json: bool) -> anyhow::Result<ExitCode> {
-    let (engine, declared) = prepare(project_root, config, false, None)?;
+    let (engine, declared) = prepare(project_root, config, false, None, METADATA_ONLY)?;
     let mut stdout = std::io::stdout();
 
     if as_json {
@@ -1394,7 +1676,7 @@ fn explain(
     config: Option<&Path>,
     as_json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let (engine, _) = prepare(project_root, config, false, None)?;
+    let (engine, _) = prepare(project_root, config, false, None, METADATA_ONLY)?;
 
     let Some(spec) = engine.rules().find(|spec| spec.id.to_string() == rule) else {
         // Naming what is configured, rather than only what is missing. A rule id is easy to
@@ -1457,6 +1739,74 @@ fn explain(
         )?;
     }
 
+    if spec.requires.contains(&Capability::Types) {
+        // Worth stating for the same reason the cross-file line is: it changes what running
+        // this rule costs, and which oracle answers it is a project-level setting rather than
+        // anything the rule said.
+        writeln!(
+            stdout,
+            "\nThis rule asks for types. Which oracle answers is `types.provider`: `builtin` \
+             needs no toolchain, `tsc` builds the project's own program."
+        )?;
+    }
+
     stdout.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed iteration clears the watcher's allowlist rather than leaving the last good
+    /// one in place.
+    ///
+    /// The set is what the *previous successful* run read. An iteration that ends early read
+    /// some unknown prefix of what a whole run reads — the file whose edit broke the run may
+    /// be exactly the one that has left the set — so carrying it forward makes the watcher
+    /// confident about a list it has no evidence for, and it stays that way until a run
+    /// succeeds. Cleared, the loop wakes for anything outside an ignored directory, which is
+    /// the right posture while nothing can say what an input is.
+    ///
+    /// Here rather than through a real `--watch` loop, because through the loop this is not
+    /// observable: the iteration a stale allowlist wakes fails for the same reason the
+    /// previous one did, so it prints no report either way and the two behaviors produce the
+    /// same bytes on stdout.
+    #[test]
+    fn a_failed_check_clears_the_dependency_sink() {
+        let dir = std::env::temp_dir().join(format!("lanekeep-sink-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("creates the fixture");
+        // Not valid JSON, so the run fails in config load — before anything could have written
+        // the sink, which is the whole point: the clear has to happen ahead of every exit.
+        std::fs::write(dir.join("lanekeep.json"), "{ not json").expect("writes the config");
+
+        let sink = Mutex::new(BTreeSet::from([PathBuf::from(
+            "node_modules/@acme/rates/index.d.ts",
+        )]));
+        let failed = check(CheckOptions {
+            project_root: &dir,
+            config: None,
+            format: "json",
+            timeout: None,
+            selection: Selection::All,
+            switches: Switches {
+                warn_only: false,
+                no_cache: true,
+                report_unused_suppressions: false,
+                fix: false,
+                profile: false,
+            },
+            dependencies: Some(&sink),
+        });
+
+        assert!(failed.is_err(), "the fixture's config must not load");
+        assert!(
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "the failed run left the previous iteration's allowlist in place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

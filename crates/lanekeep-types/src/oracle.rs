@@ -1,14 +1,78 @@
 //! The oracle itself: construction, dispatch, and the bound that makes it terminate.
 
+use std::cell::Cell;
 use std::fmt;
 use std::sync::Arc;
 
+use lanekeep_core::FilePath;
 use lanekeep_lang::Language;
-use lanekeep_lang::binding::BindingResolver;
+use lanekeep_lang::binding::{Binding, BindingResolver, ImportedName};
 use tree_sitter::{Node, Tree};
 
+use crate::declarations::ExportTarget;
 use crate::table;
 use crate::types::{Primitive, Symbol, Type};
+
+/// What an oracle asks its host when a name comes from another file.
+///
+/// A trait rather than a concrete provider, so this crate's layering holds: the oracle reads
+/// **one** tree and nothing else, and every question about *which other file* and *how deep*
+/// belongs to the value that owns the declaration cache and the budget. An oracle with no
+/// implementation attached answers exactly what it answered before cross-file resolution
+/// existed, which is what keeps `TypeScriptOracle::new` a within-file oracle.
+///
+/// Every method takes the *importing* file, because a relative specifier means nothing
+/// without one, and a `depth` already spent, because a bound reset at every file boundary is
+/// not a bound.
+pub trait ImportResolution {
+    /// The type an imported *value* has, computed in its declaring file's own context.
+    fn imported_value_type(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+        depth: u32,
+    ) -> Option<Type>;
+
+    /// The type an imported *type alias* names, when the imported name is one.
+    ///
+    /// Deliberately not "the type of the imported type". An imported class or interface keeps
+    /// its own nominal identity and its use-site symbol — replacing it with whatever its
+    /// declaration file says would drop the module the name was imported from, which is the
+    /// one field `lanekeep/no-restricted-types` matches on. Only an alias is transparent,
+    /// exactly as a same-file `type Amount = number` already is.
+    ///
+    /// Returns [`Followed`] rather than `Option<Type>` because the caller's fallback depends
+    /// on *why* there is no type: a name that simply is not an alias keeps its own nominal
+    /// identity (as it always has), but a name that *is* an alias whose chain was cut by
+    /// `MAX_DEPTH` must not — falling back there would answer with an intermediate file's
+    /// own nominal type, a confident guess rather than the honest "unknown" a cut chain
+    /// deserves. See `Followed`'s own documentation.
+    fn imported_alias_type(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+        depth: u32,
+    ) -> Followed;
+
+    /// What calling an imported function yields.
+    fn imported_return_type(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+        depth: u32,
+    ) -> Option<Type>;
+
+    /// Where an imported name is actually declared, after every re-export.
+    fn imported_export(
+        &self,
+        from: &FilePath,
+        module: &str,
+        name: &ImportedName,
+    ) -> Option<ExportTarget>;
+}
 
 /// Node kinds the dispatch below reads, which the constructor requires the grammar to know.
 ///
@@ -41,7 +105,49 @@ const REQUIRED_KINDS: &[&str] = &[
     "binary_expression",
     "unary_expression",
     "call_expression",
+    // The declaration walk's own vocabulary (`declarations.rs`). A grammar without these
+    // cannot answer a cross-file question, and probing for them here is what keeps the
+    // provider from opening a file it has no way to read.
+    "export_statement",
+    "export_clause",
+    "export_specifier",
+    "namespace_export",
+    "ambient_declaration",
+    "lexical_declaration",
+    "variable_declaration",
+    "function_signature",
+    "function_declaration",
+    "generator_function_declaration",
+    "class_declaration",
+    "abstract_class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "module",
+    "internal_module",
+    "class_heritage",
+    "extends_clause",
+    "extends_type_clause",
+    "import_statement",
 ];
+
+/// What following an imported name across the file boundary, as a type alias, found.
+///
+/// A plain `Option<Type>` cannot tell two failure shapes apart, and `named_type`'s fallback
+/// has to answer them differently: "this name is not an alias at all" keeps its own nominal
+/// identity, exactly as it always has, while "this name is an alias, but the chain following
+/// it was cut by `MAX_DEPTH`" must answer nothing — see addendum B of task 4.16. The
+/// distinction has to survive an arbitrary number of cross-file hops, because the bound can
+/// be spent several files away from the frame that first asked; every hop threads this enum
+/// rather than collapsing it back to `Option` until the walk has fully unwound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Followed {
+    /// The type the alias names.
+    Type(Type),
+    /// The name is an alias, but `MAX_DEPTH` cut the chain before it resolved to a type.
+    Exhausted,
+    /// The name does not name a type alias at all.
+    NotAnAlias,
+}
 
 /// How far the oracle will follow a chain before giving up.
 ///
@@ -51,13 +157,30 @@ const REQUIRED_KINDS: &[&str] = &[
 ///
 /// Fixed rather than measured. A bound that depended on elapsed time would put the clock in
 /// the cache key.
-const MAX_DEPTH: u32 = 16;
+pub(crate) const MAX_DEPTH: u32 = 16;
 
 /// A type oracle for one parsed TypeScript file.
 pub struct TypeScriptOracle<'t> {
     tree: &'t Tree,
     source: &'t str,
     resolver: Arc<dyn BindingResolver>,
+    /// Which file this parse is of, when the caller could say.
+    ///
+    /// Required for cross-file resolution and for nothing else, which is why it is optional:
+    /// a within-file question does not need to know where the file lives, and demanding one
+    /// would make every existing caller supply a value it has no use for.
+    file: Option<&'t FilePath>,
+    imports: Option<&'t dyn ImportResolution>,
+    /// Set the moment this oracle gives up on [`MAX_DEPTH`], when a caller asked to be told.
+    ///
+    /// The bound answers a bare `None`, which is indistinguishable from "there is no type
+    /// here" — and a caller threading a depth it has already spent needs the difference: an
+    /// answer the bound truncated describes the *prefix* the caller walked, not the node it
+    /// asked about, so it must not be memoized against that node. A `Cell` rather than a
+    /// return-type change because the bound is checked in four recursive arms several frames
+    /// below any public method, exactly the shape `Imports`' own flag exists for. `None` when
+    /// nobody asked, which is every within-file caller.
+    exhausted: Option<&'t Cell<bool>>,
 }
 
 /// Hand-written because `Arc<dyn BindingResolver>` is not `Debug` — the trait answers
@@ -79,6 +202,7 @@ impl fmt::Debug for TypeScriptOracle<'_> {
         f.debug_struct("TypeScriptOracle")
             .field("tree", &self.tree)
             .field("source_len", &self.source.len())
+            .field("has_imports", &self.imports.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -136,7 +260,74 @@ impl<'t> TypeScriptOracle<'t> {
             tree,
             source,
             resolver: Arc::clone(&support.resolver),
+            file: None,
+            imports: None,
+            exhausted: None,
         }
+    }
+
+    /// Let this oracle follow a name into the file that declares it.
+    ///
+    /// Without it every arm behaves exactly as it did before cross-file resolution existed —
+    /// an import is a name with a module and no type — which is what makes a within-file
+    /// oracle still a thing this crate can hand out.
+    #[must_use]
+    pub fn with_imports(mut self, file: &'t FilePath, imports: &'t dyn ImportResolution) -> Self {
+        self.file = Some(file);
+        self.imports = Some(imports);
+        self
+    }
+
+    /// Let this oracle report that its depth bound — rather than the program — is why it
+    /// answered nothing.
+    ///
+    /// For a caller that threads a depth it has already spent and memoizes what comes back.
+    /// A bare `None` cannot say this on its own — it is what the bound and an untypeable
+    /// node both answer — and the bound is checked several frames below any public method, so
+    /// the flag is the channel rather than a return type.
+    #[must_use]
+    pub fn with_exhaustion(mut self, exhausted: &'t Cell<bool>) -> Self {
+        self.exhausted = Some(exhausted);
+        self
+    }
+
+    /// Answer nothing, and say the bound is why.
+    fn exhaust<T>(&self) -> Option<T> {
+        if let Some(flag) = self.exhausted {
+            flag.set(true);
+        }
+        None
+    }
+
+    /// The type of `node`, starting from a depth already spent.
+    ///
+    /// For a provider that has followed an import: the recursion crosses files, and a bound
+    /// reset at every boundary is not a bound at all.
+    #[must_use]
+    pub fn type_of_from(&self, node: Node<'t>, depth: u32) -> Option<Type> {
+        self.type_of_at(node, depth)
+    }
+
+    /// The type a declaration gives the name it declares, from a depth already spent.
+    #[must_use]
+    pub fn declaration_type_from(&self, declaration: Node<'t>, depth: u32) -> Option<Type> {
+        self.declaration_type(declaration, depth)
+    }
+
+    /// The return type of `node`, from a depth already spent. See [`Self::type_of_from`].
+    #[must_use]
+    pub fn return_type_from(&self, node: Node<'t>, depth: u32) -> Option<Type> {
+        self.return_type_at(node, depth)
+    }
+
+    /// The type a name *in type position* denotes: an alias followed, a nominal otherwise.
+    ///
+    /// [`Self::type_of`] cannot stand in for it. In expression position an `identifier` is a
+    /// value, so `class A extends B {}`'s `B` would be typed as whatever value `B` holds —
+    /// which for a class declaration is nothing at all — rather than as the type it names.
+    #[must_use]
+    pub fn type_named_by(&self, node: Node<'t>) -> Option<Type> {
+        self.named_type(node, 0)
     }
 
     /// The type of the expression at `node`, or `None` when the oracle cannot be sure.
@@ -161,9 +352,118 @@ impl<'t> TypeScriptOracle<'t> {
         self.symbol_at(node)
     }
 
+    /// What calling the function at `node` yields.
+    ///
+    /// Separate from [`Self::type_of`] rather than folded into it, and the reason is the
+    /// vocabulary rather than the plumbing: a function declaration is not an expression, and
+    /// giving `type_of` a signature type would mean a `Type::Function` variant every rule
+    /// asking a simpler question would then have to unpack. There is exactly one question
+    /// rules ask about a function, so there is exactly one method.
+    ///
+    /// Accepts a call expression (whose callee is resolved), a function-like declaration, or
+    /// an identifier bound to one.
+    #[must_use]
+    pub fn return_type_of(&self, node: Node<'t>) -> Option<Type> {
+        self.return_type_at(node, 0)
+    }
+
+    fn return_type_at(&self, node: Node<'t>, depth: u32) -> Option<Type> {
+        if depth >= MAX_DEPTH {
+            return self.exhaust();
+        }
+        let next = depth.saturating_add(1);
+
+        match node.kind() {
+            "call_expression" => self.return_type_at(node.child_by_field_name("function")?, next),
+            "identifier" => {
+                if let Some(Binding::Import { module, name }) =
+                    self.resolver.resolve(self.tree, self.source, node)
+                    && let (Some(file), Some(imports)) = (self.file, self.imports)
+                {
+                    return imports.imported_return_type(file, &module, &name, next);
+                }
+                let declaration = self.resolver.declaration_of(self.tree, self.source, node)?;
+                self.return_type_at(declaration, next)
+            }
+            // `const rate = () => 1` binds the function to a name; the declarator's value is
+            // the function. An annotated declarator is deliberately not read as a signature —
+            // that would be a function *type*, which this oracle says nothing about.
+            "variable_declarator" => self.return_type_at(node.child_by_field_name("value")?, next),
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_signature"
+            | "function_expression"
+            // The expression form: `const g = function*() {...}`. `is_function_like` has
+            // always listed it; this dispatch had not, so a call to a generator bound this
+            // way fell through to `_ => None` despite the oracle treating it as function-like
+            // everywhere else — addendum A1/A2 of task 4.16.
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+            | "method_signature"
+            | "abstract_method_signature" => self.signature_return(node, next),
+            _ => None,
+        }
+    }
+
+    /// The return type of a function-like node: its annotation, or what its body returns.
+    ///
+    /// The annotation wins wherever both are present, on the same reasoning
+    /// [`Self::declaration_type`] prefers one: the annotation is what the program means, and
+    /// answering from the body would describe a mistake rather than a declaration.
+    fn signature_return(&self, node: Node<'t>, depth: u32) -> Option<Type> {
+        if let Some(annotation) = node.child_by_field_name("return_type") {
+            // `asserts_annotation` and `type_predicate_annotation` are the other two kinds
+            // this field can hold (`node-types.json`); `annotation_child` hands back whatever
+            // is there and the annotation vocabulary answers `None` for both, which is right —
+            // `x is Foo` is not a type any rule built on this oracle asks about.
+            return self.annotation_type(annotation_child(annotation)?, depth);
+        }
+
+        // An `async` function's value is a `Promise<…>` and a generator's is a `Generator<…>`,
+        // and this oracle has no variant that can say either — no type arguments, no
+        // `Promise`. With no annotation there is nothing here able to name the wrapper, so the
+        // body's `return` type is not the call's type: answering `number` for
+        // `async function rate() { return 1 }` would be a claim a rule can compare against a
+        // `number` and be wrong about every time, with nothing in the answer to say a wrapper
+        // was dropped. The annotation path above is untouched — the refusal is about the
+        // absence of an annotation rather than about `async`.
+        if wraps_its_return(node) {
+            return None;
+        }
+
+        let body = node.child_by_field_name("body")?;
+        if body.kind() != "statement_block" {
+            // A concise arrow body is the returned expression itself.
+            return self.type_of_at(body, depth);
+        }
+
+        let mut returns = Vec::new();
+        collect_returns(body, &mut returns);
+        if returns.is_empty() {
+            // No `return` at all. `void` would be a guess, and this oracle has no variant for
+            // it — see `Primitive`'s own documentation on why `any` and `unknown` are absent
+            // for the same reason.
+            return None;
+        }
+
+        // Every member or none, exactly as a union annotation is read: a member that could
+        // not be typed leaves an answer byte-identical to a complete one, with nothing left
+        // to say something was lost.
+        let members: Vec<Type> = returns
+            .into_iter()
+            .map(|returned| match returned {
+                // A bare `return;` yields `undefined`, which is a member rather than a gap.
+                None => Some(Type::Primitive(Primitive::Undefined)),
+                Some(expression) => self.type_of_at(expression, depth),
+            })
+            .collect::<Option<Vec<Type>>>()?;
+        Type::union(members)
+    }
+
     fn type_of_at(&self, node: Node<'t>, depth: u32) -> Option<Type> {
         if depth >= MAX_DEPTH {
-            return None;
+            return self.exhaust();
         }
 
         match node.kind() {
@@ -219,6 +519,25 @@ impl<'t> TypeScriptOracle<'t> {
             }
 
             "identifier" => {
+                // An imported value's declaration is in another file. With resolution
+                // attached, that file is opened and the declaration typed in its own context;
+                // without it, this is the `None` it always was.
+                //
+                // Asked here rather than in `declaration_type`'s `import_statement` arm — the
+                // seam the design named — because the module specifier and *which* export was
+                // imported are what `resolve` answers, and the `import_statement` node alone
+                // does not say which of its specifiers bound this use.
+                if let Some(Binding::Import { module, name }) =
+                    self.resolver.resolve(self.tree, self.source, node)
+                    && let (Some(file), Some(imports)) = (self.file, self.imports)
+                {
+                    return imports.imported_value_type(
+                        file,
+                        &module,
+                        &name,
+                        depth.saturating_add(1),
+                    );
+                }
                 let declaration = self.resolver.declaration_of(self.tree, self.source, node)?;
                 self.declaration_type(declaration, depth.saturating_add(1))
             }
@@ -240,7 +559,7 @@ impl<'t> TypeScriptOracle<'t> {
     /// initializer would hand every name the whole thing's type. See [`binds_one_name`].
     fn declaration_type(&self, declaration: Node<'t>, depth: u32) -> Option<Type> {
         if depth >= MAX_DEPTH {
-            return None;
+            return self.exhaust();
         }
         let next = depth.saturating_add(1);
 
@@ -294,7 +613,7 @@ impl<'t> TypeScriptOracle<'t> {
     /// thing that is right until somebody nests it.
     fn annotation_type(&self, node: Node<'t>, depth: u32) -> Option<Type> {
         if depth >= MAX_DEPTH {
-            return None;
+            return self.exhaust();
         }
 
         match node.kind() {
@@ -373,8 +692,9 @@ impl<'t> TypeScriptOracle<'t> {
     /// A type named by an identifier: a same-file alias followed, or a nominal type.
     ///
     /// An alias is followed because `type Amount = number` means a rule asking "is this a
-    /// number" should hear yes. Nothing follows it across a file boundary — an imported
-    /// alias is nominal here, and stays that way until cross-file resolution lands.
+    /// number" should hear yes. An imported alias is followed too, through the
+    /// [`ImportResolution`] hook, when one is installed; with none installed it stays nominal,
+    /// since there is nothing here to cross the file boundary with.
     ///
     /// A *type parameter* is the one declaration that is neither. `Nominal` is a claim —
     /// that this is a distinct named type — and `f<number>(1)` makes it false, so the `T`
@@ -398,6 +718,29 @@ impl<'t> TypeScriptOracle<'t> {
             }
         }
 
+        // An imported *alias* is followed across the boundary exactly as a same-file one is
+        // above: `export type Amount = number` means a rule asking "is this a number" should
+        // hear yes wherever the alias was written. Everything else keeps its own nominal
+        // identity and gains only a better `symbol` — see `ImportResolution`'s own doc for
+        // why replacing an imported class with its declaration would be a false positive
+        // rather than a better answer.
+        //
+        // `Exhausted` answers `None` rather than falling to the nominal case below: the name
+        // *is* an alias, and a chain the bound cut is unknown, never a guess — see
+        // `Followed`'s own documentation.
+        if let Some(Binding::Import {
+            module,
+            name: imported,
+        }) = self.resolver.resolve(self.tree, self.source, node)
+            && let (Some(file), Some(imports)) = (self.file, self.imports)
+        {
+            match imports.imported_alias_type(file, &module, &imported, depth.saturating_add(1)) {
+                Followed::Type(aliased) => return Some(aliased),
+                Followed::Exhausted => return self.exhaust(),
+                Followed::NotAnAlias => {}
+            }
+        }
+
         Some(Type::Nominal {
             name: name.to_owned(),
             symbol: self.symbol_at(node),
@@ -405,20 +748,46 @@ impl<'t> TypeScriptOracle<'t> {
     }
 
     /// Where the name at `node` came from, when the resolver can say.
+    ///
+    /// `exported` is the name the *declaring* module uses. With resolution attached it is
+    /// followed through every re-export to the file that declares the thing, so
+    /// `import Big from 'decimal.js'` reports `Big`'s real declared name rather than the
+    /// placeholder `default` — which is what lets a rule compare against a required export
+    /// name without accusing a conforming default import. Without resolution, or when the
+    /// declaration file is unreadable, it falls back to what the import statement itself
+    /// says.
     fn symbol_at(&self, node: Node<'t>) -> Option<Symbol> {
-        use lanekeep_lang::binding::Binding;
-
         let name = self.text(node);
         if name.is_empty() {
             return None;
         }
-        let module = match self.resolver.resolve(self.tree, self.source, node)? {
-            Binding::Import { module, .. } => Some(module),
-            Binding::Local(_) => None,
+        let (module, exported) = match self.resolver.resolve(self.tree, self.source, node)? {
+            Binding::Import {
+                module,
+                name: imported,
+            } => {
+                let declared = self
+                    .file
+                    .zip(self.imports)
+                    .and_then(|(file, imports)| imports.imported_export(file, &module, &imported))
+                    .map(|target| target.name);
+                let exported = declared.or(match &imported {
+                    // Copied even when no rename happened: the consumer compares
+                    // `exported === require.name`, and a `None`-when-unrenamed contract makes
+                    // a forgotten fallback a silent false negative on every plain import.
+                    ImportedName::Named(exported) => Some(exported.clone()),
+                    ImportedName::Default => Some("default".to_owned()),
+                    // `import * as D` binds the module object; there is no one exported name.
+                    ImportedName::Namespace => None,
+                });
+                (Some(module), exported)
+            }
+            Binding::Local(_) => (None, None),
         };
         Some(Symbol {
             name: name.to_owned(),
             module,
+            exported,
         })
     }
 
@@ -463,6 +832,59 @@ fn binds_one_name(declaration: Node<'_>, field: &str) -> bool {
     declaration
         .child_by_field_name(field)
         .is_some_and(|bound| bound.kind() == "identifier")
+}
+
+/// Whether a function-like node's call yields a wrapper around what its body returns.
+///
+/// `async` and `*` are anonymous tokens rather than fields — the grammar writes them bare, the
+/// same way `export default`'s `default` is written — so this reads the children rather than
+/// asking for a field that does not exist. Both spellings of a generator are covered: the
+/// dedicated `generator_function*` kinds and a `method_definition` or arrow carrying the token.
+fn wraps_its_return(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && matches!(child.kind(), "async" | "*"))
+}
+
+/// Every `return` in this body, skipping the ones that belong to a nested function.
+///
+/// `None` for a bare `return;`. Nested functions are skipped because their returns are
+/// somebody else's: `function f() { const g = () => 'a'; return 1; }` returns a number, and a
+/// walk that took every `return_statement` under the body would answer `number | string`.
+///
+/// A stack rather than a cursor recursion, and children pushed in reverse so the walk visits
+/// them in source order — the union is canonicalized afterwards, so this is about a
+/// reproducible *failure* message rather than about the answer.
+fn collect_returns<'t>(node: Node<'t>, out: &mut Vec<Option<Node<'t>>>) {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "return_statement" {
+            out.push(current.named_child(0));
+            continue;
+        }
+        if current.id() != node.id() && is_function_like(current) {
+            continue;
+        }
+        let mut cursor = current.walk();
+        let children: Vec<Node<'t>> = current.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+}
+
+/// Whether a node introduces a function of its own.
+fn is_function_like(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_declaration"
+            | "generator_function_declaration"
+            | "function_signature"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+            | "method_signature"
+            | "abstract_method_signature"
+    )
 }
 
 /// The type inside a `type_annotation` wrapper.

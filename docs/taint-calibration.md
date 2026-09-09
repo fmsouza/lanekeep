@@ -358,3 +358,70 @@ bug this re-run fixed in the calibration rule and in `no-secret-in-string`. Conf
 refuses a `@sanitizer` bound in a call's callee slot (#223), and the engine's
 "copy-me" fixture `SECRET_FLOW_RULE` in `crates/lanekeep-engine/src/lib.rs`, which still carried
 the idiom, captures the whole call and exercises the cut (#224).
+
+## Re-run after B4 field sensitivity (#225)
+
+#225 shipped both halves of B4: **C2**, a read of a shape property (`length`, `byteLength`,
+`byteOffset`, `size`) off a tainted base yields a clean value, and **C1**, taint tracked per
+access path to a widening bound of three segments. This re-run is #225's acceptance: the
+`${seed.length}` site the previous section named is the only thing the corpus had left, and it
+is gone.
+
+### Reproduction
+
+| | |
+|---|---|
+| Corpus | `perawallet/pera-react-native` @ **`3b17bb2ed15e4fcd113b962b2ab26e2347b22dcd`** — unchanged from #195 and #220 |
+| lanekeep | this pull request, measured at **`86b08a5`** — the C1 commit `feat(lang-js)!: track taint per access path to depth 3` (`809d870`) plus the docs-only commit above it. `lanekeep 0.8.1`, `HOST_API_VERSION=6` (moved to 6 by #202 earlier in the same pull request, not by this change) |
+| Toolchain | `rustc 1.95.0`, pinned by `rust-toolchain.toml` — unchanged |
+| Machine | Apple M3 Max, 14 cores, macOS 26.6.2 (Darwin 25.6.0, arm64) — same machine class as #195 and #220 |
+| Date | 2026-09-07 |
+| Scope | same include globs as #220 and the Appendix above (`apps/*/src`, `packages/*/src`, `extensions/*/src`). 3,984 files parsed, 0 aborts — identical to #220 |
+| Run | `just taint-calibration /private/tmp/pera-corpus /tmp/calib-b4.json` → `lanekeep check <snapshot> --no-cache --format json` |
+
+### Result: 0 findings, 0 true positives
+
+| Class | #195 (`281fb79`) | #220 | #225 (this pull request) |
+|---|---|---|---|
+| True positive | 0 | 0 | 0 |
+| FP — field-insensitivity | 3 | 3 (= 1 logical site) | **0 — fixed** |
+| FP — path-insensitivity | 0 | 0 | 0 |
+| FP — other (compound-sink sanitizer bypass) | 1 | 0 | 0 |
+
+The three findings were one logical site reported once per `(source, sink)` pair —
+`extensions/keystore-chrome/src/keystore/sign.ts:112`, the `${seed.length}` template
+substitution fed by three `key.privateKey` reads. **C2 alone closes it**: `seed` is still
+tainted at its root, and the sink still reads it, but `length` describes the value rather than
+carrying it. C1 removes no finding here and adds none, which is the honest way to say that
+**C1 shipped without corpus evidence, by decision** — it is #225's acceptance as written, and
+the corpus this tool was calibrated against contains no sibling-field read to prove it on.
+What proves C1 is its own fixture table (`crates/lanekeep-rules/tests/no_secret_in_string.rs`,
+`crates/lanekeep-lang-js/src/flow.rs`), not this run.
+
+### Perf
+
+Unchanged, and the reason is structural rather than lucky: C1 adds one prefix comparison per
+weak definition considered, and the walk is demand-driven, so the number of weak definitions
+considered did not move. lanekeep's own check wall-clock stays in the range #220 recorded on
+the same corpus and machine.
+
+### B4 verdict: closed
+
+#225's four acceptance criteria, each against what shipped:
+
+- The `${seed.length}` shape is silent — this run, and
+  `crates/lanekeep-rules/tests/calibration_queries.rs`'s
+  `a_shape_property_read_of_a_secret_is_clean` on the same source text.
+- `o.secret = s; log(o.secret)` reports and `o.secret = s; log(o.public)` is silent — 
+  `a_field_write_reports_at_its_own_path` and `a_field_write_does_not_taint_a_sibling_field_read`,
+  which replace the fixture that documented the old promise.
+- A cyclic access path hits the widening and the run reports the same thing every time —
+  `a_cyclic_object_graph_terminates_and_reports`, over a loop-carried `o.next = o`.
+- Two runs byte-identical — `two_runs_over_the_widening_fixture_are_byte_identical`, asserted
+  over the widening fixture specifically, since a visit-count-keyed bound is what would have
+  made the answer depend on traversal order.
+
+The residual false-positive count is now zero on this corpus, which retires the calibration's
+own question rather than answering it more precisely: there is nothing left to classify. A
+future re-run is worth doing when the corpus moves or when a new analysis lands, not to refine
+this number.

@@ -1,10 +1,16 @@
-//! The type oracle: what a node's type is, answered from one parsed file.
+//! The bounded type oracle: what a node's type is, and where its name came from.
 //!
-//! This is the "bounded oracle" of the type-aware rules design. It answers from the file in
-//! front of it and nothing else — no `tsconfig.json`, no declaration files, no compiler —
-//! and it answers `None` whenever it cannot be sure. That is the whole contract: a rule
-//! choosing to be silent on `None` is sound, and one choosing to report on it is the
-//! author's decision rather than the engine's.
+//! This is the "bounded oracle" of the type-aware rules design, and the bound is *depth*
+//! rather than the file. [`TypeScriptOracle`] answers from one parse and nothing else;
+//! [`BuiltinProvider`] wraps it and follows an import out of that file — to a sibling source,
+//! to a `.d.ts`, into `node_modules` — through the caller's [`lanekeep_core::FileAccess`], so
+//! every file it opens is a recorded dependency of the answer. What it still has no notion of
+//! is a *program*: no `tsconfig.json`, no path mapping, no compiler, and a fixed number of
+//! hops rather than a transitive closure.
+//!
+//! It answers `None` whenever it cannot be sure. That is the whole contract: a rule choosing
+//! to be silent on `None` is sound, and one choosing to report on it is the author's decision
+//! rather than the engine's.
 //!
 //! # Why this is its own crate
 //!
@@ -15,15 +21,27 @@
 //!
 //! # What is deliberately absent
 //!
-//! No clock, no environment, no randomness, no `HashMap` iteration. A cached result computed
-//! by this oracle must still be valid, so nothing here may observe anything outside the
-//! bytes it was handed.
+//! No clock, no environment, no randomness, no `HashMap` iteration, and no filesystem access
+//! that is not a [`lanekeep_core::FileAccess`] read. A cached result computed by this oracle
+//! must still be valid, so nothing here may observe anything the cache key does not cover: the
+//! bytes it was handed, and the tracked reads it made from them.
 
+mod builtin;
+mod declarations;
 mod oracle;
+mod provider;
+mod resolve;
 mod table;
+pub mod tsc;
 mod types;
 
-pub use oracle::{TypeScriptOracle, TypeScriptSupport};
+pub use builtin::BuiltinProvider;
+pub use declarations::{
+    Declaration, ExportTarget, Exported, declared_here, declared_name, find_export,
+};
+pub use oracle::{Followed, ImportResolution, TypeScriptOracle, TypeScriptSupport};
+pub use provider::{BeginRunError, Query, TypeProvider};
+pub use resolve::resolve_specifier;
 pub use types::{Primitive, Symbol, Type};
 
 /// What this oracle *is*, as a digest of every source file that decides an answer.

@@ -15,6 +15,13 @@
 //! Getting this wrong produces a cache that is correct on every test anyone thinks to write
 //! and wrong on the one case that matters: adding a file makes no difference until something
 //! unrelated invalidates the entry.
+//!
+//! # And a refusal is a third answer, not a spelling of absence
+//!
+//! A path that resolved out of the root through a symlink was refused unread. Recorded as
+//! absent, a validator asks the filesystem whether it is still absent, follows the link, finds
+//! the file and invalidates — every run, forever, for every importer of a pnpm-linked package.
+//! See [`ReadOutcome::Refused`].
 
 use crate::location::FilePath;
 
@@ -49,16 +56,38 @@ impl std::fmt::Display for ContentHash {
     }
 }
 
+/// What a tracked read found.
+///
+/// Three states rather than an `Option<ContentHash>`, because a refusal is not an absence.
+/// A path refused for resolving out of the root through a symlink — `node_modules/pkg` as
+/// pnpm links it — was recorded as absent, and a validator checking absence reads
+/// `root.join(path)` and *follows the link*: the file is there, so the dependency reads as
+/// "appeared", every importer of a store-linked package misses the cache on every run, and
+/// the validator has read bytes outside the project root to decide it. Recording the refusal
+/// as itself is what lets the validator reproduce the decision that was actually made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReadOutcome {
+    /// The file was read, and hashed to this.
+    Found(ContentHash),
+    /// Nothing readable was there.
+    ///
+    /// A recorded answer, not a missing record. See the module documentation.
+    Absent,
+    /// It resolved outside the root through a symlink, so it was refused unread.
+    ///
+    /// Still a dependency: the answer that rested on the refusal has to be reconsidered the
+    /// day the path becomes a real in-root file.
+    Refused,
+}
+
 /// One file a rule reached for while checking another.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TrackedRead {
     /// Path relative to the project root.
     pub path: FilePath,
 
-    /// Hash of what was read, or `None` if nothing was there.
-    ///
-    /// `None` is a recorded answer, not a missing record. See the module documentation.
-    pub hash: Option<ContentHash>,
+    /// What was found there.
+    pub outcome: ReadOutcome,
 }
 
 impl TrackedRead {
@@ -67,14 +96,39 @@ impl TrackedRead {
     pub const fn found(path: FilePath, hash: ContentHash) -> Self {
         Self {
             path,
-            hash: Some(hash),
+            outcome: ReadOutcome::Found(hash),
         }
     }
 
     /// A read that found nothing.
     #[must_use]
     pub const fn absent(path: FilePath) -> Self {
-        Self { path, hash: None }
+        Self {
+            path,
+            outcome: ReadOutcome::Absent,
+        }
+    }
+
+    /// A read that was refused because the path left the root through a symlink.
+    #[must_use]
+    pub const fn refused(path: FilePath) -> Self {
+        Self {
+            path,
+            outcome: ReadOutcome::Refused,
+        }
+    }
+
+    /// The hash of what was read, or `None` for either answer that read nothing.
+    ///
+    /// For the callers that only ever asked "same bytes as before?". Anything deciding what
+    /// to *do* about a dependency has to match on [`Self::outcome`] instead: absence and
+    /// refusal are checked against the filesystem in two different ways.
+    #[must_use]
+    pub const fn hash(&self) -> Option<ContentHash> {
+        match self.outcome {
+            ReadOutcome::Found(hash) => Some(hash),
+            ReadOutcome::Absent | ReadOutcome::Refused => None,
+        }
     }
 }
 
@@ -111,12 +165,25 @@ mod tests {
         // The case that makes a cache wrong rather than merely cold: a rule asked whether a
         // file existed, was told no, and that answer has to be invalidated when it appears.
         let read = TrackedRead::absent(FilePath::new("tsconfig.json"));
-        assert_eq!(read.hash, None);
+        assert_eq!(read.hash(), None);
         assert_ne!(
             read,
             TrackedRead::found(FilePath::new("tsconfig.json"), hash(0)),
             "absence and presence must not compare equal"
         );
+    }
+
+    #[test]
+    fn a_refusal_is_neither_absence_nor_a_reading() {
+        // The three have to be distinguishable on the entry, because the validator checks each
+        // of them against the filesystem in a different way: absence by looking for the file,
+        // a refusal by re-resolving the path under the same confinement, a reading by hashing.
+        let path = FilePath::new("node_modules/pkg/index.d.ts");
+        let refused = TrackedRead::refused(path.clone());
+        assert_eq!(refused.outcome, ReadOutcome::Refused);
+        assert_eq!(refused.hash(), None, "nothing was read");
+        assert_ne!(refused, TrackedRead::absent(path.clone()));
+        assert_ne!(refused, TrackedRead::found(path, hash(0)));
     }
 
     #[test]

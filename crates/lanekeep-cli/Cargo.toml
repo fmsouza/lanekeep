@@ -29,6 +29,7 @@ notify-debouncer-mini = { workspace = true }
 lanekeep-report = { workspace = true }
 lanekeep-server = { workspace = true }
 lanekeep-rules = { workspace = true }
+lanekeep-types = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

@@ -67,8 +67,9 @@ fn a_bare_number_on_a_governed_name_is_reported() {
 ///
 /// The aliased import is here rather than only in the engine's fixtures because that is where
 /// this was found: measured through this binary, `Decimal as Money` on a governed name was
-/// reported with a message about `number`. The oracle hands the rule the *use-site* name, so a
-/// `require` that compared the type's name rejected an alias of exactly the required type.
+/// reported with a message about `number`. The oracle hands the rule the *use-site* name
+/// beside the exported one, which is what the check reads today, so a `require` that compared
+/// the type's name rejected an alias of exactly the required type.
 #[test]
 fn a_decimal_on_the_same_governed_name_is_a_clean_run() {
     let corpus = Corpus::new(

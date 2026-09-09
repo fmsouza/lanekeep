@@ -43,6 +43,7 @@ pub mod rule_id;
 pub mod severity;
 pub mod suppression;
 pub mod tracked;
+pub mod types_config;
 pub mod violation;
 
 pub use card::{CardProblem, Examples, RuleCard};
@@ -53,13 +54,15 @@ pub use files::{FileAccess, ReadError};
 pub use fix::Fix;
 pub use gates::{CompiledGates, GateError, Gates};
 pub use limits::{
-    DEFAULT_GLOBAL_TIMEOUT, DEFAULT_MEMORY_BYTES, DEFAULT_RULE_TIMEOUT, Limits, RunClock,
+    AnalysisBudget, Charge, DEFAULT_ANALYSIS_TIMEOUT, DEFAULT_GLOBAL_TIMEOUT, DEFAULT_MEMORY_BYTES,
+    DEFAULT_RULE_TIMEOUT, Limits, Paused, RunClock, analysis_overrun_fallback,
 };
 pub use location::{FilePath, Location, Position};
 pub use rule_id::{Namespace, ParseRuleIdError, RuleId};
 pub use severity::{ParseSeverityError, Severity};
 pub use suppression::{Suppression, Suppressions};
-pub use tracked::{ContentHash, TrackedRead};
+pub use tracked::{ContentHash, ReadOutcome, TrackedRead};
+pub use types_config::{TypesConfig, TypesProvider};
 pub use violation::{Violation, any_failing, sort};
 
 /// A host analysis a rule can declare it needs.

@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lanekeep_core::FilePath;
-use lanekeep_engine::Engine;
+use lanekeep_engine::{Engine, PrepareOptions};
 use lanekeep_js::RuleRoot;
 use lanekeep_lang_js::{JavaScript, TypeScript};
 
@@ -312,6 +312,7 @@ impl Corpus {
             &lanekeep_lang_js::registry(),
             Arc::new(TypeScript),
             Arc::new(JavaScript),
+            PrepareOptions::default(),
         )
         .expect("engine prepares")
     }

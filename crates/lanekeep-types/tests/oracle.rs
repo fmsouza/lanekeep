@@ -392,19 +392,22 @@ fn a_named_type_is_nominal() {
             name: "Decimal".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "Decimal".to_owned(),
+                exported: Some("Decimal".to_owned()),
                 module: Some("decimal.js".to_owned()),
             }),
         })
     );
 }
 
-/// A renamed import's `Symbol.name` is the local alias, not the exported name.
+/// A renamed import's `Symbol.name` is the local alias, and `exported` is the name the
+/// module uses.
 ///
-/// `Symbol::name` is filled from the reference's own text, and the resolver's
-/// `ImportedName::Named` — which does carry `Decimal` — is never consulted for it. Nothing
-/// above catches this: `a_named_type_is_nominal` imports `Decimal` under its own name, so
-/// the use site and the export happen to read identically and the two provenances are
-/// indistinguishable from that test alone.
+/// `name` is filled from the reference's own text, deliberately: it is the spelling a
+/// message quotes. What used to be dropped one line later — the resolver's
+/// `ImportedName::Named("Decimal")` — is now the second field, and this is the fixture where
+/// the two differ. `a_named_type_is_nominal` above cannot stand in for it: it imports
+/// `Decimal` under its own name, so the use site and the export read identically and an
+/// implementation that copied `name` into `exported` would pass it.
 #[test]
 fn a_renamed_import_s_symbol_name_is_the_local_alias() {
     assert_eq!(
@@ -416,6 +419,7 @@ fn a_renamed_import_s_symbol_name_is_the_local_alias() {
             name: "Money".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "Money".to_owned(),
+                exported: Some("Decimal".to_owned()),
                 module: Some("decimal.js".to_owned()),
             }),
         })
@@ -431,6 +435,7 @@ fn a_locally_declared_type_is_nominal_with_no_module() {
             name: "Decimal".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "Decimal".to_owned(),
+                exported: None,
                 module: None,
             }),
         })
@@ -480,6 +485,7 @@ fn a_locally_declared_bigint_shadows_the_primitive() {
             name: "bigint".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "bigint".to_owned(),
+                exported: None,
                 module: None,
             }),
         })
@@ -634,6 +640,7 @@ fn a_local_annotated_with_a_named_type_is_nominal() {
             name: "Decimal".to_owned(),
             symbol: Some(lanekeep_types::Symbol {
                 name: "Decimal".to_owned(),
+                exported: Some("Decimal".to_owned()),
                 module: Some("decimal.js".to_owned()),
             }),
         })
@@ -799,6 +806,14 @@ fn symbol_of_use(source: &str, name: &str) -> Option<lanekeep_types::Symbol> {
     oracle.symbol_of(found.unwrap_or_else(|| panic!("no use of `{name}`")))
 }
 
+/// An unrenamed import copies the name rather than leaving `exported` empty.
+///
+/// The decision, asserted rather than left to fall out of the implementation. `None` here
+/// would mean "no alias" and read as the more meaningful contract, and it would make a
+/// consumer who forgot `?? name` silently accept every plain import — a false negative on
+/// the most ordinary spelling there is, invisible because an ignored requirement only ever
+/// removes reports. A copy has no such failure mode and costs one `String`, and it is copied
+/// even when nothing was renamed rather than left empty.
 #[test]
 fn an_imported_name_carries_the_module_it_came_from() {
     assert_eq!(
@@ -808,18 +823,21 @@ fn an_imported_name_carries_the_module_it_came_from() {
         ),
         Some(lanekeep_types::Symbol {
             name: "Decimal".to_owned(),
+            exported: Some("Decimal".to_owned()),
             module: Some("decimal.js".to_owned()),
         })
     );
 }
 
-/// The shadow pair: the same name, locally declared, carries no module.
+/// The shadow pair: the same name, locally declared, carries neither a module nor an
+/// exported name — nothing was imported, so there is nothing a module exports it under.
 #[test]
 fn a_locally_declared_name_carries_no_module() {
     assert_eq!(
         symbol_of_use("class Decimal {}\nconst x = Decimal;", "Decimal"),
         Some(lanekeep_types::Symbol {
             name: "Decimal".to_owned(),
+            exported: None,
             module: None,
         })
     );
@@ -828,6 +846,83 @@ fn a_locally_declared_name_carries_no_module() {
 #[test]
 fn a_name_nothing_declares_has_no_symbol() {
     assert_eq!(symbol_of_use("const x = missing;", "missing"), None);
+}
+
+/// A renamed import carries both names: the alias at the use site, and the name the module
+/// exports it under.
+///
+/// The whole point of the field. `a_renamed_import_s_symbol_name_is_the_local_alias` above
+/// pins the first half and passed for the entire life of a `Symbol` that had no second half
+/// at all — the resolver's `ImportedName::Named("Decimal")` reached `symbol_at` and was
+/// dropped one line later.
+#[test]
+fn a_renamed_import_carries_the_exported_name_beside_the_alias() {
+    assert_eq!(
+        symbol_of_use(
+            "import { Decimal as Money } from 'decimal.js';\nconst x = Money;",
+            "Money"
+        ),
+        Some(lanekeep_types::Symbol {
+            name: "Money".to_owned(),
+            exported: Some("Decimal".to_owned()),
+            module: Some("decimal.js".to_owned()),
+        })
+    );
+}
+
+/// A default import is exported under the literal name `default`.
+///
+/// Not the local name, which is chosen freely at the import site and says nothing about the
+/// module: `import D from 'm'` and `import Decimal from 'm'` are the same import. `default`
+/// is what the module actually exports it as, and Task 4's rule branches on exactly that
+/// string to avoid accusing conforming code.
+#[test]
+fn a_default_import_is_exported_under_the_name_default() {
+    assert_eq!(
+        symbol_of_use("import Money from 'decimal.js';\nconst x = Money;", "Money"),
+        Some(lanekeep_types::Symbol {
+            name: "Money".to_owned(),
+            exported: Some("default".to_owned()),
+            module: Some("decimal.js".to_owned()),
+        })
+    );
+}
+
+/// A namespace import has a module and no exported name at all.
+///
+/// `import * as d from 'm'` binds the module object, and no single export names it. `None`
+/// rather than `"*"`: a sentinel would be a string a comparison could match, and there is
+/// nothing here for a name comparison to be right about. This is the discriminating pair for
+/// the two tests above — an implementation that always answered `Some` of something, or that
+/// defaulted to the use-site name, passes both of them and fails this.
+#[test]
+fn a_namespace_import_has_a_module_and_no_exported_name() {
+    assert_eq!(
+        symbol_of_use("import * as d from 'decimal.js';\nconst x = d;", "d"),
+        Some(lanekeep_types::Symbol {
+            name: "d".to_owned(),
+            exported: None,
+            module: Some("decimal.js".to_owned()),
+        })
+    );
+}
+
+/// An import specifier may name the export as a string — `import { "Decimal" as D }` — and the
+/// exported name is the export's name, not its quoted spelling: a `require` comparing against
+/// `Decimal` would otherwise never match it and report conforming code.
+#[test]
+fn a_string_named_import_specifier_is_exported_without_its_quotes() {
+    assert_eq!(
+        symbol_of_use(
+            "import { \"Decimal\" as D } from 'decimal.js';\nconst x = D;",
+            "D"
+        ),
+        Some(lanekeep_types::Symbol {
+            name: "D".to_owned(),
+            exported: Some("Decimal".to_owned()),
+            module: Some("decimal.js".to_owned()),
+        })
+    );
 }
 
 /// Two runs over one input agree, byte for byte.
@@ -915,5 +1010,142 @@ fn an_ambient_functions_parameter_is_typed() {
     assert_eq!(
         type_of_last("declare function f(a: number): void;", "identifier"),
         Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+// --- #208: the six carriers that were still not scopes --------------------------------
+//
+// The oracle's half. Anchored on a `type_annotation` whose text is `A`, never on a
+// `: void` — every source below writes `: A` as its return type, so whichever annotation
+// is last in the file resolves the name under test. A fixture that lands on `: void`
+// asserts nothing, which is the dead row #207 shipped twice.
+//
+// #208 and the design both say the reproducer is `typeOf(x) == number`. It is not: with
+// `method_signature` outside `SCOPE_KINDS` the walk from `x` finds no declaration at all
+// and the oracle answers `None`. The confident wrong answer is reached through the
+// *annotation*, which is what these tests read.
+
+/// A type parameter is whatever the call site chose, so the oracle says nothing about it.
+///
+/// Before this commit the walk escaped past `method_signature` to the outer alias and this
+/// answered `Some(Primitive(Number))` — identical in every byte to a declared `number`.
+#[test]
+fn a_type_parameter_on_a_method_signature_kind_gives_nothing() {
+    for source in [
+        "type A = number;\ninterface I { m<A>(x: A): A }",
+        "type A = number;\nabstract class C { abstract m<A>(x: A): A }",
+    ] {
+        assert_eq!(type_of_last(source, "type_annotation"), None, "{source}");
+    }
+}
+
+/// The must-not-move half: with nothing shadowing it, the alias still answers.
+#[test]
+fn without_a_type_parameter_a_method_signature_kind_reads_the_alias() {
+    for source in [
+        "type A = number;\ninterface I { m(x: A): A }",
+        "type A = number;\nabstract class C { abstract m(x: A): A }",
+    ] {
+        assert_eq!(
+            type_of_last(source, "type_annotation"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}
+
+/// The parameter-side widening, which is the half that is a behavior change rather than a
+/// bug fix: these kinds carry `parameters`, so their parameters become resolvable for the
+/// first time and an annotated one is typed where it used to give nothing.
+#[test]
+fn a_parameter_of_a_method_signature_kind_is_typed() {
+    for source in [
+        "interface I { m(a: number): void }",
+        "abstract class C { abstract m(a: number): void }",
+    ] {
+        assert_eq!(
+            type_of_use(source, "a"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}
+
+// --- #208's remaining four ------------------------------------------------------------
+//
+// `: A` as the return type again, and here it is doing more work than above: the four kinds
+// spell their result differently — `call_signature` and `construct_signature` wrap it in a
+// `type_annotation`, `constructor_type` and `function_type` hold a bare type after `=>` —
+// so which node `type_of_last(_, "type_annotation")` lands on differs by kind. Writing `A`
+// in both positions makes the assertion the same one either way.
+
+/// A type parameter is whatever the call site chose in these four kinds too, so the oracle
+/// says nothing about it — the same *pair* as `method_signature`'s above, one node kind
+/// further from anything with a name. Not the same widening: this half is the bug fix, where
+/// the walk used to escape to the outer alias and answer confidently. The widening for these
+/// kinds is the parameter-side test below.
+#[test]
+fn a_type_parameter_in_signature_or_type_position_gives_nothing() {
+    for source in [
+        "type A = number;\ninterface F { <A>(x: A): A }",
+        "type A = number;\ninterface F { new <A>(x: A): A }",
+        "type A = number;\ntype F = new <A>(x: A) => A;",
+        "type A = number;\ntype F = <A>(x: A) => A;",
+    ] {
+        assert_eq!(type_of_last(source, "type_annotation"), None, "{source}");
+    }
+}
+
+/// The must-not-move half: with nothing shadowing it, the alias still answers, in each of
+/// the four kinds.
+#[test]
+fn without_a_type_parameter_signature_or_type_position_reads_the_alias() {
+    for source in [
+        "type A = number;\ninterface F { (x: A): A }",
+        "type A = number;\ninterface F { new (x: A): A }",
+        "type A = number;\ntype F = new (x: A) => A;",
+        "type A = number;\ntype F = (x: A) => A;",
+    ] {
+        assert_eq!(
+            type_of_last(source, "type_annotation"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}
+
+/// The parameter-side widening for these four kinds: each carries `parameters`, so an
+/// annotated one is typed where it used to give nothing.
+#[test]
+fn a_parameter_in_signature_or_type_position_is_typed() {
+    for source in [
+        "interface F { (a: number): void }",
+        "interface F { new (a: number): F }",
+        "type F = new (a: number) => F;",
+        "type F = (a: number) => void;",
+    ] {
+        assert_eq!(
+            type_of_use(source, "a"),
+            Some(Type::Primitive(Primitive::Number)),
+            "{source}"
+        );
+    }
+}
+
+/// Without a provider attached, an imported value still has no type.
+///
+/// The pair for `an_imported_value_has_no_type_yet` above rather than a replacement for it:
+/// that test is now specifically the *no-provider* path, and this names the reason so nobody
+/// later reads it as "cross-file resolution does not work". An oracle built by
+/// `TypeScriptOracle::new` alone opens no files, by construction — there is nothing attached
+/// that could.
+#[test]
+fn an_oracle_with_no_import_resolution_answers_nothing_for_an_import() {
+    assert_eq!(
+        type_of_use(
+            "import { Decimal } from 'm';\nconst y = Decimal;",
+            "Decimal"
+        ),
+        None
     );
 }

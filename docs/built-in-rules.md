@@ -253,7 +253,7 @@ Each convention:
 | --- | --- | --- |
 | `names` | `string[]` | Glob patterns a parameter's or variable's name must match to be governed. |
 | `forbid` | `string[]` | Primitive type names that are a violation on a governed value — `number`, `string`, `boolean`, `bigint`, `symbol`, `null` or `undefined`, the set the type oracle itself recognizes. |
-| `require` | `{ module: string, name: string }` | Optional. The type that satisfies the convention. Only `module` is matched — a governed value's type must have a symbol imported from it. `name` is what the message says to use instead, and is not checked; see below for why. |
+| `require` | `{ module: string, name: string }` | Optional. The type that satisfies the convention: a governed value's type must have a symbol imported from `module` and exported from it under `name`. A default import satisfies `module` alone — see below. Both fields are required; a `require` missing either is refused when the config loads. |
 | `reason` | `string` | What to tell the reader. Carried into the violation message; falls back to naming `require`, then to a generic message, when it is absent. |
 
 `require` is optional on its own terms: a convention may forbid a primitive without naming a
@@ -291,6 +291,14 @@ a parameter's or a declarator's annotation are all governed on the same terms.
 Modifiers do not hide a field: `readonly`, `private`, `static`, `abstract` and a `declare class`
 body all report, as does a field carrying both an annotation and an initializer.
 
+**A parameter is governed wherever it is declared, including in a signature or a type that has
+no body.** An interface method, a call signature, a construct signature, an abstract member, a
+constructor type and a function type all read their parameters exactly as an ordinary function
+does, so `interface Wallet { credit(amount: number): void }` and
+`type Credit = (amount: number) => void` both report. All of that was silent until the resolver
+treated those shapes as scopes: the query matched the parameters all along and the oracle could
+not type them, so the rule ran and found nothing, which reads the same as a conforming file.
+
 A member is a candidate only when it is *annotated*. A class field written `amount = 1` has no
 type annotation to read, and typing it would mean reading the initializer — a different claim,
 and one the member path does not make.
@@ -303,13 +311,14 @@ than from the shape being out of scope. Which of the two it is matters, because 
 | Shape | Why not | Out of scope, or silent? |
 | --- | --- | --- |
 | `const o = { amount: 1 }` | an object literal's property types its *initializer*, not a declaration; whether a convention governs one at all is a separate question | out of scope — a `pair`, not a `property_signature` |
-| `interface O { amount(): number }` | a method signature is a different node kind | out of scope |
+| `interface O { amount(): number }` | the method's own name is not a governed value; its parameters are | out of scope |
 | `interface O { [k: string]: number }` | an index signature names no property | out of scope |
 | `interface O { 'amount': number }` | a string-literal key is not a `property_identifier` | out of scope |
 | `enum O { amount = 1 }` | an enum member is a different node kind | out of scope |
 | `class O { get amount(): number }` | a getter is a method, not a field | out of scope |
 | `class O { amount = 1 }` | no `type:` annotation for the query to capture | out of scope |
 | `interface O { amount: () => number }` | a function type is one the oracle says nothing about | **matched** — the handler runs and `typeOf` answers `undefined` |
+| `type F = <A>(amount: A) => A` | a type parameter is whatever the call site chose | **matched** — the handler runs and `typeOf` answers `undefined` |
 | `function f({ amount }: Money)` | the destructured *binding* is not read, and `Money` is named elsewhere | out of scope — `{ amount }` is an `object_pattern`, not the `identifier` the parameter clause requires, and a bare `Money` holds no `property_signature` |
 
 The destructured parameter deserves its exact statement, because it is half covered.
@@ -344,7 +353,8 @@ Every governed name is asked what its type is:
 | a union with a member whose primitive is in `forbid` | reports |
 | a union with no such member | silent |
 | a named type, when the convention sets no `require` | silent — nothing to check it against |
-| a named type whose symbol was imported from `require`'s module | silent |
+| a named type imported from `require`'s module and exported from it under `require.name`, or as its default export | silent |
+| a named type imported from `require`'s module under any other exported name | reports — a sibling export of the required module is not the required type |
 | a named type from a different module, or with no symbol at all | reports — a wrong or unresolved domain type is still wrong |
 | the oracle could not type it at all (`undefined`) | silent |
 
@@ -360,32 +370,48 @@ cannot attribute to any symbol at all — an ambient or global type such as `Dat
 local declaration or import — is reported on the same terms: a governed value whose type cannot be
 established is not evidence the convention is met.
 
-### `require` is matched on the module and nothing else
+### `require` is matched on the module and on the exported name
 
-`require.name` is not compared against the type. `import { Big } from 'decimal.js'` satisfies a
-convention requiring `Decimal`, because it came from the required module — a false negative, and a
-deliberate one.
+`require.name` is compared against the name the module exports the type under, never against
+the name at the use site. `import { Decimal as Money } from 'decimal.js'` is accepted by a
+convention requiring `Decimal`: the alias is the local spelling, the oracle carries both, and
+the check reads the exported one. `import { Big } from 'decimal.js'` is reported, because a
+sibling export of the required module is not the required type.
 
-The alternative is worse. The type oracle reports a type's name as it is written *at the use site*,
-not as the module exported it, so comparing that name rejects an alias of exactly the required
-type: `import { Decimal as Money } from 'decimal.js'` is conforming code, and a rule that compared
-names reported it with a message about `number`. **A rule that accuses conforming code is the one
-failure this design forbids**, and the whole posture of the type oracle is the same trade — say
-nothing rather than say something wrong. Matching the module alone is the version of the check that
-cannot produce that failure.
+Both halves are checked and neither is redundant, and the shadow is not what shows it: a local
+`class Decimal {}` has no module and no exported name, so it fails the name half first and is
+reported either way. The shape only the module half decides is the required name imported from
+the wrong module — `import { Decimal } from 'big.js'` is reported because `big.js` is not
+`decimal.js`. A `Big` from the right module cannot satisfy `name`, which is the half this rule
+shipped without — under the earlier version it was accepted, and that false negative is what
+`require` being "matched on the module and nothing else" used to mean.
 
-Two consequences to hold. Enabling this rule against a module that exports several types treats
-them as interchangeable, so it is worth pointing `require.module` at the narrowest module that
-exports the type you mean. And `require.name` is still load-bearing for the *message* — with no
-`reason` set it is what the violation says to use instead — so it is worth spelling correctly even
-though nothing checks it.
+`require.name` is load-bearing for the *message* as well as for the check — with no `reason`
+set it is what the violation says to use instead — so it is worth spelling exactly as the
+module exports it.
 
 **`undefined` produces false negatives and never false positives.** The oracle would rather say
 nothing than accuse code it could not read, so a value it cannot type is never reported — even
-when the name matches and the value really is a raw `number`. That silence is bounded by what the
-oracle can see from the parsed file alone: no `tsconfig.json`, no declaration files, no cross-file
-resolution. "No violations" from this rule is a narrower claim than "every governed value
-conforms," and a reader who conflates the two is trusting a report that never looked.
+when the name matches and the value really is a raw `number`. That silence is bounded by what
+the oracle can read: the parsed file, and the declaration files its imports resolve to — no
+`tsconfig.json`, no path mapping, no compiler. "No violations" from this rule is a narrower
+claim than "every governed value conforms," and a reader who conflates the two is trusting a
+report that never looked.
+
+An earlier version of this section said "no declaration files, no cross-file resolution", and
+that was true of the within-file oracle it was written for. It is history now: the paragraph
+below is the behavior, and a project whose `node_modules` is absent is what the older sentence
+still describes.
+
+**A default import is resolved by name once the declaration file is readable.** `import Decimal
+from 'decimal.js'` says only `exported: 'default'` on its own — `default` is the name the module
+exports it under, and comparing that against `require.name` would accuse conforming code — so a
+default import is accepted on the module requirement alone whenever nothing better is known.
+With `decimal.js` installed, the cross-file oracle follows the default export to the name its
+declaration file declares it under, and the ordinary comparison happens: a package whose default
+export is `Big` no longer satisfies a convention requiring `Decimal`. **A project whose
+`node_modules` is not installed gets the weaker guarantee rather than a wall of false
+positives** — which is the same trade the rest of this rule makes, one file further out.
 
 ### It is one half of a pair
 
@@ -484,10 +510,10 @@ oracle types `parseFloat(...)` as `number`.
 
 **The callee is matched through the import that bound it, not by the text at the call site.**
 `import { Decimal as Money } from 'decimal.js'` followed by `new Money(parseFloat(x))` is
-reported, because the check follows the binding — which is the question `no-restricted-types`
-cannot ask at all, since the oracle reports a type's name as the use site spells it. `name` is
-the export's own name: `default` for a default import, `*` for a namespace import, and omitted
-to mean "anything from this module".
+reported, because the check follows the binding — which is the same question `no-restricted-types`
+asks of a *type* through the oracle's exported name; here it is asked of a callee, where there is
+no annotation to read. `name` is the export's own name: `default` for a default import, `*` for a
+namespace import, and omitted to mean "anything from this module".
 
 ### The default is the first argument, and that is a deliberate narrowing
 
@@ -531,9 +557,10 @@ positive is the one failure this design forbids.
 
 The rule declares `requires: ['types']`, which is what puts `ctx.types` on its context at all —
 see [`architecture.md`](architecture.md) §6.10. Everything it can say is bounded by what the
-oracle can see from the parsed file alone: no `tsconfig.json`, no declaration files, no
-cross-file resolution. A clean run means the governed positions this rule could type were fine,
-which is a narrower claim than "no forbidden value reaches that callee".
+oracle can read: the parsed file, and the declaration files its imports resolve to — no
+`tsconfig.json`, no path mapping, no compiler. A clean run means the governed positions this
+rule could type were fine, which is a narrower claim than "no forbidden value reaches that
+callee".
 
 ### It is one half of a pair
 
@@ -717,7 +744,8 @@ as sound as one over the whole tree, and a pre-commit hook is where this rule do
 
 The analysis is intra-procedural (per function), flow-sensitive with reaching-definitions-style
 kill (a later clean reassignment of the same binding cuts an earlier taint), but deliberately
-**path-insensitive** and **field-insensitive** — a may-analysis that leans toward false
+**path-insensitive** and **index-insensitive**, and **field-sensitive only to a depth of three
+segments** — a may-analysis that leans toward false
 positives rather than false negatives. Concretely, against this rule's own acceptance fixtures
 in `crates/lanekeep-rules/tests/no_secret_in_string.rs`:
 
@@ -732,7 +760,14 @@ in `crates/lanekeep-rules/tests/no_secret_in_string.rs`:
 | `const { x } = getSecret(); log(x);` | **no** — documented v1 false negative | a binding introduced by destructuring is not tracked in v1 |
 | `for (const x of getSecret()) { log(x); }` | **no** — documented v1 false negative | a binding introduced by a `for...of` header is not tracked in v1 |
 | `let msg = ""; msg += getSecret(); log(msg);` | yes | augmented assignment (`+=`, `\|\|=`, …) is a weak update — tainted-iff-RHS, and it never kills prior taint |
-| `o.secret = getSecret(); log(o.public);` | yes — documented over-approximation | field-insensitive: tainting one field taints the whole binding, and every field read from it |
+| `o.secret = getSecret(); log(o.public);` | **no** | field-sensitive: `o.public` and `o.secret` are incomparable access paths |
+| `o.secret = getSecret(); log(o.secret);` | yes | the read is the path that was written |
+| `o.a.b = getSecret(); log(o.a);` | yes | a read above a write covers everything under it |
+| `const s = getSecret(); log(s.length);` | **no** | `length`, `byteLength`, `byteOffset` and `size` describe a value rather than carrying it; `log(s.buffer)` and `log(s.mnemonic)` still report |
+| `a[0] = getSecret(); log(a[1]);` | yes — documented over-approximation | index-insensitive: every subscript is one access-path segment, so `a[0]` and `a[1]` are the same path; a subscript is an unknown key, so `o[k] = getSecret(); log(o.secret)` reports as it always did |
+| `o.a.b.c.d = getSecret(); log(o.a.b.c.e);` | yes — documented over-approximation | past three segments a path is widened, and the widened path is top for its subtree |
+| `const o = { secret: getSecret() }; log(o.public);` | yes — documented over-approximation | an object literal is one expression to the analysis: a contained source taints every path asked of the binding; field sensitivity applies to writes |
+| `o.length = getSecret(); log(o.length);` | **no** — documented v1 false negative | a shape property is cut on read whatever was written there; no `flow` lever restores it, a separate `query`/`check` can report the site |
 | `const s = getSecret(); if (isTest) { log(s); }` | yes — documented, path-insensitive | the analysis asks only whether some path reaches the read, never whether that branch runs |
 | two branches each doing `s = getSecret()`, one `log(s)` after | yes, **twice** | two distinct sources reaching one sink are two distinct findings, not deduplicated into one — deduplication only collapses a *single* source reaching one sink by more than one path |
 

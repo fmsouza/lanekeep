@@ -215,6 +215,8 @@ struct JsonConfig {
     #[serde(default)]
     suppressions: crate::RawSuppressions,
     #[serde(default)]
+    types: crate::RawTypes,
+    #[serde(default)]
     rules: Vec<JsonRule>,
 }
 
@@ -301,6 +303,7 @@ pub(crate) fn parse(
             severity: config.severity,
             timeouts: config.timeouts,
             suppressions: config.suppressions,
+            types: config.types,
             rules: Vec::new(),
         },
         rules,
@@ -913,7 +916,8 @@ mod tests {
                 "rules",
                 "severity",
                 "suppressions",
-                "timeouts"
+                "timeouts",
+                "types"
             ],
             "the schema's fields changed; the parser below has to change with it"
         );
@@ -925,7 +929,9 @@ mod tests {
             "exclude": ["**/x"],
             "namespaces": ["acme"],
             "severity": {"acme/a": "warn"},
-            "timeouts": {"rule": 100, "global": 5000},
+            "timeouts": {"rule": 100, "global": 5000, "analysis": 60000},
+            "types": {"provider": "tsc", "command": ["node"],
+                      "typescript": "./node_modules/typescript"},
             "suppressions": {"requireExpiry": true, "maxExpiryDays": 30,
                              "forbidFileScope": true},
             "rules": ["lanekeep/no-default-export"]

@@ -761,10 +761,17 @@ test-js:
     output="$(mktemp)"
     trap 'rm -f "${list}" "${output}"' EXIT
 
-    find packages/lanekeep/runtime -maxdepth 1 -name '*.test.js' -print0 > "${list}"
+    {
+        find packages/lanekeep/runtime -maxdepth 1 -name '*.test.js' -print0
+        # The `tsc` driver's own tests. A second `find` rather than a wider one: the two
+        # directories are unrelated and a single walk from the repository root would pick up
+        # anything a build ever leaves behind.
+        find crates/lanekeep-types/src/tsc -maxdepth 1 -name '*.test.mjs' -print0
+    } > "${list}"
     count="$(tr -cd '\0' < "${list}" | wc -c | tr -d ' ')"
     if [ "${count}" -eq 0 ]; then
-        echo "error: no test files under packages/lanekeep/runtime/." >&2
+        echo "error: no test files under packages/lanekeep/runtime/ or" >&2
+        echo "       crates/lanekeep-types/src/tsc/." >&2
         echo "       nothing ran, so nothing was checked." >&2
         exit 1
     fi
@@ -897,7 +904,14 @@ lanekeep:
     # checks anything, which the 15s default budget cannot absorb — the gate reddens on a cold
     # runner while a warm local one passes. The budget is raised here, not in `lanekeep.json`,
     # because the self-check is lanekeep's own; a user's budget stays the documented default.
-    ./target/debug/lanekeep check . --timeout 60000
+    #
+    # Three minutes, from what hosted runners measured on one pull request: 42.7 s on a fast
+    # runner (CI run 34310683569) and 61.2 s, 62.6 s and 63.2 s on slow ones (runs 34312535862
+    # and 34316632938, the last one twice), whose nextest phase ran the same tests 40% slower.
+    # A 60 s budget failed that gate twice with nothing wrong in the tree. The cost tracks the
+    # corpus being checked, and a budget is a cancellation rather than a measurement — `bench`
+    # is the job that measures.
+    ./target/debug/lanekeep check . --timeout 180000
 
 # Build documentation the way docs.rs will, failing on broken intra-doc links.
 #

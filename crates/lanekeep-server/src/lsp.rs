@@ -110,24 +110,31 @@ pub fn by_file(root: &Path, violations: &[Violation]) -> BTreeMap<PathBuf, Vec<V
 /// form against a path from disk would never match.
 #[must_use]
 pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
+    let rest = percent_decode(uri.strip_prefix("file://")?);
 
     // `file:///a/b` on Unix leaves `/a/b`; a Windows URI leaves `/C:/a/b`, where the leading
-    // slash is part of the URI and not of the path.
-    let rest = if rest.len() > 2
-        && rest.starts_with('/')
-        && rest.as_bytes()[2] == b':'
-        && rest.as_bytes()[1].is_ascii_alphabetic()
-    {
-        &rest[1..]
-    } else {
-        rest
-    };
+    // slash is part of the URI and not of the path. Decoded first, because an editor is free
+    // to spell the drive's colon `%3A` — VS Code does — and the slash has to go either way. A
+    // drive is one letter and a colon and nothing else before the next slash, so a Unix path
+    // whose first segment merely contains a colon keeps its root.
+    let bytes = rest.as_bytes();
+    let drive = bytes.len() > 2
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && (bytes.len() == 3 || bytes[3] == b'/');
+    let rest = if drive { &rest[1..] } else { rest.as_str() };
 
-    Some(PathBuf::from(percent_decode(rest)))
+    Some(PathBuf::from(rest))
 }
 
-/// The `file://` URI for a path.
+/// The `file://` URI a client would send for a path.
+///
+/// The client's half of the pair: the server publishes under the URI the client chose and
+/// never spells one of its own, so this serves whatever has to address a file by URI — a test
+/// playing the editor, for one. A verbatim `\\?\` spelling, which is what `canonicalize`
+/// returns on Windows, does not survive the trip back through [`path_from_uri`], and no client
+/// sends one.
 #[must_use]
 pub fn uri_from_path(path: &Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
@@ -279,6 +286,33 @@ mod tests {
         assert_eq!(
             path_from_uri("file:///C:/project/a.ts").as_deref(),
             Some(Path::new("C:/project/a.ts"))
+        );
+    }
+
+    #[test]
+    fn a_percent_encoded_drive_colon_still_drops_the_slash() {
+        // VS Code spells a Windows drive `c%3A`; the slash before it is the URI's either way.
+        assert_eq!(
+            path_from_uri("file:///c%3A/project/a.ts").as_deref(),
+            Some(Path::new("c:/project/a.ts"))
+        );
+    }
+
+    #[test]
+    fn a_plain_drive_path_survives_the_round_trip() {
+        // `uri_from_path` encodes the colon, so the decoder has to read it back. Plain, because
+        // the verbatim spelling `canonicalize` gives a Windows path does not survive: `?` and
+        // `:` are encoded, and the decoded `//?/C:` parses as a UNC share rather than a drive.
+        let path = Path::new("C:/project/a.ts");
+        assert_eq!(path_from_uri(&uri_from_path(path)).as_deref(), Some(path));
+    }
+
+    #[test]
+    fn a_colon_inside_a_unix_segment_is_not_a_drive() {
+        // `/a:b` is a directory name; only `/C:/` is a drive with a slash to drop.
+        assert_eq!(
+            path_from_uri("file:///a%3Ab/c.ts").as_deref(),
+            Some(Path::new("/a:b/c.ts"))
         );
     }
 

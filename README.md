@@ -206,6 +206,7 @@ In-repo, versioned with the code:
 | [`docs/built-in-rules.md`](docs/built-in-rules.md) | The rules lanekeep ships with, and their options |
 | [`docs/cross-file-rules.md`](docs/cross-file-rules.md) | Writing a rule that needs a whole-corpus view |
 | [`docs/obligation-rules.md`](docs/obligation-rules.md) | Writing a rule that needs a resource released on every path |
+| [`docs/type-aware-rules.md`](docs/type-aware-rules.md) | Writing a rule that needs to know what a value's type is |
 | [`docs/authoring-rust-rules.md`](docs/authoring-rust-rules.md) | Writing a rule in Rust, shipped as a WebAssembly component |
 | [`docs/authoring-go-rules.md`](docs/authoring-go-rules.md) | Writing a rule in Go |
 | [`docs/authoring-python-rules.md`](docs/authoring-python-rules.md) | Writing a rule in Python |

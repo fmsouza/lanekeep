@@ -15,11 +15,14 @@ import { defineRule } from 'lanekeep'
  * worked example for a project writing its own dataflow rule. `getSecret`, `log` and `redact`
  * are illustrative names, not a real project's API; a real config names its own.
  *
- * **v1 is intra-procedural, path-insensitive, and field-insensitive** — see
+ * **It is intra-procedural, path-insensitive, and field-sensitive to a depth of three** — see
  * `crates/lanekeep-lang-js/src/flow.rs` for the analysis this rule rides on. Concretely: taint
  * is not followed through a call's own arguments (`identity(secret)` loses it), a branch guard
- * does not suppress a report reachable from another branch, and tainting one field of an
- * object taints reads of every field of it. All three are the documented trade of a
+ * does not suppress a report reachable from another branch, and tainting `o.secret` leaves
+ * `o.public` clean while leaving `o` and `o.secret.raw` tainted. Subscripts are not
+ * distinguished — `a[0]` and `a[1]` are one path, and a subscript is an unknown key that meets
+ * every named field — and a read of `length`, `byteLength`,
+ * `byteOffset` or `size` off a tainted value is clean. All of it is the documented trade of a
  * may-analysis that leans toward false positives rather than false negatives; `sanitizers` is
  * the project-facing lever for narrowing either direction — see `docs/built-in-rules.md`.
  *

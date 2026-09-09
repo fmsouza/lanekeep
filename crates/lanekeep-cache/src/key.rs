@@ -16,7 +16,10 @@ use lanekeep_core::ContentHash;
 /// Bumped when the encoding changes. Because it feeds the key, an old file simply misses
 /// rather than being misread — the cache is disposable, so a format change costs one cold
 /// run and needs no migration.
-pub const FORMAT_VERSION: u32 = 4;
+///
+/// 4 → 5 widened a dependency's presence flag from two values to three, so that a read
+/// refused for leaving the root is recorded as itself rather than as an absence.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Everything about a run that every file's key shares.
 ///

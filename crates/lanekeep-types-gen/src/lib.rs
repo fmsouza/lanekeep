@@ -313,9 +313,12 @@ fn render_context(
         // before they discover it that way.
         out.push_str("  /**\n");
         out.push_str(
-            "   * The bounded within-file type oracle, present only for a rule that declared\n",
+            "   * The type oracle, present only for a rule that declared `requires: ['types']`.\n",
         );
-        out.push_str("   * `requires: ['types']`.\n");
+        out.push_str(
+            "   * Bounded by a fixed depth rather than by file: it follows an import into the\n",
+        );
+        out.push_str("   * declaration file that answers it, and the file after that.\n");
         out.push_str("   *\n");
         out.push_str(
             "   * Typed as always present because there is no way to spell \"present when\n",
@@ -639,20 +642,34 @@ const SYMBOL_INFO: &str = "\
  * Where a name came from. Returned by {@link TypeApi.symbolOf} directly, and nested under a
  * {@link TypeInfo} whose `symbol` field is set.
  *
- * There is deliberately no `file` naming the declaring path. Within one file it would always be
- * the file being checked, and across files it is only true once a declaration has actually been
- * read from elsewhere — which is the cross-file oracle's to add (#189), beside the tracked read
- * that makes it so.
+ * There is deliberately no `file` naming the declaring path, even now that declarations are
+ * read across files. It would be where a package happens to be installed —
+ * `node_modules/@types/money/index.d.ts` on one machine and a workspace path on another —
+ * so a rule branching on it would give different answers for one program. `module` is the
+ * stable identity, and `exported` is the name that module declares it under.
  */
 export interface SymbolInfo {
   /**
    * The name as it appears at the use site, not at the declaration. For a renamed import —
-   * `import { Decimal as Money }` — this is the local alias `Money`, never the exported
-   * name `Decimal`. Comparing this field against an expected export name therefore rejects
-   * a renamed import of the right type; `module` is the reliable field for \"did this come
-   * from there\".
+   * `import { Decimal as Money }` — this is the local alias `Money`. It is the spelling to
+   * quote in a message, because it is the spelling the reader has in front of them; compare
+   * `exported` when the question is which export of a module this is.
    */
   name: string
+  /**
+   * The name the module exports this under. For a named import — `import { Decimal }` and
+   * `import { Decimal as Money }` alike — this is `Decimal` when `m`'s declaration file is
+   * unreadable, and the name that file actually declares (following any re-export chain)
+   * when it is readable, which need not be `Decimal` at all. Copied even when nothing was
+   * renamed, so a comparison never needs a fallback to `name` that would silently accept
+   * every plain import if it were forgotten. For a default import this is the name the
+   * declaration file declares the default export under when that file is readable — `Big`
+   * for a package whose default export is `Big`, whatever the local binding is called — and
+   * falls back to the placeholder `default` only when the declaration is not readable.
+   * Absent for a namespace import, which binds the module object and has no single exported
+   * name, and absent for a local declaration, which was not imported at all.
+   */
+  exported?: string
   /**
    * The module it was imported from. Absent for a local declaration — that absence is what
    * distinguishes an imported `Decimal` from a local class that happens to share the name.
@@ -679,8 +696,10 @@ const TYPE_INFO: &str = "\
  * not assume the final branch of `if (primitive) … else if (symbol) … else` is unreachable
  * — for this shape, it is not.
  *
- * There is deliberately no `complete` field. Nothing in this milestone can make the oracle's
- * answer partial, and a field that never varies would only teach a rule to stop checking it.
+ * There is deliberately no `complete` field on a *type*. Whether the oracle had a full view
+ * is a property of the file rather than of any one answer — `TypeApi.complete()` is where it
+ * is asked — and putting it here would invite a rule to read it per type and conclude
+ * something different on each.
  */
 export interface TypeInfo {
   /** What TypeScript would call this type. Display-only — branch on the fields below instead. */
@@ -699,13 +718,18 @@ export interface TypeInfo {
 
 const TYPE_API: &str = "\
 /**
- * The bounded within-file type oracle, reached through `ctx.types`.
+ * The type oracle, reached through `ctx.types`.
  *
  * Every question can come back with no answer, and no answer is a first-class result rather
  * than a failure to work around: the oracle is conservative on purpose, and it would rather
  * say nothing than say something wrong, because a rule reporting on a wrong type accuses
  * correct code. A rule is expected to check for `undefined` and quietly stay silent, the same
  * posture the rest of the navigation surface already takes on a dead handle.
+ *
+ * It reads the file in front of it **and the declaration files that file imports**, through
+ * the same tracked, confined reads `ctx.readFile` uses. Nothing above the project root is read,
+ * ever — so point lanekeep at the workspace root, the directory `node_modules` lives in,
+ * rather than at a package inside it. `--config` does not move the root.
  */
 export interface TypeApi {
   /**
@@ -715,6 +739,52 @@ export interface TypeApi {
   typeOf(n: Node): TypeInfo | undefined
   /** Where the identifier at `n` was declared. `undefined` on the same terms as `typeOf`. */
   symbolOf(n: Node): SymbolInfo | undefined
+  /**
+   * What calling the function at `n` yields.
+   *
+   * Separate from `typeOf` because a function declaration is not an expression. Accepts a
+   * call expression, a function-like declaration, or an identifier bound to one. An
+   * annotated signature answers its annotation; an unannotated one with a single `return`
+   * answers that expression's type; several returns answer their union when every member is
+   * known and `undefined` otherwise; a function with no `return` answers `undefined` rather
+   * than guessing `void`. Type arguments are dropped throughout — `useQuery<Balance[]>`
+   * answers by the result type's name, never by the argument.
+   */
+  returnTypeOf(n: Node): TypeInfo | undefined
+  /**
+   * Whether the type at `n` is the type `module` exports as `name`, or inherits from it.
+   *
+   * Nominal, never structural: a class reaches it through `extends` or `implements`, an
+   * interface through `extends`, an alias by being transparent, and a union only when *every*
+   * member does. A primitive answers `false` — but only when `module` and `name` resolve to a
+   * declaration; a target that does not resolve answers `undefined` whatever `n` is.
+   *
+   * **`undefined` is not `false`.** `false` means the walk completed and reached nothing;
+   * `undefined` means a link could not be read — an unresolvable import, a package that is
+   * not installed, a type with no symbol at all. A rule treating the two alike reports on
+   * code the oracle never saw.
+   */
+  isAssignableTo(n: Node, module: string, name: string): boolean | undefined
+  /**
+   * Whether every import in the file being checked resolved to something readable.
+   *
+   * `false` is the honest label on a partial view: some name in this file came from a module
+   * the oracle could not open, so an `undefined` anywhere in it may be ignorance rather than
+   * a considered answer. A rule that reports only on what it established does not need to
+   * ask; a rule that wants to say \"I could not check this file\" does.
+   *
+   * An import that resolves to a file which does not *parse* counts as unreadable too: the
+   * names outside the broken span still answer, the ones inside it come back `undefined`, and
+   * nothing on either answer says which. An import of something that is not code — a
+   * stylesheet, a JSON asset, an image — is not counted at all, since it is not a module the
+   * oracle reads.
+   *
+   * **The verdict is the whole file's, and a parse fault is the whole declaration file's.**
+   * One `ERROR` node anywhere in a fifty-thousand-line `@types` bundle makes every file that
+   * imports it `false`, however far that span is from the names the rule asked about. Silence
+   * is the safe direction; a narrower verdict is a refinement rather than a promise.
+   */
+  complete(): boolean
 }
 ";
 
@@ -854,6 +924,13 @@ export interface Config {
     rule?: number
     /** Wall-clock, for the whole run. */
     global?: number
+    /**
+     * Host-side type-provider work, across the whole run.
+     *
+     * Analysis time rather than elapsed time: only what the provider spends building
+     * programs and answering requests is charged against it.
+     */
+    analysis?: number
   }
   /** Policy for suppression directives. All off by default. */
   suppressions?: {
@@ -863,6 +940,19 @@ export interface Config {
     maxExpiryDays?: number
     /** Any whole-file directive is reported. */
     forbidFileScope?: boolean
+  }
+  /** Which type oracle answers `ctx.types`. */
+  types?: {
+    /**
+     * `builtin` is lanekeep's own bounded oracle and needs no toolchain. `tsc` drives the
+     * project's own `typescript` package through a sidecar process: wider answers, a slower
+     * run, and a pre-commit hook that builds the project's program before it checks anything.
+     */
+    provider?: 'builtin' | 'tsc'
+    /** How to launch the sidecar. `tsc` only. */
+    command?: string[]
+    /** The `typescript` package the sidecar loads, resolved from the project root. `tsc` only. */
+    typescript?: string
   }
   /** The rules to run, in order. */
   rules: Rule[]

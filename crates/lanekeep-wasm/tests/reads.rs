@@ -382,7 +382,7 @@ fn a_read_is_recorded_as_a_dependency_and_so_is_an_absence() {
     assert_eq!(
         recorded
             .iter()
-            .map(|read| (read.path.as_str(), read.hash.is_some()))
+            .map(|read| (read.path.as_str(), read.hash().is_some()))
             .collect::<Vec<_>>(),
         vec![("missing.json", false), ("present.json", true)],
         "both files, in path order, and the absent one carries no hash"

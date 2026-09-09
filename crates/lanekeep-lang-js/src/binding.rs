@@ -31,22 +31,15 @@ const SCOPE_KINDS: &[&str] = &[
     "method_definition",
     "class_declaration",
     "class",
-    // Four more kinds that carry a `type_parameters` field. `tree-sitter-typescript`
-    // 0.23.2's `typescript/src/node-types.json` declares the field on eighteen node kinds
-    // (that is the count to read, not to measure from a hand sample — see below); eight
-    // were already above, and these four were not, so a type parameter declared on any of
-    // them was invisible and the walk escaped outward — exactly the failure the
-    // `type_parameters` arm below was written to fix for functions, still live for these.
-    // `type A = number; interface O<A> { x: A }` answered `number`.
+    // Kinds that carry a `type_parameters` field and were not scopes.
+    // `tree-sitter-typescript` 0.23.2's `typescript/src/node-types.json` declares the field
+    // on eighteen node kinds; eight were already above, four landed in #207 and the last six
+    // in #208, so every carrier is a scope and nothing is outstanding.
     //
-    // Six carriers remain missing: `abstract_method_signature`, `call_signature`,
-    // `construct_signature`, `constructor_type`, `function_type`, `method_signature`, tracked
-    // as lanekeep#208. All six also carry `parameters`, so each would widen
-    // parameter resolution the way `function_signature` does below, and each needs its own
-    // before/after measurement. Until then,
-    // `type A = number; interface I { m<A>(x: A): void }` still types `x` as `number`,
-    // because `method_signature` carries the type parameters and `interface_declaration`
-    // does not.
+    // What the omission produced was worse than a missing answer, which is why the list is
+    // derived from the grammar's own declaration rather than from anyone's reading:
+    // `type A = number; interface I { m<A>(x: A): A }` typed the annotation `number`, a
+    // confident answer identical in every byte to a declared one.
     //
     // Do not derive this list from a hand-written parse sample: the first attempt at this
     // fix did exactly that and reported twelve carriers, because the sample omitted every
@@ -64,6 +57,25 @@ const SCOPE_KINDS: &[&str] = &[
     "interface_declaration",
     "type_alias_declaration",
     "function_signature",
+    // #208's first two. `method_signature` and `abstract_method_signature` are ordinary
+    // members of a body the walk already descends, and they are the two that produce the
+    // reproducer: `type A = number; interface I { m<A>(x: A): A }` resolved `A` to the
+    // alias, because the type parameters are on the signature and `interface_declaration`
+    // — a scope since #207 — does not carry them.
+    //
+    // Both also carry `parameters`, so this widens as well as fixes: a parameter annotated
+    // inside an interface method or an abstract member is typed where it used to give
+    // nothing, and `lanekeep/no-restricted-types` reports it. Measured per kind, in the
+    // pull request body.
+    "method_signature",
+    "abstract_method_signature",
+    // #208's remaining four, landing together. `call_signature` and `construct_signature`
+    // are members of an interface body; `constructor_type` and `function_type` sit in pure
+    // type position, where nothing had ever asked this walk for a scope before.
+    "call_signature",
+    "construct_signature",
+    "constructor_type",
+    "function_type",
     "catch_clause",
     "for_statement",
     "for_in_statement",
@@ -349,7 +361,7 @@ fn import_binding(node: Node<'_>, source: &str, name: &str) -> Option<Binding> {
                 {
                     let imported = specifier
                         .child_by_field_name("name")
-                        .map(|n| node_text(n, source).to_owned())?;
+                        .map(|n| trim_quotes(node_text(n, source)).to_owned())?;
                     // The alias is what the local name is; without one they are the same.
                     let local = specifier
                         .child_by_field_name("alias")
@@ -808,8 +820,8 @@ mod tests {
     // `type_parameters` on eighteen node kinds; eight were already in `SCOPE_KINDS`, and
     // these four were not, so a type parameter declared on any of them was invisible and
     // the scope walk escaped outward — the exact failure the `type_parameters` arm was
-    // written to fix for functions. Six carriers remain missing (see `SCOPE_KINDS`'s own
-    // comment for the names and why); this task covers only the four below.
+    // written to fix for functions. Every carrier the grammar declares is a scope now; the
+    // two sections below cover the six that #208 added, split as they shipped.
     //
     // The sources are the same four in all three tests, deliberately. Splitting them across
     // tests would let one kind be covered in one direction and not the other, which is how
@@ -862,6 +874,119 @@ mod tests {
             "type A = number;\ntype O = { x: A };",
             "type A = number;\nabstract class C { m(x: A) { return x; } }",
             "type A = number;\ndeclare function f(x: A): void;",
+        ] {
+            assert_eq!(
+                declaration_use(source, "A"),
+                Some("type_alias_declaration".to_owned()),
+                "{source}"
+            );
+        }
+    }
+
+    // --- the six carriers #208 left, in two commits ------------------------------------
+    //
+    // Same three-test shape as the four above and for the same reason: splitting the
+    // sources across tests would let one kind be covered in one direction and not the
+    // other. `: A` is the return type in every source deliberately — a signature written
+    // `: void` puts a dead `type_annotation` last in the file, which is the row #207
+    // shipped twice and #208's acceptance names.
+
+    /// Each of these binds its type parameter rather than letting the walk escape.
+    #[test]
+    fn a_type_parameter_binds_on_a_method_signature_kind() {
+        for source in [
+            "type A = number;\ninterface I { m<A>(x: A): A }",
+            "type A = number;\nabstract class C { abstract m<A>(x: A): A }",
+        ] {
+            assert_eq!(
+                resolve_use(source, "A"),
+                Some(Binding::Local(BindingKind::TypeParam)),
+                "{source}"
+            );
+            assert_eq!(
+                declaration_use(source, "A"),
+                Some("type_parameter".to_owned()),
+                "{source}"
+            );
+        }
+    }
+
+    /// And shadows the outer alias rather than merely coexisting with it.
+    #[test]
+    fn a_type_parameter_on_a_method_signature_kind_shadows_an_outer_alias() {
+        for source in [
+            "type A = number;\ninterface I { m<A>(x: A): A }",
+            "type A = number;\nabstract class C { abstract m<A>(x: A): A }",
+        ] {
+            assert!(shadowed(source, "A"), "{source}");
+        }
+    }
+
+    /// The half that keeps the fix from over-reaching: with no type parameter to shadow it,
+    /// the outer alias is still what the annotation resolves to. This one passes before the
+    /// change as well as after — it is the guard, not the driver.
+    #[test]
+    fn without_a_type_parameter_a_method_signature_kind_reads_the_outer_alias() {
+        for source in [
+            "type A = number;\ninterface I { m(x: A): A }",
+            "type A = number;\nabstract class C { abstract m(x: A): A }",
+        ] {
+            assert_eq!(
+                declaration_use(source, "A"),
+                Some("type_alias_declaration".to_owned()),
+                "{source}"
+            );
+        }
+    }
+
+    // --- #208's remaining four: signature and type-position carriers --------------------
+    //
+    // Separate from the two above because they ship in their own commit. `call_signature`
+    // and `construct_signature` are members of a body; `constructor_type` and
+    // `function_type` are pure type position, which is untested ground for a walk that had
+    // only ever descended declarations.
+
+    #[test]
+    fn a_type_parameter_binds_in_signature_or_type_position() {
+        for source in [
+            "type A = number;\ninterface F { <A>(x: A): A }",
+            "type A = number;\ninterface F { new <A>(x: A): A }",
+            "type A = number;\ntype F = new <A>(x: A) => A;",
+            "type A = number;\ntype F = <A>(x: A) => A;",
+        ] {
+            assert_eq!(
+                resolve_use(source, "A"),
+                Some(Binding::Local(BindingKind::TypeParam)),
+                "{source}"
+            );
+            assert_eq!(
+                declaration_use(source, "A"),
+                Some("type_parameter".to_owned()),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_type_parameter_in_signature_or_type_position_shadows_an_outer_alias() {
+        for source in [
+            "type A = number;\ninterface F { <A>(x: A): A }",
+            "type A = number;\ninterface F { new <A>(x: A): A }",
+            "type A = number;\ntype F = new <A>(x: A) => A;",
+            "type A = number;\ntype F = <A>(x: A) => A;",
+        ] {
+            assert!(shadowed(source, "A"), "{source}");
+        }
+    }
+
+    /// The guard: passes before the change as well as after.
+    #[test]
+    fn without_a_type_parameter_signature_or_type_position_reads_the_outer_alias() {
+        for source in [
+            "type A = number;\ninterface F { (x: A): A }",
+            "type A = number;\ninterface F { new (x: A): A }",
+            "type A = number;\ntype F = new (x: A) => A;",
+            "type A = number;\ntype F = (x: A) => A;",
         ] {
             assert_eq!(
                 declaration_use(source, "A"),
@@ -951,5 +1076,72 @@ mod tests {
                 "disagreement for `{name}` in `{source}`"
             );
         }
+    }
+
+    /// Every kind the grammar declares `type_parameters` on is a scope, read off the grammar's
+    /// own declaration rather than off a sample.
+    ///
+    /// AGENTS.md's entry on `SCOPE_KINDS` carried four wrong counts of these kinds, every one
+    /// from a hand-written sample that did not parse everything, and a fifth nearly shipped
+    /// with the change that closed the set. `node-types.json` is where the field is declared,
+    /// so this reads it — both grammars, which declare the same kinds — and pins the two facts
+    /// the entry states: which kinds carry the field, and which of those also carry
+    /// `parameters`, the ones where scoping the kind also widened parameter resolution. A
+    /// grammar bump that adds a carrier fails here instead of typing a type parameter as its
+    /// outer alias in silence.
+    #[test]
+    fn every_carrier_the_grammar_declares_is_a_scope() {
+        use std::collections::BTreeMap;
+
+        // kind → whether it also carries `parameters`
+        fn carriers(node_types: &str) -> BTreeMap<String, bool> {
+            let kinds: Vec<serde_json::Value> =
+                serde_json::from_str(node_types).expect("node-types.json parses");
+            kinds
+                .iter()
+                .filter_map(|kind| {
+                    let fields = kind.get("fields")?.as_object()?;
+                    fields.contains_key("type_parameters").then(|| {
+                        let name = kind["type"].as_str().expect("a kind has a type");
+                        (name.to_owned(), fields.contains_key("parameters"))
+                    })
+                })
+                .collect()
+        }
+
+        let typescript = carriers(tree_sitter_typescript::TYPESCRIPT_NODE_TYPES);
+        let tsx = carriers(tree_sitter_typescript::TSX_NODE_TYPES);
+        assert_eq!(
+            typescript, tsx,
+            "the two grammars declare the field on the same kinds"
+        );
+        assert_eq!(typescript.len(), 18, "the count AGENTS.md states");
+
+        let missing: Vec<&str> = typescript
+            .keys()
+            .map(String::as_str)
+            .filter(|kind| !SCOPE_KINDS.contains(kind))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "kinds carrying `type_parameters` that are not scopes: {missing:?}"
+        );
+
+        let without_parameters: Vec<&str> = typescript
+            .iter()
+            .filter(|(_, has_parameters)| !**has_parameters)
+            .map(|(kind, _)| kind.as_str())
+            .collect();
+        assert_eq!(
+            without_parameters,
+            [
+                "abstract_class_declaration",
+                "class",
+                "class_declaration",
+                "interface_declaration",
+                "type_alias_declaration",
+            ],
+            "the carriers AGENTS.md says declare no `parameters`"
+        );
     }
 }

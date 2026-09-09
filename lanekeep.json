@@ -30,6 +30,8 @@
           "crates/lanekeep-lang-js/benches/*",
           "crates/lanekeep-rules/tests/*",
           "crates/lanekeep-types/benches/*",
+          "crates/lanekeep-types/src/builtin.rs",
+          "crates/lanekeep-types/src/tsc/tests.rs",
           "crates/lanekeep-types/tests/*",
           "crates/lanekeep-wasm/tests/*"
         ]
@@ -44,7 +46,8 @@
       "options": {
         "allow": [
           "crates/lanekeep-core/src/changed.rs",
-          "crates/lanekeep-rules/build.rs"
+          "crates/lanekeep-rules/build.rs",
+          "crates/lanekeep-types/src/tsc/mod.rs"
         ]
       }
     },
@@ -63,6 +66,7 @@
           "crates/lanekeep-config/",
           "crates/lanekeep-core/",
           "crates/lanekeep-query/",
+          "crates/lanekeep-types/",
           "crates/lanekeep-js/",
           "crates/lanekeep-engine/",
           "crates/lanekeep-wasm/"
@@ -75,7 +79,11 @@
           "crates/lanekeep-engine/benches/crossings.rs",
           "crates/lanekeep-wasm/src/runtime.rs",
           "crates/lanekeep-wasm/tests/python_determinism.rs",
-          "crates/lanekeep-wasm/tests/fixture_currency.rs"
+          "crates/lanekeep-wasm/tests/fixture_currency.rs",
+          "crates/lanekeep-types/build.rs",
+          "crates/lanekeep-types/benches/construction.rs",
+          "crates/lanekeep-types/src/tsc/tests.rs",
+          "crates/lanekeep-types/tests/provider.rs"
         ]
       }
     },
@@ -110,7 +118,8 @@
           "crates/lanekeep-rules/build.rs",
           "crates/lanekeep-types-gen/src/lib.rs",
           "crates/lanekeep-types/benches/construction.rs",
-          "crates/lanekeep-types/build.rs"
+          "crates/lanekeep-types/build.rs",
+          "crates/lanekeep-types/src/tsc/tests.rs"
         ]
       }
     }

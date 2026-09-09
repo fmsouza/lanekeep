@@ -40,6 +40,7 @@ pub type Hash = [u8; 32];
 mod json;
 
 pub use json::{ResolvedRule, RuleReference};
+pub use lanekeep_core::{TypesConfig, TypesProvider};
 
 /// Render a hash the way it appears in diagnostics and cache paths.
 #[must_use]
@@ -367,6 +368,8 @@ pub struct Config {
     pub limits: Limits,
     /// The project's policy for which shapes of valid directive it accepts.
     pub suppressions: SuppressionPolicy,
+    /// Which type oracle answers `ctx.types`, and how to reach it.
+    pub types: TypesConfig,
     /// Hash of every module in the rule import graph.
     pub ruleset_hash: Hash,
     /// Hash of the configuration values.
@@ -433,13 +436,37 @@ struct RawConfig {
     #[serde(default)]
     suppressions: RawSuppressions,
     #[serde(default)]
+    types: RawTypes,
+    #[serde(default)]
     rules: Vec<RawRule>,
 }
 
+/// The `timeouts` block as written, on [`RawTypes`]' terms — values validated in `build`, keys
+/// refused here.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTimeouts {
     rule: Option<u64>,
     global: Option<u64>,
+    analysis: Option<u64>,
+}
+
+/// The `types` block as written — permissive about a *value*, because validation happens in
+/// `build`, where a malformed one becomes a diagnostic naming the field rather than a
+/// deserialization error naming a line of JSON the user never wrote.
+///
+/// Not permissive about a *key*. `deny_unknown_fields` matches `JsonConfig` in `json.rs` — a
+/// plain name rather than an intra-doc link, which cannot resolve into a private module — and
+/// the schema's
+/// `additionalProperties: false`, and it is the difference between `typescriptt` being refused
+/// and being silently ignored — which is a project believing it configured a compiler and
+/// running against whatever the default names, with nothing anywhere to say so.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTypes {
+    provider: Option<String>,
+    command: Option<Vec<String>>,
+    typescript: Option<String>,
 }
 
 /// The `suppressions` block as written — permissive, like [`RawTimeouts`], because the
@@ -597,17 +624,45 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Capabilities this build actually provides an analysis for.
+/// Capabilities this build actually provides an analysis for, under a given configuration.
 ///
-/// Which capabilities are implemented is a property of this build, not of the config, so it
-/// is expressed as a fact about [`Capability`] rather than read from anything a project
-/// writes. `Dataflow` is the one capability both dataflow analyses rest on: obligation
-/// (`obligation`/`checkObligation`, #193) and taint flow (`flow`/`checkFlow`, #194), paired
-/// at load by `build_rule`'s coherent-shape checks. It is every variant `Capability` has
-/// besides `Types`, so today this equals [`Capability::all`]. It will not stay that way the
-/// moment a third capability is declared and not yet implemented, which is what keeps this
-/// list here rather than replaced by that call.
-const IMPLEMENTED: &[Capability] = &[Capability::Types, Capability::Dataflow];
+/// Which capabilities are implemented was a property of the build alone until `types.provider`
+/// existed. It still is for `Dataflow`. `Types` now also depends on whether the configured
+/// provider could be reached: under `builtin` there is always an oracle, and under `tsc` there
+/// is one exactly when Node and the project's `typescript` package are both there.
+///
+/// # Why this is answered twice
+///
+/// Config load runs before any provider is spawned and cannot know, so it asks with
+/// `provider_ok: true` and refuses only what no build could honor. `Engine::prepare` asks again
+/// with the real answer, after the spawn. Both refuse through
+/// [`unavailable_capability`], so one mistake cannot produce two different messages — which
+/// matters more than it sounds, because the two fire on the same config and a reader who saw
+/// both would not know they were the same check.
+#[must_use]
+pub fn implemented(types: &TypesConfig, provider_ok: bool) -> Vec<Capability> {
+    let mut capabilities = Vec::with_capacity(2);
+    if types.provider == TypesProvider::Builtin || provider_ok {
+        capabilities.push(Capability::Types);
+    }
+    capabilities.push(Capability::Dataflow);
+    capabilities
+}
+
+/// The one wording for "this rule needs a capability this run does not have".
+#[must_use]
+pub fn unavailable_capability(
+    id: &RuleId,
+    capability: Capability,
+    implemented: &[Capability],
+) -> String {
+    format!(
+        "`{id}` requires the `{}` analysis, which this build does not provide — the \
+         implemented capabilities are {}",
+        capability.as_str(),
+        describe(implemented),
+    )
+}
 
 /// Render a set of capabilities as backtick-quoted names, comma separated.
 ///
@@ -643,6 +698,7 @@ fn describe(capabilities: &[Capability]) -> String {
 fn check_requires(
     requires: Option<&serde_json::Value>,
     id: &RuleId,
+    implemented: &[Capability],
 ) -> Result<Vec<Capability>, String> {
     // Absence is handled here rather than at the call site, because an absent `requires` and
     // an empty one say the same thing and there is one place to say so.
@@ -684,22 +740,16 @@ fn check_requires(
     // itself — the same ordering as before, kept so a config carrying both a typo and a real
     // capability still reports the typo.
     //
-    // **This loop's "walk every entry, do not stop at the first" behavior currently has no
-    // test that fails without it.** `an_unimplemented_capability_is_refused_beside_an_implemented_one`
-    // used to prove it with `['types', 'dataflow']` in both orders; now that `Dataflow` is
-    // implemented alongside `Types`, `IMPLEMENTED` covers every `Capability` variant and no
-    // combination of real names can reach this `return Err` at all. When a third capability
-    // is added unimplemented, restore that test with the new name paired with an implemented
-    // one, in both orders — a `capabilities.iter().take(1)` regression is invisible to every
-    // other test in this crate, because none of them declares more than one capability.
+    // `implemented` is no longer every `Capability` variant unconditionally — under
+    // `types.provider: 'tsc'` and no spawned provider yet (config load always asks with
+    // `provider_ok: true`, so this loop only ever refuses a capability no build could honor at
+    // all; the second, real-answer gate is `Engine::prepare`'s, through the same
+    // `unavailable_capability`). `check_requires_walks_every_entry_whatever_the_order` proves
+    // this loop walks every entry rather than stopping at the first, with `['types',
+    // 'dataflow']` in both orders against a caller-supplied `implemented` that omits `Types`.
     for capability in &capabilities {
-        if !IMPLEMENTED.contains(capability) {
-            return Err(format!(
-                "`{id}` requires the `{}` analysis, which this build does not provide — the \
-                 implemented capabilities are {}",
-                capability.as_str(),
-                describe(IMPLEMENTED),
-            ));
+        if !implemented.contains(capability) {
+            return Err(unavailable_capability(id, *capability, implemented));
         }
     }
 
@@ -914,6 +964,7 @@ const EXTRACT: &str = r"
             severity: c.severity ?? {},
             timeouts: c.timeouts ?? {},
             suppressions: c.suppressions ?? {},
+            types: c.types ?? {},
             rules: rules.map((r) => ({
                 id: r?.id ?? null,
                 language: r?.language ?? null,
@@ -1203,22 +1254,25 @@ fn build(
     // phase it was meant to govern had already finished. A component whose `configure` overran
     // failed with a message ending "raise it with `--timeout`", and raising it changed nothing.
     // Resolving it before `describe_components` is what makes one number govern both phases.
-    let mut limits = Limits::default();
-    if let Some(ms) = raw.timeouts.rule {
-        limits = limits.with_rule_timeout(Duration::from_millis(ms));
-    }
-    if let Some(ms) = raw.timeouts.global {
-        limits = limits.with_global_timeout(Duration::from_millis(ms));
-    }
-    if let Some(global) = options.global_timeout {
-        limits = limits.with_global_timeout(global);
-    }
+    let limits = parse_timeouts(&raw.timeouts, options.global_timeout, display)?;
 
     // The suppression policy, validated once here — the single construction point both
     // config formats converge on, which is what makes a `suppressions` block written in
     // either format behave identically. Reached by `hash_config` below, because anything a
     // config can say has to reach one of the two hashes on purpose (`AGENTS.md`).
     let suppressions = parse_suppressions(&raw.suppressions, display)?;
+
+    // The `types` block, validated once here — the single construction point both config
+    // formats converge on, which is what makes a block written in either format behave
+    // identically. Folded into `hash_config` below, because `AGENTS.md` requires anything a
+    // config can say to reach one of the two hashes on purpose.
+    let types = parse_types(&raw.types, display)?;
+
+    // Config load asks the capability gate with `provider_ok: true`: it cannot know whether a
+    // `tsc` provider will start, so it refuses only a capability no build could honor at all.
+    // `Engine::prepare` asks `lanekeep_config::implemented` again, with the real answer, once
+    // the provider has been built.
+    let implemented_capabilities = implemented(&types, true);
 
     // Every component in the config, asked what it is. Once, here, before a `RuleSpec` exists
     // — not per worker: instantiation is 82 to 96 times the cost of not instantiating, which
@@ -1248,6 +1302,7 @@ fn build(
                         &overrides,
                         &declared,
                         Some(rule.component),
+                        &implemented_capabilities,
                     )?);
                 }
             }
@@ -1258,6 +1313,7 @@ fn build(
                 &overrides,
                 &declared,
                 None,
+                &implemented_capabilities,
             )?),
         }
     }
@@ -1295,6 +1351,7 @@ fn build(
         &limits,
         resolved,
         &suppressions,
+        &types,
     );
 
     Ok(Config {
@@ -1303,6 +1360,7 @@ fn build(
         rules,
         limits,
         suppressions,
+        types,
         ruleset_hash,
         config_hash,
     })
@@ -1349,6 +1407,98 @@ fn parse_suppressions(
         max_expiry_days: raw.max_expiry_days,
         forbid_file_scope: raw.forbid_file_scope,
     })
+}
+
+/// Validate the `types` block into the configuration the engine reads.
+///
+/// The `timeouts` block as [`Limits`], with `--timeout` applied over it.
+///
+/// A function rather than a block inside `build`, on `parse_types`' and `parse_suppressions`'
+/// terms: it is the single place both config formats converge on for these three numbers, so a
+/// value refused here is refused in both.
+///
+/// `global_timeout` is `--timeout`, applied last because a flag a user typed on this run is a
+/// more specific statement than a file that applies to every run.
+///
+/// # Errors
+///
+/// [`ConfigError::Shape`] for a zero analysis budget.
+fn parse_timeouts(
+    raw: &RawTimeouts,
+    global_timeout: Option<Duration>,
+    display: &str,
+) -> Result<Limits, ConfigError> {
+    let mut limits = Limits::default();
+    if let Some(ms) = raw.rule {
+        limits = limits.with_rule_timeout(Duration::from_millis(ms));
+    }
+    if let Some(ms) = raw.global {
+        limits = limits.with_global_timeout(Duration::from_millis(ms));
+    }
+    if let Some(ms) = raw.analysis {
+        // Refused rather than accepted and applied, on exactly `--timeout 0`'s reasoning: a
+        // zero budget is spent before the sidecar has started, so every `tsc` run under it
+        // fails with a message about analysis taking too long. A user who wrote it meant
+        // something, and neither honoring it nor ignoring it is that something.
+        if ms == 0 {
+            return Err(ConfigError::Shape {
+                path: display.to_owned(),
+                detail: "in `timeouts`: `analysis` must be greater than zero — a zero budget \
+                         is spent before the type provider has started"
+                    .to_owned(),
+            });
+        }
+        limits = limits.with_analysis_timeout(Duration::from_millis(ms));
+    }
+    if let Some(global) = global_timeout {
+        limits = limits.with_global_timeout(global);
+    }
+    Ok(limits)
+}
+
+/// A single place, reached by both config formats through `build` — the one function every
+/// `Config` is constructed by.
+///
+/// # Errors
+///
+/// [`ConfigError::Shape`] for an unknown provider or an empty command.
+fn parse_types(raw: &RawTypes, display: &str) -> Result<TypesConfig, ConfigError> {
+    let mut config = TypesConfig::default();
+
+    if let Some(name) = &raw.provider {
+        config.provider = TypesProvider::parse(name).ok_or_else(|| ConfigError::Shape {
+            path: display.to_owned(),
+            detail: format!(
+                "in `types`: unknown provider `{name}` — valid providers are {}",
+                TypesProvider::all()
+                    .iter()
+                    .map(|p| format!("`{}`", p.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })?;
+    }
+
+    if let Some(command) = &raw.command {
+        // Refused rather than defaulted. An empty `command` has nothing to spawn, and filling
+        // in `node` would be a config that says one thing and does another — the same shape as
+        // the `--timeout` bug `AGENTS.md` records, where a value was validated and then
+        // dropped. The alternative failure is an index panic in the provider, three layers
+        // from the line that is wrong.
+        if command.is_empty() {
+            return Err(ConfigError::Shape {
+                path: display.to_owned(),
+                detail: "in `types`: `command` is empty — there is nothing to spawn".to_owned(),
+            });
+        }
+        config.command.clone_from(command);
+    }
+
+    if let Some(typescript) = &raw.typescript {
+        config.typescript.clone_from(typescript);
+    }
+
+    Ok(config)
 }
 
 /// Ask every component the config names which rules it hosts, and what each of them is.
@@ -2278,6 +2428,7 @@ fn build_rule(
     overrides: &BTreeMap<RuleId, Severity>,
     declared: &BTreeSet<String>,
     component: Option<ComponentRule>,
+    implemented: &[Capability],
 ) -> Result<RuleSpec, ConfigError> {
     let fail = |detail: String| ConfigError::Rule {
         position,
@@ -2326,7 +2477,7 @@ fn build_rule(
     // that coherent-shape proof, before the card and the query, because this is about whether
     // the rule can run at all rather than about whether it is well written.
     let has_flow = raw.flow.is_some();
-    let requires = check_requires(raw.requires.as_ref(), &id).map_err(fail)?;
+    let requires = check_requires(raw.requires.as_ref(), &id, implemented).map_err(fail)?;
     let declares_dataflow = requires.contains(&Capability::Dataflow);
 
     // Flow pairing: `flow` ⟺ `checkFlow`, and either one requires `dataflow`. Obligation is
@@ -2707,6 +2858,11 @@ fn length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 /// so writing the same entries in a different order hashes the same, and the budgets are
 /// hashed as numbers rather than as whatever the user typed.
 ///
+/// `types` and the analysis budget are inputs here too, for the reason `resolved` is: a
+/// provider switched from `builtin` to `tsc`, a different TypeScript package, or a different
+/// analysis budget changes the answers a run gives, and a value a config can say that reaches
+/// no hash lets a warm run keep answering the previous configuration.
+///
 /// `resolved` is a JSON config's rule references and their options, and is empty for a
 /// TypeScript one — where the same information lives inside the config module's own source
 /// and reaches the key through `ruleset_hash` instead. `docs/architecture.md` §8.1 lists
@@ -2723,6 +2879,7 @@ fn hash_config(
     limits: &Limits,
     resolved: &[ResolvedRule],
     suppressions: &SuppressionPolicy,
+    types: &TypesConfig,
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-config-v1");
@@ -2754,6 +2911,7 @@ fn hash_config(
     for value in [
         limits.rule_timeout.as_millis(),
         limits.global_timeout.as_millis(),
+        limits.analysis_timeout.as_millis(),
         limits.memory_bytes as u128,
     ] {
         hasher.update(&value.to_le_bytes());
@@ -2775,6 +2933,12 @@ fn hash_config(
         }
     }
     hasher.update(&[u8::from(suppressions.forbid_file_scope)]);
+
+    // The type provider, folded as the structured data it is. `canonical_bytes` is already
+    // length-prefixed per field, so one `update` here is enough — the framing is inside the
+    // value rather than around it, unlike the fields above.
+    hasher.update(b"types");
+    hasher.update(&types.canonical_bytes());
 
     // In the order written, which over-invalidates on a reordering that changes nothing —
     // rules are sorted by ID before they are reported, so their position is not an input to
@@ -4292,6 +4456,7 @@ mod tests {
             &BTreeMap::new(),
             &declared,
             Some(described.component),
+            Capability::all(),
         )
         .expect_err("a component that can never run must not load");
 
@@ -4542,6 +4707,7 @@ mod tests {
             &BTreeMap::new(),
             &declared,
             Some(described.component),
+            Capability::all(),
         )
         .expect_err("a language with no query of its own must not load");
 
@@ -4605,6 +4771,7 @@ mod tests {
             &BTreeMap::new(),
             &declared,
             Some(described.component),
+            Capability::all(),
         )
         .expect_err("a query for a language the rule does not target must not load");
 
@@ -5582,6 +5749,75 @@ mod tests {
         );
     }
 
+    /// Every other axis in this section calls `hash_config` through a `Fixture`, which is
+    /// right for a property that a config's *text* has to reach. `types` and the analysis
+    /// budget are exercised directly instead, against `hash_config` itself, because the
+    /// fixture-level pair below (`the_config_hash_changes_with_the_types_provider` and its
+    /// `_for_json` partner) already proves both formats' text reaches `build`'s `types` — what
+    /// these three prove is that `hash_config`'s own fold moves for each axis, which a fixture
+    /// test cannot isolate from every other input `build` also feeds it.
+    fn hash_with_types(types: &TypesConfig) -> Hash {
+        hash_config(
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &Limits::default(),
+            &[],
+            &SuppressionPolicy::default(),
+            types,
+        )
+    }
+
+    fn hash_with_limits(limits: &Limits) -> Hash {
+        hash_config(
+            &[],
+            &[],
+            &BTreeMap::new(),
+            limits,
+            &[],
+            &SuppressionPolicy::default(),
+            &TypesConfig::default(),
+        )
+    }
+
+    #[test]
+    fn changing_the_types_provider_changes_the_config_hash() {
+        let builtin = hash_with_types(&TypesConfig::default());
+        let tsc = hash_with_types(&TypesConfig {
+            provider: TypesProvider::Tsc,
+            ..TypesConfig::default()
+        });
+        assert_ne!(hex(&builtin), hex(&tsc));
+    }
+
+    #[test]
+    fn changing_the_typescript_package_changes_the_config_hash() {
+        // The path is what decides which compiler answers, so two projects pointing at two
+        // different `typescript` installs must not share one key even at the same version —
+        // the version is a *provider identity* term and this is a *config* term, and only
+        // this one moves before the sidecar has been spoken to.
+        let base = TypesConfig {
+            provider: TypesProvider::Tsc,
+            ..TypesConfig::default()
+        };
+        let moved = TypesConfig {
+            typescript: "./vendor/typescript".to_owned(),
+            ..base.clone()
+        };
+        assert_ne!(hex(&hash_with_types(&base)), hex(&hash_with_types(&moved)));
+    }
+
+    #[test]
+    fn changing_the_analysis_budget_changes_the_config_hash() {
+        // A budget is a cache-key input for the reason every timeout is: a run that aborts
+        // under one budget and completes under another produced two different results from
+        // one input, and serving the first for the second is the failure §8.1 exists against.
+        let default = hash_with_limits(&Limits::default());
+        let tighter =
+            hash_with_limits(&Limits::default().with_analysis_timeout(Duration::from_secs(5)));
+        assert_ne!(hex(&default), hex(&tighter));
+    }
+
     #[test]
     fn the_config_hash_ignores_glob_order() {
         // Include and exclude are order-insensitive in effect, so reordering them must not
@@ -5704,6 +5940,35 @@ mod tests {
         );
     }
 
+    /// The `.ts` half of the `types.provider`-moves-`config_hash` matched pair.
+    ///
+    /// Its partner is `the_config_hash_changes_with_the_types_provider_for_json`. The three
+    /// `hash_with_types`/`hash_with_limits` tests above prove `hash_config`'s own folds move;
+    /// they call it directly and prove nothing about whether either format's loader actually
+    /// reaches it with the `types` `build` validated. Only a fixture through each format's own
+    /// loader proves that, which is why the pairing exists (`AGENTS.md`'s matched-pair rule).
+    #[test]
+    fn the_config_hash_changes_with_the_types_provider() {
+        let fixture = Fixture::new(
+            "types-provider-hash-ts",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let before = fixture.load_config().expect("loads");
+        fixture.write_all(&[(
+            "lanekeep.config.ts",
+            &config_with("rules: [rule], types: { provider: 'tsc' }"),
+        )]);
+        let after = fixture.load_config().expect("loads");
+        assert_ne!(
+            hex(&before.config_hash),
+            hex(&after.config_hash),
+            "switching the type provider must invalidate"
+        );
+    }
+
     #[test]
     fn the_suppression_policy_is_read_from_a_typescript_config() {
         let fixture = Fixture::new(
@@ -5748,6 +6013,199 @@ mod tests {
             .load_config()
             .expect_err("a zero horizon is refused");
         assert!(format!("{error}").contains("maxExpiryDays"), "{error}");
+    }
+
+    /// The `.ts` half of the `types`-block matched pair.
+    ///
+    /// Its partner is `a_json_config_delivers_the_types_block`, and the two are a pair rather
+    /// than a duplicate: `json.rs`'s exhaustive literal is a compile-time guard, and `EXTRACT`
+    /// is a JavaScript string with no guard at all, so a field added to `RawConfig` and not to
+    /// `EXTRACT` compiles and silently carries nothing. Single-format coverage of a property
+    /// both formats have to satisfy is not coverage of the property; delete either half and
+    /// the pairing is gone.
+    #[test]
+    fn a_typescript_config_delivers_the_types_block() {
+        let fixture = Fixture::new(
+            "types-block-ts",
+            &[(
+                "lanekeep.config.ts",
+                "import { defineConfig } from 'lanekeep';\n\
+                 export default defineConfig({\n\
+                   include: ['src/**'],\n\
+                   types: { provider: 'tsc', command: ['node', '--no-warnings'], \
+                            typescript: './vendor/typescript' },\n\
+                   timeouts: { analysis: 1234 },\n\
+                   rules: [],\n\
+                 });\n",
+            )],
+        );
+        let loaded = fixture.load_config().expect("loads");
+        assert_eq!(loaded.types.provider, TypesProvider::Tsc);
+        assert_eq!(loaded.types.command, ["node", "--no-warnings"]);
+        assert_eq!(loaded.types.typescript, "./vendor/typescript");
+        assert_eq!(loaded.limits.analysis_timeout, Duration::from_millis(1234));
+    }
+
+    /// The `.json` half of the `types`-block matched pair. See its partner above.
+    #[test]
+    fn a_json_config_delivers_the_types_block() {
+        let fixture = Fixture::new(
+            "types-block-json",
+            &[(
+                "lanekeep.json",
+                r#"{
+                     "include": ["src/**"],
+                     "types": {"provider": "tsc", "command": ["node", "--no-warnings"],
+                               "typescript": "./vendor/typescript"},
+                     "timeouts": {"analysis": 1234},
+                     "rules": []
+                   }"#,
+            )],
+        );
+        let loaded = fixture.load_json().expect("loads");
+        assert_eq!(loaded.types.provider, TypesProvider::Tsc);
+        assert_eq!(loaded.types.command, ["node", "--no-warnings"]);
+        assert_eq!(loaded.types.typescript, "./vendor/typescript");
+        assert_eq!(loaded.limits.analysis_timeout, Duration::from_millis(1234));
+    }
+
+    /// A misspelled key inside `types` is refused, naming it.
+    ///
+    /// Accepted and ignored is the worst of the three outcomes: a project believing it had
+    /// pointed lanekeep at a compiler runs against `./node_modules/typescript` instead, and the
+    /// only symptom is answers from a package nobody chose. `JsonConfig` and the JSON schema
+    /// both already refuse an unknown key at the top level; this is the block that did not.
+    #[test]
+    fn an_unknown_key_in_the_types_block_is_refused() {
+        let fixture = Fixture::new(
+            "types-unknown-key",
+            &[(
+                "lanekeep.json",
+                r#"{"include": ["src/**"],
+                   "types": {"provider": "tsc", "typescriptt": "./vendor/typescript"},
+                   "rules": []}"#,
+            )],
+        );
+        let error = fixture
+            .load_json()
+            .expect_err("`typescriptt` is not a field of `types`");
+        assert!(format!("{error}").contains("typescriptt"), "{error}");
+    }
+
+    /// The `.ts` half of the unknown-key pair. See its partner above.
+    ///
+    /// The pairing is the point, on the `types`-block pair's own reasoning: the two formats
+    /// reach `RawTypes` by different routes — JSON straight through `serde`, `.ts` through
+    /// `EXTRACT`'s `types: c.types ?? {}` — and single-format coverage of a property both have
+    /// to satisfy is not coverage of the property. An `EXTRACT` that ever picked the `types`
+    /// keys apart instead of passing the object through would accept `typescriptt` silently,
+    /// with the JSON half of this pair still green.
+    #[test]
+    fn an_unknown_key_in_the_types_block_of_a_typescript_config_is_refused() {
+        let fixture = Fixture::new(
+            "types-unknown-key-ts",
+            &[(
+                "lanekeep.config.ts",
+                "import { defineConfig } from 'lanekeep';\n\
+                 export default defineConfig({\n\
+                   include: ['src/**'],\n\
+                   types: { provider: 'tsc', typescriptt: './vendor/typescript' },\n\
+                   rules: [],\n\
+                 });\n",
+            )],
+        );
+        let error = fixture
+            .load_config()
+            .expect_err("`typescriptt` is not a field of `types`");
+        assert!(format!("{error}").contains("typescriptt"), "{error}");
+    }
+
+    /// The same for `timeouts`, which had the identical hole.
+    #[test]
+    fn an_unknown_key_in_the_timeouts_block_is_refused() {
+        let fixture = Fixture::new(
+            "timeouts-unknown-key",
+            &[(
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "timeouts": {"analysiss": 5}, "rules": []}"#,
+            )],
+        );
+        let error = fixture
+            .load_json()
+            .expect_err("`analysiss` is not a field of `timeouts`");
+        assert!(format!("{error}").contains("analysiss"), "{error}");
+    }
+
+    /// A zero analysis budget is refused at load, the way `--timeout 0` is.
+    ///
+    /// Applied, it is spent before the sidecar has finished starting, so every `tsc` run under
+    /// it dies with a message about analysis being too slow — a diagnostic about the symptom,
+    /// three layers from the line that is wrong.
+    #[test]
+    fn a_zero_analysis_budget_is_refused() {
+        let fixture = Fixture::new(
+            "analysis-zero",
+            &[(
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "timeouts": {"analysis": 0}, "rules": []}"#,
+            )],
+        );
+        let error = fixture.load_json().expect_err("a zero budget is refused");
+        let rendered = format!("{error}");
+        assert!(rendered.contains("analysis"), "{rendered}");
+        assert!(rendered.contains("greater than zero"), "{rendered}");
+    }
+
+    #[test]
+    fn an_omitted_types_block_is_the_builtin_provider() {
+        let fixture = Fixture::new(
+            "types-default",
+            &[("lanekeep.json", r#"{"include": ["src/**"], "rules": []}"#)],
+        );
+        let loaded = fixture.load_json().expect("loads");
+        assert_eq!(loaded.types, TypesConfig::default());
+        assert_eq!(
+            loaded.limits.analysis_timeout,
+            lanekeep_core::limits::DEFAULT_ANALYSIS_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn an_unknown_provider_names_the_ones_there_are() {
+        let fixture = Fixture::new(
+            "types-unknown",
+            &[(
+                "lanekeep.json",
+                r#"{"types": {"provider": "tsserver"}, "rules": []}"#,
+            )],
+        );
+        let error = fixture
+            .load_json()
+            .expect_err("tsserver is not a known provider");
+        let error = format!("{error}");
+        assert!(error.contains("tsserver"), "got: {error}");
+        assert!(
+            error.contains("`builtin`") && error.contains("`tsc`"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_command_is_refused_rather_than_defaulted() {
+        // A `command: []` has nothing to spawn. Filling in `node` for it would be a config
+        // that says one thing and does another; the alternative failure is `command[0]`
+        // panicking in the provider, three layers away from the line that is wrong.
+        let fixture = Fixture::new(
+            "types-empty-command",
+            &[(
+                "lanekeep.json",
+                r#"{"types": {"command": []}, "rules": []}"#,
+            )],
+        );
+        let error = fixture
+            .load_json()
+            .expect_err("an empty command has nothing to spawn");
+        assert!(format!("{error}").contains("`command`"), "got: {error}");
     }
 
     /// A rule declaring `requires`, spelled the way an author writes it.
@@ -6225,6 +6683,70 @@ mod tests {
         );
         let config = fixture.load_config().expect("loads");
         assert!(config.rules[0].requires.is_empty());
+    }
+
+    #[test]
+    fn types_are_implemented_under_the_builtin_provider_whatever_node_is_doing() {
+        // There is always an oracle under `builtin` — that is the whole point of it — so
+        // `provider_ok` cannot subtract a capability it does not gate.
+        let builtin = TypesConfig::default();
+        assert!(implemented(&builtin, false).contains(&Capability::Types));
+        assert!(implemented(&builtin, true).contains(&Capability::Types));
+    }
+
+    #[test]
+    fn types_are_unimplemented_under_a_tsc_provider_that_did_not_start() {
+        let tsc = TypesConfig {
+            provider: TypesProvider::Tsc,
+            ..TypesConfig::default()
+        };
+        assert!(!implemented(&tsc, false).contains(&Capability::Types));
+        assert!(implemented(&tsc, true).contains(&Capability::Types));
+        // Dataflow is not gated by any of this and must survive both.
+        assert!(implemented(&tsc, false).contains(&Capability::Dataflow));
+    }
+
+    #[test]
+    fn the_refusal_names_the_rule_and_what_is_left() {
+        let id: RuleId = "acme/typed".parse().expect("a valid id");
+        let message = unavailable_capability(&id, Capability::Types, &[Capability::Dataflow]);
+        assert!(message.contains("`acme/typed`"), "got: {message}");
+        assert!(message.contains("`types`"), "got: {message}");
+        assert!(message.contains("`dataflow`"), "got: {message}");
+    }
+
+    #[test]
+    fn check_requires_speaks_through_the_shared_message() {
+        // The two gates must not word one refusal two ways. Asserting equality rather than
+        // both containing some substring is what makes that true rather than likely.
+        let id: RuleId = "acme/typed".parse().expect("a valid id");
+        let error = check_requires(
+            Some(&serde_json::json!(["types"])),
+            &id,
+            &[Capability::Dataflow],
+        )
+        .expect_err("types is not implemented here");
+        assert_eq!(
+            error,
+            unavailable_capability(&id, Capability::Types, &[Capability::Dataflow])
+        );
+    }
+
+    #[test]
+    fn check_requires_walks_every_entry_whatever_the_order() {
+        // The loop above must reach an unimplemented entry wherever it sits in the list — a
+        // walk that stopped at the first implemented one would let `['dataflow', 'types']`
+        // through while refusing `['types', 'dataflow']`.
+        let id: RuleId = "acme/typed".parse().expect("a valid id");
+        for list in [["types", "dataflow"], ["dataflow", "types"]] {
+            let error =
+                check_requires(Some(&serde_json::json!(list)), &id, &[Capability::Dataflow])
+                    .expect_err("types is not implemented here, wherever it is listed");
+            assert_eq!(
+                error,
+                unavailable_capability(&id, Capability::Types, &[Capability::Dataflow])
+            );
+        }
     }
 
     /// A card valid enough to load, for the flow tests below — none of them are testing the
@@ -6873,6 +7395,30 @@ mod tests {
             "changing maxExpiryDays must invalidate"
         );
         assert_eq!(hex(&before.ruleset_hash), hex(&after.ruleset_hash));
+    }
+
+    /// The `.json` half of the `types.provider`-moves-`config_hash` matched pair. See its
+    /// partner, `the_config_hash_changes_with_the_types_provider`, above.
+    #[test]
+    fn the_config_hash_changes_with_the_types_provider_for_json() {
+        let fixture = Fixture::new(
+            "types-provider-hash-json",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+        let before = fixture.load_json().expect("loads");
+        fixture.write_all(&[(
+            "lanekeep.json",
+            r#"{"rules": ["./rule"], "types": {"provider": "tsc"}}"#,
+        )]);
+        let after = fixture.load_json().expect("loads");
+        assert_ne!(
+            hex(&before.config_hash),
+            hex(&after.config_hash),
+            "switching the type provider must invalidate"
+        );
     }
 
     #[test]

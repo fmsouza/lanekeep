@@ -24,6 +24,22 @@
 //! The two test files in `lanekeep-wasm/tests/` that read an environment variable to locate a
 //! probe artifact (`python_determinism.rs`, `fixture_currency.rs`) are also in `allow`.
 //!
+//! `crates/lanekeep-types/` came into `scope` with the `tsc` provider, and brought four entries
+//! with it. Three are scaffolding rather than engine: `benches/construction.rs` measures the
+//! oracle, `tests/provider.rs` times a sidecar that has to spend real time for a wall-clock
+//! budget to be testable at all, and `build.rs` reads `CARGO_MANIFEST_DIR` at *compile* time to
+//! digest `src/` — that digest is itself a cache-key input, computed before any run exists.
+//!
+//! The fourth is `src/tsc/tests.rs`, and the file it names is the point. This rule has no test
+//! exemption (`no-ambient-authority` has one and this one does not) and `allow` is per file, so
+//! while the `tsc` provider's tests lived in a `#[cfg(test)] mod tests` inside `src/tsc/mod.rs`
+//! the whole of that file had to be exempt — and a clock read added to the *provider's* own
+//! code would not have been reported. The tests are a file of their own now, so the exemption
+//! covers exactly the two reads that earn it: timing a spawn that was told to be slow, and
+//! timing four threads queued behind one sidecar. `src/tsc/mod.rs` is held to the rule like
+//! everything else, which is what the provider reading no clock at all now rests on rather
+//! than on a reviewer.
+//!
 //! Anything else reading the clock is an input the cache key does not have.
 //!
 //! # A port, and a meaning that shifted with it

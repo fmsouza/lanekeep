@@ -49,11 +49,39 @@ pub struct Symbol {
     /// The name as it appears at the use site the oracle read, not at the declaration.
     ///
     /// For a renamed import — `import { Decimal as Money }` — this is the local alias
-    /// `Money`, never the exported name `Decimal`. A caller comparing this field against an
-    /// expected export name therefore rejects a renamed import of the very type it wants,
-    /// which is the false positive `lanekeep/no-restricted-types` avoids by matching
-    /// `module` alone rather than `name` too.
+    /// `Money`. It stays the use-site spelling because it is what a message should quote: the
+    /// reader has `Money` in front of them, and a violation naming `Decimal` would send them
+    /// looking for text that is not in their file. [`Symbol::exported`] is the field to
+    /// compare against an expected export name.
     pub name: String,
+    /// The name the module exports this under, when it was imported.
+    ///
+    /// | Binding | `exported` |
+    /// | --- | --- |
+    /// | `import { a } from 'm'`, `import { a as b } from 'm'`, `m`'s declaration file unreadable | `Some("a")` |
+    /// | `import { a } from 'm'`, `import { a as b } from 'm'`, `m`'s declaration file readable | the name that file declares |
+    /// | `import d from 'm'`, `m`'s declaration file unreadable | `Some("default")` |
+    /// | `import d from 'm'`, `m`'s declaration file readable | the name that file declares |
+    /// | `import * as ns from 'm'` | `None` |
+    /// | a local declaration | `None` |
+    ///
+    /// **Copied even when nothing was renamed**, rather than `None` standing for "same as
+    /// `name`". The consumer is a comparison against a required export name, and under a
+    /// `None`-when-unrenamed contract a caller who forgot the `?? name` fallback would
+    /// silently accept every plain import — the most ordinary spelling there is, and a
+    /// failure that only ever *removes* reports, so nothing about the output would look
+    /// wrong. A copy costs one `String` per symbol and cannot fail that way.
+    ///
+    /// A namespace import binds the module object, which no single export names, so it is
+    /// `None` rather than a `"*"` sentinel: a sentinel is a string a comparison can match,
+    /// and there is nothing here for a name comparison to be right about.
+    ///
+    /// `Binding::is_import_of`, the predicate behind `ctx.resolvesToImport`, does spell a
+    /// namespace import `"*"`, and the two do not conflict: there `"*"` is what a rule
+    /// *writes* to ask for the namespace form, a query vocabulary; here the value is an
+    /// *answer* a rule compares against, and an answer of `"*"` would satisfy any comparison
+    /// that happened to write it.
+    pub exported: Option<String>,
     /// The module it was imported from, when it was imported. `None` for a local
     /// declaration, which is what distinguishes an imported `Decimal` from a local class
     /// that happens to share the name.
