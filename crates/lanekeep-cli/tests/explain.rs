@@ -92,6 +92,7 @@ fn explain_says_when_a_rule_reads_the_whole_corpus() {
     let output = project.run(&["explain", "lanekeep/no-unused-exports"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("whole corpus"), "{stdout}");
+    assert!(stdout.contains("--file"), "{stdout}");
 
     let other = project.run(&["explain", "lanekeep/no-default-export"]);
     assert!(

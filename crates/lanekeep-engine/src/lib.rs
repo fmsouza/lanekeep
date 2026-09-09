@@ -1686,6 +1686,15 @@ impl Engine {
         self.discovery.walk()
     }
 
+    /// Discovery itself, for a caller that must explain a selection's rejection.
+    ///
+    /// `discover()` answers what is selected; this answers *why* something is not, via
+    /// `Discovery::rejects`.
+    #[must_use]
+    pub fn discovery(&self) -> &Discovery {
+        &self.discovery
+    }
+
     /// How many rules will actually run. Rules set to `off` are dropped at preparation.
     #[must_use]
     pub fn rule_count(&self) -> usize {
@@ -1713,7 +1722,7 @@ impl Engine {
         self.run_files(&files, Coverage::Whole)
     }
 
-    /// Run over an explicit file list, for `--since` and `--staged`.
+    /// Run over an explicit file list, for `--since`, `--staged` and `--file`.
     ///
     /// # Errors
     ///
@@ -9101,15 +9110,22 @@ export default defineRule({
         #[test]
         fn a_budget_nothing_charged_does_not_cancel_the_run() {
             // The control, and the half that fails against a wall clock: this run takes far
-            // longer than its one-millisecond budget in real time — a sandbox is built, two
-            // files are read, parsed and matched — and spends none of it on analysis.
+            // longer than its budget in real time — a sandbox is built, two files are read,
+            // parsed and matched — and spends none of it on analysis. The budget is two
+            // hundred milliseconds rather than the smallest value the config accepts because
+            // a charge is a measured span, and measuring has its own cost: on loaded runners
+            // the guard around a zero-spend call has itself measured 8–11 ms (windows-latest
+            // CI, 2026-09-09 — twice on main's cc38adc, once on #240), which a one-millisecond
+            // budget turns into a false breach. Two hundred milliseconds stays far below the
+            // run's real time, so a run that charged anything real — its whole wall clock,
+            // seconds — still breaches.
             let project = Project::new(
                 "analysis-budget-unspent",
                 &[
                     ("rule.ts", DEBUGGER_RULE),
                     (
                         "lanekeep.config.ts",
-                        &config(", types: { provider: 'tsc' }, timeouts: { analysis: 1 }"),
+                        &config(", types: { provider: 'tsc' }, timeouts: { analysis: 200 }"),
                     ),
                     ("src/a.ts", "export function a() {\n  debugger;\n}\n"),
                     ("src/b.ts", "export function b() {\n  debugger;\n}\n"),

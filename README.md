@@ -89,6 +89,7 @@ actual rule.
 lanekeep check                  # the whole project
 lanekeep check --staged         # only what is about to be committed
 lanekeep check --since main     # only what changed against a ref
+lanekeep check --file src/a.ts  # exactly these files, repeatable, no git involved
 lanekeep check --watch          # re-check on every change, until Ctrl-C
 lanekeep check --fix            # apply the safe fixes, report what is left
 lanekeep check --profile        # per rule: where the time went, and what it looked at
