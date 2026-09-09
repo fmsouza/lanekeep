@@ -9,8 +9,9 @@
 [workspace]
 # One version across every crate. They are released together and only make sense together —
 # `lanekeep-cli` 0.2 against `lanekeep-core` 0.1 is a combination nobody wants to support.
-# `version.workspace = true` in each manifest is what enforces that; this file only has to
-# avoid working against it.
+# `version.workspace = true` in each manifest makes them *share* a version; the `version_group`
+# on every `[[package]]` at the end of this file makes release-plz *plan* one. Both are needed,
+# and the comment above those stanzas says what happens with only the first.
 dependencies_update = false
 publish = false
 semver_check = true
@@ -37,7 +38,7 @@ semver_check = true
 #
 # `git_only = true` also fixes the lag, by reading versions from tags instead of the registry,
 # and is the wrong fix here: only `lanekeep-cli` is tagged, deliberately — see the tag section
-# below — so the other fourteen crates would have no tag to read and release-plz would treat
+# below — so the other crates would have no tag to read and release-plz would treat
 # them as never released.
 #
 # The types left out are the ones this project already says are not worth a changelog entry.
@@ -105,15 +106,14 @@ commit_parsers = [
 # The binary is what users install, so its release is the one the whole workspace rides on.
 # Every other crate ships as part of it rather than announcing its own.
 #
-# The nineteen without tags are still tracked: release-plz works out a crate's previous
-# version from the registry rather than from a tag, and nineteen of the twenty are on
-# crates.io. `lanekeep-types` is the twentieth and is not, having been added since the last
-# release — which is not a special case to handle but the ordinary one for a new crate: with
-# no version on the registry to compare against, release-plz treats it as new and publishes
-# it with the rest. This sentence is the thing that goes stale, so it is worth rereading
-# after the first release that carries it.
+# The crates without tags are still tracked: release-plz works out a crate's previous version
+# from the registry rather than from a tag, and every publishable crate is on crates.io. A
+# crate added between releases is not a special case to handle but the ordinary one: with no
+# version on the registry to compare against, release-plz treats it as new and publishes it
+# with the rest — `lanekeep-types` arrived that way in v0.9.0.
 [[package]]
 name = "lanekeep-cli"
+version_group = "lanekeep"
 # The tag still comes from here; the GitHub release deliberately does not. Releases are
 # immutable: the asset list freezes the moment a release is published, so one created here —
 # at tag time, before any binary exists — can never receive the archives, and `release.yml`'s
@@ -169,4 +169,101 @@ changelog_include = [
 # crate keeps it.
 [[package]]
 name = "lanekeep-rules"
+version_group = "lanekeep"
 semver_check = false
+
+# Every publishable crate in one version group, so release-plz plans a single version for the
+# workspace rather than one per crate.
+#
+# release-plz plans per package: a `feat` in `lanekeep-core` makes it 0.10.0, a crate that
+# depends on a bumped crate gets a patch, and a crate with neither — no commit matching
+# `release_commits`, no changed dependency — is left out of the update. A shared version does
+# not change that: `[workspace.package] version` is raised to the highest plan and every crate
+# inherits it, but a `[workspace.dependencies]` line is rewritten only for a crate *in* the
+# update. The crates left out then sit at 0.10.0 behind a `^0.9.0` requirement, and the
+# `cargo update --workspace` release-plz runs last refuses the manifest:
+#
+#   failed to select a version for the requirement `lanekeep-lang-js = "^0.9.0"`
+#   candidate versions found which didn't match: 0.10.0
+#
+# That is what failed the first two runs after v0.9.0: at cc38adc fourteen crates were left
+# out and it tripped on `lanekeep-core`, at 92d1964 six and it tripped on `lanekeep-lang-js` —
+# whichever crates that window had not touched. v0.9.0 itself got through only because every
+# crate happened to be in the update that time.
+#
+# With a group, membership is the condition rather than luck: once any member has a releasing
+# commit, every member is planned, and a member inheriting the workspace version is planned at
+# the workspace version. So the group has to name *every* publishable crate, and
+# `scripts/test-release-config.sh` compares it against `cargo metadata` so that a crate added
+# later cannot be left out.
+[[package]]
+name = "lanekeep-cache"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-config"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-core"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-engine"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-js"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-lang"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-lang-go"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-lang-js"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-lang-python"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-lang-rust"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-languages"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-nodes"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-query"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-report"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-server"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-testkit"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-types"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-wasm"
+version_group = "lanekeep"

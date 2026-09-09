@@ -198,7 +198,66 @@ if unknown:
 
 print("; ".join(problems))
 PY
+# A block that could not run has to fail its check rather than leave an empty report behind,
+# which `check` would read as "no problems". `set -e` is not on, so the status is read here:
+# with `cargo` off `PATH`, or `cargo metadata` failing, the check used to pass green.
+status=$?
+[ "${status}" -eq 0 ] ||
+  echo "the check could not run: python3 exited ${status} (is cargo on PATH?)" >"${work}/coverage"
 check "the changelog covers every other crate" "" "$(tr -d '\r' <"${work}/coverage")"
+
+# And every publishable crate in one `version_group`, compared against `cargo metadata` for the
+# same reason. release-plz plans a version per crate, and a crate with no releasing commit and
+# no changed dependency is left out of the update: its dependency line keeps the old version
+# while `[workspace.package] version`, which it inherits, moves, and the `cargo update` that
+# release-plz runs last refuses the result. The group makes release-plz plan every member the
+# moment one has something to release. The two runs after v0.9.0 failed that way, each on
+# whichever crates that window had not touched, and a crate added later and left out of the
+# group brings it back the first time it sits still.
+python3 - "${config}" >"${work}/groups" <<'PY'
+import json
+import subprocess
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+
+metadata = subprocess.run(
+    ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+    capture_output=True,
+    text=True,
+    check=True,
+)
+members = {
+    package["name"]
+    for package in json.loads(metadata.stdout)["packages"]
+    if package.get("publish") != []
+}
+
+grouped = {
+    package["name"]: package["version_group"]
+    for package in config.get("package", [])
+    if "version_group" in package
+}
+
+problems = []
+missing = sorted(members - set(grouped))
+if missing:
+    problems.append(f"not in a version group: {', '.join(missing)}")
+groups = sorted(set(grouped.values()))
+if len(groups) > 1:
+    problems.append(f"more than one version group: {', '.join(groups)}")
+unknown = sorted(set(grouped) - members)
+if unknown:
+    problems.append(f"grouped but not a publishable crate: {', '.join(unknown)}")
+
+print("; ".join(problems))
+PY
+status=$?
+[ "${status}" -eq 0 ] ||
+  echo "the check could not run: python3 exited ${status} (is cargo on PATH?)" >"${work}/groups"
+check "every publishable crate shares one version group" "" "$(tr -d '\r' <"${work}/groups")"
 
 # And the other half: release.yml has to actually fire on that name. Both YAML spellings —
 # `tags: ["v*"]` and a block list — because which one is used is not the point.
