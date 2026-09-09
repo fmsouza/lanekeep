@@ -33,8 +33,8 @@
  * **The list is data, not prose, because a test reads it.**
  * `crates/lanekeep-wasm/tests/js_globals.rs` extracts what `sandbox.rs` withholds under QuickJS
  * and holds this array to it. Two hand-maintained lists that silently disagree is the failure
- * `crates/lanekeep-js/tests/host_types.rs` exists to prevent for the published types; this is
- * the same problem one layer down.
+ * `crates/lanekeep-js/tests/report_parity.rs` exists to prevent for this file's refusal prose;
+ * this is the same problem one layer down.
  *
  * # 2. Assembling the `ctx` a rule is written against
  *
@@ -277,9 +277,22 @@ export function buildCheckContext(ctx) {
 
     loc: (node) => ctx.loc(node),
 
-    report: (at, options) => {
+    report: (at, options, fixParam) => {
       const [message, fix] = readReportOptions(options)
-      ctx.report(at, message, fix)
+      // A fix as a third argument is the world's own spelling — `report(n, message, fix)` —
+      // which a rule author who learned the API in Rust or Go reaches for first. Honored,
+      // not truncated; and two of them is not an ambiguity a host may resolve, so the rule
+      // hears about it instead.
+      let fixToCarry = fix
+      if (fixParam !== undefined && fixParam !== null) {
+        if (fix !== undefined) {
+          throw new TypeError(
+            'ctx.report takes a fix either in the options object or as its third argument, not both',
+          )
+        }
+        fixToCarry = readReportOptions({ fix: fixParam })[1]
+      }
+      ctx.report(at, message, fixToCarry)
     },
   }
 }
@@ -311,14 +324,27 @@ export function buildReduceContext(ctx) {
         file: fact.file,
       })),
 
-    report: (at, options) => {
+    report: (at, options, fix) => {
       if (at === null || typeof at !== 'object') {
         throw new TypeError(
           'ctx.report in a reduce phase expects { file, line, column } — there is no parse ' +
             'tree here, so there are no nodes to report at',
         )
       }
-      const [message] = readReportOptions(options)
+      // The world requires a position, and the other engine refuses its absence by name —
+      // a report whose location lost a field should meet that refusal here rather than
+      // whatever the world's own import says one engine over.
+      if (
+        typeof at.file !== 'string' ||
+        typeof at.line !== 'number' ||
+        typeof at.column !== 'number'
+      ) {
+        throw new TypeError(
+          'ctx.report in a reduce phase needs `file`, `line` and `column` — ' +
+            'emit them on the fact during the per-file pass, where the node positions are still available',
+        )
+      }
+      const message = reduceReportOptions(options, fix)
       ctx.report({ file: at.file, line: at.line, column: at.column }, message)
     },
   }
@@ -343,10 +369,14 @@ export function toMatch(entries) {
 }
 
 /**
- * The `(message, fix)` pair behind `report`'s second argument.
+ * The `(message, fix)` pair behind the per-file `report`'s second argument.
  *
  * A union rather than two functions, because `ctx.report(node, 'why')` is the overwhelmingly
- * common call and should stay the short one.
+ * common call and should stay the short one. Deliberately the lenient half of this file:
+ * a present-but-non-string `message` is an ordinary miss a rule makes while sketching, and
+ * the card's message is the better answer to it — the reduce phase's read, below, is strict
+ * because `crates/lanekeep-js/src/host.rs`'s is, and the two halves of one engine differing
+ * on purpose is what that split documents.
  *
  * @param {string | {message?: string, fix?: object} | undefined} options
  * @returns {[string | undefined, object | undefined]}
@@ -375,6 +405,50 @@ export function readReportOptions(options) {
       safe: typeof fix.safe === 'boolean' ? fix.safe : undefined,
     },
   ]
+}
+
+// The refusal a supplied fix meets in a reduce report, shared by the options-object read
+// and the third-argument read — one refusal for one method, and the same words
+// `crates/lanekeep-js/src/host.rs` refuses with (`tests/report_parity.rs` holds the two
+// sides to it).
+const REDUCE_FIX_REFUSAL =
+  'ctx.report in a reduce phase cannot take a fix — there is no parse tree here, so there is no node to attach one to'
+
+/**
+ * The message a reduce report carries, from its second (and third) argument — the strict
+ * half, word for word `crates/lanekeep-js/src/host.rs`'s `reduce_report_message`.
+ *
+ * A union rather than two functions, because `ctx.report(at, 'why')` is the overwhelmingly
+ * common call and should stay the short one. Strict where the per-file read above is
+ * lenient, because the phase has no card to fall back to mid-run — the reduce handler runs
+ * after every file, and a silently dropped message would read as the card's own words.
+ * A supplied fix is refused here rather than carried, for the same reason: this phase has
+ * no parse tree, so there is no node for one to name.
+ *
+ * @param {string | {message?: string, fix?: object} | undefined} options
+ * @param {object | undefined} fix A positional fix, the world's own third argument.
+ * @returns {string | undefined}
+ */
+export function reduceReportOptions(options, fix) {
+  if (fix !== undefined && fix !== null) {
+    throw new TypeError(REDUCE_FIX_REFUSAL)
+  }
+  if (options === undefined || options === null) return undefined
+  if (typeof options === 'string') return options
+  if (typeof options !== 'object') {
+    throw new TypeError(
+      'ctx.report in a reduce phase takes a message: either a string, or { message }',
+    )
+  }
+  if (options.fix !== undefined && options.fix !== null) {
+    throw new TypeError(REDUCE_FIX_REFUSAL)
+  }
+  if (typeof options.message !== 'string') {
+    throw new TypeError(
+      'ctx.report in a reduce phase takes a message: either a string, or { message }',
+    )
+  }
+  return options.message
 }
 
 /**

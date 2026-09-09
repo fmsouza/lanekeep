@@ -8,11 +8,10 @@
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
  * The world is the single source of truth for every member the renderer emits straight from it.
- * Three members deviate from the world on purpose, and all three are QuickJS-shaped: `today` is
+ * Two members deviate from the world on purpose, and both are QuickJS-shaped: `today` is
  * omitted from `RuleContext` because QuickJS exposes it as a conditional property rather than a
- * callable, a shape this renderer cannot state honestly from the world; `facts` is added to
- * `RuleContext` because QuickJS hands a per-file rule `facts` that the world declares only on
- * `reduce-context`; and `types` is added to `RuleContext` because `ctx.types` — the bounded
+ * callable, a shape this renderer cannot state honestly from the world; and `types` is added
+ * to `RuleContext` because `ctx.types` — the bounded
  * type oracle — is QuickJS-only and has no presence in `world.wit` at all: a component rule
  * cannot declare `requires`, so there is nothing for the world to say about it. Nothing else is
  * added or omitted by hand.
@@ -136,7 +135,13 @@ export interface Gates {
   fileNotContains?: string[]
 }
 
-/** A replacement a rule offers for a violation. */
+/**
+ * A replacement a rule offers for a violation.
+ *
+ * A per-file offer alone: a fix names a node, and the reduce phase consumes facts and the
+ * file list and nothing else — there is no parse tree there for `node` to name, which is why
+ * a reduce report's options carry a message and never a fix.
+ */
 export interface Fix {
   /** The node whose text is replaced. */
   node: Node
@@ -158,6 +163,20 @@ export interface ReportOptions {
   message?: string
   /** A replacement to offer. */
   fix?: Fix
+}
+
+/** Options for a single reduce report. */
+export interface ReduceReportOptions {
+  /** Overrides the card's `message` for this one violation. */
+  message?: string
+  /**
+   * Never present. A fix replaces a node's text, and the reduce phase has no parse tree —
+   * `node` has nothing to name, and both hosts throw on a supplied fix rather than drop it.
+   * Typed `never` rather than left absent so offering one fails to compile even for an
+   * object built before the call, which a fresh literal's excess-property check alone would
+   * admit.
+   */
+  fix?: never
 }
 
 /**
@@ -381,8 +400,6 @@ export interface RuleContext {
   emitFact(fact: Fact): void
   loc(n: Node): NodeLocation | undefined
   report(at: Node, message?: string | ReportOptions): void
-  /** Facts emitted so far, optionally filtered by `kind`. */
-  facts(kind?: string): EmittedFact[]
   /**
    * The type oracle, present only for a rule that declared `requires: ['types']`.
    * Bounded by a fixed depth rather than by file: it follows an import into the
@@ -412,7 +429,8 @@ export interface ReduceLocation {
 export interface ReduceContext {
   readonly files: string[]
   facts(kind?: string): EmittedFact[]
-  report(at: ReduceLocation, message?: string | ReportOptions): void
+  /** Takes a message; a supplied `fix` throws — there is no node to attach one to. */
+  report(at: ReduceLocation, message?: string | ReduceReportOptions): void
 }
 
 /** Queries whose named captures drive the taint analysis. */

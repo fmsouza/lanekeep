@@ -148,6 +148,31 @@ const thrower = {
   },
 }
 
+/**
+ * The refusal a supplied fix meets in a reduce report, driven from inside the component.
+ *
+ * `host.js`'s strictness is otherwise verified only in Node, against the un-componentized
+ * module — and the built artifact is the thing every other claim about this file is made on.
+ * The probe reports the refusal it caught, so the assertion is about the *reason* and not
+ * merely that something threw.
+ */
+const crossFix = {
+  id: 'probe/cross-fix',
+  severity: 'warn',
+  card: card('cross-fix'),
+  query: '(program) @p',
+
+  reduce(ctx) {
+    const at = { file: ctx.files[0], line: 1, column: 1 }
+    try {
+      ctx.report(at, { fix: { node: 1, text: 'let x = 1', safe: true } })
+      ctx.report(at, 'crossfix=accepted')
+    } catch (error) {
+      ctx.report(at, `crossfix=${error instanceof Error ? error.message : String(error)}`)
+    }
+  },
+}
+
 function inner() {
   throw new Error('a rule that failed on purpose')
 }
@@ -166,4 +191,4 @@ function describe(value) {
   return `${typeof value}:${String(value)}`
 }
 
-register([reach, context, cross, thrower, order])
+register([reach, context, cross, crossFix, thrower, order])

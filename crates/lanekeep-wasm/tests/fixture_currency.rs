@@ -166,12 +166,17 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
         &[
             "wit",
             "tests/fixtures",
-            // The JavaScript fixture is bundled from these two and from its own `rule.js`,
+            // The JavaScript fixture is bundled from these and from its own `rule.js`,
             // which the walk above already covers. They are outside this crate, so their lines
             // are the only ones in the manifest spelled with a `../../` — the alternative was
-            // re-keying every other line against the repository root for the sake of two.
+            // re-keying every other line against the repository root for the sake of a few.
+            // The lockfile is here because the tool versions that build this artifact are
+            // pinned in it: `jco` (and the `componentize-js` under it) moves the bytes, and a
+            // lockfile edit without a rebuild is exactly the stale state this manifest exists
+            // to name.
             "../../packages/lanekeep/runtime/host.js",
             "../../packages/lanekeep/runtime/entry.js",
+            "../../packages/lanekeep/package-lock.json",
         ],
     );
 
@@ -209,9 +214,19 @@ fn every_committed_artifact_is_the_one_its_sources_build() {
         }
     );
 
+    // `node` and `jco` are the tools that build the one fixture here that is not a Rust
+    // component — the recipe requires both, so their presence is a fact about any rebuild
+    // context and their absence means the version comparison skips as a whole, exactly the
+    // way a missing `cargo-component` already makes it skip. The versions live in the
+    // lockfile this walk records, but the lockfile pins a *range's resolution*; these are the
+    // binaries that ran. The path is relative to the crate, because that is where a `cargo
+    // test` process stands — not to this source file, the way `include_str!` resolves.
+    let jco = "../../packages/lanekeep/node_modules/.bin/jco";
     let tools = tool_versions(&[
         ("rustc", "rustc", &["--version"][..]),
         ("cargo-component", "cargo-component", &["--version"][..]),
+        ("node", "node", &["--version"][..]),
+        ("jco", jco, &["--version"][..]),
     ])
     .unwrap_or_default();
 
