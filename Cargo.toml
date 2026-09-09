@@ -66,14 +66,14 @@ anyhow = { version = "1" }
 thiserror = { version = "2" }
 notify = { version = "8.2" }
 notify-debouncer-mini = { version = "0.7" }
-tree-sitter = { version = "0.26" }
+tree-sitter = { version = "0.27" }
 tree-sitter-typescript = { version = "0.23" }
 tree-sitter-javascript = { version = "0.25" }
 tree-sitter-python = { version = "0.25" }
 tree-sitter-go = { version = "0.25" }
 tree-sitter-rust = { version = "0.24" }
 streaming-iterator = { version = "0.1" }
-rquickjs = { version = "0.12", features = ["loader"] }
+rquickjs = { version = "0.13", features = ["loader"] }
 # The WebAssembly component runtime rules execute on. `default-features = false` and an
 # explicit list, because wasmtime's default set is fourteen features wide and includes
 # `async`, `cache` and `gc`, none of which lanekeep uses — `async` in particular would

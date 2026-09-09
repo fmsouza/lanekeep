@@ -4207,8 +4207,10 @@ pub fn builtin_grammars(
 /// the key-level tests construct their own `GrammarKey`s, so they pass whatever this does.
 ///
 /// The digest covers the ABI and the node kinds and fields a query is compiled against, so a
-/// tree-sitter bump invalidates — and so does a regeneration at an unchanged ABI, which the bare
-/// ABI version this used to carry could not see.
+/// grammar bump invalidates — and so does a regeneration at an unchanged ABI, which the bare
+/// ABI version this used to carry could not see. The tree-sitter *runtime* is not in it: every
+/// field folded is read off the grammar crate's own `TSLanguage`, so a bump of the library that
+/// walks those grammars moves nothing here and rides on `engine_version` instead.
 ///
 /// Sorted by id, so the key does not depend on registration order.
 fn grammar_keys(registry: &LanguageRegistry) -> Vec<GrammarKey> {

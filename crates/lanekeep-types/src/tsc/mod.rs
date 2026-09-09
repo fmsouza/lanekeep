@@ -426,8 +426,8 @@ impl TscProvider {
                 .collect();
             return Err(ProviderError::Unloadable(format!(
                 "typescript {version} at `{}` does not provide the compiler API the driver \
-                 needs ({}); the tsc provider is written against the TypeScript 5.x API and \
-                 measured against 5.9.3",
+                 needs ({}); the tsc provider is written against the TypeScript 5.x compiler \
+                 API and tested through 6.0.3",
                 config.typescript,
                 missing.join(", "),
             )));

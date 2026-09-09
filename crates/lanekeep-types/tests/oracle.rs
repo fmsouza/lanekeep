@@ -26,9 +26,10 @@ fn parse(source: &str) -> Tree {
 
 /// Every node in the tree, in source order.
 ///
-/// A cursor walk rather than indexing: `child_count` is a `usize` and `child` takes a
-/// `u32`, and the cast between them trips `clippy::cast_possible_truncation`, which this
-/// workspace denies.
+/// A cursor walk rather than indexing: `children` hands back every child in order with no
+/// index loop, and it is right whatever type `child_count` answers in — it was `usize`
+/// against a `u32` `child` until tree-sitter 0.27, and the cast between them tripped
+/// `clippy::cast_possible_truncation`, which this workspace denies.
 fn nodes(tree: &Tree) -> Vec<Node<'_>> {
     let mut out = Vec::new();
     let mut stack = vec![tree.root_node()];

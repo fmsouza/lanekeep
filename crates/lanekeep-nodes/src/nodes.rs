@@ -54,10 +54,11 @@ pub struct StructureFingerprint {
 
 /// Child indices of a node, as `u32`.
 ///
-/// tree-sitter reports `child_count` as `usize` but takes `u32` in `child`, so the
-/// conversion lives here once rather than at each of the three call sites.
+/// One place for the range rather than one per caller: tree-sitter answers `child_count` in
+/// `u32` since 0.27, the same type `child` takes, so nothing converts any more — and both
+/// call sites still read the same.
 fn child_indices(node: Node<'_>) -> std::ops::Range<u32> {
-    0..u32::try_from(node.child_count()).unwrap_or(u32::MAX)
+    0..node.child_count()
 }
 
 /// Owns a parsed tree and the handles issued against it.
@@ -170,7 +171,7 @@ impl NodeArena {
 
     /// The node's kind, as the grammar names it.
     #[must_use]
-    pub fn kind(&self, handle: Handle) -> Option<&'static str> {
+    pub fn kind(&self, handle: Handle) -> Option<&str> {
         self.node(handle).map(|node| node.kind())
     }
 
@@ -662,11 +663,14 @@ mod tests {
                 .child(0)
                 .and_then(|n| n.child(1))
                 .expect("has a declarator");
-            (arena.path_of(target).expect("has a path"), target.kind())
+            (
+                arena.path_of(target).expect("has a path"),
+                target.kind().to_owned(),
+            )
         };
 
         let handle = arena.intern_path(path.clone()).expect("interns");
-        assert_eq!(arena.kind(handle), Some(expected_kind));
+        assert_eq!(arena.kind(handle), Some(expected_kind.as_str()));
         assert_eq!(
             arena.intern_path(path),
             Some(handle),

@@ -464,9 +464,6 @@ pub(crate) mod testing {
                 found.push(node);
             }
             for index in (0..node.child_count()).rev() {
-                // `child_count` answers in `usize`; `child` takes `u32`. tree-sitter's own
-                // node representation is `u32`-indexed, so this cannot truncate a real tree.
-                let index = u32::try_from(index).expect("tree-sitter child index fits in u32");
                 if let Some(child) = node.child(index) {
                     stack.push(child);
                 }

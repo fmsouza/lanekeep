@@ -61,7 +61,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
           components: rustfmt, clippy
@@ -76,7 +76,7 @@ jobs:
       # Rust compile of the bench harness, not the measured path). A cache here would only
       # speed up compiling wasmtime, at the cost of a license the repo's dependency-review
       # allow-list does not carry; the weekly cadence can absorb the cold compile.
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: just,cargo-binstall
 
