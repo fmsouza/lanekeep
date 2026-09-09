@@ -58,8 +58,10 @@ pub struct Symbol {
     ///
     /// | Binding | `exported` |
     /// | --- | --- |
-    /// | `import { a } from 'm'`, `import { a as b } from 'm'` | `Some("a")` |
-    /// | `import d from 'm'` | `Some("default")` |
+    /// | `import { a } from 'm'`, `import { a as b } from 'm'`, `m`'s declaration file unreadable | `Some("a")` |
+    /// | `import { a } from 'm'`, `import { a as b } from 'm'`, `m`'s declaration file readable | the name that file declares |
+    /// | `import d from 'm'`, `m`'s declaration file unreadable | `Some("default")` |
+    /// | `import d from 'm'`, `m`'s declaration file readable | the name that file declares |
     /// | `import * as ns from 'm'` | `None` |
     /// | a local declaration | `None` |
     ///

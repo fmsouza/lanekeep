@@ -657,13 +657,17 @@ export interface SymbolInfo {
    */
   name: string
   /**
-   * The name the module exports this under. `Decimal` for `import { Decimal }` and for
-   * `import { Decimal as Money }` alike — copied even when nothing was renamed, so a
-   * comparison never needs a fallback to `name` that would silently accept every plain
-   * import if it were forgotten. `default` for a default import, which is the name the
-   * module really exports it as and never the local one. Absent for a namespace import,
-   * which binds the module object and has no single exported name, and absent for a local
-   * declaration, which was not imported at all.
+   * The name the module exports this under. For a named import — `import { Decimal }` and
+   * `import { Decimal as Money }` alike — this is `Decimal` when `m`'s declaration file is
+   * unreadable, and the name that file actually declares (following any re-export chain)
+   * when it is readable, which need not be `Decimal` at all. Copied even when nothing was
+   * renamed, so a comparison never needs a fallback to `name` that would silently accept
+   * every plain import if it were forgotten. For a default import this is the name the
+   * declaration file declares the default export under when that file is readable — `Big`
+   * for a package whose default export is `Big`, whatever the local binding is called — and
+   * falls back to the placeholder `default` only when the declaration is not readable.
+   * Absent for a namespace import, which binds the module object and has no single exported
+   * name, and absent for a local declaration, which was not imported at all.
    */
   exported?: string
   /**
