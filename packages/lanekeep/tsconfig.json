@@ -12,6 +12,7 @@
     "ctx-types.test-d.ts",
     "gates.test-d.ts",
     "index.d.ts",
+    "report.test-d.ts",
     "requires.test-d.ts",
     "structure-fingerprint.test-d.ts",
     "types.test-d.ts"

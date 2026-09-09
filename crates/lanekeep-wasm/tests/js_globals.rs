@@ -90,10 +90,11 @@ const FILE: &str = "src/a.ts";
 ///
 /// `probe/order` is last and comes from a *second module*, which is the whole of its point —
 /// see [`the_runtime_is_evaluated_before_any_rule_module`].
-const IDS: [&str; 5] = [
+const IDS: [&str; 6] = [
     "probe/reach",
     "probe/context",
     "probe/cross",
+    "probe/cross-fix",
     "probe/throw",
     "probe/order",
 ];
@@ -142,8 +143,8 @@ fn the_component_withholds_the_clock_and_randomness() {
     // Which passes a rule has is the component's own answer, and the engine dispatches on it.
     // `probe/reach` is check-only and `probe/cross` is reduce-only, so a `hasCheck` that
     // answered from the world's shape rather than from the rule would agree with itself on
-    // both and be wrong on both.
-    for (rule, check, reduce) in [(0, true, false), (2, false, true)] {
+    // both and be wrong on both. `probe/cross-fix` is the second reduce-only one.
+    for (rule, check, reduce) in [(0, true, false), (2, false, true), (3, false, true)] {
         assert_eq!(probe.has_check(rule), check, "hasCheck({rule})");
         assert_eq!(probe.has_reduce(rule), reduce, "hasReduce({rule})");
     }
@@ -230,7 +231,7 @@ fn the_component_withholds_the_clock_and_randomness() {
 /// assertion failed. The order in the source is carried into the bundle, and the bundle is what
 /// makes it matter.
 fn the_runtime_is_evaluated_before_any_rule_module(probe: &mut Probe) {
-    let (outcome, reports) = probe.check(4, "p");
+    let (outcome, reports) = probe.check(5, "p");
     outcome.expect("the ordering probe runs");
 
     let seen = reports
@@ -395,9 +396,28 @@ fn the_rest_of_the_glue_module(probe: &mut Probe) {
         "the second fact is missing: {said}"
     );
 
+    // --- and the reduce report's own strictness, from inside the component --------------------
+
+    // `host.js`'s refusals are otherwise verified only in Node, against the un-componentized
+    // module; this is the built artifact saying so. The probe reports the message it caught,
+    // so the assertion is about the reason and not merely that something threw.
+    let reports = probe.reduce(3);
+    let said = reports
+        .first()
+        .and_then(|report| report.message.clone())
+        .expect("the cross-fix probe reports what it caught");
+    assert!(
+        said.contains("crossfix=ctx.report in a reduce phase cannot take a fix"),
+        "a fix offered in a reduce report was not refused by name: {said}"
+    );
+    assert!(
+        said.contains("no node to attach one to"),
+        "the refusal should say why the fix cannot be carried: {said}"
+    );
+
     // --- a throw carries its message and its stack ------------------------------------------
 
-    let (outcome, _) = probe.check(3, "p");
+    let (outcome, _) = probe.check(4, "p");
     let error = outcome.expect_err("the throwing rule fails");
     let rendered = error.to_string();
     assert!(
@@ -638,7 +658,7 @@ impl Probe {
                 } else {
                     "null"
                 };
-                let index = u32::try_from(index).expect("four rules");
+                let index = u32::try_from(index).expect("six rules");
                 set.add(*id, &loaded, index, options).expect("added")
             })
             .collect();

@@ -17,7 +17,7 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
 
-import { WITHHELD, buildCheckContext, buildReduceContext, readReportOptions, toMatch, withhold } from './host.js'
+import { WITHHELD, buildCheckContext, buildReduceContext, readReportOptions, reduceReportOptions, toMatch, withhold } from './host.js'
 
 /**
  * A stand-in for the world's `check-context`, recording what was called on it.
@@ -173,6 +173,22 @@ test('report takes a message or an options object', () => {
   assert.deepEqual(readReportOptions('why'), ['why', undefined])
   assert.deepEqual(readReportOptions({ message: 'why' }), ['why', undefined])
   assert.throws(() => readReportOptions(7), /message string or an options object/)
+
+  // The reduce phase's read is the strict half — the QuickJS host's refusals, word for word.
+  assert.equal(reduceReportOptions('why'), 'why')
+  assert.equal(reduceReportOptions({ message: 'why' }), 'why')
+  assert.equal(reduceReportOptions(undefined), undefined)
+  for (const bad of [7, [], {}, { message: 42 }]) {
+    assert.throws(
+      () => reduceReportOptions(bad),
+      /takes a message: either a string, or \{ message \}/,
+    )
+  }
+  assert.throws(() => reduceReportOptions({ fix: {} }), /there is no node to attach one to/)
+  assert.throws(
+    () => reduceReportOptions('why', { node: 1, text: 'x' }),
+    /there is no node to attach one to/,
+  )
 })
 
 test('an omitted `safe` stays omitted, so the host decides what it means', () => {
@@ -294,12 +310,85 @@ test('the reduce phase refuses a report that offers a fix', () => {
   )
 
   // No fix, no refusal. A message-only options object is the ordinary call, and an explicitly
-  // absent fix (`null`) is not a supplied one — `readReportOptions` calls both absent, so the
-  // host hears nothing to refuse.
+  // absent fix (`null`) is not a supplied one — `reduceReportOptions` calls both absent, so
+  // the host hears nothing to refuse.
   built.report({ file: 'a.ts', line: 5, column: 6 }, { message: 'again' })
   built.report({ file: 'a.ts', line: 7, column: 8 }, { message: 'again', fix: null })
+  // The world's own positional spelling: refused, not truncated away — the fix has nowhere
+  // to go in this phase, and `--fix` reading it as carried would be the silent kind.
+  assert.throws(
+    () =>
+      built.report({ file: 'a.ts', line: 9, column: 1 }, 'cycle', {
+        node: 1,
+        text: 'let x = 1',
+      }),
+    /there is no node to attach one to/,
+  )
   assert.deepEqual(seen, [
     [{ file: 'a.ts', line: 5, column: 6 }, 'again'],
     [{ file: 'a.ts', line: 7, column: 8 }, 'again'],
   ])
+})
+
+test('the reduce phase takes a message the other engine refuses a non-message for', () => {
+  const seen = []
+  const built = buildReduceContext({
+    files: () => [],
+    facts: () => [],
+    report: (at, message) => seen.push([at, message]),
+  })
+
+  // Strict where the per-file read is lenient, because this phase has no card to fall back
+  // to mid-run — and because the QuickJS host is the specification both engines follow, so
+  // these are its own refusals, word for word. Each of these was accepted and silently
+  // message-less before the strictness; the rule heard nothing and the card spoke instead.
+  for (const bad of [7, [], {}, { message: 42 }, { fix: null }]) {
+    assert.throws(
+      () => built.report({ file: 'a.ts', line: 3, column: 4 }, bad),
+      /takes a message: either a string, or \{ message \}/,
+      `${JSON.stringify(bad)} should name the message it wanted`,
+    )
+  }
+  assert.deepEqual(seen, [])
+})
+
+test('the reduce phase refuses a report whose location lost a field', () => {
+  const built = buildReduceContext({
+    files: () => [],
+    facts: () => [],
+    report: () => {},
+  })
+
+  // The world requires the position, and the other engine refuses its absence by name — a
+  // location missing a field should meet that refusal here rather than whatever the world's
+  // own import says one engine over.
+  assert.throws(
+    () => built.report({ file: 'a.ts' }, 'cycle'),
+    /emit them on the fact during the per-file pass/,
+  )
+  assert.throws(() => built.report({ file: 'a.ts', line: 3 }, 'cycle'), /emit them on the fact/)
+  assert.throws(() => built.report({ file: 'a.ts', line: 3, column: '4' }, 'cycle'), /emit them on the fact/)
+})
+
+test('the per-file phase honors a fix given positionally', () => {
+  const { ctx, calls } = stubContext()
+  const built = buildCheckContext(ctx)
+
+  // The world spells it `report(n, message, fix)` — a rule author who learned the API in
+  // Rust or Go reaches for that shape first. Honored, not truncated into `undefined`.
+  built.report(0, 'the why', { node: 0, text: 'const x = 2;', safe: true })
+  assert.ok(
+    calls.includes('report(0,"the why",{"node":0,"text":"const x = 2;","safe":true})'),
+    `the fix should cross as the third argument: ${calls.join(' | ')}`,
+  )
+})
+
+test('a fix in both the options and the third argument is refused', () => {
+  const { ctx } = stubContext()
+  const built = buildCheckContext(ctx)
+
+  assert.throws(
+    () => built.report(0, { fix: { node: 0, text: 'a' } }, { node: 0, text: 'b' }),
+    /not both/,
+  )
 })

@@ -25,9 +25,10 @@
 //! `jco types` describes the *component* boundary — `list<node>` as `Uint32Array`, `result`
 //! as a `{ tag }` union, resources as classes with `readFile(): string | undefined` — which is
 //! not the surface a TypeScript rule author reaches under QuickJS. That surface is an interface
-//! with camelCase methods, `Match` as a `Record`, `Node` as a branded number, and `report`
-//! taking a `ReportOptions` object. The mapping between the two is the point of this crate, and
-//! it is hand-written here rather than a second hand-written description that can drift.
+//! with camelCase methods, `Match` as a `Record`, `Node` as a branded number, and the per-file
+//! `report` taking a `ReportOptions` object. The mapping between the two is the point of this
+//! crate, and it is hand-written here rather than a second hand-written description that can
+//! drift.
 
 // A generator over a fixed WIT file: a malformed world or a missing declaration is a programmer
 // error, and panicking with a message that names the missing item is the actionable failure — the
@@ -50,6 +51,13 @@ const WORLD_PATH: &str = "world.wit";
 ///
 /// The input is the complete text of `crates/lanekeep-wasm/wit/world.wit`; the output is the
 /// complete text of `packages/lanekeep/index.d.ts`.
+///
+/// # Panics
+///
+/// When the world carries something this renderer has no rendered words for — a context or
+/// report parameter it does not name an interface or doc for. The panic names it; rendering
+/// a published definition with the member quietly absent is the one failure this crate
+/// exists to make impossible.
 pub fn render_index_dts(wit: &str) -> String {
     let resolve = parse(wit);
     let world = world(&resolve);
@@ -58,6 +66,17 @@ pub fn render_index_dts(wit: &str) -> String {
     let binding_kinds = enum_cases(&resolve, interface, "binding-kind");
     let check_context = resource_methods(interface, "check-context");
     let reduce_context = resource_methods(interface, "reduce-context");
+
+    // Each `report` is the source its options interface renders from, so a parameter the
+    // world adds to one context's `report` reaches that context's options and not the other's.
+    let check_report = check_context
+        .iter()
+        .find(|method| member_name(method) == "report")
+        .expect("the per-file context reports");
+    let reduce_report = reduce_context
+        .iter()
+        .find(|method| member_name(method) == "report")
+        .expect("the reduce context reports");
 
     // Each block ends with a newline; joining with `"\n"` leaves one blank line between
     // declarations, matching the hand-written file this replaces.
@@ -71,7 +90,8 @@ pub fn render_index_dts(wit: &str) -> String {
         render_rule_card(),
         render_gates(),
         render_fix(),
-        render_report_options(),
+        render_report_options(&resolve, check_report),
+        render_reduce_report_options(&resolve, reduce_report),
         render_fact(),
         render_emitted_fact(),
         render_node_location(),
@@ -269,11 +289,12 @@ fn render_param(resolve: &Resolve, name: &str, ty: &Type) -> String {
 
 /// Render one context interface from the resource it names.
 ///
-/// `quickjs_only` controls whether the two members QuickJS adds beyond what the world itself
-/// declares are appended: `facts`, which QuickJS gives a per-file rule and the world keeps only
-/// on the cross-file resource; and `types`, the bounded type oracle, which has no presence in
-/// the world at all — no component rule can declare `requires`, so there is nothing there to
-/// derive from. Both are present on `RuleContext` and absent from `ReduceContext`.
+/// `quickjs_only` controls whether the member QuickJS adds beyond what the world itself
+/// declares is appended: `types`, the bounded type oracle, which has no presence in the world
+/// at all — no component rule can declare `requires`, so there is nothing there to derive
+/// from. It is present on `RuleContext` and absent from `ReduceContext`. `facts` is on
+/// neither: no engine provides it during the per-file pass, and a `RuleContext` that typed it
+/// would compile a call both runtimes answer with a `TypeError`.
 fn render_context(
     resolve: &Resolve,
     name: &str,
@@ -296,12 +317,12 @@ fn render_context(
         out.push_str(&render_member(resolve, method));
     }
     if quickjs_only {
-        // QuickJS hands a per-file rule `facts`, which the world keeps on the cross-file context
-        // alone. It is one of the two members this renderer adds that the world does not
-        // declare, added so the published surface keeps describing what a TypeScript rule can
-        // call.
-        out.push_str("  /** Facts emitted so far, optionally filtered by `kind`. */\n");
-        out.push_str("  facts(kind?: string): EmittedFact[]\n");
+        // `types` is the one member this renderer adds that the world does not declare, added
+        // so the published surface keeps describing what a TypeScript rule can call. `facts`
+        // is deliberately not added: no engine hands a per-file rule `facts` — the world keeps
+        // it on the cross-file context alone, and both engines assert its absence there — so
+        // typing it would compile a call that throws on the first run, the one shape this
+        // renderer must not publish.
 
         // `types` is the other. Typed as always present rather than optional: TypeScript has
         // no way to see that a rule's own `requires: ['types']` is what makes it so — `Rule`
@@ -366,20 +387,28 @@ fn render_member(resolve: &Resolve, method: &Function) -> String {
             // real parameter is the site it reports at — `Node` on the per-file context,
             // `ReduceLocation` on the cross-file one. The options half differs per context, and
             // the world says so: only the per-file `report` carries a `fix` parameter, because
-            // a fix replaces a node's text and the reduce phase has no parse tree. Reading the
-            // world rather than hardcoding the union is what keeps the types honest about that
-            // — a `report` whose signature has no `fix` parameter takes a message only, so
-            // offering one is a compile error instead of a value the host accepts and drops.
+            // a fix replaces a node's text and the reduce phase has no parse tree. Each
+            // context's options interface is named from which resource the method sits on, and
+            // its contents are rendered from the report's own trailing parameters — so a
+            // parameter the world adds reaches the published types or stops this render loudly.
             let at = method.params.get(1).map_or_else(
                 || "Node".to_owned(),
                 |param| render_type(resolve, &param.ty),
             );
-            let message = if has_fix_param(resolve, method) {
-                "string | ReportOptions"
-            } else {
-                "string"
+            let (options, doc) = match method.name.as_str() {
+                "[method]check-context.report" => ("ReportOptions", ""),
+                "[method]reduce-context.report" => (
+                    "ReduceReportOptions",
+                    // The one place a TS author meets the narrowed options is this line, so
+                    // the "why" travels with it rather than living only in `Fix`'s doc.
+                    "  /** Takes a message; a supplied `fix` throws — there is no node to attach one to. */\n",
+                ),
+                _ => panic!(
+                    "`{}`: a context this renderer does not name a report options interface for",
+                    method.name
+                ),
             };
-            return format!("  report(at: {at}, message?: {message}): void\n");
+            return format!("{doc}  report(at: {at}, message?: string | {options}): void\n");
         }
         _ => {}
     }
@@ -400,32 +429,6 @@ fn render_member(resolve: &Resolve, method: &Function) -> String {
     format!("  {}({params}): {result}\n", camel(name))
 }
 
-/// Whether the method's third real parameter is `option<fix>` — the shape of the `fix`
-/// parameter the world gives the per-file `report` and the reduce one lacks.
-///
-/// A resource method's parameters open with the component model's implicit `self` borrow at
-/// index 0, which a rule author never names — the same convention that has `render_member`
-/// read the site parameter at index 1, so `fix`, where present, is index 3.
-fn has_fix_param(resolve: &Resolve, method: &Function) -> bool {
-    let Some(param) = method.params.get(3) else {
-        return false;
-    };
-    is_option_of_fix(resolve, &param.ty)
-}
-
-/// Whether a WIT type is `option<fix>`, resolving through a named alias the same way
-/// `render_type` resolves a bare alias.
-fn is_option_of_fix(resolve: &Resolve, ty: &Type) -> bool {
-    let Type::Id(id) = ty else {
-        return false;
-    };
-    match &resolve.types[*id].kind {
-        TypeDefKind::Option(inner) => render_type(resolve, inner) == "Fix",
-        TypeDefKind::Type(inner) => is_option_of_fix(resolve, inner),
-        _ => false,
-    }
-}
-
 const HEADER: &str = "\
 /**
  * Type definitions for authoring lanekeep rules.
@@ -437,11 +440,10 @@ const HEADER: &str = "\
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
  * The world is the single source of truth for every member the renderer emits straight from it.
- * Three members deviate from the world on purpose, and all three are QuickJS-shaped: `today` is
+ * Two members deviate from the world on purpose, and both are QuickJS-shaped: `today` is
  * omitted from `RuleContext` because QuickJS exposes it as a conditional property rather than a
- * callable, a shape this renderer cannot state honestly from the world; `facts` is added to
- * `RuleContext` because QuickJS hands a per-file rule `facts` that the world declares only on
- * `reduce-context`; and `types` is added to `RuleContext` because `ctx.types` — the bounded
+ * callable, a shape this renderer cannot state honestly from the world; and `types` is added
+ * to `RuleContext` because `ctx.types` — the bounded
  * type oracle — is QuickJS-only and has no presence in `world.wit` at all: a component rule
  * cannot declare `requires`, so there is nothing for the world to say about it. Nothing else is
  * added or omitted by hand.
@@ -593,7 +595,7 @@ const FIX: &str = "\
  *
  * A per-file offer alone: a fix names a node, and the reduce phase consumes facts and the
  * file list and nothing else — there is no parse tree there for `node` to name, which is why
- * `ReduceContext.report` takes a message and no options.
+ * a reduce report's options carry a message and never a fix.
  */
 export interface Fix {
   /** The node whose text is replaced. */
@@ -608,16 +610,6 @@ export interface Fix {
    * rewrites someone's code silently.
    */
   safe?: boolean
-}
-";
-
-const REPORT_OPTIONS: &str = "\
-/** Options for a single report. */
-export interface ReportOptions {
-  /** Overrides the card's `message` for this one violation. */
-  message?: string
-  /** A replacement to offer. */
-  fix?: Fix
 }
 ";
 
@@ -1067,8 +1059,96 @@ fn render_fix() -> String {
     FIX.to_owned()
 }
 
-fn render_report_options() -> String {
-    REPORT_OPTIONS.to_owned()
+/// The per-file report's options interface, from the report's own trailing WIT parameters.
+fn render_report_options(resolve: &Resolve, report: &Function) -> String {
+    report_options_interface(
+        resolve,
+        report,
+        "ReportOptions",
+        "Options for a single report.",
+    )
+}
+
+/// The reduce report's options: the same derived fields as any report's, plus the one member
+/// the world cannot declare — `fix?: never`, the refusal rendered as a type.
+fn render_reduce_report_options(resolve: &Resolve, report: &Function) -> String {
+    report_options_interface(
+        resolve,
+        report,
+        "ReduceReportOptions",
+        "Options for a single reduce report.",
+    )
+}
+
+/// One report's options interface, from the report's own trailing WIT parameters.
+///
+/// Each parameter after the site becomes an optional field — the world types them as
+/// `option`, and the runtimes fold the pair into one object whose fields are all optional.
+/// A parameter the world adds reaches the published types, or stops the render at
+/// [`options_field_doc`] with the parameter's name: the same contract as a missing
+/// declaration anywhere else in this crate.
+fn report_options_interface(resolve: &Resolve, report: &Function, name: &str, doc: &str) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "/** {doc} */");
+    let _ = writeln!(out, "export interface {name} {{");
+    for param in report.params.iter().skip(2) {
+        let ty = match &param.ty {
+            // `option<T>` in field position is an optional field of `T`: the optionality
+            // moves out of the value and into the field, which is what the JavaScript idiom
+            // has always spelled.
+            Type::Id(id) => match &resolve.types[*id].kind {
+                TypeDefKind::Option(inner) => render_type(resolve, inner),
+                _ => render_type(resolve, &param.ty),
+            },
+            ty => render_type(resolve, ty),
+        };
+        out.push_str(options_field_doc(&param.name));
+        let _ = writeln!(out, "  {}?: {ty}", camel(&param.name));
+    }
+    if name == "ReduceReportOptions" {
+        // The member the world has no parameter for: a fix is refused by both hosts in this
+        // phase, and `never` is what that refusal looks like from TypeScript. Only the
+        // reduce interface carries it, because only there is a fix a category error.
+        out.push_str("  /**\n");
+        out.push_str(
+            "   * Never present. A fix replaces a node's text, and the reduce phase has no parse tree —\n",
+        );
+        out.push_str(
+            "   * `node` has nothing to name, and both hosts throw on a supplied fix rather than drop it.\n",
+        );
+        out.push_str(
+            "   * Typed `never` rather than left absent so offering one fails to compile even for an\n",
+        );
+        out.push_str(
+            "   * object built before the call, which a fresh literal's excess-property check alone would\n",
+        );
+        out.push_str("   * admit.\n");
+        out.push_str("   */\n");
+        out.push_str("  fix?: never\n");
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// The rendered doc for a report-options field, by its WIT parameter name.
+///
+/// The world carries the component's words, not the authoring idiom's, so each field's
+/// TypeScript prose lives here. A parameter the world adds without one stops the render
+/// naming it — the same contract as a missing declaration anywhere else in this crate.
+///
+/// # Panics
+///
+/// With the parameter's name, when `world.wit` carries a `report` parameter this table has
+/// no rendered words for — the actionable failure is adding the doc, and a silent omission
+/// would be the field vanishing from the published types.
+fn options_field_doc(name: &str) -> &'static str {
+    match name {
+        "message" => "  /** Overrides the card's `message` for this one violation. */\n",
+        "fix" => "  /** A replacement to offer. */\n",
+        _ => panic!(
+            "`report` carries a `{name}` parameter this renderer has no doc for — add it to `options_field_doc`"
+        ),
+    }
 }
 
 fn render_fact() -> String {

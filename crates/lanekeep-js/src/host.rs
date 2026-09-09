@@ -635,7 +635,8 @@ impl HostContext {
                 ctx.clone(),
                 move |ctx: Ctx<'js>,
                       handle: Handle,
-                      options: Opt<Value<'js>>|
+                      options: Opt<Value<'js>>,
+                      positional: Opt<Value<'js>>|
                       -> rquickjs::Result<()> {
                     // A report at an unresolvable handle is dropped rather than recorded at
                     // a made-up position. Reporting at 1:1 would point a reader at an
@@ -646,6 +647,11 @@ impl HostContext {
 
                     let (message, fix) = match options.0 {
                         None => (None, None),
+                        // An explicitly nullish second argument is the same absence the bare
+                        // call is — the reduce path has always taken it that way, and a rule
+                        // spelling `report(node, verbose ? reason : undefined)` is an
+                        // ordinary one, not a mistake the run should die over.
+                        Some(value) if value.is_undefined() || value.is_null() => (None, None),
                         Some(value) if value.is_string() => (value.get::<String>().ok(), None),
                         Some(value) => {
                             let Some(object) = value.as_object() else {
@@ -655,9 +661,39 @@ impl HostContext {
                                      object — { message?, fix? }",
                                 ));
                             };
-                            let message = object.get::<_, String>("message").ok();
+                            // Read as a value first: an absent key is `undefined`, and only
+                            // a real failure — a throwing getter, most often — comes back
+                            // as an error. `get::<String>.ok()` would fold the two, and a
+                            // lazily built fix or message whose getter hit an accidental
+                            // `TypeError` would vanish into "nothing supplied".
+                            let message = match object.get::<_, Value<'js>>("message")? {
+                                found if found.is_string() => found
+                                    .as_string()
+                                    .map(rquickjs::String::to_string)
+                                    .transpose()?,
+                                _ => None,
+                            };
                             let fix = read_fix(&ctx, object, &arena)?;
                             (message, fix)
+                        }
+                    };
+
+                    // A fix as a third argument is the world's own spelling — `report(n,
+                    // message, fix)` — which a rule author who learned the API in Rust or Go
+                    // reaches for first. Honored, not truncated; and two of them is not an
+                    // ambiguity a host may resolve, so the rule hears about it instead.
+                    let fix = match positional.0 {
+                        None => fix,
+                        Some(value) if value.is_undefined() || value.is_null() => fix,
+                        Some(value) => {
+                            if fix.is_some() {
+                                return Err(throw(
+                                    &ctx,
+                                    "ctx.report takes a fix either in the options object or \
+                                     as its third argument, not both",
+                                ));
+                            }
+                            fix_from_value(&ctx, &value, &arena)?
                         }
                     };
 
@@ -1085,7 +1121,8 @@ impl ReduceContext {
                 ctx.clone(),
                 move |ctx: Ctx<'js>,
                       at: Value<'js>,
-                      message: Opt<Value<'js>>|
+                      message: Opt<Value<'js>>,
+                      fix: Opt<Value<'js>>|
                       -> rquickjs::Result<()> {
                     let Some(at) = at.as_object() else {
                         return Err(throw(
@@ -1107,6 +1144,17 @@ impl ReduceContext {
                              positions are still available",
                         ));
                     };
+
+                    // A third argument can only ever be a fix — the options object is the
+                    // second — and this phase cannot carry one. Refused ahead of the message
+                    // read, so the refusal names the fix whatever the message looked like;
+                    // the same refusal `reduce_report_message` makes, one method, one message.
+                    if let Some(value) = fix.0
+                        && !value.is_undefined()
+                        && !value.is_null()
+                    {
+                        return Err(throw(&ctx, REDUCE_FIX_REFUSAL));
+                    }
 
                     // A bare string or `{ message }` — see `reduce_report_message`, which
                     // also refuses a supplied `fix`.
@@ -1138,6 +1186,11 @@ impl ReduceContext {
 /// not a message came with it: a fix replaces a node's text, and this phase has no parse
 /// tree — no node to replace, so none can be carried. It is the same refusal `host.js`'s
 /// `buildReduceContext` makes, one bug carrying one message in both engines.
+/// The refusal a supplied fix meets in a reduce report — shared by the options-object read
+/// and the third-argument read, one refusal for one method.
+const REDUCE_FIX_REFUSAL: &str = "ctx.report in a reduce phase cannot take a fix — there is no \
+     parse tree here, so there is no node to attach one to";
+
 fn reduce_report_message<'js>(
     ctx: &Ctx<'js>,
     message: Opt<Value<'js>>,
@@ -1152,31 +1205,32 @@ fn reduce_report_message<'js>(
             let Some(options) = value.as_object() else {
                 return Err(throw(
                     ctx,
-                    "ctx.report in a reduce phase takes a message: either a string, or \
-                     { message }",
+                    // On one source line, so `tests/report_parity.rs` can hold this fragment
+                    // against the JavaScript side of the same refusal.
+                    "ctx.report in a reduce phase takes a message: either a string, or { message }",
                 ));
             };
 
             let fix = options.get::<_, Value<'js>>("fix")?;
             if !fix.is_undefined() && !fix.is_null() {
-                return Err(throw(
-                    ctx,
-                    "ctx.report in a reduce phase cannot take a fix — there is no parse \
-                     tree here, so there is no node to attach one to",
-                ));
+                return Err(throw(ctx, REDUCE_FIX_REFUSAL));
             }
 
-            match options.get::<_, Value<'js>>("message") {
-                Ok(found) if found.is_string() => found
+            // Read as a value first, and let the error out rather than folding it into the
+            // shape refusal below: a getter that throws is the author's error, and replacing
+            // the pending exception with this message would destroy the only trace of what
+            // went wrong.
+            let found = options.get::<_, Value<'js>>("message")?;
+            if found.is_string() {
+                return found
                     .as_string()
                     .map(rquickjs::String::to_string)
-                    .transpose(),
-                _ => Err(throw(
-                    ctx,
-                    "ctx.report in a reduce phase takes a message: either a string, or \
-                     { message }",
-                )),
+                    .transpose();
             }
+            Err(throw(
+                ctx,
+                "ctx.report in a reduce phase takes a message: either a string, or { message }",
+            ))
         }
     }
 }
@@ -1191,13 +1245,23 @@ fn read_fix<'js>(
     options: &Object<'js>,
     arena: &Rc<RefCell<NodeArena>>,
 ) -> rquickjs::Result<Option<Fix>> {
-    let Ok(value) = options.get::<_, Value<'js>>("fix") else {
-        return Ok(None);
-    };
+    // Read as a value first: an absent `fix` is `undefined`, and only a real failure — a
+    // throwing getter, most often — comes back as an error. Folding that error into "no fix
+    // supplied" is the silent-drop class a report's options exist not to have: the violation
+    // would be recorded without the replacement the rule offered, and `--fix` would quietly
+    // do nothing for a rule that otherwise reports normally.
+    let value = options.get::<_, Value<'js>>("fix")?;
     if value.is_undefined() || value.is_null() {
         return Ok(None);
     }
+    fix_from_value(ctx, &value, arena)
+}
 
+fn fix_from_value<'js>(
+    ctx: &Ctx<'js>,
+    value: &Value<'js>,
+    arena: &Rc<RefCell<NodeArena>>,
+) -> rquickjs::Result<Option<Fix>> {
     let Some(fix) = value.as_object() else {
         return Err(throw(
             &ctx.clone(),
@@ -1670,6 +1734,103 @@ mod tests {
         assert_eq!(reports[0].message.as_deref(), Some("something specific"));
     }
 
+    /// An explicitly nullish second argument is the same absence the bare call is. The
+    /// reduce path has always taken it that way — `readReportOptions` on the other engine
+    /// and `reduce_report_message` here — and a rule spelling
+    /// `ctx.report(node, verbose ? reason : undefined)` is an ordinary one, not a mistake
+    /// the run should die over.
+    #[test]
+    fn a_report_with_a_nullish_options_argument_is_recorded_without_one() {
+        for expression in [
+            "ctx.report(ctx.root)",
+            "ctx.report(ctx.root, undefined)",
+            "ctx.report(ctx.root, null)",
+        ] {
+            let host = host("const x = 1;");
+            let _: () = run(&host, expression);
+
+            let reports = host.take_reports();
+            assert_eq!(reports.len(), 1, "{expression}");
+            assert_eq!(reports[0].message, None, "{expression}");
+            assert_eq!(reports[0].fix, None, "{expression}");
+        }
+    }
+
+    /// Reading a property whose getter throws is the rule's own error, not a missing value:
+    /// a lazily built fix whose getter hits a real `TypeError` must reach the rule as that
+    /// error, not vanish into "no fix supplied" — the silent-drop class a report's options
+    /// exist not to have.
+    #[test]
+    fn a_throwing_property_getter_propagates_its_error() {
+        for (expression, cause) in [
+            (
+                r"ctx.report(ctx.root, { message: 'm', get fix() { throw new Error('boom') } })",
+                "boom",
+            ),
+            (
+                r"ctx.report(ctx.root, { get message() { throw new Error('the cause') } })",
+                "the cause",
+            ),
+        ] {
+            let host = host("const x = 1;");
+            let error: String = run(
+                &host,
+                &format!("try {{ {expression} }} catch (error) {{ error.message }}"),
+            );
+            assert!(
+                error.contains(cause),
+                "`{expression}` should say why it failed: {error}"
+            );
+            assert!(
+                host.take_reports().is_empty(),
+                "a report whose options threw must not be recorded"
+            );
+        }
+    }
+
+    /// The world spells a fix positionally — `report(n, message, fix)` — and a rule author
+    /// who learned the API in Rust or Go reaches for that shape first. Honored, not
+    /// truncated: the fix crosses as the fix it is.
+    #[test]
+    fn a_fix_as_the_third_argument_is_honored() {
+        let host = host("const x = 1;\nconst y = 2;");
+        let _: () = run(
+            &host,
+            "ctx.report(ctx.namedChildren(ctx.root)[1], 'the message', \
+             { node: ctx.namedChildren(ctx.root)[1], text: 'const z = 3;', safe: true })",
+        );
+
+        let reports = host.take_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].message.as_deref(), Some("the message"));
+        let fix = reports[0].fix.as_ref().expect("the fix is carried");
+        assert_eq!(fix.replacement, "const z = 3;");
+        assert!(fix.safe);
+        // The range is the node's own: a fix at the wrong offsets would rewrite the wrong code.
+        assert_eq!(
+            host.arena().borrow().source().get(fix.range()),
+            Some("const y = 2;"),
+            "the fix names the range of the node it was built from"
+        );
+    }
+
+    /// Two fixes is not an ambiguity a host may resolve: which one applied would depend on
+    /// an ordering nobody documented, so the rule hears about it instead.
+    #[test]
+    fn a_fix_in_both_the_options_and_the_third_argument_is_refused() {
+        let host = host("const x = 1;");
+        let error: String = run(
+            &host,
+            "try { ctx.report(ctx.root, { fix: { node: ctx.root, text: 'a' } }, \
+             { node: ctx.root, text: 'b' }) } catch (error) { error.message }",
+        );
+        assert!(
+            error.contains("not both"),
+            "the error should name the ambiguity: {error}"
+        );
+        assert!(host.take_reports().is_empty());
+    }
+
     #[test]
     fn records_every_report_in_order() {
         let host = host("const a = 1;\nconst b = 2;\nconst c = 3;");
@@ -2026,6 +2187,10 @@ mod tests {
         for expression in [
             r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, 'plain string')",
             r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { message: 'plain string' })",
+            // An explicitly nullish `fix` is not a supplied one: the options object carries
+            // the message, and the nullish field is the same absence an omitted field is.
+            r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { message: 'plain string', fix: null })",
+            r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { message: 'plain string', fix: undefined })",
         ] {
             let context = ReduceContext::new(vec!["a.ts".to_owned()], vec![]);
             let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
@@ -2068,21 +2233,61 @@ mod tests {
     /// `buildReduceContext`, where this module is the specification both engines follow).
     #[test]
     fn a_reduce_report_refuses_a_fix() {
+        for expression in [
+            // With a message: the ordinary shape of the mistake.
+            r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { message: 'cycle', fix: { node: 1, text: 'let x = 1', safe: true } })",
+            // Without one: the fix is the mistake by itself, and the probe for it sits ahead
+            // of the message probe — this pinning the ordering, since the message refusal
+            // would be the answer if the two probes ever swapped.
+            r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { fix: {} })",
+            // The world's own positional spelling, which a rule written in Rust or Go
+            // reaches for first: refused, not truncated away.
+            r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, 'cycle', { node: 1, text: 'let x = 1' })",
+        ] {
+            let context = ReduceContext::new(vec!["a.ts".to_owned()], vec![]);
+            let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+            let error = sandbox
+                .eval_with_reduce_host::<()>(&context, expression, budget())
+                .expect_err("should refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("there is no node to attach one to"),
+                "the error should say why a fix cannot be carried: {error}"
+            );
+            // Nothing recorded: the half of the silent-drop class that is about the run
+            // continuing as if the report carried what the rule offered.
+            assert!(
+                context.take_reports().is_empty(),
+                "a refused report must not reach the phase"
+            );
+        }
+    }
+
+    /// The message probe reads `message` the same way the fix probe reads `fix` — and a
+    /// getter's own error is the author's error: folding it into the "takes a message"
+    /// refusal would destroy the only trace of what went wrong.
+    #[test]
+    fn a_throwing_message_getter_propagates_its_error() {
         let context = ReduceContext::new(vec!["a.ts".to_owned()], vec![]);
         let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
         let error = sandbox
             .eval_with_reduce_host::<()>(
                 &context,
-                r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { message: 'cycle', fix: { node: 1, text: 'let x = 1', safe: true } })",
+                r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { get message() { throw new Error('the real cause') } })",
                 budget(),
             )
             .expect_err("should refuse");
+        let rendered = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("there is no node to attach one to"),
-            "the error should say why a fix cannot be carried: {error}"
+            rendered.contains("the real cause"),
+            "the getter's own error should surface: {rendered}"
         );
+        assert!(
+            !rendered.contains("takes a message"),
+            "the shape refusal must not replace the author's error: {rendered}"
+        );
+        assert!(context.take_reports().is_empty());
     }
 
     #[test]

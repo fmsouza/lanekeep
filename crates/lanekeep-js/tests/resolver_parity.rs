@@ -8,8 +8,8 @@
 //! repository does not host.
 //!
 //! What that costs is a duplicate that nothing keeps honest. This is what keeps it honest, on
-//! the model of `host_types.rs`, which holds `packages/lanekeep/index.d.ts` against `host.rs`
-//! by reading both as text.
+//! the model of `report_parity.rs` in this directory, which holds the two engines'
+//! `ctx.report` refusal prose against each other the same way.
 //!
 //! **The messages are a proxy, and that is the point rather than a weakness.** Nobody is hurt
 //! much by two refusals that differ in wording. What the check is really for is that the two
