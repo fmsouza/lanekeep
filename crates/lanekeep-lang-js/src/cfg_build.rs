@@ -1230,7 +1230,7 @@ mod tests {
     use crate::cfg::{BlockId, Cfg, EdgeKind};
 
     /// Every block reachable from entry, by the kinds of the nodes attributed to it.
-    fn shape(cfg: &Cfg<'_>) -> Vec<Vec<&'static str>> {
+    fn shape<'t>(cfg: &Cfg<'t>) -> Vec<Vec<&'t str>> {
         cfg.blocks()
             .map(|(_, b)| b.nodes.iter().map(tree_sitter::Node::kind).collect())
             .collect()

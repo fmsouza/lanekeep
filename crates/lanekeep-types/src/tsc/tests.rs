@@ -31,6 +31,21 @@ fn typescript_package() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/lanekeep/node_modules/typescript")
 }
 
+/// The version that package declares, read from its own `package.json`.
+///
+/// What the handshake is asserted against: the driver reports whatever it loaded, so the
+/// expectation has to follow the pinned devDependency rather than name a major here — a
+/// literal would go stale on the next bump and say nothing about the sidecar.
+fn installed_typescript_version() -> String {
+    let manifest = std::fs::read_to_string(typescript_package().join("package.json"))
+        .expect("the typescript package has a package.json");
+    let parsed: serde_json::Value = serde_json::from_str(&manifest).expect("parses");
+    parsed["version"]
+        .as_str()
+        .expect("declares a version")
+        .to_owned()
+}
+
 /// `moduleResolution` is named rather than left to default because the fixture below
 /// imports out of its own `node_modules`, and the default for an `ES2022` target is
 /// `classic`, which never looks there.
@@ -227,10 +242,9 @@ fn the_default_relative_typescript_resolves_against_the_project_root() {
         AnalysisBudget::start(Duration::from_mins(2)),
     )
     .expect("the default `./node_modules/typescript` loads");
-    assert!(
-        provider.typescript_version().starts_with('5'),
-        "got: {}",
-        provider.typescript_version()
+    assert_eq!(
+        provider.typescript_version(),
+        installed_typescript_version()
     );
     drop(provider);
 }
@@ -462,10 +476,9 @@ fn the_handshake_reports_the_projects_typescript_version() {
         AnalysisBudget::start(Duration::from_mins(2)),
     )
     .expect("the sidecar starts");
-    assert!(
-        provider.typescript_version().starts_with('5'),
-        "got: {}",
-        provider.typescript_version()
+    assert_eq!(
+        provider.typescript_version(),
+        installed_typescript_version()
     );
 }
 

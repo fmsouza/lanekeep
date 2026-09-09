@@ -2,7 +2,7 @@
 //!
 //! Gated on `packages/lanekeep/node_modules/typescript`: a test that finds it absent prints
 //! why and returns, so this suite is real wherever the authoring package is installed — Node
-//! 24 and `typescript` 5.9.3 in `packages/lanekeep`'s devDependencies — and skipped where it
+//! 24 and `typescript` 6.0.3 in `packages/lanekeep`'s devDependencies — and skipped where it
 //! is not. The **package** rather than `.bin/tsc`, because the driver loads the package
 //! through `createRequire` and never runs the binary; a machine with the shim and no package
 //! would skip nothing and fail. That is the gate `crates/lanekeep-types/src/tsc/driver.test.mjs`

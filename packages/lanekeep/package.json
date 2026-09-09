@@ -69,6 +69,6 @@
   "devDependencies": {
     "@bytecodealliance/componentize-js": "0.22.0",
     "@bytecodealliance/jco": "1.27.0",
-    "typescript": "5.9.3"
+    "typescript": "6.0.3"
   }
 }

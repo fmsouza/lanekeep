@@ -27,11 +27,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
 
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 # v2.87.9
         with:
           tool: cargo-audit
 
@@ -89,8 +89,13 @@ jobs:
           # Bytecode Alliance's Apache-2.0 WITH LLVM-exception, which is already on the
           # allow list above. The recipe pins it to 0.25.0 and `just py-rules` is the
           # only path that installs it.
+          #
+          # core_detect is rustc-demangle's shape again: `license = "MIT/Apache-2.0"`,
+          # reached through encoding_rs 0.8.41 under wasmtime, on x86 targets only —
+          # which is what this job runs on.
           allow-dependencies-licenses: >-
             pkg:cargo/rustc-demangle,
+            pkg:cargo/core_detect,
             pkg:pypi/componentize-py
 
   # OpenSSF Scorecard: branch protection, pinned actions, signed releases, and the
@@ -124,6 +129,6 @@ jobs:
           path: results.sarif
           retention-days: 5
 
-      - uses: github/codeql-action/upload-sarif@18420e3271f74589575af831a523c833acda327f # codeql-bundle-v2.26.2
+      - uses: github/codeql-action/upload-sarif@977e6ceaea7361825998245d787fa3b4d6b9e5df # codeql-bundle-v2.27.0
         with:
           sarif_file: results.sarif

@@ -38,7 +38,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
 
@@ -148,7 +148,7 @@ jobs:
 
       - name: Open the release pull request
         if: steps.inflight.outputs.inflight == 'no'
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        uses: release-plz/action@346832d73e3415c2ebd0432cba3a2bf5881e5f7d # v0.5.135
         with:
           command: release-pr
         env:
@@ -158,7 +158,7 @@ jobs:
       # GitHub release. `release-plz.toml` sets `publish = false`, so it does not touch a
       # registry — `release.yml` does that, on the tag.
       - name: Tag and create the GitHub release
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        uses: release-plz/action@346832d73e3415c2ebd0432cba3a2bf5881e5f7d # v0.5.135
         with:
           command: release
         env:

@@ -352,7 +352,8 @@ the type provider could not be used
 ```
 
 **Which TypeScript.** The driver is written against the TypeScript 5.x compiler API
-(`createProgram` and its neighbors) and measured against 5.9.3. It probes for that API in its
+(`createProgram` and its neighbors), measured against 5.9.3, and its tests run against 6.0.3 —
+the devDependency in `packages/lanekeep`, which still ships that API. It probes for it in its
 handshake and refuses, naming the version and the missing function, when the package does not
 provide it — the reference corpus is on TypeScript 7.0.2, whose package need not, and this
 provider was not measured against it. Two layouts to know about: a pnpm workspace has no root

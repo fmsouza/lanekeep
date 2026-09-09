@@ -323,7 +323,7 @@ impl CompiledQuery {
 
         while let Some(m) = matches.next() {
             let captures = m
-                .captures
+                .captures()
                 .iter()
                 .map(|capture| {
                     let name = self
