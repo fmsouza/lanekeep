@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/fmsouza/lanekeep/compare/v0.8.1...v0.9.0) - 2026-09-09
+
+### Added
+
+- *(lang-js)* per-function control-flow graph for TypeScript and TSX ([#209](https://github.com/fmsouza/lanekeep/pull/209))
+- seed taint at a source captured on a parameter binding ([#217](https://github.com/fmsouza/lanekeep/pull/217)) ([#219](https://github.com/fmsouza/lanekeep/pull/219))
+- *(types)* add the bounded within-file type oracle ([#198](https://github.com/fmsouza/lanekeep/pull/198))
+- *(config)* add `requires`, the per-rule opt-in for host analyses ([#196](https://github.com/fmsouza/lanekeep/pull/196))
+- *(rules)* typestate obligations via obligation/checkObligation ([#193](https://github.com/fmsouza/lanekeep/pull/193)) ([#213](https://github.com/fmsouza/lanekeep/pull/213))
+- taint analysis — flow / checkFlow, def-use over the CFG ([#194](https://github.com/fmsouza/lanekeep/pull/194)) ([#215](https://github.com/fmsouza/lanekeep/pull/215))
+- *(js)* expose the type oracle to rules as ctx.types ([#199](https://github.com/fmsouza/lanekeep/pull/199))
+- *(rules)* [**breaking**] no-restricted-types reads typed members ([#207](https://github.com/fmsouza/lanekeep/pull/207))
+- *(rules)* add no-restricted-types, the first built-in a type decides ([#200](https://github.com/fmsouza/lanekeep/pull/200))
+- *(rules)* add no-restricted-arguments rule to catch the inline case ([#204](https://github.com/fmsouza/lanekeep/pull/204))
+- *(types)* [**breaking**] cross-file, tsc and server-held oracle; field-aware taint ([#231](https://github.com/fmsouza/lanekeep/pull/231))
+- *(types)* resolver arms, .tsx sources, per-declaration parse faults ([#232](https://github.com/fmsouza/lanekeep/pull/232))
+- *(deps)* tree-sitter 0.27, rquickjs 0.13, typescript 6, actions ([#235](https://github.com/fmsouza/lanekeep/pull/235))
+
+### Documentation
+
+- re-baseline every document to the v0.8.1 tree ([#181](https://github.com/fmsouza/lanekeep/pull/181))
+- *(engine)* run_key names its input list rather than a count ([#210](https://github.com/fmsouza/lanekeep/pull/210))
+- *(tests)* a module factory is configured by the entry module ([#211](https://github.com/fmsouza/lanekeep/pull/211))
+- *(cli)* correct the stale factory claim on the init scaffold ([#214](https://github.com/fmsouza/lanekeep/pull/214))
+
+### Fixed
+
+- *(rules)* make no-secret-in-string honor its sanitizers ([#220](https://github.com/fmsouza/lanekeep/pull/220)) ([#222](https://github.com/fmsouza/lanekeep/pull/222))
+- honor a sanitizer wrapping a source in a compound sink ([#218](https://github.com/fmsouza/lanekeep/pull/218)) ([#221](https://github.com/fmsouza/lanekeep/pull/221))
+- *(config)* fold modules into ruleset_hash by name ([#230](https://github.com/fmsouza/lanekeep/pull/230)) ([#234](https://github.com/fmsouza/lanekeep/pull/234))
+- *(docs)* gates are not semantically neutral ([#206](https://github.com/fmsouza/lanekeep/pull/206))
+- *(config)* refuse a flow sanitizer capture that can never cut ([#223](https://github.com/fmsouza/lanekeep/pull/223)) ([#226](https://github.com/fmsouza/lanekeep/pull/226))
+- *(types)* [**breaking**] judge parse faults by node and complete() by what was read ([#233](https://github.com/fmsouza/lanekeep/pull/233))
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.8.1](https://github.com/fmsouza/lanekeep/compare/v0.8.0...v0.8.1) - 2026-08-29
 
 ### Fixed
