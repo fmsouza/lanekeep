@@ -373,13 +373,21 @@ impl Session {
     }
 }
 
+/// The URI an editor would send for a file in the tree.
+///
+/// The path as the test spelled it, not canonicalized: the server canonicalizes its root and
+/// has to meet the editor's spelling, which on macOS is `/var/folders` against the root's
+/// `/private/var/folders` and on Windows a short name against a long one behind `\\?\`, so a
+/// canonical URI here would let the server skip that. Rooted the way the LSP specification
+/// writes a `file:` URI, with the slash before a drive letter that a Windows path lacks.
 fn uri(tree: &Tree, relative: &str) -> String {
-    let path = tree
-        .dir
-        .canonicalize()
-        .unwrap_or_else(|_| tree.dir.clone())
-        .join(relative);
-    format!("file://{}", path.to_string_lossy().replace('\\', "/"))
+    let path = tree.dir.join(relative).to_string_lossy().replace('\\', "/");
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+    format!("file://{path}")
 }
 
 /// The whole agreement, for one provider.
