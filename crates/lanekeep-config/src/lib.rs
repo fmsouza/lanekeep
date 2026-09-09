@@ -1343,7 +1343,7 @@ fn build(
         .filter_map(|rule| rule.component.as_ref())
         .collect();
 
-    let ruleset_hash = hash_ruleset(sandbox, &components);
+    let ruleset_hash = hash_ruleset(sandbox, root.path(), &components);
     let config_hash = hash_config(
         &raw.include,
         &raw.exclude,
@@ -2662,6 +2662,36 @@ fn build_obligation(
     .transpose()
 }
 
+/// The name a loaded module folds into `ruleset_hash` under: its path relative to the rules
+/// root, `./`-joined the way [`relative_specifier`] spells a specifier — the shape a config
+/// writes its imports in, with the checkout left out.
+///
+/// Lexical, and not [`relative_specifier`] itself: that helper canonicalizes, and this fold
+/// works on what it was handed — the map's keys are already canonical, because the loader
+/// canonicalized them when it read, and `root` is the same canonical root they were confined
+/// against, so `strip_prefix` cannot fail on a real module. A canonicalize that failed — the
+/// file already gone, or the pseudo-paths below, which are not files at all — would have to
+/// fall back to something, and an absolute fallback here is the exact bug this fold exists to
+/// keep out.
+///
+/// The fallback answers the two keys that are not paths: the host module `lanekeep` and the
+/// built-ins, which arrive by the specifier they were asked for under and carry no checkout
+/// already. A file inside the root can never strip to one of those — resolution always lands
+/// on a name carrying an extension — so the two shapes cannot collide.
+fn module_key(path: &Path, root: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(relative) => format!(
+            "./{}",
+            relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
 /// Hash the code every rule in this run is made of: modules the loader read, and components.
 ///
 /// # A correction to the architecture
@@ -2687,10 +2717,14 @@ fn build_obligation(
 /// tree is a module, so dropping the walk would take almost the whole ruleset out of the cache
 /// key. So both are folded, and the module walk leaves when the last module does.
 ///
-/// A component is hashed by its **bytes and not its path**. A resolved component path is
-/// absolute, and putting it in would make the key depend on where the checkout sits — a cache
-/// invalidated by moving a directory, for nothing. Which component a rule *names* is
-/// `hash_config`'s to carry, through the specifier; this hash is about the code.
+/// A component is hashed by its **bytes and not its path**, and a module by its bytes plus its
+/// name relative to the rules root — the same claim for both, and for the same reason. Both
+/// arrive keyed by something that moves with the checkout (a resolved component path, a
+/// canonicalized module path), and putting either in would make the key depend on where the
+/// checkout sits — a cache invalidated by moving a directory, for nothing. Which component a
+/// rule *names* is `hash_config`'s to carry, through the specifier; this hash is about the
+/// code, plus enough of a module's name to keep two byte-identical files at different paths
+/// from collapsing into one.
 ///
 /// # A component is folded once, and each rule of it separately
 ///
@@ -2753,15 +2787,23 @@ fn build_obligation(
 /// makes that harder to get wrong than it was: the bytes come from the rules that were built,
 /// so whoever teaches the TypeScript path to name a component gets the fold for free rather
 /// than having to remember a second list.
-fn hash_ruleset(sandbox: &Sandbox, components: &[&ComponentRule]) -> Hash {
+fn hash_ruleset(sandbox: &Sandbox, root: &Path, components: &[&ComponentRule]) -> Hash {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lanekeep-ruleset-v2");
+    hasher.update(b"lanekeep-ruleset-v3");
 
     if let Some(loaded) = sandbox.loaded_modules() {
         // The map is ordered, so the hash does not depend on load order — which varies with
         // import structure and is not something the user changed.
+        //
+        // The name is the module's path relative to the rules root, and not the absolute path
+        // it was resolved to: that path moves with the checkout, and a key that moved with it
+        // would be thrown away by moving a directory, for nothing — the same charge the
+        // component half already refuses, and what
+        // `the_ruleset_hash_ignores_where_a_module_sits` pins. Which rules a config *names*
+        // is `hash_config`'s, through the specifier; this half is the code and where in the
+        // tree it sits, both of which survive a move.
         for (path, source) in loaded.borrow().iter() {
-            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(module_key(path, root).as_bytes());
             hasher.update(&[0]);
             hasher.update(source.as_bytes());
             hasher.update(&[0]);
@@ -3026,6 +3068,7 @@ mod tests {
 
     struct Fixture {
         dir: PathBuf,
+        root: PathBuf,
     }
 
     impl Fixture {
@@ -3033,7 +3076,11 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("lanekeep-config-{name}"));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("creates dir");
-            let fixture = Self { dir };
+            let root = RuleRoot::new(&dir)
+                .expect("canonicalizes")
+                .path()
+                .to_path_buf();
+            let fixture = Self { dir, root };
             fixture.write_all(files);
             fixture
         }
@@ -5423,9 +5470,9 @@ mod tests {
         let fixture = Fixture::new("component-bytes", &[("mine.wasm", "\u{0}asm-one")]);
         let sandbox = fixture.empty_sandbox();
 
-        let before = hash_ruleset(&sandbox, &[&fixture.component("mine.wasm")]);
+        let before = hash_ruleset(&sandbox, &fixture.root, &[&fixture.component("mine.wasm")]);
         fixture.write_all(&[("mine.wasm", "\u{0}asm-two")]);
-        let after = hash_ruleset(&sandbox, &[&fixture.component("mine.wasm")]);
+        let after = hash_ruleset(&sandbox, &fixture.root, &[&fixture.component("mine.wasm")]);
 
         assert_ne!(
             hex(&before),
@@ -5444,6 +5491,7 @@ mod tests {
 
         let one = hash_ruleset(
             &sandbox,
+            &fixture.root,
             &[
                 &fixture.component_at("a.wasm", 0),
                 &fixture.component_at("a.wasm", 1),
@@ -5451,6 +5499,7 @@ mod tests {
         );
         let twice = hash_ruleset(
             &sandbox,
+            &fixture.root,
             &[
                 &fixture.component_at("a.wasm", 0),
                 &fixture.component_at("a.wasm", 0),
@@ -5474,6 +5523,7 @@ mod tests {
         // two rules is folded exactly as it is when it is named twice.
         let listed_again = hash_ruleset(
             &sandbox,
+            &fixture.root,
             &[
                 &fixture.component_at("a.wasm", 0),
                 &fixture.component_at("a.wasm", 1),
@@ -5503,6 +5553,7 @@ mod tests {
 
         let dealt = hash_ruleset(
             &sandbox,
+            &fixture.root,
             &[
                 &fixture.component_at("a.wasm", 0),
                 &fixture.component_at("b.wasm", 1),
@@ -5510,6 +5561,7 @@ mod tests {
         );
         let swapped = hash_ruleset(
             &sandbox,
+            &fixture.root,
             &[
                 &fixture.component_at("a.wasm", 1),
                 &fixture.component_at("b.wasm", 0),
@@ -5539,8 +5591,8 @@ mod tests {
         configured.options = r#"{"limit":1}"#.to_owned();
 
         assert_ne!(
-            hex(&hash_ruleset(&sandbox, &[&bare])),
-            hex(&hash_ruleset(&sandbox, &[&configured])),
+            hex(&hash_ruleset(&sandbox, &fixture.root, &[&bare])),
+            hex(&hash_ruleset(&sandbox, &fixture.root, &[&configured])),
             "a component configured differently is a different ruleset"
         );
     }
@@ -5585,12 +5637,14 @@ mod tests {
         fixture.write_all(&[("a.wasm", "AA"), ("b.wasm", "BBCC")]);
         let split_early = hash_ruleset(
             &sandbox,
+            &fixture.root,
             &[&fixture.component("a.wasm"), &fixture.component("b.wasm")],
         );
 
         fixture.write_all(&[("a.wasm", "AABB"), ("b.wasm", "CC")]);
         let split_late = hash_ruleset(
             &sandbox,
+            &fixture.root,
             &[&fixture.component("a.wasm"), &fixture.component("b.wasm")],
         );
 
@@ -5616,12 +5670,80 @@ mod tests {
         let sandbox = fixture.empty_sandbox();
 
         assert_eq!(
-            hex(&hash_ruleset(&sandbox, &[&fixture.component("a.wasm")])),
             hex(&hash_ruleset(
                 &sandbox,
+                &fixture.root,
+                &[&fixture.component("a.wasm")]
+            )),
+            hex(&hash_ruleset(
+                &sandbox,
+                &fixture.root,
                 &[&fixture.component("nested/b.wasm")]
             )),
             "the same component bytes are the same ruleset wherever they sit"
+        );
+    }
+
+    #[test]
+    fn the_ruleset_hash_ignores_where_a_module_sits() {
+        // The module half of `the_ruleset_hash_ignores_where_a_component_sits`, which pins the
+        // same property for components. The fold used to hash each module's absolute path, so
+        // two byte-identical checkouts keyed differently — a cache invalidated by moving a
+        // directory, for a change to nothing a rule can observe. **The mutant this
+        // discriminates is a fold of the path a module was resolved to instead of the name it
+        // sits at relative to the root** — exactly what the pre-fix fold did — and the last
+        // assertion keeps the equality honest against a mutant that buys it by hashing nothing
+        // at all: the bytes are still in, which `the_ruleset_hash_covers_an_imported_helper`
+        // proves in general and this re-proves at the moved location.
+        let files: &[(&str, &str)] = &[
+            ("rule.ts", &rule("local/example")),
+            ("lanekeep.config.ts", &config_with("rules: [rule]")),
+        ];
+        let short = Fixture::new("module-sits-aa", files);
+        let long = Fixture::new("module-sits-aaaaaaaaaaaaaaaaaaaaaaaa", files);
+
+        let here = short.load_config().expect("loads").ruleset_hash;
+        let there = long.load_config().expect("loads").ruleset_hash;
+        assert_eq!(
+            hex(&here),
+            hex(&there),
+            "the same modules are the same ruleset wherever the checkout sits"
+        );
+
+        // Not equal, or the fold went empty — an edit in the moved tree must still move the
+        // key, which is what keeps the equality above from being the fold hashing nothing.
+        long.write_all(&[("rule.ts", &rule("local/renamed"))]);
+        let edited = long.load_config().expect("loads").ruleset_hash;
+        assert_ne!(
+            hex(&there),
+            hex(&edited),
+            "the equality above must not be the fold hashing nothing — an edit in the moved \
+             tree must still invalidate"
+        );
+    }
+
+    #[test]
+    fn a_module_folds_under_its_relative_name_and_pseudo_paths_fold_whole() {
+        // The seam the real-load tests above cannot isolate: a pure rename within the tree
+        // always edits the importer's bytes too, so no test through `load` can tell a fold of
+        // the relative name from a fold of the bytes in map order — a `module_key` that
+        // returned an empty string for every real module would keep them all green. This
+        // helper is pure, so its half is pinned directly: the spelling a config's specifiers
+        // use, and the two pseudo-paths folded whole.
+        let root = Path::new("/checkout/rules");
+        assert_eq!(
+            module_key(&root.join("nested/rule.ts"), root),
+            "./nested/rule.ts"
+        );
+        assert_eq!(
+            module_key(Path::new("lanekeep/no-restricted-types"), root),
+            "lanekeep/no-restricted-types",
+            "built-ins arrive by specifier, not by path, and fold whole"
+        );
+        assert_eq!(
+            module_key(Path::new("lanekeep"), root),
+            "lanekeep",
+            "the host module arrives by specifier too"
         );
     }
 
@@ -5639,15 +5761,15 @@ mod tests {
         let one = fixture.component("one.wasm");
         let two = fixture.component("two.wasm");
 
-        let canonical = hex(&hash_ruleset(&sandbox, &[&one, &two]));
+        let canonical = hex(&hash_ruleset(&sandbox, &fixture.root, &[&one, &two]));
         assert_eq!(
             canonical,
-            hex(&hash_ruleset(&sandbox, &[&two, &one])),
+            hex(&hash_ruleset(&sandbox, &fixture.root, &[&two, &one])),
             "reordering two components is not a different ruleset"
         );
         assert_eq!(
             canonical,
-            hex(&hash_ruleset(&sandbox, &[&one, &two, &one])),
+            hex(&hash_ruleset(&sandbox, &fixture.root, &[&one, &two, &one])),
             "naming one component twice is not a different ruleset"
         );
     }
@@ -5709,8 +5831,8 @@ mod tests {
         );
 
         assert_ne!(
-            hex(&hash_ruleset(&sandbox, &[&before, &after])),
-            hex(&hash_ruleset(&sandbox, &[&before, &again])),
+            hex(&hash_ruleset(&sandbox, &fixture.root, &[&before, &after])),
+            hex(&hash_ruleset(&sandbox, &fixture.root, &[&before, &again])),
             "two rulesets whose rules fold agrees but whose second component's bytes differ \
              must not key equal — a component fold that hashed the count of distinct programs \
              but not the bytes made these equal"
@@ -5739,7 +5861,7 @@ mod tests {
                 sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
             evaluate_into(&sandbox, &root, &fixture.dir.join("lanekeep.config.ts"))
                 .expect("evaluates");
-            hash_ruleset(&sandbox, &[&mine])
+            hash_ruleset(&sandbox, &fixture.root, &[&mine])
         };
 
         assert_ne!(
@@ -7233,6 +7355,36 @@ mod tests {
         let first = fixture.load_json().expect("loads").ruleset_hash;
         let second = fixture.load_json().expect("loads").ruleset_hash;
         assert_eq!(hex(&first), hex(&second));
+    }
+
+    #[test]
+    fn the_ruleset_hash_ignores_where_a_module_sits_for_json() {
+        // The JSON twin, for the reason the matched pair above every one of these gives: the
+        // fold is the loader's, shared by both config formats, and a property that held on one
+        // path and not the other would be drift in a cache key.
+        let files: &[(&str, &str)] = &[
+            ("rule.ts", &rule("local/example")),
+            ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+        ];
+        let short = Fixture::new("json-module-sits-aa", files);
+        let long = Fixture::new("json-module-sits-aaaaaaaaaaaaaaaaaaaa", files);
+
+        let here = short.load_json().expect("loads").ruleset_hash;
+        let there = long.load_json().expect("loads").ruleset_hash;
+        assert_eq!(
+            hex(&here),
+            hex(&there),
+            "the same modules are the same ruleset wherever the checkout sits"
+        );
+
+        long.write_all(&[("rule.ts", &rule("local/renamed"))]);
+        let edited = long.load_json().expect("loads").ruleset_hash;
+        assert_ne!(
+            hex(&there),
+            hex(&edited),
+            "the equality above must not be the fold hashing nothing — an edit in the moved \
+             tree must still invalidate"
+        );
     }
 
     #[test]
