@@ -170,7 +170,7 @@ Each of these is a stated v1 scope decision, not an oversight — see
   `unmet.acquire` — it is just a poor fit: a fix replaces one node's text, and the remedy is
   almost always a `finally` that does not exist yet, not a replacement of the node the
   violation is reported on. Put the whole remedy in `card.remediation` instead.
-- **Not skipped by `--since` or `--staged`.** Unlike a cross-file `reduce` rule, an obligation
+- **Not skipped by `--since`, `--staged` or `--file`.** Unlike a cross-file `reduce` rule, an obligation
   rule is per-file and needs no whole-corpus view, so it runs — and can find something — over
   however small a set of changed files you give it. It is safe, and useful, in a pre-commit
   hook.

@@ -734,10 +734,10 @@ because it means something: it reports when the callee's own binding is tainted
 (`const h = getSecret(); h()`) and is silent for `log(x)`, which is why a rule about the
 argument captures the argument.
 
-### It runs under `--since` and `--staged`
+### It runs under `--since`, `--staged` and `--file`
 
 The analysis is per file and per function, so unlike a [cross-file rule](cross-file-rules.md)
-this one is never skipped by `--since` or `--staged`: a flow over three changed files is exactly
+this one is never skipped by `--since`, `--staged` or `--file`: a flow over three changed files is exactly
 as sound as one over the whole tree, and a pre-commit hook is where this rule does its best work.
 
 ### The analysis this rule rides on, and what a clean report does and does not mean
@@ -1300,7 +1300,7 @@ flagged like any other pair.
 
 ### Full runs only
 
-Like every cross-file rule, this one is skipped under `--since` and `--staged` with a stderr
+Like every cross-file rule, this one is skipped under `--since`, `--staged` and `--file` with a stderr
 notice naming it ([`architecture.md`](architecture.md) §8.4) — it reports on full runs only.
 
 ---

@@ -48,7 +48,7 @@ pub mod violation;
 
 pub use card::{CardProblem, Examples, RuleCard};
 pub use changed::ChangeError;
-pub use discovery::{Discovery, DiscoveryError};
+pub use discovery::{Discovery, DiscoveryError, Rejection};
 pub use fact::Fact;
 pub use files::{FileAccess, ReadError};
 pub use fix::Fix;

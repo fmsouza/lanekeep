@@ -86,6 +86,18 @@ enum Command {
         #[arg(long)]
         staged: bool,
 
+        /// Check exactly these files, resolved against the project root. Repeatable.
+        ///
+        /// The third way to narrow a run, beside `--since` and `--staged`, and the one
+        /// that needs no git: an editor, an agent host, or anyone bisecting a rule can
+        /// name a file they have not touched.
+        ///
+        /// Still intersected with discovery, so `include` and `exclude` stay in force. A
+        /// file the config does not check is an error naming why — never a silent skip,
+        /// which would read as "the rule found nothing".
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["since", "staged"])]
+        file: Vec<String>,
+
         /// Report where the run spent its time and what each rule looked at, per rule.
         ///
         /// Two tables on stderr. The first splits time between query matching and handler
@@ -206,6 +218,7 @@ fn run() -> anyhow::Result<ExitCode> {
             no_cache,
             since,
             staged,
+            file,
             report_unused_suppressions,
             fix,
             profile,
@@ -216,7 +229,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 config: config.as_deref(),
                 format: &format,
                 timeout,
-                selection: Selection::from(since.clone(), staged),
+                selection: Selection::from(file.clone(), since.clone(), staged),
                 switches: Switches {
                     warn_only,
                     no_cache,
@@ -250,7 +263,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 config: config.as_deref(),
                 format: &format,
                 timeout,
-                selection: Selection::from(since, staged),
+                selection: Selection::from(file, since, staged),
                 switches: Switches {
                     warn_only,
                     no_cache,
@@ -393,10 +406,16 @@ enum Selection {
     Since(String),
     /// Files staged in the index.
     Staged,
+    /// Exactly the files named by `--file`, as given; `resolve` normalizes them
+    /// against the project root.
+    Files(Vec<String>),
 }
 
 impl Selection {
-    fn from(since: Option<String>, staged: bool) -> Self {
+    fn from(files: Vec<String>, since: Option<String>, staged: bool) -> Self {
+        if !files.is_empty() {
+            return Self::Files(files);
+        }
         match (since, staged) {
             (Some(reference), _) => Self::Since(reference),
             (None, true) => Self::Staged,
@@ -414,6 +433,7 @@ impl Selection {
             Self::All => "",
             Self::Since(_) => "--since",
             Self::Staged => "--staged",
+            Self::Files(_) => "--file",
         }
     }
 
@@ -430,7 +450,47 @@ impl Selection {
                 reference,
             )?)),
             Self::Staged => Ok(Some(lanekeep_core::changed::staged(project_root)?)),
+            Self::Files(named) => Ok(Some(Self::named(project_root, named)?)),
         }
+    }
+
+    /// Resolve `--file` arguments to root-relative paths, or fail naming the argument.
+    ///
+    /// Canonicalize first (so `..`, `./` and duplicate separators all land on one
+    /// answer), then strip the canonical root — the same canonicalization `Discovery`
+    /// does, so the result is comparable with `discover()`'s output. Canonicalization
+    /// resolves symlinks, so a named link is checked as its target, and a link pointing
+    /// outside the root is refused as not under the project root — the same rule
+    /// discovery applies to the walk.
+    fn named(project_root: &Path, args: &[String]) -> anyhow::Result<Vec<FilePath>> {
+        let root = project_root.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "--file: cannot read project root `{}`: {e}",
+                project_root.display()
+            )
+        })?;
+        let mut out = Vec::new();
+        for arg in args {
+            let canonical = project_root.join(arg).canonicalize().map_err(|e| {
+                anyhow::anyhow!(
+                    "--file {arg}: no such file under the project root `{}`: {e}",
+                    project_root.display()
+                )
+            })?;
+            if !canonical.is_file() {
+                anyhow::bail!("--file {arg}: it is a directory, and --file names files");
+            }
+            let relative = canonical.strip_prefix(&root).map_err(|_| {
+                anyhow::anyhow!(
+                    "--file {arg}: not under the project root `{}`",
+                    project_root.display()
+                )
+            })?;
+            out.push(FilePath::new(relative));
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 }
 
@@ -1455,14 +1515,16 @@ fn note_provider(engine: &Engine) -> anyhow::Result<()> {
 /// Run the engine over a selection, or over everything when there is none.
 ///
 /// Extracted from `check` for its length; the reason it is not a one-liner is the
-/// intersection.
+/// intersection. A `--file` selection is validated before reaching here — every name it
+/// carries is in discovery — so the intersection below never silently drops one.
 fn run_selected(
     engine: &Engine,
     selected: Option<Vec<FilePath>>,
 ) -> Result<Outcome, lanekeep_engine::RunError> {
     match selected {
         // Intersected with discovery rather than used directly, so `include` and `exclude`
-        // stay in force — `--staged` must not check a file the config excluded.
+        // stay in force — no selection, git's or `--file`'s, may check a file the config
+        // excluded.
         Some(selected) => {
             let wanted: BTreeSet<&FilePath> = selected.iter().collect();
             let files: Vec<FilePath> = engine
@@ -1474,6 +1536,45 @@ fn run_selected(
         }
         None => engine.run(),
     }
+}
+
+/// A named file discovery would not take is an error, not a silent skip: a clean result
+/// over a file the user named reads as "the rule found nothing", and checking it anyway
+/// would contradict the config. The reason is named, the way an unresolvable ref is an
+/// error — from the caller's side both are the same shape of mistake: the run they asked
+/// for is not the run that would have happened.
+fn validate_named(engine: &Engine, selected: Option<&[FilePath]>) -> anyhow::Result<()> {
+    let Some(files) = selected else {
+        return Ok(());
+    };
+    let discovered: BTreeSet<FilePath> = engine.discover().into_iter().collect();
+    for file in files {
+        if discovered.contains(file) {
+            continue;
+        }
+        let reason = match engine.discovery().rejects(file) {
+            Some(lanekeep_core::Rejection::Lanekeep) => {
+                "it is lanekeep's own directory, which nothing can include".to_owned()
+            }
+            Some(lanekeep_core::Rejection::Excluded { pattern }) => {
+                format!("an `exclude` pattern matches it: `{pattern}`")
+            }
+            Some(lanekeep_core::Rejection::NotIncluded) => {
+                "no `include` pattern matches it".to_owned()
+            }
+            // The globs select it but the walk left it out. The walk honors more than
+            // `.gitignore` — `.ignore` files, the global gitignore, a directory it could
+            // not read — so the reason names the walk rather than guessing one rule.
+            None => "the walk skips it — a `.gitignore` or `.ignore` rule, or a directory \
+                     it could not read"
+                .to_owned(),
+        };
+        anyhow::bail!(
+            "--file {file}: discovery does not select it\n  {reason}\n  \
+             a file selection is intersected with discovery, so `include` and `exclude` stay in force"
+        );
+    }
+    Ok(())
 }
 
 fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
@@ -1517,6 +1618,15 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     note_provider(&engine)?;
 
     let selected = selection.resolve(project_root)?;
+
+    // A named file discovery would not take is an error, not a silent skip: a clean
+    // result over a file the user named reads as "the rule found nothing", and checking
+    // it anyway would contradict the config. `--since` and `--staged` stay silent on the
+    // same intersection because their lists are git's view, not the user's naming.
+    if let Selection::Files(_) = &selection {
+        validate_named(&engine, selected.as_deref())?;
+    }
+
     let cross_file: Vec<String> = engine
         .rules()
         .filter(|spec| spec.has_reduce)
@@ -1732,10 +1842,10 @@ fn explain(
     writeln!(stdout, "Good: {}", spec.card.examples.good)?;
 
     if spec.has_reduce {
-        // Worth stating: it changes what `--since` and `--staged` do with the rule.
+        // Worth stating: it changes what `--since`, `--staged` and `--file` do with the rule.
         writeln!(
             stdout,
-            "\nThis rule reads the whole corpus, so --since and --staged skip it."
+            "\nThis rule reads the whole corpus, so --since, --staged and --file skip it."
         )?;
     }
 
@@ -1757,6 +1867,29 @@ fn explain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three spellings of one file are one file — the same normalization `Discovery`'s
+    /// walk applies, so a named file is comparable with `discover()`'s output.
+    #[test]
+    fn named_files_normalize_and_dedup() {
+        let dir = std::env::temp_dir().join(format!("lanekeep-named-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("creates the fixture");
+        std::fs::write(dir.join("src/a.ts"), "const a = 1;\n").expect("writes");
+
+        let named = Selection::named(
+            &dir,
+            &[
+                "src/a.ts".to_owned(),
+                "./src/a.ts".to_owned(),
+                "src//a.ts".to_owned(),
+            ],
+        )
+        .expect("resolves");
+        assert_eq!(named, [FilePath::new("src/a.ts")]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A failed iteration clears the watcher's allowlist rather than leaving the last good
     /// one in place.

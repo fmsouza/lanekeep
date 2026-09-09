@@ -39,6 +39,20 @@ pub enum DiscoveryError {
     },
 }
 
+/// Why discovery would not take a file, asked without walking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rejection {
+    /// It is inside lanekeep's own directory, which no configuration includes.
+    Lanekeep,
+    /// An `exclude` glob matched it.
+    Excluded {
+        /// The pattern that matched, as the config wrote it.
+        pattern: String,
+    },
+    /// `include` is non-empty and no pattern in it matched.
+    NotIncluded,
+}
+
 /// Which files a run considers.
 #[derive(Debug)]
 pub struct Discovery {
@@ -46,6 +60,7 @@ pub struct Discovery {
     include: GlobSet,
     exclude: GlobSet,
     has_include: bool,
+    exclude_patterns: Vec<String>,
 }
 
 impl Discovery {
@@ -73,6 +88,7 @@ impl Discovery {
             include: build_set(include, "include")?,
             exclude: build_set(exclude, "exclude")?,
             has_include: !include.is_empty(),
+            exclude_patterns: exclude.to_vec(),
         })
     }
 
@@ -82,7 +98,10 @@ impl Discovery {
         &self.root
     }
 
-    /// Whether a path relative to the root is selected.
+    /// Why a path relative to the root would not be checked, without walking.
+    ///
+    /// `None` means the globs select it; the walk may still leave it out (a `.gitignore`
+    /// rule), which only the walk can see.
     ///
     /// Exclusion wins over inclusion: a project listing a broad `include` and a narrow
     /// `exclude` means the exclusion, and the other order would make `exclude` useless.
@@ -91,17 +110,32 @@ impl Discovery {
     /// directory — the cache, the precompiled components, the `tsc` driver — and nothing in it
     /// was written by the project. See `in_lanekeep_directory` below for the whole reasoning.
     #[must_use]
-    pub fn selects(&self, relative: &FilePath) -> bool {
+    pub fn rejects(&self, relative: &FilePath) -> Option<Rejection> {
         let path = relative.as_str();
         if in_lanekeep_directory(path) {
-            return false;
+            return Some(Rejection::Lanekeep);
         }
-        if self.exclude.is_match(path) {
-            return false;
+        // `is_match` short-circuits, which is what keeps `selects` cheap on the walk's hot
+        // path; the full scan runs only for a file a rejection will quote, to name the
+        // pattern as the config wrote it.
+        if self.exclude.is_match(path)
+            && let Some(index) = self.exclude.matches(path).first()
+        {
+            return Some(Rejection::Excluded {
+                pattern: self.exclude_patterns[*index].clone(),
+            });
         }
-        // No `include` at all means everything the walk turned up, which is the useful
-        // default for `lanekeep check` in a small project.
-        !self.has_include || self.include.is_match(path)
+        if self.has_include && !self.include.is_match(path) {
+            return Some(Rejection::NotIncluded);
+        }
+        None
+    }
+
+    /// Whether a path relative to the root is selected. See `rejects` for why a path is
+    /// not.
+    #[must_use]
+    pub fn selects(&self, relative: &FilePath) -> bool {
+        self.rejects(relative).is_none()
     }
 
     /// Every selected file, sorted.
@@ -380,5 +414,36 @@ mod tests {
         assert!(discovery.selects(&FilePath::new("src/a.ts")));
         assert!(!discovery.selects(&FilePath::new("src/a.test.ts")));
         assert!(!discovery.selects(&FilePath::new("other/a.ts")));
+    }
+
+    #[test]
+    fn rejects_names_the_clause_that_would_drop_a_file() {
+        let fixture = Fixture::new("rejects", &["src/a.ts", "vendor/x.ts"]);
+        let discovery = Discovery::new(
+            &fixture.dir,
+            &["src/**/*.ts".to_owned()],
+            &["vendor/**".to_owned()],
+        )
+        .expect("builds");
+
+        assert_eq!(
+            discovery.rejects(&FilePath::new("src/a.ts")),
+            None,
+            "a file the globs select is not rejected"
+        );
+        assert_eq!(
+            discovery.rejects(&FilePath::new("vendor/x.ts")),
+            Some(Rejection::Excluded {
+                pattern: "vendor/**".to_owned()
+            }),
+        );
+        assert_eq!(
+            discovery.rejects(&FilePath::new("other/a.ts")),
+            Some(Rejection::NotIncluded),
+        );
+        assert_eq!(
+            discovery.rejects(&FilePath::new(".lanekeep/driver.mjs")),
+            Some(Rejection::Lanekeep),
+        );
     }
 }

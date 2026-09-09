@@ -1686,6 +1686,15 @@ impl Engine {
         self.discovery.walk()
     }
 
+    /// Discovery itself, for a caller that must explain a selection's rejection.
+    ///
+    /// `discover()` answers what is selected; this answers *why* something is not, via
+    /// `Discovery::rejects`.
+    #[must_use]
+    pub fn discovery(&self) -> &Discovery {
+        &self.discovery
+    }
+
     /// How many rules will actually run. Rules set to `off` are dropped at preparation.
     #[must_use]
     pub fn rule_count(&self) -> usize {
@@ -1713,7 +1722,7 @@ impl Engine {
         self.run_files(&files, Coverage::Whole)
     }
 
-    /// Run over an explicit file list, for `--since` and `--staged`.
+    /// Run over an explicit file list, for `--since`, `--staged` and `--file`.
     ///
     /// # Errors
     ///
