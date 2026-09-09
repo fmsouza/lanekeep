@@ -39,22 +39,31 @@ use lanekeep_core::files::{FileAccess, normalize};
 /// Extensions tried for a relative specifier, in order.
 ///
 /// The source file before the declaration file: a `.d.ts` beside a `.ts` in one tree is a
-/// build artifact that can be stale, and the source is what the program means.
+/// build artifact that can be stale, and the source is what the program means. `.tsx` sits
+/// directly after `.ts`, and `/index.tsx` after `/index.ts` — TypeScript's own resolution
+/// order, which reads the source before the declaration file beside it.
 ///
-/// **`.tsx` and `.jsx` are deliberately absent, and that costs more than a declaration file.**
-/// This provider parses everything it opens with the TypeScript grammar — chosen by name, see
-/// `provider_language` in `lanekeep-engine` — under which every JSX element is an `ERROR` node
-/// with no error reported anywhere, the trap that produced 2218 false positives in one rule. A
-/// file this cannot read honestly is one it does not read.
-///
-/// What that gives up is **project sources**, not declaration files. A declaration file is
-/// never TSX, so nothing is lost in `node_modules`; but `import { Button } from './Button'`
-/// with `Button.tsx` beside it matches none of the suffixes above, records six absent reads,
-/// answers `undefined` for every name it brought in, and makes the importing file
-/// `complete() == false`. On a React codebase that is most sibling imports. A stated
-/// limitation rather than a bug to be surprised by — the refinement is filed with the
-/// resolver's own issue.
-const RELATIVE_SUFFIXES: &[&str] = &[".ts", ".mts", ".cts", ".d.ts", "/index.ts", "/index.d.ts"];
+/// **`.tsx` is probed; `.jsx` remains deliberately absent.** A `.jsx` file is JavaScript,
+/// which this provider does not read at all, so probing it could only record eight absent
+/// reads per import. A `.tsx` file is TypeScript — one grammar wider — and is reached often
+/// enough on a React codebase that refusing it made most sibling imports resolve to
+/// nothing, every name they brought in answer `undefined`, and the importing file
+/// `complete() == false`. What a `.tsx` costs is a second *parser*: the provider that cannot
+/// parse JSX honestly — one built with no tsx grammar — still refuses it, at the **parse**
+/// step, where the `ERROR` nodes JSX becomes under the TypeScript grammar are counted by
+/// `has_error` and the importing file is reported incomplete. An honest incompleteness
+/// rather than a silent wrong answer, which is the property the old refusal existed to
+/// protect.
+const RELATIVE_SUFFIXES: &[&str] = &[
+    ".ts",
+    ".tsx",
+    ".mts",
+    ".cts",
+    ".d.ts",
+    "/index.ts",
+    "/index.tsx",
+    "/index.d.ts",
+];
 
 /// Resolve `specifier`, written in `from`, to a file inside the project root.
 ///

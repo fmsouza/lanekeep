@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use lanekeep_config::{Config, TypesConfig};
 use lanekeep_core::FileAccess;
 use lanekeep_engine::RunError;
-use lanekeep_lang_js::TypeScript;
+use lanekeep_lang_js::{Tsx, TypeScript};
 use lanekeep_types::TypeProvider;
 
 /// One provider, held for the length of a session.
@@ -78,6 +78,10 @@ impl SessionProvider {
                 &config.types,
                 project_root,
                 Some(&TypeScript),
+                // The second grammar beside the first, the way the engine's own run path
+                // reads both out of its registry: a session's provider answers a `.tsx`
+                // sibling the same honest parse a one-shot run's does.
+                Some(&Tsx),
                 lanekeep_core::AnalysisBudget::start(config.limits.analysis_timeout),
             )
         })

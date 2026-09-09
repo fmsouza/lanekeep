@@ -1203,7 +1203,7 @@ impl Engine {
             // that speaks no TypeScript is no reason for a `tsc` run to have no provider.
             None => match config.types.provider {
                 TypesProvider::Tsc => {
-                    match provider_for(&config.types, project_root, None, analysis.clone()) {
+                    match provider_for(&config.types, project_root, None, None, analysis.clone()) {
                         Ok(started) => Some(started),
                         // A spent budget is a limit, not a missing toolchain, and it is the
                         // one error from here the capability gate must not re-word: the
@@ -1219,10 +1219,14 @@ impl Engine {
                 }
                 TypesProvider::Builtin => match provider_language(registry) {
                     None => None,
+                    // The second grammar read out of the same registry the main one was:
+                    // `by_id("tsx")` beside `provider_language`'s `by_id("typescript")`, so a
+                    // run's provider can read the `.tsx` siblings its resolver reaches.
                     Some(language) => Some(provider_for(
                         &config.types,
                         project_root,
                         Some(language.as_ref()),
+                        registry.by_id("tsx").map(AsRef::as_ref),
                         analysis.clone(),
                     )?),
                 },
@@ -4059,6 +4063,11 @@ const TSC_LANGUAGES: &[&str] = &["typescript", "tsx", "javascript", "jsx"];
 /// requiring a grammar would make a `tsc` run depend on a registry it never reads. The builtin
 /// arm refuses a `None` the same way it refuses a grammar that fails its probe.
 ///
+/// `tsx` is the second grammar, for the `.tsx` files the resolver now reaches; a run without
+/// one still works, and its provider answers a `.tsx` import from the main grammar, whose
+/// `ERROR` nodes make the importing file honestly incomplete. Like `language`, it is an
+/// `Option` because the `tsc` arm parses nothing itself.
+///
 /// # Errors
 ///
 /// [`RunError::Provider`] when the grammar is absent or does not answer the builtin oracle's
@@ -4068,11 +4077,12 @@ pub fn provider_for(
     config: &TypesConfig,
     project_root: &Path,
     language: Option<&dyn Language>,
+    tsx: Option<&dyn Language>,
     budget: AnalysisBudget,
 ) -> Result<Arc<dyn TypeProvider>, RunError> {
     match config.provider {
         TypesProvider::Builtin => language
-            .and_then(BuiltinProvider::probe)
+            .and_then(|language| BuiltinProvider::probe_with(language, tsx))
             .map(|p| Arc::new(p) as Arc<dyn TypeProvider>)
             .ok_or_else(|| RunError::Provider {
                 detail: "the TypeScript grammar did not answer the type oracle's probe".to_owned(),
@@ -4686,10 +4696,13 @@ mod tests {
         // found here rather than by a user whose run suddenly needed Node.
         let registry = lanekeep_lang_js::registry();
         let language = provider_language(&registry).expect("the registry speaks TypeScript");
+        // No second grammar: the invariant this pins is "built from the grammar
+        // `provider_language` picked", so the expected side is `probe`, which takes none.
         let built = provider_for(
             &TypesConfig::default(),
             Path::new("."),
             Some(language.as_ref()),
+            None,
             AnalysisBudget::start(Duration::from_secs(1)),
         )
         .expect("the builtin provider needs no toolchain");
