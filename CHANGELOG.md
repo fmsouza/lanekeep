@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/fmsouza/lanekeep/compare/v0.9.0...v0.10.0) - 2026-09-09
+
+### Added
+
+- *(cli)* add a repeatable --file selection to check ([#240](https://github.com/fmsouza/lanekeep/pull/240))
+
+### Fixed
+
+- *(authoring)* [**breaking**] a reduce report's fix is refused, not dropped ([#238](https://github.com/fmsouza/lanekeep/pull/238)) ([#239](https://github.com/fmsouza/lanekeep/pull/239))
+
 ## [0.9.0](https://github.com/fmsouza/lanekeep/compare/v0.8.1...v0.9.0) - 2026-09-09
 
 ### Added
