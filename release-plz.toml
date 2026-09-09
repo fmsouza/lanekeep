@@ -155,3 +155,18 @@ changelog_include = [
   "lanekeep-types",
   "lanekeep-wasm",
 ]
+
+# The one crate the semver check cannot reach. `lanekeep-rules` builds its WebAssembly
+# components in `build.rs` — TinyGo, `cargo component`, Node and `jco` — and refuses to
+# compile when an artifact is absent and cannot be rebuilt, which in a fresh clone it always
+# is: the components are gitignored. cargo-semver-checks builds the local crate from exactly
+# such a clone, so the check dies in the build script before it reads a single item.
+#
+# For as long as release-plz swallowed that, the release pull request reported "✓ API
+# compatible changes" for a crate it had never built. release-plz 0.3.163 detects
+# cargo-semver-checks failures, and the first run after moving to 0.3.164 failed here instead.
+# What the check would cover is a rule table and a handful of `include_bytes!`es; every other
+# crate keeps it.
+[[package]]
+name = "lanekeep-rules"
+semver_check = false
