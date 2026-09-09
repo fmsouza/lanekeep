@@ -74,39 +74,39 @@ Under the builtin provider, always:
 - **Conditional, mapped, function and object types.** Each would need an abstraction the
   bounded oracle does not have, and guessing is worse than silence.
 - **Declaration merging**, and ambient `declare module` blocks as a resolution source.
-- **`.tsx` files reached through an import**, project sources included. The provider parses
-  everything it opens with the TypeScript grammar, under which every JSX element is an `ERROR`
-  node with nothing reported anywhere, so a file it cannot read honestly is one it does not
-  read. The grammar is selected by name rather than by taking whichever registered language
-  answers first — `tsx` sorts before `typescript`, and picking it would parse every `.ts` file
-  the provider opens with the wrong dialect. A declaration file is never TSX, so nothing is
-  lost in `node_modules` — but a **project source** is another matter: `import { Button } from
-  './Button'` with `Button.tsx` beside it resolves to nothing, records six absent reads, and
-  makes the importing file `complete() === false`. On a React codebase that is most sibling
-  imports, so a rule there should expect `complete()` to answer `false` far more often than
-  the missing-`node_modules` case suggests. A stated limitation of this release; the
-  refinement is filed with the resolver's own issue.
 - **A destructured binding.** `function f({ amount }: Money)` types `amount` as nothing —
   reading the pattern's own annotation would hand every name the whole thing's type.
 - **A type parameter.** `interface O<T> { x: T }` types `x` as nothing, because `T` is whatever
   the call site chose.
 
-And, situationally: anything behind an import that did not resolve. `complete()` is how a rule
-finds out that happened — with two deliberate exclusions. An import that resolves to a file
-which does not *parse* counts as unread, because the names outside the broken span answer while
-the ones inside it come back `undefined` and nothing on either answer says which. And an import
-of something that is not code — `./app.css`, `./data.json`, `./logo.svg` — is not counted at
-all: it is not a module the oracle reads, and counting it would label most of a bundler's
-project incomplete for having stylesheets. A specifier is skipped only when its last segment
-carries a known asset extension, never when it merely looks like one: `./user.service`,
-`./auth.guard` and the rest of the NestJS and Angular vocabulary are modules and are probed.
+A `.tsx` project source — `Button.tsx` beside `import { Button } from './Button'` — resolves
+and answers like any other source: the provider carries a second parser, in the TSX grammar,
+chosen by the resolved path's extension, so JSX is read rather than swallowed into `ERROR`
+nodes. A run whose registry has no `tsx` grammar at all keeps the old refusal, honestly: a
+sibling whose JSX the TypeScript grammar cannot read then fails to parse and the importing
+file reports `complete() === false`. `.jsx` files stay unread — they are JavaScript, which
+this provider does not read at all.
 
-**The verdict is the whole file's, and a parse fault is the whole declaration file's.** One
-`ERROR` node anywhere in a fifty-thousand-line `@types` bundle makes every file that imports it
-`complete() === false`, however far that span is from the names the rule asked about. Silence is
-the safe direction — a rule told the view is partial stays quiet, where a narrower verdict that
-was wrong would let it report — so the coarse answer is what this release gives; an `ERROR`
-covering the *asked* name is a refinement filed with the resolver's own issue.
+And, situationally: anything behind an import that did not resolve. `complete()` is how a rule
+finds out that happened — with two deliberate exclusions. An import of something that is not
+code — `./app.css`, `./data.json`, `./logo.svg` — is not counted at all: it is not a module the
+oracle reads, and counting it would label most of a bundler's project incomplete for having
+stylesheets. A specifier is skipped only when its last segment carries a known asset extension,
+never when it merely looks like one: `./user.service`, `./auth.guard` and the rest of the
+NestJS and Angular vocabulary are modules and are probed. And an import whose target resolves
+is still judged by what the walk *reaches*, not by the whole file it landed in — that is the
+next paragraph.
+
+**The parse-fault verdict is per reached declaration.** `complete()` walks every *named* import
+to the node that declares it and answers `false` only when an `ERROR` node's span intersects
+that node's — either the parser gave up around the declaration, or it recovered inside the
+declaration's own damaged body. An `ERROR` in a sibling statement covers nothing: the names it
+swallowed answer `undefined`, but a declaration the rule actually asked about answers normally,
+and an import that reaches only such declarations stays complete. The coarse verdict survives
+where no single declaration can be reached — a side-effect import, a namespace binding
+(`import * as ns`), a bare `export *` — because a module object reaches everywhere, so any
+`ERROR` in its file counts. And a name whose re-export chain cannot be walked to the end is as
+unread as it ever was.
 
 Two further limits, specific to individual questions:
 
@@ -130,9 +130,9 @@ And two specific to `symbolOf` and `isAssignableTo`:
 
 The file under check, and the declaration files its imports resolve to:
 
-1. A **relative** specifier tries `x.ts`, `x.mts`, `x.cts`, `x.d.ts`, `x/index.ts`,
-   `x/index.d.ts`, in that order. A specifier naming the emitted JavaScript — `./money.js`,
-   TypeScript's own ESM spelling — is tried at the same stem.
+1. A **relative** specifier tries `x.ts`, `x.tsx`, `x.mts`, `x.cts`, `x.d.ts`, `x/index.ts`,
+   `x/index.tsx`, `x/index.d.ts`, in that order. A specifier naming the emitted JavaScript —
+   `./money.js`, TypeScript's own ESM spelling — is tried at the same stem.
 2. A **bare** specifier walks `node_modules` upward from the importing file's directory. In a
    package it reads `package.json`: `exports` under the `types` condition (subpath maps and
    `*` patterns included), then `types`, then `typings`, then `index.d.ts`; then the same for

@@ -95,12 +95,15 @@ pub trait TypeProvider: Send + Sync {
     /// path because the question is about the file's *imports*, which cannot be enumerated
     /// without its tree.
     ///
-    /// **A whole-file verdict, deliberately coarse.** One unreadable import makes the whole
-    /// file `false`, and an import whose declaration file carries a single `ERROR` node
-    /// anywhere counts as unreadable — so one unparsed construct in a fifty-thousand-line
-    /// `@types` bundle makes every file that imports it incomplete, project-wide. Silence is
-    /// the safe direction, and a narrower verdict (an `ERROR` covering the *asked* name) is a
-    /// refinement filed with the resolver's own issue rather than a promise made here.
+    /// **The verdict is per declaration reached, not per file.** An `ERROR` anywhere in a
+    /// resolved declaration file used to mark every importer of it incomplete — one unparsed
+    /// construct in a fifty-thousand-line `@types` bundle, poisoning the whole project. Now
+    /// a named import is judged by the node its name actually reaches: an `ERROR` covering
+    /// that node makes the file incomplete, one elsewhere does not, and the declarations
+    /// outside the broken span answer normally. A nameless import — side-effect, namespace,
+    /// `export *` — has no single node to reach and keeps the whole-file verdict. Silence is
+    /// still the safe direction: a link that cannot be read, wherever it sits, is `false`
+    /// rather than a guess.
     fn complete(&self, q: Query<'_>) -> bool;
 
     /// What this provider *is*, for the cache key.

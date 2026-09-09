@@ -34,7 +34,7 @@ use lanekeep_lang::binding::ImportedName;
 
 use crate::declarations::{
     Declaration, ExportTarget, Exported, declared_in, declared_name, find_export,
-    import_specifiers, target_node,
+    imports_with_names, target_node,
 };
 use crate::oracle::{Followed, ImportResolution, MAX_DEPTH, TypeScriptOracle, TypeScriptSupport};
 use crate::provider::{BeginRunError, Query, TypeProvider};
@@ -51,7 +51,13 @@ const MAX_EXPORT_DEPTH: u32 = 16;
 /// The provider that reads declaration files with this crate's own oracle.
 pub struct BuiltinProvider {
     support: TypeScriptSupport,
-    /// One parser for everything this provider opens, behind a lock.
+    /// The main grammar's analysis identity, held from probe time beside the tsx parser's
+    /// own — both grammars are what [`TypeProvider::identity`] folds, so a provider built
+    /// over a different pair of grammars cannot share a cache entry with this one.
+    grammar_identity: [u8; 32],
+    /// One parser per grammar this provider opens, behind a lock — this one for every path
+    /// that is not `.tsx`, the second grammar's (when one was given at probe time) for the
+    /// rest, chosen by the resolved path's extension in [`Self::parser_for`].
     ///
     /// **It does parse corpus files a second time**, and an earlier version of this comment
     /// claimed the opposite. `RELATIVE_SUFFIXES` prefers `.ts` over `.d.ts`, so a relative
@@ -69,6 +75,13 @@ pub struct BuiltinProvider {
     /// has no comments. The rule is right about what it sees; the second parser is deliberate,
     /// and the entry is what says a reviewer has already weighed it.
     parser: Mutex<tree_sitter::Parser>,
+    /// The second grammar's parser, behind its **own** lock — never this one's — together
+    /// with the identity of the language probed to build it.
+    ///
+    /// `None` when no second grammar was given. The resolver still reaches a `.tsx` sibling
+    /// then, but the main grammar reads its JSX as `ERROR` nodes, and `complete()` counts
+    /// those as unread: an honest "incomplete" rather than a confidently wrong answer.
+    tsx: Option<TsxParser>,
     /// Declaration files parsed so far, by path — kept across `begin_run`, not cleared by it.
     ///
     /// A `BTreeMap`, per the ordering invariant, and behind a lock because rayon runs one
@@ -112,6 +125,42 @@ impl fmt::Debug for BuiltinProvider {
     /// `Debug`, the same reason and the same shape as the oracle's own impl.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BuiltinProvider").finish_non_exhaustive()
+    }
+}
+
+/// The second parser: the grammar for the `.tsx` files the resolver reaches, behind its own
+/// lock so a `.ts` parse and a `.tsx` parse never wait on each other.
+struct TsxParser {
+    parser: Mutex<tree_sitter::Parser>,
+    /// The probed language's `analysis_identity`, folded into
+    /// [`TypeProvider::identity`] so the grammar a `.tsx` answer was read with is part of
+    /// the cache key that answer lands under.
+    identity: [u8; 32],
+}
+
+impl TsxParser {
+    /// A parser over the given grammar, or `None` when the grammar will not load — the same
+    /// refusal the main probe makes, for the same reason: a parser that cannot be built is
+    /// a provider that cannot read what the resolver hands it.
+    fn probe(language: &dyn Language) -> Option<Self> {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language.grammar()).ok()?;
+        Some(Self {
+            parser: Mutex::new(parser),
+            identity: language.analysis_identity(),
+        })
+    }
+}
+
+/// Whether a project-relative path names a `.tsx` file.
+///
+/// Case-insensitive because the filesystem decides case, and the parse has to agree with the
+/// resolver's suffix probe on whatever case the tree spells. The stem check keeps a hidden
+/// `.tsx` — no stem at all — from counting as one.
+fn extension_is_tsx(path: &str) -> bool {
+    match path.rsplit_once('.') {
+        Some((stem, extension)) => !stem.ends_with('/') && extension.eq_ignore_ascii_case("tsx"),
+        None => false,
     }
 }
 
@@ -169,7 +218,8 @@ struct Walk {
 }
 
 impl BuiltinProvider {
-    /// Confirm a grammar speaks TypeScript and build a provider over it.
+    /// Confirm a grammar speaks TypeScript and build a provider over it, with no second
+    /// grammar — [`Self::probe_with`] is where one is added.
     ///
     /// `None` on the same two conditions [`TypeScriptSupport::probe`] refuses on — a grammar
     /// without the vocabulary this oracle reads, or a language with no binding resolver —
@@ -180,12 +230,33 @@ impl BuiltinProvider {
     /// built from a resolver alone.
     #[must_use]
     pub fn probe(language: &dyn Language) -> Option<Self> {
+        Self::probe_with(language, None)
+    }
+
+    /// [`Self::probe`] with a second grammar, for the `.tsx` files the resolver reaches.
+    ///
+    /// The oracle's vocabulary is still confirmed against the *main* language alone, and the
+    /// support built from it is what answers every question: the tsx grammar speaks the same
+    /// node vocabulary — it is the same resolver, one grammar wider — so a `.tsx` sibling
+    /// needs no second oracle, only a second parse.
+    ///
+    /// `None` when either grammar will not load into a parser, the main probe's own refusal
+    /// unchanged: a resolver that reaches a `.tsx` file a provided grammar cannot parse is
+    /// one that would answer from `ERROR` nodes.
+    #[must_use]
+    pub fn probe_with(language: &dyn Language, tsx: Option<&dyn Language>) -> Option<Self> {
         let support = TypeScriptSupport::probe(language)?;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language.grammar()).ok()?;
+        let tsx = match tsx {
+            None => None,
+            Some(tsx) => Some(TsxParser::probe(tsx)?),
+        };
         Some(Self {
             support,
+            grammar_identity: language.analysis_identity(),
             parser: Mutex::new(parser),
+            tsx,
             declarations: Mutex::new(BTreeMap::new()),
             completeness: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -196,6 +267,22 @@ impl BuiltinProvider {
     /// The parser, whether or not another thread died holding it.
     fn parser(&self) -> MutexGuard<'_, tree_sitter::Parser> {
         self.parser.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The parser for the file at `path`: the second grammar's when the path's extension is
+    /// `.tsx` — case-insensitively, so the parse agrees with the resolver's suffix probe on
+    /// whatever case the tree spells — and a tsx grammar was given, the main one otherwise.
+    ///
+    /// One guard, whichever mutex it came out of: the caller cannot tell and need not, and
+    /// the two locks are what keep a `.ts` parse and a `.tsx` parse from waiting on each
+    /// other. No tsx grammar, every path answers from the main parser — including a `.tsx`
+    /// one, whose JSX then becomes the `ERROR` nodes `complete()` counts.
+    fn parser_for(&self, path: &str) -> MutexGuard<'_, tree_sitter::Parser> {
+        let tsx = self.tsx.as_ref().filter(|_| extension_is_tsx(path));
+        match tsx {
+            Some(tsx) => tsx.parser.lock().unwrap_or_else(PoisonError::into_inner),
+            None => self.parser(),
+        }
     }
 
     /// An oracle over a question's own file, able to follow imports out of it.
@@ -250,7 +337,7 @@ impl BuiltinProvider {
         #[cfg(test)]
         self.parses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let parsed = Declaration::parse(path.clone(), source, &mut self.parser())?;
+        let parsed = Declaration::parse(path.clone(), source, &mut self.parser_for(path.as_str()))?;
         let parsed = Arc::new(parsed);
         // Replaces rather than keeps: the bytes this access read are the ones the run is
         // answering about from here on.
@@ -366,7 +453,15 @@ impl BuiltinProvider {
     /// Nominal, never structural. `Some(false)` is a real answer — the walk completed and
     /// reached nothing — and `None` is "a link in the chain could not be read", which a rule
     /// must not treat as a negative: a project whose `node_modules` is absent would otherwise
-    /// have every governed value reported.
+    /// have every governed value reported. A parent declaration an `ERROR` span covers is
+    /// unreadable the same way — the walk refuses rather than answer over a node it only
+    /// partly read — which is the `Declaration` the `at` bundle carries.
+    ///
+    /// That fourth element is the [`Declaration`] of the file the walk currently stands in,
+    /// and `None` when that file is the *asking* one, which is never a cached declaration.
+    /// Entering a declaration file re-arms it with that file's own parse —
+    /// `heritage_assignable` asks it whether the parent it just reached is covered — so the
+    /// ranges are always read against the very tree the walk is standing in.
     ///
     /// `target` is resolved once, by [`Self::is_assignable_to`], rather than compared as a
     /// `(module, name)` pair at every step. A symbol's own `module` field cannot stand in for
@@ -380,16 +475,21 @@ impl BuiltinProvider {
     fn assignable(
         &self,
         files: &FileAccess,
-        // The file this walk currently stands in: its path, its tree, and its source, bundled
-        // so the whole trio moves as one argument — `assignable`/`heritage_assignable` would
-        // otherwise carry eight parameters apiece and trip `clippy::too_many_arguments`.
-        at: (&FilePath, &tree_sitter::Tree, &str),
+        // The file this walk currently stands in: its path, its tree, its source, and —
+        // when that file is a parsed declaration rather than the asking file — its
+        // `Declaration`, bundled so the whole quartet moves as one argument.
+        // `assignable`/`heritage_assignable` would otherwise carry nine parameters apiece
+        // and trip `clippy::too_many_arguments`; the fourth element is what
+        // `heritage_assignable` reads `ERROR` coverage from.
+        at: (&FilePath, &tree_sitter::Tree, &str, Option<&Declaration>),
         ty: &Type,
         target: (&FilePath, &str),
         depth: u32,
         walk: &mut Walk,
     ) -> Option<bool> {
-        let (at_path, tree, source) = at;
+        // The fourth element is read by `heritage_assignable`, which gets `at` whole; this
+        // frame only threads it.
+        let (at_path, tree, source, _) = at;
         if depth >= MAX_EXPORT_DEPTH {
             // Counted, so nothing computed above this point is memoized: the answer this
             // truncation produces is about the path, not about the declaration.
@@ -414,22 +514,15 @@ impl BuiltinProvider {
                 symbol,
             } => {
                 // The resolver's own opinion, when it has one. Genuinely no answer — an
-                // ambient global (`Date`, never declared or imported anywhere) — and,
-                // indistinguishably from the resolver's own output, a name the resolver
-                // cannot bind for a reason unrelated to whether it exists:
-                // `lanekeep-lang-js`'s `declaration_entry_of` has no arm for
-                // `interface_declaration`, `enum_declaration`, `abstract_class_declaration`,
-                // `module`, `internal_module`, or the `ambient_declaration` wrapper `.d.ts`
-                // files write `declare` as — so `interface Amountish {}` and
-                // `export declare class Decimal {}` are as invisible to it as an undeclared
-                // global would be.
+                // ambient global (`Date`, never declared or imported anywhere) — which no
+                // resolver arm can bind because nothing binds it.
                 //
-                // `declared_in` is the fallback that tells the two apart: the same
-                // ambient-aware, resolver-free walk `declarations.rs` uses for every `.d.ts`
-                // lookup in this crate, over the *current* file. It sees every one of the
-                // kinds the resolver misses. Only when that also finds nothing is this
-                // genuinely unreadable — matching `symbol_at`'s own contract, which already
-                // returns `None` outright rather than a `Symbol` with empty fields.
+                // `declared_in` is the fallback that tells an ambient global apart from a
+                // name that only *looks* unbound — a spelling the resolver's walk does not
+                // cover, or a construct a future grammar revision moves — over the *current*
+                // file. When it also finds nothing, this is genuinely unreadable, matching
+                // `symbol_at`'s own contract, which already returns `None` outright rather
+                // than a `Symbol` with empty fields.
                 let (declaring, declared) = if let Some(symbol) = symbol {
                     match &symbol.module {
                         Some(specifier) => {
@@ -477,9 +570,11 @@ impl BuiltinProvider {
                 } else {
                     let decl = self.declaration(files, &declaring);
                     match decl {
+                        // Re-armed with the file being entered: its own recorded `ERROR`
+                        // ranges are the ones that describe the tree the walk now stands in.
                         Some(decl) => self.heritage_assignable(
                             files,
-                            (&decl.path, &decl.tree, &decl.source),
+                            (&decl.path, &decl.tree, &decl.source, Some(&decl)),
                             &declared,
                             target,
                             depth,
@@ -522,13 +617,13 @@ impl BuiltinProvider {
     fn heritage_assignable(
         &self,
         files: &FileAccess,
-        at: (&FilePath, &tree_sitter::Tree, &str),
+        at: (&FilePath, &tree_sitter::Tree, &str, Option<&Declaration>),
         declared: &str,
         target: (&FilePath, &str),
         depth: u32,
         walk: &mut Walk,
     ) -> Option<bool> {
-        let (_, tree, source) = at;
+        let (_, tree, source, error) = at;
         // The asking file is parsed by the *engine* and is deliberately not in the
         // declaration cache — re-reading it here would be a second parse of a file already
         // parsed, which is what `local/one-parser-per-file` exists to catch. So `declared_in`
@@ -538,6 +633,15 @@ impl BuiltinProvider {
             // provider could not read rather than one it read and rejected.
             return None;
         };
+        // An `ERROR` covering the parent the walk just reached leaves its shape only partly
+        // read, and a covered parent is unreadable — never a negative — the same reasoning
+        // the walk's other `None`s carry. Asked of the file the walk stands in, whose
+        // recorded ranges belong to exactly the tree being read.
+        if let Some(damaged) = error
+            && damaged.error_covers(declaration)
+        {
+            return None;
+        }
         // Told when its own bound is what answered nothing. The walk threads the depth it has
         // already spent into `type_of_from` below, so the oracle can give up on `MAX_DEPTH`
         // several frames down and hand back a `None` that describes the path rather than the
@@ -613,7 +717,7 @@ impl BuiltinProvider {
 /// never resolved, which is the one claim the flag must never make. That spelling is a
 /// convention rather than a curiosity: `.service`, `.component`, `.module`, `.dto`, `.entity`,
 /// `.guard`, `.pipe` and `.config` are how NestJS and Angular projects name most of their
-/// files. A denylist that misses an asset kind costs six absent probes and an honest
+/// files. A denylist that misses an asset kind costs eight absent probes and an honest
 /// `complete() == false`; an allowlist that misses a naming convention costs a silent lie.
 fn reads_as_code(specifier: &str) -> bool {
     let last = specifier.rsplit('/').next().unwrap_or(specifier);
@@ -627,9 +731,10 @@ fn reads_as_code(specifier: &str) -> bool {
 /// Extensions a bundler resolves that are not programs.
 ///
 /// Stylesheets, data, images, fonts, prose, schemas and media — everything a loader turns into
-/// a value without any of it being TypeScript. `.tsx` and `.jsx` are deliberately **not** here:
-/// the resolver refuses them (see `RELATIVE_SUFFIXES`), and that refusal is a real
-/// incompleteness a file should be told about rather than an asset to skip over.
+/// a value without any of it being TypeScript. `.jsx` is deliberately **not** here: the
+/// resolver refuses it (see `RELATIVE_SUFFIXES`), and that refusal is a real incompleteness a
+/// file should be told about rather than an asset to skip over. `.tsx` is resolved and parsed
+/// now, so it belongs here no more than `.ts` does.
 const ASSET_EXTENSIONS: &[&str] = &[
     "css", "scss", "sass", "less", "styl", "json", "svg", "png", "jpg", "jpeg", "gif", "webp",
     "avif", "ico", "woff", "woff2", "ttf", "eot", "otf", "md", "mdx", "txt", "yaml", "yml", "toml",
@@ -883,9 +988,12 @@ impl TypeProvider for BuiltinProvider {
             lowlink: usize::MAX,
             exhausted: 0,
         };
+        // No `Declaration` in the bundle: the asking file is the engine's parse, not a
+        // cached one, so there is nothing here whose recorded `ERROR` ranges describe the
+        // tree at hand.
         self.assignable(
             q.files,
-            (q.file, q.tree, q.source),
+            (q.file, q.tree, q.source, None),
             &ty,
             (&target.file, &target.name),
             0,
@@ -902,40 +1010,87 @@ impl TypeProvider for BuiltinProvider {
     /// later invalidates a rule that stayed silent for its absence. Memoized per file, since
     /// several rules ask the same question about the same file within one run.
     ///
-    /// Two things it deliberately does not count. A specifier that is not code — `./app.css`,
-    /// `./data.json`, `./logo.svg` — is skipped entirely, probes and all: it is not a module
+    /// One thing it deliberately does not count: a specifier that is not code — `./app.css`,
+    /// `./data.json`, `./logo.svg` — is skipped entirely, probes and all. It is not a module
     /// this oracle reads, and counting it would label most of a bundler's project incomplete
-    /// for having stylesheets. And a declaration that resolves but whose *parse carries an
-    /// `ERROR`* counts as unread: `tree_sitter::Parser::parse` answers a tree for any UTF-8
-    /// input, so the names inside the broken span answer `undefined` while the ones outside it
-    /// answer normally — a partial answer with nothing on it to say so, which is the one
-    /// combination a rule cannot defend itself against.
+    /// for having stylesheets.
+    ///
+    /// **An `ERROR` counts only when it covers the declaration a name's walk actually
+    /// reached** (#229). `tree_sitter::Parser::parse` answers a tree for any UTF-8 input, so
+    /// a file this provider could not fully read shows up only as `ERROR` nodes — and the
+    /// whole-file verdict this used to ask let one damaged statement mark every importer of
+    /// the file incomplete, project-wide, throwing away the declarations outside the broken
+    /// span that answer normally. Each named import is now walked to the node that declares
+    /// it, through re-exports like every other arm, and the file is incomplete when that
+    /// walk cannot end at an uncovered declaration: a resolved specifier, an export that
+    /// resolves, a reached node no `ERROR` span overlaps. A nameless import — a side-effect
+    /// one, or a namespace binding, or `export *` — has no single node to reach: a
+    /// side-effect import asserts the module's whole shape and a namespace import binds a
+    /// module object whose members can be anything, so both keep the whole-file verdict.
     fn complete(&self, q: Query<'_>) -> bool {
         if let Some(known) = self.completeness().get(q.file) {
             return *known;
         }
 
         let mut complete = true;
-        for specifier in import_specifiers(q.tree, q.source) {
+        for imported in imports_with_names(q.tree, q.source) {
             // A stylesheet, a JSON asset or an image is not a module this oracle reads, and a
             // bundler's `import './app.css'` is not a missing type answer — see `reads_as_code`.
             // Skipped before the probe rather than after it, so nothing about it is recorded
-            // either: six absent reads per such import, on a codebase where most files have
+            // either: eight absent reads per such import, on a codebase where most files have
             // one, is cache-entry size spent on a question nobody asked.
-            if !reads_as_code(&specifier) {
+            if !reads_as_code(&imported.specifier) {
                 continue;
             }
-            // Resolved, readable *and* parsed without error. A specifier that names a file
-            // this provider cannot parse is exactly as partial as one that names nothing:
-            // either way no answer about a name from that module was reached by reading
-            // anything. A file that parses only partly is the worse case of the two, because
-            // the names outside the `ERROR` span still answer and the ones inside it are
-            // silently absent.
-            if resolve_specifier(q.files, q.file, &specifier)
-                .and_then(|file| self.declaration(q.files, &file))
-                .is_none_or(|decl| decl.has_error)
-            {
+            // Resolved once per specifier, before the name loop: which reads the *specifier*
+            // itself records must not depend on how many names share the module. (The
+            // per-name chains below add their own reads — that is the pass recording what it
+            // really consulted; the access memo keeps a repeated path from being recorded
+            // twice.)
+            let resolved = resolve_specifier(q.files, q.file, &imported.specifier)
+                .and_then(|file| self.declaration(q.files, &file).map(|decl| (file, decl)));
+            let Some((file, decl)) = resolved else {
+                // A specifier that names a file this provider cannot parse is exactly as
+                // partial as one that names nothing: either way no answer about a name from
+                // that module was reached by reading anything.
                 complete = false;
+                continue;
+            };
+            // Nameless: no single declaration to reach, so whatever the parse carries
+            // counts. The namespace arm of a mixed clause (`import d, * as ns`) is judged
+            // the same way, because the module object it binds reaches everywhere.
+            if imported.names.is_empty() || imported.names.contains(&ImportedName::Namespace) {
+                if decl.has_error {
+                    complete = false;
+                }
+                continue;
+            }
+            for name in &imported.names {
+                let wanted = match name {
+                    ImportedName::Named(exported) => exported.as_str(),
+                    ImportedName::Default => "default",
+                    // Handled with the nameless arm above; unreachable from the enumeration
+                    // `imports_with_names` does, and the nameless reading is what a
+                    // namespace binding means if one ever arrives here.
+                    ImportedName::Namespace => continue,
+                };
+                // A miss anywhere along the chain — a name nothing exports, a target file
+                // that will not parse, a reached node an `ERROR` covers — is an unread
+                // answer for this name. The first category is newly counted against the
+                // file: yesterday's verdict stopped at the specifier, so a cleanly parsing
+                // module that did not export the name left the file complete; today the
+                // chain is walked, and a walk that cannot end at a declaration is the same
+                // partial answer a missing file is.
+                let reached = match self.export_target(q.files, &file, wanted) {
+                    Some(target) => match self.declaration(q.files, &target.file) {
+                        Some(decl) => target_node(&decl, &target.name).is_some(),
+                        None => false,
+                    },
+                    None => false,
+                };
+                if !reached {
+                    complete = false;
+                }
             }
         }
 
@@ -975,8 +1130,22 @@ impl TypeProvider for BuiltinProvider {
         // Tagged as well as hashed. `oracle_identity` alone would let a future provider that
         // happened to derive its identity the same way collide with this one, and the tag is
         // what makes "which provider answered" part of the key rather than an inference.
-        let mut out = Vec::with_capacity(40);
+        //
+        // After the tag, the main parser's grammar identity, then the tsx one's behind a
+        // presence byte: with it, and only with it, the fold carries a second grammar, so a
+        // provider built with one can never fold to the same bytes as one built without it —
+        // a key that cannot tell the two runs apart would let one warm the other's cache.
+        // Today both terms are this crate family's shared analysis digest, so the *byte that
+        // discriminates* is the presence bit itself; the per-grammar digests a run key
+        // already carries (`grammar_keys`, `analysis_keys`) do the rest. The oracle's
+        // identity stays last, the one field every provider over every grammar pair carries.
+        let mut out = Vec::with_capacity(8 + 32 + 1 + 32 + 32);
         out.extend_from_slice(b"builtin:");
+        out.extend_from_slice(&self.grammar_identity);
+        if let Some(tsx) = &self.tsx {
+            out.push(1);
+            out.extend_from_slice(&tsx.identity);
+        }
         out.extend_from_slice(&crate::oracle_identity());
         out
     }
@@ -1007,7 +1176,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use lanekeep_lang::Language as _;
-    use lanekeep_lang_js::TypeScript;
+    use lanekeep_lang_js::{Tsx, TypeScript};
 
     use super::{AnalysisBudget, BuiltinProvider, FileAccess, FilePath, Query, Type, TypeProvider};
     use crate::types::Primitive;
@@ -1043,6 +1212,21 @@ mod tests {
     /// A budget generous enough that nothing here can breach it.
     fn budget() -> AnalysisBudget {
         AnalysisBudget::start(std::time::Duration::from_mins(10))
+    }
+
+    /// The tsx grammar is a second parser with a second identity, and the provider's own
+    /// identity is what a cache key folds — so a run whose provider can read `.tsx` must not
+    /// share one with a run whose provider cannot.
+    #[test]
+    fn a_tsx_parser_moves_the_provider_identity() {
+        let without = BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+        let with =
+            BuiltinProvider::probe_with(&TypeScript, Some(&Tsx)).expect("TypeScript and tsx");
+        assert_ne!(
+            without.identity(),
+            with.identity(),
+            "the tsx grammar's identity is part of the provider's"
+        );
     }
 
     /// The mirror of `a_path_that_was_absent_is_parsed_once_it_becomes_text`: a path that has

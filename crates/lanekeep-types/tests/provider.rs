@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use lanekeep_core::{AnalysisBudget, FileAccess, FilePath};
-use lanekeep_lang_js::TypeScript;
+use lanekeep_lang_js::{Tsx, TypeScript};
 use lanekeep_types::{Query, TypeProvider};
 
 /// A budget generous enough that nothing here can breach it.
@@ -403,26 +403,124 @@ fn a_specifier_naming_the_emitted_javascript_resolves_to_its_source() {
     );
 }
 
-/// A `.tsx` sibling is deliberately unresolvable, and the reason is not a missing entry.
+/// A `.tsx` sibling resolves and parses with the TSX grammar.
 ///
-/// This provider parses every declaration file with one grammar. Parsing a `.tsx` with the
-/// TypeScript grammar turns each JSX element into an `ERROR` node **silently** — AGENTS.md's
-/// "the grammar that parses a file is chosen by the file", which produced 2218 false
-/// positives in one rule the last time it was got wrong. A confidently wrong parse is worse
-/// than the `undefined` a miss produces, and the importing file is then honestly incomplete.
+/// The refusal this replaces was `RELATIVE_SUFFIXES`' deliberate omission of `.tsx`: one
+/// parser could speak only the TypeScript grammar, under which every JSX element is a
+/// silent `ERROR` node. With a second parser, chosen by the resolved path's extension,
+/// the sibling reads honestly and the importer's imports all resolve.
 #[test]
-fn a_tsx_sibling_is_not_resolved_by_the_builtin_provider() {
+fn a_tsx_sibling_is_resolved_and_parsed_with_the_tsx_grammar() {
     let project = Project::new(
-        "relative-tsx",
+        "relative-tsx-resolves",
+        &[("src/Button.tsx", "export const B = () => <b/>;\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe_with(&TypeScript, Some(&Tsx))
+        .expect("TypeScript and tsx");
+    let subject = "import { B } from './Button';\nlet b = B;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/app.tsx");
+    assert!(
+        provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "the .tsx sibling resolves and its JSX parses without an ERROR"
+    );
+}
+
+/// Without a tsx grammar the provider still refuses `.tsx` — honestly, as an incomplete
+/// file, rather than parsing JSX into silent `ERROR` nodes and answering from them.
+#[test]
+fn a_tsx_sibling_stays_unresolved_without_a_tsx_grammar() {
+    let project = Project::new(
+        "relative-tsx-refuses",
+        &[("src/Button.tsx", "export const B = () => <b/>;\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { B } from './Button';\nlet b = B;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/app.tsx");
+    assert!(
+        !provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "no tsx grammar, no honest read of the sibling"
+    );
+}
+
+/// The extension is matched case-insensitively, so a manifest that names a `Button.TSX`
+/// still gets the TSX parser. Relative probes append lowercase suffixes, so the case can
+/// only reach the parser through a manifest-declared path — and the import is nameless so
+/// the whole-file verdict is what the grammar's own parse decides.
+#[test]
+fn an_uppercase_tsx_extension_is_parsed_with_the_tsx_grammar() {
+    let project = Project::new(
+        "relative-tsx-uppercase",
         &[
-            ("src/a.ts", ""),
-            ("src/Button.tsx", "export const B = () => <b/>;\n"),
+            (
+                "node_modules/widgets/package.json",
+                r#"{"exports": {"./Button": "./src/Button.TSX"}}"#,
+            ),
+            (
+                "node_modules/widgets/src/Button.TSX",
+                "export const B = () => <b/>;\n",
+            ),
         ],
     );
     let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe_with(&TypeScript, Some(&Tsx))
+        .expect("TypeScript and tsx");
+    let subject = "import 'widgets/Button';\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/app.tsx");
+    assert!(
+        provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "the uppercase extension resolves, and its JSX parses with the TSX grammar"
+    );
+}
+
+/// A type answer crosses into the sibling, typed from its own annotation.
+#[test]
+fn a_type_answer_crosses_into_a_tsx_sibling() {
+    let project = Project::new(
+        "tsx-sibling-type",
+        &[("src/Button.tsx", "export const who: string = 'b';\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe_with(&TypeScript, Some(&Tsx))
+        .expect("TypeScript and tsx");
+    let subject = "import { who } from './Button';\nlet w = who;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "identifier");
     assert_eq!(
-        resolve_specifier(&files, &FilePath::new("src/a.ts"), "./Button"),
-        None
+        provider.type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files,
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::String
+        )),
+        "`who` is typed by its own annotation in the .tsx sibling"
     );
 }
 
@@ -469,8 +567,10 @@ fn every_relative_probe_is_recorded_in_a_fixed_order() {
             ("src/money.d.ts".to_owned(), false),
             ("src/money.mts".to_owned(), false),
             ("src/money.ts".to_owned(), false),
+            ("src/money.tsx".to_owned(), false),
             ("src/money/index.d.ts".to_owned(), false),
             ("src/money/index.ts".to_owned(), false),
+            ("src/money/index.tsx".to_owned(), false),
         ],
         "dependencies come back in path order, and every miss is one"
     );
@@ -1643,6 +1743,29 @@ fn a_re_export_chain_within_the_bound_answers_the_renamed_declaration() {
     );
 }
 
+/// A destructured export binds a pattern, and the pattern's text is not a name.
+///
+/// The declaration walk finds `export const { e } = { e: 2 }` for the name `e` — the
+/// resolver matches through the pattern — but the thing it found has no *name*: the
+/// declarator's `name` field is the whole `object_pattern`, and reporting `{ e }` where a
+/// spelling belongs would hand a rule comparing `exported` against a required name a
+/// mismatch on conforming code. The chain falls back to the asked name, which is what a
+/// shorthand destructuring exports.
+#[test]
+fn a_destructured_export_falls_back_to_the_asked_name() {
+    let project = Project::new(
+        "symbol-destructured",
+        &[("src/pieces.d.ts", "export const { e } = { e: 2 };\n")],
+    );
+    let subject = "import { e } from './pieces';\nconst y = e;\n";
+    let symbol = ask(&project, subject, TypeProvider::symbol_of).expect("a symbol");
+    assert_eq!(
+        symbol.exported.as_deref(),
+        Some("e"),
+        "the pattern's text is not a name; the asked spelling is"
+    );
+}
+
 /// `returnTypeOf` over one file, one case per rule in §3.5.
 ///
 /// A table, because the rule is stated as five clauses and each needs its own row: an
@@ -2443,7 +2566,7 @@ fn a_comment_inside_an_implements_clause_is_skipped() {
 
 /// A file every import of which resolves is complete; one with a dead import is not.
 ///
-/// Addendum C2 (task 4.16) widens this table with the import shapes `import_specifiers`
+/// Addendum C2 (task 4.16) widens this table with the import shapes `imports_with_names`
 /// had not exercised: a default import, a namespace import, `import type`, a side-effect
 /// `import 'm'` with no bound name at all, and — separately, since it needs its own
 /// assertion below rather than a boolean here — a file with two imports where only one
@@ -2581,9 +2704,10 @@ fn completeness_with_two_imports_only_one_missing_records_both_probes() {
 /// `import x = require('m')` is counted, even though its `source` lives on the nested
 /// `import_require_clause` rather than on the `import_statement` itself.
 ///
-/// Addendum C3. `import_specifiers` reads `statement.child_by_field_name("source")` directly
-/// on the `import_statement`; for this shape that field is unset — `node-types.json` marks it
-/// `required: false` on `import_statement` and puts the *actual* required `source` field on
+/// Addendum C3. `imports_with_names` (the old `import_specifiers`) reads
+/// `statement.child_by_field_name("source")` directly on the `import_statement`; for this
+/// shape that field is unset — `node-types.json` marks it `required: false` on
+/// `import_statement` and puts the *actual* required `source` field on
 /// `import_require_clause`, its child. Missed, `import x = require('./dist/money')` would
 /// count as zero imports and this file would answer complete despite depending on a module
 /// that resolves to nothing.
@@ -2719,7 +2843,7 @@ fn a_declaration_rewritten_between_two_accesses_is_reparsed() {
 /// A stylesheet, a JSON asset and an image are not modules this provider reads.
 ///
 /// `import './app.css'` fails every probe, so an eager completeness pass counted the file
-/// incomplete and recorded six absent reads for it — on a React codebase that is most files,
+/// incomplete and recorded eight absent reads for it — on a React codebase that is most files,
 /// and the label "incomplete" then means "this project has CSS" rather than "a type answer is
 /// missing". A specifier whose final segment carries an extension the resolver cannot answer
 /// is not a module the oracle reads, so it is skipped entirely: no probe, no dependency, no
@@ -2781,20 +2905,26 @@ fn completeness_still_counts_a_package_whose_name_has_a_dot() {
     );
 }
 
-/// A declaration file that resolves but does not parse cleanly makes the importer incomplete.
-///
-/// `tree_sitter::Parser::parse` answers a tree for any UTF-8 input, `ERROR` nodes included, so
-/// `Declaration::parse` never fails on a broken file and the importer counted as complete
-/// while every name inside the `ERROR` span answered `undefined`. That is the one combination
-/// a rule cannot defend against: a confident silence with a `complete()` that says the silence
-/// is meaningful.
+/// An `ERROR` covering the reached declaration makes the importer incomplete; an `ERROR`
+/// in a sibling statement does not. `complete()` walks each named import to the node that
+/// declares it and asks whether an `ERROR` span overlaps that node's — the granularity
+/// #229 asks for, in place of the whole-file verdict.
 #[test]
-fn completeness_is_false_when_a_resolved_declaration_does_not_parse() {
+fn completeness_is_false_only_when_an_error_overlaps_the_reached_declaration() {
     for (test, declaration, expected) in [
         (
-            "complete-broken-declaration",
-            "export declare class Big {} garbage )(\n",
+            // Dump-verified: the ERROR the parser recovered inside the class body
+            // ([28..29]) intersects the class_declaration's own span ([15..39]).
+            "complete-covered-declaration",
+            "export declare class Big { m(: number }\n",
             false,
+        ),
+        (
+            // The ERROR is a sibling statement ([28..38]); Big's declaration ([15..27])
+            // is clean and reachable, so the whole-file verdict no longer poisons it.
+            "complete-unrelated-error",
+            "export declare class Big {}\ngarbage )(\n",
+            true,
         ),
         (
             "complete-sound-declaration",
@@ -2820,6 +2950,102 @@ fn completeness_is_false_when_a_resolved_declaration_does_not_parse() {
             "{declaration}"
         );
     }
+}
+
+/// A nameless import — side-effect here — has no single declaration to reach, so the
+/// whole-file verdict stays for it: any ERROR anywhere in the module counts.
+#[test]
+fn a_nameless_import_keeps_the_whole_file_verdict() {
+    let project = Project::new(
+        "complete-side-effect-error",
+        &[("src/big.d.ts", "export declare class Big {}\ngarbage )(\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import './big';\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    assert!(
+        !provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "a side-effect import asserts the module's shape; any ERROR counts"
+    );
+}
+
+/// A mixed clause — `import d, * as ns from 'm'` — binds a module object *as well as* a
+/// name, and the module object reaches everywhere: the whole-file verdict stays for the
+/// statement even though its named half could have been walked.
+#[test]
+fn a_mixed_clause_keeps_the_whole_file_verdict() {
+    let project = Project::new(
+        "complete-mixed-clause-error",
+        &[(
+            "src/big.d.ts",
+            "export declare const ok: number;\ngarbage )(\n",
+        )],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import ok, * as ns from './big';\nconst y = ok;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    assert!(
+        !provider.complete(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: tree.root_node(),
+            files: &files,
+        }),
+        "the namespace binding reaches every member; any ERROR counts"
+    );
+}
+
+/// The heritage arm of `is_assignable_to` answers None — unreadable — when a parent
+/// declaration the walk visited is error-covered, rather than a confident answer computed
+/// over a damaged tree. The chain here is X → Mid → Damaged, asked against `Root`: the
+/// walk must cross Damaged's covered node to answer, so it refuses.
+///
+/// The question is asked at the `type_identifier` the implements clause names — dumped:
+/// both the class name and the heritage member parse as `type_identifier` in this grammar,
+/// and the only plain `identifier` in the subject is the import specifier, whose type this
+/// bare oracle cannot read at all. Asking there would answer None without walking
+/// anything, which is the one assertion that cannot fail.
+#[test]
+fn an_error_covered_heritage_parent_is_unreadable_not_negative() {
+    let project = Project::new(
+        "heritage-error-covered",
+        &[(
+            "src/big.d.ts",
+            "export interface Root { r(): void }\nexport interface Mid extends Damaged { m(): void }\nexport interface Damaged { d: ;;; }\n",
+        )],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { Mid } from './big';\nclass X implements Mid {}\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "type_identifier");
+    assert_eq!(
+        provider.is_assignable_to(
+            Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node,
+                files: &files,
+            },
+            "./big",
+            "Root",
+        ),
+        None,
+        "a damaged link in the chain is unreadable, never a negative"
+    );
 }
 
 /// The answer is memoized per file, so a rule asking twice costs one pass.

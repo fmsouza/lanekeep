@@ -105,6 +105,35 @@ impl JsBindingResolver {
         Self::declaration_entry(scope, source, name).map(|(node, _)| node)
     }
 
+    /// Whether `node` declares `name` locally, and the node that binds it.
+    ///
+    /// The resolver's own entry walk, projected for callers that hold a *candidate
+    /// declaration* rather than a use: `lanekeep-types`' export lookup asks exactly this
+    /// question of every top-level statement, and a second kind table there drifted from
+    /// this one once already (#229). Imports are filtered out — an `import_statement` binds
+    /// a name for the resolver's own walk, but it does not *declare* one, and a caller
+    /// asking "what declares this name here" must not be answered with a node the name
+    /// merely passes through.
+    #[must_use]
+    #[expect(
+        clippy::unused_self,
+        clippy::trivially_copy_pass_by_ref,
+        reason = "the resolver is zero-sized and stateless, so the receiver can be neither \
+                  used nor passed efficiently; the method form is the point — a caller \
+                  holds a resolver and asks it, beside `declaration_of`"
+    )]
+    pub fn declares<'t>(&self, source: &'t str, node: Node<'t>, name: &str) -> Option<Node<'t>> {
+        Self::declares_local(node, source, name)
+    }
+
+    /// The walk behind [`JsBindingResolver::declares`], free of the receiver it does not
+    /// read.
+    fn declares_local<'t>(node: Node<'t>, source: &str, name: &str) -> Option<Node<'t>> {
+        declaration_entry_of(node, source, name)
+            .filter(|(_, binding)| matches!(binding, Binding::Local(_)))
+            .map(|(node, _)| node)
+    }
+
     /// The declaration of `name` in this scope: the node, and what it binds.
     ///
     /// One walk with two projections above it, rather than two walks. Two would be free to
@@ -239,11 +268,20 @@ fn declaration_entry_of<'t>(
                 .map(|declarator| (declarator, Binding::Local(kind)))
         }
 
-        "function_declaration" | "generator_function_declaration" => {
+        // A function binds its name in every form the grammar spells it: the plain and
+        // generator declarations, and the ambient `declare function f(a: number): void`,
+        // which is a `function_signature` rather than a `function_declaration` —
+        // `node-types.json` gives the kind a required `name` (`identifier`) beside the
+        // `parameters` field that made it a scope back in #207.
+        "function_declaration" | "generator_function_declaration" | "function_signature" => {
             named_as(node, source, name).then_some((node, Binding::Local(BindingKind::Function)))
         }
 
-        "class_declaration" => {
+        // A class and its `abstract` spelling are two kinds — there is no
+        // `class_declaration` node for an abstract class, so without the second here the
+        // walk matched on kind and a use of the name escaped outward to nothing — and both
+        // bind the name the same way.
+        "class_declaration" | "abstract_class_declaration" => {
             named_as(node, source, name).then_some((node, Binding::Local(BindingKind::Class)))
         }
 
@@ -255,9 +293,44 @@ fn declaration_entry_of<'t>(
         // would misreport a type alias as a class to any rule asking `bindingKind` — the
         // exact failure the `Type`/`Receiver`/`TypeParam` kinds above were added to avoid:
         // "the nearest existing kind would be a lie".
-        "type_alias_declaration" => {
+        //
+        // An interface and an enum name a type by the same convention, in one arm here as
+        // Rust's resolver puts `struct_item`/`enum_item` in one — "a struct, enum, union or
+        // alias all name a type". The grammar hands each kind a required `name` field (the
+        // interface's a `type_identifier`, the enum's an `identifier`) exactly as the alias
+        // does.
+        "type_alias_declaration" | "interface_declaration" | "enum_declaration" => {
             named_as(node, source, name).then_some((node, Binding::Local(BindingKind::Type)))
         }
+
+        // `namespace P` and `module P` both bind a module name. Either kind's `name` may be
+        // an `identifier`, a `nested_identifier` or a `string`, and a string's node text
+        // carries the quotes themselves — `declare module "p"` declares `p`, not `"p"` — so
+        // the comparison goes through `trim_quotes`, which the import arm above already
+        // reads module specifiers through for the same reason.
+        "module" | "internal_module" => named_unquoted_as(node, source, name)
+            .then_some((node, Binding::Local(BindingKind::Module))),
+
+        // `declare` wraps whatever it applies to and has no name of its own, so the answer
+        // is whatever the wrapped declaration answers: `declare const r: number` binds `r`
+        // as a const, `declare function f(): void` as a function. The wrapped declaration
+        // is the first *named* child — the `declare` token itself is anonymous, and
+        // `node-types.json` gives the kind no fields at all.
+        "ambient_declaration" => node
+            .named_child(0)
+            .and_then(|inner| declaration_entry_of(inner, source, name)),
+
+        // A top-level `namespace` is the one declaration that is not a statement in this
+        // grammar: measured against 0.23.2, `namespace P {}` parses as an
+        // `expression_statement` wrapping the `internal_module`, where `module P {}` — and
+        // every other declaration kind — is a direct child of `program`. Without looking
+        // through the statement, the `internal_module` arm above is unreachable for exactly
+        // the construct it exists for, and a use of a namespace's name walks out of the
+        // file to nothing. Nothing else declares through an expression, so the recursion
+        // answers for namespaces alone.
+        "expression_statement" => node
+            .named_child(0)
+            .and_then(|inner| declaration_entry_of(inner, source, name)),
 
         // `export const x = 1`, `export function f() {}` — the declaration is inside.
         "export_statement" => node
@@ -271,6 +344,17 @@ fn declaration_entry_of<'t>(
 fn named_as(node: Node<'_>, source: &str, name: &str) -> bool {
     node.child_by_field_name("name")
         .is_some_and(|n| node_text(n, source) == name)
+}
+
+/// Whether a declaration's `name` field is `name`, once its quotes are gone.
+///
+/// `module`'s and `internal_module`'s `name` may be a `string` as well as an identifier,
+/// and a `string` node's text includes the quotes, so the plain [`named_as`] comparison
+/// would answer `"p" != p`. `trim_quotes` is what the import arm reads module specifiers
+/// through, for the same reason.
+fn named_unquoted_as(node: Node<'_>, source: &str, name: &str) -> bool {
+    node.child_by_field_name("name")
+        .is_some_and(|n| trim_quotes(node_text(n, source)) == name)
 }
 
 /// `const` or `let` for a lexical declaration, `var` otherwise.
@@ -1143,5 +1227,102 @@ mod tests {
             ],
             "the carriers AGENTS.md says declare no `parameters`"
         );
+    }
+
+    // --- #229: declaration kinds the resolver did not bind --------------------------------
+
+    #[test]
+    fn resolves_an_interface_declaration() {
+        assert_eq!(
+            resolve_use(
+                "interface Amountish { m(): void }\nlet x: Amountish;",
+                "Amountish"
+            ),
+            Some(Binding::Local(BindingKind::Type))
+        );
+    }
+
+    #[test]
+    fn resolves_an_enum_declaration() {
+        assert_eq!(
+            resolve_use("enum Color { Red }\nlet c: Color;", "Color"),
+            Some(Binding::Local(BindingKind::Type))
+        );
+    }
+
+    #[test]
+    fn resolves_an_abstract_class_declaration() {
+        assert_eq!(
+            resolve_use(
+                "abstract class Repo { abstract get(): number }\nlet r: Repo;",
+                "Repo"
+            ),
+            Some(Binding::Local(BindingKind::Class))
+        );
+    }
+
+    #[test]
+    fn resolves_an_ambient_function_signature() {
+        assert_eq!(
+            resolve_use(
+                "declare function credit(amount: number): void;\ncredit(1);",
+                "credit"
+            ),
+            Some(Binding::Local(BindingKind::Function))
+        );
+    }
+
+    #[test]
+    fn resolves_an_internal_module_by_name() {
+        assert_eq!(
+            resolve_use(
+                "namespace Payments { export const rate = 1 }\nlet r = Payments.rate;",
+                "Payments"
+            ),
+            Some(Binding::Local(BindingKind::Module))
+        );
+    }
+
+    #[test]
+    fn resolves_a_module_declaration_with_an_identifier_name() {
+        assert_eq!(
+            resolve_use(
+                "declare module Payments { export const rate = 1 }\nlet r = Payments.rate;",
+                "Payments"
+            ),
+            Some(Binding::Local(BindingKind::Module))
+        );
+    }
+
+    #[test]
+    fn resolves_through_an_ambient_declaration_wrapper() {
+        assert_eq!(
+            resolve_use("declare const rate: number;\nlet x = rate;", "rate"),
+            Some(Binding::Local(BindingKind::Const))
+        );
+    }
+
+    #[test]
+    fn an_interface_declaration_answers_the_interface_node() {
+        assert_eq!(
+            declaration_use(
+                "interface Amountish { m(): void }\nlet x: Amountish;",
+                "Amountish"
+            ),
+            Some("interface_declaration".to_owned())
+        );
+    }
+
+    #[test]
+    fn declares_answers_nothing_for_an_import() {
+        let source = "import { Big } from './big';";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&TypeScript.grammar())
+            .expect("grammar loads");
+        let tree = parser.parse(source, None).expect("parses");
+        let statement = tree.root_node().named_child(0).expect("one statement");
+        assert_eq!(statement.kind(), "import_statement");
+        assert_eq!(JsBindingResolver.declares(source, statement, "Big"), None);
     }
 }

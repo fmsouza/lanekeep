@@ -17,6 +17,11 @@ categories.workspace = true
 # way would put a dependency outside the cache key.
 lanekeep-core = { workspace = true }
 lanekeep-lang = { workspace = true }
+# The JS family's binding resolver: the kinds a top-level statement can declare with are
+# read through `JsBindingResolver::declares` rather than a second table here, which drifted
+# from the resolver once already (#229). Acyclic — that crate depends only on
+# `lanekeep-lang` and the grammars.
+lanekeep-lang-js = { workspace = true }
 # Two readers, both of shapes hand-parsing would get subtly wrong. `package.json`'s `exports`
 # is a recursive tree of strings, objects and condition names; and the `tsc` sidecar's protocol
 # is newline-delimited JSON in both directions, where this crate is the one writing the
