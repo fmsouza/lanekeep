@@ -95,15 +95,20 @@ pub trait TypeProvider: Send + Sync {
     /// path because the question is about the file's *imports*, which cannot be enumerated
     /// without its tree.
     ///
-    /// **The verdict is per declaration reached, not per file.** An `ERROR` anywhere in a
-    /// resolved declaration file used to mark every importer of it incomplete — one unparsed
-    /// construct in a fifty-thousand-line `@types` bundle, poisoning the whole project. Now
-    /// a named import is judged by the node its name actually reaches: an `ERROR` covering
-    /// that node makes the file incomplete, one elsewhere does not, and the declarations
-    /// outside the broken span answer normally. A nameless import — side-effect, namespace,
-    /// `export *` — has no single node to reach and keeps the whole-file verdict. Silence is
-    /// still the safe direction: a link that cannot be read, wherever it sits, is `false`
-    /// rather than a guess.
+    /// **The verdict is about reading, per declaration where one is reached.** A parse fault
+    /// anywhere in a resolved declaration file used to mark every importer of it incomplete —
+    /// one unparsed construct in a fifty-thousand-line `@types` bundle, poisoning the whole
+    /// project. The builtin provider judges a named import by the node its name reaches: a
+    /// fault inside that node — an `ERROR`, or the `MISSING` token an unclosed brace leaves —
+    /// makes the file incomplete, one elsewhere does not, and the declarations outside the
+    /// damaged span answer normally. A name whose module resolved and parsed cleanly but which
+    /// the provider cannot follow to a declaration is *not* incomplete: `complete` says whether
+    /// every import was read, never whether every name is typeable, and `export = X` beside
+    /// `declare namespace X` is a module read whole whose members answer `undefined`. A
+    /// nameless import — side-effect, namespace, `export *` — has no single node to reach and
+    /// keeps the whole-file verdict. Silence is still the safe direction: a link that cannot
+    /// be read, wherever it sits, is `false` rather than a guess. A provider that delegates to
+    /// `tsc` answers whatever its driver reports for the file as a whole.
     fn complete(&self, q: Query<'_>) -> bool;
 
     /// What this provider *is*, for the cache key.

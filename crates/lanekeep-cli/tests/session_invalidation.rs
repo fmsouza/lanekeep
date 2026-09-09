@@ -64,7 +64,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use corpus::tsc_available;
 use lanekeep_core::FileAccess;
 use lanekeep_engine::Engine;
-use lanekeep_lang_js::{JavaScript, Tsx, TypeScript};
+use lanekeep_lang_js::{JavaScript, TypeScript};
 use lanekeep_types::TypeProvider;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -272,15 +272,17 @@ fn held(dir: &Path) -> Arc<dyn TypeProvider> {
         },
     )
     .expect("loads the config");
+    // The grammar pair a session holds, read the way `SessionProvider::for_request` reads it:
+    // from the registry, through `builtin_grammars`. The fixture's importer is a `.ts` file,
+    // so the pair itself is not what this pins — only that it is the pair a session would.
+    let registry = lanekeep_languages::registry();
+    let (language, tsx) =
+        lanekeep_engine::builtin_grammars(&registry).expect("the registry speaks TypeScript");
     lanekeep_engine::provider_for(
         &loaded.types,
         dir,
-        Some(&TypeScript),
-        // The second grammar beside the first, the way `SessionProvider::for_request` and the
-        // engine's own run path both pass them — the fixture's importer is a `.ts` file, so
-        // the grammar pair itself is not what this pins, only that it is the pair a session
-        // would hold.
-        Some(&Tsx),
+        Some(language),
+        tsx,
         lanekeep_core::AnalysisBudget::start(loaded.limits.analysis_timeout),
     )
     .expect("builds a provider")

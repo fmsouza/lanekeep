@@ -10,6 +10,7 @@ msrv = "1.94"
 # identifier", which is wrong and reads worse. `".."` appends to clippy's default
 # list rather than replacing it.
 doc-valid-idents = [
+    "JSDoc",
     "QuickJS",
     "StarlingMonkey",
     "SpiderMonkey",

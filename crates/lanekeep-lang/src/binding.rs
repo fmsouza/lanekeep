@@ -249,6 +249,22 @@ pub trait BindingResolver: Send + Sync {
     ) -> Option<Node<'t>> {
         None
     }
+
+    /// Whether `node` declares `name` locally, and the node that binds it.
+    ///
+    /// The other direction from [`declaration_of`](Self::declaration_of): the caller holds a
+    /// *candidate declaration* — a top-level statement of a declaration file — rather than a
+    /// use, and asks whether it is the one that declares `name`. That is the question a type
+    /// oracle's export lookup asks of every statement, and it belongs here, on the resolver
+    /// that owns the kind table, so that no second table has to be kept beside it (#229).
+    ///
+    /// Imports are not declarations: an `import_statement` binds a name for the scope walk,
+    /// but a caller asking "what declares this name here" must not be answered with a node
+    /// the name merely passes through. Defaults to `None` on the same terms as
+    /// `declaration_of`.
+    fn declares<'t>(&self, _source: &str, _node: Node<'t>, _name: &str) -> Option<Node<'t>> {
+        None
+    }
 }
 
 #[cfg(test)]
