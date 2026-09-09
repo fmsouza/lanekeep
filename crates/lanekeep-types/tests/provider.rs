@@ -403,6 +403,46 @@ fn a_specifier_naming_the_emitted_javascript_resolves_to_its_source() {
     );
 }
 
+/// TypeScript's ESM spelling of a `.tsx` module names the emitted `.jsx`, and the source sits
+/// at the same stem — the `.js` case one probe over, for the file the tsx grammar reads.
+#[test]
+fn a_specifier_naming_the_emitted_jsx_resolves_to_its_tsx_source() {
+    let project = Project::new(
+        "relative-jsx-suffix",
+        &[
+            ("src/a.ts", ""),
+            (
+                "src/Button.tsx",
+                "export const who: string = 'b';\nexport const B = () => <b/>;\n",
+            ),
+        ],
+    );
+    let files = project.files();
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/a.ts"), "./Button.jsx"),
+        Some(FilePath::new("src/Button.tsx"))
+    );
+    let provider = lanekeep_types::BuiltinProvider::probe_with(&TypeScript, Some(&Tsx))
+        .expect("TypeScript and tsx");
+    let subject = "import { who } from './Button.jsx';\nlet w = who;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "identifier");
+    assert_eq!(
+        provider.type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files,
+        }),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::String
+        )),
+        "the `.jsx` spelling reaches the `.tsx` source and its own annotation"
+    );
+}
+
 /// A `.tsx` sibling resolves and parses with the TSX grammar.
 ///
 /// The refusal this replaces was `RELATIVE_SUFFIXES`' deliberate omission of `.tsx`: one
@@ -439,11 +479,17 @@ fn a_tsx_sibling_is_resolved_and_parsed_with_the_tsx_grammar() {
 fn a_tsx_sibling_stays_unresolved_without_a_tsx_grammar() {
     let project = Project::new(
         "relative-tsx-refuses",
-        &[("src/Button.tsx", "export const B = () => <b/>;\n")],
+        &[(
+            "src/Button.tsx",
+            "export const label: string = 'hi';\nexport const B = () => <b/>;\n",
+        )],
     );
     let files = project.files();
     let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
-    let subject = "import { B } from './Button';\nlet b = B;\n";
+    // The clean export, deliberately: under the TypeScript grammar the JSX statement is the
+    // `ERROR`, and a per-declaration verdict would find `label` untouched and call the file
+    // read — through a parse in the wrong dialect.
+    let subject = "import { label } from './Button';\nlet l = label;\n";
     let tree = parse(subject);
     let file = FilePath::new("src/app.tsx");
     assert!(
@@ -500,7 +546,10 @@ fn an_uppercase_tsx_extension_is_parsed_with_the_tsx_grammar() {
 fn a_type_answer_crosses_into_a_tsx_sibling() {
     let project = Project::new(
         "tsx-sibling-type",
-        &[("src/Button.tsx", "export const who: string = 'b';\n")],
+        &[(
+            "src/Button.tsx",
+            "export const who: string = 'b';\nexport const B = () => <b/>;\n",
+        )],
     );
     let files = project.files();
     let provider = lanekeep_types::BuiltinProvider::probe_with(&TypeScript, Some(&Tsx))
@@ -2986,11 +3035,17 @@ fn a_mixed_clause_keeps_the_whole_file_verdict() {
         "complete-mixed-clause-error",
         &[(
             "src/big.d.ts",
-            "export declare const ok: number;\ngarbage )(\n",
+            "export declare const ok: number;\nexport default ok;\ngarbage )(\n",
         )],
     );
     let files = project.files();
     let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    // With a default export the `Default` half is reached cleanly, so only the namespace
+    // half can turn the verdict: `import ok from './big'` alone is complete here.
+    assert!(complete_of(
+        &project,
+        "import ok from './big';\nconst y = ok;\n"
+    ));
     let subject = "import ok, * as ns from './big';\nconst y = ok;\n";
     let tree = parse(subject);
     let file = FilePath::new("src/a.ts");
@@ -3302,5 +3357,334 @@ fn a_cycle_at_the_bottom_does_not_disable_the_memo_above_it() {
     assert!(
         elapsed < std::time::Duration::from_secs(1),
         "one cycle must not cost the memo for everything above it: took {elapsed:?}"
+    );
+}
+
+// --- #232 review: the resolve-and-parse contract, judged by node ----------------------------
+
+/// `complete()` for `subject` as `src/a.ts`, over the builtin provider with no tsx grammar.
+fn complete_of(project: &Project, subject: &str) -> bool {
+    ask(project, subject, TypeProvider::complete)
+}
+
+/// A missing token is a parse fault as much as an `ERROR` node is. `has_error()` on the
+/// reached declaration sees both; a span check over recorded `ERROR` ranges saw only the
+/// second, and let a class the parser never finished reading through as read.
+#[test]
+fn a_missing_token_in_the_reached_declaration_is_unread() {
+    let project = Project::new(
+        "complete-missing-token",
+        &[("src/big.d.ts", "export declare class Big { m(): void\n")],
+    );
+    assert!(
+        !complete_of(&project, "import { Big } from './big';\nconst y = Big;\n"),
+        "an unclosed class body is a declaration the parser did not finish reading"
+    );
+    assert!(
+        !complete_of(&project, "import './big';\nconst y = 1;\n"),
+        "and the nameless arm agrees with the named one about the same file"
+    );
+}
+
+/// A name the walk cannot model is not evidence that anything went unread: the module
+/// resolved and parsed, which is the contract. `export = X` beside `declare namespace X` is
+/// the shape most `@types` packages ship, and a rule gated on `complete()` must not go
+/// silent on every file that names one of its members.
+#[test]
+fn a_name_the_walk_cannot_model_leaves_a_clean_module_complete() {
+    let project = Project::new(
+        "complete-export-assignment",
+        &[(
+            "node_modules/@types/react/index.d.ts",
+            "export = React;\nexport as namespace React;\ndeclare namespace React {\n  function useState(): void;\n}\n",
+        )],
+    );
+    assert!(complete_of(
+        &project,
+        "import { useState } from 'react';\nuseState();\n"
+    ));
+    assert!(complete_of(
+        &project,
+        "import React from 'react';\nReact;\n"
+    ));
+    assert!(complete_of(
+        &project,
+        "import * as React from 'react';\nReact;\n"
+    ));
+}
+
+/// A barrel written as two statements — `import { A } from './a'; export { A };` — is
+/// walked through its import: the local clause names an imported binding, and the walk
+/// continues into the module it came from rather than stopping at a name nothing here
+/// declares.
+#[test]
+fn a_two_statement_barrel_is_walked_through_its_import() {
+    let project = Project::new(
+        "barrel-two-statements",
+        &[
+            ("src/index.ts", "import { A } from './a';\nexport { A };\n"),
+            ("src/a.ts", "export const A: number = 1;\n"),
+        ],
+    );
+    let subject = "import { A } from './index';\nconst y = A;\n";
+    assert!(complete_of(&project, subject));
+    assert_eq!(
+        ask(&project, subject, TypeProvider::type_of),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        )),
+        "the chain continues into `./a`, so the value types from its declaration"
+    );
+}
+
+/// The walk continues under the module's own spelling of the name, not the barrel's alias.
+#[test]
+fn a_two_statement_barrel_follows_the_import_alias() {
+    let project = Project::new(
+        "barrel-two-statements-alias",
+        &[
+            (
+                "src/index.ts",
+                "import { A as B } from './a';\nexport { B as C };\n",
+            ),
+            ("src/a.ts", "export const A: number = 1;\n"),
+        ],
+    );
+    assert_eq!(
+        ask(
+            &project,
+            "import { C } from './index';\nconst y = C;\n",
+            TypeProvider::type_of
+        ),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// `export * as ns from 'm'` binds a module object: nothing to walk to, and nothing unread.
+#[test]
+fn a_namespace_re_export_leaves_the_importer_complete() {
+    let project = Project::new(
+        "barrel-namespace-reexport",
+        &[
+            ("src/barrel.ts", "export * as utils from './utils';\n"),
+            ("src/utils.ts", "export const u: number = 1;\n"),
+        ],
+    );
+    assert!(complete_of(
+        &project,
+        "import { utils } from './barrel';\nconst y = utils;\n"
+    ));
+}
+
+/// `namespace A.B {}` declares `A`; the dotted spelling is no binding. The name a chain
+/// reports is the one the enclosing scope sees, not the text of the `nested_identifier`.
+#[test]
+fn a_dotted_namespace_declares_its_first_segment() {
+    let project = Project::new(
+        "dotted-namespace",
+        &[
+            (
+                "src/legacy.d.ts",
+                "export declare namespace A.B { const q: number }\n",
+            ),
+            ("src/index.ts", "export { A as Ns } from './legacy';\n"),
+        ],
+    );
+    let subject = "import { Ns } from './index';\nconst y = Ns;\n";
+    assert!(
+        complete_of(&project, subject),
+        "the walk ends at the namespace `A` declares"
+    );
+    let symbol = ask(&project, subject, TypeProvider::symbol_of).expect("a symbol");
+    assert_eq!(
+        symbol.exported.as_deref(),
+        Some("A"),
+        "the declared name is the first segment, never `A.B`"
+    );
+}
+
+/// A link the walk could not read — a re-export into a file that is absent, or into a
+/// declaration the parser did not finish — is unread, and the importer says so. The walk
+/// failing on a *clean* file is the other case, and it is not this one.
+#[test]
+fn a_damaged_link_in_a_re_export_chain_is_unread() {
+    let absent = Project::new(
+        "chain-absent-link",
+        &[("src/index.ts", "export { A } from './nowhere';\n")],
+    );
+    assert!(!complete_of(
+        &absent,
+        "import { A } from './index';\nconst y = A;\n"
+    ));
+    let damaged = Project::new(
+        "chain-damaged-link",
+        &[
+            ("src/index.ts", "export { A } from './a';\n"),
+            ("src/a.d.ts", "export declare class A { m(: number }\n"),
+        ],
+    );
+    assert!(!complete_of(
+        &damaged,
+        "import { A } from './index';\nconst y = A;\n"
+    ));
+}
+
+/// `symbolOf` reads nothing off a declaration the parser only partly read: the walk refuses
+/// the damaged node, and the symbol falls back to the import's own spelling rather than the
+/// alias read out of the damaged file.
+#[test]
+fn symbol_of_reads_nothing_from_a_damaged_declaration() {
+    let project = Project::new(
+        "symbol-damaged",
+        &[(
+            "src/big.d.ts",
+            "declare class Huge { m(: number }\nexport { Huge as Big };\n",
+        )],
+    );
+    let symbol = ask(
+        &project,
+        "import { Big } from './big';\nconst y = Big;\n",
+        TypeProvider::symbol_of,
+    )
+    .expect("the import's own spelling");
+    assert_eq!(symbol.exported.as_deref(), Some("Big"));
+}
+
+/// `isAssignableTo`'s target is resolved by the same walk, so a damaged target is
+/// unreadable — never a confident answer either way.
+#[test]
+fn a_damaged_target_is_unreadable_not_assignable() {
+    let project = Project::new(
+        "assignable-damaged-target",
+        &[("src/big.d.ts", "export declare class Big { m(: number }\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "import { Big } from './big';\nlet b: Big;\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "type_identifier");
+    assert_eq!(
+        provider.is_assignable_to(
+            Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node,
+                files: &files,
+            },
+            "./big",
+            "Big",
+        ),
+        None,
+        "the target's declaration was only partly read"
+    );
+}
+
+/// A damaged parent in the asking file's own tree is as unreadable as one in a declaration
+/// file: the node carries its own error flag, whichever tree it sits in.
+#[test]
+fn a_damaged_heritage_parent_in_the_asking_file_is_unreadable() {
+    let project = Project::new(
+        "heritage-damaged-locally",
+        &[("src/big.d.ts", "export interface Root { r(): void }\n")],
+    );
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "interface Damaged { d: ;;; }\ninterface Mid extends Damaged { m(): void }\nclass X implements Mid {}\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let node = last_of(&tree, "type_identifier");
+    assert_eq!(
+        provider.is_assignable_to(
+            Query {
+                file: &file,
+                tree: &tree,
+                source: subject,
+                node,
+                files: &files,
+            },
+            "./big",
+            "Root",
+        ),
+        None,
+        "the chain crosses a parent the parser only partly read"
+    );
+}
+
+/// A star source that cannot be read does not hide the one after it that declares the name:
+/// the walk reads past it, the way it always has, and reports the source it could not read
+/// only when no source answered.
+#[test]
+fn a_dead_star_source_does_not_hide_a_live_one() {
+    let project = Project::new(
+        "barrel-dead-star",
+        &[
+            (
+                "src/index.ts",
+                "export * from './removed';\nexport * from './money';\n",
+            ),
+            ("src/money.ts", "export const rate: number = 1;\n"),
+        ],
+    );
+    let subject = "import { rate } from './index';\nconst y = rate;\n";
+    assert_eq!(
+        ask(&project, subject, TypeProvider::type_of),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        )),
+        "the live source answers whatever sits ahead of it"
+    );
+    assert!(complete_of(&project, subject));
+    let nowhere = Project::new(
+        "barrel-dead-star-only",
+        &[("src/index.ts", "export * from './removed';\n")],
+    );
+    assert!(
+        !complete_of(
+            &nowhere,
+            "import { rate } from './index';\nconst y = rate;\n"
+        ),
+        "with no source answering, the one that could not be read is what the verdict is about"
+    );
+}
+
+/// Three segments, because the grammar spells every inner level of a dotted name as a
+/// `member_expression`: the declared name is still the first segment.
+#[test]
+fn a_three_segment_namespace_declares_its_first_segment() {
+    let project = Project::new(
+        "dotted-namespace-three",
+        &[
+            (
+                "src/legacy.d.ts",
+                "export declare namespace google.maps.places { const q: number }\n",
+            ),
+            ("src/index.ts", "export { google as G } from './legacy';\n"),
+        ],
+    );
+    let subject = "import { G } from './index';\nconst y = G;\n";
+    assert!(complete_of(&project, subject));
+    let symbol = ask(&project, subject, TypeProvider::symbol_of).expect("a symbol");
+    assert_eq!(symbol.exported.as_deref(), Some("google"));
+}
+
+/// A `.tsx` file is unread by a provider with no tsx grammar whatever its parse under the
+/// wrong grammar happens to say: `<Foo>bar` is a type assertion to the TypeScript grammar
+/// and JSX to the TSX one, so a clean parse is not a right one.
+#[test]
+fn a_tsx_file_is_unread_without_a_tsx_grammar_whatever_its_parse() {
+    let project = Project::new(
+        "relative-tsx-clean-parse",
+        &[("src/Button.tsx", "export const who: string = 'b';\n")],
+    );
+    let subject = "import { who } from './Button';\nlet w = who;\n";
+    assert!(!complete_of(&project, subject));
+    assert_eq!(ask(&project, subject, TypeProvider::type_of), None);
+    assert!(
+        !complete_of(&project, "import './Button';\nconst y = 1;\n"),
+        "the nameless arm agrees"
     );
 }

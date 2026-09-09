@@ -1449,6 +1449,45 @@ capability that is a per-language `Option` on a trait needs a fixture for every 
 claims it, or "declared for a language with no analyzer is silent, not refused" (§6.10) quietly
 covers a language that was meant to have one.
 
+**`Node::has_error()` is true for a `MISSING` token; `kind() == "ERROR"` is not.** An unclosed
+brace — `export declare class Big { m(): void` — parses to a tree with **zero** `ERROR` nodes
+and one zero-width `MISSING "}"`, and the root's `has_error()` is true. #232 recorded `ERROR`
+nodes' byte ranges at parse time and judged a reached declaration by span intersection, so
+every truncated file read as fully readable: `complete()` said `true` and `returnTypeOf` typed
+the half-read class, while the nameless arm, still on the whole-file flag, said `false` about
+the same file. Ask the reached node itself — `node.has_error()` is O(1), counts both kinds of
+fault, and is a property of the node in whichever tree it sits, which is also what lets the
+asking file's own damaged parents answer `None` the way a declaration file's do. The span
+walk was also a full tree walk per parse, under the parser lock — measured 2026-09-09 at
+36 ms on a synthetic 472k-node `.d.ts`, where a walk that stops at the first subtree whose
+`has_error()` is false stops at the root and costs one flag read.
+
+**A completeness gate built on a type walk counts every shape the walk cannot model.** #232
+made `complete()` false whenever `export_target` could not end a named import at a
+declaration, meaning to catch damaged declarations — and it caught `export = X` beside
+`declare namespace X` (the `@types/react` idiom), the two-statement barrel `import { A } from
+'./a'; export { A };` (in the one large local `node_modules` the review counted, the more
+common barrel spelling — the ratio is the point, the corpus is gone), `export * as ns from`,
+and `namespace A.B`, all of them clean files, all flipped to incomplete for every importer.
+`complete()` is about *reading*: a name is unread when a link of its chain could not be read,
+not when a module read whole has no export the walk models. `walk_export` now says which —
+`Unreached::Unread` against `Unmodeled` — and only the first counts. Two things the fix nearly
+got wrong are worth keeping beside it: a star source that cannot be read must be read *past*,
+or a dead `export * from './generated'` ahead of a live source silences every name the
+barrel re-exports; and every inner level of a dotted namespace name is a `member_expression`,
+not a `nested_identifier`, so a two-segment fixture proves nothing about `google.maps.places`.
+
+**Three provider construction sites make three decisions unless they read one function.** The
+run's builtin arm read `registry.by_id("tsx")`, the CLI session hardcoded `Some(&Tsx)`, and
+the `tsc`-spawn fallback still called `probe` with no tsx, folding a shorter identity than
+the run's — beside a comment claiming the two answer identically. `builtin_grammars` is the
+one place the three read from now; no test can tell that from a hardcoded pair, because the
+shipped registry's `TypeScript` and `Tsx` are the same values, so it is a fact about the
+source. And the identity test the fold came with asserted only inequality, which the vectors'
+lengths satisfied on their own: `TypeScript` and `Tsx` share one `analysis_identity`, so a
+provider over the TSX grammar folded exactly what one over TypeScript did.
+`the_identity_folds_both_grammar_digests_and_the_resolver` pins the fold byte for byte.
+
 ## What not to do
 
 - Do not add a dependency without checking `deny.toml`. Network crates are banned

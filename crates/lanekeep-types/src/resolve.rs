@@ -43,17 +43,21 @@ use lanekeep_core::files::{FileAccess, normalize};
 /// directly after `.ts`, and `/index.tsx` after `/index.ts` — TypeScript's own resolution
 /// order, which reads the source before the declaration file beside it.
 ///
-/// **`.tsx` is probed; `.jsx` remains deliberately absent.** A `.jsx` file is JavaScript,
-/// which this provider does not read at all, so probing it could only record eight absent
-/// reads per import. A `.tsx` file is TypeScript — one grammar wider — and is reached often
-/// enough on a React codebase that refusing it made most sibling imports resolve to
-/// nothing, every name they brought in answer `undefined`, and the importing file
+/// **`.tsx` is probed; a `.jsx` *file* remains deliberately absent.** A `.jsx` file is
+/// JavaScript, which this provider does not read at all, so probing it could only record
+/// eight absent reads per import — a `.jsx` *specifier* is another matter, and `relative`
+/// strips it the way it strips `.js`, because it is how a `.tsx` module is imported under
+/// `moduleResolution: node16`. A `.tsx` file is TypeScript — one grammar wider — and is
+/// reached often enough on a React codebase that refusing it made most sibling imports
+/// resolve to nothing, every name they brought in answer `undefined`, and the importing file
 /// `complete() == false`. What a `.tsx` costs is a second *parser*: the provider that cannot
-/// parse JSX honestly — one built with no tsx grammar — still refuses it, at the **parse**
-/// step, where the `ERROR` nodes JSX becomes under the TypeScript grammar are counted by
-/// `has_error` and the importing file is reported incomplete. An honest incompleteness
-/// rather than a silent wrong answer, which is the property the old refusal existed to
-/// protect.
+/// parse JSX honestly — one built with no tsx grammar — still refuses it, one step later than
+/// here, at `walk_export` and `complete()`, which do not read a file in a dialect they have
+/// no grammar for: the importing file is reported incomplete for every name it takes from it,
+/// and every such name answers `undefined`. An honest incompleteness rather than a silent
+/// wrong answer, which is the property the old refusal existed to protect — and a parse in
+/// the wrong dialect is wrong even when it is clean, since `<Foo>bar` is a type assertion to
+/// one grammar and JSX to the other.
 const RELATIVE_SUFFIXES: &[&str] = &[
     ".ts",
     ".tsx",
@@ -90,8 +94,9 @@ fn relative(files: &FileAccess, from: &FilePath, specifier: &str) -> Option<File
     // TypeScript's ESM spelling names the *emitted* file; the declaration sits at the same
     // stem. Stripping the suffix here rather than adding four more probe entries keeps the
     // recorded dependency list short, which is a cache-entry-size decision as much as a
-    // correctness one.
-    let stem = [".js", ".mjs", ".cjs"]
+    // correctness one. `.jsx` is the emitted name of a `.tsx` module — the spelling
+    // `moduleResolution: node16` requires for one — and it strips like `.js` does.
+    let stem = [".js", ".jsx", ".mjs", ".cjs"]
         .iter()
         .find_map(|suffix| specifier.strip_suffix(suffix))
         .unwrap_or(specifier);

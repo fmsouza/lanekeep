@@ -83,30 +83,38 @@ A `.tsx` project source — `Button.tsx` beside `import { Button } from './Butto
 and answers like any other source: the provider carries a second parser, in the TSX grammar,
 chosen by the resolved path's extension, so JSX is read rather than swallowed into `ERROR`
 nodes. A run whose registry has no `tsx` grammar at all keeps the old refusal, honestly: a
-sibling whose JSX the TypeScript grammar cannot read then fails to parse and the importing
-file reports `complete() === false`. `.jsx` files stay unread — they are JavaScript, which
-this provider does not read at all.
+`.tsx` sibling is then not read at all — a parse in the wrong dialect is wrong even when it
+is clean — so every name taken from it answers `undefined` and the importing file reports
+`complete() === false`. `.jsx` *files* stay unread — they are JavaScript, which this provider does
+not read at all — but the `.jsx` *specifier* is another matter: `import { Button } from
+'./Button.jsx'`, the spelling `moduleResolution: node16` requires for a `.tsx` module,
+resolves to `Button.tsx` the way `./money.js` resolves to `money.ts`.
 
 And, situationally: anything behind an import that did not resolve. `complete()` is how a rule
-finds out that happened — with two deliberate exclusions. An import of something that is not
+finds out that happened — with one deliberate exclusion. An import of something that is not
 code — `./app.css`, `./data.json`, `./logo.svg` — is not counted at all: it is not a module the
 oracle reads, and counting it would label most of a bundler's project incomplete for having
 stylesheets. A specifier is skipped only when its last segment carries a known asset extension,
 never when it merely looks like one: `./user.service`, `./auth.guard` and the rest of the
-NestJS and Angular vocabulary are modules and are probed. And an import whose target resolves
-is still judged by what the walk *reaches*, not by the whole file it landed in — that is the
-next paragraph.
+NestJS and Angular vocabulary are modules and are probed. An import whose target resolves is
+judged by what the walk *reaches*, not by the whole file it landed in — the next paragraph.
 
-**The parse-fault verdict is per reached declaration.** `complete()` walks every *named* import
-to the node that declares it and answers `false` only when an `ERROR` node's span intersects
-that node's — either the parser gave up around the declaration, or it recovered inside the
-declaration's own damaged body. An `ERROR` in a sibling statement covers nothing: the names it
-swallowed answer `undefined`, but a declaration the rule actually asked about answers normally,
-and an import that reaches only such declarations stays complete. The coarse verdict survives
-where no single declaration can be reached — a side-effect import, a namespace binding
-(`import * as ns`), a bare `export *` — because a module object reaches everywhere, so any
-`ERROR` in its file counts. And a name whose re-export chain cannot be walked to the end is as
-unread as it ever was.
+**The parse-fault verdict is per reached declaration, and `complete()` is about reading.**
+`complete()` walks every *named* import to the node that declares it and answers `false` when
+a link of that chain could not be read: the specifier resolves to nothing, a file will not
+parse, or the declaration it ends at carries a parse fault of its own — an `ERROR` the parser
+recovered inside its body, or the `MISSING` token an unclosed brace leaves, which is what a
+truncated file produces and no `ERROR` at all. A fault in a sibling statement covers nothing:
+the names it swallowed answer `undefined`, but a declaration the rule actually asked about
+answers normally, and an import that reaches only such declarations stays complete. A name the
+walk cannot follow to a declaration in a module it read whole is not incomplete either —
+`export = X` beside `declare namespace X`, the shape most `@types` packages ship, resolves and
+parses, and its members answer `undefined` with `complete()` still `true`. `complete()` says
+whether every import was read, never whether every name is typeable. The coarse verdict
+survives where no single declaration can be reached — a side-effect import, a namespace
+binding (`import * as ns`), a bare `export *` — because a module object reaches everywhere, so
+any fault in its file counts. A `.tsx` file a provider has no tsx grammar for is unread
+outright, whatever a parse in the wrong dialect would have said.
 
 Two further limits, specific to individual questions:
 
@@ -132,7 +140,8 @@ The file under check, and the declaration files its imports resolve to:
 
 1. A **relative** specifier tries `x.ts`, `x.tsx`, `x.mts`, `x.cts`, `x.d.ts`, `x/index.ts`,
    `x/index.tsx`, `x/index.d.ts`, in that order. A specifier naming the emitted JavaScript —
-   `./money.js`, TypeScript's own ESM spelling — is tried at the same stem.
+   `./money.js`, TypeScript's own ESM spelling, or `./Button.jsx` for a `.tsx` module — is
+   tried at the same stem.
 2. A **bare** specifier walks `node_modules` upward from the importing file's directory. In a
    package it reads `package.json`: `exports` under the `types` condition (subpath maps and
    `*` patterns included), then `types`, then `typings`, then `index.d.ts`; then the same for
