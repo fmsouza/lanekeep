@@ -362,14 +362,24 @@ fn render_member(resolve: &Resolve, method: &Function) -> String {
         "files" => return "  readonly files: string[]\n".to_owned(),
         "emit-fact" => return "  emitFact(fact: Fact): void\n".to_owned(),
         "report" => {
-            // `report` folds the two optional WIT parameters into the JavaScript
-            // `ReportOptions` idiom; the first real parameter is the site it reports at —
-            // `Node` on the per-file context, `ReduceLocation` on the cross-file one.
+            // `report` folds its optional WIT parameters into the JavaScript idiom; the first
+            // real parameter is the site it reports at — `Node` on the per-file context,
+            // `ReduceLocation` on the cross-file one. The options half differs per context, and
+            // the world says so: only the per-file `report` carries a `fix` parameter, because
+            // a fix replaces a node's text and the reduce phase has no parse tree. Reading the
+            // world rather than hardcoding the union is what keeps the types honest about that
+            // — a `report` whose signature has no `fix` parameter takes a message only, so
+            // offering one is a compile error instead of a value the host accepts and drops.
             let at = method.params.get(1).map_or_else(
                 || "Node".to_owned(),
                 |param| render_type(resolve, &param.ty),
             );
-            return format!("  report(at: {at}, message?: string | ReportOptions): void\n");
+            let message = if has_fix_param(resolve, method) {
+                "string | ReportOptions"
+            } else {
+                "string"
+            };
+            return format!("  report(at: {at}, message?: {message}): void\n");
         }
         _ => {}
     }
@@ -388,6 +398,32 @@ fn render_member(resolve: &Resolve, method: &Function) -> String {
         .as_ref()
         .map_or_else(|| "void".to_owned(), |ty| render_type(resolve, ty));
     format!("  {}({params}): {result}\n", camel(name))
+}
+
+/// Whether the method's third real parameter is `option<fix>` — the shape of the `fix`
+/// parameter the world gives the per-file `report` and the reduce one lacks.
+///
+/// A resource method's parameters open with the component model's implicit `self` borrow at
+/// index 0, which a rule author never names — the same convention that has `render_member`
+/// read the site parameter at index 1, so `fix`, where present, is index 3.
+fn has_fix_param(resolve: &Resolve, method: &Function) -> bool {
+    let Some(param) = method.params.get(3) else {
+        return false;
+    };
+    is_option_of_fix(resolve, &param.ty)
+}
+
+/// Whether a WIT type is `option<fix>`, resolving through a named alias the same way
+/// `render_type` resolves a bare alias.
+fn is_option_of_fix(resolve: &Resolve, ty: &Type) -> bool {
+    let Type::Id(id) = ty else {
+        return false;
+    };
+    match &resolve.types[*id].kind {
+        TypeDefKind::Option(inner) => render_type(resolve, inner) == "Fix",
+        TypeDefKind::Type(inner) => is_option_of_fix(resolve, inner),
+        _ => false,
+    }
 }
 
 const HEADER: &str = "\
@@ -552,7 +588,13 @@ export type UnmetObligation = {
 ";
 
 const FIX: &str = "\
-/** A replacement a rule offers for a violation. */
+/**
+ * A replacement a rule offers for a violation.
+ *
+ * A per-file offer alone: a fix names a node, and the reduce phase consumes facts and the
+ * file list and nothing else — there is no parse tree there for `node` to name, which is why
+ * `ReduceContext.report` takes a message and no options.
+ */
 export interface Fix {
   /** The node whose text is replaced. */
   node: Node

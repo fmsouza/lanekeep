@@ -264,3 +264,42 @@ test('the reduce phase reports at a location and refuses anything else', () => {
   // over a node is making a category error and should hear about it.
   assert.throws(() => built.report(7, 'cycle'), /there are no nodes to report at/)
 })
+
+test('the reduce phase refuses a report that offers a fix', () => {
+  const seen = []
+  const built = buildReduceContext({
+    files: () => [],
+    facts: () => [],
+    report: (at, message) => seen.push([at, message]),
+  })
+
+  // A fix replaces a node's text, and this phase has no parse tree — no node to replace, so
+  // no fix can be carried. The `at` check next door throws on this same category error; a
+  // supplied `fix` is the same mistake and should be heard, not silently dropped before
+  // `--fix` can ever see it.
+  assert.throws(
+    () =>
+      built.report(
+        { file: 'a.ts', line: 3, column: 4 },
+        { message: 'cycle', fix: { node: 1, text: 'let x = 1', safe: true } },
+      ),
+    /there is no node to attach one to/,
+  )
+
+  // Any supplied fix, however empty, is refused: a fix's *shape* is the per-file host's
+  // business, and here its existence alone is the mistake.
+  assert.throws(
+    () => built.report({ file: 'a.ts', line: 3, column: 4 }, { fix: {} }),
+    /there is no node to attach one to/,
+  )
+
+  // No fix, no refusal. A message-only options object is the ordinary call, and an explicitly
+  // absent fix (`null`) is not a supplied one — `readReportOptions` calls both absent, so the
+  // host hears nothing to refuse.
+  built.report({ file: 'a.ts', line: 5, column: 6 }, { message: 'again' })
+  built.report({ file: 'a.ts', line: 7, column: 8 }, { message: 'again', fix: null })
+  assert.deepEqual(seen, [
+    [{ file: 'a.ts', line: 5, column: 6 }, 'again'],
+    [{ file: 'a.ts', line: 7, column: 8 }, 'again'],
+  ])
+})

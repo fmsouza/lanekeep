@@ -1108,39 +1108,9 @@ impl ReduceContext {
                         ));
                     };
 
-                    // A bare string or `{ message }`, because the per-file `ctx.report` takes
-                    // options as its second argument and nobody remembers that this one is
-                    // different. Accepting both costs nothing and removes a papercut whose
-                    // only symptom was a type-conversion error naming neither argument.
-                    let message = match message.0 {
-                        None => None,
-                        Some(value) if value.is_undefined() || value.is_null() => None,
-                        Some(value) => {
-                            if let Some(text) = value.as_string() {
-                                Some(text.to_string()?)
-                            } else if let Some(options) = value.as_object() {
-                                match options.get::<_, Value<'js>>("message") {
-                                    Ok(found) if found.is_string() => found
-                                        .as_string()
-                                        .map(rquickjs::String::to_string)
-                                        .transpose()?,
-                                    _ => {
-                                        return Err(throw(
-                                            &ctx,
-                                            "ctx.report in a reduce phase takes a message: \
-                                             either a string, or { message }",
-                                        ));
-                                    }
-                                }
-                            } else {
-                                return Err(throw(
-                                    &ctx,
-                                    "ctx.report in a reduce phase takes a message: either a \
-                                     string, or { message }",
-                                ));
-                            }
-                        }
-                    };
+                    // A bare string or `{ message }` — see `reduce_report_message`, which
+                    // also refuses a supplied `fix`.
+                    let message = reduce_report_message(&ctx, message)?;
 
                     reports.borrow_mut().push(ReduceReport {
                         file,
@@ -1154,6 +1124,60 @@ impl ReduceContext {
         )?;
 
         Ok(object)
+    }
+}
+
+/// The message half of a reduce report's second argument.
+///
+/// A bare string or `{ message }`, because the per-file `ctx.report` takes options as its
+/// second argument and nobody remembers that this one is different. Accepting both costs
+/// nothing and removes a papercut whose only symptom was a type-conversion error naming
+/// neither argument.
+///
+/// A supplied `fix` is refused before the message probe, so the fix refusal wins whether or
+/// not a message came with it: a fix replaces a node's text, and this phase has no parse
+/// tree — no node to replace, so none can be carried. It is the same refusal `host.js`'s
+/// `buildReduceContext` makes, one bug carrying one message in both engines.
+fn reduce_report_message<'js>(
+    ctx: &Ctx<'js>,
+    message: Opt<Value<'js>>,
+) -> rquickjs::Result<Option<String>> {
+    match message.0 {
+        None => Ok(None),
+        Some(value) if value.is_undefined() || value.is_null() => Ok(None),
+        Some(value) => {
+            if let Some(text) = value.as_string() {
+                return Ok(Some(text.to_string()?));
+            }
+            let Some(options) = value.as_object() else {
+                return Err(throw(
+                    ctx,
+                    "ctx.report in a reduce phase takes a message: either a string, or \
+                     { message }",
+                ));
+            };
+
+            let fix = options.get::<_, Value<'js>>("fix")?;
+            if !fix.is_undefined() && !fix.is_null() {
+                return Err(throw(
+                    ctx,
+                    "ctx.report in a reduce phase cannot take a fix — there is no parse \
+                     tree here, so there is no node to attach one to",
+                ));
+            }
+
+            match options.get::<_, Value<'js>>("message") {
+                Ok(found) if found.is_string() => found
+                    .as_string()
+                    .map(rquickjs::String::to_string)
+                    .transpose(),
+                _ => Err(throw(
+                    ctx,
+                    "ctx.report in a reduce phase takes a message: either a string, or \
+                     { message }",
+                )),
+            }
+        }
     }
 }
 
@@ -2035,6 +2059,29 @@ mod tests {
         assert!(
             error.to_string().contains("message"),
             "the error should say what it wanted: {error}"
+        );
+    }
+
+    /// A fix replaces a node's text, and this phase has no parse tree — no node to replace,
+    /// so none can be carried. A rule offering one must hear about it rather than have
+    /// `--fix` silently skip it, the same refusal the component runtime makes (`host.js`'s
+    /// `buildReduceContext`, where this module is the specification both engines follow).
+    #[test]
+    fn a_reduce_report_refuses_a_fix() {
+        let context = ReduceContext::new(vec!["a.ts".to_owned()], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        let error = sandbox
+            .eval_with_reduce_host::<()>(
+                &context,
+                r"ctx.report({ file: 'a.ts', line: 1, column: 2 }, { message: 'cycle', fix: { node: 1, text: 'let x = 1', safe: true } })",
+                budget(),
+            )
+            .expect_err("should refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("there is no node to attach one to"),
+            "the error should say why a fix cannot be carried: {error}"
         );
     }
 

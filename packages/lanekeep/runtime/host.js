@@ -318,7 +318,13 @@ export function buildReduceContext(ctx) {
             'tree here, so there are no nodes to report at',
         )
       }
-      const [message] = readReportOptions(options)
+      const [message, fix] = readReportOptions(options)
+      if (fix !== undefined) {
+        throw new TypeError(
+          'ctx.report in a reduce phase cannot take a fix — there is no parse tree here, ' +
+            'so there is no node to attach one to',
+        )
+      }
       ctx.report({ file: at.file, line: at.line, column: at.column }, message)
     },
   }

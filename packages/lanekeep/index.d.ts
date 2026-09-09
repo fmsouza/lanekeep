@@ -136,7 +136,13 @@ export interface Gates {
   fileNotContains?: string[]
 }
 
-/** A replacement a rule offers for a violation. */
+/**
+ * A replacement a rule offers for a violation.
+ *
+ * A per-file offer alone: a fix names a node, and the reduce phase consumes facts and the
+ * file list and nothing else — there is no parse tree there for `node` to name, which is why
+ * `ReduceContext.report` takes a message and no options.
+ */
 export interface Fix {
   /** The node whose text is replaced. */
   node: Node
@@ -412,7 +418,7 @@ export interface ReduceLocation {
 export interface ReduceContext {
   readonly files: string[]
   facts(kind?: string): EmittedFact[]
-  report(at: ReduceLocation, message?: string | ReportOptions): void
+  report(at: ReduceLocation, message?: string): void
 }
 
 /** Queries whose named captures drive the taint analysis. */
