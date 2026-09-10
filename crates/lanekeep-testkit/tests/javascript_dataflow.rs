@@ -101,3 +101,34 @@ fn a_finally_discharges_on_every_path_in_a_javascript_file() {
         .accepts("function f() { const b = acq(); try { use(b); } finally { rel(b); } }\n")
         .expect("`finally` is on every path out");
 }
+
+/// A flow rule that declares `requires: ['dataflow', 'types']` and calls `ctx.types` inside
+/// `checkFlow`. If the provider were not attached in the flow phase, `ctx.types.complete()`
+/// would throw a `TypeError` and no violation would be reported — so a reported violation is
+/// proof the path is live (#247's related note).
+const FLOW_RULE_WITH_TYPES: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/secret-with-types',\n\
+      language: ['typescript'],\n\
+      requires: ['dataflow', 'types'],\n\
+      flow: {\n\
+        sources: ['(call_expression function: (identifier) @fn (#eq? @fn \"getSecret\")) @source'],\n\
+        sinks: ['(call_expression function: (identifier) @fn (#eq? @fn \"log\") \
+                 arguments: (arguments (_) @sink))'],\n\
+      },\n\
+      card: { message: 'leak', remediation: 'redact', examples: { bad: 'log(s)', good: 'log(redact(s))' } },\n\
+      checkFlow(ctx, path) { if (ctx.types.complete()) ctx.report(path.sink, 'reaches a sink'); },\n\
+    });\n";
+
+#[test]
+fn ctx_types_is_reachable_inside_check_flow() {
+    RuleTester::with_extension("ts-flow-types", FLOW_RULE_WITH_TYPES, "ts")
+        .expect("builds")
+        .reports_at(
+            "function f() { const s = getSecret(); log(s); }\n",
+            &[(1, 43)],
+        )
+        .expect(
+            "ctx.types.complete() returns true inside checkFlow and the flow reports at the sink",
+        );
+}

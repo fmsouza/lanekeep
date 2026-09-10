@@ -18,10 +18,25 @@ pub struct FlowPath<'t> {
     pub steps: Vec<Node<'t>>,
 }
 
-/// A per-language may-taint analysis over source/sink/sanitizer node sets.
-pub trait FlowAnalyzer: Send + Sync {
+/// The result of one file's taint analysis: the flows found, and how many constructs the
+/// analysis could not see through.
+#[derive(Debug, Clone)]
+pub struct FlowAnalysis<'t> {
     /// One [`FlowPath`] per (source, sink) where taint reaches the sink without passing a
     /// sanitizer, deduplicated, in canonical order (sink source-position, then source).
+    pub paths: Vec<FlowPath<'t>>,
+    /// How many identifier-bearing expressions the analysis dropped at its fallback arm —
+    /// a binding's taint carried into a construct v1 does not model (`binary_expression`,
+    /// `template_substitution`, `unary_expression`, ...). The documented call boundary is
+    /// excluded. Zero means every value that flowed to a sink was one the analysis models;
+    /// nonzero is the honest "did not look here" signal (issue #247).
+    pub dropped: u32,
+}
+
+/// A per-language may-taint analysis over source/sink/sanitizer node sets.
+pub trait FlowAnalyzer: Send + Sync {
+    /// The flows found (canonical, deduplicated) plus a count of constructs the analysis
+    /// could not see through.
     fn analyze<'t>(
         &self,
         tree: &'t Tree,
@@ -29,7 +44,7 @@ pub trait FlowAnalyzer: Send + Sync {
         sources: &[Node<'t>],
         sinks: &[Node<'t>],
         sanitizers: &[Node<'t>],
-    ) -> Vec<FlowPath<'t>>;
+    ) -> FlowAnalysis<'t>;
 }
 
 #[cfg(test)]
@@ -47,8 +62,11 @@ mod tests {
             _sources: &[Node<'t>],
             _sinks: &[Node<'t>],
             _sanitizers: &[Node<'t>],
-        ) -> Vec<FlowPath<'t>> {
-            vec![]
+        ) -> FlowAnalysis<'t> {
+            FlowAnalysis {
+                paths: Vec::new(),
+                dropped: 0,
+            }
         }
     }
 

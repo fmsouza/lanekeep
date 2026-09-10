@@ -849,6 +849,9 @@ impl std::fmt::Debug for Engine {
 /// `content_gated` or `language_gated` in all seventeen rows — and which of the two it lands
 /// in differs by rule, so "identical rows warm" is false as well. The reconciliation above
 /// is what still holds warm: the six counters sum to `files_discovered` in every state.
+///
+/// `dropped` sits outside this reconciliation on purpose — it counts constructs skipped
+/// *within* analyzed files, not a file's disposition, so it is not one of the six.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
@@ -890,6 +893,14 @@ pub struct RuleTiming {
     /// Files this rule actually saw run: both gates passed, and its declared language
     /// matched the file's.
     pub parsed: u64,
+    /// Constructs the taint analysis could not see through, summed over this rule's files.
+    ///
+    /// Orthogonal to the six counters above: not a file disposition (a file can be parsed
+    /// *and* carry drops, and this can exceed the file count), so it does not participate in
+    /// their sum-to-`files_discovered`. It is a flow rule's honest "did not look here" signal
+    /// (#247): a rule reporting nothing with `dropped > 0` traced a value into a construct v1
+    /// does not follow.
+    pub dropped: u64,
 }
 
 impl RuleTiming {
@@ -913,6 +924,9 @@ impl RuleTiming {
         self.content_gated += other.content_gated;
         self.language_gated += other.language_gated;
         self.parsed += other.parsed;
+        // Not one of the six reconciled counters (see the struct doc), but still a per-file
+        // count that this rule's total must sum across every file it ran against.
+        self.dropped += other.dropped;
     }
 }
 
@@ -3297,6 +3311,14 @@ impl Engine {
     /// handle once the borrow has ended. A JS `Node` *is* that handle — the same integer a
     /// `Match` carries into `check` — so `checkFlow` receives `{ source, sink, steps }` of
     /// handles and reports at `path.sink` through the ordinary `ctx` surface.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "role queries, the analysis call, the node-to-handle mapping and the report \
+                  all belong in one place — see the doc comment above. #247's `dropped` \
+                  capture is three lines threading a value already computed here to the \
+                  `timing` this function already owns, not a new responsibility that would \
+                  motivate splitting the function"
+    )]
     fn run_flow_rule(
         &self,
         worker: &mut Worker<'_>,
@@ -3347,6 +3369,10 @@ impl Engine {
         // analyzer returns canonical deduplicated flows over them, and each flow is reduced to
         // owned capture paths before the borrow ends.
         let query_started = clock(self.profiling);
+        // Deferred rather than `mut ... = 0`: the block below always assigns exactly once
+        // before this is read, and an initial value would be dead — `unused_assignments`,
+        // denied under `-D warnings` in `just lint`.
+        let dropped_constructs: u32;
         let flows: Vec<FlowPathPaths> = {
             let arena = host.arena().borrow();
             let ts_tree = arena.tree();
@@ -3355,8 +3381,10 @@ impl Engine {
             let sinks = collect_captures(&flow.sinks, ts_tree, source, "sink");
             let sanitizers = collect_captures(&flow.sanitizers, ts_tree, source, "sanitizer");
 
-            analyzer
-                .analyze(ts_tree, source, &sources, &sinks, &sanitizers)
+            let analysis = analyzer.analyze(ts_tree, source, &sources, &sinks, &sanitizers);
+            dropped_constructs = analysis.dropped;
+            analysis
+                .paths
                 .into_iter()
                 .filter_map(|flow_path| {
                     // A node that does not resolve to a path is dropped rather than mapped to
@@ -3380,6 +3408,10 @@ impl Engine {
             timing.query = started.elapsed();
             timing.matches = flows.len() as u64;
         }
+        // Recorded whether or not a flow was found and whether or not profiling is on — the
+        // analysis always ran, and a file with drops but no flow is exactly the case #247 is
+        // about. Discarded downstream when `self.profiling` is false, like the other counters.
+        timing.dropped = u64::from(dropped_constructs);
 
         if flows.is_empty() {
             // No captures, or no flow between them: no crossing into the sandbox at all, the
@@ -6766,6 +6798,109 @@ export default defineRule({
             found,
             vec![("src/a.ts", 3, 7, "a tainted value reaches this sink")],
             "exactly one violation, at the `s` inside `log(s)`"
+        );
+    }
+
+    #[test]
+    fn a_dropped_construct_is_counted_in_the_flow_rule_timing() {
+        // `s` is tainted, but the binary sink `s + "!"` drops it — no flow is found, yet the
+        // file was not clean: the analysis could not see through the construct. `dropped` is
+        // what tells the two apart (#247).
+        let project = Project::new(
+            "flow-drop-count",
+            &[
+                ("rule.ts", SECRET_FLOW_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s + \"!\");\n}\n",
+                ),
+            ],
+        );
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs");
+        assert!(
+            outcome.violations.is_empty(),
+            "the binary sink drops the taint, so no flow reaches the sink"
+        );
+        assert_eq!(
+            timing_for(&outcome, "local/no-secret-in-string").dropped,
+            1,
+            "the binary sink was counted as a construct the analysis could not see through"
+        );
+    }
+
+    #[test]
+    fn two_sinks_accumulate_the_drop_count_and_a_clean_sink_still_reports() {
+        // Two sinks in one file: `log(s + "!")` is a binary drop (+1, no flow); `log(s)` is a
+        // real flow (reports, adds no drop). Proves `analyze` sums drops across sinks and a
+        // clean sink beside a dropping one still reports.
+        let project = Project::new(
+            "flow-drop-accumulate",
+            &[
+                ("rule.ts", SECRET_FLOW_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s + \"!\");\n  log(s);\n}\n",
+                ),
+            ],
+        );
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs");
+        assert_eq!(
+            outcome.violations.len(),
+            1,
+            "the clean sink `log(s)` still reports one flow"
+        );
+        assert_eq!(
+            timing_for(&outcome, "local/no-secret-in-string").dropped,
+            1,
+            "one binary-sink drop, accumulated over both sinks; the clean sink adds none"
+        );
+    }
+
+    #[test]
+    fn the_drop_count_sums_across_files_for_one_rule() {
+        // Each file contributes one binary-sink drop; RuleTiming::accumulate must sum them
+        // per rule across files (a `=` instead of `+=` would report 1, not 2).
+        let project = Project::new(
+            "flow-drop-accumulate-files",
+            &[
+                ("rule.ts", SECRET_FLOW_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s + \"!\");\n}\n",
+                ),
+                (
+                    "src/b.ts",
+                    "function g() {\n  const t = getSecret();\n  log(t + \"?\");\n}\n",
+                ),
+            ],
+        );
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs");
+        assert!(
+            outcome.violations.is_empty(),
+            "both binary sinks drop the taint; no flow reaches a sink"
+        );
+        assert_eq!(
+            timing_for(&outcome, "local/no-secret-in-string").dropped,
+            2,
+            "one drop per file, summed across both files by RuleTiming::accumulate",
         );
     }
 

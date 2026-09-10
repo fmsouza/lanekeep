@@ -582,37 +582,45 @@ fn write_profile(
 /// the path gates and records the counter before the read and before the cache is consulted
 /// at all, so two rules differing only in `pathMatches` render different rows warm.
 fn write_gate_profile(
+    w: &mut dyn std::io::Write,
     timings: &BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming>,
     files_discovered: usize,
 ) -> anyhow::Result<()> {
-    let mut stderr = std::io::stderr();
-    writeln!(stderr, "\nprofile — what each rule looked at\n")?;
+    writeln!(w, "\nprofile — what each rule looked at\n")?;
     writeln!(
-        stderr,
-        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
-        "rule", "path-gated", "unread", "cached", "content-gated", "lang-gated", "parsed"
+        w,
+        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7}",
+        "rule",
+        "path-gated",
+        "unread",
+        "cached",
+        "content-gated",
+        "lang-gated",
+        "parsed",
+        "dropped"
     )?;
 
     for (id, timing) in timings {
         writeln!(
-            stderr,
-            "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
+            w,
+            "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7}",
             id.to_string(),
             timing.path_gated,
             timing.unread,
             timing.cached,
             timing.content_gated,
             timing.language_gated,
-            timing.parsed
+            timing.parsed,
+            timing.dropped
         )?;
     }
 
     writeln!(
-        stderr,
-        "\n  each row sums to {files_discovered} files discovered\n"
+        w,
+        "\n  each row's first six columns sum to {files_discovered} files discovered\n"
     )?;
     writeln!(
-        stderr,
+        w,
         "  a nonzero cached means the columns to its right are incomplete for this run — \
          re-run\n  with `--no-cache` to read them; path-gated is unaffected, since a path \
          gate runs\n  before the cache is consulted\n  a rule reporting nothing with \
@@ -623,7 +631,13 @@ fn write_gate_profile(
          a rule reporting nothing with parsed above 0 did run — some files reached its\n  \
          query and it found nothing in them\n"
     )?;
-    stderr.flush()?;
+    writeln!(
+        w,
+        "  dropped counts constructs the flow analysis could not see through — not a file\n  \
+         disposition, so it is outside the six-column sum above; a flow rule reporting\n  \
+         nothing with dropped above 0 traced a value into a construct v1 does not follow\n"
+    )?;
+    w.flush()?;
     Ok(())
 }
 
@@ -1702,7 +1716,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
     if let Some(timings) = &outcome.timings {
         // To stderr, so `--profile --format json` still pipes a clean document.
         write_profile(timings)?;
-        write_gate_profile(timings, outcome.files_discovered)?;
+        write_gate_profile(&mut std::io::stderr(), timings, outcome.files_discovered)?;
     }
 
     let code = lanekeep_report::exit_code(&outcome.violations, warn_only);
@@ -1867,6 +1881,41 @@ fn explain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The trailing `dropped` column is a construct count, not a file disposition — it has
+    /// to render in the header and on each row without disturbing the six file-disposition
+    /// columns it sits beside.
+    #[test]
+    fn gate_profile_renders_the_dropped_column() {
+        let mut timings: BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming> =
+            BTreeMap::new();
+        let id: lanekeep_core::RuleId = "local/demo".parse().expect("valid id");
+        timings.insert(
+            id,
+            lanekeep_engine::RuleTiming {
+                parsed: 5,
+                dropped: 3,
+                ..Default::default()
+            },
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_gate_profile(&mut buf, &timings, 5).expect("writes");
+        let out = String::from_utf8(buf).expect("utf8");
+
+        assert!(
+            out.contains("dropped"),
+            "the header names the dropped column"
+        );
+        let row = out
+            .lines()
+            .find(|l| l.contains("local/demo"))
+            .expect("a data row");
+        assert!(
+            row.trim_end().ends_with('3'),
+            "the row's last column is the drop count, 3"
+        );
+    }
 
     /// Three spellings of one file are one file — the same normalization `Discovery`'s
     /// walk applies, so a named file is comparable with `discover()`'s output.

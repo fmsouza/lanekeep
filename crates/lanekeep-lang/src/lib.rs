@@ -16,7 +16,7 @@ pub mod flow;
 pub mod grammar;
 pub mod obligation;
 
-pub use flow::{FlowAnalyzer, FlowPath};
+pub use flow::{FlowAnalysis, FlowAnalyzer, FlowPath};
 pub use grammar::grammar_digest;
 pub use obligation::{ObligationAnalyzer, ObligationScope, UnmetObligation};
 
