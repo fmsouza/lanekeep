@@ -64,6 +64,15 @@ pub trait TypeProvider: Send + Sync {
     /// and giving `type_of` a signature type would invent a variant every rule would then
     /// have to unpack. Accepts a call expression, a function-like declaration, or an
     /// identifier bound to one.
+    ///
+    /// A generic call's return may or may not be instantiated from its arguments, depending on
+    /// the provider: the `tsc` provider answers the instantiated type — `useMemo(() => 0n, [])`
+    /// is `bigint` — while the builtin oracle answers `None`, doing no call-site inference. The
+    /// common divergence is exactly that: `tsc` names a type where the builtin is silent, and
+    /// silence is spelled `None`, the "could not be sure" value every rule already handles. The
+    /// two can also give *different* present answers for an *overloaded* call — the builtin
+    /// reads the first declared overload, `tsc` the one the arguments select — a narrow case no
+    /// shipped rule asks about, and one where `tsc`'s answer is the more precise of the two.
     fn return_type_of(&self, q: Query<'_>) -> Option<Type>;
 
     /// Whether the type at `q.node` is the type `module` exports as `name`, or declares a

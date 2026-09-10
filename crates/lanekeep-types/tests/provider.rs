@@ -2154,6 +2154,47 @@ fn return_type_of_reads_a_signature_or_infers_one() {
     }
 }
 
+/// A generic call's return type is a bare type parameter, and the builtin oracle does not
+/// instantiate it: both entry points answer `None`. Single-parameter instantiation from an
+/// argument's type is real inference and out of scope here — the `tsc` provider does it (see the
+/// matching fixture in `tsc/driver.test.mjs`, where the same source answers `bigint` both ways),
+/// and this one says nothing rather than a `text`-only stub. Issue #245.
+#[test]
+fn a_generic_calls_return_type_is_not_instantiated() {
+    let project = Project::new("generic-return", &[]);
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let subject = "declare function useMemo<T>(factory: () => T, deps: unknown[]): T;\n\
+                   const amount = useMemo(() => 0n, []);\n";
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    // The call's return is the bare parameter `T`, which resolves to no type this oracle names.
+    assert_eq!(
+        provider.return_type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: last_of(&tree, "call_expression"),
+            files: &files,
+        }),
+        None,
+    );
+    // And the binding it produces is untypeable too — this oracle does not type a call.
+    let amount = last_of(&tree, "variable_declarator")
+        .child_by_field_name("name")
+        .expect("the declarator names `amount`");
+    assert_eq!(
+        provider.type_of(Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node: amount,
+            files: &files,
+        }),
+        None,
+    );
+}
+
 /// A method's own declaration answers its return type directly, with no call needed.
 ///
 /// Addendum A1: `return_type_at`'s dispatch already lists `method_definition` among the

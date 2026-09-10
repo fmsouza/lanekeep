@@ -383,6 +383,15 @@ impl<'t> TypeScriptOracle<'t> {
     ///
     /// Accepts a call expression (whose callee is resolved), a function-like declaration, or
     /// an identifier bound to one.
+    ///
+    /// A *generic* call whose signature returns a bare type parameter answers `None`, not the
+    /// type the call site would instantiate it to: `useMemo(() => 0n, [])`, whose signature
+    /// returns `T`, is `None` here rather than `bigint`. Instantiating a parameter from an
+    /// argument's type is inference this oracle does not do — the `tsc` provider does it and
+    /// answers `bigint`. The honest label for what this one cannot see is the same `None` every
+    /// unread thing gets, never a nominal named `T`: a rule may branch on `None`, whereas a
+    /// `text`-only `T` would be a non-`undefined` answer carrying no field to branch on. The
+    /// type parameter itself is dropped by [`Self::type_named_by`] for the same reason.
     #[must_use]
     pub fn return_type_of(&self, node: Node<'t>) -> Option<Type> {
         self.return_type_at(node, 0)
