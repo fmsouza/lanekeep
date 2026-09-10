@@ -3372,7 +3372,7 @@ impl Engine {
         // Deferred rather than `mut ... = 0`: the block below always assigns exactly once
         // before this is read, and an initial value would be dead — `unused_assignments`,
         // denied under `-D warnings` in `just lint`.
-        let dropped: u32;
+        let dropped_constructs: u32;
         let flows: Vec<FlowPathPaths> = {
             let arena = host.arena().borrow();
             let ts_tree = arena.tree();
@@ -3382,7 +3382,7 @@ impl Engine {
             let sanitizers = collect_captures(&flow.sanitizers, ts_tree, source, "sanitizer");
 
             let analysis = analyzer.analyze(ts_tree, source, &sources, &sinks, &sanitizers);
-            dropped = analysis.dropped;
+            dropped_constructs = analysis.dropped;
             analysis
                 .paths
                 .into_iter()
@@ -3411,7 +3411,7 @@ impl Engine {
         // Recorded whether or not a flow was found and whether or not profiling is on — the
         // analysis always ran, and a file with drops but no flow is exactly the case #247 is
         // about. Discarded downstream when `self.profiling` is false, like the other counters.
-        timing.dropped = u64::from(dropped);
+        timing.dropped = u64::from(dropped_constructs);
 
         if flows.is_empty() {
             // No captures, or no flow between them: no crossing into the sandbox at all, the
@@ -6865,6 +6865,42 @@ export default defineRule({
             timing_for(&outcome, "local/no-secret-in-string").dropped,
             1,
             "one binary-sink drop, accumulated over both sinks; the clean sink adds none"
+        );
+    }
+
+    #[test]
+    fn the_drop_count_sums_across_files_for_one_rule() {
+        // Each file contributes one binary-sink drop; RuleTiming::accumulate must sum them
+        // per rule across files (a `=` instead of `+=` would report 1, not 2).
+        let project = Project::new(
+            "flow-drop-accumulate-files",
+            &[
+                ("rule.ts", SECRET_FLOW_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s + \"!\");\n}\n",
+                ),
+                (
+                    "src/b.ts",
+                    "function g() {\n  const t = getSecret();\n  log(t + \"?\");\n}\n",
+                ),
+            ],
+        );
+        let outcome = project
+            .prepare_with("lanekeep.config.ts")
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs");
+        assert!(
+            outcome.violations.is_empty(),
+            "both binary sinks drop the taint; no flow reaches a sink"
+        );
+        assert_eq!(
+            timing_for(&outcome, "local/no-secret-in-string").dropped,
+            2,
+            "one drop per file, summed across both files by RuleTiming::accumulate",
         );
     }
 
