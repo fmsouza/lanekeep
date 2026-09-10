@@ -417,3 +417,100 @@ fn a_named_write_is_read_through_a_subscript() {
         )
         .expect("a secret read through a subscript is still the secret");
 }
+
+// --- #246: taint carried by a binding through a wrapping expression or a literal, end to end.
+// The `flow.rs` unit tests pin the analyzer directly; these prove the same shapes survive the
+// whole stack — query capture, config pairing, the engine's flow phase — as a project rule sees
+// it. Before #246 every one of these was a silent miss: the shape fell through `taint_of`'s `_`.
+
+/// #22 — a tainted binding wrapped in an object literal at the sink: `log({ cause: secret })`,
+/// the headline row of the ticket. The only difference from the already-reporting
+/// `log({ cause: getSecret() })` was whether the source was inlined or bound first.
+#[test]
+fn a_tainted_binding_in_an_object_literal_reports() {
+    tester()
+        .reports_at(
+            "function f() { const s = getSecret(); log({ cause: s }); }\n",
+            &[(1, 43)],
+        )
+        .expect("a tainted field taints the object whole");
+}
+
+/// #23 — a shorthand property `{ secret }` is `{ secret: secret }`, resolved as a reference.
+#[test]
+fn a_shorthand_property_reports() {
+    tester()
+        .reports_at(
+            "function f() { const secret = getSecret(); log({ secret }); }\n",
+            &[(1, 48)],
+        )
+        .expect("a shorthand names the binding it carries");
+}
+
+/// #24 — a tainted binding as an array element: `log([secret])`.
+#[test]
+fn a_tainted_binding_in_an_array_literal_reports() {
+    tester()
+        .reports_at(
+            "function f() { const s = getSecret(); log([s]); }\n",
+            &[(1, 43)],
+        )
+        .expect("an array element taints the array");
+}
+
+/// #25 — a tainted ternary branch: `log(c ? x : secret)`. The union of the two branches.
+#[test]
+fn a_tainted_ternary_branch_reports() {
+    tester()
+        .reports_at(
+            "function f() { const s = getSecret(); log(cond ? \"\" : s); }\n",
+            &[(1, 43)],
+        )
+        .expect("a tainted branch taints the ternary");
+}
+
+/// #26 — a transparent wrapper at the sink: `log(secret!)`. Parentheses, `as`, `satisfies` and
+/// `await` pass through the same way; the analyzer's own tests cover each.
+#[test]
+fn a_non_null_assertion_reports() {
+    tester()
+        .reports_at(
+            "function f() { const s = getSecret(); log(s!); }\n",
+            &[(1, 43)],
+        )
+        .expect("`s!` is `s`");
+}
+
+/// #26b — the ticket's `const b = a as string; log(b)`: a cast on a binding's initializer,
+/// reached through def-use rather than at the sink.
+#[test]
+fn a_cast_on_a_binding_reports() {
+    tester()
+        .reports_at(
+            "function f() { const a = getSecret(); const b = a as string; log(b); }\n",
+            &[(1, 66)],
+        )
+        .expect("a cast does not change the value");
+}
+
+/// #27 — field precision survives the new object arm: reading a *different*, known field of the
+/// literal is silent. The control for #22, so the object arm cannot be a whole-object wildcard.
+#[test]
+fn an_untainted_object_literal_field_is_silent() {
+    tester()
+        .accepts("function f() { const s = getSecret(); const o = { cause: s }; log(o.other); }\n")
+        .expect("o.cause and o.other are incomparable paths");
+}
+
+/// #28 — a transparent wrapper as a member *base* is peeled: `(o as any).token`, the idiomatic
+/// cast-then-access. Transparency is symmetric — a wrapper is its inner value read whole and as
+/// a base alike.
+#[test]
+fn a_cast_member_base_reports() {
+    tester()
+        .reports_at(
+            "function f() { const s = getSecret(); const o = { token: s }; log((o as any).token); }\n",
+            &[(1, 67)],
+        )
+        .expect("`(o as T).token` is `o.token`");
+}
