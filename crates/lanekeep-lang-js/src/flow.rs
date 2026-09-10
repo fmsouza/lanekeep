@@ -421,8 +421,11 @@ impl<'t> Taint<'_, 't> {
             // construct v1 does not model — `binary_expression`, `template_substitution`,
             // `unary_expression`, ... Count it when the expression bears an identifier (so a
             // pure-literal `1 + 2` does not register), then carry nothing. This is the "did
-            // not look here" signal #247 asks the analysis to record; the arm does not
-            // recurse, so each dropped expression is counted once.
+            // not look here" signal #247 asks the analysis to record. The arm does not
+            // recurse, so a drop's own nested sub-constructs are not additionally counted —
+            // but a construct reached by two independent demand walks (e.g. `const x = a + b;
+            // log({ p: x, q: x })`) can still be counted more than once. So this is a sum of
+            // fallback-arm hits, not a count of distinct nodes.
             _ => {
                 if subtree_has_identifier(expr) {
                     self.dropped.set(self.dropped.get().saturating_add(1));
