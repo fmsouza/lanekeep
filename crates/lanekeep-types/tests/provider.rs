@@ -1547,6 +1547,280 @@ fn ask<T>(
     )
 }
 
+/// Like [`ask`], but the question is about the node whose source text is exactly `text`.
+///
+/// `last_of` cannot address a chain: `t.a.b` is a `member_expression` whose object is the
+/// `member_expression` `t.a`, and a source-order walk hands back whichever it visits last.
+/// Selecting by text names the whole expression a test means.
+fn ask_expr<T>(
+    project: &Project,
+    subject: &str,
+    text: &str,
+    ask: impl FnOnce(&lanekeep_types::BuiltinProvider, Query<'_>) -> T,
+) -> T {
+    let files = project.files();
+    let provider = lanekeep_types::BuiltinProvider::probe(&TypeScript).expect("TypeScript");
+    let tree = parse(subject);
+    let file = FilePath::new("src/a.ts");
+    let mut stack = vec![tree.root_node()];
+    let mut found = None;
+    while let Some(node) = stack.pop() {
+        if subject.get(node.byte_range()) == Some(text) {
+            found = Some(node);
+            break;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<tree_sitter::Node<'_>> = node.children(&mut cursor).collect();
+        stack.extend(children);
+    }
+    let node = found.unwrap_or_else(|| panic!("no node with text `{text}`"));
+    ask(
+        &provider,
+        Query {
+            file: &file,
+            tree: &tree,
+            source: subject,
+            node,
+            files: &files,
+        },
+    )
+}
+
+/// A member off an imported interface is typed across the file boundary.
+#[test]
+fn a_member_off_an_imported_interface_is_typed() {
+    let project = Project::new(
+        "imported-interface-member",
+        &[(
+            "src/money.d.ts",
+            "export interface Order { amount: number }\n",
+        )],
+    );
+    let subject = "import { Order } from './money';\nfunction f(o: Order) { return o.amount; }\n";
+    assert_eq!(
+        ask_expr(&project, subject, "o.amount", TypeProvider::type_of),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// A member off an imported object-type alias is typed across the boundary too.
+#[test]
+fn a_member_off_an_imported_object_alias_is_typed() {
+    let project = Project::new(
+        "imported-object-alias-member",
+        &[(
+            "src/money.d.ts",
+            "export type Order = { amount: bigint };\n",
+        )],
+    );
+    let subject = "import { Order } from './money';\nfunction f(o: Order) { return o.amount; }\n";
+    assert_eq!(
+        ask_expr(&project, subject, "o.amount", TypeProvider::type_of),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::BigInt
+        ))
+    );
+}
+
+/// A member off an imported ambient class is typed across the boundary.
+#[test]
+fn a_member_off_an_imported_class_is_typed() {
+    let project = Project::new(
+        "imported-class-member",
+        &[(
+            "src/money.d.ts",
+            "export declare class Order { amount: number }\n",
+        )],
+    );
+    let subject = "import { Order } from './money';\nfunction f(o: Order) { return o.amount; }\n";
+    assert_eq!(
+        ask_expr(&project, subject, "o.amount", TypeProvider::type_of),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
+/// An optional member of an imported interface is the member type or `undefined`.
+#[test]
+fn a_cross_file_optional_member_is_typed_or_undefined() {
+    let project = Project::new(
+        "imported-optional-member",
+        &[(
+            "src/money.d.ts",
+            "export interface Order { amount?: number }\n",
+        )],
+    );
+    let subject = "import { Order } from './money';\nfunction f(o: Order) { return o.amount; }\n";
+    assert_eq!(
+        ask_expr(&project, subject, "o.amount", TypeProvider::type_of),
+        lanekeep_types::Type::union(vec![
+            lanekeep_types::Type::Primitive(lanekeep_types::Primitive::Number),
+            lanekeep_types::Type::Primitive(lanekeep_types::Primitive::Undefined),
+        ])
+    );
+}
+
+/// A two-hop chain reads through a second type declared in the same imported file.
+#[test]
+fn a_two_hop_chain_reads_within_the_imported_file() {
+    let project = Project::new(
+        "chain-within-imported-file",
+        &[(
+            "src/tx.d.ts",
+            "export interface Transaction { transfer: AssetTransfer }\n\
+             export interface AssetTransfer { amount: bigint }\n",
+        )],
+    );
+    let subject = "import { Transaction } from './tx';\nfunction f(t: Transaction) { return t.transfer.amount; }\n";
+    assert_eq!(
+        ask_expr(
+            &project,
+            subject,
+            "t.transfer.amount",
+            TypeProvider::type_of
+        ),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::BigInt
+        ))
+    );
+}
+
+/// A chain reads through a type imported by the *declaring* file, not the asking one.
+///
+/// The specifier `./asset` is relative to `src/tx.d.ts`, never to `src/a.ts`. A fold that
+/// resolved the second hop against the asking file would open the wrong file or none — this is
+/// the case that forces threading the file each hop stands in.
+#[test]
+fn a_chain_crosses_a_second_file_relative_to_the_declaring_one() {
+    let project = Project::new(
+        "chain-across-two-files",
+        &[
+            (
+                "src/tx.d.ts",
+                "import { AssetTransfer } from './asset';\n\
+                 export interface Transaction { transfer: AssetTransfer }\n",
+            ),
+            (
+                "src/asset.d.ts",
+                "export interface AssetTransfer { amount: bigint }\n",
+            ),
+        ],
+    );
+    let subject = "import { Transaction } from './tx';\nfunction f(t: Transaction) { return t.transfer.amount; }\n";
+    assert_eq!(
+        ask_expr(
+            &project,
+            subject,
+            "t.transfer.amount",
+            TypeProvider::type_of
+        ),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::BigInt
+        ))
+    );
+}
+
+/// The motivating shape: an optional-chained member off an optional member of an imported type.
+#[test]
+fn the_motivating_optional_chain_is_typed_or_undefined() {
+    let project = Project::new(
+        "motivating-optional-chain",
+        &[(
+            "src/tx.d.ts",
+            "export interface Transaction { assetTransferTransaction?: AssetTransfer }\n\
+             export interface AssetTransfer { amount: bigint }\n",
+        )],
+    );
+    let subject = "import { Transaction } from './tx';\n\
+                   function f(t: Transaction) { return t.assetTransferTransaction?.amount; }\n";
+    assert_eq!(
+        ask_expr(
+            &project,
+            subject,
+            "t.assetTransferTransaction?.amount",
+            TypeProvider::type_of
+        ),
+        lanekeep_types::Type::union(vec![
+            lanekeep_types::Type::Primitive(lanekeep_types::Primitive::BigInt),
+            lanekeep_types::Type::Primitive(lanekeep_types::Primitive::Undefined),
+        ])
+    );
+}
+
+/// A member off a receiver annotated `T | undefined`, where `T` is imported, is or `undefined`.
+#[test]
+fn a_member_off_a_nullable_imported_receiver_is_or_undefined() {
+    let project = Project::new(
+        "nullable-imported-receiver",
+        &[(
+            "src/money.d.ts",
+            "export interface Order { amount: number }\n",
+        )],
+    );
+    let subject =
+        "import { Order } from './money';\nfunction f(o: Order | undefined) { return o.amount; }\n";
+    assert_eq!(
+        ask_expr(&project, subject, "o.amount", TypeProvider::type_of),
+        lanekeep_types::Type::union(vec![
+            lanekeep_types::Type::Primitive(lanekeep_types::Primitive::Number),
+            lanekeep_types::Type::Primitive(lanekeep_types::Primitive::Undefined),
+        ])
+    );
+}
+
+/// A base whose type name is shadowed in the asking file resolves to the shadow, not a
+/// same-named top-level declaration — the provider's base hop must be scope-aware too.
+#[test]
+fn a_member_off_a_shadowed_base_reads_the_shadow() {
+    let project = Project::new("shadowed-base", &[]);
+    let subject = "interface Box { value: number }\n\
+                   function f() {\n\
+                   \x20 type Box = { value: string };\n\
+                   \x20 const b: Box = { value: 's' };\n\
+                   \x20 return b.value;\n\
+                   }\n";
+    assert_eq!(
+        ask_expr(&project, subject, "b.value", TypeProvider::type_of),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::String
+        ))
+    );
+}
+
+/// A member off a base imported from a file that is not there answers nothing.
+#[test]
+fn a_member_off_an_unresolved_import_answers_nothing() {
+    let project = Project::new("member-unresolved-import", &[]);
+    let subject = "import { Order } from './missing';\nfunction f(o: Order) { return o.amount; }\n";
+    assert_eq!(
+        ask_expr(&project, subject, "o.amount", TypeProvider::type_of),
+        None
+    );
+}
+
+/// A string-literal subscript crosses files exactly as a dot access does.
+#[test]
+fn a_string_literal_subscript_crosses_files() {
+    let project = Project::new(
+        "subscript-cross-file",
+        &[(
+            "src/money.d.ts",
+            "export interface Order { amount: number }\n",
+        )],
+    );
+    let subject =
+        "import { Order } from './money';\nfunction f(o: Order) { return o[\"amount\"]; }\n";
+    assert_eq!(
+        ask_expr(&project, subject, "o[\"amount\"]", TypeProvider::type_of),
+        Some(lanekeep_types::Type::Primitive(
+            lanekeep_types::Primitive::Number
+        ))
+    );
+}
+
 /// An imported value is typed from its declaration file.
 #[test]
 fn an_imported_value_is_typed_through_its_declaration_file() {

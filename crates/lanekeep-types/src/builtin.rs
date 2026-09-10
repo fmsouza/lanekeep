@@ -30,13 +30,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use lanekeep_core::{AnalysisBudget, FileAccess, FilePath};
 use lanekeep_lang::Language;
-use lanekeep_lang::binding::ImportedName;
+use lanekeep_lang::binding::{Binding, ImportedName};
 
 use crate::declarations::{
     Declaration, ExportTarget, Exported, declared_in, declared_name, find_export,
     imports_with_names, target_node,
 };
-use crate::oracle::{Followed, ImportResolution, MAX_DEPTH, TypeScriptOracle, TypeScriptSupport};
+use crate::oracle::{
+    Followed, ImportResolution, MAX_DEPTH, TypeScriptOracle, TypeScriptSupport, annotation_child,
+    declaration_body, member_annotation, member_name, optional_access, sole_non_nullish_arm,
+    type_contains_nullish, type_name_node, with_optional,
+};
 use crate::provider::{BeginRunError, Query, TypeProvider};
 use crate::resolve::resolve_specifier;
 use crate::types::{Symbol, Type};
@@ -47,6 +51,19 @@ use crate::types::{Symbol, Type};
 /// is indistinguishable from not knowing, which is already a first-class answer. Fixed rather
 /// than measured — a bound that depended on elapsed time would put the clock in the cache key.
 const MAX_EXPORT_DEPTH: u32 = 16;
+
+/// A sink handed a resolved member container and the file it lives in, by
+/// [`BuiltinProvider::with_container`].
+///
+/// A `type` alias rather than the bare `dyn FnMut` written inline: it appears in two
+/// signatures and trips `clippy::type_complexity` at each. The `for<'a>` is the point — the
+/// container node and its file borrow a declaration parse opened *inside* `with_container`,
+/// whose lifetime the caller cannot name, so the sink must accept any.
+type ContainerSink<'f> = dyn for<'a> FnMut(
+        (&'a FilePath, &'a tree_sitter::Tree, &'a str),
+        tree_sitter::Node<'a>,
+    ) -> Option<Type>
+    + 'f;
 
 /// The provider that reads declaration files with this crate's own oracle.
 pub struct BuiltinProvider {
@@ -785,6 +802,181 @@ impl BuiltinProvider {
         }
         answer
     }
+
+    /// The type of a property access or subscript at `node`, folded across files.
+    ///
+    /// The member *names* come from the asking file's expression; the receiver each hop reads
+    /// from lives in whichever file last declared it. So the base is typed in the asking file
+    /// and the chain is folded from there, threading the file it stands in exactly as
+    /// [`Self::assignable`] does — a `Type::Nominal` returned across a hop carries a specifier
+    /// relative to the file that produced it, so folding through the asking file's oracle
+    /// instead would resolve the second hop against the wrong directory. The oracle's own
+    /// within-file `member_access` is the same walk without the file-crossing; this is why the
+    /// two exist.
+    fn member_access(
+        &self,
+        files: &FileAccess,
+        at: (&FilePath, &tree_sitter::Tree, &str),
+        node: tree_sitter::Node<'_>,
+    ) -> Option<Type> {
+        let (base, members) = member_path(at.2, node)?;
+        let (base_type_node, base_nullish) =
+            TypeScriptOracle::new(&self.support, at.1, at.2).annotated_type_node(base)?;
+        self.type_chain(files, at, base_type_node, base_nullish, &members, 0)
+    }
+
+    /// Fold `members` — each a name and whether its link is optional — onto `type_node`, a type
+    /// node in file `at`, crossing files at imported type references.
+    ///
+    /// `nullish` accumulates the chain's short-circuiting: once any link is optional or any
+    /// receiver is nullable, the whole tail is `| undefined`.
+    fn type_chain(
+        &self,
+        files: &FileAccess,
+        at: (&FilePath, &tree_sitter::Tree, &str),
+        type_node: tree_sitter::Node<'_>,
+        nullish: bool,
+        members: &[(String, bool)],
+        depth: u32,
+    ) -> Option<Type> {
+        let Some(((member, optional), rest)) = members.split_first() else {
+            // `type_node` is the last member's type node, read in the file it lives in.
+            return with_optional(
+                TypeScriptOracle::new(&self.support, at.1, at.2)
+                    .annotation_type_from(type_node, 0)?,
+                nullish,
+            );
+        };
+        if depth >= MAX_EXPORT_DEPTH {
+            return None;
+        }
+        let receiver_nullish = type_contains_nullish(type_node);
+        self.with_container(files, at, type_node, depth, &mut |at2, container| {
+            let (annotation, member_optional) = member_annotation(at2.2, container, member)?;
+            self.type_chain(
+                files,
+                at2,
+                annotation_child(annotation)?,
+                nullish || receiver_nullish || *optional || member_optional,
+                rest,
+                depth.saturating_add(1),
+            )
+        })
+    }
+
+    /// Resolve a type node to the member container it denotes — following aliases and stripping a
+    /// nullable union's arms, crossing files at an imported reference — and hand the container,
+    /// with the file it lives in, to `f`.
+    ///
+    /// The callback runs while this frame still holds the declaring file's parse, so the
+    /// container node it is handed stays valid; a chain continued inside `f` keeps every file it
+    /// has opened alive on the stack, one frame per hop.
+    fn with_container(
+        &self,
+        files: &FileAccess,
+        at: (&FilePath, &tree_sitter::Tree, &str),
+        type_node: tree_sitter::Node<'_>,
+        depth: u32,
+        f: &mut ContainerSink<'_>,
+    ) -> Option<Type> {
+        if depth >= MAX_EXPORT_DEPTH {
+            return None;
+        }
+        match type_node.kind() {
+            "object_type" => f(at, type_node),
+            "parenthesized_type" => self.with_container(
+                files,
+                at,
+                type_node.named_child(0)?,
+                depth.saturating_add(1),
+                f,
+            ),
+            "union_type" => self.with_container(
+                files,
+                at,
+                sole_non_nullish_arm(type_node)?,
+                depth.saturating_add(1),
+                f,
+            ),
+            "type_identifier" | "generic_type" => {
+                let name = type_name_node(type_node)?;
+                if let Some(Binding::Import {
+                    module,
+                    name: imported,
+                }) = self.support.resolver().resolve(at.1, at.2, name)
+                {
+                    let (decl, target) = self.imported(files, at.0, &module, &imported)?;
+                    let node = target_node(&decl, &target.name)?;
+                    self.declaration_container(
+                        files,
+                        (&decl.path, &decl.tree, &decl.source),
+                        node,
+                        depth.saturating_add(1),
+                        f,
+                    )
+                } else {
+                    // Scope-aware, so a type name shadowed inside a function in the asking file
+                    // resolves to the shadow, not a same-named top-level declaration — the same
+                    // fix `resolve_to_container` makes in the oracle. In a declaration file the
+                    // relevant types are top-level anyway, so this is no worse there and correct
+                    // in the asking file.
+                    let node = self.support.resolver().declaration_of(at.1, at.2, name)?;
+                    if node.has_error() {
+                        return None;
+                    }
+                    self.declaration_container(files, at, node, depth.saturating_add(1), f)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The member container of a declaration node, following a type alias's right-hand side.
+    fn declaration_container(
+        &self,
+        files: &FileAccess,
+        at: (&FilePath, &tree_sitter::Tree, &str),
+        declaration: tree_sitter::Node<'_>,
+        depth: u32,
+        f: &mut ContainerSink<'_>,
+    ) -> Option<Type> {
+        if declaration.kind() == "type_alias_declaration" {
+            return self.with_container(
+                files,
+                at,
+                declaration.child_by_field_name("value")?,
+                depth.saturating_add(1),
+                f,
+            );
+        }
+        f(at, declaration_body(declaration)?)
+    }
+}
+
+/// The base expression of a property-access/subscript chain, and the members read off it in
+/// order — outermost last.
+///
+/// `a?.b["c"]` gives base `a` and `[("b", true), ("c", false)]`. Parentheses are transparent.
+/// A base that is not a member access (an identifier, a call, `this`) ends the walk and is
+/// returned for the caller to type.
+fn member_path<'t>(
+    source: &str,
+    node: tree_sitter::Node<'t>,
+) -> Option<(tree_sitter::Node<'t>, Vec<(String, bool)>)> {
+    let mut members = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "member_expression" | "subscript_expression" => {
+                members.push((member_name(source, current)?, optional_access(current)));
+                current = current.child_by_field_name("object")?;
+            }
+            "parenthesized_expression" => current = current.named_child(0)?,
+            _ => break,
+        }
+    }
+    members.reverse();
+    Some((current, members))
 }
 
 /// Whether a specifier names something this resolver could read as TypeScript.
@@ -1019,6 +1211,13 @@ impl ImportResolution for Imports<'_> {
 
 impl TypeProvider for BuiltinProvider {
     fn type_of(&self, q: Query<'_>) -> Option<Type> {
+        // A property access or subscript is folded here rather than in the oracle: each hop's
+        // receiver may be declared in another file, and the specifier that names it is relative
+        // to *that* file, not the asking one — so the walk has to thread the file it stands in,
+        // which needs the `FileAccess` only the provider holds.
+        if matches!(q.node.kind(), "member_expression" | "subscript_expression") {
+            return self.member_access(q.files, (q.file, q.tree, q.source), q.node);
+        }
         let exhausted = Cell::new(false);
         let imports = Imports {
             provider: self,
