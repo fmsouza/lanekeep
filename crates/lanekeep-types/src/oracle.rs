@@ -507,9 +507,18 @@ impl<'t> TypeScriptOracle<'t> {
 
             "binary_expression" => {
                 let next = depth.saturating_add(1);
-                let left = self.primitive_of(node.child_by_field_name("left")?, next);
+                let operator = self.operator_of(node)?;
+                let left_node = node.child_by_field_name("left")?;
                 let right = self.primitive_of(node.child_by_field_name("right")?, next);
-                table::binary(self.operator_of(node)?, left, right).map(Type::Primitive)
+                // `a ?? b` keeps `a` whenever `a` is neither `null` nor `undefined`, so its
+                // left contributes `NonNullable<typeof a>`: the left is typed with the nullish
+                // arms stripped. Every other operator reads the left as it stands.
+                let left = if operator == "??" {
+                    self.non_nullish_primitive_of(left_node, next)
+                } else {
+                    self.primitive_of(left_node, next)
+                };
+                table::binary(operator, left, right).map(Type::Primitive)
             }
 
             "unary_expression" => table::unary(self.operator_of(node)?).map(Type::Primitive),
@@ -751,6 +760,46 @@ impl<'t> TypeScriptOracle<'t> {
         match self.type_of_at(node, depth)? {
             Type::Primitive(primitive) => Some(primitive),
             Type::Nominal { .. } | Type::Union(_) => None,
+        }
+    }
+
+    /// A node's primitive with `null`/`undefined` dropped, for the left of `??`.
+    ///
+    /// This is `NonNullable<T>` narrowed to the table's vocabulary. `a ?? b` reduces to `a`'s
+    /// type only when `a` is present, so the nullish arms of the left never reach the result and
+    /// are removed before the table sees it — which is what lets `number | undefined` on the
+    /// left agree with a `number` fallback.
+    ///
+    /// A single primitive answers itself unless it is `null`/`undefined` alone, whose
+    /// non-nullish part is `never` and has no table row. A union answers its one remaining
+    /// primitive after the nullish arms are dropped; a union that still holds a nominal, or more
+    /// than one primitive, answers `None`, because the table reasons about single primitives and
+    /// nothing else.
+    fn non_nullish_primitive_of(&self, node: Node<'t>, depth: u32) -> Option<Primitive> {
+        fn is_nullish(primitive: Primitive) -> bool {
+            matches!(primitive, Primitive::Null | Primitive::Undefined)
+        }
+        match self.type_of_at(node, depth)? {
+            Type::Primitive(primitive) if !is_nullish(primitive) => Some(primitive),
+            Type::Union(members) => {
+                let mut sole = None;
+                for member in members {
+                    match member {
+                        Type::Primitive(primitive) if is_nullish(primitive) => {}
+                        Type::Primitive(primitive) => {
+                            if sole.is_some() {
+                                return None;
+                            }
+                            sole = Some(primitive);
+                        }
+                        // A nominal arm survives the nullish strip but is not a primitive the
+                        // table can answer, so the whole thing is unknown.
+                        _ => return None,
+                    }
+                }
+                sole
+            }
+            _ => None,
         }
     }
 
