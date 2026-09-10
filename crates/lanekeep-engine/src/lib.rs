@@ -3357,6 +3357,7 @@ impl Engine {
 
             analyzer
                 .analyze(ts_tree, source, &sources, &sinks, &sanitizers)
+                .paths
                 .into_iter()
                 .filter_map(|flow_path| {
                     // A node that does not resolve to a path is dropped rather than mapped to

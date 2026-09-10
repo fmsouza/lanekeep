@@ -65,11 +65,11 @@
 //! negatives. See
 //! `docs/superpowers/specs/2026-09-05-taint-analysis-flow-checkflow-design.md` §5.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 
 use lanekeep_lang::binding::BindingResolver;
-use lanekeep_lang::flow::{FlowAnalyzer, FlowPath};
+use lanekeep_lang::flow::{FlowAnalysis, FlowAnalyzer, FlowPath};
 use tree_sitter::{Node, Tree};
 
 use crate::binding::JsBindingResolver;
@@ -193,8 +193,9 @@ impl FlowAnalyzer for JsFlowAnalyzer {
         sources: &[Node<'t>],
         sinks: &[Node<'t>],
         sanitizers: &[Node<'t>],
-    ) -> Vec<FlowPath<'t>> {
+    ) -> FlowAnalysis<'t> {
         let mut flows: Vec<(FlowPath<'t>, Path)> = Vec::new();
+        let mut dropped: u32 = 0;
         for &sink in sinks {
             // Each sink is analyzed in its own enclosing function's CFG. Rebuilding per
             // sink keeps the borrow simple; the fixtures hold one or two functions.
@@ -211,8 +212,11 @@ impl FlowAnalyzer for JsFlowAnalyzer {
                 cfg,
                 root,
                 in_progress: RefCell::new(BTreeSet::new()),
+                dropped: Cell::new(0),
             };
-            for fact in taint.taint_of(sink, &Path::new(), 0) {
+            let facts = taint.taint_of(sink, &Path::new(), 0);
+            dropped = dropped.saturating_add(taint.dropped.get());
+            for fact in facts {
                 flows.push((
                     FlowPath {
                         source: fact.source,
@@ -223,7 +227,10 @@ impl FlowAnalyzer for JsFlowAnalyzer {
                 ));
             }
         }
-        canonicalize(flows)
+        FlowAnalysis {
+            paths: canonicalize(flows),
+            dropped,
+        }
     }
 }
 
@@ -284,6 +291,10 @@ struct Taint<'a, 't> {
     /// reached by the instance already answering it; `canonicalize` keeps the shortest chain
     /// either way. `BTreeSet` rather than a hash set so the walk stays deterministic.
     in_progress: RefCell<BTreeSet<(usize, Path)>>,
+    /// Constructs met at [`Taint::taint_of`]'s fallback arm that bear an identifier — the
+    /// analysis's own tally of values it could not see through (#247). `Cell` because
+    /// `taint_of` takes `&self`; single-threaded within one file's analysis, so deterministic.
+    dropped: Cell<u32>,
 }
 
 impl<'t> Taint<'_, 't> {
@@ -401,9 +412,23 @@ impl<'t> Taint<'_, 't> {
                 .flat_map(|branch| self.taint_of(branch, path, depth))
                 .collect(),
             // A non-source, non-sanitizer call is opaque: v1 does not follow taint through a
-            // call's arguments (the alias-through-call false negative, spec §13). Only a
-            // direct source or a local identifier alias carries taint.
-            _ => Vec::new(),
+            // call's arguments (the alias-through-call false negative, spec §13). This is the
+            // *documented* boundary, so it is deliberately not counted as a drop (#247) —
+            // counting it would drown the signal below and make a future completeness
+            // predicate false for nearly every file.
+            "call_expression" => Vec::new(),
+            // Every other kind is an *undocumented* drop: a binding's taint carried into a
+            // construct v1 does not model — `binary_expression`, `template_substitution`,
+            // `unary_expression`, ... Count it when the expression bears an identifier (so a
+            // pure-literal `1 + 2` does not register), then carry nothing. This is the "did
+            // not look here" signal #247 asks the analysis to record; the arm does not
+            // recurse, so each dropped expression is counted once.
+            _ => {
+                if subtree_has_identifier(expr) {
+                    self.dropped.set(self.dropped.get().saturating_add(1));
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -885,6 +910,16 @@ fn is_member(node: Node<'_>, set: &[Node<'_>]) -> bool {
     set.iter().any(|member| member.id() == node.id())
 }
 
+/// Whether `node`'s subtree contains at least one `identifier`. The filter that keeps the
+/// drop counter off pure-literal expressions (`1 + 2`, `` `abc` ``), which carry no binding.
+fn subtree_has_identifier(node: Node<'_>) -> bool {
+    if node.kind() == "identifier" {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(subtree_has_identifier)
+}
+
 /// The base identifier a member or subscript access is rooted at, and the access path from it
 /// to `node`: `o.a.b` is `(o, [Field("a"), Field("b")])`, `o[i].c` is `(o, [Index,
 /// Field("c")])`, and a bare `o` is `(o, [])`.
@@ -1176,6 +1211,7 @@ mod tests {
         let sanitizers = calls_named(&tree, src, sanitizer_name);
         JsFlowAnalyzer
             .analyze(&tree, src, &sources, &sinks, &sanitizers)
+            .paths
             .into_iter()
             .map(|flow| {
                 (
@@ -1200,6 +1236,7 @@ mod tests {
         let sanitizers = calls_named(&tree, src, sanitizer_name);
         JsFlowAnalyzer
             .analyze(&tree, src, &sources, &sinks, &sanitizers)
+            .paths
             .into_iter()
             .map(|flow| {
                 (
@@ -1209,6 +1246,52 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// The drop count: how many identifier-bearing values reached a construct the analysis
+    /// does not model. `parse`, `sink_args` are the existing test helpers; sources and
+    /// sanitizers are empty because the count is independent of them.
+    fn dropped(src: &str) -> u32 {
+        let tree = parse(src);
+        let sinks = sink_args(&tree, src, "log");
+        JsFlowAnalyzer.analyze(&tree, src, &[], &sinks, &[]).dropped
+    }
+
+    #[test]
+    fn a_value_reaching_an_unmodeled_construct_is_counted_as_dropped() {
+        // A binding carried into a construct v1 does not follow — the honest "did not look
+        // here" signal (#247). Each is a sink whose value expression falls to the fallback arm.
+        assert_eq!(
+            dropped("function f() { log(a + b); }"),
+            1,
+            "a binary sink is a silent drop"
+        );
+        assert_eq!(
+            dropped("function f() { log(`x${y}`); }"),
+            1,
+            "a template substitution is a drop"
+        );
+        assert_eq!(
+            dropped("function f() { log(!ok); }"),
+            1,
+            "a unary expression is a drop"
+        );
+        // Not counted: a modeled value, a literal with no binding, and the documented call boundary.
+        assert_eq!(
+            dropped("function f() { log(a); }"),
+            0,
+            "a plain identifier is modeled"
+        );
+        assert_eq!(
+            dropped("function f() { log(1 + 2); }"),
+            0,
+            "a literal-only expression has no identifier"
+        );
+        assert_eq!(
+            dropped("function f() { log(f()); }"),
+            0,
+            "the documented call boundary is not counted"
+        );
     }
 
     #[test]
@@ -1385,7 +1468,9 @@ mod tests {
             })
             .expect("one getSecret is outside redact");
         let sinks = sink_args(&tree, src, "log");
-        let flows = JsFlowAnalyzer.analyze(&tree, src, &sources, &sinks, &sanitizers);
+        let flows = JsFlowAnalyzer
+            .analyze(&tree, src, &sources, &sinks, &sanitizers)
+            .paths;
         assert_eq!(flows.len(), 1, "only the unwrapped source reports");
         assert_eq!(
             flows[0].source.start_byte(),
@@ -2739,6 +2824,7 @@ mod tests {
         let sanitizers = calls_named(&tree, src, sanitizer_name);
         JsFlowAnalyzer
             .analyze(&tree, src, &sources, &sinks, &sanitizers)
+            .paths
             .into_iter()
             .map(|flow| {
                 (
@@ -2821,6 +2907,7 @@ mod tests {
         let sanitizers = calls_named(&tree, src, "redact");
         let flows: Vec<_> = JsFlowAnalyzer
             .analyze(&tree, src, &sources, &sinks, &sanitizers)
+            .paths
             .into_iter()
             .map(|flow| src[flow.source.byte_range()].to_owned())
             .collect();
