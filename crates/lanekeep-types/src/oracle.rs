@@ -324,6 +324,17 @@ impl<'t> TypeScriptOracle<'t> {
         self.declaration_type(declaration, depth)
     }
 
+    /// The type a `type_annotation` (or a bare type node) denotes, from a depth already spent.
+    ///
+    /// Steps through the `type_annotation` wrapper, then types the node in *type* position —
+    /// `number` comes back as [`Primitive::Number`], not a nominal named `number`, which is
+    /// what separates it from [`Self::type_named_by`]. For the provider, typing a member's
+    /// declared type in the file that declares the member.
+    #[must_use]
+    pub fn annotation_type_from(&self, annotation: Node<'t>, depth: u32) -> Option<Type> {
+        self.annotation_type(annotation_child(annotation)?, depth)
+    }
+
     /// The return type of `node`, from a depth already spent. See [`Self::type_of_from`].
     #[must_use]
     pub fn return_type_from(&self, node: Node<'t>, depth: u32) -> Option<Type> {
@@ -552,6 +563,134 @@ impl<'t> TypeScriptOracle<'t> {
                 self.declaration_type(declaration, depth.saturating_add(1))
             }
 
+            "member_expression" | "subscript_expression" => self.member_access(node, depth),
+
+            _ => None,
+        }
+    }
+
+    /// The type of a property access (`a.b`, `a?.b`) or a string-literal subscript (`a["b"]`),
+    /// when the base's type is declared **in this same file**.
+    ///
+    /// Resolution is by node, not by [`Type`]: it follows the base's annotation node to the
+    /// declaration it names, walks that declaration's body for the member, and reads the
+    /// member's own annotation node. A [`Type`] cannot stand in as the intermediate, because an
+    /// object type (`type T = { … }`, or an inline `{ … }` member) has no [`Type`] variant at
+    /// all — the reachable-by-`Type` receivers would be only interfaces and classes, and the
+    /// idiomatic object-literal alias would answer nothing.
+    ///
+    /// A cross-file base answers `None` here, deliberately: a type reference imported from
+    /// another file is resolved by the provider, which owns the
+    /// [`FileAccess`](lanekeep_core::FileAccess) a crossing needs and threads the file each hop
+    /// stands in — see `BuiltinProvider`'s member walk. With no provider attached this is the
+    /// within-file answer, matching every other arm.
+    ///
+    /// `undefined` is added when this link is optional (`a?.b`), when the member is optional
+    /// (`b?: T`), or when the receiver's own type carried `null`/`undefined` — the last is what
+    /// propagates `a?.b.c`'s short-circuit through the tail, since the `optional_chain` marker
+    /// sits only on the inner link.
+    fn member_access(&self, node: Node<'t>, depth: u32) -> Option<Type> {
+        let (member_inner, nullish) = self.member_site(node, depth)?;
+        with_optional(
+            self.annotation_type(member_inner, depth.saturating_add(1))?,
+            nullish,
+        )
+    }
+
+    /// The type *node* a property access or subscript denotes, and whether the path to it
+    /// short-circuits to `undefined`.
+    ///
+    /// Returns the member's annotation node rather than its [`Type`] so that a chain reads
+    /// through it: the next link's receiver is this node.
+    fn member_site(&self, node: Node<'t>, depth: u32) -> Option<(Node<'t>, bool)> {
+        if depth >= MAX_DEPTH {
+            return self.exhaust();
+        }
+        let object = node.child_by_field_name("object")?;
+        let (receiver, path_nullish) = self.receiver_type_node(object, depth.saturating_add(1))?;
+        let receiver_nullish = type_contains_nullish(receiver);
+        let container = self.resolve_to_container(receiver, depth.saturating_add(1))?;
+        let member = member_name(self.source, node)?;
+        let (annotation, member_optional) = member_annotation(self.source, container, &member)?;
+        Some((
+            annotation_child(annotation)?,
+            path_nullish || receiver_nullish || optional_access(node) || member_optional,
+        ))
+    }
+
+    /// The type node an expression is annotated with, and whether the path to it short-circuits.
+    ///
+    /// A property access or subscript is itself a member site; a binding is resolved through
+    /// [`Self::annotated_type_node`]; parentheses are transparent.
+    fn receiver_type_node(&self, expr: Node<'t>, depth: u32) -> Option<(Node<'t>, bool)> {
+        match expr.kind() {
+            "member_expression" | "subscript_expression" => self.member_site(expr, depth),
+            "parenthesized_expression" => {
+                self.receiver_type_node(expr.named_child(0)?, depth.saturating_add(1))
+            }
+            _ => self.annotated_type_node(expr),
+        }
+    }
+
+    /// The type node a bound name is annotated with, and whether that binding is nullable.
+    ///
+    /// A binding with no annotation gives nothing — this milestone does not infer a variable's
+    /// type from its initializer for the purpose of a member read. Exposed for the provider,
+    /// which resolves the base of a cross-file chain in the asking file before folding the rest.
+    #[must_use]
+    pub fn annotated_type_node(&self, expr: Node<'t>) -> Option<(Node<'t>, bool)> {
+        match expr.kind() {
+            "parenthesized_expression" => self.annotated_type_node(expr.named_child(0)?),
+            "identifier" => {
+                let declaration = self.resolver.declaration_of(self.tree, self.source, expr)?;
+                let nullish = declaration.kind() == "optional_parameter";
+                Some((binding_annotation(declaration)?, nullish))
+            }
+            _ => None,
+        }
+    }
+
+    /// The member container a type node denotes, following same-file aliases and stripping a
+    /// nullable union's `null`/`undefined` arms.
+    ///
+    /// An imported type reference answers `None`: this oracle opens no files, and the provider
+    /// resolves the crossing instead.
+    fn resolve_to_container(&self, type_node: Node<'t>, depth: u32) -> Option<Node<'t>> {
+        if depth >= MAX_DEPTH {
+            return self.exhaust();
+        }
+        match type_node.kind() {
+            "object_type" => Some(type_node),
+            "parenthesized_type" => {
+                self.resolve_to_container(type_node.named_child(0)?, depth.saturating_add(1))
+            }
+            "union_type" => {
+                self.resolve_to_container(sole_non_nullish_arm(type_node)?, depth.saturating_add(1))
+            }
+            "type_identifier" | "generic_type" => {
+                let name = type_name_node(type_node)?;
+                if matches!(
+                    self.resolver.resolve(self.tree, self.source, name),
+                    Some(Binding::Import { .. })
+                ) {
+                    return None;
+                }
+                // Scope-aware, like `named_type`: a `type`/`interface`/`class` declared inside a
+                // function shadows a same-named module-level one, and a top-level lookup would
+                // read the wrong declaration's members — a confident wrong answer. `resolve`
+                // above rules out imports first, so this only ever resolves a local.
+                let declaration = self.resolver.declaration_of(self.tree, self.source, name)?;
+                if declaration.has_error() {
+                    return None;
+                }
+                match declaration.kind() {
+                    "type_alias_declaration" => self.resolve_to_container(
+                        declaration.child_by_field_name("value")?,
+                        depth.saturating_add(1),
+                    ),
+                    _ => declaration_body(declaration),
+                }
+            }
             _ => None,
         }
     }
@@ -902,10 +1041,198 @@ fn is_function_like(node: Node<'_>) -> bool {
 /// A parameter's `type` field is the `type_annotation` node, not the type itself, so every
 /// caller reading an annotation has to step through it. One place to get that wrong is
 /// better than four.
-fn annotation_child(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn annotation_child(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() == "type_annotation" {
         node.named_child(0)
     } else {
         Some(node)
+    }
+}
+
+/// The static member a property access or subscript names.
+///
+/// The property identifier of `a.b` / `a?.b`, or the string literal of `a["b"]` / `a?.["b"]`.
+/// A dynamic subscript — `a[i]`, `a[0]`, `a[k + 1]` — names no member the oracle can resolve
+/// without an element-type representation it does not have, and yields `None`. A private field
+/// (`a.#x`, a `private_property_identifier`) is not an interface member and yields `None` too.
+pub(crate) fn member_name(source: &str, node: Node<'_>) -> Option<String> {
+    match node.kind() {
+        "member_expression" => {
+            let property = node.child_by_field_name("property")?;
+            (property.kind() == "property_identifier")
+                .then(|| source.get(property.byte_range()).map(str::to_owned))
+                .flatten()
+        }
+        "subscript_expression" => {
+            let index = node.child_by_field_name("index")?;
+            if index.kind() != "string" {
+                return None;
+            }
+            string_literal_value(source.get(index.byte_range())?)
+        }
+        _ => None,
+    }
+}
+
+/// The value of a single-quoted or double-quoted string literal, quotes stripped.
+///
+/// `None` when the text carries an escape: decoding one to match a member name is more than a
+/// property key ever needs, so the conservative answer is no member rather than a wrong one.
+fn string_literal_value(text: &str) -> Option<String> {
+    let inner = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| {
+            text.strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+        })?;
+    (!inner.contains('\\')).then(|| inner.to_owned())
+}
+
+/// Whether a property access or subscript is optional (`a?.b`, `a?.["b"]`).
+///
+/// `optional_chain` is a field on both `member_expression` and `subscript_expression`, present
+/// only on the link that carries the `?.`.
+pub(crate) fn optional_access(node: Node<'_>) -> bool {
+    node.child_by_field_name("optional_chain").is_some()
+}
+
+/// The type node a bound name is annotated with: a parameter's or variable's `type`, unwrapped
+/// from its `type_annotation`.
+///
+/// A binding that destructures gives nothing, for the reason [`binds_one_name`] documents; one
+/// with no annotation gives nothing too, since an initializer's type is not what this reads.
+pub(crate) fn binding_annotation(declaration: Node<'_>) -> Option<Node<'_>> {
+    let field = match declaration.kind() {
+        "required_parameter" | "optional_parameter" => "pattern",
+        "variable_declarator" => "name",
+        _ => return None,
+    };
+    if !binds_one_name(declaration, field) {
+        return None;
+    }
+    annotation_child(declaration.child_by_field_name("type")?)
+}
+
+/// Whether a type node denotes `null` or `undefined`.
+///
+/// In *type* position both are wrapped in a `literal_type` — `T | undefined` parses as
+/// `(union_type (type_identifier) (literal_type (undefined)))` — so the bare kinds alone never
+/// match a real annotation. The unwrapped forms are accepted too, harmlessly.
+fn is_nullish_type(type_node: Node<'_>) -> bool {
+    match type_node.kind() {
+        "null" | "undefined" => true,
+        "literal_type" => type_node
+            .named_child(0)
+            .is_some_and(|inner| matches!(inner.kind(), "null" | "undefined")),
+        _ => false,
+    }
+}
+
+/// Whether a type node is, or is a union containing, `null` or `undefined`.
+///
+/// One level of union, which is what a nullable annotation writes; a nested union is rare and
+/// the conservative miss only ever drops an `undefined` the answer would have carried.
+pub(crate) fn type_contains_nullish(type_node: Node<'_>) -> bool {
+    if is_nullish_type(type_node) {
+        return true;
+    }
+    if type_node.kind() == "union_type" {
+        let mut cursor = type_node.walk();
+        return type_node.named_children(&mut cursor).any(is_nullish_type);
+    }
+    false
+}
+
+/// The single non-nullish arm of a union type, or `None` when it has zero or several.
+///
+/// `Order | undefined` denotes `Order` for a member read; `A | B` denotes no single receiver.
+/// A `comment` is a named child of a `union_type`, so it is skipped by kind the way
+/// [`Self::annotation_type`](TypeScriptOracle::annotation_type)'s union arm skips it.
+pub(crate) fn sole_non_nullish_arm(union_type: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = union_type.walk();
+    let mut arm = None;
+    for child in union_type.named_children(&mut cursor) {
+        if is_nullish_type(child) || child.kind() == "comment" {
+            continue;
+        }
+        if arm.is_some() {
+            return None;
+        }
+        arm = Some(child);
+    }
+    arm
+}
+
+/// The name node of a type reference: the reference itself for a `type_identifier`, or the
+/// `name` field for a `generic_type` (`Foo<T>`), whose type arguments this crate drops.
+pub(crate) fn type_name_node(type_node: Node<'_>) -> Option<Node<'_>> {
+    match type_node.kind() {
+        "type_identifier" => Some(type_node),
+        "generic_type" => type_node.child_by_field_name("name"),
+        _ => None,
+    }
+}
+
+/// The body an interface or class exposes members through.
+///
+/// An alias is not here: it is followed to its right-hand side first, which may be an object
+/// type, another named type, or a union — a distinction the body of a declaration cannot make.
+pub(crate) fn declaration_body(declaration: Node<'_>) -> Option<Node<'_>> {
+    matches!(
+        declaration.kind(),
+        "interface_declaration" | "class_declaration" | "abstract_class_declaration"
+    )
+    .then(|| declaration.child_by_field_name("body"))
+    .flatten()
+}
+
+/// The annotation of the member named `member`, and whether that member is optional (`b?: T`).
+///
+/// Reads an `interface_body`, an `object_type` or a `class_body` — their members are positional
+/// named children, not reached through a field. A member with no annotation (a class field with
+/// only an initializer, a method) has no type to read, so a matching name without a `type`
+/// field yields `None`. The optional `?` is an anonymous token, not a field, so it is found by
+/// scanning children.
+pub(crate) fn member_annotation<'t>(
+    source: &str,
+    container: Node<'t>,
+    member: &str,
+) -> Option<(Node<'t>, bool)> {
+    let mut cursor = container.walk();
+    for child in container.named_children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "property_signature" | "public_field_definition"
+        ) {
+            continue;
+        }
+        let Some(name) = child.child_by_field_name("name") else {
+            continue;
+        };
+        if name.kind() != "property_identifier" || source.get(name.byte_range()) != Some(member) {
+            continue;
+        }
+        let annotation = child.child_by_field_name("type")?;
+        return Some((annotation, has_optional_token(child)));
+    }
+    None
+}
+
+/// Whether an optional-member marker (`?`) is present, as in `b?: T`.
+fn has_optional_token(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| child.kind() == "?")
+}
+
+/// A member type, with `| undefined` added when the access short-circuits.
+///
+/// [`Type::union`] flattens and dedups, so an already-nullable member type gains nothing when
+/// `optional` is set. It returns `None` only for an empty input, which this never passes.
+pub(crate) fn with_optional(ty: Type, optional: bool) -> Option<Type> {
+    if optional {
+        Type::union(vec![ty, Type::Primitive(Primitive::Undefined)])
+    } else {
+        Some(ty)
     }
 }

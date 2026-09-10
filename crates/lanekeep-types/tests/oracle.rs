@@ -1150,3 +1150,233 @@ fn an_oracle_with_no_import_resolution_answers_nothing_for_an_import() {
         None
     );
 }
+
+/// Type the expression whose source text is exactly `text`.
+///
+/// `type_of_last(_, "member_expression")` cannot address a chain: `nodes` is pre-order, so
+/// the outer `a.b.c` is visited before the inner `a.b`, and `rfind` hands back the inner one.
+/// Selecting by exact text names the whole expression a test means.
+fn type_of_expr(source: &str, text: &str) -> Option<Type> {
+    let tree = parse(source);
+    let support = TypeScriptSupport::probe(&TypeScript).expect("TypeScript is supported");
+    let oracle = TypeScriptOracle::new(&support, &tree, source);
+    let found = nodes(&tree)
+        .into_iter()
+        .find(|node| source.get(node.byte_range()) == Some(text));
+    oracle.type_of(found.unwrap_or_else(|| panic!("no node with text `{text}`")))
+}
+
+/// A member off a same-file interface is the member's annotated type.
+#[test]
+fn a_member_off_a_same_file_interface_is_its_annotated_type() {
+    assert_eq!(
+        type_of_expr(
+            "interface Order { amount: number }\nfunction f(o: Order) { return o.amount; }",
+            "o.amount"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// A member off a same-file object-type alias reads the same way.
+#[test]
+fn a_member_off_a_same_file_object_alias_is_its_annotated_type() {
+    assert_eq!(
+        type_of_expr(
+            "type Order = { amount: bigint };\nfunction f(o: Order) { return o.amount; }",
+            "o.amount"
+        ),
+        Some(Type::Primitive(Primitive::BigInt))
+    );
+}
+
+/// A public field off a same-file class is its annotated type.
+#[test]
+fn a_field_off_a_same_file_class_is_its_annotated_type() {
+    assert_eq!(
+        type_of_expr(
+            "class Order { amount: number = 0 }\nfunction f(o: Order) { return o.amount; }",
+            "o.amount"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// An unknown member answers nothing rather than guessing.
+#[test]
+fn an_unknown_member_answers_nothing() {
+    assert_eq!(
+        type_of_expr(
+            "interface Order { amount: number }\nfunction f(o: Order) { return o.missing; }",
+            "o.missing"
+        ),
+        None
+    );
+}
+
+/// A member off a base the oracle cannot type answers nothing.
+#[test]
+fn a_member_off_an_untyped_base_answers_nothing() {
+    assert_eq!(
+        type_of_expr("function f(o) { return o.amount; }", "o.amount"),
+        None
+    );
+}
+
+/// An optional access is the member type or `undefined`.
+#[test]
+fn an_optional_access_is_the_member_type_or_undefined() {
+    assert_eq!(
+        type_of_expr(
+            "interface Order { amount: number }\nfunction f(o: Order) { return o?.amount; }",
+            "o?.amount"
+        ),
+        Type::union(vec![
+            Type::Primitive(Primitive::Number),
+            Type::Primitive(Primitive::Undefined),
+        ])
+    );
+}
+
+/// An optional member is the member type or `undefined`, even accessed with a plain dot.
+#[test]
+fn an_optional_member_is_the_member_type_or_undefined() {
+    assert_eq!(
+        type_of_expr(
+            "interface Order { amount?: number }\nfunction f(o: Order) { return o.amount; }",
+            "o.amount"
+        ),
+        Type::union(vec![
+            Type::Primitive(Primitive::Number),
+            Type::Primitive(Primitive::Undefined),
+        ])
+    );
+}
+
+/// A chain reads through several same-file types.
+#[test]
+fn a_chain_reads_through_same_file_types() {
+    assert_eq!(
+        type_of_expr(
+            "interface Inner { amount: number }\ninterface Outer { inner: Inner }\n\
+             function f(o: Outer) { return o.inner.amount; }",
+            "o.inner.amount"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// An optional link taints the whole tail of the chain with `undefined`.
+///
+/// The `optional_chain` marker sits only on `o?.inner`, but `a?.b.c` short-circuits the whole
+/// tail: if `o` is nullish the entire expression is `undefined`, so `.amount` is `number |
+/// undefined`, not `number`.
+#[test]
+fn an_optional_link_taints_the_rest_of_the_chain() {
+    assert_eq!(
+        type_of_expr(
+            "interface Inner { amount: number }\ninterface Outer { inner: Inner }\n\
+             function f(o: Outer) { return o?.inner.amount; }",
+            "o?.inner.amount"
+        ),
+        Type::union(vec![
+            Type::Primitive(Primitive::Number),
+            Type::Primitive(Primitive::Undefined),
+        ])
+    );
+}
+
+/// A string-literal subscript reads a member exactly as a dot access does.
+#[test]
+fn a_string_literal_subscript_reads_a_member() {
+    assert_eq!(
+        type_of_expr(
+            "interface Order { amount: number }\nfunction f(o: Order) { return o[\"amount\"]; }",
+            "o[\"amount\"]"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// A dynamic subscript answers nothing — the oracle has no element-type representation.
+#[test]
+fn a_dynamic_subscript_answers_nothing() {
+    assert_eq!(
+        type_of_expr(
+            "interface Order { amount: number }\nfunction f(o: Order, k: string) { return o[k]; }",
+            "o[k]"
+        ),
+        None
+    );
+}
+
+/// A locally shadowed type name resolves to the shadow, not the module-level declaration.
+///
+/// The member walk must resolve a base's type name scope-awarely: a top-level `Box` and a
+/// `Box` declared inside a function are different types, and answering the module-level one's
+/// member for a value typed by the local one is a confident wrong answer.
+#[test]
+fn a_member_off_a_shadowed_type_reads_the_shadow() {
+    assert_eq!(
+        type_of_expr(
+            "interface Box { value: number }\n\
+             function f() {\n\
+             \x20 type Box = { value: string };\n\
+             \x20 const b: Box = { value: 's' };\n\
+             \x20 return b.value;\n\
+             }",
+            "b.value"
+        ),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+/// A member off a receiver annotated `T | undefined` is the member type or `undefined`.
+///
+/// In type position `undefined` is a `literal_type`, not a bare `undefined` node — the receiver
+/// resolves to its one non-nullish arm, and the whole access carries the `| undefined`.
+#[test]
+fn a_member_off_a_nullable_receiver_is_or_undefined() {
+    assert_eq!(
+        type_of_expr(
+            "interface Order { amount: number }\n\
+             function f(o: Order | undefined) { return o.amount; }",
+            "o.amount"
+        ),
+        Type::union(vec![
+            Type::Primitive(Primitive::Number),
+            Type::Primitive(Primitive::Undefined),
+        ])
+    );
+}
+
+/// A nullable intermediate member taints the tail of the chain with `undefined`.
+#[test]
+fn a_nullable_intermediate_member_taints_the_tail() {
+    assert_eq!(
+        type_of_expr(
+            "interface Amount { cents: number }\n\
+             interface Order { amount: Amount | null }\n\
+             function f(o: Order) { return o.amount.cents; }",
+            "o.amount.cents"
+        ),
+        Type::union(vec![
+            Type::Primitive(Primitive::Number),
+            Type::Primitive(Primitive::Undefined),
+        ])
+    );
+}
+
+/// A member typed as an inline anonymous object is read through: node-based resolution walks
+/// the `object_type` directly, so the chain does not need a name at every hop.
+#[test]
+fn a_chain_reads_through_an_inline_object_member() {
+    assert_eq!(
+        type_of_expr(
+            "interface Outer { inner: { amount: number } }\n\
+             function f(o: Outer) { return o.inner.amount; }",
+            "o.inner.amount"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
