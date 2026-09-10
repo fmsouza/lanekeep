@@ -9766,12 +9766,14 @@ export default defineRule({
                 timeout: None,
                 has_reduce,
                 component: Some(backed_by(fixture())),
-                // A component cannot declare `requires`, `flow` or a `checkFlow` handler —
-                // `rule-metadata` has no such fields — so every component-backed `RuleSpec`
-                // carries the same empty/absent values `lanekeep-config`'s `build_rule`
-                // produces for one (`crates/lanekeep-config/src/lib.rs`'s `raw_rule_from`).
+                // A component cannot declare `requires`, `flow`, a `checkFlow` handler or a
+                // `checkFile` handler — `rule-metadata` has no such fields — so every
+                // component-backed `RuleSpec` carries the same empty/absent values
+                // `lanekeep-config`'s `build_rule` produces for one
+                // (`crates/lanekeep-config/src/lib.rs`'s `raw_rule_from`).
                 requires: Vec::new(),
                 has_check_flow: false,
+                has_check_file: false,
                 flow: None,
                 // Same reasoning as `requires`: `rule-metadata` has no `obligation` field
                 // either, so `lanekeep-config` never produces one for a component-backed rule.
