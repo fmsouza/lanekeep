@@ -456,8 +456,15 @@ const TWO_SILENT_RULES_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"r
 /// expects.
 fn gate_table_header() -> String {
     format!(
-        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6}",
-        "rule", "path-gated", "unread", "cached", "content-gated", "lang-gated", "parsed"
+        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7}",
+        "rule",
+        "path-gated",
+        "unread",
+        "cached",
+        "content-gated",
+        "lang-gated",
+        "parsed",
+        "dropped"
     )
 }
 
@@ -601,7 +608,7 @@ print('x')
     // from" — both are 3 here too — so this line is right by construction (see `main.rs`'s own
     // call site), not proven by this assertion.
     assert!(
-        cold_stderr.contains("each row sums to 3 files discovered"),
+        cold_stderr.contains("each row's first six columns sum to 3 files discovered"),
         "{cold_stderr}"
     );
 
@@ -694,7 +701,7 @@ print('x')
     // The reconciliation line still holds after the cold-to-warm transition — the property the
     // six-column split exists to protect, not merely a number that happens to still add up.
     assert!(
-        warm_stderr.contains("each row sums to 3 files discovered"),
+        warm_stderr.contains("each row's first six columns sum to 3 files discovered"),
         "{warm_stderr}"
     );
 }
