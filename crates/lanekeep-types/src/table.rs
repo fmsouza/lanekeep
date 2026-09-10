@@ -40,9 +40,20 @@ pub(crate) fn binary(
 
         "+" => plus(left, right),
 
-        // Everything else — `??`, `&&`, `||`, the bitwise operators, `in`, `instanceof` —
-        // is deliberately outside the table. Their results depend on values rather than on
-        // types, and guessing would be worse than saying nothing.
+        // `a ?? b` is `NonNullable<typeof a> | typeof b`, a type-level result, unlike the
+        // value-dependent operators below. When both sides reduce to the same primitive that
+        // union is that primitive, and the answer is exact. When they disagree it is a union of
+        // two — not a single primitive — so the table says nothing rather than pick one. The
+        // oracle strips `null`/`undefined` from the left before calling, so `NonNullable` is
+        // already applied to what arrives here.
+        "??" => match (left?, right?) {
+            (left, right) if left == right => Some(left),
+            _ => None,
+        },
+
+        // Everything else — `&&`, `||`, the bitwise operators, `in`, `instanceof` — is
+        // deliberately outside the table. Their results depend on a run-time value rather than
+        // on types, and guessing would be worse than saying nothing.
         _ => None,
     }
 }
@@ -223,21 +234,54 @@ mod tests {
         assert_eq!(binary("+", Some(Primitive::Number), None), None);
     }
 
+    /// `??` yields its operand type when both sides agree on a primitive.
+    ///
+    /// `a ?? b` is `NonNullable<typeof a> | typeof b`; when both reduce to the same primitive
+    /// that union is that primitive. The oracle strips `null`/`undefined` from the left before
+    /// this is reached, so the table sees two plain primitives.
+    #[test]
+    fn nullish_coalescing_is_that_primitive_when_both_sides_agree() {
+        assert_eq!(
+            binary("??", Some(Primitive::Number), Some(Primitive::Number)),
+            Some(Primitive::Number)
+        );
+        assert_eq!(
+            binary("??", Some(Primitive::BigInt), Some(Primitive::BigInt)),
+            Some(Primitive::BigInt)
+        );
+        assert_eq!(
+            binary("??", Some(Primitive::String), Some(Primitive::String)),
+            Some(Primitive::String)
+        );
+    }
+
+    /// The refusal that keeps `??` honest.
+    ///
+    /// `number ?? bigint` is `number | bigint`, which is not a single primitive, so the table
+    /// says nothing rather than name one arm. An operand the oracle could not type sinks the
+    /// answer the same way arithmetic's does — a `??` over an untyped side is not evidence.
+    #[test]
+    fn nullish_coalescing_refuses_disagreeing_or_unknown_sides() {
+        assert_eq!(
+            binary("??", Some(Primitive::Number), Some(Primitive::BigInt)),
+            None
+        );
+        assert_eq!(
+            binary("??", Some(Primitive::String), Some(Primitive::Number)),
+            None
+        );
+        assert_eq!(binary("??", None, Some(Primitive::Number)), None);
+        assert_eq!(binary("??", Some(Primitive::Number), None), None);
+        assert_eq!(binary("??", None, None), None);
+    }
+
     /// Deliberately absent from the table, and asserted so rather than left to chance.
+    ///
+    /// `??` is no longer among them — it reaches the table now — so its removal from this list
+    /// is the assertion that it moved, paired with the positive test above.
     #[test]
     fn an_operator_outside_the_table_is_unknown() {
-        for operator in [
-            "??",
-            "&&",
-            "||",
-            "&",
-            "|",
-            "^",
-            "<<",
-            ">>",
-            "in",
-            "instanceof",
-        ] {
+        for operator in ["&&", "||", "&", "|", "^", "<<", ">>", "in", "instanceof"] {
             assert_eq!(
                 binary(operator, Some(Primitive::Number), Some(Primitive::Number)),
                 None,

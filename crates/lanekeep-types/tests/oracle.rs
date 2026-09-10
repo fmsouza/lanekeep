@@ -229,10 +229,184 @@ fn mixing_a_number_and_a_bigint_is_not_typed() {
     assert_eq!(type_of_last("const x = 1 + 1n;", "binary_expression"), None);
 }
 
-/// `??` is deliberately outside the table, asserted as expected rather than incidental.
+/// A value-dependent operator is deliberately outside the table, asserted rather than incidental.
+///
+/// `&&` stands in for the group (`||`, the bitwise operators, `in`, `instanceof`): its result
+/// depends on a run-time value, not on the operand types. `??` used to be asserted here and no
+/// longer is — it reaches the table now, and the nullish-coalescing tests below are where it is
+/// pinned.
 #[test]
 fn an_operator_outside_the_table_is_not_typed() {
-    assert_eq!(type_of_last("const x = a ?? b;", "binary_expression"), None);
+    assert_eq!(
+        type_of_expr(
+            "function f(a: number, b: number) { return a && b; }",
+            "a && b"
+        ),
+        None
+    );
+}
+
+/// `count ?? 0` is `number` when the left is `number | undefined`.
+///
+/// This is the defaulting idiom the operator table exists to see through: the left is nullable
+/// (that is why it is defaulted), its non-nullish arm is `number`, and the fallback is `number`,
+/// so the whole expression is `number` under any reading. The oracle strips `null`/`undefined`
+/// from the left before the table compares the two sides.
+#[test]
+fn a_nullish_default_over_a_nullable_left_is_the_shared_primitive() {
+    assert_eq!(
+        type_of_expr(
+            "function f(count: number | undefined) { return count ?? 0; }",
+            "count ?? 0"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// The nullish arm dropped from the left is `null` as readily as `undefined`.
+#[test]
+fn a_nullish_default_drops_null_from_the_left() {
+    assert_eq!(
+        type_of_expr(
+            "function f(s: string | null) { return s ?? ''; }",
+            "s ?? ''"
+        ),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+/// A non-nullable left agrees with a matching fallback, `??` redundant or not.
+///
+/// The left never strips anything here — it is already a plain `string` — so this pins the
+/// path where both sides arrive as bare primitives, distinct from the union-stripping one above.
+#[test]
+fn a_nullish_default_over_a_non_nullable_left_is_that_primitive() {
+    assert_eq!(
+        type_of_expr(
+            "function f(a: string, b: string) { return a ?? b; }",
+            "a ?? b"
+        ),
+        Some(Type::Primitive(Primitive::String))
+    );
+}
+
+/// The ticket's flagship: `tx.amount ?? 0n` is `bigint`, needing property access and `??` at once.
+///
+/// The property is required, so `tx.amount` is a bare `bigint`; the fallback is `bigint`; the
+/// whole expression is `bigint`. Before property access (#249) and this arm together, it answered
+/// nothing.
+#[test]
+fn a_nullish_default_over_a_typed_property_is_that_property_type() {
+    assert_eq!(
+        type_of_expr(
+            "interface Tx { amount: bigint }\nfunction f(tx: Tx) { return tx.amount ?? 0n; }",
+            "tx.amount ?? 0n"
+        ),
+        Some(Type::Primitive(Primitive::BigInt))
+    );
+}
+
+/// An optional property is `T | undefined`, and the `??` strips the `undefined` to agree.
+///
+/// This is the idiom in full: `amount?: bigint` makes `tx.amount` nullable, which is exactly why
+/// `?? 0n` is written, and the result is the `bigint` the fallback and the stripped left share.
+#[test]
+fn a_nullish_default_over_an_optional_property_is_that_property_type() {
+    assert_eq!(
+        type_of_expr(
+            "interface Tx { amount?: bigint }\nfunction f(tx: Tx) { return tx.amount ?? 0n; }",
+            "tx.amount ?? 0n"
+        ),
+        Some(Type::Primitive(Primitive::BigInt))
+    );
+}
+
+/// Disagreeing sides answer nothing: `number | undefined ?? 0n` is `number | bigint`, not one type.
+#[test]
+fn a_nullish_default_with_a_disagreeing_fallback_is_not_typed() {
+    assert_eq!(
+        type_of_expr(
+            "function f(count: number | undefined) { return count ?? 0n; }",
+            "count ?? 0n"
+        ),
+        None
+    );
+}
+
+/// A left that strips to more than one primitive is not a single primitive, so it answers nothing.
+///
+/// `number | string | undefined` loses its `undefined` and still holds two primitives; naming one
+/// would be a guess, so the table stays silent. This guards the arm against collapsing to a single
+/// side.
+#[test]
+fn a_nullish_default_over_a_multi_primitive_left_is_not_typed() {
+    assert_eq!(
+        type_of_expr(
+            "function f(x: number | string | undefined) { return x ?? 0; }",
+            "x ?? 0"
+        ),
+        None
+    );
+}
+
+/// A left that reduces to a nominal is not a primitive the table can answer.
+///
+/// `number | Decimal` has no nullish arm to drop and still holds a nominal member, so the strip
+/// leaves something the table has no row for. Answering `number` would be a confident wrong
+/// answer — `x` may be a `Decimal` — so the oracle says nothing. This is the only fixture that
+/// reaches the nominal arm of the strip.
+#[test]
+fn a_nullish_default_over_a_left_that_reduces_to_a_nominal_is_not_typed() {
+    assert_eq!(
+        type_of_expr(
+            "interface Decimal { c: number }\n\
+             function f(x: number | Decimal) { return x ?? 0; }",
+            "x ?? 0"
+        ),
+        None
+    );
+}
+
+/// A chain of defaults composes: `a ?? b ?? 0` is `number` when each link is a `number`.
+///
+/// The inner `a ?? b` is typed first — `number | undefined` on the left, a `number` fallback —
+/// and the outer `??` reads that `number` result as its own non-nullish left. Nesting is only the
+/// `binary_expression` arm reached recursively.
+#[test]
+fn a_chain_of_nullish_defaults_composes_to_the_shared_primitive() {
+    assert_eq!(
+        type_of_expr(
+            "function f(a: number | undefined, b: number) { return a ?? b ?? 0; }",
+            "a ?? b ?? 0"
+        ),
+        Some(Type::Primitive(Primitive::Number))
+    );
+}
+
+/// A nullable fallback sinks the answer: the right is read as it stands, never stripped.
+///
+/// `a ?? b` with both `number | undefined` is itself `number | undefined`, because a nullish `b`
+/// is kept — so the right is a union, and the table answers nothing rather than a bare `number`.
+/// Only the left has its nullish arms removed.
+#[test]
+fn a_nullish_default_with_a_nullable_fallback_is_not_typed() {
+    assert_eq!(
+        type_of_expr(
+            "function f(a: number | undefined, b: number | undefined) { return a ?? b; }",
+            "a ?? b"
+        ),
+        None
+    );
+}
+
+/// Two untyped sides answer nothing through the oracle, not only in the table.
+///
+/// The outside-table e2e assertion moved to `&&`; this keeps a `??` over operands the oracle
+/// cannot type pinned end to end, the path where `non_nullish_primitive_of` and `primitive_of`
+/// both come back `None`.
+#[test]
+fn a_nullish_default_over_two_untyped_sides_is_not_typed() {
+    assert_eq!(type_of_expr("const x = a ?? b;", "a ?? b"), None);
 }
 
 #[test]
