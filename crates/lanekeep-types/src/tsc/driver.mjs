@@ -1363,10 +1363,37 @@ const handlers = {
     if (!context) return null
     const node = nodeAt(context.sourceFile, request.start, request.end)
     if (!node) return null
-    const callee = ts.isCallExpression(node) || ts.isNewExpression(node) ? node.expression : node
+    const isCall = ts.isCallExpression(node) || ts.isNewExpression(node)
+    const callee = isCall ? node.expression : node
     const type = context.checker.getTypeAtLocation(callee)
     const signatures = context.checker.getSignaturesOfType(type, ts.SignatureKind.Call)
+    // A callee with no call signature is not a function, and a call to one answers nothing —
+    // the builtin provider says the same. The guard runs before `getResolvedSignature`, which
+    // would otherwise hand back its error signature (an `any` return) for that case, and `any`
+    // is a claim rather than the "I could not be sure" absence the whole surface is built on.
+    // A `new` on a class reaches here with an empty list too — a constructor's signatures are
+    // `Construct`, not `Call` — so this path answers nothing for it exactly as it did before.
     if (signatures.length === 0) return null
+
+    if (isCall) {
+      // A genuine call selects the one overload its arguments match and instantiates that
+      // signature's type parameters — the type an editor hover shows for the call, and the
+      // same type `typeOf` gives the variable it is bound to. Reading the callee's *declared*
+      // signatures instead (the branch below) leaves a generic return as its bare parameter,
+      // so `useMemo(() => 0n, [])` answered `{ text: 'T' }` — non-`undefined`, yet carrying no
+      // field a rule may branch on. `getResolvedSignature` is what closes that gap (#245).
+      const resolved = context.checker.getResolvedSignature(node)
+      if (!resolved) return null
+      return normalizeType(
+        context.checker,
+        context.checker.getReturnTypeOfSignature(resolved),
+        undefined,
+      )
+    }
+
+    // A bare function reference (`m.fn`, not `m.fn()`) has no call site to instantiate from, so
+    // its declared signatures are read directly. `getResolvedSignature` cannot help here — it
+    // takes a call-like node, which this is not.
     const returns = signatures.map((signature) =>
       context.checker.getReturnTypeOfSignature(signature),
     )

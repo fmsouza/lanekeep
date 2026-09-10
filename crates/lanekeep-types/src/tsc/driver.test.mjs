@@ -71,7 +71,9 @@ before(() => {
       'const money = new Decimal()\n' +
       'const count: number = 1\n' +
       'declare const mixed: string | number\n' +
-      'export { money, count, mixed }\n',
+      'declare function useMemo<T>(factory: () => T, deps: unknown[]): T\n' +
+      'const amount = useMemo(() => 0n, [])\n' +
+      'export { money, count, mixed, amount }\n',
   )
   child = spawn(process.execPath, [driver, project, typescript], {
     stdio: ['pipe', 'pipe', 'inherit'],
@@ -145,6 +147,30 @@ test('symbolOf resolves an import to the module as written', TIMEOUT, async (t) 
   assert.equal(response.value.name, 'Decimal')
   assert.equal(response.value.module, './lib')
   assert.equal(response.value.exported, 'Decimal')
+})
+
+test('returnTypeOf instantiates a generic call from its arguments', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  const file = path.join(project, 'src/a.ts')
+  const source = readFileSync(file, 'utf8')
+  const response = await ask('returnTypeOf', { file, ...spanOf(source, 'useMemo(() => 0n, [])') })
+  assert.equal(response.ok, true, JSON.stringify(response))
+  // The call site chooses `T = bigint`. Before #245 this read the return off the callee's
+  // *declared* signature, which is still the placeholder `T`, and answered `{ text: 'T' }` —
+  // a non-`undefined` answer carrying nothing a rule may branch on.
+  assert.equal(response.value.primitive, 'bigint', JSON.stringify(response.value))
+})
+
+// The other half of the pin the two entry points must not drift apart on: `typeOf` of the
+// bound variable already answers the instantiated type, so a `returnTypeOf` that answered
+// anything but `bigint` for the call it was bound from would be the two paths disagreeing.
+test('typeOf answers the instantiated type a generic call is bound to', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  const file = path.join(project, 'src/a.ts')
+  const source = readFileSync(file, 'utf8')
+  const response = await ask('typeOf', { file, ...spanOf(source, 'amount') })
+  assert.equal(response.ok, true, JSON.stringify(response))
+  assert.equal(response.value.primitive, 'bigint', JSON.stringify(response.value))
 })
 
 test('programs is stable across two calls', TIMEOUT, async (t) => {
