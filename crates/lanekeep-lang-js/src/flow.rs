@@ -40,6 +40,15 @@
 //! same base too, and a path past the widening bound taints every sibling below it — which is
 //! the sound direction for a taint tool.
 //!
+//! **A wrapping expression or a literal carries its operands' taint (#246).** A transparent
+//! wrapper — `(e)`, `e!`, `await e`, `e as T`, `e satisfies T` — *is* its inner value, so it
+//! carries that value's taint at the same path (there is no promise model, so `await` is
+//! transparent too). An object, array or conditional carries the union of its members' taint,
+//! each at the path the read observes it under: `log({ cause: s })` reports, and `log(o.public)`
+//! where `o = { cause: s }` stays silent. A source *textually inside* any of these was always
+//! caught by the containment scan regardless of path; what #246 adds is the taint that reaches
+//! them held by a *binding*, which the containment scan cannot see.
+//!
 //! **Augmented assignment is a weak update too.** `x += rhs` (and `-=`, `||=`, `??=`, …)
 //! desugars to `x = x op rhs`, whose result is tainted if *either* the prior `x` or `rhs` is
 //! tainted. So an `op=` joins the same additive, non-killing union: it contributes `rhs`'s taint
@@ -288,7 +297,10 @@ impl<'t> Taint<'_, 't> {
     ///
     /// Value-level: a `@sanitizer` call yields a clean value regardless of its arguments, an
     /// arbitrary non-source call carries nothing (v1 does not track taint through a call), and
-    /// only a direct `@source` or a local alias of a tainted binding is tainted.
+    /// only a direct `@source` or a local alias of a tainted binding is tainted. A
+    /// taint-transparent wrapper — `(e)`, `e!`, `await e`, `e as T`, `e satisfies T` — carries
+    /// its inner value's taint unchanged, and an object, array or ternary carries the union of
+    /// its members' taint at the path each is read under (#246).
     ///
     /// A **direct** source taints whatever path is asked of it. That downward closure is
     /// load-bearing: dropping it would silence `const s = getSecret(); log(s.mnemonic)`, the
@@ -363,11 +375,97 @@ impl<'t> Taint<'_, 't> {
                     None => Vec::new(),
                 }
             }
+            // Taint-transparent wrappers (#246): the result *is* the inner expression's value,
+            // so the caller's path passes straight through. `(e)`, `e!`, `e as T`,
+            // `e satisfies T`, and — with no promise model to confuse — `await e`. Depth is
+            // unchanged, as for the member read above: this is syntactic descent within one
+            // expression, bounded by tree height, not a def-use hop that could cycle.
+            "parenthesized_expression"
+            | "non_null_expression"
+            | "await_expression"
+            | "as_expression"
+            | "satisfies_expression" => match transparent_inner(expr) {
+                Some(inner) => self.taint_of(inner, path, depth),
+                None => Vec::new(),
+            },
+            // A literal propagates the taint of its members, at the path each is read under
+            // (#246) — real propagation rather than passthrough, so `log({ cause: secret })`
+            // reports and `log({ cause: secret }); … o.other` does not.
+            "object" => self.taint_of_object(expr, path, depth),
+            "array" => self.taint_of_array(expr, path, depth),
+            // A conditional yields one branch or the other; its value is the union of the two,
+            // each asked at the caller's path. The condition does not carry the value.
+            "ternary_expression" => ["consequence", "alternative"]
+                .into_iter()
+                .filter_map(|field| expr.child_by_field_name(field))
+                .flat_map(|branch| self.taint_of(branch, path, depth))
+                .collect(),
             // A non-source, non-sanitizer call is opaque: v1 does not follow taint through a
             // call's arguments (the alias-through-call false negative, spec §13). Only a
             // direct source or a local identifier alias carries taint.
             _ => Vec::new(),
         }
+    }
+
+    /// The taint an object literal carries at `path`: the union over its members of the taint
+    /// each carries at the path the caller's read observes it under (#246).
+    ///
+    /// A `pair`'s key is one path segment ([`key_segment`]); a `shorthand_property_identifier`
+    /// (`{ name }`) is `{ name: name }`, its key `Field(name)` and its value the binding it
+    /// names, resolved as an identifier; a `spread_element` (`{ ...o }`) exposes the same paths
+    /// as the object it spreads, so it is asked at the caller's path unchanged; a
+    /// `method_definition` carries no value. The residual asked of a keyed member is what
+    /// remains of `path` after its key ([`read_under`]): a read at `[]` observes every member,
+    /// a read at `[k, …rest]` observes the members whose key is comparable to `k`.
+    fn taint_of_object(&self, obj: Node<'t>, path: &Path, depth: u32) -> Vec<Fact<'t>> {
+        let mut facts = Vec::new();
+        let mut cursor = obj.walk();
+        for member in obj.named_children(&mut cursor) {
+            match member.kind() {
+                "pair" => {
+                    let key = member
+                        .child_by_field_name("key")
+                        .map_or(Seg::Index, |key| key_segment(key, self.source));
+                    if let Some(value) = member.child_by_field_name("value")
+                        && let Some(residual) = read_under(path, &key)
+                    {
+                        facts.extend(self.taint_of(value, &residual, depth));
+                    }
+                }
+                "shorthand_property_identifier" => {
+                    let key = Seg::Field(self.source[member.byte_range()].to_owned());
+                    if let Some(residual) = read_under(path, &key) {
+                        facts.extend(self.taint_of_identifier(member, &residual, depth));
+                    }
+                }
+                "spread_element" => {
+                    if let Some(inner) = member.named_child(0) {
+                        facts.extend(self.taint_of(inner, path, depth));
+                    }
+                }
+                // A `method_definition` binds a function, not a value that can carry taint.
+                _ => {}
+            }
+        }
+        facts
+    }
+
+    /// The taint an array literal carries at `path`: the union over its elements, each sitting at
+    /// [`Seg::Index`] (index-insensitive, #225). A `spread_element` (`[...a]`) exposes the same
+    /// paths as what it spreads, asked at the caller's path unchanged.
+    fn taint_of_array(&self, arr: Node<'t>, path: &Path, depth: u32) -> Vec<Fact<'t>> {
+        let mut facts = Vec::new();
+        let mut cursor = arr.walk();
+        for element in arr.named_children(&mut cursor) {
+            if element.kind() == "spread_element" {
+                if let Some(inner) = element.named_child(0) {
+                    facts.extend(self.taint_of(inner, path, depth));
+                }
+            } else if let Some(residual) = read_under(path, &Seg::Index) {
+                facts.extend(self.taint_of(element, &residual, depth));
+            }
+        }
+        facts
     }
 
     /// The taint facts an identifier read carries **at access path `path`**: resolve it to its
@@ -791,9 +889,14 @@ fn is_member(node: Node<'_>, set: &[Node<'_>]) -> bool {
 /// to `node`: `o.a.b` is `(o, [Field("a"), Field("b")])`, `o[i].c` is `(o, [Index,
 /// Field("c")])`, and a bare `o` is `(o, [])`.
 ///
-/// `None` when the base is not a plain identifier — a call result, `this`, a parenthesized
-/// expression — because there is then no binding for taint to attach to. That refusal is
-/// unchanged from the `base_identifier` this replaces; what is new is the path beside it.
+/// A taint-transparent wrapper in the base chain is peeled (#246): `(o).secret`,
+/// `(o as T).secret`, `o!.token` and `(await o).x` root at the same binding and path as the
+/// unwrapped form, so a cast-then-access is not silently opaque. This matches [`taint_of`]'s
+/// transparency for a wrapper read whole — a wrapper is its inner value as a base too.
+///
+/// `None` when the base is not a plain identifier and is not one of those wrappers — a call
+/// result, `this`, an object or array literal used directly as a base (`{ … }.k`, a rare shape)
+/// — because there is then no binding for taint to attach to.
 ///
 /// The result is [`truncate`]d here, at the one place a path is built from syntax, so no
 /// caller can hold a path longer than [`MAX_PATH_LEN`] and no comparison downstream has to
@@ -817,6 +920,13 @@ fn base_and_path<'t>(node: Node<'t>, source: &str) -> Option<(Node<'t>, Path)> {
                 segments.push(Seg::Index);
                 current = current.child_by_field_name("object")?;
             }
+            // A wrapper contributes no segment; unwrap it and keep walking the base chain. Each
+            // step moves strictly inward, so the loop still terminates on the finite tree.
+            "parenthesized_expression"
+            | "non_null_expression"
+            | "await_expression"
+            | "as_expression"
+            | "satisfies_expression" => current = transparent_inner(current)?,
             _ => return None,
         }
     }
@@ -837,19 +947,61 @@ fn write_target<'t>(assignment: Node<'t>, source: &str) -> Option<(Node<'t>, Pat
     base_and_path(left, source)
 }
 
-/// The segment a `member_expression`'s property contributes.
-///
-/// A plain `property_identifier` is the name. Anything else the grammar can put in that slot —
-/// a private name `o.#k` above all — folds to [`Seg::Index`], which compares equal to every
-/// other opaque segment: an over-approximation, and the sound direction, rather than inventing
-/// a name that two different constructs might collide on.
+/// The segment a `member_expression`'s property contributes: [`key_segment`] of its `property`
+/// child, and [`Seg::Index`] when it has none.
 fn property_segment(member: Node<'_>, source: &str) -> Seg {
-    match member.child_by_field_name("property") {
-        Some(property) if property.kind() == "property_identifier" => {
-            Seg::Field(source[property.byte_range()].to_owned())
-        }
-        _ => Seg::Index,
+    member
+        .child_by_field_name("property")
+        .map_or(Seg::Index, |property| key_segment(property, source))
+}
+
+/// The segment a named key contributes — a `member_expression`'s property or an object literal
+/// `pair`'s key.
+///
+/// A plain `property_identifier` is the name. Anything else the grammar can put in that slot — a
+/// private name `o.#k`, a string or number key, a computed `[k]` — folds to [`Seg::Index`],
+/// which compares equal to every other segment: an over-approximation, and the sound direction,
+/// rather than inventing a name that two different constructs might collide on. In particular a
+/// string key `{ "cause": … }` folds to `Index` because the matching subscript read `o["cause"]`
+/// does too, so the two still meet.
+fn key_segment(key: Node<'_>, source: &str) -> Seg {
+    if key.kind() == "property_identifier" {
+        Seg::Field(source[key.byte_range()].to_owned())
+    } else {
+        Seg::Index
     }
+}
+
+/// The value expression of a taint-transparent wrapper — `(e)`, `e!`, `await e`, `e as T`,
+/// `e satisfies T` — whose result *is* that inner expression's value.
+///
+/// For a cast the type child follows the value in source order, so the value is the first named
+/// child; for the others there is one named child (a `parenthesized_expression`'s optional `type`
+/// field aside, which is skipped so a type annotation is never mistaken for the value).
+fn transparent_inner(expr: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = expr.walk();
+    expr.named_children(&mut cursor)
+        .find(|child| child.kind() != "type_annotation")
+}
+
+/// The residual path with which a literal member sitting at segment `key` is read, given the
+/// caller's `path` — or `None` when the read cannot observe that member (#246).
+///
+/// A read at `[]` observes the member whole, residual `[]`. A read at `[head, …rest]` observes
+/// the member iff `head` is comparable to `key` by the [`Seg::Index`]-wildcard rule of
+/// [`prefix_comparable`], with residual `rest`. The residual is a suffix of `path`, so no path
+/// grows and no truncation is needed.
+fn read_under(path: &Path, key: &Seg) -> Option<Path> {
+    match path.split_first() {
+        None => Some(Vec::new()),
+        Some((head, rest)) => seg_comparable(head, key).then(|| rest.to_vec()),
+    }
+}
+
+/// Whether two single segments are comparable — equal, or either an [`Seg::Index`] wildcard. The
+/// per-segment core [`prefix_comparable`] applies down a whole path.
+fn seg_comparable(a: &Seg, b: &Seg) -> bool {
+    matches!((a, b), (Seg::Index, _) | (_, Seg::Index)) || a == b
 }
 
 /// Whether `expr` is a `member_expression` whose property names one of [`SHAPE_PROPERTIES`].
@@ -1950,6 +2102,287 @@ mod tests {
             let flows = run(source, "getSecret", "log", "redact");
             assert_eq!(flows.len(), 1, "{source}");
         }
+    }
+
+    // --- #246: taint carried by a binding through a wrapping expression or a literal ------
+    //
+    // Before #246 `taint_of` had two arms — `identifier` and the member/subscript read — and a
+    // `_ => Vec::new()` that silently dropped taint held by a *binding* inside every other
+    // expression kind. A source textually *inside* the expression was still caught by the
+    // containment scan; taint reaching the expression through a binding was not. These pin the
+    // shapes that fall through to `_`, in both directions.
+
+    #[test]
+    fn taint_passes_through_a_parenthesized_expression() {
+        let flows = run(
+            "function f(){ const s = getSecret(); log((s)); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "parentheses do not change the value");
+    }
+
+    #[test]
+    fn taint_passes_through_a_non_null_assertion() {
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s!); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "`s!` is `s`");
+    }
+
+    #[test]
+    fn taint_passes_through_an_as_expression() {
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s as string); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a cast does not change the value");
+    }
+
+    #[test]
+    fn an_as_expression_bound_first_still_carries_taint() {
+        // The ticket's own row: `const b = a as string; log(b)` — the cast sits on a def's rhs,
+        // reached through def-use rather than at the sink.
+        let flows = run(
+            "function f(){ const a = getSecret(); const b = a as string; log(b); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "a cast on a binding's initializer is transparent"
+        );
+    }
+
+    #[test]
+    fn taint_passes_through_a_satisfies_expression() {
+        let flows = run(
+            "function f(){ const s = getSecret(); log(s satisfies string); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "`satisfies` does not change the value");
+    }
+
+    #[test]
+    fn taint_passes_through_an_await_expression() {
+        let flows = run(
+            "async function f(){ const s = getSecret(); log(await s); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "await is transparent: there is no promise model to confuse"
+        );
+    }
+
+    #[test]
+    fn taint_follows_an_awaited_binding() {
+        // The ticket's row `const x = await p; log(x)`: await composing through def-use.
+        let flows = run(
+            "async function f(){ const p = getSecret(); const x = await p; log(x); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "the awaited binding carries its taint");
+    }
+
+    #[test]
+    fn a_tainted_binding_in_an_object_literal_reaches_the_sink() {
+        // The headline row: `log({ cause: secret })`, taint held by the binding, not textually
+        // inside the literal. The difference from the reporting `log({ cause: getSecret() })`
+        // was only whether the author inlined the source.
+        let flows = run(
+            "function f(){ const secret = getSecret(); log({ cause: secret }); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a tainted field taints the object whole");
+    }
+
+    #[test]
+    fn a_tainted_object_literal_field_reaches_a_matching_read() {
+        let flows = run(
+            "function f(){ const s = getSecret(); const o = { cause: s }; log(o.cause); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "the read is the field that was tainted");
+    }
+
+    #[test]
+    fn an_untainted_object_literal_field_is_silent() {
+        // Field sensitivity: reading a *different*, known field of the literal carries nothing.
+        let flows = run(
+            "function f(){ const s = getSecret(); const o = { cause: s }; log(o.other); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "o.cause and o.other are incomparable paths"
+        );
+    }
+
+    #[test]
+    fn a_shorthand_property_carries_taint() {
+        // `{ secret }` is `{ secret: secret }` — a `shorthand_property_identifier`, resolved as
+        // a reference to the binding.
+        let flows = run(
+            "function f(){ const secret = getSecret(); log({ secret }); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a shorthand names the binding it carries");
+    }
+
+    #[test]
+    fn a_spread_of_a_tainted_object_reaches_the_sink() {
+        let flows = run(
+            "function f(){ const s = getSecret(); const o = { x: s }; log({ ...o }); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a spread exposes the fields it copies");
+    }
+
+    #[test]
+    fn a_tainted_binding_in_an_array_literal_reaches_the_sink() {
+        let flows = run(
+            "function f(){ const secret = getSecret(); log([secret]); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "an array element taints the array");
+    }
+
+    #[test]
+    fn a_ternary_branch_carries_taint() {
+        // `log(c ? secret : x)` — the alternative is tainted, the consequence is not; the union
+        // reports once.
+        let flows = run(
+            "function f(cond){ const secret = getSecret(); log(cond ? \"\" : secret); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "a tainted branch taints the ternary");
+    }
+
+    #[test]
+    fn a_sanitized_ternary_branch_composes_with_the_cut() {
+        // Both branches are clean: the consequence is sanitized, the alternative is a literal.
+        // The ternary arm sits below the sanitizer cut, so `redact(s)` is still cut inside it.
+        let flows = run(
+            "function f(cond){ const s = getSecret(); log(cond ? redact(s) : \"\"); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "a sanitized branch stays clean inside a ternary"
+        );
+    }
+
+    #[test]
+    fn a_clean_object_literal_is_silent() {
+        let flows = run(
+            "function f(){ const c = \"x\"; log({ cause: c }); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(flows.is_empty(), "no source, no flow");
+    }
+
+    // A transparent wrapper is transparent as a *base* too (#246): `(o).secret`,
+    // `(o as T).secret`, `o!.token` and `(await o).x` read the same field of the same binding
+    // as the unwrapped form. Without peeling the base, `base_and_path` bottoms out at the
+    // wrapper and the read carries nothing — the asymmetry a cast-then-access
+    // (`(config as Secrets).apiKey`) would defeat trivially.
+
+    #[test]
+    fn a_parenthesized_member_base_is_peeled() {
+        let flows = run(
+            "function f(){ const s = getSecret(); const o = { secret: s }; log((o).secret); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "`(o).secret` is `o.secret`");
+    }
+
+    #[test]
+    fn a_cast_member_base_is_peeled() {
+        let flows = run(
+            "function f(){ const s = getSecret(); const o = { token: s }; log((o as any).token); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "`(o as T).token` is `o.token`");
+    }
+
+    #[test]
+    fn a_non_null_member_base_is_peeled() {
+        let flows = run(
+            "function f(){ const s = getSecret(); const o = { token: s }; log(o!.token); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(flows.len(), 1, "`o!.token` is `o.token`");
+    }
+
+    #[test]
+    fn a_wrapped_member_base_keeps_field_precision() {
+        // Peeling the wrapper must not cost field sensitivity: a different, known field is silent.
+        let flows = run(
+            "function f(){ const s = getSecret(); const o = { secret: s }; log((o).other); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert!(
+            flows.is_empty(),
+            "(o).secret and (o).other are incomparable"
+        );
+    }
+
+    #[test]
+    fn a_write_through_a_wrapped_base_taints() {
+        // The peel serves the write side too: `(o).secret = …` is a field write to `o`.
+        let flows = run(
+            "function f(){ const o = {}; (o).secret = getSecret(); log(o.secret); }",
+            "getSecret",
+            "log",
+            "redact",
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "a write through a wrapped base lands on the binding"
+        );
     }
 
     // --- C2 (#225): a shape-property read off a tainted base is clean ----------------------
