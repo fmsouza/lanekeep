@@ -156,12 +156,16 @@ fn completeness() -> RuleTester {
 
 #[test]
 fn check_file_reports_when_a_construct_was_dropped() {
-    completeness()
-        .reports_at(
-            "function f() { const s = getSecret(); log(s + \"!\"); }\n",
-            &[(1, 1)],
-        )
+    let tester = completeness();
+    let source = "function f() { const s = getSecret(); log(s + \"!\"); }\n";
+    tester
+        .reports_at(source, &[(1, 1)])
         .expect("checkFile reports at the file root when ctx.flow.complete() is false");
+    // Pins `ctx.flow.dropped`'s value, not just `complete()`'s effect on position — see
+    // `check_file_reports_on_an_incomplete_flowless_file` in `lanekeep-engine`.
+    tester
+        .reports_messages(source, &["unverified: 1"])
+        .expect("the message carries ctx.flow.dropped's count");
 }
 
 #[test]

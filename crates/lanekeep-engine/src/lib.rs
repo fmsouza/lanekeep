@@ -6892,7 +6892,10 @@ export default defineRule({
     #[test]
     fn check_file_reports_on_an_incomplete_flowless_file() {
         // `s + "!"` is a binary-sink drop: dropped == 1, no flow reaches a sink. `checkFile`
-        // still runs (the whole point) and reports at the file root.
+        // still runs (the whole point) and reports at the file root. The message is asserted
+        // alongside the position so this pins `ctx.flow.dropped`'s *value* — deleting
+        // `flow.set("dropped", dropped)` in `install_flow` would still leave `complete()` (and
+        // so the position) unaffected, but would render `undefined` into the template here.
         let project = Project::new(
             "checkfile-incomplete",
             &[
@@ -6905,15 +6908,21 @@ export default defineRule({
             ],
         );
         let outcome = project.run().expect("runs");
-        let found: Vec<(u32, u32)> = outcome
+        let found: Vec<(u32, u32, &str)> = outcome
             .violations
             .iter()
-            .map(|v| (v.location.position.line, v.location.position.column))
+            .map(|v| {
+                (
+                    v.location.position.line,
+                    v.location.position.column,
+                    v.message.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             found,
-            vec![(1, 1)],
-            "checkFile reports once, at the file root"
+            vec![(1, 1, "could not verify: 1 construct(s) unanalyzed")],
+            "checkFile reports once, at the file root, with ctx.flow.dropped's count in the message"
         );
     }
 
@@ -6935,6 +6944,84 @@ export default defineRule({
         assert!(
             outcome.violations.is_empty(),
             "complete() is true, so checkFile reports nothing"
+        );
+    }
+
+    /// A rule declaring both `checkFlow` and `checkFile` — the two dispatch blocks in
+    /// `run_flow_rule` (the per-flow loop and the once-per-file eval) are otherwise only ever
+    /// covered in isolation. `log(s)` gives `checkFlow` a real flow to report; `log(x + "!")`
+    /// beside it is a binary-sink drop that does not participate in any flow, so the file is
+    /// still incomplete and `checkFile` reports too — proving neither handler's presence
+    /// suppresses or duplicates the other's.
+    const BOTH_HANDLERS_RULE: &str = r#"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/flow-both',
+  requires: ['dataflow'],
+  flow: {
+    sources: ['(call_expression function: (identifier) @source (#eq? @source "getSecret"))'],
+    sinks: ['(call_expression function: (identifier) @fn (#eq? @fn "log") arguments: (arguments (_) @sink))'],
+    sanitizers: ['(call_expression function: (identifier) @fn (#eq? @fn "redact")) @sanitizer'],
+  },
+  card: {
+    message: 'flow', remediation: 'redact',
+    examples: { bad: 'log(s)', good: 'log(redact(s))' },
+  },
+  checkFlow(ctx, path) { ctx.report(path.sink, 'flow reaches a sink'); },
+  checkFile(ctx) { if (!ctx.flow.complete()) ctx.report(ctx.root, `file incomplete: ${ctx.flow.dropped}`); },
+});
+"#;
+
+    #[test]
+    fn flow_both_check_flow_and_check_file_coexist_on_one_rule() {
+        let project = Project::new(
+            "flow-both-handlers",
+            &[
+                ("rule.ts", BOTH_HANDLERS_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s);\n  log(x + \"!\");\n}\n",
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        let found: Vec<(u32, u32, &str)> = outcome
+            .violations
+            .iter()
+            .map(|v| {
+                (
+                    v.location.position.line,
+                    v.location.position.column,
+                    v.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcome.violations.len(),
+            2,
+            "checkFlow's per-flow report and checkFile's per-file report both land"
+        );
+
+        let messages: BTreeSet<&str> = outcome
+            .violations
+            .iter()
+            .map(|v| v.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            BTreeSet::from(["flow reaches a sink", "file incomplete: 1"]),
+            "one violation from each handler, neither suppressing nor duplicating the other"
+        );
+
+        // Positions confirmed empirically, not guessed: checkFile reports at the file root,
+        // (1, 1); checkFlow reports at the `s` inside `log(s)`, (3, 7) — the same position
+        // `a_flow_rule_reports_at_its_sink` pins for the identical source shape. The engine's
+        // ordering contract (`(ruleId, file, line, column)`) is what puts the file-root report
+        // first even though `run_flow_rule` invokes `checkFlow` before `checkFile`.
+        assert_eq!(
+            found,
+            vec![(1, 1, "file incomplete: 1"), (3, 7, "flow reaches a sink")],
+            "checkFile's report at the root and checkFlow's report at the sink, in sorted order"
         );
     }
 
