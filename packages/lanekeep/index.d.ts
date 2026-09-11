@@ -482,8 +482,9 @@ export type ObligationSpec = {
   /**
    * `'function'` — every path out of the enclosing function, `return`/`throw` included.
    * `'block'` — every path out of the block the acquire is in.
+   * `'module'` — a matching-`@key` release must exist somewhere in the file.
    */
-  scope: 'function' | 'block'
+  scope: 'function' | 'block' | 'module'
 }
 
 /** An acquire some path leaves undischarged, passed to `checkObligation`. */
@@ -493,6 +494,11 @@ export type UnmetObligation = {
   readonly exit: Node
   /** Whether any path *did* discharge it: partial coverage reads differently to none. */
   readonly partial: boolean
+  /**
+   * The acquire's `@key` capture, when the rule's acquire/release queries bind one — so a
+   * report can name the value. Absent for an un-keyed obligation.
+   */
+  readonly key?: Node
 }
 
 /** A rule, as `defineRule` takes it. */
