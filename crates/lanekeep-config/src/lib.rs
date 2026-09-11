@@ -2510,6 +2510,10 @@ fn build_rule(
              declares `flow`"
         )));
     }
+    // `|| raw.has_check_file` is redundant today — the `checkFile`-without-`flow` refusal
+    // above already guarantees `has_check_file ⟹ has_flow`, so `has_flow` alone covers it.
+    // Order-dependent: move this check above that one and the disjunct stops being dead,
+    // firing on a `checkFile` rule for a message that never names `checkFile`.
     if (has_flow || raw.has_check_flow || raw.has_check_file) && !declares_dataflow {
         return Err(fail(format!(
             "`{id}` uses dataflow (`flow`/`checkFlow`) but does not declare `requires: \
@@ -2522,6 +2526,9 @@ fn build_rule(
     // `checkFile` (#247). A rule with none can never report anything — the failure the lone
     // `!has_check` refusal used to catch before a dataflow handler was a second way to
     // satisfy it.
+    // `checkFile` is left out of this message on purpose: a rule with `checkFile` can never
+    // reach this gate (its own conjunct requires `!raw.has_check_file`), and a `checkFile`
+    // without `flow` is already refused above, before this point.
     if !raw.has_check && !raw.has_check_flow && !raw.has_check_obligation && !raw.has_check_file {
         return Err(fail(format!(
             "`{id}` has no `check`, `checkFlow` or `checkObligation` — a rule without a \
