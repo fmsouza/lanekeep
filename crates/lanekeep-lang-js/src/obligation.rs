@@ -15,7 +15,7 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
         _tree: &'t Tree,
         source: &str,
         scope: ObligationScope,
-        _keyed: bool,
+        keyed: bool,
         acquires: &[Keyed<'t>],
         releases: &[Keyed<'t>],
     ) -> Vec<UnmetObligation<'t>> {
@@ -52,6 +52,12 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
                 ObligationScope::Function | ObligationScope::Module => None,
             };
 
+            // Value identity: with `keyed`, a release only discharges an acquire whose
+            // `@key` text agrees with its own. A keyed acquire whose match bound no `@key`
+            // correlates with nothing, so it is always reported (the `_ => false` arm).
+            let key_text = |k: &Keyed<'t>| k.key.map(|n| &source[n.byte_range()]);
+            let acq_key = key_text(&acquire);
+
             // Release blocks for this same function (a release node whose root is this
             // root) and, for block scope, lexically inside `region`. A release outside the
             // region cannot be what discharges a block-scoped obligation even if it is
@@ -59,14 +65,23 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
             // handles finally-duplicated release nodes.
             let rel_blocks: Vec<BlockId> = releases
                 .iter()
-                .map(|r| r.node)
-                .filter(|r| enclosing_cfg_root(*r).is_some_and(|rr| rr.id() == root.id()))
+                .filter(|r| enclosing_cfg_root(r.node).is_some_and(|rr| rr.id() == root.id()))
                 .filter(|r| {
                     region.as_ref().is_none_or(|region| {
-                        r.start_byte() >= region.start && r.end_byte() <= region.end
+                        r.node.start_byte() >= region.start && r.node.end_byte() <= region.end
                     })
                 })
-                .flat_map(|r| resolve_blocks(&cfg, r))
+                .filter(|r| {
+                    if !keyed {
+                        return true; // un-keyed: today's behavior, any release discharges.
+                    }
+                    // keyed: both sides must carry a key and the texts must agree.
+                    match (acq_key, key_text(r)) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => false,
+                    }
+                })
+                .flat_map(|r| resolve_blocks(&cfg, r.node))
                 .collect();
 
             let discharged = match &region {
@@ -283,5 +298,94 @@ mod tests {
             !unmet[0].partial,
             "no in-scope path discharges it, so this is not a partial miss"
         );
+    }
+
+    /// Build `Keyed` pairs whose `key` is the first argument identifier of each matched
+    /// call node — e.g. `acq(a)` / `rel(a)` -> the `a`. Confirmed against the parser
+    /// directly (not just `node-types.json`): `call_expression.arguments` is the
+    /// `arguments` node, and its first named child is the bare argument expression with
+    /// no intervening wrapper.
+    fn keyed_calls<'t>(tree: &'t tree_sitter::Tree, source: &str, text: &str) -> Vec<Keyed<'t>> {
+        calls(tree, source, text)
+            .into_iter()
+            .map(|node| {
+                let key = node
+                    .child_by_field_name("arguments")
+                    .and_then(|args| args.named_child(0));
+                Keyed { node, key }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keyed_function_scope_discharges_only_the_matching_acquire() {
+        // rel(a) releases `a`, not `b`: `b` must be reported, `a` silent.
+        let source = "function f() { const a = acq(a); const b = acq(b); rel(a); }";
+        let tree = parse(source);
+        let acq = keyed_calls(&tree, source, "acq(a)")
+            .into_iter()
+            .chain(keyed_calls(&tree, source, "acq(b)"))
+            .collect::<Vec<_>>();
+        let rel = keyed_calls(&tree, source, "rel(a)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Function,
+            true,
+            &acq,
+            &rel,
+        );
+        assert_eq!(unmet.len(), 1, "only b is undischarged");
+        assert_eq!(&source[unmet[0].acquire.byte_range()], "acq(b)");
+    }
+
+    #[test]
+    fn keyed_acquire_without_a_captured_key_is_reported() {
+        // keyed obligation, but this acquire bound no @key -> cannot correlate -> reported.
+        let source = "function f() { const a = acq(); rel(a); }";
+        let tree = parse(source);
+        let acq = vec![Keyed {
+            node: calls(&tree, source, "acq()")[0],
+            key: None,
+        }];
+        let rel = keyed_calls(&tree, source, "rel(a)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Function,
+            true,
+            &acq,
+            &rel,
+        );
+        assert_eq!(
+            unmet.len(),
+            1,
+            "no key means no correlation, so it is reported"
+        );
+    }
+
+    #[test]
+    fn keyed_block_scope_requires_both_region_and_key_match() {
+        // `a` is released inside its block with the matching key: discharged. `b`'s only
+        // release shares its key but sits outside the block, lexically — block scope
+        // must still report it even though a keyed match for it exists in the function.
+        let source = "function f() { { const a = acq(a); const b = acq(b); rel(a); } rel(b); }";
+        let tree = parse(source);
+        let acq = keyed_calls(&tree, source, "acq(a)")
+            .into_iter()
+            .chain(keyed_calls(&tree, source, "acq(b)"))
+            .collect::<Vec<_>>();
+        let rel = keyed_calls(&tree, source, "rel(a)")
+            .into_iter()
+            .chain(keyed_calls(&tree, source, "rel(b)"))
+            .collect::<Vec<_>>();
+        let unmet =
+            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Block, true, &acq, &rel);
+        assert_eq!(
+            unmet.len(),
+            1,
+            "b's matching-key release is lexically outside its block"
+        );
+        assert_eq!(&source[unmet[0].acquire.byte_range()], "acq(b)");
     }
 }
