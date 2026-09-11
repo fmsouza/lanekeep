@@ -2339,9 +2339,10 @@ fn has_dataflow(requires: &serde_json::Value) -> bool {
 /// In the order they are found: `obligation` declared with no `checkObligation` to fire it,
 /// `checkObligation` declared with no `obligation` to drive it, and — once both are present —
 /// an `obligation` not paired with `requires: ['dataflow']`, an `acquire` or `release` role
-/// that is empty or holds a query never binding the capture its role names, or a `scope`
-/// other than `"function"` or `"block"`. An *absent* `scope` is [`build_obligation`]'s to
-/// refuse, where the value is consumed.
+/// that is empty or holds a query never binding the capture its role names, `@key` bound on
+/// some acquire/release queries but not every one, or a `scope` other than `"function"`,
+/// `"block"`, or `"module"` — `"module"` itself refused unless `@key` is bound on every query.
+/// An *absent* `scope` is [`build_obligation`]'s to refuse, where the value is consumed.
 ///
 /// The role floors are `parse_flow`'s, restated: an empty `acquire` has nothing to be
 /// obligated and an empty `release` nothing to discharge it, so `checkObligation` is either
@@ -2380,6 +2381,7 @@ fn check_obligation_shape(
             if let Some(obligation) = obligation {
                 check_obligation_role(&obligation.acquire, "acquire", "@acquire", id)?;
                 check_obligation_role(&obligation.release, "release", "@release", id)?;
+                check_obligation_key(obligation, id)?;
             }
             match obligation.and_then(|o| o.scope.as_deref()) {
                 Some(scope) if !matches!(scope, "function" | "block" | "module") => Err(format!(
@@ -2417,6 +2419,37 @@ fn check_obligation_role(
                  query in this role must capture what it names"
             ));
         }
+    }
+    Ok(())
+}
+
+/// `@key` correlation is all-or-nothing, and a `module` scope requires it.
+///
+/// Binding `@key` on some acquire/release queries but not every one has decided that
+/// correlation matters for part of the obligation and not the rest, which is not a coherent
+/// shape to run — refused regardless of `scope`. And `scope: 'module'` without `@key` on every
+/// query is refused too: without correlation a module-wide scope is strictly worse than a
+/// narrower one, since every unrelated acquire/release pair in the file would fall into the
+/// same bucket.
+fn check_obligation_key(o: &RawObligation, id: &RuleId) -> Result<(), String> {
+    let binds_key = |q: &str| binds(q, "key");
+    let acq_all = o.acquire.iter().all(|q| binds_key(q));
+    let rel_all = o.release.iter().all(|q| binds_key(q));
+    let acq_any = o.acquire.iter().any(|q| binds_key(q));
+    let rel_any = o.release.iter().any(|q| binds_key(q));
+    let all = acq_all && rel_all;
+    let any = acq_any || rel_any;
+    if any && !all {
+        return Err(format!(
+            "`{id}` binds `@key` on some obligation queries but not every one — `@key` \
+             correlation is all-or-nothing"
+        ));
+    }
+    if o.scope.as_deref() == Some("module") && !all {
+        return Err(format!(
+            "`{id}` has obligation `scope` `module` but does not bind `@key` on every \
+             acquire and release query — a module-wide scope needs `@key` to correlate"
+        ));
     }
     Ok(())
 }
@@ -5486,6 +5519,96 @@ mod tests {
             hex(&baseline),
             hex(&acquire_changed),
             "editing an obligation's `acquire` query must invalidate the ruleset hash"
+        );
+
+        // #248 Task 4: `@key` and a `module` scope are likewise literal tokens in the rule's
+        // own module source, so the same verbatim fold has to reach them too — proven here
+        // rather than assumed. Both sources below are written out in full, not derived from
+        // one another with `.replace()` (the fixture-built-by-a-helper trap in AGENTS.md):
+        // a mis-typed needle would silently leave the "changed" source identical to the
+        // original and the `assert_ne!` would still (correctly) fail, but for the wrong
+        // reason, telling a future reader nothing.
+        //
+        // Both queries below bind `@key` together or neither does — never a mix — because
+        // `check_obligation_key` refuses a partially keyed obligation regardless of `scope`,
+        // so "acquire binds `@key`" cannot be varied independently of `release` while keeping
+        // every variant loadable.
+        let keyed_function_scoped_src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/zeroed',\n\
+              requires: ['dataflow'],\n\
+              query: '(identifier) @id',\n\
+              obligation: {\n\
+                acquire: ['(x (y) @key) @acquire'],\n\
+                release: ['(x (y) @key) @release'],\n\
+                scope: 'function',\n\
+              },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { ctx.report(m.id); },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        fixture.write_all(&[("rule.ts", keyed_function_scoped_src)]);
+        let keyed_function_scoped = fixture
+            .load_config()
+            .expect("fully keyed, function-scoped obligation loads")
+            .ruleset_hash;
+
+        let unkeyed_function_scoped_src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/zeroed',\n\
+              requires: ['dataflow'],\n\
+              query: '(identifier) @id',\n\
+              obligation: {\n\
+                acquire: ['(call_expression) @acquire'],\n\
+                release: ['(call_expression) @release'],\n\
+                scope: 'function',\n\
+              },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { ctx.report(m.id); },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        fixture.write_all(&[("rule.ts", unkeyed_function_scoped_src)]);
+        let unkeyed_function_scoped = fixture
+            .load_config()
+            .expect("unkeyed, function-scoped obligation loads")
+            .ruleset_hash;
+
+        assert_ne!(
+            hex(&keyed_function_scoped),
+            hex(&unkeyed_function_scoped),
+            "binding `@key` on an obligation's queries must invalidate the ruleset hash"
+        );
+
+        let keyed_module_scoped_src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/zeroed',\n\
+              requires: ['dataflow'],\n\
+              query: '(identifier) @id',\n\
+              obligation: {\n\
+                acquire: ['(x (y) @key) @acquire'],\n\
+                release: ['(x (y) @key) @release'],\n\
+                scope: 'module',\n\
+              },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { ctx.report(m.id); },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        fixture.write_all(&[("rule.ts", keyed_module_scoped_src)]);
+        let keyed_module_scoped = fixture
+            .load_config()
+            .expect("fully keyed, module-scoped obligation loads")
+            .ruleset_hash;
+
+        assert_ne!(
+            hex(&keyed_function_scoped),
+            hex(&keyed_module_scoped),
+            "an obligation's `scope` moving from `function` to `module` must invalidate the \
+             ruleset hash"
+        );
+        assert_ne!(
+            hex(&unkeyed_function_scoped),
+            hex(&keyed_module_scoped),
+            "the `@key` edit and the `scope` edit above must not collide on the same hash"
         );
     }
 
