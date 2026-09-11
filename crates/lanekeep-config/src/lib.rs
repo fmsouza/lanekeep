@@ -108,6 +108,8 @@ pub struct RuleSpec {
     /// clean and never reports: exactly the failure this field exists to catch at load time
     /// instead.
     pub has_check_flow: bool,
+    /// Whether the rule has a `checkFile` handler (a per-file flow-completeness hook).
+    pub has_check_file: bool,
     /// The rule's taint-flow queries, when it declared `flow`. `None` for every rule that
     /// did not — which is every rule except a dataflow one.
     pub flow: Option<FlowSpec>,
@@ -487,11 +489,11 @@ struct RawSuppressions {
 }
 
 #[derive(Debug, Deserialize)]
-// Four independent handler-presence flags — `has_check`, `has_reduce`, `has_check_flow`,
-// `has_check_obligation` — each a `typeof … === 'function'` probe recorded by `EXTRACT`, not a
-// state machine to fold into an enum. The dataflow family (#193 obligation + #194 flow) took the
-// count from three to four; `#[expect]` rather than `#[allow]` so this self-clears if a handler
-// is ever removed.
+// Five independent handler-presence flags — `has_check`, `has_reduce`, `has_check_flow`,
+// `has_check_obligation`, `has_check_file` — each a `typeof … === 'function'` probe recorded
+// by `EXTRACT`, not a state machine to fold into an enum. The dataflow family (#193 obligation
+// + #194 flow) took the count from three to four; #247's `checkFile` took it to five.
+// `#[expect]` rather than `#[allow]` so this self-clears if a handler is ever removed.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "config-extraction DTO of independent handler-presence flags"
@@ -527,6 +529,10 @@ struct RawRule {
     /// missing handler and a typo become indistinguishable. Read by `build_rule`'s obligation
     /// shape refusals and by the relaxed no-`check` gate.
     has_check_obligation: bool,
+    /// Whether the rule declared `checkFile`, on the same reasoning as `has_check`: a
+    /// missing handler and a typo must stay distinguishable after `JSON.stringify` drops
+    /// functions. Read by the flow-family validation checks and the relaxed no-`check` gate.
+    has_check_file: bool,
 }
 
 /// `obligation` as written — permissive, on the same reasoning as [`RawTimeouts`] and
@@ -980,6 +986,7 @@ const EXTRACT: &str = r"
                 flow: r?.flow ?? null,
                 obligation: r?.obligation ?? null,
                 has_check_obligation: typeof r?.checkObligation === 'function',
+                has_check_file: typeof r?.checkFile === 'function',
             })),
         });
     })()
@@ -2274,8 +2281,10 @@ fn raw_rule_from(
         requires: None,
         has_check,
         has_reduce,
-        // A component cannot have a `checkFlow` either, for the same reason as `flow` above.
+        // A component cannot have a `checkFlow` or a `checkFile` either, for the same reason
+        // as `flow` above.
         has_check_flow: false,
+        has_check_file: false,
         flow: None,
         // Same reasoning as `requires` above: `rule-metadata` has no `obligation` field, so a
         // component rule has nowhere to declare one and none of this is ever anything but the
@@ -2480,13 +2489,13 @@ fn build_rule(
     let requires = check_requires(raw.requires.as_ref(), &id, implemented).map_err(fail)?;
     let declares_dataflow = requires.contains(&Capability::Dataflow);
 
-    // Flow pairing: `flow` ⟺ `checkFlow`, and either one requires `dataflow`. Obligation is
-    // the sibling member of the dataflow family, paired above by `check_obligation_shape`;
-    // both analyses rest on the one `dataflow` capability.
-    if has_flow && !raw.has_check_flow {
+    // Flow pairing: `flow` ⟺ (`checkFlow` or `checkFile`), and any of the three requires
+    // `dataflow`. Obligation is the sibling member of the dataflow family, paired above by
+    // `check_obligation_shape`; both analyses rest on the one `dataflow` capability.
+    if has_flow && !raw.has_check_flow && !raw.has_check_file {
         return Err(fail(format!(
-            "`{id}` declares `flow` but has no `checkFlow` — a flow with nothing to run \
-             reports nothing"
+            "`{id}` declares `flow` but has no `checkFlow` or `checkFile` — a flow with \
+             nothing to run reports nothing"
         )));
     }
     if raw.has_check_flow && !has_flow {
@@ -2494,7 +2503,18 @@ fn build_rule(
             "`{id}` has a `checkFlow` but no `flow` — there is nothing for it to be called on"
         )));
     }
-    if (has_flow || raw.has_check_flow) && !declares_dataflow {
+    if raw.has_check_file && !has_flow {
+        return Err(fail(format!(
+            "`{id}` has a `checkFile` but no `flow` — `checkFile` reports on the \
+             completeness of a file's taint analysis, which only runs for a rule that \
+             declares `flow`"
+        )));
+    }
+    // `|| raw.has_check_file` is redundant today — the `checkFile`-without-`flow` refusal
+    // above already guarantees `has_check_file ⟹ has_flow`, so `has_flow` alone covers it.
+    // Order-dependent: move this check above that one and the disjunct stops being dead,
+    // firing on a `checkFile` rule for a message that never names `checkFile`.
+    if (has_flow || raw.has_check_flow || raw.has_check_file) && !declares_dataflow {
         return Err(fail(format!(
             "`{id}` uses dataflow (`flow`/`checkFlow`) but does not declare `requires: \
              ['dataflow']`"
@@ -2502,10 +2522,14 @@ fn build_rule(
     }
 
     // The rule must be able to run at all through some handler: an ordinary `check`, or one
-    // of the two dataflow-family handlers, `checkFlow` (#194) or `checkObligation` (#193). A
-    // rule with none can never report anything — the failure the lone `!has_check` refusal
-    // used to catch before a dataflow handler was a second way to satisfy it.
-    if !raw.has_check && !raw.has_check_flow && !raw.has_check_obligation {
+    // of the dataflow-family handlers, `checkFlow` (#194), `checkObligation` (#193) or
+    // `checkFile` (#247). A rule with none can never report anything — the failure the lone
+    // `!has_check` refusal used to catch before a dataflow handler was a second way to
+    // satisfy it.
+    // `checkFile` is left out of this message on purpose: a rule with `checkFile` can never
+    // reach this gate (its own conjunct requires `!raw.has_check_file`), and a `checkFile`
+    // without `flow` is already refused above, before this point.
+    if !raw.has_check && !raw.has_check_flow && !raw.has_check_obligation && !raw.has_check_file {
         return Err(fail(format!(
             "`{id}` has no `check`, `checkFlow` or `checkObligation` — a rule without a \
              handler can never report anything"
@@ -2573,6 +2597,7 @@ fn build_rule(
         timeout: raw.timeout.map(Duration::from_millis),
         has_reduce: raw.has_reduce,
         has_check_flow: raw.has_check_flow,
+        has_check_file: raw.has_check_file,
         flow,
         component,
         requires,
@@ -7018,6 +7043,43 @@ mod tests {
         assert_eq!(flow.sources.len(), 1);
         assert_eq!(flow.sinks.len(), 1);
         assert_eq!(flow.sanitizers.len(), 1);
+    }
+
+    #[test]
+    fn check_file_without_flow_is_refused() {
+        // requires+checkFile present, flow absent → refuse, naming both checkFile and flow.
+        let err = load_err(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          checkFile(ctx) {},
+        })
+    ",
+        );
+        assert!(
+            err.contains("`test/f`") && err.contains("checkFile") && err.contains("flow"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_flow_rule_with_check_file_loads_without_check_flow() {
+        let spec = load_one(
+            r"
+        export default defineRule({
+          id: 'test/f', severity: 'error', card: CARD,
+          requires: ['dataflow'],
+          flow: {
+            sources: ['(call_expression function: (identifier) @source)'],
+            sinks: ['(arguments (identifier) @sink)'],
+          },
+          checkFile(ctx) {},
+        })
+    ",
+        );
+        assert!(spec.has_check_file);
+        assert!(!spec.has_check_flow);
     }
 
     /// The #223 footgun: `@sanitizer` on the callee identifier is accepted by the substring

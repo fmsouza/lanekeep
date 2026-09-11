@@ -8,12 +8,14 @@
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
  * The world is the single source of truth for every member the renderer emits straight from it.
- * Two members deviate from the world on purpose, and both are QuickJS-shaped: `today` is
+ * Three members deviate from the world on purpose, and all three are QuickJS-shaped: `today` is
  * omitted from `RuleContext` because QuickJS exposes it as a conditional property rather than a
- * callable, a shape this renderer cannot state honestly from the world; and `types` is added
+ * callable, a shape this renderer cannot state honestly from the world; `types` is added
  * to `RuleContext` because `ctx.types` — the bounded
  * type oracle — is QuickJS-only and has no presence in `world.wit` at all: a component rule
- * cannot declare `requires`, so there is nothing for the world to say about it. Nothing else is
+ * cannot declare `requires`, so there is nothing for the world to say about it; and `flow` is
+ * added to `RuleContext` for the same reason — `ctx.flow`, the taint-analysis completeness
+ * surface, is QuickJS-only too and has no presence in `world.wit` either. Nothing else is
  * added or omitted by hand.
  */
 
@@ -374,6 +376,18 @@ export interface TypeApi {
   complete(): boolean
 }
 
+/**
+ * The taint-analysis completeness surface, present on `ctx.flow` for a rule that declares
+ * `flow`. Answers whether the analysis saw through every construct in the file being checked
+ * — so a rule can say "I could not verify this file" rather than nothing.
+ */
+export interface FlowApi {
+  /** `true` iff the analysis dropped no construct in this file (`dropped === 0`). */
+  complete(): boolean
+  /** How many constructs the analysis could not see through in this file. */
+  readonly dropped: number
+}
+
 /** A rule's RuleContext surface. */
 export interface RuleContext {
   readonly filePath: string
@@ -413,6 +427,11 @@ export interface RuleContext {
    * deliberate.
    */
   types: TypeApi
+  /**
+   * The taint-analysis completeness surface, present only in the flow phase
+   * of a rule that declares `flow` (inside `checkFlow` / `checkFile`).
+   */
+  flow: FlowApi
 }
 
 /** A violation the reduce phase reports, which has no node to point at. */
@@ -557,6 +576,12 @@ export interface Rule {
   obligation?: ObligationSpec
   /** Called once per value left with an unmet obligation at the end of its scope. */
   checkObligation?(ctx: RuleContext, unmet: UnmetObligation): void
+  /**
+   * Called once per file the rule's flow phase examined, including files with no flow.
+   * Read `ctx.flow.complete()` / `ctx.flow.dropped` and report at `ctx.root` when the taint
+   * analysis could not see through every construct. Requires `flow`.
+   */
+  checkFile?(ctx: RuleContext): void
 }
 
 /** A lanekeep configuration, as `defineConfig` takes it. */

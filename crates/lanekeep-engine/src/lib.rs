@@ -3286,7 +3286,7 @@ impl Engine {
         outcome: &mut FileOutcome,
     ) -> Result<(), RunError> {
         for rule in admitted {
-            if !rule.spec.has_check_flow {
+            if !rule.spec.has_check_flow && !rule.spec.has_check_file {
                 continue;
             }
             let (violations, facts, read_the_date, timing) =
@@ -3301,7 +3301,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Run one flow rule over one file: role queries → taint analysis → `checkFlow` per path.
+    /// Run one flow rule over one file: role queries → taint analysis → `checkFlow` per path →
+    /// `checkFile` once.
     ///
     /// The same four return values as [`Engine::run_rule`], so `dispatch_flow` folds them in
     /// the same way. The novel step is the node→handle conversion in the middle, and it is the
@@ -3310,14 +3311,16 @@ impl Engine {
     /// to a structural path while the tree is borrowed, and `NodeArena::intern_path` mints the
     /// handle once the borrow has ended. A JS `Node` *is* that handle — the same integer a
     /// `Match` carries into `check` — so `checkFlow` receives `{ source, sink, steps }` of
-    /// handles and reports at `path.sink` through the ordinary `ctx` surface.
+    /// handles and reports at `path.sink` through the ordinary `ctx` surface. `checkFile(ctx)`
+    /// (#247) runs after, once, whether or not any flow was found — `ctx.flow` is attached
+    /// beforehand so either handler can read `complete()` / `dropped`.
     #[expect(
         clippy::too_many_lines,
-        reason = "role queries, the analysis call, the node-to-handle mapping and the report \
-                  all belong in one place — see the doc comment above. #247's `dropped` \
-                  capture is three lines threading a value already computed here to the \
-                  `timing` this function already owns, not a new responsibility that would \
-                  motivate splitting the function"
+        reason = "role queries, the analysis call, the node-to-handle mapping and the two \
+                  report-driving handlers all belong in one place — see the doc comment above. \
+                  #247's `ctx.flow` attachment and the `checkFile` dispatch reuse the sandbox, \
+                  timeout and `timing` this function already builds for `checkFlow`, not a new \
+                  responsibility that would motivate splitting the function"
     )]
     fn run_flow_rule(
         &self,
@@ -3412,59 +3415,87 @@ impl Engine {
         // analysis always ran, and a file with drops but no flow is exactly the case #247 is
         // about. Discarded downstream when `self.profiling` is false, like the other counters.
         timing.dropped = u64::from(dropped_constructs);
+        // Attach `ctx.flow` (the completeness surface) for every flow rule reaching this point,
+        // so both `checkFlow` and `checkFile` can read `ctx.flow.complete()` / `ctx.flow.dropped`.
+        host = host.with_dropped_constructs(dropped_constructs);
 
-        if flows.is_empty() {
+        // Nothing to run only when there are no flows AND no per-file handler. A `checkFile`
+        // rule must still run on a flowless file — that is the whole point of the signal.
+        if flows.is_empty() && !rule.spec.has_check_file {
             // No captures, or no flow between them: no crossing into the sandbox at all, the
             // boundary-proportional-to-findings invariant the phase is built around.
             return Ok((Vec::new(), Vec::new(), false, timing));
         }
 
-        // Only now, with flows in hand, is a sandbox needed — the same lazy build the check
-        // path makes, so a file with no flow never starts one.
+        // Only now, with flows or a per-file handler in hand, is a sandbox needed — the same
+        // lazy build the check path makes, so a file needing neither never starts one.
         let sandbox = worker.sandbox()?;
 
         // The rule's clock pauses while a provider answers; see `Engine::run_rule`.
         host = host.with_rule_clock(sandbox.budget());
         let timeout = rule.spec.timeout.unwrap_or(self.limits.rule_timeout);
 
-        for flow_path in flows {
-            // Phase 2 — mint the handles from the paths collected above, then invoke the
-            // handler through the module the config already loaded, so the rule object here is
-            // the same one the config validated.
-            let (source_handle, sink_handle, step_handles) = {
-                let mut arena = host.arena().borrow_mut();
-                let source_handle = arena.intern_path(flow_path.source);
-                let sink_handle = arena.intern_path(flow_path.sink);
-                let step_handles: Vec<u32> = flow_path
-                    .steps
-                    .into_iter()
-                    .filter_map(|step| arena.intern_path(step))
-                    .collect();
-                (source_handle, sink_handle, step_handles)
-            };
-            // A flow whose source or sink no longer resolves is dropped rather than reported
-            // at a made-up node — the posture `ctx.report` itself takes for a dead handle.
-            let (Some(source_handle), Some(sink_handle)) = (source_handle, sink_handle) else {
-                continue;
-            };
+        // Per-flow reporting only for a rule that declared `checkFlow`; a `checkFile`-only rule
+        // leaves its flows unreported by design.
+        if rule.spec.has_check_flow {
+            for flow_path in flows {
+                // Phase 2 — mint the handles from the paths collected above, then invoke the
+                // handler through the module the config already loaded, so the rule object here
+                // is the same one the config validated.
+                let (source_handle, sink_handle, step_handles) = {
+                    let mut arena = host.arena().borrow_mut();
+                    let source_handle = arena.intern_path(flow_path.source);
+                    let sink_handle = arena.intern_path(flow_path.sink);
+                    let step_handles: Vec<u32> = flow_path
+                        .steps
+                        .into_iter()
+                        .filter_map(|step| arena.intern_path(step))
+                        .collect();
+                    (source_handle, sink_handle, step_handles)
+                };
+                // A flow whose source or sink no longer resolves is dropped rather than
+                // reported at a made-up node — the posture `ctx.report` itself takes for a
+                // dead handle.
+                let (Some(source_handle), Some(sink_handle)) = (source_handle, sink_handle) else {
+                    continue;
+                };
 
-            let steps_literal = step_handles
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
+                let steps_literal = step_handles
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let call = format!(
+                    "globalThis.__lanekeepConfig.rules[{}].checkFlow(ctx, {{ source: {source_handle}, \
+                     sink: {sink_handle}, steps: [{steps_literal}] }})",
+                    rule_index(&rule.spec)
+                );
+
+                let handler_started = clock(self.profiling);
+                let outcome = sandbox.eval_with_host_timeout::<()>(&host, &call, timeout);
+                if let Some(started) = handler_started {
+                    timing.handler = timing.handler.saturating_add(started.elapsed());
+                }
+
+                outcome.map_err(|e: SandboxError| RunError::Rule {
+                    rule: rule.spec.id.to_string(),
+                    file: path.as_str().to_owned(),
+                    detail: e.to_string(),
+                })?;
+            }
+        }
+
+        // Per-file: once, for a rule that declared `checkFile`, after any per-flow reporting.
+        if rule.spec.has_check_file {
             let call = format!(
-                "globalThis.__lanekeepConfig.rules[{}].checkFlow(ctx, {{ source: {source_handle}, \
-                 sink: {sink_handle}, steps: [{steps_literal}] }})",
+                "globalThis.__lanekeepConfig.rules[{}].checkFile(ctx)",
                 rule_index(&rule.spec)
             );
-
             let handler_started = clock(self.profiling);
             let outcome = sandbox.eval_with_host_timeout::<()>(&host, &call, timeout);
             if let Some(started) = handler_started {
                 timing.handler = timing.handler.saturating_add(started.elapsed());
             }
-
             outcome.map_err(|e: SandboxError| RunError::Rule {
                 rule: rule.spec.id.to_string(),
                 file: path.as_str().to_owned(),
@@ -6834,6 +6865,166 @@ export default defineRule({
         );
     }
 
+    /// A flow rule whose only handler is `checkFile`: it reports at the file root when the
+    /// taint analysis could not see through every construct (#247).
+    const CHECKFILE_RULE: &str = r#"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/flow-completeness',
+  requires: ['dataflow'],
+  flow: {
+    sources: ['(call_expression function: (identifier) @source (#eq? @source "getSecret"))'],
+    sinks: ['(call_expression function: (identifier) @fn (#eq? @fn "log") arguments: (arguments (_) @sink))'],
+    sanitizers: ['(call_expression function: (identifier) @fn (#eq? @fn "redact")) @sanitizer'],
+  },
+  card: {
+    message: 'could not fully verify this file',
+    remediation: 'simplify the value flowing into the sink',
+    examples: { bad: 'log(s + x)', good: 'log(s)' },
+  },
+  checkFile(ctx) {
+    if (!ctx.flow.complete()) {
+      ctx.report(ctx.root, `could not verify: ${ctx.flow.dropped} construct(s) unanalyzed`);
+    }
+  },
+});
+"#;
+
+    #[test]
+    fn check_file_reports_on_an_incomplete_flowless_file() {
+        // `s + "!"` is a binary-sink drop: dropped == 1, no flow reaches a sink. `checkFile`
+        // still runs (the whole point) and reports at the file root. The message is asserted
+        // alongside the position so this pins `ctx.flow.dropped`'s *value* — deleting
+        // `flow.set("dropped", dropped)` in `install_flow` would still leave `complete()` (and
+        // so the position) unaffected, but would render `undefined` into the template here.
+        let project = Project::new(
+            "checkfile-incomplete",
+            &[
+                ("rule.ts", CHECKFILE_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s + \"!\");\n}\n",
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        let found: Vec<(u32, u32, &str)> = outcome
+            .violations
+            .iter()
+            .map(|v| {
+                (
+                    v.location.position.line,
+                    v.location.position.column,
+                    v.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![(1, 1, "could not verify: 1 construct(s) unanalyzed")],
+            "checkFile reports once, at the file root, with ctx.flow.dropped's count in the message"
+        );
+    }
+
+    #[test]
+    fn check_file_is_silent_on_a_complete_file() {
+        // `log(s)` is a modeled flow (no dropped construct); complete() is true.
+        let project = Project::new(
+            "checkfile-complete",
+            &[
+                ("rule.ts", CHECKFILE_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s);\n}\n",
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert!(
+            outcome.violations.is_empty(),
+            "complete() is true, so checkFile reports nothing"
+        );
+    }
+
+    /// A rule declaring both `checkFlow` and `checkFile` — the two dispatch blocks in
+    /// `run_flow_rule` (the per-flow loop and the once-per-file eval) are otherwise only ever
+    /// covered in isolation. `log(s)` gives `checkFlow` a real flow to report; `log(x + "!")`
+    /// beside it is a binary-sink drop that does not participate in any flow, so the file is
+    /// still incomplete and `checkFile` reports too — proving neither handler's presence
+    /// suppresses or duplicates the other's.
+    const BOTH_HANDLERS_RULE: &str = r#"import { defineRule } from 'lanekeep';
+export default defineRule({
+  id: 'local/flow-both',
+  requires: ['dataflow'],
+  flow: {
+    sources: ['(call_expression function: (identifier) @source (#eq? @source "getSecret"))'],
+    sinks: ['(call_expression function: (identifier) @fn (#eq? @fn "log") arguments: (arguments (_) @sink))'],
+    sanitizers: ['(call_expression function: (identifier) @fn (#eq? @fn "redact")) @sanitizer'],
+  },
+  card: {
+    message: 'flow', remediation: 'redact',
+    examples: { bad: 'log(s)', good: 'log(redact(s))' },
+  },
+  checkFlow(ctx, path) { ctx.report(path.sink, 'flow reaches a sink'); },
+  checkFile(ctx) { if (!ctx.flow.complete()) ctx.report(ctx.root, `file incomplete: ${ctx.flow.dropped}`); },
+});
+"#;
+
+    #[test]
+    fn flow_both_check_flow_and_check_file_coexist_on_one_rule() {
+        let project = Project::new(
+            "flow-both-handlers",
+            &[
+                ("rule.ts", BOTH_HANDLERS_RULE),
+                ("lanekeep.config.ts", &config("")),
+                (
+                    "src/a.ts",
+                    "function f() {\n  const s = getSecret();\n  log(s);\n  log(x + \"!\");\n}\n",
+                ),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        let found: Vec<(u32, u32, &str)> = outcome
+            .violations
+            .iter()
+            .map(|v| {
+                (
+                    v.location.position.line,
+                    v.location.position.column,
+                    v.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            outcome.violations.len(),
+            2,
+            "checkFlow's per-flow report and checkFile's per-file report both land"
+        );
+
+        let messages: BTreeSet<&str> = outcome
+            .violations
+            .iter()
+            .map(|v| v.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            BTreeSet::from(["flow reaches a sink", "file incomplete: 1"]),
+            "one violation from each handler, neither suppressing nor duplicating the other"
+        );
+
+        // Positions confirmed empirically, not guessed: checkFile reports at the file root,
+        // (1, 1); checkFlow reports at the `s` inside `log(s)`, (3, 7) — the same position
+        // `a_flow_rule_reports_at_its_sink` pins for the identical source shape. The engine's
+        // ordering contract (`(ruleId, file, line, column)`) is what puts the file-root report
+        // first even though `run_flow_rule` invokes `checkFlow` before `checkFile`.
+        assert_eq!(
+            found,
+            vec![(1, 1, "file incomplete: 1"), (3, 7, "flow reaches a sink")],
+            "checkFile's report at the root and checkFlow's report at the sink, in sorted order"
+        );
+    }
+
     #[test]
     fn two_sinks_accumulate_the_drop_count_and_a_clean_sink_still_reports() {
         // Two sinks in one file: `log(s + "!")` is a binary drop (+1, no flow); `log(s)` is a
@@ -9766,12 +9957,14 @@ export default defineRule({
                 timeout: None,
                 has_reduce,
                 component: Some(backed_by(fixture())),
-                // A component cannot declare `requires`, `flow` or a `checkFlow` handler —
-                // `rule-metadata` has no such fields — so every component-backed `RuleSpec`
-                // carries the same empty/absent values `lanekeep-config`'s `build_rule`
-                // produces for one (`crates/lanekeep-config/src/lib.rs`'s `raw_rule_from`).
+                // A component cannot declare `requires`, `flow`, a `checkFlow` handler or a
+                // `checkFile` handler — `rule-metadata` has no such fields — so every
+                // component-backed `RuleSpec` carries the same empty/absent values
+                // `lanekeep-config`'s `build_rule` produces for one
+                // (`crates/lanekeep-config/src/lib.rs`'s `raw_rule_from`).
                 requires: Vec::new(),
                 has_check_flow: false,
+                has_check_file: false,
                 flow: None,
                 // Same reasoning as `requires`: `rule-metadata` has no `obligation` field
                 // either, so `lanekeep-config` never produces one for a component-backed rule.

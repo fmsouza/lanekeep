@@ -85,7 +85,12 @@ use lanekeep_types::{Query, Symbol, Type, TypeProvider};
 ///   read, so the cache sees it — and `ctx.types` gains `returnTypeOf`, `isAssignableTo` and
 ///   `complete`. A build without them can answer a question this build answers differently,
 ///   which is what a generation is for.
-pub const HOST_API_VERSION: u32 = 7;
+/// - `8` — `ctx.flow` and the `checkFile` handler (#247). A flow rule can read
+///   `ctx.flow.complete()` / `ctx.flow.dropped` — whether the taint analysis saw through
+///   every construct in the file — and a new per-file `checkFile(ctx)` handler runs once per
+///   examined file, including flowless ones, so a rule can report "could not verify this
+///   file." A build with them reaches a verdict a build without them cannot.
+pub const HOST_API_VERSION: u32 = 8;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +150,9 @@ pub struct HostContext {
     /// workers. Cloning is a refcount bump, which is what lets the closures below capture
     /// one each.
     provider: Option<Arc<dyn TypeProvider>>,
+    /// The taint analysis's per-file drop count, attached by the engine in the flow phase.
+    /// `Some` makes `ctx.flow` present; `None` (the check phase) leaves it absent.
+    dropped: Option<u32>,
     /// The interrupt budget to stop while a provider answers, when the host supplied one.
     ///
     /// `None` in a unit test that builds a context without a sandbox, and in the reduce phase.
@@ -188,6 +196,7 @@ impl std::fmt::Debug for HostContext {
             .field("has_file_access", &self.files.is_some())
             .field("has_language", &self.language.is_some())
             .field("has_provider", &self.provider.is_some())
+            .field("has_flow", &self.dropped.is_some())
             .field("has_rule_clock", &self.rule_clock.is_some())
             .field("has_today", &self.today.is_some())
             .field("date_read", &self.date_read.get())
@@ -209,6 +218,7 @@ impl HostContext {
             files: None,
             language: None,
             provider: None,
+            dropped: None,
             rule_clock: None,
             today: None,
             date_read: Rc::new(Cell::new(false)),
@@ -234,6 +244,18 @@ impl HostContext {
     #[must_use]
     pub fn with_today(mut self, today: &str) -> Self {
         self.today = Some(Rc::from(today));
+        self
+    }
+
+    /// Attach the taint analysis's per-file drop count, enabling `ctx.flow`.
+    ///
+    /// The engine calls this in the flow phase only, after the analysis has run — never in
+    /// the check phase, which has no taint analysis to report on. `Some(0)` is a complete
+    /// file and is still attached: `ctx.flow` must be present to say so, not absent because
+    /// nothing was dropped.
+    #[must_use]
+    pub fn with_dropped_constructs(mut self, dropped: u32) -> Self {
+        self.dropped = Some(dropped);
         self
     }
 
@@ -378,6 +400,7 @@ impl HostContext {
         self.install_reads(ctx, &object)?;
         self.install_queries(ctx, &object)?;
         self.install_types(ctx, &object)?;
+        self.install_flow(ctx, &object)?;
 
         // `ctx.today` is a property backed by a getter, so reading it can be *observed*. A
         // plain value would be indistinguishable from an unread one, and the cache would
@@ -1016,6 +1039,23 @@ impl HostContext {
         )?;
 
         object.set("types", types)?;
+        Ok(())
+    }
+
+    /// Install `ctx.flow` — the taint-analysis completeness surface — present only when the
+    /// engine attached a drop count (a flow rule in the flow phase). `complete()` is the
+    /// honest predicate; `dropped` is the raw count for a message.
+    fn install_flow<'js>(&self, ctx: &Ctx<'js>, object: &Object<'js>) -> rquickjs::Result<()> {
+        let Some(dropped) = self.dropped else {
+            return Ok(());
+        };
+        let flow = Object::new(ctx.clone())?;
+        flow.set(
+            "complete",
+            Function::new(ctx.clone(), move || -> bool { dropped == 0 })?,
+        )?;
+        flow.set("dropped", dropped)?;
+        object.set("flow", flow)?;
         Ok(())
     }
 }

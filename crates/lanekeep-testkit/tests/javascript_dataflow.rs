@@ -132,3 +132,45 @@ fn ctx_types_is_reachable_inside_check_flow() {
             "ctx.types.complete() returns true inside checkFlow and the flow reports at the sink",
         );
 }
+
+/// A `checkFile` rule (the #247 payoff): it reports at `ctx.root` when the taint analysis
+/// could not see through a construct, and is silent when the file is fully analyzed — the
+/// distinction between "no flow" and "not analyzed" a rule previously could not draw.
+const FLOW_RULE_COMPLETENESS: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/flow-completeness',\n\
+      language: ['javascript'],\n\
+      requires: ['dataflow'],\n\
+      flow: {\n\
+        sources: ['(call_expression function: (identifier) @fn (#eq? @fn \"getSecret\")) @source'],\n\
+        sinks: ['(call_expression function: (identifier) @fn (#eq? @fn \"log\") \
+                 arguments: (arguments (_) @sink))'],\n\
+      },\n\
+      card: { message: 'incomplete', remediation: 'simplify', examples: { bad: 'log(s+x)', good: 'log(s)' } },\n\
+      checkFile(ctx) { if (!ctx.flow.complete()) ctx.report(ctx.root, `unverified: ${ctx.flow.dropped}`); },\n\
+    });\n";
+
+fn completeness() -> RuleTester {
+    RuleTester::with_extension("js-flow-complete", FLOW_RULE_COMPLETENESS, "js").expect("builds")
+}
+
+#[test]
+fn check_file_reports_when_a_construct_was_dropped() {
+    let tester = completeness();
+    let source = "function f() { const s = getSecret(); log(s + \"!\"); }\n";
+    tester
+        .reports_at(source, &[(1, 1)])
+        .expect("checkFile reports at the file root when ctx.flow.complete() is false");
+    // Pins `ctx.flow.dropped`'s value, not just `complete()`'s effect on position — see
+    // `check_file_reports_on_an_incomplete_flowless_file` in `lanekeep-engine`.
+    tester
+        .reports_messages(source, &["unverified: 1"])
+        .expect("the message carries ctx.flow.dropped's count");
+}
+
+#[test]
+fn check_file_is_silent_when_the_file_is_complete() {
+    completeness()
+        .accepts("function f() { const s = getSecret(); log(s); }\n")
+        .expect("ctx.flow.complete() is true, so checkFile reports nothing");
+}

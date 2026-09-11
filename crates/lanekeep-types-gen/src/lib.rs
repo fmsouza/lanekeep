@@ -99,6 +99,7 @@ pub fn render_index_dts(wit: &str) -> String {
         render_symbol_info(),
         render_type_info(),
         render_type_api(),
+        render_flow_api(),
         render_context(&resolve, "RuleContext", &check_context, true),
         render_reduce_location(),
         render_context(&resolve, "ReduceContext", &reduce_context, false),
@@ -289,12 +290,13 @@ fn render_param(resolve: &Resolve, name: &str, ty: &Type) -> String {
 
 /// Render one context interface from the resource it names.
 ///
-/// `quickjs_only` controls whether the member QuickJS adds beyond what the world itself
-/// declares is appended: `types`, the bounded type oracle, which has no presence in the world
-/// at all — no component rule can declare `requires`, so there is nothing there to derive
-/// from. It is present on `RuleContext` and absent from `ReduceContext`. `facts` is on
-/// neither: no engine provides it during the per-file pass, and a `RuleContext` that typed it
-/// would compile a call both runtimes answer with a `TypeError`.
+/// `quickjs_only` controls whether the members QuickJS adds beyond what the world itself
+/// declares are appended: `types`, the bounded type oracle, and `flow`, the taint-analysis
+/// completeness surface — neither has any presence in the world at all, since no component
+/// rule can declare `requires`, so there is nothing there to derive either from. Both are
+/// present on `RuleContext` and absent from `ReduceContext`. `facts` is on neither: no engine
+/// provides it during the per-file pass, and a `RuleContext` that typed it would compile a
+/// call both runtimes answer with a `TypeError`.
 fn render_context(
     resolve: &Resolve,
     name: &str,
@@ -317,8 +319,9 @@ fn render_context(
         out.push_str(&render_member(resolve, method));
     }
     if quickjs_only {
-        // `types` is the one member this renderer adds that the world does not declare, added
-        // so the published surface keeps describing what a TypeScript rule can call. `facts`
+        // `types` is one of the two members this renderer adds that the world does not
+        // declare, added so the published surface keeps describing what a TypeScript rule can
+        // call. `facts`
         // is deliberately not added: no engine hands a per-file rule `facts` — the world keeps
         // it on the cross-file context alone, and both engines assert its absence there — so
         // typing it would compile a call that throws on the first run, the one shape this
@@ -357,6 +360,13 @@ fn render_context(
         out.push_str("   * deliberate.\n");
         out.push_str("   */\n");
         out.push_str("  types: TypeApi\n");
+        out.push_str("  /**\n");
+        out.push_str(
+            "   * The taint-analysis completeness surface, present only in the flow phase\n",
+        );
+        out.push_str("   * of a rule that declares `flow` (inside `checkFlow` / `checkFile`).\n");
+        out.push_str("   */\n");
+        out.push_str("  flow: FlowApi\n");
     }
     out.push_str("}\n");
     out
@@ -440,12 +450,14 @@ const HEADER: &str = "\
  * Node: `defineRule` and `defineConfig` are identity functions whose only job is to give the
  * compiler something to check against, and `RuleContext` is provided by lanekeep at run time.
  * The world is the single source of truth for every member the renderer emits straight from it.
- * Two members deviate from the world on purpose, and both are QuickJS-shaped: `today` is
+ * Three members deviate from the world on purpose, and all three are QuickJS-shaped: `today` is
  * omitted from `RuleContext` because QuickJS exposes it as a conditional property rather than a
- * callable, a shape this renderer cannot state honestly from the world; and `types` is added
+ * callable, a shape this renderer cannot state honestly from the world; `types` is added
  * to `RuleContext` because `ctx.types` — the bounded
  * type oracle — is QuickJS-only and has no presence in `world.wit` at all: a component rule
- * cannot declare `requires`, so there is nothing for the world to say about it. Nothing else is
+ * cannot declare `requires`, so there is nothing for the world to say about it; and `flow` is
+ * added to `RuleContext` for the same reason — `ctx.flow`, the taint-analysis completeness
+ * surface, is QuickJS-only too and has no presence in `world.wit` either. Nothing else is
  * added or omitted by hand.
  */
 ";
@@ -822,6 +834,20 @@ export interface TypeApi {
 }
 ";
 
+const FLOW_API: &str = "\
+/**
+ * The taint-analysis completeness surface, present on `ctx.flow` for a rule that declares
+ * `flow`. Answers whether the analysis saw through every construct in the file being checked
+ * — so a rule can say \"I could not verify this file\" rather than nothing.
+ */
+export interface FlowApi {
+  /** `true` iff the analysis dropped no construct in this file (`dropped === 0`). */
+  complete(): boolean
+  /** How many constructs the analysis could not see through in this file. */
+  readonly dropped: number
+}
+";
+
 const REDUCE_LOCATION: &str = "\
 /** A violation the reduce phase reports, which has no node to point at. */
 export interface ReduceLocation {
@@ -938,6 +964,12 @@ export interface Rule {
   obligation?: ObligationSpec
   /** Called once per value left with an unmet obligation at the end of its scope. */
   checkObligation?(ctx: RuleContext, unmet: UnmetObligation): void
+  /**
+   * Called once per file the rule's flow phase examined, including files with no flow.
+   * Read `ctx.flow.complete()` / `ctx.flow.dropped` and report at `ctx.root` when the taint
+   * analysis could not see through every construct. Requires `flow`.
+   */
+  checkFile?(ctx: RuleContext): void
 }
 ";
 
@@ -1177,6 +1209,10 @@ fn render_type_info() -> String {
 
 fn render_type_api() -> String {
     TYPE_API.to_owned()
+}
+
+fn render_flow_api() -> String {
+    FLOW_API.to_owned()
 }
 
 fn render_reduce_location() -> String {
