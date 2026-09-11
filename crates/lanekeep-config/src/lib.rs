@@ -6660,6 +6660,59 @@ mod tests {
         );
     }
 
+    /// `scope: 'module'` correlates acquire and release across the whole file, and without
+    /// `@key` every unrelated acquire/release pair would fall into the same bucket — strictly
+    /// worse than a narrower scope. Refused rather than run.
+    #[test]
+    fn module_scope_without_a_key_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x) @acquire'], release: ['(y) @release'], scope: 'module' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-module-no-key", src).expect_err("module without @key");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
+        assert!(text.contains("@key"), "{text}");
+        assert!(text.contains("module"), "{text}");
+    }
+
+    /// `@key` correlation is all-or-nothing: binding it on only some of the obligation's
+    /// queries has decided correlation matters for part of the obligation and not the rest,
+    /// which is not a coherent shape to run.
+    #[test]
+    fn a_key_on_some_queries_but_not_all_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x (y) @key) @acquire'], release: ['(y) @release'], scope: 'function' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let err = load_rule_source("ob-key-mixed", src).expect_err("mixed @key");
+        let text = err.to_string();
+        assert!(text.contains("local/x"), "{text}");
+        assert!(text.contains("@key"), "{text}");
+        assert!(text.contains("every"), "{text}");
+    }
+
+    /// The shape the two refusals above exist to require: `@key` bound on every acquire and
+    /// release query is exactly what lets a module-wide scope correlate correctly, and loads.
+    #[test]
+    fn module_scope_with_a_key_on_every_query_loads() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/x', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(x (y) @key) @acquire'], release: ['(x (y) @key) @release'], scope: 'module' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        let config = load_rule_source("ob-module-keyed", src).expect("keyed module scope loads");
+        assert_eq!(config.rules.len(), 1);
+    }
+
     /// An obligation-only rule — no `query`, no `check`, only `obligation`/`checkObligation` —
     /// loads without a `query`.
     ///
