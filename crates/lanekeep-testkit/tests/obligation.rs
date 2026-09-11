@@ -255,3 +255,57 @@ fn two_runs_are_byte_identical() {
     let b = t.run(src).expect("run b");
     assert_eq!(format!("{a:?}"), format!("{b:?}"));
 }
+
+/// The obligation value-identity feature's flagship pattern: register/forget correlated by
+/// `@key` at `scope: 'module'`. Where `RULE`/`BLOCK`/`ONLY` above are un-keyed — any release
+/// discharges any acquire — this binds `@key` on the call's argument identifier in both the
+/// acquire and release queries, so discharge requires a release naming the *same* value,
+/// anywhere in the file (module scope shares no control-flow graph across sibling
+/// functions/arrows — see `crates/lanekeep-lang-js/src/obligation.rs`'s module-scope
+/// short-circuit). `checkObligation` also reads `ctx.text(u.key)` to name the value in its
+/// message, which is what pins `unmet.key` crossing the sandbox as a real node handle rather
+/// than merely being present on the JS object.
+const KEYED: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/registered-is-forgotten',\n\
+      requires: ['dataflow'],\n\
+      obligation: {\n\
+        acquire: ['(call_expression function: (identifier) @f (#eq? @f \"reg\") \
+                   arguments: (arguments (identifier) @key)) @acquire'],\n\
+        release: ['(call_expression function: (identifier) @f (#eq? @f \"forget\") \
+                   arguments: (arguments (identifier) @key)) @release'],\n\
+        scope: 'module',\n\
+      },\n\
+      card: { message: 'not forgotten', remediation: 'call forget(id)',\n\
+              examples: { bad: 'reg(a)', good: 'reg(a); forget(a)' } },\n\
+      checkObligation(ctx, u) {\n\
+        ctx.report(u.acquire, `registration for ${ctx.text(u.key)} is never forgotten`);\n\
+      },\n\
+    });\n";
+
+fn keyed() -> RuleTester {
+    RuleTester::new("keyed", KEYED).expect("builds")
+}
+
+/// The analyzer-level RED for this exact fixture shape was established in Task 3
+/// (`crates/lanekeep-lang-js/src/obligation.rs`'s module-scope key-matching unit tests); this
+/// is its `RuleTester` equivalent, exercised through query matching, `Engine::run_rule`'s
+/// obligation arm, and `checkObligation` itself — confirmed passing end to end, not
+/// re-deriving the red. `on` and `off` are sibling arrow functions with no shared CFG; only
+/// key correlation, not reachability, can discharge `reg(id)` here.
+#[test]
+fn a_matching_forget_in_a_sibling_arrow_is_silent() {
+    keyed()
+        .accepts("const on = (id) => { reg(id); };\nconst off = (id) => { forget(id); };\n")
+        .expect("the sibling forget discharges it");
+}
+
+#[test]
+fn a_missing_forget_reports_and_names_the_key() {
+    keyed()
+        .reports_messages(
+            "const on = (id) => { reg(id); };\n",
+            &["registration for id is never forgotten"],
+        )
+        .expect("no forget anywhere");
+}
