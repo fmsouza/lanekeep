@@ -1,6 +1,6 @@
 //! lang-js's implementation of the obligation capability, over the per-function CFG.
 
-use lanekeep_lang::obligation::{ObligationAnalyzer, ObligationScope, UnmetObligation};
+use lanekeep_lang::obligation::{Keyed, ObligationAnalyzer, ObligationScope, UnmetObligation};
 use tree_sitter::{Node, Tree};
 
 use crate::cfg::{BlockId, Cfg};
@@ -15,17 +15,18 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
         _tree: &'t Tree,
         source: &str,
         scope: ObligationScope,
-        acquires: &[Node<'t>],
-        releases: &[Node<'t>],
+        _keyed: bool,
+        acquires: &[Keyed<'t>],
+        releases: &[Keyed<'t>],
     ) -> Vec<UnmetObligation<'t>> {
         let mut out: Vec<UnmetObligation<'t>> = Vec::new();
 
         // Source order of the acquire, for determinism.
-        let mut ordered: Vec<Node<'t>> = acquires.to_vec();
-        ordered.sort_by_key(Node::start_byte);
+        let mut ordered: Vec<Keyed<'t>> = acquires.to_vec();
+        ordered.sort_by_key(|k| k.node.start_byte());
 
         for acquire in ordered {
-            let Some(root) = enclosing_cfg_root(acquire) else {
+            let Some(root) = enclosing_cfg_root(acquire.node) else {
                 continue;
             };
             let Some(cfg) = Cfg::build(source, root) else {
@@ -34,17 +35,21 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
             // `acquire` is typically a `call_expression` nested inside a statement, and
             // `cfg_build` only attributes whole statements — `block_of` alone would find
             // nothing for it. `resolve_block` walks up to the nearest attributed ancestor.
-            let Some(acq_block) = resolve_block(&cfg, acquire) else {
+            let Some(acq_block) = resolve_block(&cfg, acquire.node) else {
                 continue;
             };
 
             // `scope: 'block'` additionally restricts discharge to a release lexically
             // inside the enclosing `statement_block` — `on_all_paths_within`'s own region.
             // With no enclosing block (top-level code), the obligation falls back to the
-            // function frame, same as `scope: 'function'`.
+            // function frame, same as `scope: 'function'`. `Module` is not yet given its own
+            // region — it is carried here alongside `Function` until a later task gives it
+            // real, file-wide, key-correlated discharge.
             let region = match scope {
-                ObligationScope::Block => enclosing_block(acquire).map(|block| block.byte_range()),
-                ObligationScope::Function => None,
+                ObligationScope::Block => {
+                    enclosing_block(acquire.node).map(|block| block.byte_range())
+                }
+                ObligationScope::Function | ObligationScope::Module => None,
             };
 
             // Release blocks for this same function (a release node whose root is this
@@ -54,13 +59,14 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
             // handles finally-duplicated release nodes.
             let rel_blocks: Vec<BlockId> = releases
                 .iter()
-                .filter(|r| enclosing_cfg_root(**r).is_some_and(|rr| rr.id() == root.id()))
+                .map(|r| r.node)
+                .filter(|r| enclosing_cfg_root(*r).is_some_and(|rr| rr.id() == root.id()))
                 .filter(|r| {
                     region.as_ref().is_none_or(|region| {
                         r.start_byte() >= region.start && r.end_byte() <= region.end
                     })
                 })
-                .flat_map(|r| resolve_blocks(&cfg, *r))
+                .flat_map(|r| resolve_blocks(&cfg, r))
                 .collect();
 
             let discharged = match &region {
@@ -79,15 +85,16 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
                 .filter(|e| cfg.reaches_avoiding(acq_block, &rel_blocks, e.block))
                 .find_map(|e| e.node)
                 // No concrete return/throw on the escaping path: report at the acquire.
-                .unwrap_or(acquire);
+                .unwrap_or(acquire.node);
 
             // partial: some path did discharge, i.e. a release is reachable at all.
             let partial = rel_blocks.iter().any(|&r| cfg.reaches(acq_block, r));
 
             out.push(UnmetObligation {
-                acquire,
+                acquire: acquire.node,
                 exit: witness,
                 partial,
+                key: acquire.key,
             });
         }
         out
@@ -135,7 +142,7 @@ fn resolve_blocks<'t>(cfg: &Cfg<'t>, node: Node<'t>) -> Vec<BlockId> {
 mod tests {
     use super::JsObligationAnalyzer;
     use crate::cfg::testing::{find_all, parse};
-    use lanekeep_lang::obligation::{ObligationAnalyzer, ObligationScope};
+    use lanekeep_lang::obligation::{Keyed, ObligationAnalyzer, ObligationScope};
 
     fn calls<'t>(
         tree: &'t tree_sitter::Tree,
@@ -148,14 +155,29 @@ mod tests {
             .collect()
     }
 
+    /// Wrap bare nodes for a signature that now takes `&[Keyed]` everywhere, with no `@key`
+    /// bound — every fixture in this file predates value-identity and asserts the unkeyed
+    /// behavior, which this task must leave unchanged.
+    fn bare<'t>(ns: Vec<tree_sitter::Node<'t>>) -> Vec<Keyed<'t>> {
+        ns.into_iter()
+            .map(|node| Keyed { node, key: None })
+            .collect()
+    }
+
     #[test]
     fn zeroed_on_all_paths_is_silent() {
         let source = "function f() { const b = acq(); rel(b); }";
         let tree = parse(source);
         let acq = calls(&tree, source, "acq()");
         let rel = calls(&tree, source, "rel(b)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Function, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Function,
+            false,
+            &bare(acq),
+            &bare(rel),
+        );
         assert!(unmet.is_empty());
     }
 
@@ -165,8 +187,14 @@ mod tests {
         let tree = parse(source);
         let acq = calls(&tree, source, "acq()");
         let rel = calls(&tree, source, "rel(b)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Function, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Function,
+            false,
+            &bare(acq),
+            &bare(rel),
+        );
         assert_eq!(unmet.len(), 1);
         assert!(unmet[0].partial, "the fallthrough path did discharge");
         assert_eq!(unmet[0].exit.kind(), "return_statement");
@@ -177,8 +205,14 @@ mod tests {
         let source = "function f() { const b = acq(); }";
         let tree = parse(source);
         let acq = calls(&tree, source, "acq()");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Function, &acq, &[]);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Function,
+            false,
+            &bare(acq),
+            &[],
+        );
         assert_eq!(unmet.len(), 1);
         assert!(!unmet[0].partial);
     }
@@ -189,8 +223,14 @@ mod tests {
         let tree = parse(source);
         let acq = calls(&tree, source, "acq()");
         let rel = calls(&tree, source, "rel(b)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Function, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Function,
+            false,
+            &bare(acq),
+            &bare(rel),
+        );
         assert!(unmet.is_empty(), "finally is on all paths");
     }
 
@@ -206,7 +246,14 @@ mod tests {
         let tree = parse(source);
         let acq = calls(&tree, source, "acq()");
         let rel = calls(&tree, source, "rel(b)");
-        let unmet = JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Block, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Block,
+            false,
+            &bare(acq),
+            &bare(rel),
+        );
         assert!(
             unmet.is_empty(),
             "the release is lexically inside the block"
@@ -219,7 +266,14 @@ mod tests {
         let tree = parse(source);
         let acq = calls(&tree, source, "acq()");
         let rel = calls(&tree, source, "rel(b)");
-        let unmet = JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Block, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Block,
+            false,
+            &bare(acq),
+            &bare(rel),
+        );
         assert_eq!(
             unmet.len(),
             1,

@@ -2382,9 +2382,9 @@ fn check_obligation_shape(
                 check_obligation_role(&obligation.release, "release", "@release", id)?;
             }
             match obligation.and_then(|o| o.scope.as_deref()) {
-                Some(scope) if scope != "function" && scope != "block" => Err(format!(
+                Some(scope) if !matches!(scope, "function" | "block" | "module") => Err(format!(
                     "`{id}` has an obligation `scope` of `{scope}` — it must be \
-                     `function` or `block`"
+                     `function`, `block`, or `module`"
                 )),
                 _ => Ok(()),
             }
@@ -2675,7 +2675,8 @@ fn build_obligation(
     raw.map(|o| {
         let Some(scope) = o.scope else {
             return Err(format!(
-                "`{id}` has an `obligation` with no `scope` — it must be `function` or `block`"
+                "`{id}` has an `obligation` with no `scope` — it must be \
+                 `function`, `block`, or `module`"
             ));
         };
         Ok(ObligationSpec {

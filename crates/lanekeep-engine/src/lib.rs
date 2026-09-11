@@ -460,6 +460,9 @@ struct CompiledObligation {
     release: Vec<CompiledQuery>,
     /// The scope the obligation must be discharged within.
     scope: ObligationScope,
+    /// Whether any acquire or release query binds a `@key` capture, computed once here from
+    /// the raw query text so the per-file hot path never has to ask again.
+    keyed: bool,
 }
 
 /// What one rule compiled for one language it targets.
@@ -1397,6 +1400,16 @@ impl Engine {
                                     },
                                 )
                             };
+                            // Whether either role binds `@key`, read off the raw query text
+                            // rather than the compiled query — `capture_sites` is lexical and
+                            // needs no grammar, and this runs once at prepare time rather than
+                            // per match. Task 4 is where the two roles disagreeing becomes a
+                            // load error; here it is only ever read, never enforced.
+                            let keyed = o.acquire.iter().chain(o.release.iter()).any(|q| {
+                                lanekeep_query::capture_sites(q)
+                                    .iter()
+                                    .any(|s| s.name == "key")
+                            });
                             Ok(CompiledObligation {
                                 acquire: o
                                     .acquire
@@ -1415,6 +1428,7 @@ impl Engine {
                                         detail: format!("invalid obligation scope `{}`", o.scope),
                                     }
                                 })?,
+                                keyed,
                             })
                         })
                         .transpose()?;
@@ -3561,44 +3575,69 @@ impl Engine {
         // borrow, then turn its verdicts into owned paths before the borrow ends — the same
         // two-phase shape [`Self::run_rule`]'s match loop uses, forced by the arena needing
         // `&mut self` to intern a handle.
-        let plan: Vec<(Vec<u32>, Vec<u32>, bool)> = {
+        let plan: Vec<(Vec<u32>, Vec<u32>, bool, Option<Vec<u32>>)> = {
             let arena = host.arena().borrow();
             let tree = arena.tree();
-            let nodes_named = |queries: &[CompiledQuery], name: &str| {
-                let mut found = Vec::new();
+            // Unlike `nodes_named`'s predecessor, this reads `@key` from the *same* match as
+            // the acquire/release capture, so a key is only ever the one the rule's own query
+            // paired with that node — never one incidentally bound elsewhere in the file.
+            let keyed_nodes = |queries: &[CompiledQuery], name: &str| {
+                let mut found: Vec<lanekeep_lang::obligation::Keyed<'_>> = Vec::new();
                 for q in queries {
                     q.for_each_match(tree, source.as_bytes(), |m| {
-                        found.extend(m.get_all(name));
+                        let key = m.get("key");
+                        for node in m.get_all(name) {
+                            found.push(lanekeep_lang::obligation::Keyed { node, key });
+                        }
                     });
                 }
                 found
             };
-            let acquires = nodes_named(&obligation.acquire, "acquire");
-            let releases = nodes_named(&obligation.release, "release");
+            let acquires = keyed_nodes(&obligation.acquire, "acquire");
+            let releases = keyed_nodes(&obligation.release, "release");
             analyzer
-                .analyze(tree, source, obligation.scope, &acquires, &releases)
+                .analyze(
+                    tree,
+                    source,
+                    obligation.scope,
+                    obligation.keyed,
+                    &acquires,
+                    &releases,
+                )
                 .into_iter()
                 .filter_map(|u| {
-                    Some((arena.path_of(u.acquire)?, arena.path_of(u.exit)?, u.partial))
+                    let key_path = u.key.and_then(|k| arena.path_of(k));
+                    Some((
+                        arena.path_of(u.acquire)?,
+                        arena.path_of(u.exit)?,
+                        u.partial,
+                        key_path,
+                    ))
                 })
                 .collect()
         };
 
-        for (acquire_path, exit_path, partial) in plan {
-            let (acquire_handle, exit_handle) = {
+        for (acquire_path, exit_path, partial, key_path) in plan {
+            let (acquire_handle, exit_handle, key_handle) = {
                 let mut arena = host.arena().borrow_mut();
                 (
                     arena.intern_path(acquire_path),
                     arena.intern_path(exit_path),
+                    key_path.and_then(|p| arena.intern_path(p)),
                 )
             };
             let (Some(acquire_handle), Some(exit_handle)) = (acquire_handle, exit_handle) else {
                 continue;
             };
+            let key_field = match key_handle {
+                Some(h) => format!("{h}"),
+                None => "undefined".to_owned(),
+            };
 
             let call = format!(
                 "globalThis.__lanekeepConfig.rules[{}].checkObligation(ctx, \
-                 {{acquire: {acquire_handle}, exit: {exit_handle}, partial: {partial}}})",
+                 {{acquire: {acquire_handle}, exit: {exit_handle}, partial: {partial}, \
+                 key: {key_field}}})",
                 rule_index(&rule.spec)
             );
 

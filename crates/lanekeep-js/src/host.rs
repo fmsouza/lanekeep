@@ -90,7 +90,12 @@ use lanekeep_types::{Query, Symbol, Type, TypeProvider};
 ///   every construct in the file — and a new per-file `checkFile(ctx)` handler runs once per
 ///   examined file, including flowless ones, so a rule can report "could not verify this
 ///   file." A build with them reaches a verdict a build without them cannot.
-pub const HOST_API_VERSION: u32 = 8;
+/// - `9` — obligation value identity (#248). `UnmetObligation` gains `key` — the acquire's
+///   `@key` capture node, present when the rule's acquire/release queries bind `@key` — and
+///   discharge is value-keyed, with a new `module` scope discharging by existence of a
+///   matching-key release anywhere in the file. A build with `key` reaches verdicts a build
+///   without it cannot.
+pub const HOST_API_VERSION: u32 = 9;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
