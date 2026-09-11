@@ -132,3 +132,41 @@ fn ctx_types_is_reachable_inside_check_flow() {
             "ctx.types.complete() returns true inside checkFlow and the flow reports at the sink",
         );
 }
+
+/// A `checkFile` rule (the #247 payoff): it reports at `ctx.root` when the taint analysis
+/// could not see through a construct, and is silent when the file is fully analyzed — the
+/// distinction between "no flow" and "not analyzed" a rule previously could not draw.
+const FLOW_RULE_COMPLETENESS: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/flow-completeness',\n\
+      language: ['javascript'],\n\
+      requires: ['dataflow'],\n\
+      flow: {\n\
+        sources: ['(call_expression function: (identifier) @fn (#eq? @fn \"getSecret\")) @source'],\n\
+        sinks: ['(call_expression function: (identifier) @fn (#eq? @fn \"log\") \
+                 arguments: (arguments (_) @sink))'],\n\
+      },\n\
+      card: { message: 'incomplete', remediation: 'simplify', examples: { bad: 'log(s+x)', good: 'log(s)' } },\n\
+      checkFile(ctx) { if (!ctx.flow.complete()) ctx.report(ctx.root, `unverified: ${ctx.flow.dropped}`); },\n\
+    });\n";
+
+fn completeness() -> RuleTester {
+    RuleTester::with_extension("js-flow-complete", FLOW_RULE_COMPLETENESS, "js").expect("builds")
+}
+
+#[test]
+fn check_file_reports_when_a_construct_was_dropped() {
+    completeness()
+        .reports_at(
+            "function f() { const s = getSecret(); log(s + \"!\"); }\n",
+            &[(1, 1)],
+        )
+        .expect("checkFile reports at the file root when ctx.flow.complete() is false");
+}
+
+#[test]
+fn check_file_is_silent_when_the_file_is_complete() {
+    completeness()
+        .accepts("function f() { const s = getSecret(); log(s); }\n")
+        .expect("ctx.flow.complete() is true, so checkFile reports nothing");
+}
