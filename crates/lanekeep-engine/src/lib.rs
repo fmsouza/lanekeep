@@ -478,6 +478,9 @@ type CompiledForLanguage = (
     Option<CompiledObligation>,
 );
 
+// (acquire path, exit path, partial, optional key path)
+type ObligationPlan = Vec<(Vec<u32>, Vec<u32>, bool, Option<Vec<u32>>)>;
+
 /// One language's patterns, accumulated across rules before anything is compiled.
 struct Concatenation {
     language: Arc<dyn Language>,
@@ -3575,7 +3578,7 @@ impl Engine {
         // borrow, then turn its verdicts into owned paths before the borrow ends — the same
         // two-phase shape [`Self::run_rule`]'s match loop uses, forced by the arena needing
         // `&mut self` to intern a handle.
-        let plan: Vec<(Vec<u32>, Vec<u32>, bool, Option<Vec<u32>>)> = {
+        let plan: ObligationPlan = {
             let arena = host.arena().borrow();
             let tree = arena.tree();
             // Unlike `nodes_named`'s predecessor, this reads `@key` from the *same* match as

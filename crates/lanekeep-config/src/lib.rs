@@ -5482,6 +5482,15 @@ mod tests {
     /// always did, and folds them exactly as `the_ruleset_hash_is_stable_when_nothing_changed`
     /// already asserts for an ordinary rule.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one property — acquire, release, scope, `@key` binding and `module` scope \
+                  each independently invalidate the ruleset hash — checked against one shared \
+                  fixture so every comparison reads against the same baseline and against its \
+                  siblings; splitting per field would either rebuild that fixture in each \
+                  function or thread hash values between `#[test]` functions, and Task 4's \
+                  `@key`/`module` additions are what pushed this over the threshold"
+    )]
     fn changing_an_obligations_acquire_release_or_scope_changes_the_ruleset_hash() {
         let fixture = Fixture::new(
             "obligation-fields-hash",
@@ -5537,7 +5546,7 @@ mod tests {
         // own module source, so the same verbatim fold has to reach them too — proven here
         // rather than assumed. Both sources below are written out in full, not derived from
         // one another with `.replace()` (the fixture-built-by-a-helper trap in AGENTS.md):
-        // a mis-typed needle would silently leave the "changed" source identical to the
+        // a mistyped needle would silently leave the "changed" source identical to the
         // original and the `assert_ne!` would still (correctly) fail, but for the wrong
         // reason, telling a future reader nothing.
         //

@@ -625,7 +625,7 @@ The cost of that posture is that a type-aware rule is silent for four different 
 
 ### 6.11 Obligation typestate
 
-`requires: ['dataflow']` unlocks a second `RuleSpec` shape beside plain `check`: a rule declares `obligation` — `acquire`/`release` tree-sitter queries plus a `scope` — and `checkObligation(ctx, unmet)` is invoked once per acquire the analysis cannot prove discharged. It is a **must**-analysis over the per-function control-flow graph (§3, "The control-flow graph"): an acquired resource has to reach a release on every path out of `scope`, not merely on some path — the opposite bias from an ordinary query-driven rule, and the reason that section already documents its `may`/`must` trade-offs as a deliberate pair rather than a single default.
+`requires: ['dataflow']` unlocks a second `RuleSpec` shape beside plain `check`: a rule declares `obligation` — `acquire`/`release` tree-sitter queries plus a `scope` — and `checkObligation(ctx, unmet)` is invoked once per acquire the analysis cannot prove discharged. Under `scope: 'function'` or `'block'` it is a **must**-analysis over the per-function control-flow graph (§3, "The control-flow graph"): an acquired resource has to reach a release on every path out of `scope`, not merely on some path — the opposite bias from an ordinary query-driven rule, and the reason that section already documents its `may`/`must` trade-offs as a deliberate pair rather than a single default. `scope: 'module'` is the exception, below: no control-flow graph at all, just whether a release exists anywhere in the file, correlated by `@key`.
 
 ```ts
 export default defineRule({

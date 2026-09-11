@@ -206,7 +206,7 @@ mod tests {
     /// Wrap bare nodes for a signature that now takes `&[Keyed]` everywhere, with no `@key`
     /// bound — every fixture in this file predates value-identity and asserts the unkeyed
     /// behavior, which this task must leave unchanged.
-    fn bare<'t>(ns: Vec<tree_sitter::Node<'t>>) -> Vec<Keyed<'t>> {
+    fn bare(ns: Vec<tree_sitter::Node<'_>>) -> Vec<Keyed<'_>> {
         ns.into_iter()
             .map(|node| Keyed { node, key: None })
             .collect()
