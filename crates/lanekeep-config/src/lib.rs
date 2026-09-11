@@ -135,27 +135,32 @@ pub struct RuleSpec {
     ///
     /// By the time a `RuleSpec` exists, `build_rule` has already refused the shape mistakes:
     /// `obligation` without `checkObligation` or the reverse, an `obligation` not paired with
-    /// `requires: ['dataflow']`, and a `scope` other than `"function"` or `"block"`. `dataflow`
-    /// joined `IMPLEMENTED` at #193, so a well-formed obligation rule now loads — the engine
-    /// compiles its acquire/release queries and dispatches through the analyzer `requires`
-    /// named.
+    /// `requires: ['dataflow']`, a `scope` other than `"function"`, `"block"`, or `"module"`,
+    /// `@key` bound on some acquire/release queries but not every one, and `scope: "module"`
+    /// without `@key` on every query. `dataflow` joined `IMPLEMENTED` at #193, so a well-formed
+    /// obligation rule now loads — the engine compiles its acquire/release queries and
+    /// dispatches through the analyzer `requires` named.
     pub obligation: Option<ObligationSpec>,
 }
 
 /// A rule's typestate obligation, as extracted from its source.
 ///
-/// `scope` is kept as the raw string the rule declared — `"function"` or `"block"` — rather
-/// than a `lanekeep-lang` enum, because this crate has no dependency on that crate. Nothing
-/// here confirms it is one of those two values, or that it is even present when a rule also
-/// declares `checkObligation`: that validation, and parsing the string into the analyzer's
-/// own enum, are the engine's job once there is an analyzer to hand it to.
+/// `scope` is kept as the raw string the rule declared — `"function"`, `"block"`, or
+/// `"module"` — rather than a `lanekeep-lang` enum, because this crate has no dependency on
+/// that crate. Nothing here confirms it is one of those three values, or that it is even
+/// present when a rule also declares `checkObligation`: that validation, and parsing the
+/// string into the analyzer's own enum, are the engine's job once there is an analyzer to hand
+/// it to. An optional `@key` correlating capture, when the rule's acquire/release queries bind
+/// one, lives inside `acquire`/`release`'s own query text rather than as a field here — value
+/// correlation is a property of the queries, not of this struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObligationSpec {
     /// Queries whose `@acquire` capture starts an obligation on the captured value.
     pub acquire: Vec<String>,
     /// Queries whose `@release` capture discharges it.
     pub release: Vec<String>,
-    /// `"function"` or `"block"`, as written — see the struct doc for what is not yet checked.
+    /// `"function"`, `"block"`, or `"module"`, as written — see the struct doc for what is not
+    /// yet checked.
     pub scope: String,
 }
 
@@ -540,9 +545,12 @@ struct RawRule {
 /// rather than a deserialization error naming a line of generated JSON. Its shape is checked
 /// by [`check_obligation_shape`], called from `build_rule` before [`check_requires`]: that
 /// `checkObligation` agrees with its presence, that `requires` names `dataflow`, that
-/// `acquire` and `release` are non-empty and each query binds the capture its role names, and
-/// that a `scope` written at all is `"function"` or `"block"`. An absent `scope` is refused
-/// by [`build_obligation`], where the value is consumed. See #193.
+/// `acquire` and `release` are non-empty and each query binds the capture its role names,
+/// that an optional `@key` capture — living inside those same query strings, not a field of
+/// its own — is bound on every acquire/release query or none, and that a `scope` written at
+/// all is `"function"`, `"block"`, or `"module"` (the last requiring `@key` on every query).
+/// An absent `scope` is refused by [`build_obligation`], where the value is consumed. See
+/// #193, #248.
 #[derive(Debug, Deserialize)]
 struct RawObligation {
     #[serde(default)]
@@ -2338,11 +2346,15 @@ fn has_dataflow(requires: &serde_json::Value) -> bool {
 ///
 /// In the order they are found: `obligation` declared with no `checkObligation` to fire it,
 /// `checkObligation` declared with no `obligation` to drive it, and — once both are present —
-/// an `obligation` not paired with `requires: ['dataflow']`, an `acquire` or `release` role
-/// that is empty or holds a query never binding the capture its role names, `@key` bound on
-/// some acquire/release queries but not every one, or a `scope` other than `"function"`,
-/// `"block"`, or `"module"` — `"module"` itself refused unless `@key` is bound on every query.
-/// An *absent* `scope` is [`build_obligation`]'s to refuse, where the value is consumed.
+/// an `obligation` not paired with `requires: ['dataflow']`, then an `acquire` or `release`
+/// role that is empty or holds a query never binding the capture its role names. Only after
+/// those do [`check_obligation_key`]'s two `@key` refusals run — `@key` bound on some
+/// acquire/release queries but not every one, or a `scope` of `"module"` with `@key` not bound
+/// on every query — and whether the scope token itself is one of `"function"`, `"block"`, or
+/// `"module"` is checked last of all. So a `scope: 'loop'` obligation that also mixes `@key`
+/// is refused for the mixed `@key`, never for the unknown scope — the two never both get a
+/// chance to speak. An *absent* `scope` is [`build_obligation`]'s to refuse, where the value is
+/// consumed.
 ///
 /// The role floors are `parse_flow`'s, restated: an empty `acquire` has nothing to be
 /// obligated and an empty `release` nothing to discharge it, so `checkObligation` is either
@@ -6658,8 +6670,8 @@ mod tests {
     }
 
     /// `scope` is not free text — the analyzer only ever tracks an obligation across a
-    /// `function` or a `block` — so an unknown value is refused by name rather than reaching
-    /// an engine that has no case for it.
+    /// `function`, a `block`, or the whole `module` — so an unknown value is refused by name
+    /// rather than reaching an engine that has no case for it.
     #[test]
     fn an_unknown_obligation_scope_is_refused() {
         let src = "import { defineRule } from 'lanekeep';\n\

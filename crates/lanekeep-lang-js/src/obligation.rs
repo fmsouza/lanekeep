@@ -1,4 +1,6 @@
-//! lang-js's implementation of the obligation capability, over the per-function CFG.
+//! lang-js's implementation of the obligation capability: a per-function CFG walk for
+//! `function`/`block` scope, and a file-wide `@key` existence check with no CFG at all for
+//! `module` scope, where sibling functions have no graph in common to walk.
 
 use lanekeep_lang::obligation::{Keyed, ObligationAnalyzer, ObligationScope, UnmetObligation};
 use tree_sitter::{Node, Tree};
