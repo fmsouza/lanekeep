@@ -18,6 +18,10 @@ pub enum ObligationScope {
     /// in the file. Discharge is existence of a matching key, not reachability — sibling
     /// functions share no control-flow graph. Requires a `@key` capture.
     Module,
+    /// A value acquired in a class must have a matching-key release in the *same* class.
+    /// Existence, like [`Self::Module`], but the search is bounded to one class. Requires a
+    /// `@key` capture.
+    Class,
 }
 
 impl ObligationScope {
@@ -28,6 +32,7 @@ impl ObligationScope {
             "function" => Some(Self::Function),
             "block" => Some(Self::Block),
             "module" => Some(Self::Module),
+            "class" => Some(Self::Class),
             _ => None,
         }
     }
@@ -76,7 +81,7 @@ mod tests {
     use super::ObligationScope;
 
     #[test]
-    fn scope_parses_the_three_names_and_nothing_else() {
+    fn scope_parses_the_known_names_and_nothing_else() {
         assert_eq!(
             ObligationScope::parse("function"),
             Some(ObligationScope::Function)
@@ -88,6 +93,10 @@ mod tests {
         assert_eq!(
             ObligationScope::parse("module"),
             Some(ObligationScope::Module)
+        );
+        assert_eq!(
+            ObligationScope::parse("class"),
+            Some(ObligationScope::Class)
         );
         assert_eq!(ObligationScope::parse("loop"), None);
     }
