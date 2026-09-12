@@ -66,7 +66,7 @@
 //! `docs/superpowers/specs/2026-09-05-taint-analysis-flow-checkflow-design.md` §5.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lanekeep_lang::binding::BindingResolver;
 use lanekeep_lang::flow::{FlowAnalysis, FlowAnalyzer, FlowPath};
@@ -212,6 +212,7 @@ impl FlowAnalyzer for JsFlowAnalyzer {
                 cfg,
                 root,
                 in_progress: RefCell::new(BTreeSet::new()),
+                memo: RefCell::new(BTreeMap::new()),
                 dropped: Cell::new(0),
             };
             let facts = taint.taint_of(sink, &Path::new(), 0);
@@ -236,6 +237,9 @@ impl FlowAnalyzer for JsFlowAnalyzer {
 
 /// One reason a value is tainted: the originating source, the alias hops between it and the
 /// value, in flow order (source → value), and the access path the taint was found at.
+///
+/// `Clone` so [`Taint::memo`] can hand a cached answer back to a repeated question.
+#[derive(Clone)]
 struct Fact<'t> {
     source: Node<'t>,
     steps: Vec<Node<'t>>,
@@ -269,6 +273,12 @@ impl Def<'_> {
     }
 }
 
+/// The fan-out memo [`Taint::taint_of_identifier`] keeps: a completed `(use start byte, path,
+/// depth)` question maps to the facts it carries. `depth` is part of the key because a question's
+/// facts depend on it — every hop truncates at [`MAX_DEPTH`] — so two reaches of one node at
+/// different depths are different questions. A named type so [`Taint::memo`] reads as one thing.
+type IdentMemo<'t> = BTreeMap<(usize, Path, u32), Vec<Fact<'t>>>;
+
 /// The immutable context for one sink's taint walk.
 struct Taint<'a, 't> {
     tree: &'t Tree,
@@ -281,16 +291,35 @@ struct Taint<'a, 't> {
     cfg: Option<&'a Cfg<'t>>,
     /// The enclosing function's root node, whose subtree is scanned for reassignments.
     root: Option<Node<'t>>,
-    /// Every `(use start byte, path)` question currently being answered up the stack.
-    ///
-    /// A loop of self-referential field writes — `while (c) { o.f0 = o; o.f1 = o; }` — asks
-    /// "`o` at `[]`" from inside the answer to "`o` at `[]`", once per write, at every level of
-    /// [`MAX_DEPTH`]: exponential in the depth, and outside every budget, since the analyzer
-    /// runs in plain Rust between the run clock's polls. A repeated question is cut instead. It
-    /// loses nothing: a fact is a (source, sink) pair, and every source the repeat could reach is
-    /// reached by the instance already answering it; `canonicalize` keeps the shortest chain
-    /// either way. `BTreeSet` rather than a hash set so the walk stays deterministic.
+    /// Every `(use start byte, path)` question currently being answered up the stack — the
+    /// **cycle** guard. A loop of self-referential field writes — `while (c) { o.f0 = o; }` —
+    /// asks "`o` at `[]`" from inside the answer to "`o` at `[]`", and this depth-independent set
+    /// cuts that re-entry however many levels deep it recurs. It loses nothing: the in-flight
+    /// instance enumerates every source the repeat could, and `canonicalize` keeps the shortest
+    /// chain either way. The fan-out [`Self::memo`] cannot do this job, because each turn of a
+    /// cycle is one level deeper, so the same question never repeats at a single depth.
     in_progress: RefCell<BTreeSet<(usize, Path)>>,
+    /// The **fan-out** memo (#254): a completed `(use start byte, path, depth)` question maps to
+    /// the facts it carries, so a binding reached `k` ways through sibling members or writes —
+    /// each finishing before the next begins — is walked once, not re-walked per sibling. Without
+    /// it, acyclic DAG fan-out did up to `k^MAX_DEPTH` leaf walks, in plain Rust between the run
+    /// clock's polls (architecture §3), so a generated input could wedge a run without tripping
+    /// the timeout, run budget or memory ceiling.
+    ///
+    /// `depth` is in the key because a question's facts are **not** a pure function of
+    /// `(node, path)`: `taint_of` cuts at `depth >= MAX_DEPTH`, so a node reached first on a long
+    /// arm — its tail to the source overflowing the budget — computes a smaller answer than the
+    /// same node on a short arm. Keying on depth keeps the two reaches distinct, so the deep,
+    /// truncated answer is never served to a shallow query that could see further (the false
+    /// negative a depth-blind memo produces). A **cycle** cut inside a computed answer is still
+    /// safe to memoize: the cut question is an ancestor whose own instance enumerates every source
+    /// it can reach, and `canonicalize` unions those in, so the memoized answer omitting them
+    /// changes no reported flow. Only the depth cut lacks that safety net — which is why the key
+    /// carries `depth` and the cycle guard above stays separate and depth-independent.
+    ///
+    /// Both containers are ordered rather than hashed so any future iteration stays deterministic;
+    /// today both are only point-accessed, so the choice does not affect output.
+    memo: RefCell<IdentMemo<'t>>,
     /// Constructs met at [`Taint::taint_of`]'s fallback arm that bear an identifier — the
     /// analysis's own tally of values it could not see through (#247). `Cell` because
     /// `taint_of` takes `&self`; single-threaded within one file's analysis, so deterministic.
@@ -422,10 +451,14 @@ impl<'t> Taint<'_, 't> {
             // `unary_expression`, ... Count it when the expression bears an identifier (so a
             // pure-literal `1 + 2` does not register), then carry nothing. This is the "did
             // not look here" signal #247 asks the analysis to record. The arm does not
-            // recurse, so a drop's own nested sub-constructs are not additionally counted —
-            // but a construct reached by two independent demand walks (e.g. `const x = a + b;
-            // log({ p: x, q: x })`) can still be counted more than once. So this is a sum of
-            // fallback-arm hits, not a count of distinct nodes.
+            // recurse, so a drop's own nested sub-constructs are not additionally counted. A
+            // construct reached through two *distinct* use-site nodes (e.g. `const x = a + b;
+            // log({ p: x, q: x })` — two `x` reads) is still counted once per node, since each is
+            // its own memoized question; a construct reached again through the *same* node at the
+            // *same* depth (an acyclic fan-out onto one binding, #254) is counted once, because
+            // the repeat hits [`Taint::taint_of_identifier`]'s memo rather than re-walking. So
+            // this is a sum of fallback-arm hits over distinct `(use-site node, path, depth)`
+            // questions, not a raw visit count.
             _ => {
                 if subtree_has_identifier(expr) {
                     self.dropped.set(self.dropped.get().saturating_add(1));
@@ -509,13 +542,22 @@ impl<'t> Taint<'_, 't> {
         let Some(decl) = JsBindingResolver.declaration_of(self.tree, self.source, ident) else {
             return Vec::new();
         };
-        let question = (ident.start_byte(), path.clone());
-        if !self.in_progress.borrow_mut().insert(question.clone()) {
-            // Already being answered further up the stack: a cycle of weak definitions. The
-            // outer instance enumerates every source this one could, so answering again only
-            // re-walks the same definitions — which is what made the walk exponential.
+        let byte = ident.start_byte();
+        // Fan-out cut (#254): this exact `(node, path, depth)` was computed before, so hand back
+        // the cached facts rather than re-walking the subtree. `depth` is in the key because the
+        // answer depends on it (the `MAX_DEPTH` cut) — see [`Self::memo`].
+        let memo_key = (byte, path.clone(), depth);
+        if let Some(facts) = self.memo.borrow().get(&memo_key) {
+            return facts.clone();
+        }
+        // Cycle cut: this `(node, path)` is already being answered up the stack. A cycle re-enters
+        // only at a strictly deeper `depth`, so it misses the memo above and lands here, where the
+        // depth-independent guard cuts it.
+        let cycle_key = (byte, path.clone());
+        if self.in_progress.borrow().contains(&cycle_key) {
             return Vec::new();
         }
+        self.in_progress.borrow_mut().insert(cycle_key.clone());
         let mut facts = Vec::new();
         for def in self.reaching_defs(decl, ident) {
             self.collect_def_facts(def, path, depth, &mut facts);
@@ -523,7 +565,12 @@ impl<'t> Taint<'_, 't> {
         for (def, residual) in self.weak_reaching_defs(decl, ident, path) {
             self.collect_def_facts(def, &residual, depth, &mut facts);
         }
-        self.in_progress.borrow_mut().remove(&question);
+        self.in_progress.borrow_mut().remove(&cycle_key);
+        // Collapse the fan-out's duplicate facts before caching or returning them, so a source
+        // reached `k` ways does not carry `k` equivalent facts up the tree (#254). Without this
+        // the memo bounds the walk's *visits* but not its *facts*, leaving a `k^levels` vector.
+        dedup_facts(&mut facts);
+        self.memo.borrow_mut().insert(memo_key, facts.clone());
         facts
     }
 
@@ -1107,6 +1154,37 @@ fn enclosing_root_and_cfg<'t>(source: &str, node: Node<'t>) -> Option<(Node<'t>,
     None
 }
 
+/// Collapse a node's facts to one per source, keeping the shortest chain — tie-broken exactly as
+/// [`canonicalize`] does: chain length, then step start bytes, then the access path.
+///
+/// [`Taint::memo`] makes the walk *visit* each node once, but nothing deduplicates the *facts* a
+/// visit returns, so a source reached through `k` sibling members or writes still accumulates `k`
+/// equivalent facts, and a `k`-way fan-out `levels` deep builds a `k^levels` vector even though
+/// every node is walked once — the residual exponential the memo alone leaves (#254). Collapsing
+/// here bounds every node's fact count to the file's distinct sources.
+///
+/// It changes no reported flow. Within one sink's walk the sink is fixed, so one fact per source
+/// is one per `(source, sink)` — exactly what [`canonicalize`] keeps. And keeping the *shortest*
+/// chain is safe to do locally: a chain's source-side steps are settled at the node nearest the
+/// source and a caller only ever appends later (sink-side) steps ([`Taint::collect_def_facts`]
+/// pushes its hop last), so the lexicographic tie-break is decided below and the local shortest is
+/// the global shortest.
+fn dedup_facts(facts: &mut Vec<Fact<'_>>) {
+    facts.sort_by(|a, b| {
+        (a.source.start_byte(), a.source.end_byte())
+            .cmp(&(b.source.start_byte(), b.source.end_byte()))
+            .then_with(|| a.steps.len().cmp(&b.steps.len()))
+            .then_with(|| {
+                a.steps
+                    .iter()
+                    .map(Node::start_byte)
+                    .cmp(b.steps.iter().map(Node::start_byte))
+            })
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    facts.dedup_by_key(|fact| (fact.source.start_byte(), fact.source.end_byte()));
+}
+
 /// The total order [`canonicalize`] reduces raw flows by: the `(source, sink)` pair, then the
 /// chain length, then the chain's positions, then the access path the fact was found at.
 type CanonicalKey = ((usize, usize, usize, usize), usize, Vec<usize>, Path);
@@ -1174,6 +1252,7 @@ fn step_positions(flow: &FlowPath<'_>) -> Vec<usize> {
 mod tests {
     use super::*;
     use crate::cfg::testing::{find_all, parse};
+    use std::fmt::Write as _;
 
     /// The identifier a call's callee names, when it is a plain identifier.
     fn callee_name<'a>(call: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -2103,6 +2182,122 @@ mod tests {
             "the secret written before the loop still reaches the sink"
         );
         assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    /// A binding graph whose fan-out is exponential in its nesting depth (#254): `a0` is a
+    /// source, and each `a{i}` binds an object literal that names `a{i-1}` in `k` members. Reading
+    /// `a{levels}` whole observes every member, so the walk fans out `k` ways at each of `levels`
+    /// levels — `k^levels` sibling sub-walks over the same bindings.
+    fn object_fanout_src(levels: usize, k: usize) -> String {
+        let mut s = String::from("function f(){ const a0 = getSecret(); ");
+        for i in 1..=levels {
+            write!(s, "const a{i} = {{ ").unwrap();
+            for j in 0..k {
+                write!(s, "m{j}: a{}, ", i - 1).unwrap();
+            }
+            s.push_str("}; ");
+        }
+        write!(s, "log(a{levels}); }}").unwrap();
+        s
+    }
+
+    /// The same #254 fan-out through the field-write vector (#225): `o0` holds the source, and
+    /// each `o{i}` takes `k` field writes `o{i}.m{j} = o{i-1}`. A straight line with no cycle, so
+    /// `weak_def_reaches` admits every write that precedes the read, and reading `o{levels}`
+    /// re-walks the `k` writes into the previous object at each level — `k^levels` sub-walks.
+    fn field_write_fanout_src(levels: usize, k: usize) -> String {
+        let mut s = String::from("function f(){ ");
+        for i in 0..=levels {
+            write!(s, "const o{i} = {{}}; ").unwrap();
+        }
+        s.push_str("o0.s = getSecret(); ");
+        for i in 1..=levels {
+            for j in 0..k {
+                write!(s, "o{i}.m{j} = o{}; ", i - 1).unwrap();
+            }
+        }
+        write!(s, "log(o{levels}); }}").unwrap();
+        s
+    }
+
+    #[test]
+    fn an_acyclic_object_literal_fan_out_terminates_promptly() {
+        // The DAG fan-out #254, guarding both halves of the fix at once. The `in_progress` set is
+        // only a *cycle* guard — it never cut a question that finished and was reached again
+        // through a sibling — so this was exponential in the nesting depth, with no budget
+        // reaching the analyzer (architecture §3). The fix is the fan-out `memo` (each node walked
+        // once) AND `dedup_facts` (each node's facts collapsed to one per source); the memo alone
+        // still built a `k^levels` fact vector. k=6, levels=10 measured ~20 s with the memo but no
+        // dedup, and ~40 ms with both — so five seconds is the line between "terminates" and
+        // "hangs the run", not a performance claim, and it trips if *either* half regresses. Not
+        // the cyclic case `a_loop_of_self_referential_field_writes_terminates_promptly` guards.
+        let src = object_fanout_src(10, 6);
+        let started = std::time::Instant::now();
+        let flows = run(&src, "getSecret", "log", "redact");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the acyclic object-literal fan-out did not terminate promptly"
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "the one secret still reaches the sink, once"
+        );
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn an_acyclic_field_write_fan_out_terminates_promptly() {
+        // The identical #254 fan-out through weak_reaching_defs (#225), which predates the
+        // object-literal vector: `o{i}.m{j} = o{i-1}`, acyclic, so nothing cut it before the fix.
+        // Here each field-write hop appends a distinct step, so the facts are not exact duplicates
+        // — `dedup_facts` keeps the one shortest chain per source, which is why the memo alone
+        // (~14 s at k=6, levels=9) is not enough and both halves are needed (~0.1 s with dedup).
+        let src = field_write_fanout_src(9, 6);
+        let started = std::time::Instant::now();
+        let flows = run(&src, "getSecret", "log", "redact");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the acyclic field-write fan-out did not terminate promptly"
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "the one secret still reaches the sink, once"
+        );
+        assert_eq!(flows[0].0, "getSecret()");
+    }
+
+    #[test]
+    fn a_binding_reached_at_two_depths_is_not_poisoned_by_the_deeper_reach() {
+        // #254 memo soundness. The facts a `(node, path)` question carries are NOT a pure
+        // function of `(node, path)` — they also depend on `depth`, because every hop truncates
+        // at `taint_of`'s `depth >= MAX_DEPTH` guard. So the memo key must carry `depth`: a
+        // binding reached first on a LONG arm — whose tail to the source overflows MAX_DEPTH, so
+        // it computes empty — must not poison a SHORT arm that has the budget to reach the
+        // source. `w` is read through a 12-alias arm (`d12`) and directly; from `w` the source
+        // is seven more hops, so the deep arm reaches it past MAX_DEPTH=16 and the direct arm
+        // well within it. Both array orderings must report the one flow; an order-dependent
+        // verdict would prove the memo changed the output.
+        let deep_first = "function f() { \
+            const s0 = getSecret(); \
+            const s1 = s0; const s2 = s1; const s3 = s2; const s4 = s3; const s5 = s4; \
+            const w = s5; \
+            const d1 = w; const d2 = d1; const d3 = d2; const d4 = d3; const d5 = d4; \
+            const d6 = d5; const d7 = d6; const d8 = d7; const d9 = d8; const d10 = d9; \
+            const d11 = d10; const d12 = d11; \
+            log([d12, w]); }";
+        let shallow_first = deep_first.replace("log([d12, w])", "log([w, d12])");
+        assert_eq!(
+            run(deep_first, "getSecret", "log", "redact").len(),
+            1,
+            "deep-arm-first must still report the flow (the deeper reach must not cache empty for the shallow one)"
+        );
+        assert_eq!(
+            run(&shallow_first, "getSecret", "log", "redact").len(),
+            1,
+            "shallow-arm-first must report the flow"
+        );
     }
 
     #[test]
