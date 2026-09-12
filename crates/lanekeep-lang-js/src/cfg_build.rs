@@ -240,6 +240,25 @@ pub(crate) fn enclosing_block(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+/// The nearest enclosing class of `node` (inclusive), or `None` at top level.
+///
+/// Matches every class kind `tree-sitter-typescript` attaches methods to —
+/// `class_declaration`, a `class` expression, and `abstract_class_declaration` — the same set
+/// `lanekeep-lang-js`'s binding resolver treats as class scopes.
+pub(crate) fn enclosing_class(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if matches!(
+            n.kind(),
+            "class_declaration" | "class" | "abstract_class_declaration"
+        ) {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
 impl<'t, 's> Builder<'t, 's> {
     /// The text of `node`, carrying the *source's* lifetime rather than a borrow of `self`.
     ///
@@ -3499,6 +3518,34 @@ function f() {
         assert_eq!(
             super::enclosing_cfg_root(acquire).unwrap().kind(),
             "program"
+        );
+    }
+
+    #[test]
+    fn enclosing_class_finds_each_class_kind_and_none_at_top_level() {
+        use crate::cfg::testing::{find_all, parse};
+        for src in [
+            "class C { m() { call(); } }",
+            "const C = class { m() { call(); } };",
+            "abstract class C { m() { call(); } }",
+        ] {
+            let tree = parse(src);
+            let call = find_all(&tree, "call_expression")[0];
+            let class = super::enclosing_class(call).expect("the call is inside a class");
+            assert!(
+                matches!(
+                    class.kind(),
+                    "class_declaration" | "class" | "abstract_class_declaration"
+                ),
+                "kind was {}",
+                class.kind()
+            );
+        }
+        let tree = parse("function f() { call(); }");
+        let call = find_all(&tree, "call_expression")[0];
+        assert!(
+            super::enclosing_class(call).is_none(),
+            "no class encloses a top-level function"
         );
     }
 }
