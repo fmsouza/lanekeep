@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/fmsouza/lanekeep/compare/v0.10.0...v0.11.0) - 2026-09-12
+
+### Added
+
+- *(types)* type property access and chains in the builtin oracle ([#249](https://github.com/fmsouza/lanekeep/pull/249))
+- *(types)* type the ?? operator when both sides share a primitive ([#251](https://github.com/fmsouza/lanekeep/pull/251))
+- *(types)* instantiate a generic call's return type under tsc ([#252](https://github.com/fmsouza/lanekeep/pull/252))
+- *(flow)* follow taint through wrappers, literals and ternaries ([#253](https://github.com/fmsouza/lanekeep/pull/253))
+- *(flow)* expose analysis completeness to rules ([#256](https://github.com/fmsouza/lanekeep/pull/256))
+- *(obligation)* value identity via @key and a module scope ([#248](https://github.com/fmsouza/lanekeep/pull/248)) ([#257](https://github.com/fmsouza/lanekeep/pull/257))
+- *(flow)* record and profile constructs the taint analysis drops ([#255](https://github.com/fmsouza/lanekeep/pull/255))
+
+### Fixed
+
+- *(flow)* bound taint walk cost so acyclic fan-out isn't exponential ([#259](https://github.com/fmsouza/lanekeep/pull/259))
+
 ## [0.10.0](https://github.com/fmsouza/lanekeep/compare/v0.9.0...v0.10.0) - 2026-09-09
 
 ### Added
