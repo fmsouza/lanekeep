@@ -139,9 +139,9 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
 ///
 /// `region_of` maps a node to the region node that bounds correlation; `region_required` is
 /// `false` for `module` (the region is the whole file, so any matching-key release counts) and
-/// `true` for `class`/`component` (a release only discharges an acquire in the *same* region
-/// node, and an acquire outside any region can never be discharged). Correlation is text
-/// equality — value-flow is a later change.
+/// `true` for `class` (a release only discharges an acquire in the *same* region node, and an
+/// acquire outside any region can never be discharged). Correlation is text equality —
+/// value-flow is a later change.
 fn discharge_by_existence<'t>(
     source: &str,
     acquires: &[Keyed<'t>],

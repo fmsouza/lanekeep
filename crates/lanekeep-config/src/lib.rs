@@ -2459,13 +2459,13 @@ fn check_obligation_key(o: &RawObligation, id: &RuleId) -> Result<(), String> {
              correlation is all-or-nothing"
         ));
     }
-    if let Some(scope @ ("module" | "class")) = o.scope.as_deref() {
-        if !all {
-            return Err(format!(
-                "`{id}` has obligation `scope` `{scope}` but does not bind `@key` on every \
-                 acquire and release query — a {scope}-wide scope needs `@key` to correlate"
-            ));
-        }
+    if let Some(scope @ ("module" | "class")) = o.scope.as_deref()
+        && !all
+    {
+        return Err(format!(
+            "`{id}` has obligation `scope` `{scope}` but does not bind `@key` on every \
+             acquire and release query — a {scope}-wide scope needs `@key` to correlate"
+        ));
     }
     Ok(())
 }
