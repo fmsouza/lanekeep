@@ -22,6 +22,10 @@ pub enum ObligationScope {
     /// Existence, like [`Self::Module`], but the search is bounded to one class. Requires a
     /// `@key` capture.
     Class,
+    /// A value acquired in a React function component must have a matching-key release in the
+    /// *same* component. Existence, like [`Self::Class`], bounded to one component. Requires a
+    /// `@key` capture.
+    Component,
 }
 
 impl ObligationScope {
@@ -33,6 +37,7 @@ impl ObligationScope {
             "block" => Some(Self::Block),
             "module" => Some(Self::Module),
             "class" => Some(Self::Class),
+            "component" => Some(Self::Component),
             _ => None,
         }
     }
@@ -97,6 +102,10 @@ mod tests {
         assert_eq!(
             ObligationScope::parse("class"),
             Some(ObligationScope::Class)
+        );
+        assert_eq!(
+            ObligationScope::parse("component"),
+            Some(ObligationScope::Component)
         );
         assert_eq!(ObligationScope::parse("loop"), None);
     }
