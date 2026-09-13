@@ -56,7 +56,7 @@ same file.
 type ObligationSpec = {
   acquire: string[]
   release: string[]
-  scope: 'function' | 'block' | 'module'
+  scope: 'function' | 'block' | 'module' | 'class'
 }
 ```
 
@@ -68,10 +68,10 @@ or a `zeroBytes(...)` helper, and either one discharges it. A capture literally 
 query, however the rest of the pattern is shaped. A query in either role may also bind an
 optional `@key` capture alongside it, to correlate a specific acquire with a specific release
 rather than treating every release as interchangeable — see "`@key` correlation and
-`scope: 'module'`" below.
+`scope: 'module'`" and "`@key` correlation and `scope: 'class'`" below.
 
-`scope` decides which paths have to carry a release, or — for `'module'` — whether a matching
-one exists at all:
+`scope` decides which paths have to carry a release, or — for `'module'` and `'class'` —
+whether a matching one exists at all:
 
 - **`'function'`** — every path out of the function the acquire sits in, `return` and
   `throw` included.
@@ -80,6 +80,11 @@ one exists at all:
 - **`'module'`** — no paths, and no control-flow graph at all: discharge is whether a release
   keyed to the same `@key` exists anywhere in the file. This scope requires `@key` — see
   below.
+- **`'class'`** — like `'module'`, but bounded to the enclosing class rather than the whole
+  file: discharge is whether a release keyed to the same `@key` exists somewhere in the same
+  class, a sibling method included. An acquire with no enclosing class at all can never be
+  discharged under this scope, however the file's releases are keyed. This scope requires
+  `@key` too — see below.
 
 ## `requires: ['dataflow']` is mandatory
 
@@ -95,9 +100,9 @@ being present. The load-time refusals, all naming the rule:
 | `acquire` or `release` empty or absent | refused — nothing to acquire, or nothing to discharge it, means `checkObligation` could never say anything true |
 | an `acquire` query with no `@acquire`, or a `release` query with no `@release` | refused — it would compile and match nothing forever |
 | `scope` missing | refused — the type declares it required, and the loader says the same rather than defaulting to `'function'` |
-| `scope` other than `'function'`/`'block'`/`'module'` | refused |
+| `scope` other than `'function'`/`'block'`/`'module'`/`'class'` | refused |
 | `@key` bound on some acquire/release queries but not every one | refused — correlation has to be all-or-nothing across the whole obligation, never partial |
-| `scope: 'module'` without `@key` bound on every acquire and release query | refused — a file-wide scope with no correlation would let any release in the file discharge any acquire |
+| `scope: 'module'` or `scope: 'class'` without `@key` bound on every acquire and release query | refused — a file-wide (or class-wide) scope with no correlation would let any release in the file (or class) discharge any acquire |
 | an acquire or release query that fails to compile | refused, naming the rule, at the same point a broken main `query` is |
 | neither `check` nor `obligation` | refused — a rule needs a handler |
 
@@ -118,8 +123,8 @@ type UnmetObligation = {
 | Field | Meaning |
 | --- | --- |
 | `acquire` | The node the acquire query matched. |
-| `exit` | The source-earliest `return`, `throw`, or implicit function end reachable from the acquire without passing a release. This is what `ctx.report` is usually called on — the escape the analysis found, not the acquire itself. Under `scope: 'module'` there is no path to walk, so this is always the acquire node itself. |
-| `partial` | Whether *some* path did discharge the obligation. A resource zeroed on the happy path but missed on one early `return` is a different finding from one never zeroed at all, and `partial` is how a rule tells the two apart in its message. Always `false` under `scope: 'module'` — there are no paths to be partial over. |
+| `exit` | The source-earliest `return`, `throw`, or implicit function end reachable from the acquire without passing a release. This is what `ctx.report` is usually called on — the escape the analysis found, not the acquire itself. Under `scope: 'module'` or `scope: 'class'` there is no path to walk, so this is always the acquire node itself. |
+| `partial` | Whether *some* path did discharge the obligation. A resource zeroed on the happy path but missed on one early `return` is a different finding from one never zeroed at all, and `partial` is how a rule tells the two apart in its message. Always `false` under `scope: 'module'` or `scope: 'class'` — there are no paths to be partial over. |
 | `key` | The acquire's `@key` capture, present when the rule's acquire and release queries bind one — absent for an un-keyed obligation. `ctx.text(unmet.key)` is how a rule names the value in its own message; see the worked example below. |
 
 `checkObligation` is called once per acquire the analysis cannot prove discharged — nothing
@@ -212,10 +217,59 @@ may bind it too, and the release set the CFG walk considers is filtered down to 
 releases before that walk runs. That is what makes `const a = acq(); const b = acq(); rel(a)`
 report only `b`, once both `acq`'s and `rel`'s queries key on the acquired value: without
 `@key` a release discharges every acquire it is on-all-paths-from regardless of which value
-came back, and `a` would silently cover for `b`. `scope: 'module'` is the one place `@key`
-stops being optional: without it a file-wide scope would let any release in the file discharge
-any acquire, which is strictly worse than a scope that at least confines itself to one
-function — see the load-time refusals above.
+came back, and `a` would silently cover for `b`. `scope: 'module'` and `scope: 'class'` are
+the two places `@key` stops being optional: without it a file-wide or class-wide scope would
+let any release in the file (or class) discharge any acquire, which is strictly worse than a
+scope that at least confines itself to one function — see the load-time refusals above.
+
+## `@key` correlation and `scope: 'class'`
+
+`scope: 'class'` asks the same existence question as `'module'` — a matching-key release
+somewhere, not a control-flow path — but bounds "somewhere" to the enclosing class rather than
+the whole file. It is the shape for a register/forget pair expressed as two methods of one
+class, rather than two sibling functions:
+
+```ts
+export default defineRule({
+  id: 'local/registered-is-forgotten-in-class',
+  requires: ['dataflow'],
+  obligation: {
+    acquire: [
+      `(call_expression function: (identifier) @f (#eq? @f "reg")
+         arguments: (arguments (identifier) @key)) @acquire`,
+    ],
+    release: [
+      `(call_expression function: (identifier) @f (#eq? @f "forget")
+         arguments: (arguments (identifier) @key)) @release`,
+    ],
+    scope: 'class',
+  },
+  card: {
+    message: 'not forgotten',
+    remediation: 'call forget(id) from a method of the same class',
+    examples: {
+      bad: 'class C { open() { reg(a); } }',
+      good: 'class C { open() { reg(a); } close() { forget(a); } }',
+    },
+  },
+  checkObligation(ctx, unmet) {
+    ctx.report(unmet.acquire, `registration for ${ctx.text(unmet.key)} is never forgotten`)
+  },
+})
+```
+
+Same queries, and the same `@key` correlation rule as `'module'` above — exact source-text
+equality, all-or-nothing across every acquire and release query.
+
+| Code | Result |
+| --- | --- |
+| `class C { open() { reg(id); } close() { forget(id); } }` | silent — `close` is a sibling method of the same class as `open`, and the key matches |
+| `class A { open() { reg(id); } } class B { close() { forget(id); } }` | reports — the key matches, but `forget` sits in a different class, and `'class'` scope does not reach across classes the way `'module'` reaches across the whole file |
+| `function f() { reg(id); } class C { close() { forget(id); } }` | reports — the acquire has no enclosing class at all, so there is no region to search for a release in, regardless of what exists elsewhere in the file |
+
+The third row is where `'class'` and `'module'` diverge sharpest: an acquire outside any class
+can never be discharged under `scope: 'class'`, even when an otherwise-matching release exists
+in the same file — `'module'` would have accepted it.
 
 ## Limitations
 
@@ -223,9 +277,10 @@ Each of these is a stated v1 scope decision, not an oversight — see
 [`architecture.md`](architecture.md) §6.11 for the mechanism behind each one.
 
 - **Value identity is opt-in, through `@key`.** Bind an optional `@key` capture on every
-  acquire and release query — see "`@key` correlation and `scope: 'module'`" above — and
-  discharge requires matching key text, not merely a release somewhere on all paths.
-  `scope: 'module'` requires it outright: a file-wide scope with no correlation would let any
+  acquire and release query — see "`@key` correlation and `scope: 'module'`" and
+  "`@key` correlation and `scope: 'class'`" above — and discharge requires matching key text,
+  not merely a release somewhere on all paths. `scope: 'module'` and `scope: 'class'` both
+  require it outright: a file-wide or class-wide scope with no correlation would let any
   release discharge any acquire, which is strictly worse than a narrower scope. Without
   `@key`, nothing here has changed: a release on all paths still discharges every acquire it
   is on-all-paths-from, regardless of which value it released — exact with one acquire per
@@ -235,10 +290,11 @@ Each of these is a stated v1 scope decision, not an oversight — see
   handed back to a caller that might release it instead.
 - **Nothing crosses a function boundary under `'function'`/`'block'` scope.** The unit of
   analysis there is the function the acquire is in; a callback or a call passed the acquired
-  value is invisible to the CFG walk. `scope: 'module'` is the deliberate exception — it exists
-  because this is exactly what makes a register/forget pair split across two sibling callbacks
-  inexpressible otherwise, and it buys that by giving up the control-flow graph entirely for a
-  file-wide existence check keyed by `@key`.
+  value is invisible to the CFG walk. `scope: 'module'` and `scope: 'class'` are the deliberate
+  exceptions — they exist because this is exactly what makes a register/forget pair split
+  across two sibling callbacks, or two sibling methods, inexpressible otherwise, and each buys
+  that by giving up the control-flow graph entirely for an existence check keyed by `@key` —
+  file-wide for `'module'`, bounded to the enclosing class for `'class'`.
 - **Silent, not refused, on a language with no analyzer.** In v1 the analyzer exists only for
   TypeScript, TSX and JavaScript. Declaring `obligation` for any other language is not a load-time
   mistake — the rule loads cleanly, and `checkObligation` is simply never invoked for that
