@@ -1,7 +1,8 @@
 //! lang-js's implementation of the obligation capability: a per-function CFG walk for
-//! `function`/`block` scope, and an existence check with no CFG at all for `module` and
-//! `class` scope — file-wide for `module`, bounded to the enclosing class for `class` —
-//! where sibling functions or methods have no graph in common to walk.
+//! `function`/`block` scope, and an existence check with no CFG at all for `module`,
+//! `class` and `component` scope — file-wide for `module`, bounded to the enclosing class
+//! for `class`, bounded to the enclosing React function component for `component` — where
+//! sibling functions, methods, or components have no graph in common to walk.
 
 use lanekeep_lang::obligation::{Keyed, ObligationAnalyzer, ObligationScope, UnmetObligation};
 use tree_sitter::{Node, Tree};
