@@ -670,4 +670,42 @@ mod tests {
             "neither function is a component region, so the acquire cannot discharge"
         );
     }
+
+    /// The case the test above cannot cover: here the acquire's own host is the JSX-less
+    /// `PascalCase` function, not the lowercase one, so `region_of` is actually asked about it.
+    ///
+    /// In the test above the acquire sits in `render` (lowercase), so `acq_region` is already
+    /// `None` before `Factory` ever enters the picture — `discharge_by_existence`'s
+    /// `!(region_required && acq_region.is_none())` short-circuits `false` without calling
+    /// `region_of` on `Factory` at all. A `contains_jsx`/`is_pascal_case` bug that wrongly
+    /// accepted a JSX-less `PascalCase` function as a component would pass that test unnoticed.
+    ///
+    /// Putting both the acquire and its matching-key release inside `Factory` closes the gap:
+    /// if `Factory` were wrongly treated as a component, `region_of` would map both nodes to
+    /// it and the release would discharge the acquire, flipping `unmet` from one entry to
+    /// none. Correct behavior reports it — `Factory` has no JSX, so it is not a component
+    /// region, and an acquire with no region cannot be discharged, exactly as
+    /// `class_scope_reports_an_acquire_with_no_enclosing_class` reports an acquire with no
+    /// enclosing class regardless of what else the file contains.
+    #[test]
+    fn component_scope_reports_when_the_shared_pascalcase_host_has_no_jsx() {
+        let source = "function Factory() { reg(id); forget(id); return 1; }";
+        let tree = parse_tsx(source);
+        let acq = keyed_calls(&tree, source, "reg(id)");
+        let rel = keyed_calls(&tree, source, "forget(id)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Component,
+            true,
+            &acq,
+            &rel,
+        );
+        assert_eq!(
+            unmet.len(),
+            1,
+            "Factory has no JSX, so it is not a component region, even though the acquire \
+             and its matching-key release share one PascalCase-named host"
+        );
+    }
 }
