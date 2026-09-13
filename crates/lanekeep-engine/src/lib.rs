@@ -1409,8 +1409,9 @@ impl Engine {
                             // Whether either role binds `@key`, read off the raw query text
                             // rather than the compiled query — `capture_sites` is lexical and
                             // needs no grammar, and this runs once at prepare time rather than
-                            // per match. Task 4 is where the two roles disagreeing becomes a
-                            // load error; here it is only ever read, never enforced.
+                            // per match. `check_obligation_key` in lanekeep-config refuses
+                            // `@key` bound on some-but-not-every query; here the presence flag
+                            // is only read, never enforced.
                             let keyed = o.acquire.iter().chain(o.release.iter()).any(|q| {
                                 lanekeep_query::capture_sites(q)
                                     .iter()
