@@ -66,6 +66,17 @@ pub struct UnmetObligation<'t> {
     pub key: Option<Node<'t>>,
 }
 
+/// How a keyed obligation correlates an acquire's `@key` with a release's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCorrelation {
+    /// No `@key` bound — every release discharges (the un-keyed behavior).
+    None,
+    /// Correlate by exact captured text.
+    Text,
+    /// Correlate by shared value origin.
+    Binding,
+}
+
 /// A per-language typestate analysis over acquire/release node sets.
 pub trait ObligationAnalyzer: Send + Sync {
     /// Return one [`UnmetObligation`] per acquire some path leaves undischarged, in source
@@ -75,7 +86,7 @@ pub trait ObligationAnalyzer: Send + Sync {
         tree: &'t Tree,
         source: &str,
         scope: ObligationScope,
-        keyed: bool,
+        correlation: KeyCorrelation,
         acquires: &[Keyed<'t>],
         releases: &[Keyed<'t>],
     ) -> Vec<UnmetObligation<'t>>;

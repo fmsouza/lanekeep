@@ -4,7 +4,9 @@
 //! for `class`, bounded to the enclosing React function component for `component` — where
 //! sibling functions, methods, or components have no graph in common to walk.
 
-use lanekeep_lang::obligation::{Keyed, ObligationAnalyzer, ObligationScope, UnmetObligation};
+use lanekeep_lang::obligation::{
+    KeyCorrelation, Keyed, ObligationAnalyzer, ObligationScope, UnmetObligation,
+};
 use tree_sitter::{Node, Tree};
 
 use crate::cfg::{BlockId, Cfg};
@@ -19,10 +21,14 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
         _tree: &'t Tree,
         source: &str,
         scope: ObligationScope,
-        keyed: bool,
+        correlation: KeyCorrelation,
         acquires: &[Keyed<'t>],
         releases: &[Keyed<'t>],
     ) -> Vec<UnmetObligation<'t>> {
+        // Task 3 plumbs the enum through; the actual Text/Binding distinction is a later
+        // task's job. Both behave as text correlation for now, exactly as the old `keyed`
+        // bool did — `Binding` is not yet a distinct code path.
+        let keyed = correlation != KeyCorrelation::None;
         // Module and Class are cross-function existence scopes: sibling functions and methods
         // share no control-flow graph, so discharge is the existence of a matching-key release
         // in the same region, not reachability. Handle them before the per-acquire CFG loop
@@ -295,7 +301,7 @@ fn resolve_blocks<'t>(cfg: &Cfg<'t>, node: Node<'t>) -> Vec<BlockId> {
 mod tests {
     use super::JsObligationAnalyzer;
     use crate::cfg::testing::{find_all, parse, parse_tsx};
-    use lanekeep_lang::obligation::{Keyed, ObligationAnalyzer, ObligationScope};
+    use lanekeep_lang::obligation::{KeyCorrelation, Keyed, ObligationAnalyzer, ObligationScope};
 
     fn calls<'t>(
         tree: &'t tree_sitter::Tree,
@@ -327,7 +333,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Function,
-            false,
+            KeyCorrelation::None,
             &bare(acq),
             &bare(rel),
         );
@@ -344,7 +350,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Function,
-            false,
+            KeyCorrelation::None,
             &bare(acq),
             &bare(rel),
         );
@@ -362,7 +368,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Function,
-            false,
+            KeyCorrelation::None,
             &bare(acq),
             &[],
         );
@@ -380,7 +386,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Function,
-            false,
+            KeyCorrelation::None,
             &bare(acq),
             &bare(rel),
         );
@@ -403,7 +409,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Block,
-            false,
+            KeyCorrelation::None,
             &bare(acq),
             &bare(rel),
         );
@@ -423,7 +429,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Block,
-            false,
+            KeyCorrelation::None,
             &bare(acq),
             &bare(rel),
         );
@@ -469,7 +475,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Function,
-            true,
+            KeyCorrelation::Text,
             &acq,
             &rel,
         );
@@ -491,7 +497,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Function,
-            true,
+            KeyCorrelation::Text,
             &acq,
             &rel,
         );
@@ -517,8 +523,14 @@ mod tests {
             .into_iter()
             .chain(keyed_calls(&tree, source, "rel(b)"))
             .collect::<Vec<_>>();
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Block, true, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Block,
+            KeyCorrelation::Text,
+            &acq,
+            &rel,
+        );
         assert_eq!(
             unmet.len(),
             1,
@@ -533,8 +545,14 @@ mod tests {
         let tree = parse(source);
         let acq = keyed_calls(&tree, source, "reg(id)");
         let rel = keyed_calls(&tree, source, "forget(id)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Module, true, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Module,
+            KeyCorrelation::Text,
+            &acq,
+            &rel,
+        );
         assert!(
             unmet.is_empty(),
             "the sibling forget discharges the same key"
@@ -546,8 +564,14 @@ mod tests {
         let source = "const on = (id) => { reg(id); };"; // no forget at all
         let tree = parse(source);
         let acq = keyed_calls(&tree, source, "reg(id)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Module, true, &acq, &[]);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Module,
+            KeyCorrelation::Text,
+            &acq,
+            &[],
+        );
         assert_eq!(unmet.len(), 1);
         assert!(!unmet[0].partial, "module scope has no partial notion");
         assert_eq!(
@@ -564,8 +588,14 @@ mod tests {
         let tree = parse(source);
         let acq = keyed_calls(&tree, source, "reg(id)");
         let rel = keyed_calls(&tree, source, "forget(id)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Module, true, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Module,
+            KeyCorrelation::Text,
+            &acq,
+            &rel,
+        );
         assert!(unmet.is_empty());
     }
 
@@ -575,8 +605,14 @@ mod tests {
         let tree = parse(source);
         let acq = keyed_calls(&tree, source, "reg(id)");
         let rel = keyed_calls(&tree, source, "forget(id)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Class, true, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Class,
+            KeyCorrelation::Text,
+            &acq,
+            &rel,
+        );
         assert!(
             unmet.is_empty(),
             "a sibling method of the same class releases the key"
@@ -589,8 +625,14 @@ mod tests {
         let tree = parse(source);
         let acq = keyed_calls(&tree, source, "reg(id)");
         let rel = keyed_calls(&tree, source, "forget(id)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Class, true, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Class,
+            KeyCorrelation::Text,
+            &acq,
+            &rel,
+        );
         assert_eq!(
             unmet.len(),
             1,
@@ -604,8 +646,14 @@ mod tests {
         let tree = parse(source);
         let acq = keyed_calls(&tree, source, "reg(id)");
         let rel = keyed_calls(&tree, source, "forget(id)");
-        let unmet =
-            JsObligationAnalyzer.analyze(&tree, source, ObligationScope::Class, true, &acq, &rel);
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Class,
+            KeyCorrelation::Text,
+            &acq,
+            &rel,
+        );
         assert_eq!(
             unmet.len(),
             1,
@@ -623,7 +671,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Component,
-            true,
+            KeyCorrelation::Text,
             &acq,
             &rel,
         );
@@ -643,7 +691,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Component,
-            true,
+            KeyCorrelation::Text,
             &acq,
             &rel,
         );
@@ -661,7 +709,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Component,
-            true,
+            KeyCorrelation::Text,
             &acq,
             &rel,
         );
@@ -698,7 +746,7 @@ mod tests {
             &tree,
             source,
             ObligationScope::Component,
-            true,
+            KeyCorrelation::Text,
             &acq,
             &rel,
         );
