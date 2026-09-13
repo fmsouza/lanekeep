@@ -3674,4 +3674,43 @@ mod tests {
             "nothing resolves -> empty origin"
         );
     }
+
+    #[test]
+    fn origin_of_a_cyclic_alias_terminates() {
+        // Exercises the cycle guard `origin_key`'s doc claims: `in_progress` is keyed per
+        // identifier occurrence, and the walk from `forget(a)` revisits `b`'s use inside
+        // `const a = b` a second time (at a deeper depth, alias-hopping through `const b = a`)
+        // where that occurrence is already in progress, cutting it there rather than recursing
+        // forever. The test *completing* is the proof it terminates; MAX_DEPTH is not what
+        // stops this one, since the cut lands well under it. A rootless mutual cycle has no
+        // terminal definition, so the correct origin is empty, not merely non-hanging.
+        let source = "function f() { const a = b; const b = a; forget(a); }";
+        let tree = parse(source);
+        let at_forget = ident(&tree, source, "a", 2); // 0 = `a`'s declarator, 1 = `const b = a` rhs, 2 = forget's arg
+        let o = origin_key(&tree, source, at_forget);
+        assert!(
+            o.is_empty(),
+            "a rootless mutual cycle has no terminal definition -> empty origin"
+        );
+    }
+
+    #[test]
+    fn origin_of_an_imported_key_matches_across_functions() {
+        // `declaration_of` resolves a named-import use to the enclosing `import_statement`
+        // (binding.rs's `a_use_reaches_the_import_that_bound_it`); `reaching_defs` never finds
+        // a reassignment of it (an import is never assignment-target-shaped), so
+        // `origin_of_identifier` takes the import statement itself as the root. One `import` is
+        // one node, so both functions land on the same root and correlate -- the same shape as
+        // `origin_of_a_shared_outer_const_matches_across_functions`, through an import rather
+        // than a module-level `const`.
+        let source =
+            "import { KEY } from './k';\nfunction o() { reg(KEY); }\nfunction c() { forget(KEY); }";
+        let tree = parse(source);
+        let in_o = ident(&tree, source, "KEY", 1);
+        let in_c = ident(&tree, source, "KEY", 2);
+        assert!(
+            origin_key(&tree, source, in_o).intersects(&origin_key(&tree, source, in_c)),
+            "both reference the one imported KEY"
+        );
+    }
 }
