@@ -11,40 +11,51 @@ use tree_sitter::{Node, Tree};
 
 use crate::cfg::{BlockId, Cfg};
 use crate::cfg_build::{enclosing_block, enclosing_cfg_root, enclosing_class};
+use crate::flow::{OriginKey, origin_key};
 
 /// Stateless; the shared static below is one instance for all three lang-js languages.
 pub(crate) struct JsObligationAnalyzer;
 
 impl ObligationAnalyzer for JsObligationAnalyzer {
-    fn analyze<'t>(
+    fn analyze<'t, 's>(
         &self,
-        _tree: &'t Tree,
-        source: &str,
+        tree: &'t Tree,
+        source: &'s str,
         scope: ObligationScope,
         correlation: KeyCorrelation,
         acquires: &[Keyed<'t>],
         releases: &[Keyed<'t>],
     ) -> Vec<UnmetObligation<'t>> {
-        // Task 3 plumbs the enum through; the actual Text/Binding distinction is a later
-        // task's job. Both behave as text correlation for now, exactly as the old `keyed`
-        // bool did — `Binding` is not yet a distinct code path.
-        let keyed = correlation != KeyCorrelation::None;
+        // Precomputed once, O(N+M): a `Binding` key's value-origin walk (`origin_key`) is the
+        // expensive part, and every correlation site below compares one key against several —
+        // it must not re-walk per pair. `Text`/`None` stay exactly as cheap as before (a byte
+        // range or nothing); only `Binding` pays for the walk, once per acquire/release.
+        let acq_pairs: Vec<(Keyed<'t>, CorrelationKey<'s>)> = acquires
+            .iter()
+            .copied()
+            .map(|k| (k, correlation_key(tree, source, &k, correlation)))
+            .collect();
+        let rel_pairs: Vec<(Keyed<'t>, CorrelationKey<'s>)> = releases
+            .iter()
+            .copied()
+            .map(|k| (k, correlation_key(tree, source, &k, correlation)))
+            .collect();
+
         // Module and Class are cross-function existence scopes: sibling functions and methods
-        // share no control-flow graph, so discharge is the existence of a matching-key release
+        // share no control-flow graph, so discharge is the existence of a correlating release
         // in the same region, not reachability. Handle them before the per-acquire CFG loop
         // below, which assumes one enclosing function body per acquire.
         match scope {
             ObligationScope::Module => {
-                return discharge_by_existence(source, acquires, releases, |_| None, false);
+                return discharge_by_existence(&acq_pairs, &rel_pairs, |_| None, false);
             }
             ObligationScope::Class => {
-                return discharge_by_existence(source, acquires, releases, enclosing_class, true);
+                return discharge_by_existence(&acq_pairs, &rel_pairs, enclosing_class, true);
             }
             ObligationScope::Component => {
                 return discharge_by_existence(
-                    source,
-                    acquires,
-                    releases,
+                    &acq_pairs,
+                    &rel_pairs,
                     |n| enclosing_component(n, source),
                     true,
                 );
@@ -55,10 +66,10 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
         let mut out: Vec<UnmetObligation<'t>> = Vec::new();
 
         // Source order of the acquire, for determinism.
-        let mut ordered: Vec<Keyed<'t>> = acquires.to_vec();
-        ordered.sort_by_key(|k| k.node.start_byte());
+        let mut ordered = acq_pairs.clone();
+        ordered.sort_by_key(|(k, _)| k.node.start_byte());
 
-        for acquire in ordered {
+        for (acquire, acq_key) in ordered {
             let Some(root) = enclosing_cfg_root(acquire.node) else {
                 continue;
             };
@@ -90,35 +101,26 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
                 | ObligationScope::Component => None,
             };
 
-            // Value identity: with `keyed`, a release only discharges an acquire whose
-            // `@key` text agrees with its own. A keyed acquire whose match bound no `@key`
-            // correlates with nothing, so it is always reported (the `_ => false` arm).
-            let acq_key = key_text(source, &acquire);
-
             // Release blocks for this same function (a release node whose root is this
             // root) and, for block scope, lexically inside `region`. A release outside the
             // region cannot be what discharges a block-scoped obligation even if it is
             // reachable — `{ acquire(); } release();` must still report. `resolve_blocks`
             // handles finally-duplicated release nodes.
-            let rel_blocks: Vec<BlockId> = releases
+            let rel_blocks: Vec<BlockId> = rel_pairs
                 .iter()
-                .filter(|r| enclosing_cfg_root(r.node).is_some_and(|rr| rr.id() == root.id()))
-                .filter(|r| {
+                .filter(|(r, _)| enclosing_cfg_root(r.node).is_some_and(|rr| rr.id() == root.id()))
+                .filter(|(r, _)| {
                     region.as_ref().is_none_or(|region| {
                         r.node.start_byte() >= region.start && r.node.end_byte() <= region.end
                     })
                 })
-                .filter(|r| {
-                    if !keyed {
-                        return true; // un-keyed: today's behavior, any release discharges.
-                    }
-                    // keyed: both sides must carry a key and the texts must agree.
-                    match (acq_key, key_text(source, r)) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => false,
-                    }
+                .filter(|(_, rel_key)| match correlation {
+                    // un-keyed: today's behavior, any release discharges.
+                    KeyCorrelation::None => true,
+                    // keyed: both sides must carry a key and correlate under it.
+                    KeyCorrelation::Text | KeyCorrelation::Binding => correlate(&acq_key, rel_key),
                 })
-                .flat_map(|r| resolve_blocks(&cfg, r.node))
+                .flat_map(|(r, _)| resolve_blocks(&cfg, r.node))
                 .collect();
 
             let discharged = match &region {
@@ -153,32 +155,84 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
     }
 }
 
+/// A `Keyed`'s `@key`, reduced for comparison under a [`KeyCorrelation`] — precomputed once per
+/// acquire/release so the value-origin walk behind `Binding` is O(N+M), not O(N×M) over every
+/// pair compared.
+#[derive(Clone)]
+enum CorrelationKey<'s> {
+    /// No `@key` in this match, or `KeyCorrelation::None` (correlation is not in play).
+    Absent,
+    /// Correlate by exact captured text.
+    Text(&'s str),
+    /// Correlate by shared value origin.
+    Origin(OriginKey),
+}
+
+/// Reduce a `Keyed`'s `@key` capture to a [`CorrelationKey`] under `correlation`. The
+/// value-origin walk (`origin_key`) only ever runs here, once per node — never inside a
+/// comparison — which is what keeps `Binding` linear rather than quadratic.
+fn correlation_key<'t, 's>(
+    tree: &'t Tree,
+    source: &'s str,
+    k: &Keyed<'t>,
+    correlation: KeyCorrelation,
+) -> CorrelationKey<'s> {
+    match correlation {
+        KeyCorrelation::None => CorrelationKey::Absent,
+        KeyCorrelation::Text => match key_text(source, k) {
+            Some(text) => CorrelationKey::Text(text),
+            None => CorrelationKey::Absent,
+        },
+        KeyCorrelation::Binding => match k.key.map(|n| origin_key(tree, source, n)) {
+            // An origin that resolved to nothing (cycle, depth limit, opaque access) cannot
+            // correlate with anything either — collapsing it to `Absent` keeps "no value
+            // origin found" and "no `@key` captured" the same case for `correlate`, rather
+            // than relying on `intersects` being incidentally false between two empty sets.
+            Some(origin) if !origin.is_empty() => CorrelationKey::Origin(origin),
+            _ => CorrelationKey::Absent,
+        },
+    }
+}
+
+/// Whether two precomputed keys correlate — name the same value. `Absent` never correlates,
+/// not even with itself: a keyed acquire or release whose match bound no `@key` cannot be what
+/// discharges (or is discharged by) anything, matching the pre-`CorrelationKey` behavior where
+/// a missing `@key`'s `Option` was compared and never taken the `Some == Some` arm. The un-keyed
+/// "any release discharges" path (`KeyCorrelation::None`) does not call this at all — see its
+/// own arm in `analyze`'s function/block filter.
+fn correlate(a: &CorrelationKey<'_>, b: &CorrelationKey<'_>) -> bool {
+    match (a, b) {
+        (CorrelationKey::Text(x), CorrelationKey::Text(y)) => x == y,
+        (CorrelationKey::Origin(x), CorrelationKey::Origin(y)) => x.intersects(y),
+        _ => false,
+    }
+}
+
 /// Discharge by existence within a region, shared by every cross-function scope.
 ///
 /// `region_of` maps a node to the region node that bounds correlation; `region_required` is
-/// `false` for `module` (the region is the whole file, so any matching-key release counts) and
+/// `false` for `module` (the region is the whole file, so any correlating release counts) and
 /// `true` for `class`/`component` (a release only discharges an acquire in the *same* region
-/// node, and an acquire outside any region can never be discharged). Correlation is text
-/// equality — value-flow is a later change.
-fn discharge_by_existence<'t>(
-    source: &str,
-    acquires: &[Keyed<'t>],
-    releases: &[Keyed<'t>],
+/// node, and an acquire outside any region can never be discharged). Correlation is whatever
+/// `acquires`/`releases` were already reduced to — `analyze` precomputes each `CorrelationKey`
+/// once, so `Text` vs `Binding` is baked in by the time this runs and this function never reads
+/// source or `KeyCorrelation` itself.
+fn discharge_by_existence<'t, 's>(
+    acquires: &[(Keyed<'t>, CorrelationKey<'s>)],
+    releases: &[(Keyed<'t>, CorrelationKey<'s>)],
     region_of: impl Fn(Node<'t>) -> Option<Node<'t>>,
     region_required: bool,
 ) -> Vec<UnmetObligation<'t>> {
-    let mut ordered: Vec<Keyed<'t>> = acquires.to_vec();
-    ordered.sort_by_key(|k| k.node.start_byte());
+    let mut ordered = acquires.to_vec();
+    ordered.sort_by_key(|(k, _)| k.node.start_byte());
     ordered
         .into_iter()
-        .filter_map(|acquire| {
+        .filter_map(|(acquire, acq_key)| {
             let acq_region = region_of(acquire.node).map(|n| n.id());
             let discharged = !(region_required && acq_region.is_none())
-                && key_text(source, &acquire).is_some_and(|ak| {
-                    releases.iter().any(|r| {
-                        key_text(source, r) == Some(ak)
-                            && (!region_required || region_of(r.node).map(|n| n.id()) == acq_region)
-                    })
+                && releases.iter().any(|(r, rel_key)| {
+                    correlate(&acq_key, rel_key)
+                        && (!region_required || region_of(r.node).map(|n| n.id()) == acq_region)
                 });
             (!discharged).then_some(UnmetObligation {
                 acquire: acquire.node,
@@ -253,9 +307,8 @@ fn contains_jsx(node: Node<'_>) -> bool {
     false
 }
 
-/// Text of a `Keyed`'s `@key` capture, for correlating an acquire with a release by value
-/// identity. `None` when the match bound no `@key` — shared by every existence-scope discharge
-/// check and the per-acquire keyed filter, so the paths cannot drift on what "the key" means.
+/// Text of a `Keyed`'s `@key` capture. `None` when the match bound no `@key`. The `Text` arm of
+/// [`correlation_key`] — `Binding` correlates by value origin instead, via `origin_key`.
 fn key_text<'s>(source: &'s str, k: &Keyed<'_>) -> Option<&'s str> {
     k.key.map(|n| &source[n.byte_range()])
 }
@@ -756,5 +809,76 @@ mod tests {
             "Factory has no JSX, so it is not a component region, even though the acquire \
              and its matching-key release share one PascalCase-named host"
         );
+    }
+
+    // -- KeyCorrelation::Binding -------------------------------------------------------
+
+    #[test]
+    fn binding_correlates_a_renamed_copy_under_function_scope() {
+        let source = "function f(clientId) { const id = clientId; reg(clientId); forget(id); }";
+        let tree = parse(source);
+        let acq = keyed_calls(&tree, source, "reg(clientId)");
+        let rel = keyed_calls(&tree, source, "forget(id)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Function,
+            KeyCorrelation::Binding,
+            &acq,
+            &rel,
+        );
+        assert!(
+            unmet.is_empty(),
+            "id is a copy of clientId -> same origin -> discharged"
+        );
+    }
+
+    #[test]
+    fn text_does_not_correlate_the_renamed_copy() {
+        // The same source under Text reports: "clientId" != "id".
+        let source = "function f(clientId) { const id = clientId; reg(clientId); forget(id); }";
+        let tree = parse(source);
+        let acq = keyed_calls(&tree, source, "reg(clientId)");
+        let rel = keyed_calls(&tree, source, "forget(id)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Function,
+            KeyCorrelation::Text,
+            &acq,
+            &rel,
+        );
+        assert_eq!(unmet.len(), 1, "text correlation cannot follow the rename");
+    }
+
+    #[test]
+    fn binding_reports_distinct_params_but_text_is_silent() {
+        // The #257 param-based sibling flagship: distinct params -> different origins.
+        let source = "const onC = (clientId) => { reg(clientId); };\nconst onD = (clientId) => { forget(clientId); };";
+        let tree = parse(source);
+        let acq = keyed_calls(&tree, source, "reg(clientId)");
+        let rel = keyed_calls(&tree, source, "forget(clientId)");
+        let by_binding = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Module,
+            KeyCorrelation::Binding,
+            &acq,
+            &rel,
+        );
+        let by_text = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Module,
+            KeyCorrelation::Text,
+            &acq,
+            &rel,
+        );
+        assert_eq!(
+            by_binding.len(),
+            1,
+            "distinct param bindings do not correlate under binding"
+        );
+        assert!(by_text.is_empty(), "text still correlates the shared name");
     }
 }

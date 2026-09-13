@@ -240,8 +240,12 @@ impl FlowAnalyzer for JsFlowAnalyzer {
 /// the same value — iff their sets intersect, which is what lets an obligation rule pair an acquire
 /// with its release by the key each is given.
 ///
-/// Deterministic: a [`BTreeSet`] of `node.id()`s read from the tree and source alone, with no clock
-/// or environment (the determinism invariant, `docs/architecture.md`).
+/// The ids are `node.id()` — a raw subtree pointer, not a content hash — so they are **run-local**
+/// identities, valid only for correlating two `OriginKey`s built in the same run, through
+/// [`Self::intersects`]/[`Self::is_empty`]. They are not the file-content determinism the rest of
+/// the engine promises (`docs/architecture.md`'s determinism invariant): two parses of identical
+/// bytes are not guaranteed to land the same ids, even within one process. Never serialize an
+/// `OriginKey`, fold it into a cache key, or sort/emit its ids into output.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OriginKey {
     defs: BTreeSet<usize>,
