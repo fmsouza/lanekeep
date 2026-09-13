@@ -1419,8 +1419,10 @@ impl Engine {
                             });
                             // `key_by` only distinguishes `Text` from `Binding` once a `@key`
                             // is actually bound — with none, correlation is `None` regardless
-                            // of what `key_by` says. Binding behaves as Text for now; that
-                            // distinction is a later task's job (see `JsObligationAnalyzer`).
+                            // of what `key_by` says. `key_by == "binding"` maps to
+                            // `KeyCorrelation::Binding`, which correlates by value origin via
+                            // `origin_key` (`lanekeep-lang-js`'s `flow.rs`) rather than by
+                            // captured text.
                             let correlation = if !keyed {
                                 KeyCorrelation::None
                             } else if o.key_by == "binding" {
