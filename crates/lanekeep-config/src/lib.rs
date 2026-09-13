@@ -2350,12 +2350,12 @@ fn has_dataflow(requires: &serde_json::Value) -> bool {
 /// an `obligation` not paired with `requires: ['dataflow']`, then an `acquire` or `release`
 /// role that is empty or holds a query never binding the capture its role names. Only after
 /// those do [`check_obligation_key`]'s two `@key` refusals run — `@key` bound on some
-/// acquire/release queries but not every one, or a `scope` of `"module"` or `"class"` with
-/// `@key` not bound on every query — and whether the scope token itself is one of `"function"`,
-/// `"block"`, `"module"`, or `"class"` is checked last of all. So a `scope: 'loop'` obligation
-/// that also mixes `@key` is refused for the mixed `@key`, never for the unknown scope — the
-/// two never both get a chance to speak. An *absent* `scope` is [`build_obligation`]'s to
-/// refuse, where the value is consumed.
+/// acquire/release queries but not every one, or a `scope` of `"module"`, `"class"`, or
+/// `"component"` with `@key` not bound on every query — and whether the scope token itself is
+/// one of `"function"`, `"block"`, `"module"`, `"class"`, or `"component"` is checked last of
+/// all. So a `scope: 'loop'` obligation that also mixes `@key` is refused for the mixed `@key`,
+/// never for the unknown scope — the two never both get a chance to speak. An *absent* `scope`
+/// is [`build_obligation`]'s to refuse, where the value is consumed.
 ///
 /// The role floors are `parse_flow`'s, restated: an empty `acquire` has nothing to be
 /// obligated and an empty `release` nothing to discharge it, so `checkObligation` is either
@@ -2443,14 +2443,16 @@ fn check_obligation_role(
     Ok(())
 }
 
-/// `@key` correlation is all-or-nothing, and a `module` or `class` scope requires it.
+/// `@key` correlation is all-or-nothing, and a `module`, `class`, or `component` scope
+/// requires it.
 ///
 /// Binding `@key` on some acquire/release queries but not every one has decided that
 /// correlation matters for part of the obligation and not the rest, which is not a coherent
-/// shape to run — refused regardless of `scope`. And `scope: 'module'` or `scope: 'class'`
-/// without `@key` on every query is refused too: without correlation a module- or class-wide
-/// scope is strictly worse than a narrower one, since every unrelated acquire/release pair in
-/// the file (or, for `class`, in the class) would fall into the same bucket.
+/// shape to run — refused regardless of `scope`. And `scope: 'module'`, `scope: 'class'`, or
+/// `scope: 'component'` without `@key` on every query is refused too: without correlation a
+/// module-, class-, or component-wide scope is strictly worse than a narrower one, since every
+/// unrelated acquire/release pair in the file (or, for `class`/`component`, in the class or
+/// component) would fall into the same bucket.
 fn check_obligation_key(o: &RawObligation, id: &RuleId) -> Result<(), String> {
     let binds_key = |q: &str| binds(q, "key");
     let acq_all = o.acquire.iter().all(|q| binds_key(q));
