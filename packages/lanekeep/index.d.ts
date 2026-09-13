@@ -483,8 +483,9 @@ export type ObligationSpec = {
    * `'function'` — every path out of the enclosing function, `return`/`throw` included.
    * `'block'` — every path out of the block the acquire is in.
    * `'module'` — a matching-`@key` release must exist somewhere in the file.
+   * `'class'` — a matching-`@key` release must exist in the same class.
    */
-  scope: 'function' | 'block' | 'module'
+  scope: 'function' | 'block' | 'module' | 'class'
 }
 
 /** An acquire some path leaves undischarged, passed to `checkObligation`. */

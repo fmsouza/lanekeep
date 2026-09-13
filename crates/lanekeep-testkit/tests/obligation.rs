@@ -309,3 +309,67 @@ fn a_missing_forget_reports_and_names_the_key() {
         )
         .expect("no forget anywhere");
 }
+
+/// `scope: 'class'`, run end to end. Same acquire/release queries and `@key` correlation as
+/// `KEYED` above; only the existence region changes, from the whole file to the enclosing
+/// class. `crates/lanekeep-lang-js/src/obligation.rs`'s
+/// `class_scope_is_silent_when_a_sibling_method_releases_the_same_key` and
+/// `class_scope_reports_when_the_release_is_in_a_different_class` carry the same two fixture
+/// shapes directly against `JsObligationAnalyzer`; these are the `RuleTester` equivalent,
+/// exercised through query matching, `Engine::run_rule`'s obligation arm, and
+/// `checkObligation` itself.
+const CLASS: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/registered-is-forgotten-in-class',\n\
+      requires: ['dataflow'],\n\
+      obligation: {\n\
+        acquire: ['(call_expression function: (identifier) @f (#eq? @f \"reg\") \
+                   arguments: (arguments (identifier) @key)) @acquire'],\n\
+        release: ['(call_expression function: (identifier) @f (#eq? @f \"forget\") \
+                   arguments: (arguments (identifier) @key)) @release'],\n\
+        scope: 'class',\n\
+      },\n\
+      card: { message: 'not forgotten', remediation: 'call forget(id) in the same class',\n\
+              examples: { bad: 'class C { open() { reg(a); } }',\n\
+                          good: 'class C { open() { reg(a); } close() { forget(a); } }' } },\n\
+      checkObligation(ctx, u) {\n\
+        ctx.report(u.acquire, `registration for ${ctx.text(u.key)} is never forgotten`);\n\
+      },\n\
+    });\n";
+
+fn class_scope() -> RuleTester {
+    RuleTester::new("class-scope", CLASS).expect("builds")
+}
+
+/// A naive translation of `a_matching_forget_in_a_sibling_arrow_is_silent` above — only
+/// `scope: 'module'` swapped for `scope: 'class'`, the fixture otherwise untouched — reports:
+/// `on`/`off` are sibling arrow functions with no enclosing class at all, and `scope: 'class'`
+/// requires one (`crates/lanekeep-lang-js/src/obligation.rs`'s
+/// `class_scope_reports_an_acquire_with_no_enclosing_class`), so `reg(id)` is unconditionally
+/// reported regardless of the matching `forget(id)` sitting elsewhere in the file — this is
+/// the RED this suite's task report records, proof that `class` genuinely differs from
+/// `module` rather than aliasing it. Wrapping both calls in one shared class, as below, is
+/// what makes it discharge.
+#[test]
+fn a_matching_forget_in_a_sibling_method_of_the_same_class_is_silent() {
+    class_scope()
+        .accepts("class C { open() { reg(id); } close() { forget(id); } }\n")
+        .expect("the sibling method's forget, in the same class, discharges it");
+}
+
+/// The invalid half of the pair above: `open`/`close` still sit in sibling methods with no
+/// control-flow graph in common, but now in two different classes rather than one. The
+/// matching key exists in the file — this is not `a_missing_forget_reports_and_names_the_key`'s
+/// "no forget anywhere" case — but `scope: 'class'` bounds existence to the *same* class
+/// (`crates/lanekeep-lang-js/src/obligation.rs`'s
+/// `class_scope_reports_when_the_release_is_in_a_different_class`), so a release next door in
+/// a sibling class cannot discharge it.
+#[test]
+fn a_forget_in_a_different_class_still_reports() {
+    class_scope()
+        .reports_messages(
+            "class A { open() { reg(id); } }\nclass B { close() { forget(id); } }\n",
+            &["registration for id is never forgotten"],
+        )
+        .expect("the only forget is in a different class");
+}
