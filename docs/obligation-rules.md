@@ -56,7 +56,8 @@ same file.
 type ObligationSpec = {
   acquire: string[]
   release: string[]
-  scope: 'function' | 'block' | 'module' | 'class'
+  scope: 'function' | 'block' | 'module' | 'class' | 'component'
+  keyBy?: 'text' | 'binding'
 }
 ```
 
@@ -67,11 +68,13 @@ or a `zeroBytes(...)` helper, and either one discharges it. A capture literally 
 `@acquire` or `@release` is what the analyzer reads out of a match; name it that in every
 query, however the rest of the pattern is shaped. A query in either role may also bind an
 optional `@key` capture alongside it, to correlate a specific acquire with a specific release
-rather than treating every release as interchangeable — see "`@key` correlation and
-`scope: 'module'`" and "`@key` correlation and `scope: 'class'`" below.
+rather than treating every release as interchangeable, and `keyBy` says *how* two `@key`
+captures are compared — see "`@key` correlation and `scope: 'module'`", "`@key` correlation and
+`scope: 'class'`", "`@key` correlation and `scope: 'component'`" and "`keyBy`: correlating by
+value origin" below.
 
-`scope` decides which paths have to carry a release, or — for `'module'` and `'class'` —
-whether a matching one exists at all:
+`scope` decides which paths have to carry a release, or — for `'module'`, `'class'` and
+`'component'` — whether a matching one exists at all:
 
 - **`'function'`** — every path out of the function the acquire sits in, `return` and
   `throw` included.
@@ -85,6 +88,14 @@ whether a matching one exists at all:
   class, a sibling method included. An acquire with no enclosing class at all can never be
   discharged under this scope, however the file's releases are keyed. This scope requires
   `@key` too — see below.
+- **`'component'`** — like `'module'` and `'class'`, but bounded to the enclosing React
+  *function* component: the nearest function or arrow function whose name — its own, or the
+  `const`/`let` binding it is assigned to — starts with an uppercase letter, and whose body
+  contains JSX anywhere in it. Discharge is whether a release keyed to the same `@key` exists
+  somewhere inside that same component, a nested callback (an event handler, a `useEffect`
+  cleanup) included. An acquire with no enclosing component at all — a plain helper function,
+  or a *class* component's method (see "Class components are out of scope" below) — can never
+  be discharged under this scope. This scope requires `@key` too — see below.
 
 ## `requires: ['dataflow']` is mandatory
 
@@ -100,9 +111,9 @@ being present. The load-time refusals, all naming the rule:
 | `acquire` or `release` empty or absent | refused — nothing to acquire, or nothing to discharge it, means `checkObligation` could never say anything true |
 | an `acquire` query with no `@acquire`, or a `release` query with no `@release` | refused — it would compile and match nothing forever |
 | `scope` missing | refused — the type declares it required, and the loader says the same rather than defaulting to `'function'` |
-| `scope` other than `'function'`/`'block'`/`'module'`/`'class'` | refused |
+| `scope` other than `'function'`/`'block'`/`'module'`/`'class'`/`'component'` | refused |
 | `@key` bound on some acquire/release queries but not every one | refused — correlation has to be all-or-nothing across the whole obligation, never partial |
-| `scope: 'module'` or `scope: 'class'` without `@key` bound on every acquire and release query | refused — a file-wide (or class-wide) scope with no correlation would let any release in the file (or class) discharge any acquire |
+| `scope: 'module'`, `scope: 'class'`, or `scope: 'component'` without `@key` bound on every acquire and release query | refused — a file-, class-, or component-wide scope with no correlation would let any release in the file (or class, or component) discharge any acquire |
 | an acquire or release query that fails to compile | refused, naming the rule, at the same point a broken main `query` is |
 | neither `check` nor `obligation` | refused — a rule needs a handler |
 
@@ -123,8 +134,8 @@ type UnmetObligation = {
 | Field | Meaning |
 | --- | --- |
 | `acquire` | The node the acquire query matched. |
-| `exit` | The source-earliest `return`, `throw`, or implicit function end reachable from the acquire without passing a release. This is what `ctx.report` is usually called on — the escape the analysis found, not the acquire itself. Under `scope: 'module'` or `scope: 'class'` there is no path to walk, so this is always the acquire node itself. |
-| `partial` | Whether *some* path did discharge the obligation. A resource zeroed on the happy path but missed on one early `return` is a different finding from one never zeroed at all, and `partial` is how a rule tells the two apart in its message. Always `false` under `scope: 'module'` or `scope: 'class'` — there are no paths to be partial over. |
+| `exit` | The source-earliest `return`, `throw`, or implicit function end reachable from the acquire without passing a release. This is what `ctx.report` is usually called on — the escape the analysis found, not the acquire itself. Under `scope: 'module'`, `scope: 'class'`, or `scope: 'component'` there is no path to walk, so this is always the acquire node itself. |
+| `partial` | Whether *some* path did discharge the obligation. A resource zeroed on the happy path but missed on one early `return` is a different finding from one never zeroed at all, and `partial` is how a rule tells the two apart in its message. Always `false` under `scope: 'module'`, `scope: 'class'`, or `scope: 'component'` — there are no paths to be partial over. |
 | `key` | The acquire's `@key` capture, present when the rule's acquire and release queries bind one — absent for an un-keyed obligation. `ctx.text(unmet.key)` is how a rule names the value in its own message; see the worked example below. |
 
 `checkObligation` is called once per acquire the analysis cannot prove discharged — nothing
@@ -217,10 +228,11 @@ may bind it too, and the release set the CFG walk considers is filtered down to 
 releases before that walk runs. That is what makes `const a = acq(); const b = acq(); rel(a)`
 report only `b`, once both `acq`'s and `rel`'s queries key on the acquired value: without
 `@key` a release discharges every acquire it is on-all-paths-from regardless of which value
-came back, and `a` would silently cover for `b`. `scope: 'module'` and `scope: 'class'` are
-the two places `@key` stops being optional: without it a file-wide or class-wide scope would
-let any release in the file (or class) discharge any acquire, which is strictly worse than a
-scope that at least confines itself to one function — see the load-time refusals above.
+came back, and `a` would silently cover for `b`. `scope: 'module'`, `scope: 'class'` and
+`scope: 'component'` are the places `@key` stops being optional: without it a file-, class-,
+or component-wide scope would let any release in the file (or class, or component) discharge
+any acquire, which is strictly worse than a scope that at least confines itself to one
+function — see the load-time refusals above.
 
 ## `@key` correlation and `scope: 'class'`
 
@@ -271,30 +283,185 @@ The third row is where `'class'` and `'module'` diverge sharpest: an acquire out
 can never be discharged under `scope: 'class'`, even when an otherwise-matching release exists
 in the same file — `'module'` would have accepted it.
 
+## `@key` correlation and `scope: 'component'`
+
+`scope: 'component'` asks the same existence question as `'module'` and `'class'` — a
+matching-key release somewhere, not a control-flow path — but bounds "somewhere" to the
+enclosing React function component: the nearest function or arrow function whose name starts
+with an uppercase letter and whose body contains JSX anywhere in it. It is the shape for a
+subscribe/cleanup pair expressed inside one component, however the cleanup call itself is
+nested — directly in the body, or inside a `useEffect` callback:
+
+```ts
+export default defineRule({
+  id: 'local/subscription-is-cleaned-up',
+  requires: ['dataflow'],
+  obligation: {
+    acquire: [
+      `(call_expression function: (identifier) @f (#eq? @f "subscribe")
+         arguments: (arguments (identifier) @key)) @acquire`,
+    ],
+    release: [
+      `(call_expression function: (identifier) @f (#eq? @f "unsubscribe")
+         arguments: (arguments (identifier) @key)) @release`,
+    ],
+    scope: 'component',
+  },
+  card: {
+    message: 'subscription not cleaned up',
+    remediation: 'call unsubscribe(id) somewhere in the same component, e.g. a useEffect cleanup',
+    examples: {
+      bad: 'function Feed({ id }) { subscribe(id); return <div/> }',
+      good: 'function Feed({ id }) { useEffect(() => { subscribe(id); return () => unsubscribe(id) }, [id]); return <div/> }',
+    },
+  },
+  checkObligation(ctx, unmet) {
+    ctx.report(unmet.acquire, `subscription for ${ctx.text(unmet.key)} is never cleaned up`)
+  },
+})
+```
+
+Same `@key` correlation rule as `'module'` and `'class'` above — exact source-text equality,
+all-or-nothing across every acquire and release query.
+
+| Code | Result |
+| --- | --- |
+| `function Feed({ id }) { subscribe(id); return <div/>; }` | reports — no `unsubscribe` anywhere in `Feed` |
+| `function Feed({ id }) { useEffect(() => { subscribe(id); return () => unsubscribe(id); }, [id]); return <div/>; }` | silent — the cleanup sits inside a nested callback, but that callback is still lexically inside `Feed`'s body, which is the whole of the component region |
+| `function Feed({ id }) { subscribe(id); return <div/>; }` and, elsewhere in the file, `function Other({ id }) { unsubscribe(id); return <div/>; }` | reports — the release exists, but in a different component |
+| `function feed({ id }) { subscribe(id); return <div/>; }` | reports, unconditionally — lowercase name, so `feed` is not a component at all, and there is no region to search for a release in |
+| `function Feed({ id }) { subscribe(id); }` (no JSX anywhere in the body) | reports, unconditionally — `Feed` is PascalCase but has no JSX, so it is not a component either |
+
+### Class components are out of scope
+
+`'component'` only ever recognizes a function or arrow function — never a class. A class
+component's acquire and release calls are invisible to it, exactly as a plain top-level
+function's calls are invisible to `'class'` scope's search. Write the rule with
+`scope: 'class'` instead (above) to cover a class component's own acquire/release pairing:
+that scope bounds the search to the enclosing class body — `render`, lifecycle methods, and
+any other method of the same class — which is precisely a class component's shape.
+
+```ts
+class Feed extends React.Component {
+  componentDidMount() { subscribe(this.props.id) }
+  componentWillUnmount() { unsubscribe(this.props.id) }
+  render() { return <div/> }
+}
+```
+
+is a `scope: 'class'` obligation, not a `scope: 'component'` one: there is no function or
+arrow function here for `'component'` to find in the first place, so an obligation rule
+written with `scope: 'component'` would report every acquire in this class unconditionally,
+regardless of the matching release two lines below it.
+
+## `keyBy`: correlating by value origin
+
+Every `@key` correlation shown above compares by **exact captured text** — `keyBy: 'text'`,
+the default. `keyBy: 'binding'` compares differently: not what the `@key` capture *says*, but
+what value it resolves to, following identifier copies, transparent wrappers and ternaries back
+to a terminal definition — a parameter, a non-alias initializer, or an import — with a
+reassignment killing an earlier definition the same way an ordinary tainted read would see it.
+Two `@key` captures correlate under `keyBy: 'binding'` when that walk finds them sharing a root
+definition; it reuses the dataflow analyzer's own reaching-definition machinery rather than a
+second implementation of it.
+
+```ts
+export default defineRule({
+  id: 'local/registered-is-forgotten-by-origin',
+  requires: ['dataflow'],
+  obligation: {
+    acquire: [
+      `(call_expression function: (identifier) @f (#eq? @f "register")
+         arguments: (arguments (identifier) @key)) @acquire`,
+    ],
+    release: [
+      `(call_expression function: (identifier) @f (#eq? @f "forget")
+         arguments: (arguments (identifier) @key)) @release`,
+    ],
+    scope: 'function',
+    keyBy: 'binding',
+  },
+  card: {
+    message: 'not forgotten',
+    remediation: 'call forget on the same value',
+    examples: { bad: 'register(a);', good: 'register(a); forget(a);' },
+  },
+  checkObligation(ctx, unmet) {
+    ctx.report(unmet.exit, unmet.partial ? 'missed on some path' : 'never forgotten')
+  },
+})
+```
+
+| Code | Result |
+| --- | --- |
+| `function f(clientId) { const id = clientId; register(clientId); forget(id); }` | silent — `id` is a plain copy of `clientId`; both `@key` captures resolve to the same parameter |
+| `function f(clientId, otherId) { register(clientId); forget(otherId); }` | reports — `clientId` and `otherId` are two distinct parameters; the release's key resolves to a different origin |
+
+This is the same register/forget shape "`@key` correlation and `scope: 'module'`" above uses,
+with `scope: 'function'` and `keyBy: 'binding'` in place of `scope: 'module'`'s default
+`keyBy: 'text'` — `keyBy` composes with every `scope`, not only `'function'` shown here.
+`'block'`, `'module'`, `'class'` and `'component'` each still ask their own question, a
+control-flow path or existence in a region; `keyBy` only changes how the two sides of a
+correlation are compared once that question is asked.
+
+`keyBy: 'binding'` requires `@key` bound on every acquire and release query, refused at load
+otherwise — the identical ground `scope: 'module'`, `scope: 'class'` and `scope: 'component'`
+are already refused on, above: with no `@key` anywhere there is nothing for it to correlate by.
+And a `@key` whose value-origin walk resolves to nothing — an unresolved use, a reference cycle,
+or the walk's own depth limit — has no key to correlate with anything and is always reported,
+the same safe-over-report posture `@key` correlation has everywhere else in this document.
+
+### `'binding'` does not correlate distinct per-frame parameters
+
+Value-origin tracking is static: a `@key` resolves to the AST node of its own declaration, never
+to "whichever call passed this argument." Two different functions each declaring their own
+parameter of the same name are two different declarations, with two different origins, however
+identically they are named. The sibling-callback pattern from "`@key` correlation and
+`scope: 'module'`" above —
+
+```ts
+const on = (id) => { reg(id) }
+const off = (id) => { forget(id) }
+```
+
+— relies on `on`'s `id` and `off`'s `id` correlating by name alone, since `scope: 'module'`'s
+default `keyBy: 'text'` compares exactly that. Rewriting it to `keyBy: 'binding'` would report
+`reg(id)` unconditionally: `on`'s parameter and `off`'s parameter are two distinct declarations
+with no shared origin, whatever a caller elsewhere might pass to both. **Use `keyBy: 'text'` —
+the default — for this pattern.** Reach for `'binding'` only where the two `@key` sides are
+genuinely the same lexical value, copied or wrapped, rather than two independently-bound
+parameters that merely happen to share a name.
+
 ## Limitations
 
 Each of these is a stated v1 scope decision, not an oversight — see
 [`architecture.md`](architecture.md) §6.11 for the mechanism behind each one.
 
 - **Value identity is opt-in, through `@key`.** Bind an optional `@key` capture on every
-  acquire and release query — see "`@key` correlation and `scope: 'module'`" and
-  "`@key` correlation and `scope: 'class'`" above — and discharge requires matching key text,
-  not merely a release somewhere on all paths. `scope: 'module'` and `scope: 'class'` both
-  require it outright: a file-wide or class-wide scope with no correlation would let any
-  release discharge any acquire, which is strictly worse than a narrower scope. Without
-  `@key`, nothing here has changed: a release on all paths still discharges every acquire it
-  is on-all-paths-from, regardless of which value it released — exact with one acquire per
-  function and imprecise with several, do not rely on it to tell two acquired values in the
-  same function apart. And keyed or not, there is still no notion that `return`/`throw`
-  themselves release: a release is only ever a query match, never inferred from a value
-  handed back to a caller that might release it instead.
+  acquire and release query — see "`@key` correlation and `scope: 'module'`",
+  "`@key` correlation and `scope: 'class'`" and "`@key` correlation and `scope: 'component'`"
+  above — and discharge requires the two keys to correlate, not merely a release somewhere on
+  all paths: matching captured text by default (`keyBy: 'text'`), or a shared value origin
+  under `keyBy: 'binding'` (see "`keyBy`: correlating by value origin" above, including the
+  caveat that `'binding'` does not correlate two distinct functions' distinct parameters).
+  `scope: 'module'`, `scope: 'class'` and `scope: 'component'` all require `@key` outright:
+  a file-, class-, or component-wide scope with no correlation would let any release discharge
+  any acquire, which is strictly worse than a narrower scope. Without `@key`, nothing here has
+  changed: a release on all paths still discharges every acquire it is on-all-paths-from,
+  regardless of which value it released — exact with one acquire per function and imprecise
+  with several, do not rely on it to tell two acquired values in the same function apart. And
+  keyed or not, there is still no notion that `return`/`throw` themselves release: a release is
+  only ever a query match, never inferred from a value handed back to a caller that might
+  release it instead.
 - **Nothing crosses a function boundary under `'function'`/`'block'` scope.** The unit of
   analysis there is the function the acquire is in; a callback or a call passed the acquired
-  value is invisible to the CFG walk. `scope: 'module'` and `scope: 'class'` are the deliberate
-  exceptions — they exist because this is exactly what makes a register/forget pair split
-  across two sibling callbacks, or two sibling methods, inexpressible otherwise, and each buys
-  that by giving up the control-flow graph entirely for an existence check keyed by `@key` —
-  file-wide for `'module'`, bounded to the enclosing class for `'class'`.
+  value is invisible to the CFG walk. `scope: 'module'`, `scope: 'class'` and
+  `scope: 'component'` are the deliberate exceptions — they exist because this is exactly what
+  makes a register/forget pair split across two sibling callbacks, two sibling methods, or two
+  sibling components, inexpressible otherwise, and each buys that by giving up the
+  control-flow graph entirely for an existence check keyed by `@key` — file-wide for
+  `'module'`, bounded to the enclosing class for `'class'`, bounded to the enclosing React
+  function component for `'component'`.
 - **Silent, not refused, on a language with no analyzer.** In v1 the analyzer exists only for
   TypeScript, TSX and JavaScript. Declaring `obligation` for any other language is not a load-time
   mistake — the rule loads cleanly, and `checkObligation` is simply never invoked for that

@@ -373,3 +373,181 @@ fn a_forget_in_a_different_class_still_reports() {
         )
         .expect("the only forget is in a different class");
 }
+
+/// `scope: 'component'`, run end to end. Same acquire/release queries and `@key` correlation
+/// as `KEYED`/`CLASS` above; the existence region is the enclosing React function component —
+/// a `PascalCase`-named function or arrow function whose body contains JSX.
+/// `crates/lanekeep-lang-js/src/obligation.rs`'s `component_scope_is_silent_within_one_component`
+/// and `component_scope_reports_across_two_components` carry the same two fixture shapes
+/// directly against `JsObligationAnalyzer`; these are the `RuleTester` equivalent, exercised
+/// through query matching, `Engine::run_rule`'s obligation arm, and `checkObligation` itself —
+/// and, unlike the unit tests, through a real `.tsx` file on disk. That extension is not
+/// cosmetic: `AGENTS.md` documents that which grammar parses a file is decided by the file's
+/// extension, not by anything the rule declares, so a `.ts` fixture here would parse `<b/>`
+/// under the plain TypeScript grammar rather than TSX — no JSX node would ever exist for
+/// `contains_jsx` to find, `W`/`A`/`B` below would never be recognized as components, and
+/// every case would report regardless of scope semantics. `RuleTester::with_extension` is
+/// what selects the TSX grammar, mirroring `a_tsx_rule_can_be_tested_against_tsx` in
+/// `crates/lanekeep-testkit/src/lib.rs`.
+const COMPONENT: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/registered-is-forgotten-in-component',\n\
+      requires: ['dataflow'],\n\
+      obligation: {\n\
+        acquire: ['(call_expression function: (identifier) @f (#eq? @f \"reg\") \
+                   arguments: (arguments (identifier) @key)) @acquire'],\n\
+        release: ['(call_expression function: (identifier) @f (#eq? @f \"forget\") \
+                   arguments: (arguments (identifier) @key)) @release'],\n\
+        scope: 'component',\n\
+      },\n\
+      card: { message: 'not forgotten', remediation: 'call forget(id) in the same component',\n\
+              examples: { bad: 'function Foo() { reg(a); return <div/>; }',\n\
+                          good: 'function Foo() { reg(a); forget(a); return <div/>; }' } },\n\
+      checkObligation(ctx, u) {\n\
+        ctx.report(u.acquire, `registration for ${ctx.text(u.key)} is never forgotten`);\n\
+      },\n\
+    });\n";
+
+fn component_scope() -> RuleTester {
+    RuleTester::with_extension("component-scope", COMPONENT, "tsx").expect("builds")
+}
+
+/// A naive translation of `a_matching_forget_in_a_sibling_method_of_the_same_class_is_silent`
+/// onto `component` scope: acquire and release both sit inside one `PascalCase` arrow function
+/// whose body returns JSX (the release nested in an inner callback, exactly as in the unit
+/// fixture), so `W` is a component region and the matching-key release discharges the
+/// acquire — mirrors `crates/lanekeep-lang-js/src/obligation.rs`'s
+/// `component_scope_is_silent_within_one_component`.
+#[test]
+fn a_matching_forget_in_the_same_component_is_silent() {
+    component_scope()
+        .accepts("const W = () => { reg(id); const c = () => { forget(id); }; return <b/>; };\n")
+        .expect("acquire and release both sit inside the one PascalCase+JSX component W");
+}
+
+/// The invalid half: `A`/`B` are two separate `PascalCase`+JSX components with no component
+/// region in common, so `B`'s release cannot discharge `A`'s acquire — mirrors
+/// `crates/lanekeep-lang-js/src/obligation.rs`'s `component_scope_reports_across_two_components`.
+#[test]
+fn a_forget_in_a_different_component_still_reports() {
+    component_scope()
+        .reports_messages(
+            "const A = () => { reg(id); return <b/>; };\n\
+             const B = () => { forget(id); return <b/>; };\n",
+            &["registration for id is never forgotten"],
+        )
+        .expect("the only forget is in a different component");
+}
+
+/// `keyBy: 'binding'`, run end to end through the real `Engine::prepare` path. Before this
+/// suite, `crates/lanekeep-engine/src/lib.rs`'s `key_by == "binding"` → `KeyCorrelation::Binding`
+/// mapping was reached only by `lanekeep-config`'s load-time refusals and by unit tests against
+/// `JsObligationAnalyzer` directly — never by a real rule module going through config load,
+/// query compilation and a match. `scope: 'function'`, not `'module'`: value-origin correlation
+/// composes with the per-function CFG walk exactly as text correlation already does in `KEYED`
+/// above (`Text`/`'module'`); this is the `Binding`/`'function'` combination.
+///
+/// The valid fixture below is `crates/lanekeep-lang-js/src/flow.rs`'s
+/// `origin_follows_a_const_copy` unit fixture, unchanged: `id` is a plain copy of `clientId`, so
+/// `register`'s `@key` and `forget`'s `@key` resolve to the same parameter under the value-origin
+/// walk even though their captured text differs — that unit test proves the origins intersect;
+/// this is its `RuleTester` equivalent, proving the whole pipeline discharges the obligation
+/// because of it.
+const KEYBY_BINDING: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/registered-is-forgotten-by-origin',\n\
+      requires: ['dataflow'],\n\
+      obligation: {\n\
+        acquire: ['(call_expression function: (identifier) @f (#eq? @f \"register\") \
+                   arguments: (arguments (identifier) @key)) @acquire'],\n\
+        release: ['(call_expression function: (identifier) @f (#eq? @f \"forget\") \
+                   arguments: (arguments (identifier) @key)) @release'],\n\
+        scope: 'function',\n\
+        keyBy: 'binding',\n\
+      },\n\
+      card: { message: 'not forgotten', remediation: 'call forget on the same value',\n\
+              examples: { bad: 'register(a);', good: 'register(a); forget(a);' } },\n\
+      checkObligation(ctx, u) {\n\
+        ctx.report(u.exit, u.partial ? 'missed on some path' : 'never forgotten');\n\
+      },\n\
+    });\n";
+
+fn keyby_binding() -> RuleTester {
+    RuleTester::new("keyby-binding", KEYBY_BINDING).expect("builds")
+}
+
+#[test]
+fn a_renamed_copy_correlates_under_keyby_binding() {
+    keyby_binding()
+        .accepts("function f(clientId) { const id = clientId; register(clientId); forget(id); }\n")
+        .expect(
+            "id is a copy of clientId; keyBy: 'binding' correlates them by shared value origin \
+             even though their captured text differs",
+        );
+}
+
+/// The invalid counterpart: two distinct parameters, never aliased, so their value origins are
+/// two distinct root definitions (each parameter is its own root — see
+/// `origin_of_identifier`'s "no reaching definition" case in `flow.rs`) that do not intersect.
+/// `forget(otherId)`'s block is filtered out of the correlating-release set before the CFG walk
+/// runs (`crates/lanekeep-lang-js/src/obligation.rs`'s `correlate`, called from the `rel_blocks`
+/// filter in `analyze`), so the acquire is reported exactly as if no release existed at all —
+/// `partial: false`, "never forgotten" — even though a syntactically identical `forget(...)` call
+/// is right there.
+#[test]
+fn a_different_origin_still_reports_under_keyby_binding() {
+    keyby_binding()
+        .reports_messages(
+            "function f(clientId, otherId) { register(clientId); forget(otherId); }\n",
+            &["never forgotten"],
+        )
+        .expect("clientId and otherId are two distinct parameters with no shared origin");
+}
+
+/// `keyBy: 'text'` regression: the identical rule shape and the identical acquire/release
+/// queries as `KEYBY_BINDING` above, differing only in `keyBy`. Pins that adding `'binding'`
+/// left `'text'`'s pre-existing meaning — exact captured-text equality, nothing more —
+/// untouched: this rule *reports* on exactly the source `KEYBY_BINDING` is silent on, because
+/// `"clientId"` and `"id"` are different strings regardless of what either resolves to.
+const KEYBY_TEXT: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/registered-is-forgotten-by-text',\n\
+      requires: ['dataflow'],\n\
+      obligation: {\n\
+        acquire: ['(call_expression function: (identifier) @f (#eq? @f \"register\") \
+                   arguments: (arguments (identifier) @key)) @acquire'],\n\
+        release: ['(call_expression function: (identifier) @f (#eq? @f \"forget\") \
+                   arguments: (arguments (identifier) @key)) @release'],\n\
+        scope: 'function',\n\
+        keyBy: 'text',\n\
+      },\n\
+      card: { message: 'not forgotten', remediation: 'call forget on the same value',\n\
+              examples: { bad: 'register(a);', good: 'register(a); forget(a);' } },\n\
+      checkObligation(ctx, u) {\n\
+        ctx.report(u.exit, u.partial ? 'missed on some path' : 'never forgotten');\n\
+      },\n\
+    });\n";
+
+fn keyby_text() -> RuleTester {
+    RuleTester::new("keyby-text", KEYBY_TEXT).expect("builds")
+}
+
+#[test]
+fn a_renamed_copy_does_not_correlate_under_keyby_text() {
+    keyby_text()
+        .reports_messages(
+            "function f(clientId) { const id = clientId; register(clientId); forget(id); }\n",
+            &["never forgotten"],
+        )
+        .expect(
+            "the same source KEYBY_BINDING accepts; keyBy: 'text' compares captured text only, \
+             and \"clientId\" != \"id\"",
+        );
+}
+
+#[test]
+fn matching_text_still_discharges_under_keyby_text() {
+    keyby_text()
+        .accepts("function f(a) { register(a); forget(a); }\n")
+        .expect("equal captured text still correlates under keyBy: 'text', as before #258");
+}
