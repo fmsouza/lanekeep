@@ -214,6 +214,7 @@ impl FlowAnalyzer for JsFlowAnalyzer {
                 in_progress: RefCell::new(BTreeSet::new()),
                 memo: RefCell::new(BTreeMap::new()),
                 dropped: Cell::new(0),
+                origin_memo: RefCell::new(BTreeMap::new()),
             };
             let facts = taint.taint_of(sink, &Path::new(), 0);
             dropped = dropped.saturating_add(taint.dropped.get());
@@ -232,6 +233,70 @@ impl FlowAnalyzer for JsFlowAnalyzer {
             paths: canonicalize(flows),
             dropped,
         }
+    }
+}
+
+/// The set of root definitions a value flows from, as tree-node ids. Two keys **correlate** — name
+/// the same value — iff their sets intersect, which is what lets an obligation rule pair an acquire
+/// with its release by the key each is given.
+///
+/// The ids are `node.id()` — a raw subtree pointer, not a content hash — so they are **run-local**
+/// identities, valid only for correlating two `OriginKey`s built in the same run, through
+/// [`Self::intersects`]/[`Self::is_empty`]. They are not the file-content determinism the rest of
+/// the engine promises (`docs/architecture.md`'s determinism invariant): two parses of identical
+/// bytes are not guaranteed to land the same ids, even within one process. Never serialize an
+/// `OriginKey`, fold it into a cache key, or sort/emit its ids into output.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct OriginKey {
+    defs: BTreeSet<usize>,
+}
+
+impl OriginKey {
+    /// Whether the two values may share a root definition — the correlation test.
+    pub(crate) fn intersects(&self, other: &OriginKey) -> bool {
+        !self.defs.is_disjoint(&other.defs)
+    }
+
+    /// Whether nothing resolved — no root definition was found for the value.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.defs.is_empty()
+    }
+}
+
+/// The value-origin of `node`: the set of root-definition node ids the value at `node` flows from,
+/// following identifier copies, transparent wrappers and ternaries down to terminal definitions — a
+/// parameter, a non-alias initializer, an import, or (contributing nothing) an unresolved use. Two
+/// nodes' [`OriginKey`]s intersect iff the values may be the same.
+///
+/// It reuses [`Taint`]'s reaching-definition machinery ([`Taint::reaching_defs`] over
+/// [`Taint::definitions_of`]) so a reassignment is honored with CFG kill — the origin of `id` in
+/// `let id = a; id = b; forget(id)` is `b`, not `a` — and reuses the [`Taint::in_progress`] cycle
+/// guard, the [`Taint::origin_memo`] fan-out memo and [`MAX_DEPTH`] so a cyclic (`const a = b;
+/// const b = a`) or wide alias graph terminates. The `@source`/`@sanitizer` sets are empty: origin
+/// tracking collects terminal definitions rather than matching a captured set. The CFG is the one
+/// enclosing `node`; a definition outside it (a module-level `const` read from inside a function)
+/// has no block there and is admitted, the same over-approximation [`Taint::reaching_defs`] makes.
+pub(crate) fn origin_key<'t>(tree: &'t Tree, source: &str, node: Node<'t>) -> OriginKey {
+    let empty: &[Node<'t>] = &[];
+    let root_and_cfg = enclosing_root_and_cfg(source, node);
+    let (root, cfg) = match &root_and_cfg {
+        Some((root, cfg)) => (Some(*root), Some(cfg)),
+        None => (None, None),
+    };
+    let taint = Taint {
+        tree,
+        source,
+        sources: empty,
+        sanitizers: empty,
+        cfg,
+        root,
+        in_progress: RefCell::new(BTreeSet::new()),
+        memo: RefCell::new(BTreeMap::new()),
+        dropped: Cell::new(0),
+        origin_memo: RefCell::new(BTreeMap::new()),
+    };
+    OriginKey {
+        defs: taint.origin_of_value(node, 0),
     }
 }
 
@@ -279,6 +344,14 @@ impl Def<'_> {
 /// different depths are different questions. A named type so [`Taint::memo`] reads as one thing.
 type IdentMemo<'t> = BTreeMap<(usize, Path, u32), Vec<Fact<'t>>>;
 
+/// The fan-out memo [`Taint::origin_of_identifier`] keeps, the [`IdentMemo`] analogue for the
+/// value-origin walk: a completed `(use start byte, depth)` question maps to the root-definition
+/// node ids it flows from. `depth` is in the key for the same reason as [`IdentMemo`] — every hop
+/// truncates at [`MAX_DEPTH`], so a node reached first on a long arm computes a smaller answer than
+/// on a short one, and keying on depth keeps the two distinct. No `Path`: origin correlation is
+/// value-level, so the walk carries no access path.
+type OriginMemo = BTreeMap<(usize, u32), BTreeSet<usize>>;
+
 /// The immutable context for one sink's taint walk.
 struct Taint<'a, 't> {
     tree: &'t Tree,
@@ -324,6 +397,11 @@ struct Taint<'a, 't> {
     /// analysis's own tally of values it could not see through (#247). `Cell` because
     /// `taint_of` takes `&self`; single-threaded within one file's analysis, so deterministic.
     dropped: Cell<u32>,
+    /// The fan-out memo for [`Taint::origin_of_identifier`] — the value-origin walk's own
+    /// [`Self::memo`], keyed `(use start byte, depth)`. Used only by [`origin_key`]'s walk; the
+    /// taint walk above never touches it, and it starts empty on the taint path. `BTreeMap` (not a
+    /// hash) so any future iteration stays deterministic, as for the two containers above.
+    origin_memo: RefCell<OriginMemo>,
 }
 
 impl<'t> Taint<'_, 't> {
@@ -572,6 +650,100 @@ impl<'t> Taint<'_, 't> {
         dedup_facts(&mut facts);
         self.memo.borrow_mut().insert(memo_key, facts.clone());
         facts
+    }
+
+    /// The value-origin of an expression read at a value level: the root-definition node ids the
+    /// value flows from. Mirrors [`Self::taint_of`]'s descent — peel a transparent wrapper, union a
+    /// ternary's two arms, route an identifier to [`Self::origin_of_identifier`] — but rather than
+    /// matching a `@source` set it bottoms out at the terminal value expression, whose `node.id()`
+    /// is a root. Syntactic descent (wrapper, ternary) keeps `depth`, bounded by tree height; a
+    /// def-use hop increments it in [`Self::origin_of_identifier`]. See [`origin_key`].
+    fn origin_of_value(&self, expr: Node<'t>, depth: u32) -> BTreeSet<usize> {
+        if depth >= MAX_DEPTH {
+            return BTreeSet::new();
+        }
+        match expr.kind() {
+            "identifier" => self.origin_of_identifier(expr, depth),
+            // A transparent wrapper *is* its inner value — `(e)`, `e!`, `await e`, `e as T`,
+            // `e satisfies T` — so its origin is the inner value's, at unchanged depth, exactly as
+            // [`Self::taint_of`] passes a wrapper through.
+            "parenthesized_expression"
+            | "non_null_expression"
+            | "await_expression"
+            | "as_expression"
+            | "satisfies_expression" => transparent_inner(expr)
+                .map(|inner| self.origin_of_value(inner, depth))
+                .unwrap_or_default(),
+            // A conditional yields one arm or the other, so its origin is the union of both —
+            // the same arm handling [`Self::taint_of`] gives a ternary. The condition holds no
+            // value.
+            "ternary_expression" => ["consequence", "alternative"]
+                .into_iter()
+                .filter_map(|field| expr.child_by_field_name(field))
+                .flat_map(|branch| self.origin_of_value(branch, depth))
+                .collect(),
+            // A terminal value expression — a call, a literal, a member/subscript read, a binary
+            // or `new` expression, ... : the value originates here, so this node id is a root. It
+            // is not descended (an alias identifier above is), which is what makes two uses that
+            // reach the same initializer share it. Recording the value expression rather than the
+            // definition site is what lets a ternary or wrapper *initializer* still be descended
+            // above rather than sealed here; each is tree-unique and reached identically by every
+            // use, so the two choices name the same correlation class.
+            _ => BTreeSet::from([expr.id()]),
+        }
+    }
+
+    /// The value-origin of an identifier read: resolve it to its declaration, then union the
+    /// origins of the definitions that *reach this read* — so a reassignment is followed and the
+    /// killed first definition is not. This is the CFG kill of [`Self::reaching_defs`], the same
+    /// machinery [`Self::taint_of_identifier`] uses, which is why `let id = a; id = b; forget(id)`
+    /// has origin `b` and not `a`. An alias definition (`const b = a`, `b = a`) is a hop, followed
+    /// into its right-hand side by [`Self::origin_of_value`]; a binding with no reaching definition
+    /// — a parameter, an import, a `let` read before assignment — is itself the root and
+    /// contributes its `decl.id()`. An unresolved use (no declaration in the file) contributes
+    /// nothing, the one empty [`OriginKey`].
+    ///
+    /// Only the strong ([`Self::reaching_defs`]) definitions are followed, not the weak field
+    /// writes and augmented assignments [`Self::taint_of_identifier`] also unions in: origin
+    /// correlation is about the value a name is bound to, and a field write mutates the object
+    /// rather than rebinding the name.
+    fn origin_of_identifier(&self, ident: Node<'t>, depth: u32) -> BTreeSet<usize> {
+        let Some(decl) = JsBindingResolver.declaration_of(self.tree, self.source, ident) else {
+            return BTreeSet::new();
+        };
+        let byte = ident.start_byte();
+        // Fan-out cut — the [`Self::taint_of_identifier`] memo analogue: this exact `(node, depth)`
+        // was computed before, so hand it back rather than re-walking. `depth` is in the key
+        // because the answer depends on it (the `MAX_DEPTH` cut) — see [`OriginMemo`].
+        let memo_key = (byte, depth);
+        if let Some(defs) = self.origin_memo.borrow().get(&memo_key) {
+            return defs.clone();
+        }
+        // Cycle cut, reusing [`Self::taint_of_identifier`]'s depth-independent [`Self::in_progress`]
+        // guard: this use is already being answered up the stack (`const a = b; const b = a`). A
+        // cycle re-enters at a strictly deeper depth, missing the depth-keyed memo above and
+        // landing here. Keyed at the empty path, since origin is value-level.
+        let cycle_key = (byte, Path::new());
+        if self.in_progress.borrow().contains(&cycle_key) {
+            return BTreeSet::new();
+        }
+        self.in_progress.borrow_mut().insert(cycle_key.clone());
+        let reaching = self.reaching_defs(decl, ident);
+        let origins: BTreeSet<usize> = if reaching.is_empty() {
+            // No definition reaches: the declaration itself is the root — a parameter, an import
+            // specifier, or a `let` read before any assignment.
+            BTreeSet::from([decl.id()])
+        } else {
+            reaching
+                .into_iter()
+                .flat_map(|def| self.origin_of_value(def.rhs, depth.saturating_add(1)))
+                .collect()
+        };
+        self.in_progress.borrow_mut().remove(&cycle_key);
+        self.origin_memo
+            .borrow_mut()
+            .insert(memo_key, origins.clone());
+        origins
     }
 
     /// Fold the taint carried by one definition's right-hand side into `facts`, asking it about
@@ -3422,5 +3594,123 @@ mod tests {
         // here is what keeps the two sets disjoint.
         assert_eq!(write_path("function f(){ s = x; }"), None);
         assert_eq!(write_path("function f(){ s += x; }"), None);
+    }
+
+    // --- origin_key ------------------------------------------------------------------------
+
+    /// The `nth` identifier (source order) reading exactly `text`.
+    fn ident<'t>(tree: &'t Tree, source: &str, text: &str, nth: usize) -> Node<'t> {
+        find_all(tree, "identifier")
+            .into_iter()
+            .filter(|n| &source[n.byte_range()] == text)
+            .nth(nth)
+            .expect("identifier present")
+    }
+
+    #[test]
+    fn origin_follows_a_const_copy() {
+        // register(clientId) and forget(id) share an origin: id is a copy of clientId.
+        let source =
+            "function f(clientId) { const id = clientId; register(clientId); forget(id); }";
+        let tree = parse(source);
+        let at_register = ident(&tree, source, "clientId", 2); // param, decl-rhs, then the register arg
+        let at_forget = ident(&tree, source, "id", 1); // the forget arg (0 is the declarator name)
+        let a = origin_key(&tree, source, at_register);
+        let b = origin_key(&tree, source, at_forget);
+        assert!(
+            !a.is_empty() && a.intersects(&b),
+            "id is a copy of clientId; origins must intersect"
+        );
+    }
+
+    #[test]
+    fn origin_tracks_reassignment_not_the_first_definition() {
+        let source = "function f(a, b) { let id = a; id = b; forget(id); }";
+        let tree = parse(source);
+        let at_forget = ident(&tree, source, "id", 2); // 0 = declarator, 1 = `id = b` lhs, 2 = forget arg
+        let a_ref = ident(&tree, source, "a", 1); // the `= a` rhs
+        let b_ref = ident(&tree, source, "b", 1); // the `id = b` rhs
+        let o = origin_key(&tree, source, at_forget);
+        assert!(
+            o.intersects(&origin_key(&tree, source, b_ref)),
+            "reaching def at forget is id = b"
+        );
+        assert!(
+            !o.intersects(&origin_key(&tree, source, a_ref)),
+            "the first definition was killed"
+        );
+    }
+
+    #[test]
+    fn origin_unions_a_ternary() {
+        let source = "function f(a, b, c) { const x = c ? a : b; sink(x); }";
+        let tree = parse(source);
+        let at_sink = ident(&tree, source, "x", 1);
+        let o = origin_key(&tree, source, at_sink);
+        assert!(o.intersects(&origin_key(&tree, source, ident(&tree, source, "a", 1))));
+        assert!(o.intersects(&origin_key(&tree, source, ident(&tree, source, "b", 1))));
+    }
+
+    #[test]
+    fn origin_of_a_shared_outer_const_matches_across_functions() {
+        let source =
+            "const KEY = mk();\nfunction o() { register(KEY); }\nfunction c() { forget(KEY); }";
+        let tree = parse(source);
+        let in_o = ident(&tree, source, "KEY", 1);
+        let in_c = ident(&tree, source, "KEY", 2);
+        assert!(
+            origin_key(&tree, source, in_o).intersects(&origin_key(&tree, source, in_c)),
+            "both reference the one module-level KEY"
+        );
+    }
+
+    #[test]
+    fn origin_of_an_unresolved_use_is_empty() {
+        let source = "function f() { forget(whoKnows); }";
+        let tree = parse(source);
+        let use_node = ident(&tree, source, "whoKnows", 0);
+        assert!(
+            origin_key(&tree, source, use_node).is_empty(),
+            "nothing resolves -> empty origin"
+        );
+    }
+
+    #[test]
+    fn origin_of_a_cyclic_alias_terminates() {
+        // Exercises the cycle guard `origin_key`'s doc claims: `in_progress` is keyed per
+        // identifier occurrence, and the walk from `forget(a)` revisits `b`'s use inside
+        // `const a = b` a second time (at a deeper depth, alias-hopping through `const b = a`)
+        // where that occurrence is already in progress, cutting it there rather than recursing
+        // forever. The test *completing* is the proof it terminates; MAX_DEPTH is not what
+        // stops this one, since the cut lands well under it. A rootless mutual cycle has no
+        // terminal definition, so the correct origin is empty, not merely non-hanging.
+        let source = "function f() { const a = b; const b = a; forget(a); }";
+        let tree = parse(source);
+        let at_forget = ident(&tree, source, "a", 2); // 0 = `a`'s declarator, 1 = `const b = a` rhs, 2 = forget's arg
+        let o = origin_key(&tree, source, at_forget);
+        assert!(
+            o.is_empty(),
+            "a rootless mutual cycle has no terminal definition -> empty origin"
+        );
+    }
+
+    #[test]
+    fn origin_of_an_imported_key_matches_across_functions() {
+        // `declaration_of` resolves a named-import use to the enclosing `import_statement`
+        // (binding.rs's `a_use_reaches_the_import_that_bound_it`); `reaching_defs` never finds
+        // a reassignment of it (an import is never assignment-target-shaped), so
+        // `origin_of_identifier` takes the import statement itself as the root. One `import` is
+        // one node, so both functions land on the same root and correlate -- the same shape as
+        // `origin_of_a_shared_outer_const_matches_across_functions`, through an import rather
+        // than a module-level `const`.
+        let source =
+            "import { KEY } from './k';\nfunction o() { reg(KEY); }\nfunction c() { forget(KEY); }";
+        let tree = parse(source);
+        let in_o = ident(&tree, source, "KEY", 1);
+        let in_c = ident(&tree, source, "KEY", 2);
+        assert!(
+            origin_key(&tree, source, in_o).intersects(&origin_key(&tree, source, in_c)),
+            "both reference the one imported KEY"
+        );
     }
 }

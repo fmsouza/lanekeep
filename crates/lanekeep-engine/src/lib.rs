@@ -47,7 +47,9 @@ use lanekeep_js::{
     FileAccess, HOST_API_VERSION, HostContext, Limits, ReduceContext, ReduceFact, RuleRoot,
     RunClock, Sandbox, SandboxError,
 };
-use lanekeep_lang::{Language, LanguageId, LanguageRegistry, ObligationAnalyzer, ObligationScope};
+use lanekeep_lang::{
+    KeyCorrelation, Language, LanguageId, LanguageRegistry, ObligationAnalyzer, ObligationScope,
+};
 use lanekeep_query::{CompileError, CompiledQuery};
 use lanekeep_types::BuiltinProvider;
 use lanekeep_types::tsc::{ProviderError, TscProvider};
@@ -460,9 +462,10 @@ struct CompiledObligation {
     release: Vec<CompiledQuery>,
     /// The scope the obligation must be discharged within.
     scope: ObligationScope,
-    /// Whether any acquire or release query binds a `@key` capture, computed once here from
-    /// the raw query text so the per-file hot path never has to ask again.
-    keyed: bool,
+    /// How a bound `@key` capture correlates an acquire with a release — `None` when neither
+    /// query binds one, computed once here from the raw query text and `key_by` so the
+    /// per-file hot path never has to ask again.
+    correlation: KeyCorrelation,
 }
 
 /// What one rule compiled for one language it targets.
@@ -1406,13 +1409,27 @@ impl Engine {
                             // Whether either role binds `@key`, read off the raw query text
                             // rather than the compiled query — `capture_sites` is lexical and
                             // needs no grammar, and this runs once at prepare time rather than
-                            // per match. Task 4 is where the two roles disagreeing becomes a
-                            // load error; here it is only ever read, never enforced.
+                            // per match. `check_obligation_key` in lanekeep-config refuses
+                            // `@key` bound on some-but-not-every query; here the presence flag
+                            // is only read, never enforced.
                             let keyed = o.acquire.iter().chain(o.release.iter()).any(|q| {
                                 lanekeep_query::capture_sites(q)
                                     .iter()
                                     .any(|s| s.name == "key")
                             });
+                            // `key_by` only distinguishes `Text` from `Binding` once a `@key`
+                            // is actually bound — with none, correlation is `None` regardless
+                            // of what `key_by` says. `key_by == "binding"` maps to
+                            // `KeyCorrelation::Binding`, which correlates by value origin via
+                            // `origin_key` (`lanekeep-lang-js`'s `flow.rs`) rather than by
+                            // captured text.
+                            let correlation = if !keyed {
+                                KeyCorrelation::None
+                            } else if o.key_by == "binding" {
+                                KeyCorrelation::Binding
+                            } else {
+                                KeyCorrelation::Text
+                            };
                             Ok(CompiledObligation {
                                 acquire: o
                                     .acquire
@@ -1431,7 +1448,7 @@ impl Engine {
                                         detail: format!("invalid obligation scope `{}`", o.scope),
                                     }
                                 })?,
-                                keyed,
+                                correlation,
                             })
                         })
                         .transpose()?;
@@ -3603,7 +3620,7 @@ impl Engine {
                     tree,
                     source,
                     obligation.scope,
-                    obligation.keyed,
+                    obligation.correlation,
                     &acquires,
                     &releases,
                 )

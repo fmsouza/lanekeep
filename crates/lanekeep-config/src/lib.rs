@@ -135,33 +135,44 @@ pub struct RuleSpec {
     ///
     /// By the time a `RuleSpec` exists, `build_rule` has already refused the shape mistakes:
     /// `obligation` without `checkObligation` or the reverse, an `obligation` not paired with
-    /// `requires: ['dataflow']`, a `scope` other than `"function"`, `"block"`, `"module"`, or
-    /// `"class"`, `@key` bound on some acquire/release queries but not every one, and
-    /// `scope: "module"` or `scope: "class"` without `@key` on every query. `dataflow` joined
-    /// `IMPLEMENTED` at #193, so a well-formed obligation rule now loads — the engine compiles
-    /// its acquire/release queries and dispatches through the analyzer `requires` named.
+    /// `requires: ['dataflow']`, a `scope` other than `"function"`, `"block"`, `"module"`,
+    /// `"class"`, or `"component"`, `@key` bound on some acquire/release queries but not every
+    /// one, `scope: "module"`, `scope: "class"`, or `scope: "component"` without `@key` on
+    /// every query, a `keyBy` other than `"text"` or `"binding"`, and `keyBy: "binding"`
+    /// without `@key` on every acquire/release query. `dataflow` joined `IMPLEMENTED` at #193,
+    /// so a well-formed obligation rule now loads — the engine compiles its acquire/release
+    /// queries and dispatches through the analyzer `requires` named.
     pub obligation: Option<ObligationSpec>,
 }
 
 /// A rule's typestate obligation, as extracted from its source.
 ///
 /// `scope` is kept as the raw string the rule declared — `"function"`, `"block"`, `"module"`,
-/// or `"class"` — rather than a `lanekeep-lang` enum, because this crate has no dependency on
-/// that crate. Nothing here confirms it is one of those four values, or that it is even
-/// present when a rule also declares `checkObligation`: that validation, and parsing the
-/// string into the analyzer's own enum, are the engine's job once there is an analyzer to hand
-/// it to. An optional `@key` correlating capture, when the rule's acquire/release queries bind
-/// one, lives inside `acquire`/`release`'s own query text rather than as a field here — value
-/// correlation is a property of the queries, not of this struct.
+/// `"class"`, or `"component"` — rather than a `lanekeep-lang` enum, because this crate has no
+/// dependency on that crate. Nothing here confirms it is one of those five values, or that it
+/// is even present when a rule also declares `checkObligation`: that validation, and parsing
+/// the string into the analyzer's own enum, are the engine's job once there is an analyzer to
+/// hand it to. An optional `@key` correlating capture, when the rule's acquire/release queries
+/// bind one, lives inside `acquire`/`release`'s own query text rather than as a field here —
+/// value correlation is a property of the queries, not of this struct. `key_by` says *how*
+/// that capture is compared — `"text"` for its source text, `"binding"` for what the value
+/// resolves to. `check_obligation_key` refuses anything but those two, and refuses `"binding"`
+/// unless `@key` is bound on every acquire/release query, before a `RuleSpec` ever exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObligationSpec {
     /// Queries whose `@acquire` capture starts an obligation on the captured value.
     pub acquire: Vec<String>,
     /// Queries whose `@release` capture discharges it.
     pub release: Vec<String>,
-    /// `"function"`, `"block"`, `"module"`, or `"class"`, as written — see the struct doc for
-    /// what is not yet checked.
+    /// `"function"`, `"block"`, `"module"`, `"class"`, or `"component"`, as written — see the
+    /// struct doc for what is not yet checked.
     pub scope: String,
+    /// `"text"` or `"binding"` — how a bound `@key` capture correlates acquire and release.
+    /// `"text"` compares the captured node's source text; `"binding"` compares what the value
+    /// resolves to, through the analyzer's value-origin primitive. Defaults to `"text"` when a
+    /// rule writes no `keyBy` at all: `build_obligation` fills it in, so this is never left
+    /// standing in for an absent declaration the way `scope` is.
+    pub key_by: String,
 }
 
 /// A rule's taint-flow queries, as loaded from config. The engine compiles these.
@@ -547,10 +558,13 @@ struct RawRule {
 /// `checkObligation` agrees with its presence, that `requires` names `dataflow`, that
 /// `acquire` and `release` are non-empty and each query binds the capture its role names,
 /// that an optional `@key` capture — living inside those same query strings, not a field of
-/// its own — is bound on every acquire/release query or none, and that a `scope` written at
-/// all is `"function"`, `"block"`, `"module"`, or `"class"` (the last two requiring `@key` on
-/// every query). An absent `scope` is refused by [`build_obligation`], where the value is
-/// consumed. See #193, #248.
+/// its own — is bound on every acquire/release query or none, that a `scope` written at
+/// all is `"function"`, `"block"`, `"module"`, `"class"`, or `"component"` (the last three
+/// requiring `@key` on every query), and, via [`check_obligation_key`], that a written `keyBy`
+/// is `"text"` or `"binding"` (`"binding"` requiring `@key` on every query too). An absent
+/// `scope` is refused by [`build_obligation`], where the value is consumed; an absent `keyBy`
+/// is defaulted to `"text"` there instead, rather than refused, since it is a fresh field with
+/// an ordinary default and no declared-type document to disagree with. See #193, #248, #258.
 #[derive(Debug, Deserialize)]
 struct RawObligation {
     #[serde(default)]
@@ -558,6 +572,10 @@ struct RawObligation {
     #[serde(default)]
     release: Vec<String>,
     scope: Option<String>,
+    /// `"text"` or `"binding"`, validated by [`check_obligation_key`] and defaulted to
+    /// `"text"` by [`build_obligation`] when absent.
+    #[serde(default, rename = "keyBy")]
+    key_by: Option<String>,
 }
 
 /// `language: 'tsx'` and `language: ['typescript', 'tsx']` are both ordinary things to write.
@@ -2349,12 +2367,12 @@ fn has_dataflow(requires: &serde_json::Value) -> bool {
 /// an `obligation` not paired with `requires: ['dataflow']`, then an `acquire` or `release`
 /// role that is empty or holds a query never binding the capture its role names. Only after
 /// those do [`check_obligation_key`]'s two `@key` refusals run — `@key` bound on some
-/// acquire/release queries but not every one, or a `scope` of `"module"` or `"class"` with
-/// `@key` not bound on every query — and whether the scope token itself is one of `"function"`,
-/// `"block"`, `"module"`, or `"class"` is checked last of all. So a `scope: 'loop'` obligation
-/// that also mixes `@key` is refused for the mixed `@key`, never for the unknown scope — the
-/// two never both get a chance to speak. An *absent* `scope` is [`build_obligation`]'s to
-/// refuse, where the value is consumed.
+/// acquire/release queries but not every one, or a `scope` of `"module"`, `"class"`, or
+/// `"component"` with `@key` not bound on every query — and whether the scope token itself is
+/// one of `"function"`, `"block"`, `"module"`, `"class"`, or `"component"` is checked last of
+/// all. So a `scope: 'loop'` obligation that also mixes `@key` is refused for the mixed `@key`,
+/// never for the unknown scope — the two never both get a chance to speak. An *absent* `scope`
+/// is [`build_obligation`]'s to refuse, where the value is consumed.
 ///
 /// The role floors are `parse_flow`'s, restated: an empty `acquire` has nothing to be
 /// obligated and an empty `release` nothing to discharge it, so `checkObligation` is either
@@ -2396,10 +2414,15 @@ fn check_obligation_shape(
                 check_obligation_key(obligation, id)?;
             }
             match obligation.and_then(|o| o.scope.as_deref()) {
-                Some(scope) if !matches!(scope, "function" | "block" | "module" | "class") => {
+                Some(scope)
+                    if !matches!(
+                        scope,
+                        "function" | "block" | "module" | "class" | "component"
+                    ) =>
+                {
                     Err(format!(
                         "`{id}` has an obligation `scope` of `{scope}` — it must be \
-                         `function`, `block`, `module`, or `class`"
+                         `function`, `block`, `module`, `class`, or `component`"
                     ))
                 }
                 _ => Ok(()),
@@ -2437,14 +2460,22 @@ fn check_obligation_role(
     Ok(())
 }
 
-/// `@key` correlation is all-or-nothing, and a `module` or `class` scope requires it.
+/// `@key` correlation is all-or-nothing, a `module`, `class`, or `component` scope requires
+/// it, and `keyBy` names a real comparison and cannot ask for one it has no `@key` to feed.
 ///
 /// Binding `@key` on some acquire/release queries but not every one has decided that
 /// correlation matters for part of the obligation and not the rest, which is not a coherent
-/// shape to run — refused regardless of `scope`. And `scope: 'module'` or `scope: 'class'`
-/// without `@key` on every query is refused too: without correlation a module- or class-wide
-/// scope is strictly worse than a narrower one, since every unrelated acquire/release pair in
-/// the file (or, for `class`, in the class) would fall into the same bucket.
+/// shape to run — refused regardless of `scope`. And `scope: 'module'`, `scope: 'class'`, or
+/// `scope: 'component'` without `@key` on every query is refused too: without correlation a
+/// module-, class-, or component-wide scope is strictly worse than a narrower one, since every
+/// unrelated acquire/release pair in the file (or, for `class`/`component`, in the class or
+/// component) would fall into the same bucket.
+///
+/// `keyBy` is a separate, additive check on top of that: an unknown value is refused by name,
+/// the same floor `scope` gets, and `keyBy: 'binding'` — which asks the analyzer to correlate
+/// by what a `@key` capture resolves to rather than by its source text — is refused when no
+/// `@key` is bound anywhere, on the identical reasoning the `module`/`class`/`component` scope
+/// check above gives: there is nothing for it to correlate by.
 fn check_obligation_key(o: &RawObligation, id: &RuleId) -> Result<(), String> {
     let binds_key = |q: &str| binds(q, "key");
     let acq_all = o.acquire.iter().all(|q| binds_key(q));
@@ -2459,13 +2490,29 @@ fn check_obligation_key(o: &RawObligation, id: &RuleId) -> Result<(), String> {
              correlation is all-or-nothing"
         ));
     }
-    if let Some(scope @ ("module" | "class")) = o.scope.as_deref()
+    if let Some(scope @ ("module" | "class" | "component")) = o.scope.as_deref()
         && !all
     {
         return Err(format!(
             "`{id}` has obligation `scope` `{scope}` but does not bind `@key` on every \
              acquire and release query — a {scope}-wide scope needs `@key` to correlate"
         ));
+    }
+    match o.key_by.as_deref() {
+        None | Some("text") => {}
+        Some("binding") => {
+            if !all {
+                return Err(format!(
+                    "`{id}` sets obligation `keyBy: 'binding'` but does not bind `@key` on \
+                     every acquire and release query — value-origin correlation needs a `@key`"
+                ));
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "`{id}` has an obligation `keyBy` of `{other}` — it must be `text` or `binding`"
+            ));
+        }
     }
     Ok(())
 }
@@ -2725,13 +2772,14 @@ fn build_obligation(
         let Some(scope) = o.scope else {
             return Err(format!(
                 "`{id}` has an `obligation` with no `scope` — it must be \
-                 `function`, `block`, `module`, or `class`"
+                 `function`, `block`, `module`, `class`, or `component`"
             ));
         };
         Ok(ObligationSpec {
             acquire: o.acquire,
             release: o.release,
             scope,
+            key_by: o.key_by.unwrap_or_else(|| "text".to_string()),
         })
     })
     .transpose()
@@ -5675,6 +5723,108 @@ mod tests {
             hex(&keyed_class_scoped),
             "the `@key` edit and the `class` scope edit above must not collide on the same hash"
         );
+
+        // Task 3 (#258): `component` is a fourth scope token, requiring `@key` on the same
+        // terms as `module` and `class` — proven independently rather than assumed identical,
+        // on the same reasoning the module and class cases above give.
+        let keyed_component_scoped_src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/zeroed',\n\
+              requires: ['dataflow'],\n\
+              query: '(identifier) @id',\n\
+              obligation: {\n\
+                acquire: ['(x (y) @key) @acquire'],\n\
+                release: ['(x (y) @key) @release'],\n\
+                scope: 'component',\n\
+              },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { ctx.report(m.id); },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        fixture.write_all(&[("rule.ts", keyed_component_scoped_src)]);
+        let keyed_component_scoped = fixture
+            .load_config()
+            .expect("fully keyed, component-scoped obligation loads")
+            .ruleset_hash;
+
+        assert_ne!(
+            hex(&keyed_function_scoped),
+            hex(&keyed_component_scoped),
+            "an obligation's `scope` moving from `function` to `component` must invalidate the \
+             ruleset hash"
+        );
+        assert_ne!(
+            hex(&keyed_module_scoped),
+            hex(&keyed_component_scoped),
+            "a `component` scope and a `module` scope must not collide on the same hash"
+        );
+        assert_ne!(
+            hex(&keyed_class_scoped),
+            hex(&keyed_component_scoped),
+            "a `component` scope and a `class` scope must not collide on the same hash"
+        );
+        assert_ne!(
+            hex(&unkeyed_function_scoped),
+            hex(&keyed_component_scoped),
+            "the `@key` edit and the `component` scope edit above must not collide on the same \
+             hash"
+        );
+
+        // Task 2 (#258): `keyBy` is likewise a literal token in the rule's own module source,
+        // so the same verbatim fold has to reach it too — proven independently rather than
+        // assumed, on the same reasoning every field above gives. Compared against
+        // `keyed_function_scoped`, which is identical except for the absent `keyBy`, so this
+        // isolates the one field.
+        let key_by_binding_src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/zeroed',\n\
+              requires: ['dataflow'],\n\
+              query: '(identifier) @id',\n\
+              obligation: {\n\
+                acquire: ['(x (y) @key) @acquire'],\n\
+                release: ['(x (y) @key) @release'],\n\
+                scope: 'function',\n\
+                keyBy: 'binding',\n\
+              },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { ctx.report(m.id); },\n\
+              checkObligation(ctx, u) { ctx.report(u.exit); },\n\
+            });\n";
+        fixture.write_all(&[("rule.ts", key_by_binding_src)]);
+        let key_by_binding = fixture
+            .load_config()
+            .expect("keyBy: 'binding' with a key on every query loads")
+            .ruleset_hash;
+
+        assert_ne!(
+            hex(&keyed_function_scoped),
+            hex(&key_by_binding),
+            "adding `keyBy: 'binding'` to an obligation must invalidate the ruleset hash"
+        );
+        assert_ne!(
+            hex(&unkeyed_function_scoped),
+            hex(&key_by_binding),
+            "the `keyBy: 'binding'` edit and the unkeyed edit above must not collide on the \
+             same hash"
+        );
+        assert_ne!(
+            hex(&keyed_module_scoped),
+            hex(&key_by_binding),
+            "the `keyBy: 'binding'` edit and the `module` scope edit above must not collide on \
+             the same hash"
+        );
+        assert_ne!(
+            hex(&keyed_class_scoped),
+            hex(&key_by_binding),
+            "the `keyBy: 'binding'` edit and the `class` scope edit above must not collide on \
+             the same hash"
+        );
+        assert_ne!(
+            hex(&keyed_component_scoped),
+            hex(&key_by_binding),
+            "the `keyBy: 'binding'` edit and the `component` scope edit above must not collide \
+             on the same hash"
+        );
     }
 
     #[test]
@@ -6637,6 +6787,7 @@ mod tests {
             acquire: vec!["(call_expression) @acquire".to_owned()],
             release: vec!["(call_expression) @release".to_owned()],
             scope: Some("block".to_owned()),
+            key_by: None,
         };
         let obligation = build_obligation(Some(raw), &"local/x".parse().expect("valid id"))
             .expect("a declared scope is accepted")
@@ -6650,6 +6801,10 @@ mod tests {
             vec!["(call_expression) @release".to_owned()]
         );
         assert_eq!(obligation.scope, "block");
+        // An absent `keyBy` defaults to `"text"`, the same way `scope` is required rather than
+        // defaulted — see `key_by_binding_with_a_key_loads_and_key_by_defaults_to_text` for the
+        // dedicated coverage of that default.
+        assert_eq!(obligation.key_by, "text");
     }
 
     /// Load a config whose single rule is exactly `rule_src`, and return what happened.
@@ -6723,8 +6878,9 @@ mod tests {
     }
 
     /// `scope` is not free text — the analyzer only ever tracks an obligation across a
-    /// `function`, a `block`, the whole `module`, or the enclosing `class` — so an unknown
-    /// value is refused by name rather than reaching an engine that has no case for it.
+    /// `function`, a `block`, the whole `module`, the enclosing `class`, or the enclosing
+    /// `component` — so an unknown value is refused by name rather than reaching an engine
+    /// that has no case for it.
     #[test]
     fn an_unknown_obligation_scope_is_refused() {
         let src = "import { defineRule } from 'lanekeep';\n\
@@ -6931,6 +7087,111 @@ mod tests {
               card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
               checkObligation() {} });";
         load_rule_source("ob-class-keyed", src).expect("a fully keyed class obligation loads");
+    }
+
+    /// `scope: 'component'` correlates acquire and release within the enclosing React function
+    /// component, on the same reasoning as `scope: 'module'` and `scope: 'class'` — without
+    /// `@key` every unrelated acquire/release pair in the component would fall into the same
+    /// bucket. Refused rather than run.
+    #[test]
+    fn a_component_scope_without_a_key_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({ id: 'local/ob', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(call_expression) @acquire'], \
+                            release: ['(call_expression) @release'], scope: 'component' },\n\
+              checkObligation() {} });";
+        let err = load_rule_source("ob-comp-no-key", src)
+            .expect_err("component needs a key")
+            .to_string();
+        assert!(
+            err.contains("component") && err.contains("@key"),
+            "message was: {err}"
+        );
+    }
+
+    /// The shape the refusal above exists to require: `@key` bound on every acquire and
+    /// release query is exactly what lets a component-wide scope correlate correctly, and
+    /// loads.
+    #[test]
+    fn a_component_scope_with_a_key_on_every_query_loads() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({ id: 'local/ob', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(call_expression (identifier) @key) @acquire'], \
+                            release: ['(call_expression (identifier) @key) @release'], scope: 'component' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation() {} });";
+        load_rule_source("ob-comp-keyed", src).expect("a fully keyed component obligation loads");
+    }
+
+    /// `keyBy: 'binding'` asks the analyzer to correlate `@key` by what it resolves to rather
+    /// than by source text, which needs a `@key` to resolve in the first place — on the same
+    /// reasoning `module`/`class`/`component` scopes need one to correlate by at all. Refused
+    /// rather than run.
+    #[test]
+    fn key_by_binding_without_a_key_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({ id: 'local/ob', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(call_expression) @acquire'], \
+                            release: ['(call_expression) @release'], scope: 'function', keyBy: 'binding' },\n\
+              checkObligation() {} });";
+        let err = load_rule_source("ob-bind-no-key", src)
+            .expect_err("binding needs a key")
+            .to_string();
+        assert!(
+            err.contains("keyBy") && err.contains("binding") && err.contains("@key"),
+            "message was: {err}"
+        );
+    }
+
+    /// `keyBy` is not free text — only `"text"` and `"binding"` name a comparison the analyzer
+    /// implements — so an unknown value is refused by name, the same floor `scope` gets.
+    #[test]
+    fn an_unknown_key_by_is_refused() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({ id: 'local/ob', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(call_expression (identifier) @key) @acquire'], \
+                            release: ['(call_expression (identifier) @key) @release'], scope: 'function', keyBy: 'sideways' },\n\
+              checkObligation() {} });";
+        let err = load_rule_source("ob-bad-keyby", src)
+            .expect_err("unknown keyBy")
+            .to_string();
+        assert!(
+            err.contains("keyBy") && err.contains("sideways"),
+            "message was: {err}"
+        );
+    }
+
+    /// The shape the refusal above exists to require: `@key` bound on every acquire and release
+    /// query is exactly what lets `keyBy: 'binding'` correlate, and loads — with `key_by`
+    /// reaching the built `ObligationSpec` as written. And a rule that writes no `keyBy` at all
+    /// gets `"text"` rather than an absent value, asserted directly against `build_obligation`
+    /// the way `an_obligation_specs_fields_reach_the_rule_spec` pins the other fields.
+    #[test]
+    fn key_by_binding_with_a_key_loads_and_key_by_defaults_to_text() {
+        let src = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({ id: 'local/ob', requires: ['dataflow'],\n\
+              obligation: { acquire: ['(call_expression (identifier) @key) @acquire'], \
+                            release: ['(call_expression (identifier) @key) @release'], scope: 'function', keyBy: 'binding' },\n\
+              card: { message: 'm', remediation: 'r', examples: { bad: 'a', good: 'b' } },\n\
+              checkObligation() {} });";
+        let config =
+            load_rule_source("ob-bind-ok", src).expect("keyBy: 'binding' with a key loads");
+        let obligation = config.rules[0]
+            .obligation
+            .as_ref()
+            .expect("obligation present");
+        assert_eq!(obligation.key_by, "binding");
+
+        let raw = RawObligation {
+            acquire: vec!["(call_expression) @acquire".to_owned()],
+            release: vec!["(call_expression) @release".to_owned()],
+            scope: Some("function".to_owned()),
+            key_by: None,
+        };
+        let defaulted = build_obligation(Some(raw), &"local/ob".parse().expect("valid id"))
+            .expect("no keyBy is accepted")
+            .expect("`Some` in, `Some` out");
+        assert_eq!(defaulted.key_by, "text");
     }
 
     /// An obligation-only rule — no `query`, no `check`, only `obligation`/`checkObligation` —

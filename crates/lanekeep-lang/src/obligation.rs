@@ -22,6 +22,10 @@ pub enum ObligationScope {
     /// Existence, like [`Self::Module`], but the search is bounded to one class. Requires a
     /// `@key` capture.
     Class,
+    /// A value acquired in a React function component must have a matching-key release in the
+    /// *same* component. Existence, like [`Self::Class`], bounded to one component. Requires a
+    /// `@key` capture.
+    Component,
 }
 
 impl ObligationScope {
@@ -33,6 +37,7 @@ impl ObligationScope {
             "block" => Some(Self::Block),
             "module" => Some(Self::Module),
             "class" => Some(Self::Class),
+            "component" => Some(Self::Component),
             _ => None,
         }
     }
@@ -61,6 +66,17 @@ pub struct UnmetObligation<'t> {
     pub key: Option<Node<'t>>,
 }
 
+/// How a keyed obligation correlates an acquire's `@key` with a release's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCorrelation {
+    /// No `@key` bound — every release discharges (the un-keyed behavior).
+    None,
+    /// Correlate by exact captured text.
+    Text,
+    /// Correlate by shared value origin.
+    Binding,
+}
+
 /// A per-language typestate analysis over acquire/release node sets.
 pub trait ObligationAnalyzer: Send + Sync {
     /// Return one [`UnmetObligation`] per acquire some path leaves undischarged, in source
@@ -70,7 +86,7 @@ pub trait ObligationAnalyzer: Send + Sync {
         tree: &'t Tree,
         source: &str,
         scope: ObligationScope,
-        keyed: bool,
+        correlation: KeyCorrelation,
         acquires: &[Keyed<'t>],
         releases: &[Keyed<'t>],
     ) -> Vec<UnmetObligation<'t>>;
@@ -97,6 +113,10 @@ mod tests {
         assert_eq!(
             ObligationScope::parse("class"),
             Some(ObligationScope::Class)
+        );
+        assert_eq!(
+            ObligationScope::parse("component"),
+            Some(ObligationScope::Component)
         );
         assert_eq!(ObligationScope::parse("loop"), None);
     }
