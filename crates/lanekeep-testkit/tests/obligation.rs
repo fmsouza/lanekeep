@@ -373,3 +373,68 @@ fn a_forget_in_a_different_class_still_reports() {
         )
         .expect("the only forget is in a different class");
 }
+
+/// `scope: 'component'`, run end to end. Same acquire/release queries and `@key` correlation
+/// as `KEYED`/`CLASS` above; the existence region is the enclosing React function component —
+/// a `PascalCase`-named function or arrow function whose body contains JSX.
+/// `crates/lanekeep-lang-js/src/obligation.rs`'s `component_scope_is_silent_within_one_component`
+/// and `component_scope_reports_across_two_components` carry the same two fixture shapes
+/// directly against `JsObligationAnalyzer`; these are the `RuleTester` equivalent, exercised
+/// through query matching, `Engine::run_rule`'s obligation arm, and `checkObligation` itself —
+/// and, unlike the unit tests, through a real `.tsx` file on disk. That extension is not
+/// cosmetic: `AGENTS.md` documents that which grammar parses a file is decided by the file's
+/// extension, not by anything the rule declares, so a `.ts` fixture here would parse `<b/>`
+/// under the plain TypeScript grammar rather than TSX — no JSX node would ever exist for
+/// `contains_jsx` to find, `W`/`A`/`B` below would never be recognized as components, and
+/// every case would report regardless of scope semantics. `RuleTester::with_extension` is
+/// what selects the TSX grammar, mirroring `a_tsx_rule_can_be_tested_against_tsx` in
+/// `crates/lanekeep-testkit/src/lib.rs`.
+const COMPONENT: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/registered-is-forgotten-in-component',\n\
+      requires: ['dataflow'],\n\
+      obligation: {\n\
+        acquire: ['(call_expression function: (identifier) @f (#eq? @f \"reg\") \
+                   arguments: (arguments (identifier) @key)) @acquire'],\n\
+        release: ['(call_expression function: (identifier) @f (#eq? @f \"forget\") \
+                   arguments: (arguments (identifier) @key)) @release'],\n\
+        scope: 'component',\n\
+      },\n\
+      card: { message: 'not forgotten', remediation: 'call forget(id) in the same component',\n\
+              examples: { bad: 'function Foo() { reg(a); return <div/>; }',\n\
+                          good: 'function Foo() { reg(a); forget(a); return <div/>; }' } },\n\
+      checkObligation(ctx, u) {\n\
+        ctx.report(u.acquire, `registration for ${ctx.text(u.key)} is never forgotten`);\n\
+      },\n\
+    });\n";
+
+fn component_scope() -> RuleTester {
+    RuleTester::with_extension("component-scope", COMPONENT, "tsx").expect("builds")
+}
+
+/// A naive translation of `a_matching_forget_in_a_sibling_method_of_the_same_class_is_silent`
+/// onto `component` scope: acquire and release both sit inside one `PascalCase` arrow function
+/// whose body returns JSX (the release nested in an inner callback, exactly as in the unit
+/// fixture), so `W` is a component region and the matching-key release discharges the
+/// acquire — mirrors `crates/lanekeep-lang-js/src/obligation.rs`'s
+/// `component_scope_is_silent_within_one_component`.
+#[test]
+fn a_matching_forget_in_the_same_component_is_silent() {
+    component_scope()
+        .accepts("const W = () => { reg(id); const c = () => { forget(id); }; return <b/>; };\n")
+        .expect("acquire and release both sit inside the one PascalCase+JSX component W");
+}
+
+/// The invalid half: `A`/`B` are two separate `PascalCase`+JSX components with no component
+/// region in common, so `B`'s release cannot discharge `A`'s acquire — mirrors
+/// `crates/lanekeep-lang-js/src/obligation.rs`'s `component_scope_reports_across_two_components`.
+#[test]
+fn a_forget_in_a_different_component_still_reports() {
+    component_scope()
+        .reports_messages(
+            "const A = () => { reg(id); return <b/>; };\n\
+             const B = () => { forget(id); return <b/>; };\n",
+            &["registration for id is never forgotten"],
+        )
+        .expect("the only forget is in a different component");
+}

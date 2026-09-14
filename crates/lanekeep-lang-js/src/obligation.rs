@@ -1,7 +1,8 @@
 //! lang-js's implementation of the obligation capability: a per-function CFG walk for
-//! `function`/`block` scope, and an existence check with no CFG at all for `module` and
-//! `class` scope — file-wide for `module`, bounded to the enclosing class for `class` —
-//! where sibling functions or methods have no graph in common to walk.
+//! `function`/`block` scope, and an existence check with no CFG at all for `module`,
+//! `class` and `component` scope — file-wide for `module`, bounded to the enclosing class
+//! for `class`, bounded to the enclosing React function component for `component` — where
+//! sibling functions, methods, or components have no graph in common to walk.
 
 use lanekeep_lang::obligation::{Keyed, ObligationAnalyzer, ObligationScope, UnmetObligation};
 use tree_sitter::{Node, Tree};
@@ -33,6 +34,15 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
             ObligationScope::Class => {
                 return discharge_by_existence(source, acquires, releases, enclosing_class, true);
             }
+            ObligationScope::Component => {
+                return discharge_by_existence(
+                    source,
+                    acquires,
+                    releases,
+                    |n| enclosing_component(n, source),
+                    true,
+                );
+            }
             ObligationScope::Function | ObligationScope::Block => {}
         }
 
@@ -59,17 +69,19 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
             // `scope: 'block'` additionally restricts discharge to a release lexically
             // inside the enclosing `statement_block` — `on_all_paths_within`'s own region.
             // With no enclosing block (top-level code), the obligation falls back to the
-            // function frame, same as `scope: 'function'`. `Module` and `Class` are handled
-            // entirely above, before this loop runs, so this arm never actually executes for
-            // either — they stay grouped with `Function` only to keep the match exhaustive
-            // over `ObligationScope`'s four variants without reaching for a `_` wildcard.
+            // function frame, same as `scope: 'function'`. `Module`, `Class` and `Component`
+            // are handled entirely above, before this loop runs, so this arm never actually
+            // executes for any of them — they stay grouped with `Function` only to keep the
+            // match exhaustive over `ObligationScope`'s five variants without reaching for a
+            // `_` wildcard.
             let region = match scope {
                 ObligationScope::Block => {
                     enclosing_block(acquire.node).map(|block| block.byte_range())
                 }
-                ObligationScope::Function | ObligationScope::Module | ObligationScope::Class => {
-                    None
-                }
+                ObligationScope::Function
+                | ObligationScope::Module
+                | ObligationScope::Class
+                | ObligationScope::Component => None,
             };
 
             // Value identity: with `keyed`, a release only discharges an acquire whose
@@ -139,9 +151,9 @@ impl ObligationAnalyzer for JsObligationAnalyzer {
 ///
 /// `region_of` maps a node to the region node that bounds correlation; `region_required` is
 /// `false` for `module` (the region is the whole file, so any matching-key release counts) and
-/// `true` for `class` (a release only discharges an acquire in the *same* region node, and an
-/// acquire outside any region can never be discharged). Correlation is text equality —
-/// value-flow is a later change.
+/// `true` for `class`/`component` (a release only discharges an acquire in the *same* region
+/// node, and an acquire outside any region can never be discharged). Correlation is text
+/// equality — value-flow is a later change.
 fn discharge_by_existence<'t>(
     source: &str,
     acquires: &[Keyed<'t>],
@@ -170,6 +182,69 @@ fn discharge_by_existence<'t>(
             })
         })
         .collect()
+}
+
+/// The nearest enclosing React function component of `node`, or `None`.
+///
+/// A component is a `function_declaration`, `function_expression` or `arrow_function` that is
+/// (a) named in `PascalCase` — the function's own name, or the `const`/`let` binding it is
+/// assigned to for an unnamed arrow/function expression — and (b) contains at least one JSX
+/// node anywhere in its body. Class components are `class` scope's job. The walk skips
+/// non-component function ancestors (an event handler inside a component) and keeps climbing.
+fn enclosing_component<'t>(node: Node<'t>, source: &str) -> Option<Node<'t>> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if matches!(
+            n.kind(),
+            "function_declaration" | "function_expression" | "arrow_function"
+        ) && component_name(n, source).is_some_and(is_pascal_case)
+            && contains_jsx(n)
+        {
+            return Some(n);
+        }
+        current = n.parent();
+    }
+    None
+}
+
+/// The name a function is known by: its own `name` field, or the `variable_declarator` that
+/// binds an unnamed arrow / function expression (`const Foo = () => …`).
+fn component_name<'a>(func: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if let Some(name) = func.child_by_field_name("name") {
+        return Some(&source[name.byte_range()]);
+    }
+    let parent = func.parent()?;
+    if parent.kind() == "variable_declarator" {
+        let name = parent.child_by_field_name("name")?;
+        if name.kind() == "identifier" {
+            return Some(&source[name.byte_range()]);
+        }
+    }
+    None
+}
+
+/// React's component-name rule: begins with an ASCII uppercase letter.
+fn is_pascal_case(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
+/// Whether `node`'s subtree contains any JSX. Walks into nested functions on purpose — a
+/// component's JSX is often inside a `.map` callback.
+fn contains_jsx(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if matches!(
+            n.kind(),
+            "jsx_element" | "jsx_self_closing_element" | "jsx_fragment"
+        ) {
+            return true;
+        }
+        let mut cursor = n.walk();
+        for child in n.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
 }
 
 /// Text of a `Keyed`'s `@key` capture, for correlating an acquire with a release by value
@@ -219,7 +294,7 @@ fn resolve_blocks<'t>(cfg: &Cfg<'t>, node: Node<'t>) -> Vec<BlockId> {
 #[cfg(test)]
 mod tests {
     use super::JsObligationAnalyzer;
-    use crate::cfg::testing::{find_all, parse};
+    use crate::cfg::testing::{find_all, parse, parse_tsx};
     use lanekeep_lang::obligation::{Keyed, ObligationAnalyzer, ObligationScope};
 
     fn calls<'t>(
@@ -535,6 +610,103 @@ mod tests {
             unmet.len(),
             1,
             "an acquire outside any class cannot be discharged"
+        );
+    }
+
+    #[test]
+    fn component_scope_is_silent_within_one_component() {
+        let source = "const W = () => { reg(id); const c = () => { forget(id); }; return <b/>; };";
+        let tree = parse_tsx(source);
+        let acq = keyed_calls(&tree, source, "reg(id)");
+        let rel = keyed_calls(&tree, source, "forget(id)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Component,
+            true,
+            &acq,
+            &rel,
+        );
+        assert!(
+            unmet.is_empty(),
+            "acquire and release are both inside the PascalCase+JSX component W"
+        );
+    }
+
+    #[test]
+    fn component_scope_reports_across_two_components() {
+        let source = "const A = () => { reg(id); return <b/>; };\nconst B = () => { forget(id); return <b/>; };";
+        let tree = parse_tsx(source);
+        let acq = keyed_calls(&tree, source, "reg(id)");
+        let rel = keyed_calls(&tree, source, "forget(id)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Component,
+            true,
+            &acq,
+            &rel,
+        );
+        assert_eq!(unmet.len(), 1, "release is in a different component");
+    }
+
+    #[test]
+    fn component_scope_ignores_a_lowercase_or_jsxless_function() {
+        // lowercase name -> not a component; and a PascalCase fn with no JSX -> not a component.
+        let source = "function render() { reg(id); return <b/>; }\nfunction Factory() { forget(id); return 1; }";
+        let tree = parse_tsx(source);
+        let acq = keyed_calls(&tree, source, "reg(id)");
+        let rel = keyed_calls(&tree, source, "forget(id)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Component,
+            true,
+            &acq,
+            &rel,
+        );
+        assert_eq!(
+            unmet.len(),
+            1,
+            "neither function is a component region, so the acquire cannot discharge"
+        );
+    }
+
+    /// The case the test above cannot cover: here the acquire's own host is the JSX-less
+    /// `PascalCase` function, not the lowercase one, so `region_of` is actually asked about it.
+    ///
+    /// In the test above the acquire sits in `render` (lowercase), so `acq_region` is already
+    /// `None` before `Factory` ever enters the picture — `discharge_by_existence`'s
+    /// `!(region_required && acq_region.is_none())` short-circuits `false` without calling
+    /// `region_of` on `Factory` at all. A `contains_jsx`/`is_pascal_case` bug that wrongly
+    /// accepted a JSX-less `PascalCase` function as a component would pass that test unnoticed.
+    ///
+    /// Putting both the acquire and its matching-key release inside `Factory` closes the gap:
+    /// if `Factory` were wrongly treated as a component, `region_of` would map both nodes to
+    /// it and the release would discharge the acquire, flipping `unmet` from one entry to
+    /// none. Correct behavior reports it — `Factory` has no JSX, so it is not a component
+    /// region, and an acquire with no region cannot be discharged, exactly as
+    /// `class_scope_reports_an_acquire_with_no_enclosing_class` reports an acquire with no
+    /// enclosing class regardless of what else the file contains.
+    #[test]
+    fn component_scope_reports_when_the_shared_pascalcase_host_has_no_jsx() {
+        let source = "function Factory() { reg(id); forget(id); return 1; }";
+        let tree = parse_tsx(source);
+        let acq = keyed_calls(&tree, source, "reg(id)");
+        let rel = keyed_calls(&tree, source, "forget(id)");
+        let unmet = JsObligationAnalyzer.analyze(
+            &tree,
+            source,
+            ObligationScope::Component,
+            true,
+            &acq,
+            &rel,
+        );
+        assert_eq!(
+            unmet.len(),
+            1,
+            "Factory has no JSX, so it is not a component region, even though the acquire \
+             and its matching-key release share one PascalCase-named host"
         );
     }
 }
