@@ -57,6 +57,7 @@ type ObligationSpec = {
   acquire: string[]
   release: string[]
   scope: 'function' | 'block' | 'module' | 'class' | 'component'
+  keyBy?: 'text' | 'binding'
 }
 ```
 
@@ -67,9 +68,10 @@ or a `zeroBytes(...)` helper, and either one discharges it. A capture literally 
 `@acquire` or `@release` is what the analyzer reads out of a match; name it that in every
 query, however the rest of the pattern is shaped. A query in either role may also bind an
 optional `@key` capture alongside it, to correlate a specific acquire with a specific release
-rather than treating every release as interchangeable — see "`@key` correlation and
-`scope: 'module'`", "`@key` correlation and `scope: 'class'`" and "`@key` correlation and
-`scope: 'component'`" below.
+rather than treating every release as interchangeable, and `keyBy` says *how* two `@key`
+captures are compared — see "`@key` correlation and `scope: 'module'`", "`@key` correlation and
+`scope: 'class'`", "`@key` correlation and `scope: 'component'`" and "`keyBy`: correlating by
+value origin" below.
 
 `scope` decides which paths have to carry a release, or — for `'module'`, `'class'` and
 `'component'` — whether a matching one exists at all:
@@ -352,6 +354,84 @@ arrow function here for `'component'` to find in the first place, so an obligati
 written with `scope: 'component'` would report every acquire in this class unconditionally,
 regardless of the matching release two lines below it.
 
+## `keyBy`: correlating by value origin
+
+Every `@key` correlation shown above compares by **exact captured text** — `keyBy: 'text'`,
+the default. `keyBy: 'binding'` compares differently: not what the `@key` capture *says*, but
+what value it resolves to, following identifier copies, transparent wrappers and ternaries back
+to a terminal definition — a parameter, a non-alias initializer, or an import — with a
+reassignment killing an earlier definition the same way an ordinary tainted read would see it.
+Two `@key` captures correlate under `keyBy: 'binding'` when that walk finds them sharing a root
+definition; it reuses the dataflow analyzer's own reaching-definition machinery rather than a
+second implementation of it.
+
+```ts
+export default defineRule({
+  id: 'local/registered-is-forgotten-by-origin',
+  requires: ['dataflow'],
+  obligation: {
+    acquire: [
+      `(call_expression function: (identifier) @f (#eq? @f "register")
+         arguments: (arguments (identifier) @key)) @acquire`,
+    ],
+    release: [
+      `(call_expression function: (identifier) @f (#eq? @f "forget")
+         arguments: (arguments (identifier) @key)) @release`,
+    ],
+    scope: 'function',
+    keyBy: 'binding',
+  },
+  card: {
+    message: 'not forgotten',
+    remediation: 'call forget on the same value',
+    examples: { bad: 'register(a);', good: 'register(a); forget(a);' },
+  },
+  checkObligation(ctx, unmet) {
+    ctx.report(unmet.exit, unmet.partial ? 'missed on some path' : 'never forgotten')
+  },
+})
+```
+
+| Code | Result |
+| --- | --- |
+| `function f(clientId) { const id = clientId; register(clientId); forget(id); }` | silent — `id` is a plain copy of `clientId`; both `@key` captures resolve to the same parameter |
+| `function f(clientId, otherId) { register(clientId); forget(otherId); }` | reports — `clientId` and `otherId` are two distinct parameters; the release's key resolves to a different origin |
+
+This is the same register/forget shape "`@key` correlation and `scope: 'module'`" above uses,
+with `scope: 'function'` and `keyBy: 'binding'` in place of `scope: 'module'`'s default
+`keyBy: 'text'` — `keyBy` composes with every `scope`, not only `'function'` shown here.
+`'block'`, `'module'`, `'class'` and `'component'` each still ask their own question, a
+control-flow path or existence in a region; `keyBy` only changes how the two sides of a
+correlation are compared once that question is asked.
+
+`keyBy: 'binding'` requires `@key` bound on every acquire and release query, refused at load
+otherwise — the identical ground `scope: 'module'`, `scope: 'class'` and `scope: 'component'`
+are already refused on, above: with no `@key` anywhere there is nothing for it to correlate by.
+And a `@key` whose value-origin walk resolves to nothing — an unresolved use, a reference cycle,
+or the walk's own depth limit — has no key to correlate with anything and is always reported,
+the same safe-over-report posture `@key` correlation has everywhere else in this document.
+
+### `'binding'` does not correlate distinct per-frame parameters
+
+Value-origin tracking is static: a `@key` resolves to the AST node of its own declaration, never
+to "whichever call passed this argument." Two different functions each declaring their own
+parameter of the same name are two different declarations, with two different origins, however
+identically they are named. The sibling-callback pattern from "`@key` correlation and
+`scope: 'module'`" above —
+
+```ts
+const on = (id) => { reg(id) }
+const off = (id) => { forget(id) }
+```
+
+— relies on `on`'s `id` and `off`'s `id` correlating by name alone, since `scope: 'module'`'s
+default `keyBy: 'text'` compares exactly that. Rewriting it to `keyBy: 'binding'` would report
+`reg(id)` unconditionally: `on`'s parameter and `off`'s parameter are two distinct declarations
+with no shared origin, whatever a caller elsewhere might pass to both. **Use `keyBy: 'text'` —
+the default — for this pattern.** Reach for `'binding'` only where the two `@key` sides are
+genuinely the same lexical value, copied or wrapped, rather than two independently-bound
+parameters that merely happen to share a name.
+
 ## Limitations
 
 Each of these is a stated v1 scope decision, not an oversight — see
@@ -360,8 +440,11 @@ Each of these is a stated v1 scope decision, not an oversight — see
 - **Value identity is opt-in, through `@key`.** Bind an optional `@key` capture on every
   acquire and release query — see "`@key` correlation and `scope: 'module'`",
   "`@key` correlation and `scope: 'class'`" and "`@key` correlation and `scope: 'component'`"
-  above — and discharge requires matching key text, not merely a release somewhere on all
-  paths. `scope: 'module'`, `scope: 'class'` and `scope: 'component'` all require it outright:
+  above — and discharge requires the two keys to correlate, not merely a release somewhere on
+  all paths: matching captured text by default (`keyBy: 'text'`), or a shared value origin
+  under `keyBy: 'binding'` (see "`keyBy`: correlating by value origin" above, including the
+  caveat that `'binding'` does not correlate two distinct functions' distinct parameters).
+  `scope: 'module'`, `scope: 'class'` and `scope: 'component'` all require `@key` outright:
   a file-, class-, or component-wide scope with no correlation would let any release discharge
   any acquire, which is strictly worse than a narrower scope. Without `@key`, nothing here has
   changed: a release on all paths still discharges every acquire it is on-all-paths-from,

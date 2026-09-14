@@ -487,6 +487,13 @@ export type ObligationSpec = {
    * `'component'` — a matching-`@key` release must exist in the same React function component.
    */
   scope: 'function' | 'block' | 'module' | 'class' | 'component'
+  /**
+   * How a `@key` correlates an acquire with a release. `'text'` (default) — exact captured
+   * text. `'binding'` — shared value origin (follows copies/wrappers/ternaries); requires
+   * `@key`. Note: `'binding'` does not correlate distinct per-frame parameters — use `'text'`
+   * for the sibling-callback pattern.
+   */
+  keyBy?: 'text' | 'binding'
 }
 
 /** An acquire some path leaves undischarged, passed to `checkObligation`. */

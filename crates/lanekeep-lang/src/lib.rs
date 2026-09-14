@@ -18,7 +18,7 @@ pub mod obligation;
 
 pub use flow::{FlowAnalysis, FlowAnalyzer, FlowPath};
 pub use grammar::grammar_digest;
-pub use obligation::{ObligationAnalyzer, ObligationScope, UnmetObligation};
+pub use obligation::{KeyCorrelation, ObligationAnalyzer, ObligationScope, UnmetObligation};
 
 use std::collections::BTreeMap;
 use std::fmt;
