@@ -896,8 +896,10 @@ dependencies = [
  "lanekeep-query",
  "lanekeep-types",
  "rquickjs",
+ "serde_json",
  "thiserror",
  "tree-sitter",
+ "tree-sitter-typescript",
 ]
 
 [[package]]

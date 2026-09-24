@@ -133,6 +133,7 @@ const BLANK_WHOLE: &[&str] = &[
     "interface_declaration",
     "type_alias_declaration",
     "ambient_declaration",
+    "function_signature",
     "implements_clause",
     "abstract_method_signature",
     "method_signature",
@@ -558,6 +559,93 @@ mod tests {
                 "export const helper = 1;",
                 "{declaration}"
             );
+        }
+    }
+
+    #[test]
+    fn strips_overload_signatures() {
+        // A signature has no body, so there is nothing in it to keep.
+        assert_eq!(
+            normalized("function f(a: string): string;\nfunction f(a: unknown) { return a }"),
+            "function f(a ) { return a }"
+        );
+        assert_eq!(
+            normalized(
+                "export function f(a: string): string;\n\
+                 export function f(a: unknown) { return a }"
+            ),
+            "export function f(a ) { return a }"
+        );
+    }
+
+    #[test]
+    fn every_declaration_kind_the_grammar_declares_is_classified() {
+        use std::collections::BTreeSet;
+
+        // Blanked whole, and an `export` of one is blanked with it.
+        const TYPE_ONLY: &[&str] = &[
+            "ambient_declaration",
+            "function_signature",
+            "interface_declaration",
+            "type_alias_declaration",
+        ];
+        // These generate code, so blanking one would delete part of the program.
+        const RUNTIME: &[&str] = &[
+            "abstract_class_declaration",
+            "class_declaration",
+            "enum_declaration",
+            "function_declaration",
+            "generator_function_declaration",
+            "import_alias",
+            "internal_module",
+            "lexical_declaration",
+            "module",
+            "variable_declaration",
+        ];
+
+        // Read off node-types.json, where the kinds are declared, so a grammar upgrade that
+        // adds one fails here until someone decides whether it is type-only, rather than
+        // reaching rules unstripped the way `function_signature` did.
+        fn declarations(node_types: &str) -> BTreeSet<String> {
+            let kinds: Vec<serde_json::Value> =
+                serde_json::from_str(node_types).expect("node-types.json parses");
+            kinds
+                .iter()
+                .find(|kind| kind["type"] == "declaration")
+                .and_then(|kind| kind["subtypes"].as_array())
+                .expect("the grammar declares a `declaration` supertype")
+                .iter()
+                .map(|subtype| {
+                    subtype["type"]
+                        .as_str()
+                        .expect("a kind has a type")
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        let typescript = declarations(tree_sitter_typescript::TYPESCRIPT_NODE_TYPES);
+        assert_eq!(
+            typescript,
+            declarations(tree_sitter_typescript::TSX_NODE_TYPES),
+            "the two grammars declare the same declaration kinds"
+        );
+
+        let classified: BTreeSet<String> = TYPE_ONLY
+            .iter()
+            .chain(RUNTIME)
+            .map(|kind| (*kind).to_owned())
+            .collect();
+        assert_eq!(
+            typescript, classified,
+            "the grammar's declaration kinds changed: decide whether each new one is type-only"
+        );
+
+        for kind in TYPE_ONLY {
+            assert!(BLANK_WHOLE.contains(kind), "`{kind}` is type-only");
+        }
+        for kind in RUNTIME {
+            assert!(!BLANK_WHOLE.contains(kind), "`{kind}` generates code");
         }
     }
 
