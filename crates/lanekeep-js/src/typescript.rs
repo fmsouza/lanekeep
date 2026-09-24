@@ -32,6 +32,12 @@
 //! Stripping is verified rather than trusted: the result is parsed as JavaScript, and a
 //! syntax error means the stripper is wrong, not the author. That check turns a whole class
 //! of subtle stripping bugs into a loud failure at the point of the mistake.
+//!
+//! It is only as strict as tree-sitter's JavaScript grammar, which is more permissive than
+//! the language: it parses a bare `export` as an identifier. A stripper bug that leaves one
+//! behind therefore passes the check and surfaces only in QuickJS — as `invalid export
+//! syntax` at the statement after it, or not at all when that statement is a declaration,
+//! which it then silently exports.
 
 use lanekeep_lang::Language;
 use thiserror::Error;
@@ -253,6 +259,16 @@ fn strip_node(node: Node<'_>, source: &str, output: &mut Vec<u8>) -> Result<(), 
             return Ok(());
         }
 
+        // `export interface I {}`, `export type T = ...`, `export declare ...`. The `export`
+        // (and a `default`) belongs to the statement rather than to the declaration, so
+        // blanking the declaration alone leaves a bare `export` that attaches to whatever
+        // statement follows: `invalid export syntax` from QuickJS when that is another
+        // export, and a silent export of a private binding when it is a declaration.
+        "export_statement" if exports_a_type_only_declaration(node) => {
+            blank(output, node.byte_range());
+            return Ok(());
+        }
+
         // `x as T`, `x satisfies T`, `x!` — all of the form "an expression followed by
         // type-only syntax". Keep the expression, blank everything after it, and keep
         // descending so nested assertions inside it are stripped too.
@@ -343,6 +359,13 @@ fn has_leading_type_keyword(node: Node<'_>) -> bool {
     node.children(&mut cursor)
         .nth(1)
         .is_some_and(|second| !second.is_named() && second.kind() == "type")
+}
+
+/// Whether an `export` statement wraps a declaration that is blanked whole, as in
+/// `export interface I {}`.
+fn exports_a_type_only_declaration(node: Node<'_>) -> bool {
+    node.child_by_field_name("declaration")
+        .is_some_and(|declaration| BLANK_WHOLE.contains(&declaration.kind()))
 }
 
 /// Whether a parameter belongs to a constructor, which is what makes an accessibility
@@ -471,6 +494,71 @@ mod tests {
             normalized("export type { Z };\nconst c = 1;"),
             "const c = 1;"
         );
+    }
+
+    #[test]
+    fn strips_exported_interfaces_and_type_aliases_with_their_export() {
+        // `export` belongs to the statement, not to the declaration it wraps, so blanking
+        // the declaration alone leaves a bare `export` behind.
+        assert_eq!(normalized("export interface A { b: string }"), "");
+        assert_eq!(normalized("export type B = string | null;"), "");
+    }
+
+    #[test]
+    fn a_value_export_after_an_exported_type_survives() {
+        // The reported shape: QuickJS read the leftover `export` together with the next
+        // one and refused the module with `invalid export syntax`.
+        assert_eq!(
+            normalized(
+                "export interface ImportSource { specifier: string }\n\
+                 export const helper = () => 1"
+            ),
+            "export const helper = () => 1"
+        );
+        assert_eq!(
+            normalized("export type Alias = string | number\nexport const helper = () => 1"),
+            "export const helper = () => 1"
+        );
+    }
+
+    #[test]
+    fn an_exported_type_does_not_export_the_statement_after_it() {
+        // The silent half of the same bug. A leftover `export` in front of a declaration
+        // is a valid export of it, so a binding the author kept private would have joined
+        // the module's interface with nothing anywhere to say so.
+        assert_eq!(
+            normalized("export interface A { b: string }\nconst helper = 1;"),
+            "const helper = 1;"
+        );
+        assert_eq!(
+            normalized("export type B = string;\nfunction helper() {}"),
+            "function helper() {}"
+        );
+    }
+
+    #[test]
+    fn strips_a_default_exported_interface() {
+        assert_eq!(
+            normalized("export default interface I { a: string }\nexport const helper = () => 1"),
+            "export const helper = () => 1"
+        );
+    }
+
+    #[test]
+    fn strips_exported_ambient_declarations() {
+        for declaration in [
+            "export declare const g: number;",
+            "export declare function f(): void;",
+            "export declare class C { m(): void }",
+            "export declare enum E { A }",
+            "export declare namespace N { const q: number }",
+        ] {
+            assert_eq!(
+                normalized(&format!("{declaration}\nexport const helper = 1;")),
+                "export const helper = 1;",
+                "{declaration}"
+            );
+        }
     }
 
     #[test]
