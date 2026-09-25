@@ -17,7 +17,7 @@
 # tool wasm-opt 131
 # tool wasm-tools 1.255.0
 crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm da424231bc7bbbff860716dd34deaf9beed3aa3c6aacb905354690db9422dc70
-crates/lanekeep-wasm/wit/world.wit 18284b4f5c84f40654ff679992e83daf6511f4a3d09cd6247eea26f2a3d366f5
+crates/lanekeep-wasm/wit/world.wit a95c47c21f5babecd1914bf2dd8b86344e06745a576feaabe30292139096c59e
 go-rules/.gitignore 02af855e1226375a64521b31bd8994a45c665fbe93ea55dfdb4b38f062d98c36
 go-rules/fixtures/maporder/main.go 2e1705b14c8762d6b372589acd571b2904eacf9815b8cf898c4dcf1db2d3e244
 go-rules/go.mod 25d0033f110d1e59cc9e59ecc9b2bda4102adaa59f0414844df1d8e17c889e4c
@@ -29,7 +29,7 @@ go-rules/internal/lanekeep/host/rule/rule.wit.go f47c483fb11996d57aa45be9e100a23
 go-rules/internal/lanekeep/host/types/abi.go b44aee505b74f4d3c1bac2e2b4c83bca694f9c1647ba6842f6db9e6d89a597fe
 go-rules/internal/lanekeep/host/types/empty.s cedeeff551bb1e50bfc4ab8c6299a62fb7b25cae79805253a45adc7dc18696c9
 go-rules/internal/lanekeep/host/types/types.wasm.go 86d08384b477c23d56eafd91ec4db12939f4d333778d9e96f4fad7ba01091797
-go-rules/internal/lanekeep/host/types/types.wit.go 92a6ea4d6671d032eb3b844a2daff8221e1018b3a3643929cdcd9e6c508e1345
+go-rules/internal/lanekeep/host/types/types.wit.go a10b74625401e8e4720dcda4f2f656e14fa927a4784558e9339947e95bf240a1
 go-rules/lanekeep/capture.go 1204297483bd9bd43df742286a173f52361271c22930fb35b24380972dd42310
 go-rules/lanekeep/capture_test.go 630b58245ba6ccf889823a8f089df580eae2885eb72ef4cc16f7849f5a1401d0
 go-rules/lanekeep/doc.go 69f2a5853e8ed6ba291dcc6df03b8ef28765bdde3a9b4ddbc56adc22de78c991
