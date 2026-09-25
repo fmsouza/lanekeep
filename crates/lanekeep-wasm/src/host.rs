@@ -260,7 +260,7 @@
 //! §6.5 says the reduce form of `report` takes `{ file, line, column }`, and says why: there
 //! are no nodes in that phase, so the position has to be captured during the per-file pass
 //! while the tree is still there. The published `ReduceLocation` declares all three, so a
-//! TypeScript rule omitting one does not compile. `lanekeep_js::ReduceContext`'s `report`
+//! TypeScript rule omitting one fails to type-check. `lanekeep_js::ReduceContext`'s `report`
 //! throws unless all three are present, and tells the author exactly that. And
 //! [`lanekeep_core::Position`] has no representation for an unknown line, so a report accepted
 //! without one has to acquire one somewhere downstream.

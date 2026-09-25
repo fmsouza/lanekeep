@@ -133,8 +133,8 @@ impl Guest for Component {
                 // with no line or column: a cross-file violation with no site is
                 // unactionable, and 1:1 cannot be told apart from a rule that meant 1:1.
                 // The option is in the record because the published TypeScript
-                // `ReduceLocation` has it, not because a positionless report works. See
-                // `wit/world.wit`'s `reduce-location`, and `tests/reduce.rs`.
+                // `ReduceLocation` had it when this world was written, not because a
+                // positionless report works. See `wit/world.wit` and `tests/reduce.rs`.
                 line: None,
                 column: None,
             },
