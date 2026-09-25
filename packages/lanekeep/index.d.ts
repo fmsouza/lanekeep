@@ -203,7 +203,7 @@ export interface EmittedFact extends Fact {
 /**
  * A node's location: the file, line and column `ctx.loc` returns.
  *
- * `line` and `column` are required here, unlike on `ReduceLocation`: `ctx.loc` either
+ * `line` and `column` are required here, as they are on `ReduceLocation`: `ctx.loc` either
  * resolves the node and returns all three together, or the node does not resolve and the
  * call returns `undefined` entirely — there is no partial state to leave room for.
  */
@@ -434,14 +434,23 @@ export interface RuleContext {
   flow: FlowApi
 }
 
-/** A violation the reduce phase reports, which has no node to point at. */
+/**
+ * Where the reduce phase reports a violation. That phase has no node to point at, so the
+ * position is one a fact carried out of the per-file pass, while the tree was still there —
+ * `ctx.loc(node)` returns exactly this shape.
+ *
+ * All three are required, and `ctx.report` throws when `line` or `column` is missing. No
+ * default stands in for either: 1:1 would point a reader at an unrelated line, and could not
+ * be told apart from a rule that meant 1:1. A finding about a file as a whole — a key missing
+ * from a locale file — says `line: 1, column: 1` itself.
+ */
 export interface ReduceLocation {
   /** Path relative to the project root. */
   file: string
   /** One-based. */
-  line?: number
+  line: number
   /** One-based. */
-  column?: number
+  column: number
 }
 
 /** A rule's ReduceContext surface. */
