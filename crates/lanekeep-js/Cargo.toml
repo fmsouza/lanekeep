@@ -23,6 +23,8 @@ tree-sitter = { workspace = true }
 
 [dev-dependencies]
 lanekeep-lang-js = { workspace = true }
+serde_json = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 
 [lints]
 workspace = true

@@ -399,6 +399,16 @@ Nothing is visible in an editor. If a rule fails to strip at a line that looks f
 `ERROR` node positions from the tree rather than reading the reported one — and write
 control characters as escapes (`\u0000`), never literally.
 
+**The stripper's JavaScript check cannot see a bare `export`, so a green `strip_types` is not
+evidence that QuickJS will load the module.** tree-sitter-javascript 0.25.0 parses `export` as an
+identifier. Blanking only the declaration inside `export interface I {}` left `export` and
+spaces, which parsed as `(expression_statement (identifier))` with no `ERROR`, and QuickJS then
+refused the module with `invalid export syntax` at the *next* export, pointing at code that was
+fine. In front of a private declaration the same leftover is a valid `export`: a module-local
+`const hidden` became importable. Test a stripping change by evaluating a module through the
+loader, as `loads_modules_that_export_types_beside_values` in `crates/lanekeep-js/src/loader.rs`
+does, not by the check passing.
+
 **`Path::is_absolute` is platform-specific, and tests that assume otherwise pass on
 macOS and fail on Windows.** `/etc/passwd` is absolute on Unix and merely *rooted* on
 Windows; `C:\...` is the reverse. Build an absolute path from `std::env::temp_dir()` rather

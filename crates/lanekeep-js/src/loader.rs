@@ -1453,6 +1453,38 @@ mod tests {
     }
 
     #[test]
+    fn loads_modules_that_export_types_beside_values() {
+        // An exported interface or type alias used to strip to a bare `export`, which QuickJS
+        // read together with the next export and refused as `invalid export syntax` — in a
+        // rule module and in a module it imports alike.
+        let fixture = Fixture::new(
+            "e2e-exported-types",
+            &[
+                (
+                    "rule.ts",
+                    "import { defineRule } from 'lanekeep';\n\
+                     import type { ImportSource } from './shared';\n\
+                     import { helper } from './shared';\n\
+                     export interface Options { source: ImportSource }\n\
+                     export default defineRule({ id: `local/helper-${helper()}` });\n",
+                ),
+                (
+                    "shared.ts",
+                    "export interface ImportSource { specifier: string }\n\
+                     export type Alias = string;\n\
+                     export const helper = () => 1\n",
+                ),
+            ],
+        );
+        let sandbox = sandbox_for(&fixture);
+        let path = fixture.root().resolve("", "./rule").expect("resolves");
+
+        let module: std::collections::HashMap<String, String> =
+            sandbox.import_default(&path).expect("module evaluates");
+        assert_eq!(module.get("id").map(String::as_str), Some("local/helper-1"));
+    }
+
+    #[test]
     fn a_bare_import_fails_at_load_with_the_explanation() {
         let fixture = Fixture::new(
             "e2e-bare",
