@@ -1056,6 +1056,21 @@ fn reporting_without_a_position(file: &str) -> wasmtime::Error {
     ))
 }
 
+/// The error a cross-file report at line or column 0 returns.
+///
+/// `u32` already rules out the rest of what `lanekeep-js` refuses as not one-based — negative,
+/// fractional, `NaN`, past the range — so zero is the one such value that reaches this host.
+/// It is refused rather than recorded because a position is one-based everywhere downstream,
+/// and a SARIF `startLine` of 0 is a result the format rejects.
+fn reporting_at_position_zero(file: &str, line: u32, column: u32) -> wasmtime::Error {
+    wasmtime::Error::msg(format!(
+        "`reduce-context.report` was called for `{file}` at line {line}, column {column}. \
+         Positions are one-based, so 0 names no line and no column, and a SARIF `startLine` \
+         must be at least 1. `lanekeep-js` refuses the same call the same way — its reduce \
+         `ctx.report` throws unless `line` and `column` are whole numbers from 1."
+    ))
+}
+
 impl HostCheckContext for HostState {
     fn file_path(&mut self, this: Resource<CheckContext>) -> wasmtime::Result<String> {
         Ok(self.check_context_mut(&this)?.file_path.clone())
@@ -1555,7 +1570,7 @@ impl HostReduceContext for HostState {
             .collect())
     }
 
-    /// Record a cross-file violation, or fail the call when it names no site.
+    /// Record a cross-file violation, or fail the call when it names no site or a zero one.
     ///
     /// The context is resolved first, as every sibling on both resources resolves first, so a
     /// dead handle is reported as a dead handle rather than as a bad location.
@@ -1574,6 +1589,9 @@ impl HostReduceContext for HostState {
         let (Some(line), Some(column)) = (at.line, at.column) else {
             return Err(reporting_without_a_position(&at.file));
         };
+        if line == 0 || column == 0 {
+            return Err(reporting_at_position_zero(&at.file, line, column));
+        }
 
         context.reports.push(ReduceReport {
             file: at.file,

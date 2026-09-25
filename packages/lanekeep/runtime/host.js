@@ -331,23 +331,45 @@ export function buildReduceContext(ctx) {
             'tree here, so there are no nodes to report at',
         )
       }
+      // Read once, so the values checked below are the values the world is handed: a getter
+      // answering twice could otherwise pass one to the check and the other to the world.
+      const { file, line, column } = at
       // The world requires a position, and the other engine refuses its absence by name —
       // a report whose location lost a field should meet that refusal here rather than
       // whatever the world's own import says one engine over.
-      if (
-        typeof at.file !== 'string' ||
-        typeof at.line !== 'number' ||
-        typeof at.column !== 'number'
-      ) {
+      if (typeof file !== 'string' || typeof line !== 'number' || typeof column !== 'number') {
         throw new TypeError(
           'ctx.report in a reduce phase needs `file`, `line` and `column` — ' +
             'emit them on the fact during the per-file pass, where the node positions are still available',
         )
       }
+      // Present and numeric is not yet a position: see `isOneBased`.
+      if (!isOneBased(line) || !isOneBased(column)) {
+        throw new TypeError(
+          'ctx.report in a reduce phase needs `line` and `column` as whole numbers from 1 — ' +
+            'positions are one-based, as `ctx.loc` returns them',
+        )
+      }
       const message = reduceReportOptions(options, fix)
-      ctx.report({ file: at.file, line: at.line, column: at.column }, message)
+      ctx.report({ file, line, column }, message)
     },
   }
+}
+
+/**
+ * Whether a reduce location's `line` or `column` names a position: a whole number from 1 to
+ * the largest `u32`, the range the world's `reduce-location` and `lanekeep_core::Position` hold.
+ *
+ * Checked here because the world's import would take the number as it came: `3.5`, `-1` and
+ * `NaN` reach a `u32` as something other than what the rule wrote, and 0 is a line no reader
+ * can find and a SARIF `startLine` the format refuses. `NaN` and the infinities are not
+ * integers, so they fall out with the fractions.
+ *
+ * @param {number} n
+ * @returns {boolean}
+ */
+function isOneBased(n) {
+  return Number.isInteger(n) && n >= 1 && n <= 0xffffffff
 }
 
 /**

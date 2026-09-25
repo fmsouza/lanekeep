@@ -330,6 +330,35 @@ test('the reduce phase refuses a report that offers a fix', () => {
   ])
 })
 
+test('the reduce phase refuses a position that is not one-based', () => {
+  const seen = []
+  const built = buildReduceContext({
+    files: () => [],
+    facts: () => [],
+    report: (at, message) => seen.push([at, message]),
+  })
+
+  // Present, a number, and still not a position: one-based means a whole number from 1, and
+  // anything else would reach the world's `u32` as something other than what the rule wrote.
+  // Each half on its own, in the words the QuickJS host uses for the same values.
+  for (const bad of [0, -1, 3.5, NaN, Infinity, 2 ** 32]) {
+    assert.throws(() => built.report({ file: 'a.ts', line: bad, column: 1 }, 'x'), /as whole numbers from 1/)
+    assert.throws(() => built.report({ file: 'a.ts', line: 1, column: bad }, 'x'), /as whole numbers from 1/)
+  }
+  assert.deepEqual(seen, [])
+
+  // Both ends of the range are positions: the first line, and the last one a `u32` holds.
+  built.report({ file: 'a.ts', line: 1, column: 2 ** 32 - 1 }, 'first')
+  built.report({ file: 'a.ts', line: 2 ** 32 - 1, column: 1 }, 'last')
+  assert.deepEqual(
+    seen.map(([at]) => [at.line, at.column]),
+    [
+      [1, 2 ** 32 - 1],
+      [2 ** 32 - 1, 1],
+    ],
+  )
+})
+
 test('the reduce phase takes a message the other engine refuses a non-message for', () => {
   const seen = []
   const built = buildReduceContext({
