@@ -250,17 +250,20 @@
 //!
 //! `reduce-location` declares `line` and `column` as `option<u32>`, so unlike a grammar or a
 //! `FileAccess` there is a representable "did not say" and something has to be decided about
-//! it. The option is not a decision that a positionless report works — it mirrors the published
-//! TypeScript `ReduceLocation`, whose `line?` and `column?` have been optional in the *type*
-//! and required by the *runtime* since long before this world existed.
+//! it. The option is not a decision that a positionless report works — it mirrored the published
+//! TypeScript `ReduceLocation`, whose `line?` and `column?` were optional in the *type* and
+//! required by the *runtime* from before this world existed. The type has since been made to
+//! require both; the record keeps its option because narrowing it is an ABI change, which every
+//! component already built against this world would have to be rebuilt for.
 //!
-//! Three things agree on the requirement, and none of them is this file. `docs/architecture.md`
+//! Four things agree on the requirement, and none of them is this file. `docs/architecture.md`
 //! §6.5 says the reduce form of `report` takes `{ file, line, column }`, and says why: there
 //! are no nodes in that phase, so the position has to be captured during the per-file pass
-//! while the tree is still there. `lanekeep_js::ReduceContext`'s `report` throws unless all
-//! three are present, and tells the author exactly that. And [`lanekeep_core::Position`] has no
-//! representation for an unknown line, so a report accepted without one has to acquire one
-//! somewhere downstream.
+//! while the tree is still there. The published `ReduceLocation` declares all three, so a
+//! TypeScript rule omitting one fails to type-check. `lanekeep_js::ReduceContext`'s `report`
+//! throws unless all three are present, and tells the author exactly that. And
+//! [`lanekeep_core::Position`] has no representation for an unknown line, so a report accepted
+//! without one has to acquire one somewhere downstream.
 //!
 //! Downstream, the only thing to acquire is 1:1 — which is the one answer that actively
 //! misleads. It points a reader at an unrelated line, and it is indistinguishable from a rule

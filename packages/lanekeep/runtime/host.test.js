@@ -382,10 +382,11 @@ test('the reduce phase takes a message the other engine refuses a non-message fo
 })
 
 test('the reduce phase refuses a report whose location lost a field', () => {
+  const seen = []
   const built = buildReduceContext({
     files: () => [],
     facts: () => [],
-    report: () => {},
+    report: (at, message) => seen.push([at, message]),
   })
 
   // The world requires the position, and the other engine refuses its absence by name — a
@@ -395,8 +396,14 @@ test('the reduce phase refuses a report whose location lost a field', () => {
     () => built.report({ file: 'a.ts' }, 'cycle'),
     /emit them on the fact during the per-file pass/,
   )
+  // Each half on its own, as `index.d.ts`'s `ReduceLocation` requires each: a line with no
+  // column is the report a rule most plausibly writes, and a column with no line is the half a
+  // check that only ever met the first would wave through.
   assert.throws(() => built.report({ file: 'a.ts', line: 3 }, 'cycle'), /emit them on the fact/)
+  assert.throws(() => built.report({ file: 'a.ts', column: 4 }, 'cycle'), /emit them on the fact/)
   assert.throws(() => built.report({ file: 'a.ts', line: 3, column: '4' }, 'cycle'), /emit them on the fact/)
+  // Refused before the world is reached, rather than recorded at a stand-in position.
+  assert.deepEqual(seen, [])
 })
 
 test('the per-file phase honors a fix given positionally', () => {

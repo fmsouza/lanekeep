@@ -510,8 +510,9 @@ fn the_check_export_receives_a_borrowed_context_and_reports_through_it() {
 /// site is unactionable, and 1:1 cannot be told apart from a rule that meant 1:1. See
 /// `wit/world.wit`'s `reduce-location` and `tests/reduce.rs`'s
 /// `reporting_without_a_position_fails_the_call`. The option is in the record because the
-/// published TypeScript `ReduceLocation` has it, not because a positionless report works, so the
-/// ABI has to carry a case no rule may rely on.
+/// published TypeScript `ReduceLocation` had it when the world was written — the type has
+/// required both since, and narrowing the record is an ABI change — not because a positionless
+/// report works, so the ABI has to carry a case no rule may rely on.
 #[test]
 fn the_reduce_export_receives_its_own_context_and_reports_a_partial_location() {
     let (engine, component, linker) = linked();

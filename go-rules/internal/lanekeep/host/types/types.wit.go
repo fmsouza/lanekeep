@@ -127,31 +127,31 @@ type NodeLocation struct {
 //
 // **`line` and `column` are optional in this record and required by the host.** The
 // option
-// mirrors the published TypeScript `ReduceLocation`, where both have always been
-// optional
-// in the type and required by the runtime; it is not permission to omit them. A `report`
-// naming no site fails the call, in both engines, because the only stand-in available
-// downstream is 1:1 — which points a reader at an unrelated line and cannot be told
-// apart
-// from a rule that meant 1:1. A rule that means "the whole file" says `1, 1` itself.
+// is not permission to omit them. A `report` naming no site fails the call, in both
+// engines, because the only stand-in available downstream is 1:1 — which points a
+// reader at
+// an unrelated line and cannot be told apart from a rule that meant 1:1. A rule that
+// means
+// "the whole file" says `1, 1` itself. The published TypeScript `ReduceLocation`
+// declares
+// both required, so a rule type-checked against it hears about a missing one before
+// it
+// runs; it declared them optional until it was brought into line with the host, and
+// this
+// option was written to mirror it.
 //
-// Declaring them `u32` would make that structural rather than enforced, and is the
-// stronger
-// shape. It is not taken here because it would put this record out of step with the
-// published type it mirrors, and because it is an ABI change. That second reason
-// used to
-// carry a window with it — cheap only while no authoring crate binds against this
-// world —
-// and the window has closed: `rust-rules/no-unwrap` and `rust-rules/no-glob-import`
-// both
-// point `[package.metadata.component.target]` at this directory, and their artifacts
-// are
-// committed and hashed. Changing the record now invalidates every one of them and
-// any
-// component built outside this repository besides, which inverts what this paragraph
-// used
-// to recommend: the option stays, and the host keeps enforcing what the type will
-// not.
+// Declaring them `u32` would make the requirement structural rather than enforced,
+// and is
+// the stronger shape. It is not taken because it is an ABI change, and the window
+// in which
+// that was cheap — while no authoring crate bound against this world — has closed:
+// `rust-rules/no-unwrap` and `rust-rules/no-glob-import` both point
+// `[package.metadata.component.target]` at this directory, and the shipped rule components
+// and the committed test fixtures all bind against it, as does any component built
+// outside
+// this repository. Changing the record invalidates every one of them, so the option
+// stays,
+// and the host keeps enforcing what the record will not.
 //
 //	record reduce-location {
 //		file: string,

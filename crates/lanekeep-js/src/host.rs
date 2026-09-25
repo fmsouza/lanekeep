@@ -2529,6 +2529,12 @@ mod tests {
         let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
         for bad in [
             "ctx.report({ file: 'b.ts' })",
+            // Each half on its own, as `index.d.ts`'s `ReduceLocation` requires each: a line
+            // with no column is the report a rule most plausibly writes, and it is as
+            // unactionable as one naming neither — `lanekeep-wasm`'s
+            // `reporting_without_a_position_fails_the_call` makes the same split.
+            "ctx.report({ file: 'b.ts', line: 3 })",
+            "ctx.report({ file: 'b.ts', column: 1 })",
             "ctx.report({ line: 1, column: 1 })",
             "ctx.report(3)",
             "ctx.report('b.ts')",
@@ -2536,7 +2542,12 @@ mod tests {
             let error = sandbox
                 .eval_with_reduce_host::<()>(&context, bad, budget())
                 .expect_err("is rejected");
-            assert!(!error.to_string().is_empty(), "`{bad}` should be rejected");
+            // The host's own refusal, not any error at all: a typo in one of these probes
+            // fails as a `SyntaxError`, which is not the rejection being pinned.
+            assert!(
+                error.to_string().contains("ctx.report in a reduce phase"),
+                "`{bad}` should be refused by the reduce `report`: {error}"
+            );
         }
         assert!(context.take_reports().is_empty());
     }
