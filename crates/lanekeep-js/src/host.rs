@@ -1177,16 +1177,27 @@ impl ReduceContext {
                         ));
                     };
 
-                    let (Ok(file), Ok(line), Ok(column)) = (
+                    let (Ok(file), Some(line), Some(column)) = (
                         at.get::<_, String>("file"),
-                        at.get::<_, u32>("line"),
-                        at.get::<_, u32>("column"),
+                        numeric(at, "line"),
+                        numeric(at, "column"),
                     ) else {
                         return Err(throw(
                             &ctx,
                             "ctx.report in a reduce phase needs `file`, `line` and `column` — \
                              emit them on the fact during the per-file pass, where the node \
                              positions are still available",
+                        ));
+                    };
+
+                    // Present and numeric is not yet a position. See `one_based` for what
+                    // reading these as `u32` directly would have let through.
+                    let (Some(line), Some(column)) = (one_based(&line), one_based(&column)) else {
+                        return Err(throw(
+                            &ctx,
+                            "ctx.report in a reduce phase needs `line` and `column` \
+                             as whole numbers from 1 — positions are one-based, as `ctx.loc` \
+                             returns them",
                         ));
                     };
 
@@ -1218,6 +1229,32 @@ impl ReduceContext {
 
         Ok(object)
     }
+}
+
+/// A reduce location's `line` or `column`, if it is a number at all.
+///
+/// Absent, `null`, a string: each is the "needs `file`, `line` and `column`" refusal, the one
+/// these fields always had. Read once, as a [`Value`], so the number [`one_based`] checks is
+/// the number it converts — a getter answering twice could otherwise pass one to the check and
+/// the other to the conversion.
+fn numeric<'js>(at: &Object<'js>, key: &str) -> Option<Value<'js>> {
+    at.get::<_, Value<'js>>(key).ok().filter(Value::is_number)
+}
+
+/// A reduce location's `line` or `column`, if it names a position: a whole number from 1 to
+/// `u32::MAX`, the range `lanekeep_core::Position` holds.
+///
+/// Checked through `f64` before converting, because rquickjs reaches a `u32` through `f64` and
+/// an `as` cast: `3.5` would arrive as 3 and `NaN` as 0, positions the rule never wrote, and 0
+/// is a line no reader can find and a SARIF `startLine` the format refuses. `NaN` and the
+/// infinities fail the check with the fractions and the out-of-range, and past it the
+/// conversion is exact.
+fn one_based(value: &Value<'_>) -> Option<u32> {
+    let number = value.as_number()?;
+    if number.fract() != 0.0 || !(1.0..=f64::from(u32::MAX)).contains(&number) {
+        return None;
+    }
+    value.get::<u32>().ok()
 }
 
 /// The message half of a reduce report's second argument.
@@ -2307,6 +2344,59 @@ mod tests {
                 "a refused report must not reach the phase"
             );
         }
+    }
+
+    /// A position that is present and is not a position. One-based means a whole number from
+    /// 1, and anything else is recorded as a line nobody can find: `3.5` truncated to 3, `NaN`
+    /// to 0, and a 0 that SARIF's `startLine` refuses outright. Each half on its own, as the
+    /// missing-field refusal is made, and in the words `host.js` uses.
+    #[test]
+    fn a_reduce_report_refuses_a_position_that_is_not_one_based() {
+        let context = ReduceContext::new(vec![], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        for bad in ["0", "-1", "3.5", "NaN", "Infinity", "4294967296"] {
+            for at in [
+                format!("{{ file: 'b.ts', line: {bad}, column: 1 }}"),
+                format!("{{ file: 'b.ts', line: 1, column: {bad} }}"),
+            ] {
+                let expression = format!("ctx.report({at})");
+                let error = sandbox
+                    .eval_with_reduce_host::<()>(&context, &expression, budget())
+                    .expect_err("is refused");
+                // Not the whole `report_parity.rs` fragment: that test reads this file's text,
+                // and spelling its fragment here would satisfy it whatever the refusal says.
+                assert!(
+                    error.to_string().contains("whole numbers from 1"),
+                    "`{expression}` should be refused as not one-based: {error}"
+                );
+            }
+        }
+        assert!(
+            context.take_reports().is_empty(),
+            "a refused report is not recorded at a position the host made up"
+        );
+    }
+
+    /// Both ends of the range are positions, so the refusal above is not narrower than it says:
+    /// 1 is the first line, and `u32::MAX` is the last one `Position` can hold.
+    #[test]
+    fn a_reduce_report_accepts_both_ends_of_the_position_range() {
+        let context = ReduceContext::new(vec![], vec![]);
+        let sandbox = Sandbox::with_limits(Limits::default()).expect("builds");
+        sandbox
+            .eval_with_reduce_host::<()>(
+                &context,
+                "ctx.report({ file: 'b.ts', line: 1, column: 4294967295 }); \
+                 ctx.report({ file: 'b.ts', line: 4294967295, column: 1 })",
+                budget(),
+            )
+            .expect("both ends are positions");
+        let positions: Vec<(u32, u32)> = context
+            .take_reports()
+            .iter()
+            .map(|report| (report.line, report.column))
+            .collect();
+        assert_eq!(positions, vec![(1, u32::MAX), (u32::MAX, 1)]);
     }
 
     /// The message probe reads `message` the same way the fix probe reads `fix` — and a

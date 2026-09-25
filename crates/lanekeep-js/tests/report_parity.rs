@@ -35,6 +35,8 @@ const FRAGMENTS: &[&str] = &[
     "there are no nodes to report at",
     // The position the world requires.
     "emit them on the fact during the per-file pass",
+    // A position present but not one: zero, negative, fractional, NaN, or past `u32`.
+    "as whole numbers from 1",
     // A fix cannot be carried: no parse tree, no node to attach one to.
     "there is no node to attach one to",
     // The message shape, for the strict reduce read.

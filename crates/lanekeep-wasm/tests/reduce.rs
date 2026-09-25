@@ -458,6 +458,39 @@ fn reporting_without_a_position_fails_the_call() {
 }
 
 #[test]
+fn reporting_at_line_or_column_zero_fails_the_call() {
+    // Positions are one-based, so 0 names no line and no column, and a SARIF `startLine` must
+    // be at least 1: recording one would emit a result the format rejects. `u32` already rules
+    // out the rest of what the JavaScript hosts refuse (negative, fractional, NaN, too large),
+    // so zero is the one bad value this ABI lets through. Each half on its own, as the
+    // positionless refusal above is made.
+    for (line, column) in [("0", "1"), ("1", "0"), ("0", "0")] {
+        let mut harness = Harness::new(&["report", "src/b.ts", line, column], Vec::new());
+        let error = harness
+            .reduce()
+            .expect_err("a zero position is not a position");
+
+        let cause = error.root_cause().to_string();
+        assert!(
+            cause.contains("`reduce-context.report`"),
+            "the host names the method it refused ({line}:{column}): {cause}"
+        );
+        assert!(
+            cause.contains("one-based"),
+            "and why ({line}:{column}): {cause}"
+        );
+        assert!(
+            cause.contains("src/b.ts"),
+            "and the file the rule named ({line}:{column}): {cause}"
+        );
+        assert!(
+            harness.reports().is_empty(),
+            "a refused report is not recorded ({line}:{column})"
+        );
+    }
+}
+
+#[test]
 fn taking_the_reports_empties_the_context() {
     // For the reason `take_facts` empties on the per-file side: a context read twice must not
     // report a violation twice.
