@@ -32,6 +32,12 @@
 //! Stripping is verified rather than trusted: the result is parsed as JavaScript, and a
 //! syntax error means the stripper is wrong, not the author. That check turns a whole class
 //! of subtle stripping bugs into a loud failure at the point of the mistake.
+//!
+//! It is only as strict as tree-sitter's JavaScript grammar, which is more permissive than
+//! the language: it parses a bare `export` as an identifier. A stripper bug that leaves one
+//! behind therefore passes the check and surfaces only in QuickJS — as `invalid export
+//! syntax` at the statement after it, or not at all when that statement is a declaration,
+//! which it then silently exports.
 
 use lanekeep_lang::Language;
 use thiserror::Error;
@@ -127,6 +133,7 @@ const BLANK_WHOLE: &[&str] = &[
     "interface_declaration",
     "type_alias_declaration",
     "ambient_declaration",
+    "function_signature",
     "implements_clause",
     "abstract_method_signature",
     "method_signature",
@@ -253,6 +260,16 @@ fn strip_node(node: Node<'_>, source: &str, output: &mut Vec<u8>) -> Result<(), 
             return Ok(());
         }
 
+        // `export interface I {}`, `export type T = ...`, `export declare ...`. The `export`
+        // (and a `default`) belongs to the statement rather than to the declaration, so
+        // blanking the declaration alone leaves a bare `export` that attaches to whatever
+        // statement follows: `invalid export syntax` from QuickJS when that is another
+        // export, and a silent export of a private binding when it is a declaration.
+        "export_statement" if exports_a_type_only_declaration(node) => {
+            blank(output, node.byte_range());
+            return Ok(());
+        }
+
         // `x as T`, `x satisfies T`, `x!` — all of the form "an expression followed by
         // type-only syntax". Keep the expression, blank everything after it, and keep
         // descending so nested assertions inside it are stripped too.
@@ -343,6 +360,13 @@ fn has_leading_type_keyword(node: Node<'_>) -> bool {
     node.children(&mut cursor)
         .nth(1)
         .is_some_and(|second| !second.is_named() && second.kind() == "type")
+}
+
+/// Whether an `export` statement wraps a declaration that is blanked whole, as in
+/// `export interface I {}`.
+fn exports_a_type_only_declaration(node: Node<'_>) -> bool {
+    node.child_by_field_name("declaration")
+        .is_some_and(|declaration| BLANK_WHOLE.contains(&declaration.kind()))
 }
 
 /// Whether a parameter belongs to a constructor, which is what makes an accessibility
@@ -471,6 +495,158 @@ mod tests {
             normalized("export type { Z };\nconst c = 1;"),
             "const c = 1;"
         );
+    }
+
+    #[test]
+    fn strips_exported_interfaces_and_type_aliases_with_their_export() {
+        // `export` belongs to the statement, not to the declaration it wraps, so blanking
+        // the declaration alone leaves a bare `export` behind.
+        assert_eq!(normalized("export interface A { b: string }"), "");
+        assert_eq!(normalized("export type B = string | null;"), "");
+    }
+
+    #[test]
+    fn a_value_export_after_an_exported_type_survives() {
+        // The reported shape: QuickJS read the leftover `export` together with the next
+        // one and refused the module with `invalid export syntax`.
+        assert_eq!(
+            normalized(
+                "export interface ImportSource { specifier: string }\n\
+                 export const helper = () => 1"
+            ),
+            "export const helper = () => 1"
+        );
+        assert_eq!(
+            normalized("export type Alias = string | number\nexport const helper = () => 1"),
+            "export const helper = () => 1"
+        );
+    }
+
+    #[test]
+    fn an_exported_type_does_not_export_the_statement_after_it() {
+        // The silent half of the same bug. A leftover `export` in front of a declaration
+        // is a valid export of it, so a binding the author kept private would have joined
+        // the module's interface with nothing anywhere to say so.
+        assert_eq!(
+            normalized("export interface A { b: string }\nconst helper = 1;"),
+            "const helper = 1;"
+        );
+        assert_eq!(
+            normalized("export type B = string;\nfunction helper() {}"),
+            "function helper() {}"
+        );
+    }
+
+    #[test]
+    fn strips_a_default_exported_interface() {
+        assert_eq!(
+            normalized("export default interface I { a: string }\nexport const helper = () => 1"),
+            "export const helper = () => 1"
+        );
+    }
+
+    #[test]
+    fn strips_exported_ambient_declarations() {
+        for declaration in [
+            "export declare const g: number;",
+            "export declare function f(): void;",
+            "export declare class C { m(): void }",
+            "export declare enum E { A }",
+            "export declare namespace N { const q: number }",
+        ] {
+            assert_eq!(
+                normalized(&format!("{declaration}\nexport const helper = 1;")),
+                "export const helper = 1;",
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_overload_signatures() {
+        // A signature has no body, so there is nothing in it to keep.
+        assert_eq!(
+            normalized("function f(a: string): string;\nfunction f(a: unknown) { return a }"),
+            "function f(a ) { return a }"
+        );
+        assert_eq!(
+            normalized(
+                "export function f(a: string): string;\n\
+                 export function f(a: unknown) { return a }"
+            ),
+            "export function f(a ) { return a }"
+        );
+    }
+
+    #[test]
+    fn every_declaration_kind_the_grammar_declares_is_classified() {
+        use std::collections::BTreeSet;
+
+        // Blanked whole, and an `export` of one is blanked with it.
+        const TYPE_ONLY: &[&str] = &[
+            "ambient_declaration",
+            "function_signature",
+            "interface_declaration",
+            "type_alias_declaration",
+        ];
+        // These generate code, so blanking one would delete part of the program.
+        const RUNTIME: &[&str] = &[
+            "abstract_class_declaration",
+            "class_declaration",
+            "enum_declaration",
+            "function_declaration",
+            "generator_function_declaration",
+            "import_alias",
+            "internal_module",
+            "lexical_declaration",
+            "module",
+            "variable_declaration",
+        ];
+
+        // Read off node-types.json, where the kinds are declared, so a grammar upgrade that
+        // adds one fails here until someone decides whether it is type-only, rather than
+        // reaching rules unstripped the way `function_signature` did.
+        fn declarations(node_types: &str) -> BTreeSet<String> {
+            let kinds: Vec<serde_json::Value> =
+                serde_json::from_str(node_types).expect("node-types.json parses");
+            kinds
+                .iter()
+                .find(|kind| kind["type"] == "declaration")
+                .and_then(|kind| kind["subtypes"].as_array())
+                .expect("the grammar declares a `declaration` supertype")
+                .iter()
+                .map(|subtype| {
+                    subtype["type"]
+                        .as_str()
+                        .expect("a kind has a type")
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        let typescript = declarations(tree_sitter_typescript::TYPESCRIPT_NODE_TYPES);
+        assert_eq!(
+            typescript,
+            declarations(tree_sitter_typescript::TSX_NODE_TYPES),
+            "the two grammars declare the same declaration kinds"
+        );
+
+        let classified: BTreeSet<String> = TYPE_ONLY
+            .iter()
+            .chain(RUNTIME)
+            .map(|kind| (*kind).to_owned())
+            .collect();
+        assert_eq!(
+            typescript, classified,
+            "the grammar's declaration kinds changed: decide whether each new one is type-only"
+        );
+
+        for kind in TYPE_ONLY {
+            assert!(BLANK_WHOLE.contains(kind), "`{kind}` is type-only");
+        }
+        for kind in RUNTIME {
+            assert!(!BLANK_WHOLE.contains(kind), "`{kind}` generates code");
+        }
     }
 
     #[test]
