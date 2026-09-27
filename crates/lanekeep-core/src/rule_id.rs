@@ -65,6 +65,13 @@ impl fmt::Display for Namespace {
     }
 }
 
+/// The id lanekeep reports a file it could not fully parse under (architecture §11).
+///
+/// Reserved in the `lanekeep` namespace and backed by no rule: the engine emits it. It lives
+/// here rather than in the engine because the config names it too — `"severity":
+/// { "lanekeep/parse": … }` is how its level is set.
+pub const PARSE_RULE: &str = "lanekeep/parse";
+
 /// Why a string is not a valid rule ID.
 ///
 /// Each variant carries what was actually seen. A diagnostic that says only "invalid rule
@@ -467,6 +474,12 @@ mod tests {
 
         let back: RuleId = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, id);
+    }
+
+    #[test]
+    fn the_parse_rule_is_a_well_formed_lanekeep_id() {
+        let id: RuleId = PARSE_RULE.parse().expect("a well-formed id");
+        assert!(id.namespace().is_lanekeep());
     }
 
     #[test]

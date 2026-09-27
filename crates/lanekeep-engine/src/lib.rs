@@ -40,7 +40,7 @@ use lanekeep_config::{ComponentBytes, Config, ConfigError, RuleSpec};
 use lanekeep_core::suppression::{self, Date, Scope, Suppressions};
 use lanekeep_core::{
     AnalysisBudget, Capability, CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location,
-    Position, RuleId, Severity, TrackedRead, TypesConfig, TypesProvider, Violation,
+    PARSE_RULE, Position, RuleId, Severity, TrackedRead, TypesConfig, TypesProvider, Violation,
     analysis_overrun_fallback,
 };
 use lanekeep_js::{
@@ -701,6 +701,9 @@ pub struct Engine {
     /// dated key, while `requireExpiry` and `forbidFileScope` are date-independent and cache
     /// under the plain key.
     suppression_policy: lanekeep_config::SuppressionPolicy,
+    /// Severity of the engine's own `lanekeep/parse` report on a file whose tree carries a
+    /// parse fault. `warn` until the config can set it; `Off` skips the check.
+    parse_severity: Severity,
     limits: Limits,
     rules_root: RuleRoot,
     config_path: PathBuf,
@@ -1574,6 +1577,7 @@ impl Engine {
             discovery,
             limits: config.limits,
             suppression_policy: config.suppressions,
+            parse_severity: Severity::Warn,
             rules_root,
             config_path: config_path.to_path_buf(),
             typescript,
@@ -2415,6 +2419,9 @@ impl Engine {
         // directives are applied — a flow finding is reported at the sink and suppressed there
         // like any other.
         self.dispatch_flow(worker, files, admitted, file, &mut outcome)?;
+        // Before directives, unlike `lanekeep/suppression`'s reports: a team can acknowledge a
+        // file lanekeep's grammar misreads, and the directive is the record of that decision.
+        outcome.violations.extend(self.parse_fault(file));
         self.apply_directives(&mut outcome, directives, path);
 
         outcome.suppressions.clone_from(&directives.valid);
@@ -2793,6 +2800,28 @@ impl Engine {
             });
 
         Some(by_rule)
+    }
+
+    /// The `lanekeep/parse` violation for a file whose tree carries a parse fault: `None` for a
+    /// tree the parser read whole, or when the diagnostic is `off`.
+    ///
+    /// From the tree every rule of this file already ran against, and pushed before directives
+    /// are applied, so a directive naming `lanekeep/parse` acknowledges it and the cache entry
+    /// carries it like any other violation.
+    fn parse_fault(&self, file: &FileUnderCheck<'_>) -> Option<Violation> {
+        if !self.parse_severity.is_enabled() {
+            return None;
+        }
+        let faults = lanekeep_lang::faults::summarize(file.tree.root_node())?;
+        let rule_id = PARSE_RULE.parse::<RuleId>().ok()?;
+        Some(Violation {
+            rule_id,
+            location: Location::new(file.path.clone(), Position::new(faults.line, faults.column)),
+            message: parse_fault_message(file.language.id().as_str(), &faults),
+            remediation: parse_fault_remediation(),
+            severity: self.parse_severity,
+            fix: None,
+        })
     }
 
     /// Drop the violations this file's directives silence, and record which fired.
@@ -4505,6 +4534,46 @@ fn engine_version() -> &'static str {
 /// A real namespaced id, so it sorts, suppresses and serializes like any other — and so a
 /// consumer parsing output does not meet a special case.
 const SUPPRESSION_RULE: &str = "lanekeep/suppression";
+
+/// The message a `lanekeep/parse` violation carries: which grammar, and how much of the file
+/// it could not read.
+fn parse_fault_message(language: &str, faults: &lanekeep_lang::faults::Summary) -> String {
+    if faults.root_is_error {
+        return format!(
+            "the {language} parser could not read this file as a whole: its root is an `ERROR` \
+             node, so a query anchored at the root cannot match, and every construct in it was \
+             read only in error recovery"
+        );
+    }
+    let span = if faults.last_line > faults.line {
+        format!("lines {} to {}", faults.line, faults.last_line)
+    } else {
+        format!("line {}", faults.line)
+    };
+    let more = match faults.regions.saturating_sub(1) {
+        0 => String::new(),
+        1 => String::from("; 1 more region after it"),
+        others => format!("; {others} more regions after it"),
+    };
+    format!(
+        "the {language} parser recovered from an error across {span}: constructs there may be \
+         missing or misread, so rules can miss them or misreport them{more}"
+    )
+}
+
+/// What to do about a `lanekeep/parse` violation. The same for every file and grammar, because
+/// the agent and SARIF formats state it once per rule.
+///
+/// The directive token comes from `lanekeep_core::suppression`, never spelled out: lanekeep
+/// checks this file, and the scanner finds a token anywhere in its bytes.
+fn parse_fault_remediation() -> String {
+    format!(
+        "lanekeep's grammar can misread valid code: if this code is valid, do not rewrite it to \
+         satisfy the parser — acknowledge it with `{} lanekeep/parse reason: <why>` on the line \
+         above. If it is invalid, fix the syntax",
+        suppression::NEXT_LINE
+    )
+}
 
 /// Position of a rule in the config's `rules` array, which is how the handler is reached.
 fn rule_index(spec: &RuleSpec) -> usize {
@@ -8324,6 +8393,298 @@ export default defineRule({
             ],
         );
         assert_eq!(project.run().expect("runs").violations.len(), 1);
+    }
+
+    // --- parse faults ---------------------------------------------------------------------
+
+    /// A rule anchored at the root, the shape #271 found silent: it runs once per file, and
+    /// never on a file whose root is `ERROR`.
+    const PROGRAM_ANCHOR_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+        export default defineRule({\n\
+          id: 'local/anchor',\n\
+          query: '(program) @file',\n\
+          card: {\n\
+            message: 'program root reached',\n\
+            remediation: 'n/a',\n\
+            examples: { bad: 'a', good: 'b' },\n\
+          },\n\
+          check(ctx, m) { ctx.report(m.file); },\n\
+        });\n";
+
+    /// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads
+    /// (tree-sitter/tree-sitter-typescript#367), with a statement after it: the root is `ERROR`.
+    const REPRO: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
+                         await importOriginal<typeof import('vitest')>()\n})\n\n1\n";
+
+    const NO_TRAILING: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
+                               await importOriginal<typeof import('vitest')>()\n})\n";
+
+    const REALISTIC: &str = "import { describe, expect, it, vi } from 'vitest'\n\
+                             import { fetchUser } from './api'\n\
+                             \n\
+                             vi.mock('./api', async importOriginal => {\n    \
+                             const actual = await importOriginal<typeof import('./api')>()\n    \
+                             return { ...actual, fetchUser: vi.fn() }\n\
+                             })\n\
+                             \n\
+                             describe('fetchUser', () => {\n    \
+                             it('works', async () => {\n        \
+                             expect(await fetchUser(1)).toBeUndefined()\n    \
+                             })\n\
+                             })\n";
+
+    fn parse_faults(outcome: &Outcome) -> Vec<&Violation> {
+        outcome
+            .violations
+            .iter()
+            .filter(|v| v.rule_id.to_string() == PARSE_RULE)
+            .collect()
+    }
+
+    const ROOT_MESSAGE: &str = "the typescript parser could not read this file as a whole: its \
+        root is an `ERROR` node, so a query anchored at the root cannot match, and every \
+        construct in it was read only in error recovery";
+
+    fn region_message(span: &str, more: &str) -> String {
+        format!(
+            "the typescript parser recovered from an error across {span}: constructs there may \
+             be missing or misread, so rules can miss them or misreport them{more}"
+        )
+    }
+
+    /// Spelled out here rather than read from the engine, so the test is an independent
+    /// oracle. The token is the assembled one from the suppressions section above.
+    fn expected_remediation() -> String {
+        format!(
+            "lanekeep's grammar can misread valid code: if this code is valid, do not rewrite it \
+             to satisfy the parser — acknowledge it with `{NEXT_LINE} lanekeep/parse reason: \
+             <why>` on the line above. If it is invalid, fix the syntax"
+        )
+    }
+
+    #[test]
+    fn a_root_the_parser_could_not_build_is_reported_and_blinds_a_root_anchor() {
+        let project = Project::new(
+            "parse-fault-root",
+            &[
+                ("rule.ts", PROGRAM_ANCHOR_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/repro.ts", REPRO),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+
+        let faults = parse_faults(&outcome);
+        assert_eq!(faults.len(), 1, "{:?}", messages(&outcome));
+        let fault = faults[0];
+        assert_eq!(
+            (fault.location.position.line, fault.location.position.column),
+            (1, 1)
+        );
+        assert_eq!(fault.severity, Severity::Warn);
+        assert_eq!(fault.message, ROOT_MESSAGE);
+        assert_eq!(fault.remediation, expected_remediation());
+        assert!(
+            !outcome
+                .violations
+                .iter()
+                .any(|v| v.rule_id.to_string() == "local/anchor"),
+            "an anchor on `(program)` cannot match an `ERROR` root"
+        );
+    }
+
+    #[test]
+    fn each_fault_shape_is_reported_where_its_code_begins() {
+        let cases: Vec<(&str, String, (u32, u32), String)> = vec![
+            ("repro", REPRO.to_owned(), (1, 1), ROOT_MESSAGE.to_owned()),
+            (
+                "leading-comment",
+                format!("// a leading comment\n\n{REPRO}"),
+                (3, 1),
+                ROOT_MESSAGE.to_owned(),
+            ),
+            (
+                "no-trailing",
+                NO_TRAILING.to_owned(),
+                (2, 5),
+                region_message("lines 2 to 3", ""),
+            ),
+            (
+                "realistic",
+                REALISTIC.to_owned(),
+                (4, 24),
+                region_message("lines 4 to 13", ""),
+            ),
+            (
+                "one-line",
+                "const x = ;\n".to_owned(),
+                (1, 9),
+                region_message("line 1", ""),
+            ),
+            (
+                "two-regions",
+                "let a = 1\nconst x = ;\nlet b = 2\nlet c = )\n".to_owned(),
+                (2, 9),
+                region_message("line 2", "; 1 more region after it"),
+            ),
+            (
+                "three-regions",
+                "const x = ;\nconst y = ;\nconst z = ;\n".to_owned(),
+                (1, 9),
+                region_message("line 1", "; 2 more regions after it"),
+            ),
+            (
+                "missing",
+                "export declare class Big { m(): void\n".to_owned(),
+                (1, 37),
+                region_message("line 1", ""),
+            ),
+        ];
+        let config = config("");
+        let paths: Vec<String> = cases
+            .iter()
+            .map(|(name, ..)| format!("src/{name}.ts"))
+            .collect();
+        let mut files: Vec<(&str, &str)> = vec![
+            ("rule.ts", PROGRAM_ANCHOR_RULE),
+            ("lanekeep.config.ts", &config),
+        ];
+        files.extend(
+            paths
+                .iter()
+                .zip(&cases)
+                .map(|(path, (_, source, ..))| (path.as_str(), source.as_str())),
+        );
+        let outcome = Project::new("parse-fault-shapes", &files)
+            .run()
+            .expect("runs");
+
+        for (path, (_, _, (line, column), message)) in paths.iter().zip(&cases) {
+            let found: Vec<&Violation> = parse_faults(&outcome)
+                .into_iter()
+                .filter(|v| v.location.file.as_str() == path)
+                .collect();
+            assert_eq!(found.len(), 1, "{path}: {:?}", messages(&outcome));
+            assert_eq!(
+                (
+                    found[0].location.position.line,
+                    found[0].location.position.column
+                ),
+                (*line, *column),
+                "{path}"
+            );
+            assert_eq!(&found[0].message, message, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_clean_file_draws_nothing_from_the_parser() {
+        let clean = REPRO.replace("<typeof import('vitest')>", "<number>");
+        let project = Project::new(
+            "parse-fault-clean",
+            &[
+                ("rule.ts", PROGRAM_ANCHOR_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/clean.ts", &clean),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert!(
+            parse_faults(&outcome).is_empty(),
+            "{:?}",
+            messages(&outcome)
+        );
+        assert_eq!(
+            outcome.violations.len(),
+            1,
+            "the anchor fires once: {:?}",
+            messages(&outcome)
+        );
+    }
+
+    #[test]
+    fn the_message_names_the_grammar_that_parsed_the_file() {
+        let project = Project::new(
+            "parse-fault-tsx",
+            &[
+                ("rule.ts", PROGRAM_ANCHOR_RULE),
+                ("lanekeep.config.ts", &config_for("src/**/*.tsx")),
+                ("src/a.tsx", "const x = ;\n"),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        let faults = parse_faults(&outcome);
+        assert_eq!(faults.len(), 1, "{:?}", messages(&outcome));
+        assert!(
+            faults[0]
+                .message
+                .starts_with("the tsx parser recovered from an error across line 1: "),
+            "{}",
+            faults[0].message
+        );
+    }
+
+    #[test]
+    fn a_file_no_rule_reads_is_not_diagnosed() {
+        // The only rule's content gate rejects the file before the parse, so no rule is blind
+        // to it, and nothing is reported.
+        let project = Project::new(
+            "parse-fault-gated",
+            &[
+                ("rule.ts", &content_gated_rule("local/content-gated")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/repro.ts", REPRO),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert!(outcome.violations.is_empty(), "{:?}", messages(&outcome));
+    }
+
+    #[test]
+    fn a_next_line_directive_acknowledges_the_report_and_counts_as_used() {
+        let acknowledged =
+            format!("// {NEXT_LINE} lanekeep/parse reason: tree-sitter-typescript#367\n{REPRO}");
+        let project = Project::new(
+            "parse-fault-acknowledged",
+            &[
+                ("rule.ts", PROGRAM_ANCHOR_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/repro.ts", &acknowledged),
+            ],
+        );
+        let run = || {
+            project
+                .build()
+                .map(Engine::reporting_unused_suppressions)
+                .expect("prepares")
+                .run()
+                .expect("runs")
+        };
+        let cold = run();
+        assert!(cold.violations.is_empty(), "cold: {:?}", messages(&cold));
+        let warm = run();
+        assert!(
+            warm.violations.is_empty(),
+            "a warm run replays the acknowledgement as used: {:?}",
+            messages(&warm)
+        );
+    }
+
+    #[test]
+    fn a_warm_run_replays_the_report() {
+        let project = Project::new(
+            "parse-fault-warm",
+            &[
+                ("rule.ts", PROGRAM_ANCHOR_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/repro.ts", REPRO),
+            ],
+        );
+        let cold = project.run().expect("runs");
+        let warm = project.run().expect("runs");
+        assert_eq!(parse_faults(&cold).len(), 1);
+        assert_eq!(cold.violations, warm.violations);
+        assert_eq!(project.cache().len(), 1, "the entry was written and served");
     }
 
     // --- unused suppressions ---------------------------------------------------------------
