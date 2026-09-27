@@ -19,6 +19,10 @@ tree-sitter = { workspace = true }
 [build-dependencies]
 blake3 = { workspace = true }
 
+[dev-dependencies]
+# Real trees for `faults`' tests: a `tree_sitter::Node` cannot be built synthetically.
+tree-sitter-typescript = { workspace = true }
+
 [lints]
 workspace = true
 

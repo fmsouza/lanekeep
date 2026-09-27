@@ -201,14 +201,7 @@ fn parse(language: &dyn Language, source: &str) -> Result<Tree, StripError> {
 }
 
 fn first_error(node: Node<'_>) -> Option<Node<'_>> {
-    if node.is_error() || node.is_missing() {
-        return Some(node);
-    }
-    if !node.has_error() {
-        return None;
-    }
-    let mut cursor = node.walk();
-    node.children(&mut cursor).find_map(first_error)
+    lanekeep_lang::faults::regions(node).into_iter().next()
 }
 
 fn one_based(zero_based: usize) -> u32 {
