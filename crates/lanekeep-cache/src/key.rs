@@ -13,7 +13,8 @@ use lanekeep_core::ContentHash;
 
 /// The on-disk format's version.
 ///
-/// Bumped when the encoding changes. Because it feeds the key, an old file simply misses
+/// Bumped when the encoding changes, or when what an entry records changes. Because it feeds
+/// the key, an old file simply misses
 /// rather than being misread — the cache is disposable, so a format change costs one cold
 /// run and needs no migration.
 ///

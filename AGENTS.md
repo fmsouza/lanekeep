@@ -1529,6 +1529,27 @@ lengths satisfied on their own: `TypeScript` and `Tsx` share one `analysis_ident
 provider over the TSX grammar folded exactly what one over TypeScript did.
 `the_identity_folds_both_grammar_digests_and_the_resolver` pins the fold byte for byte.
 
+**A rule anchored at `(program)` never runs on a file whose root is `ERROR`, and until #271 the
+only sign was `parsed 1, matches 0`.** tree-sitter-typescript 0.23.2 reads
+`f<typeof import('m')>()` as `f < typeof import('m')` followed by a stray `()`
+(tree-sitter/tree-sitter-typescript#367, open, with no release of the grammar since 2024-11).
+That is Vitest's `importOriginal<typeof import('./m')>()` idiom, found in about 280 files of one
+consumer's test suite. With any statement after it, recovery cannot fit the file under the start
+symbol, and the root itself is `ERROR`. In a realistic test file the root stays `program`, but
+one `ERROR` runs from the mock to the end of the file, so no `describe`, `it` or `expect` after
+it is a `call_expression` any more. A root-kind check would catch neither the second shape nor
+any of the 34 of 966 `.d.ts` files under `packages/lanekeep/node_modules` (as `npm ci` installs
+it at `473004b`) that fault on other grammar gaps, all with a `program` root. `lanekeep/parse` now
+reports every faulted tree, and `--profile` counts them as `faulted`.
+
+Two things it cannot do. It cannot see a misparse that leaves no error node:
+`f<typeof import('m')>(1)` parses clean as `(f < typeof import('m')) > (1)`. And it inherits the
+grammar key's blind spot. A tree-sitter-typescript bump that fixes #367 without changing the
+grammar's shape leaves every cache key as it was, so old diagnostics replay. The pull request
+making that bump owns its own invalidation, and
+`the_type_argument_import_misparse_is_still_present` in `crates/lanekeep-lang-js/src/lib.rs`
+fails on it to say so.
+
 ## What not to do
 
 - Do not add a dependency without checking `deny.toml`. Network crates are banned
