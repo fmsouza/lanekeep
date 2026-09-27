@@ -15,6 +15,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+/// The directive tokens, assembled rather than written: lanekeep checks this file, and a token
+/// spelled out here would be a live directive in it.
+const NEXT_LINE: &str = concat!("lanekeep", "-ignore-next-line");
+const WHOLE_FILE: &str = concat!("lanekeep", "-ignore-file");
+
 /// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads, with a statement
 /// after it, so the root is `ERROR`.
 const REPRO: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
@@ -195,5 +200,188 @@ fn a_python_file_names_its_grammar() {
             .expect("a message")
             .starts_with("the python parser "),
         "{json}"
+    );
+}
+
+fn fails_on_error(project: &Project) {
+    let (code, json) = project.check_json(&["--no-cache"]);
+    assert_eq!(code, 1, "an error-severity fault fails the run: {json}");
+    let faults = violations_of(&json, "lanekeep/parse");
+    assert_eq!(faults.len(), 1, "{json}");
+    assert_eq!(faults[0]["severity"], "error");
+}
+
+fn silent_when_off(project: &Project) {
+    let (code, json) = project.check_json(&["--no-cache"]);
+    assert_eq!(code, 0, "{json}");
+    assert!(violations_of(&json, "lanekeep/parse").is_empty(), "{json}");
+}
+
+#[test]
+fn an_error_parse_severity_fails_the_run_json() {
+    fails_on_error(&Project::new(
+        "error-json",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            (
+                "lanekeep.json",
+                &json_config(r#"{"lanekeep/parse": "error"}"#),
+            ),
+            ("src/repro.ts", REPRO),
+        ],
+    ));
+}
+
+#[test]
+fn an_error_parse_severity_fails_the_run_ts() {
+    fails_on_error(&Project::new(
+        "error-ts",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            (
+                "lanekeep.config.ts",
+                &ts_config("{ 'lanekeep/parse': 'error' }"),
+            ),
+            ("src/repro.ts", REPRO),
+        ],
+    ));
+}
+
+#[test]
+fn an_off_parse_severity_reports_nothing_json() {
+    silent_when_off(&Project::new(
+        "off-json",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            (
+                "lanekeep.json",
+                &json_config(r#"{"lanekeep/parse": "off"}"#),
+            ),
+            ("src/repro.ts", REPRO),
+        ],
+    ));
+}
+
+#[test]
+fn an_off_parse_severity_reports_nothing_ts() {
+    silent_when_off(&Project::new(
+        "off-ts",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            (
+                "lanekeep.config.ts",
+                &ts_config("{ 'lanekeep/parse': 'off' }"),
+            ),
+            ("src/repro.ts", REPRO),
+        ],
+    ));
+}
+
+#[test]
+fn the_root_case_is_acknowledged_line_by_line_under_forbid_file_scope() {
+    // Under `forbidFileScope` every whole-file directive is itself an error, so the next-line
+    // form is the only acknowledgement. It has to land on the line the report names.
+    let acknowledged =
+        format!("// {NEXT_LINE} lanekeep/parse reason: tree-sitter-typescript#367\n{REPRO}");
+    let project = Project::new(
+        "forbid-file-scope",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            (
+                "lanekeep.json",
+                r#"{"include": ["src/**/*.ts"], "rules": ["./rules/anchor.ts"],
+                    "suppressions": {"forbidFileScope": true}}"#,
+            ),
+            ("src/repro.ts", &acknowledged),
+        ],
+    );
+    let (code, json) = project.check_json(&["--no-cache"]);
+    assert_eq!(code, 0, "{json}");
+    assert_eq!(json["total"], 0, "{json}");
+}
+
+#[test]
+fn a_whole_file_acknowledgement_under_require_expiry_still_silences() {
+    let acknowledged =
+        format!("// {WHOLE_FILE} lanekeep/parse reason: tree-sitter-typescript#367\n{REPRO}");
+    let project = Project::new(
+        "require-expiry",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            (
+                "lanekeep.json",
+                r#"{"include": ["src/**/*.ts"], "rules": ["./rules/anchor.ts"],
+                    "suppressions": {"requireExpiry": true}}"#,
+            ),
+            ("src/repro.ts", &acknowledged),
+        ],
+    );
+    let (code, json) = project.check_json(&["--no-cache"]);
+    assert!(violations_of(&json, "lanekeep/parse").is_empty(), "{json}");
+    let policy = violations_of(&json, "lanekeep/suppression");
+    assert_eq!(policy.len(), 1, "{json}");
+    assert!(
+        policy[0]["message"]
+            .as_str()
+            .expect("a message")
+            .starts_with("suppression has no `expires:`"),
+        "{json}"
+    );
+    assert_eq!(code, 1, "the policy violation is an error: {json}");
+}
+
+#[test]
+fn an_acknowledgement_of_an_off_report_is_unused() {
+    let acknowledged =
+        format!("// {NEXT_LINE} lanekeep/parse reason: tree-sitter-typescript#367\n{REPRO}");
+    let project = Project::new(
+        "unused-when-off",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            (
+                "lanekeep.json",
+                &json_config(r#"{"lanekeep/parse": "off"}"#),
+            ),
+            ("src/repro.ts", &acknowledged),
+        ],
+    );
+    let (_, json) = project.check_json(&["--no-cache", "--report-unused-suppressions"]);
+    let unused = violations_of(&json, "lanekeep/suppression");
+    assert_eq!(unused.len(), 1, "{json}");
+    assert_eq!(
+        unused[0]["message"],
+        "suppression silenced nothing — \"tree-sitter-typescript#367\""
+    );
+}
+
+#[test]
+fn a_severity_change_between_warm_runs_is_not_served_stale() {
+    let project = Project::new(
+        "warm-toggle",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            ("lanekeep.json", &json_config("{}")),
+            ("src/repro.ts", REPRO),
+        ],
+    );
+    let count = |project: &Project| {
+        let (_, json) = project.check_json(&[]);
+        violations_of(&json, "lanekeep/parse").len()
+    };
+    assert_eq!(count(&project), 1, "cold, warn");
+    project.write(
+        "lanekeep.json",
+        &json_config(r#"{"lanekeep/parse": "off"}"#),
+    );
+    assert_eq!(
+        count(&project),
+        0,
+        "off: the warn-era entry must not be served"
+    );
+    project.write("lanekeep.json", &json_config("{}"));
+    assert_eq!(
+        count(&project),
+        1,
+        "warn again: the off-era entry must not be served"
     );
 }

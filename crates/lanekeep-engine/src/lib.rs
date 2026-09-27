@@ -701,8 +701,8 @@ pub struct Engine {
     /// dated key, while `requireExpiry` and `forbidFileScope` are date-independent and cache
     /// under the plain key.
     suppression_policy: lanekeep_config::SuppressionPolicy,
-    /// Severity of the engine's own `lanekeep/parse` report on a file whose tree carries a
-    /// parse fault. `warn` until the config can set it; `Off` skips the check.
+    /// Severity of the engine's own `lanekeep/parse` report on a file its parser could not
+    /// read whole, read from the config's `severity` map; `Off` skips the check.
     parse_severity: Severity,
     limits: Limits,
     rules_root: RuleRoot,
@@ -1577,7 +1577,7 @@ impl Engine {
             discovery,
             limits: config.limits,
             suppression_policy: config.suppressions,
-            parse_severity: Severity::Warn,
+            parse_severity: config.parse_severity,
             rules_root,
             config_path: config_path.to_path_buf(),
             typescript,

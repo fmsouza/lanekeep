@@ -28,7 +28,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use lanekeep_core::{Capability, Examples, Gates, Namespace, RuleCard, RuleId, Severity};
+use lanekeep_core::{
+    Capability, Examples, Gates, Namespace, PARSE_RULE, RuleCard, RuleId, Severity,
+};
 use lanekeep_js::{Limits, ResolveError, RuleRoot, RunClock, Sandbox};
 use lanekeep_wasm::{RuleSet, WasmEngine, WasmRuntime};
 use serde::Deserialize;
@@ -386,6 +388,10 @@ pub struct Config {
     pub limits: Limits,
     /// The project's policy for which shapes of valid directive it accepts.
     pub suppressions: SuppressionPolicy,
+    /// Severity of the engine's `lanekeep/parse` report on a file its parser could not read
+    /// whole: `warn` unless the `severity` map names it. Read from the same map as every
+    /// rule's override, so it reaches `config_hash` through the fold that map already has.
+    pub parse_severity: Severity,
     /// Which type oracle answers `ctx.types`, and how to reach it.
     pub types: TypesConfig,
     /// Hash of every module in the rule import graph.
@@ -1256,6 +1262,14 @@ fn build(
 ) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
+    // No `RuleSpec` carries `lanekeep/parse` — the engine emits it — so its override is read
+    // here rather than when rules are built. `hash_config` already folds the whole map.
+    let parse_severity = PARSE_RULE
+        .parse::<RuleId>()
+        .ok()
+        .and_then(|id| overrides.get(&id).copied())
+        .unwrap_or(Severity::Warn);
+
     // Namespaces this project claims, beyond the two lanekeep defines. Validated for shape
     // here so a malformed one is reported against `namespaces` rather than against whichever
     // rule happened to use it first.
@@ -1393,6 +1407,7 @@ fn build(
         rules,
         limits,
         suppressions,
+        parse_severity,
         types,
         ruleset_hash,
         config_hash,
@@ -6353,6 +6368,118 @@ mod tests {
             hex(&make("", "none")),
             hex(&make(", severity: { 'local/example': 'warn' }", "warn")),
             "changing a severity must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_parse_severity_defaults_to_warn() {
+        let config = Fixture::new(
+            "parse-severity-default",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        )
+        .load_config()
+        .expect("loads");
+        assert_eq!(config.parse_severity, Severity::Warn);
+    }
+
+    #[test]
+    fn the_parse_severity_defaults_to_warn_for_json() {
+        let config = Fixture::new(
+            "json-parse-severity-default",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        )
+        .load_json()
+        .expect("loads");
+        assert_eq!(config.parse_severity, Severity::Warn);
+    }
+
+    #[test]
+    fn the_severity_map_sets_the_parse_severity() {
+        let config = Fixture::new(
+            "parse-severity-set",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("rules: [rule], severity: { 'lanekeep/parse': 'error' }"),
+                ),
+            ],
+        )
+        .load_config()
+        .expect("loads");
+        assert_eq!(config.parse_severity, Severity::Error);
+    }
+
+    #[test]
+    fn the_severity_map_sets_the_parse_severity_for_json() {
+        let config = Fixture::new(
+            "json-parse-severity-set",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./rule"], "severity": {"lanekeep/parse": "off"}}"#,
+                ),
+            ],
+        )
+        .load_json()
+        .expect("loads");
+        assert_eq!(config.parse_severity, Severity::Off);
+    }
+
+    /// Paired with `…_for_json`. The `severity` map is folded whole, including ids no rule
+    /// claims, so this holds before any change here. Watch it fail by mutation (Step 4).
+    #[test]
+    fn the_config_hash_changes_with_the_parse_severity() {
+        let make = |extra: &str, tag: &str| {
+            Fixture::new(
+                &format!("parse-severity-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.config.ts",
+                        &config_with(&format!("rules: [rule]{extra}")),
+                    ),
+                ],
+            )
+            .load_config()
+            .expect("loads")
+            .config_hash
+        };
+        assert_ne!(
+            hex(&make("", "none")),
+            hex(&make(", severity: { 'lanekeep/parse': 'error' }", "error")),
+            "changing the parse severity must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_config_hash_changes_with_the_parse_severity_for_json() {
+        let make = |severity: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-parse-severity-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "severity": {severity}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+        assert_ne!(
+            hex(&make("{}", "none")),
+            hex(&make(r#"{"lanekeep/parse": "off"}"#, "off")),
+            "changing the parse severity must invalidate"
         );
     }
 
