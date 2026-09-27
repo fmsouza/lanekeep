@@ -39,9 +39,9 @@ use lanekeep_cache::{CacheKey, Entry as CacheEntry, GrammarKey, RunKey, Store};
 use lanekeep_config::{ComponentBytes, Config, ConfigError, RuleSpec};
 use lanekeep_core::suppression::{self, Date, Scope, Suppressions};
 use lanekeep_core::{
-    AnalysisBudget, Capability, CompiledGates, Discovery, DiscoveryError, Fact, FilePath, Location,
-    PARSE_RULE, Position, RuleId, Severity, TrackedRead, TypesConfig, TypesProvider, Violation,
-    analysis_overrun_fallback,
+    AnalysisBudget, Capability, CompiledGates, Discovery, DiscoveryError, Examples, Fact, FilePath,
+    Location, PARSE_RULE, Position, RuleCard, RuleId, Severity, TrackedRead, TypesConfig,
+    TypesProvider, Violation, analysis_overrun_fallback,
 };
 use lanekeep_js::{
     FileAccess, HOST_API_VERSION, HostContext, Limits, ReduceContext, ReduceFact, RuleRoot,
@@ -1769,6 +1769,18 @@ impl Engine {
     /// new output format.
     pub fn rules(&self) -> impl Iterator<Item = &RuleSpec> {
         self.rules.iter().map(|prepared| &prepared.spec)
+    }
+
+    /// Every card this run's violations can be described by: each configured rule's own, and
+    /// the engine's for the id it reports itself.
+    pub fn cards(&self) -> impl Iterator<Item = (RuleId, RuleCard)> + '_ {
+        let reserved = PARSE_RULE
+            .parse::<RuleId>()
+            .ok()
+            .map(|id| (id, parse_fault_card()));
+        self.rules()
+            .map(|spec| (spec.id.clone(), spec.card.clone()))
+            .chain(reserved)
     }
 
     /// Run over the whole corpus.
@@ -4617,6 +4629,19 @@ fn parse_fault_remediation() -> String {
          above. If it is invalid, fix the syntax",
         suppression::NEXT_LINE
     )
+}
+
+/// The card for `lanekeep/parse`. No rule module carries one, because no rule module emits the
+/// diagnostic, and the agent and SARIF formats describe a rule from its card.
+fn parse_fault_card() -> RuleCard {
+    RuleCard {
+        message: String::from("a file lanekeep's parser did not fully read"),
+        remediation: parse_fault_remediation(),
+        examples: Examples {
+            bad: String::from("const x = ;"),
+            good: String::from("const x = 1;"),
+        },
+    }
 }
 
 /// Position of a rule in the config's `rules` array, which is how the handler is reached.
@@ -8774,6 +8799,29 @@ export default defineRule({
         }
     }
 
+    #[test]
+    fn the_engine_describes_its_own_report() {
+        let project = Project::new(
+            "parse-fault-card",
+            &[
+                ("rule.ts", PROGRAM_ANCHOR_RULE),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+            ],
+        );
+        let engine = project.build().expect("prepares");
+        let cards: BTreeMap<RuleId, RuleCard> = engine.cards().collect();
+        let card = cards
+            .get(&PARSE_RULE.parse::<RuleId>().expect("a well-formed id"))
+            .expect("a card for lanekeep/parse");
+        assert_eq!(card.message, "a file lanekeep's parser did not fully read");
+        assert_eq!(card.remediation, expected_remediation());
+        assert!(
+            cards.contains_key(&"local/anchor".parse::<RuleId>().expect("a well-formed id")),
+            "configured rules keep their own cards"
+        );
+    }
+
     // --- unused suppressions ---------------------------------------------------------------
 
     impl Project {
@@ -10451,10 +10499,10 @@ export default defineRule({
                 id: id.parse().expect("a well-formed rule id"),
                 languages: vec!["typescript".to_owned()],
                 severity: Severity::Error,
-                card: lanekeep_core::RuleCard {
+                card: RuleCard {
                     message: "a component rule fired".to_owned(),
                     remediation: "n/a".to_owned(),
-                    examples: lanekeep_core::Examples {
+                    examples: Examples {
                         bad: "const x = 1;".to_owned(),
                         good: "nothing".to_owned(),
                     },

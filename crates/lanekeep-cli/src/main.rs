@@ -1403,10 +1403,7 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
         .map_err(|e| e.to_string())?;
         let outcome = engine.run().map_err(|e| e.to_string())?;
 
-        let cards: lanekeep_report::Cards = engine
-            .rules()
-            .map(|spec| (spec.id.clone(), spec.card.clone()))
-            .collect();
+        let cards: lanekeep_report::Cards = engine.cards().collect();
 
         // The `agent` format, which exists for exactly this consumer — grouped by rule, with
         // the remediation stated once and an example either way. Never colored: escape codes
@@ -1698,13 +1695,10 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         std::io::stdout().is_terminal(),
         std::env::var("NO_COLOR").ok().as_deref(),
     );
-    // Cards for every configured rule. The agent and SARIF reporters describe a rule as
-    // well as its violations, and a `Violation` carries the message and remediation but not
-    // the examples.
-    let cards: lanekeep_report::Cards = engine
-        .rules()
-        .map(|spec| (spec.id.clone(), spec.card.clone()))
-        .collect();
+    // Cards for every configured rule, and the engine's own, for the ids it reports itself.
+    // The agent and SARIF reporters describe a rule as well as its violations, and a
+    // `Violation` carries the message and remediation but not the examples.
+    let cards: lanekeep_report::Cards = engine.cards().collect();
 
     let rendered = lanekeep_report::render(
         format,

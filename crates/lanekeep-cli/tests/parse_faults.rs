@@ -417,3 +417,53 @@ fn the_profile_counts_a_file_the_parser_could_not_read() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(gate_faulted(&stderr, "local/anchor"), 1, "{stderr}");
 }
+
+fn expected_remediation() -> String {
+    format!(
+        "lanekeep's grammar can misread valid code: if this code is valid, do not rewrite it to \
+         satisfy the parser — acknowledge it with `{NEXT_LINE} lanekeep/parse reason: <why>` on \
+         the line above. If it is invalid, fix the syntax"
+    )
+}
+
+fn repro_project(name: &str) -> Project {
+    Project::new(
+        name,
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            ("lanekeep.json", &json_config("{}")),
+            ("src/repro.ts", REPRO),
+        ],
+    )
+}
+
+#[test]
+fn sarif_carries_the_parse_remediation() {
+    let project = repro_project("sarif");
+    let output = project.run(&["check", "--format", "sarif", "--no-cache"]);
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).expect("SARIF is JSON");
+    let rules = doc["runs"][0]["tool"]["driver"]["rules"]
+        .as_array()
+        .expect("a rules array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"] == "lanekeep/parse")
+        .unwrap_or_else(|| panic!("no lanekeep/parse rule: {doc}"));
+    assert_eq!(rule["help"]["text"], expected_remediation().as_str());
+    assert_eq!(
+        rule["shortDescription"]["text"],
+        "a file lanekeep's parser did not fully read"
+    );
+}
+
+#[test]
+fn the_agent_format_states_the_parse_remediation_once() {
+    let project = repro_project("agent");
+    let output = project.run(&["check", "--format", "agent", "--no-cache"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!(
+        "## lanekeep/parse\na file lanekeep's parser did not fully read\nFix: {}\n",
+        expected_remediation()
+    );
+    assert!(stdout.contains(&expected), "{stdout}");
+}
