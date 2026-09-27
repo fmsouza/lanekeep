@@ -385,3 +385,35 @@ fn a_severity_change_between_warm_runs_is_not_served_stale() {
         "warn again: the off-era entry must not be served"
     );
 }
+
+/// The `faulted` counter for one rule's row of the gate table: its seventh number.
+fn gate_faulted(stderr: &str, id: &str) -> u64 {
+    let table = stderr
+        .split("what each rule looked at")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no gate table: {stderr}"));
+    let line = table
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(id))
+        .unwrap_or_else(|| panic!("no row for {id}: {stderr}"));
+    line.split_whitespace()
+        .nth(7)
+        .and_then(|token| token.parse().ok())
+        .unwrap_or_else(|| panic!("no faulted column: {line}"))
+}
+
+#[test]
+fn the_profile_counts_a_file_the_parser_could_not_read() {
+    let project = Project::new(
+        "profile",
+        &[
+            ("rules/anchor.ts", ANCHOR_RULE),
+            ("lanekeep.json", &json_config("{}")),
+            ("src/repro.ts", REPRO),
+            ("src/clean.ts", "const a = 1;\n"),
+        ],
+    );
+    let output = project.run(&["check", "--profile", "--no-cache"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(gate_faulted(&stderr, "local/anchor"), 1, "{stderr}");
+}

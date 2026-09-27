@@ -456,7 +456,7 @@ const TWO_SILENT_RULES_CONFIG: &str = r#"{"include": ["src/**"], "timeouts": {"r
 /// expects.
 fn gate_table_header() -> String {
     format!(
-        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7}",
+        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7} {:>7}",
         "rule",
         "path-gated",
         "unread",
@@ -464,6 +464,7 @@ fn gate_table_header() -> String {
         "content-gated",
         "lang-gated",
         "parsed",
+        "faulted",
         "dropped"
     )
 }

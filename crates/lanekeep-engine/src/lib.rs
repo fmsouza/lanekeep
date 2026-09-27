@@ -862,8 +862,8 @@ impl std::fmt::Debug for Engine {
 /// in differs by rule, so "identical rows warm" is false as well. The reconciliation above
 /// is what still holds warm: the six counters sum to `files_discovered` in every state.
 ///
-/// `dropped` sits outside this reconciliation on purpose — it counts constructs skipped
-/// *within* analyzed files, not a file's disposition, so it is not one of the six.
+/// `faulted` and `dropped` sit outside this reconciliation on purpose — each counts something
+/// *within* files already `parsed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
@@ -905,6 +905,13 @@ pub struct RuleTiming {
     /// Files this rule actually saw run: both gates passed, and its declared language
     /// matched the file's.
     pub parsed: u64,
+    /// Files this rule ran against whose tree carries a parse fault — a subset of `parsed`.
+    ///
+    /// Orthogonal to the six disposition counters, like `dropped`: a faulted file is also
+    /// `parsed`. It separates "the query found nothing" from "the query ran over a tree the
+    /// parser could not fully build", and it is counted whatever `lanekeep/parse`'s severity,
+    /// since this table is where a silent rule gets diagnosed.
+    pub faulted: u64,
     /// Constructs the taint analysis could not see through, summed over this rule's files.
     ///
     /// Orthogonal to the six counters above: not a file disposition (a file can be parsed
@@ -936,6 +943,8 @@ impl RuleTiming {
         self.content_gated += other.content_gated;
         self.language_gated += other.language_gated;
         self.parsed += other.parsed;
+        // Outside the six reconciled counters, like `dropped` below.
+        self.faulted += other.faulted;
         // Not one of the six reconciled counters (see the struct doc), but still a per-file
         // count that this rule's total must sum across every file it ran against.
         self.dropped += other.dropped;
@@ -2398,11 +2407,16 @@ impl Engine {
         )
     }
 
-    /// The rest of [`Self::check_file`] once a file has actually parsed: dispatch, apply
+    /// The rest of [`Self::check_file`] once a file has actually parsed: count it toward
+    /// `--profile`'s `faulted` column, dispatch, push a `lanekeep/parse` violation, apply
     /// directives, and build the cache entry. Split out only to keep that function under
     /// clippy's line limit. `path` is read off `file`; `worker` and `files` travel as one
     /// pair and so do the cache key and its expiry flag, to keep this under clippy's
     /// argument-count limit too.
+    ///
+    /// The `lanekeep/parse` push comes before directives are applied because a directive
+    /// naming it is how a team acknowledges the fault, and the cache entry built afterward
+    /// is what carries that acknowledgement into the next warm run.
     fn finish_parsed(
         &self,
         (worker, files): (&mut Worker<'_>, &Arc<FileAccess>),
@@ -2413,6 +2427,9 @@ impl Engine {
         (keys, has_expiry): (Option<(CacheKey, CacheKey)>, bool),
     ) -> Result<FileOutcome, RunError> {
         let path = file.path;
+        if self.profiling && file.tree.root_node().has_error() {
+            outcome.timings.extend(self.faulted_timings(path, admitted));
+        }
         self.dispatch(worker, files, admitted, file, &mut outcome)?;
         // The flow phase runs after the check phase, over the same file and the same admitted
         // set, so its violations land in `outcome` before the entry is built and before
@@ -2480,6 +2497,33 @@ impl Engine {
                     timing.language_gated = 1;
                 }
                 (rule.spec.id.clone(), timing)
+            })
+            .collect()
+    }
+
+    /// `faulted: 1` for every admitted rule that ran against this file, which is every rule
+    /// `parsed_or_language_gated_timings` counted as `parsed`. Only called when profiling, for
+    /// a tree that carries a fault.
+    fn faulted_timings(
+        &self,
+        path: &FilePath,
+        admitted: &[&Prepared],
+    ) -> Vec<(RuleId, RuleTiming)> {
+        let Some(language_id) = self.language_of(path) else {
+            return Vec::new();
+        };
+        admitted
+            .iter()
+            .copied()
+            .filter(|rule| rule.for_language(language_id).is_some())
+            .map(|rule| {
+                (
+                    rule.spec.id.clone(),
+                    RuleTiming {
+                        faulted: 1,
+                        ..RuleTiming::default()
+                    },
+                )
             })
             .collect()
     }
@@ -8662,6 +8706,11 @@ export default defineRule({
         };
         let cold = run();
         assert!(cold.violations.is_empty(), "cold: {:?}", messages(&cold));
+        assert_eq!(
+            project.cache().len(),
+            1,
+            "the cold run wrote the entry the warm run replays"
+        );
         let warm = run();
         assert!(
             warm.violations.is_empty(),
@@ -8685,6 +8734,44 @@ export default defineRule({
         assert_eq!(parse_faults(&cold).len(), 1);
         assert_eq!(cold.violations, warm.violations);
         assert_eq!(project.cache().len(), 1, "the entry was written and served");
+    }
+
+    #[test]
+    fn a_faulted_parse_is_counted_whatever_the_severity() {
+        for (tag, extra) in [
+            ("warn", ""),
+            ("off", ", severity: { 'lanekeep/parse': 'off' }"),
+        ] {
+            let project = Project::new(
+                &format!("parse-fault-profile-{tag}"),
+                &[
+                    ("rule.ts", PROGRAM_ANCHOR_RULE),
+                    ("lanekeep.config.ts", &config(extra)),
+                    ("src/repro.ts", REPRO),
+                    ("src/clean.ts", "const a = 1;\n"),
+                ],
+            );
+            let outcome = project
+                .build()
+                .expect("prepares")
+                .without_cache()
+                .profiling()
+                .run()
+                .expect("runs");
+            let timing = timing_for(&outcome, "local/anchor");
+            assert_eq!(timing.faulted, 1, "{tag}: {timing:?}");
+            assert_eq!(timing.parsed, 2, "{tag}: both files parsed: {timing:?}");
+            assert_eq!(
+                timing.path_gated
+                    + timing.unread
+                    + timing.cached
+                    + timing.content_gated
+                    + timing.language_gated
+                    + timing.parsed,
+                2,
+                "{tag}: `faulted` stays outside the six-column sum: {timing:?}"
+            );
+        }
     }
 
     // --- unused suppressions ---------------------------------------------------------------
