@@ -115,10 +115,11 @@ mod tests {
         summarize(tree(source).root_node())
     }
 
-    // Always builds `Some(..)`: `summary_of` returns `Option<Summary>`, and every fixture in
-    // this module has a fault, so comparing against a bare `Summary` would need `Some(...)` at
-    // every call site instead of once here.
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "every call site compares a faulted fixture against `summary_of`, which \
+                  returns `Option<Summary>`; wrapping once here beats `Some(...)` at each one"
+    )]
     fn at(
         root_is_error: bool,
         line: u32,
