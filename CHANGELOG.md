@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/fmsouza/lanekeep/compare/v0.11.0...v0.12.0) - 2026-09-28
+
+### Added
+
+- *(engine)* [**breaking**] report files the parser could not read whole ([#275](https://github.com/fmsouza/lanekeep/pull/275))
+
+### Fixed
+
+- *(obligation)* resolve a shorthand property to its binding ([#277](https://github.com/fmsouza/lanekeep/pull/277))
+- *(js)* strip exported type-only declarations and overload signatures ([#268](https://github.com/fmsouza/lanekeep/pull/268))
+- *(types)* require line and column on ReduceLocation ([#267](https://github.com/fmsouza/lanekeep/pull/267))
+- *(reduce)* refuse report positions that are not whole numbers from 1 ([#270](https://github.com/fmsouza/lanekeep/pull/270))
+- *(deps)* rquickjs 0.14, thiserror 2.0.21, actions ([#276](https://github.com/fmsouza/lanekeep/pull/276))
+
 ## [0.11.0](https://github.com/fmsouza/lanekeep/compare/v0.10.0...v0.11.0) - 2026-09-14
 
 ### Added
