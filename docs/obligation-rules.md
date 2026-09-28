@@ -358,9 +358,10 @@ regardless of the matching release two lines below it.
 
 Every `@key` correlation shown above compares by **exact captured text** — `keyBy: 'text'`,
 the default. `keyBy: 'binding'` compares differently: not what the `@key` capture *says*, but
-what value it resolves to, following identifier copies, transparent wrappers and ternaries back
-to a terminal definition — a parameter, a non-alias initializer, or an import — with a
-reassignment killing an earlier definition the same way an ordinary tainted read would see it.
+what value it resolves to, following identifier copies, shorthand properties (`{ key }` reads
+`key`), transparent wrappers and ternaries back to a terminal definition — a parameter, a
+non-alias initializer, or an import — with a reassignment killing an earlier definition the
+same way an ordinary tainted read would see it.
 Two `@key` captures correlate under `keyBy: 'binding'` when that walk finds them sharing a root
 definition; it reuses the dataflow analyzer's own reaching-definition machinery rather than a
 second implementation of it.

@@ -264,9 +264,10 @@ impl OriginKey {
 }
 
 /// The value-origin of `node`: the set of root-definition node ids the value at `node` flows from,
-/// following identifier copies, transparent wrappers and ternaries down to terminal definitions — a
-/// parameter, a non-alias initializer, an import, or (contributing nothing) an unresolved use. Two
-/// nodes' [`OriginKey`]s intersect iff the values may be the same.
+/// following identifier copies (a shorthand property `{ name }` reads `name`), transparent wrappers
+/// and ternaries down to terminal definitions — a parameter, a non-alias initializer, an import,
+/// or (contributing nothing) an unresolved use. Two nodes' [`OriginKey`]s intersect iff the values
+/// may be the same.
 ///
 /// It reuses [`Taint`]'s reaching-definition machinery ([`Taint::reaching_defs`] over
 /// [`Taint::definitions_of`]) so a reassignment is honored with CFG kill — the origin of `id` in
@@ -663,7 +664,11 @@ impl<'t> Taint<'_, 't> {
             return BTreeSet::new();
         }
         match expr.kind() {
-            "identifier" => self.origin_of_identifier(expr, depth),
+            // `{ name }` is `{ name: name }`: the shorthand reads the binding it names, resolved
+            // as an identifier — the same reading [`Self::taint_of_object`] gives it.
+            "identifier" | "shorthand_property_identifier" => {
+                self.origin_of_identifier(expr, depth)
+            }
             // A transparent wrapper *is* its inner value — `(e)`, `e!`, `await e`, `e as T`,
             // `e satisfies T` — so its origin is the inner value's, at unchanged depth, exactly as
             // [`Self::taint_of`] passes a wrapper through.
@@ -3661,6 +3666,30 @@ mod tests {
         assert!(
             origin_key(&tree, source, in_o).intersects(&origin_key(&tree, source, in_c)),
             "both reference the one module-level KEY"
+        );
+    }
+
+    #[test]
+    fn origin_of_a_shorthand_property_is_the_binding_it_names() {
+        // `{ seed }` is `{ seed: seed }`: the shorthand reads `seed`, so it shares the origin of
+        // the call that bound `seed` and not of any other value in scope.
+        let source = "function f() { const seed = mk(); const other = mk(); return { seed }; }";
+        let tree = parse(source);
+        let shorthand = find_all(&tree, "shorthand_property_identifier")
+            .into_iter()
+            .next()
+            .expect("shorthand present");
+        let mut calls = find_all(&tree, "call_expression").into_iter();
+        let seed_call = calls.next().expect("the call bound to seed");
+        let other_call = calls.next().expect("the call bound to other");
+        let o = origin_key(&tree, source, shorthand);
+        assert!(
+            o.intersects(&origin_key(&tree, source, seed_call)),
+            "the shorthand names seed"
+        );
+        assert!(
+            !o.intersects(&origin_key(&tree, source, other_call)),
+            "and not other"
         );
     }
 
