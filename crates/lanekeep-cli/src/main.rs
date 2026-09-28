@@ -1695,9 +1695,10 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         std::io::stdout().is_terminal(),
         std::env::var("NO_COLOR").ok().as_deref(),
     );
-    // Cards for every configured rule, and the engine's own, for the ids it reports itself.
-    // The agent and SARIF reporters describe a rule as well as its violations, and a
-    // `Violation` carries the message and remediation but not the examples.
+    // Cards for every configured rule, and the engine's own for `lanekeep/parse`, the only id
+    // it reports itself — `lanekeep/suppression` has none yet. The agent and SARIF reporters
+    // describe a rule as well as its violations, and a `Violation` carries the message and
+    // remediation but not the examples.
     let cards: lanekeep_report::Cards = engine.cards().collect();
 
     let rendered = lanekeep_report::render(

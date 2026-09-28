@@ -1533,22 +1533,29 @@ provider over the TSX grammar folded exactly what one over TypeScript did.
 only sign was `parsed 1, matches 0`.** tree-sitter-typescript 0.23.2 reads
 `f<typeof import('m')>()` as `f < typeof import('m')` followed by a stray `()`
 (tree-sitter/tree-sitter-typescript#367, open, with no release of the grammar since 2024-11).
-That is Vitest's `importOriginal<typeof import('./m')>()` idiom, found in about 280 files of one
-consumer's test suite. With any statement after it, recovery cannot fit the file under the start
-symbol, and the root itself is `ERROR`. In a realistic test file the root stays `program`, but
-one `ERROR` runs from the mock to the end of the file, so no `describe`, `it` or `expect` after
-it is a `call_expression` any more. A root-kind check would catch neither the second shape nor
-any of the 34 of 966 `.d.ts` files under `packages/lanekeep/node_modules` (as `npm ci` installs
-it at `473004b`) that fault on other grammar gaps, all with a `program` root. `lanekeep/parse` now
+That is Vitest's `importOriginal<typeof import('./m')>()` idiom, which #271 reports in about 280
+files of one consumer's test suite. How much of a file recovery then takes depends on what
+surrounds the call, and no general rule about it has held up. In #271's reproduction a trailing
+`1` turns the root itself into `ERROR`, while a trailing `const z = 2` leaves it `program`. In its
+realistic test file, written without semicolons, one `ERROR` runs from the mock to the end of the
+file, so no `describe`, `it` or `expect` after it is a `call_expression` any more; the same file
+with semicolons loses only the call's `()`. A root-kind check would miss every shape but the
+first, and so would it miss the 34 files, all `.d.ts` and all with a `program` root, that fault
+on other grammar gaps among the 966 `.ts`, `.tsx`, `.js`, `.mjs` and `.cjs` files under 2 MB in
+`packages/lanekeep/node_modules` as `npm ci` installs it at `473004b`. `lanekeep/parse` now
 reports every faulted tree, and `--profile` counts them as `faulted`.
 
 Two things it cannot do. It cannot see a misparse that leaves no error node:
-`f<typeof import('m')>(1)` parses clean as `(f < typeof import('m')) > (1)`. And it inherits the
-grammar key's blind spot. A tree-sitter-typescript bump that fixes #367 without changing the
-grammar's shape leaves every cache key as it was, so old diagnostics replay. The pull request
-making that bump owns its own invalidation, and
+`f<typeof import('m')>(1)` parses clean as `(f < typeof import('m')) > (1)`. And its answer is
+tree-sitter's error recovery, which two cache-key inputs cannot see. The grammar key hashes a
+grammar's shape, not its parse tables, and nothing hashes the tree-sitter runtime, whose
+`parser.c` decides where recovery puts each `ERROR`. So a bump of either that changes recovery
+without changing the grammar's shape replays old diagnostics from a warm cache. For the grammar,
 `the_type_argument_import_misparse_is_still_present` in `crates/lanekeep-lang-js/src/lib.rs`
-fails on it to say so.
+fails when #367 is fixed, and the edit that failure forces is itself the invalidation:
+`crates/lanekeep-lang-js/build.rs` hashes the crate's whole `src/`, tests included, into its
+`analysis_identity`, so keep the canary there. For the runtime there is no such guard yet. A pull
+request that moves `tree-sitter` owns its own invalidation.
 
 ## What not to do
 

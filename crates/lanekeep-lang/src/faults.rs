@@ -137,8 +137,8 @@ mod tests {
     }
 
     /// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads
-    /// (tree-sitter/tree-sitter-typescript#367). With a statement after it, the root itself is
-    /// `ERROR`.
+    /// (tree-sitter/tree-sitter-typescript#367), followed by the expression statement `1`, which
+    /// turns the root itself into `ERROR` (a following declaration does not).
     const REPRO: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
                          await importOriginal<typeof import('vitest')>()\n})\n\n1\n";
 

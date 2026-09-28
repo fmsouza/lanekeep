@@ -263,11 +263,12 @@ declared language by construction.
 **A query anchored at the root runs only on a file whose root parsed.** When tree-sitter's error
 recovery cannot fit a file under the grammar's start symbol, the root itself is `ERROR`, so
 `(program) @file` never matches and the rule never runs there — tree-sitter-typescript 0.23.2
-does this to a file using Vitest's `importOriginal<typeof import('./m')>()` idiom once any
-statement follows it (tree-sitter/tree-sitter-typescript#367). A file with only nested faults
-still matches, and its tree is still partly misread, so the anchor firing says nothing about
-whether the file was read whole: `lanekeep/parse` (§11) is what says that. A rule that must run
-once per file anchors at `[(program) (ERROR)] @root` and keeps the match whose
+can do this to a file using Vitest's `importOriginal<typeof import('./m')>()` idiom
+(tree-sitter/tree-sitter-typescript#367), depending on what follows the call: in #271's
+reproduction a trailing `1` does it and a trailing `const z = 2` does not. A file with only
+nested faults still matches, and its tree is still partly misread, so the anchor firing says
+nothing about whether the file was read whole: `lanekeep/parse` (§11) is what says that. A rule
+that must run once per file anchors at `[(program) (ERROR)] @root` and keeps the match whose
 `ctx.parent(root) === undefined` — compared against `undefined`, because the root's handle is
 `0`. `checkFile` requires `flow`, so it is no alternative today.
 

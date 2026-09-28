@@ -20,8 +20,9 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const NEXT_LINE: &str = concat!("lanekeep", "-ignore-next-line");
 const WHOLE_FILE: &str = concat!("lanekeep", "-ignore-file");
 
-/// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads, with a statement
-/// after it, so the root is `ERROR`.
+/// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads, followed by the
+/// expression statement `1`, which turns the root itself into `ERROR` (a following declaration
+/// does not).
 const REPRO: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
                      await importOriginal<typeof import('vitest')>()\n})\n\n1\n";
 

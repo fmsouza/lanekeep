@@ -1772,7 +1772,8 @@ impl Engine {
     }
 
     /// Every card this run's violations can be described by: each configured rule's own, and
-    /// the engine's for the id it reports itself.
+    /// the engine's for `lanekeep/parse`, the only id it reports itself — `lanekeep/suppression`
+    /// has none yet.
     pub fn cards(&self) -> impl Iterator<Item = (RuleId, RuleCard)> + '_ {
         let reserved = PARSE_RULE
             .parse::<RuleId>()
@@ -8481,7 +8482,8 @@ export default defineRule({
         });\n";
 
     /// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads
-    /// (tree-sitter/tree-sitter-typescript#367), with a statement after it: the root is `ERROR`.
+    /// (tree-sitter/tree-sitter-typescript#367), followed by the expression statement `1`, which
+    /// turns the root itself into `ERROR` (a following declaration does not).
     const REPRO: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
                          await importOriginal<typeof import('vitest')>()\n})\n\n1\n";
 

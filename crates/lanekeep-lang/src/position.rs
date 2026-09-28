@@ -4,7 +4,8 @@
 //! reaches it through `NodeArena::position`, and the engine's `lanekeep/parse` diagnostic calls
 //! it directly, so the two cannot disagree about where a node is. The column is tree-sitter's,
 //! which counts bytes while `Position` documents characters; that is a known disagreement being
-//! fixed separately, and this function is the one place the fix has to land.
+//! fixed separately. Every reported violation position goes through here; `lanekeep-js`'s
+//! strip-error positions have their own conversion, which the same fix must also cover.
 
 use tree_sitter::Point;
 
