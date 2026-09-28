@@ -8600,8 +8600,17 @@ export default defineRule({
             (1, 1)
         );
         assert_eq!(fault.severity, Severity::Warn);
-        assert_eq!(fault.message, ROOT_MESSAGE);
-        assert_eq!(fault.remediation, expected_remediation());
+        assert_eq!(
+            fault.message, ROOT_MESSAGE,
+            "this text is cached per violation: changing it means bumping FORMAT_VERSION in \
+             crates/lanekeep-cache/src/key.rs"
+        );
+        assert_eq!(
+            fault.remediation,
+            expected_remediation(),
+            "this text is cached per violation: changing it means bumping FORMAT_VERSION in \
+             crates/lanekeep-cache/src/key.rs"
+        );
         assert!(
             !outcome
                 .violations
@@ -8691,7 +8700,11 @@ export default defineRule({
                 (*line, *column),
                 "{path}"
             );
-            assert_eq!(&found[0].message, message, "{path}");
+            assert_eq!(
+                &found[0].message, message,
+                "{path}: this text is cached per violation: changing it means bumping \
+                 FORMAT_VERSION in crates/lanekeep-cache/src/key.rs"
+            );
         }
     }
 
@@ -8914,8 +8927,17 @@ export default defineRule({
         let card = cards
             .get(&PARSE_RULE.parse::<RuleId>().expect("a well-formed id"))
             .expect("a card for lanekeep/parse");
-        assert_eq!(card.message, "a file lanekeep's parser did not fully read");
-        assert_eq!(card.remediation, expected_remediation());
+        assert_eq!(
+            card.message, "a file lanekeep's parser did not fully read",
+            "this text is cached per violation: changing it means bumping FORMAT_VERSION in \
+             crates/lanekeep-cache/src/key.rs"
+        );
+        assert_eq!(
+            card.remediation,
+            expected_remediation(),
+            "this text is cached per violation: changing it means bumping FORMAT_VERSION in \
+             crates/lanekeep-cache/src/key.rs"
+        );
         assert!(
             cards.contains_key(&"local/anchor".parse::<RuleId>().expect("a well-formed id")),
             "configured rules keep their own cards"

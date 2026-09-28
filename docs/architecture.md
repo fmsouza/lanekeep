@@ -729,8 +729,9 @@ key = blake3(
                                   //   own identity() and the programs term its begin_run
                                   //   answered, and every registered language's
     ruleset_hash,                 // rule module sources in the graph, and component bytes
-    config_hash,                  // severity, include/exclude, options, the types block
-                                  //   and timeouts.analysis
+    config_hash,                  // severity, the resolved lanekeep/parse severity,
+                                  //   include/exclude, options, the types block and
+                                  //   timeouts.analysis
     every (grammar_id, grammar_digest) in the registry, sorted and count-prefixed
     file_relative_path,           // path gates exist — path is an input
     file_content_hash,            // blake3 of bytes
@@ -881,7 +882,8 @@ A `lanekeep.config.ts` is a rule module like any other: same loader, same sandbo
 
 It also sets `lanekeep/parse` (§11), which no rule declares: `warn` unless the map names it. The
 map is folded into `config_hash` whole, ids no rule claims included, which is what makes that
-key reach the cache.
+key reach the cache. The resolved severity is folded as well, defaults included, so a change of
+`lanekeep/parse`'s default reaches the cache even for a config that never names the id.
 
 ### 9.1 `lanekeep.json`, and why it no longer shares a mechanism
 

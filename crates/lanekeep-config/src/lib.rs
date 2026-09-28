@@ -1399,6 +1399,7 @@ fn build(
         resolved,
         &suppressions,
         &types,
+        parse_severity,
     );
 
     Ok(Config {
@@ -2562,6 +2563,17 @@ fn build_rule(
         .parse::<RuleId>()
         .map_err(|e| fail(e.to_string()))?;
 
+    // `lanekeep/parse` is the engine's own id, not a namespace-membership question: refusing
+    // it here, before the namespace check below, keeps a rule from sharing severity and
+    // acknowledgements with the engine's own report and from overwriting its card in
+    // `Engine::cards()`.
+    if id.to_string() == PARSE_RULE {
+        return Err(fail(format!(
+            "`{PARSE_RULE}` is reserved for lanekeep's own report on a file its parser could \
+             not read whole; a rule cannot claim it"
+        )));
+    }
+
     // A namespace nobody declared is a typo, and this is the only layer that can tell.
     // Parsing accepts any well-formed namespace so a team can use its own; declaring it is
     // what keeps `lanekep/foo` from becoming a valid ID that quietly matches nothing.
@@ -3043,6 +3055,10 @@ fn length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 /// analysis budget changes the answers a run gives, and a value a config can say that reaches
 /// no hash lets a warm run keep answering the previous configuration.
 ///
+/// `parse_severity` is folded as the resolved value, defaults included, the same as `limits`
+/// and the suppression policy: a config that never names `lanekeep/parse` still has to move
+/// this key when that id's *default* severity changes, or a warm run would replay the old one.
+///
 /// `resolved` is a JSON config's rule references and their options, and is empty for a
 /// TypeScript one — where the same information lives inside the config module's own source
 /// and reaches the key through `ruleset_hash` instead. `docs/architecture.md` §8.1 lists
@@ -3060,6 +3076,7 @@ fn hash_config(
     resolved: &[ResolvedRule],
     suppressions: &SuppressionPolicy,
     types: &TypesConfig,
+    parse_severity: Severity,
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-config-v1");
@@ -3086,6 +3103,9 @@ fn hash_config(
         hasher.update(level.as_str().as_bytes());
         hasher.update(&[0]);
     }
+
+    hasher.update(b"parse_severity");
+    hasher.update(parse_severity.as_str().as_bytes());
 
     hasher.update(b"limits");
     for value in [
@@ -3554,6 +3574,46 @@ mod tests {
             .load_config()
             .expect_err("claiming the reserved namespace should be refused")
             .to_string();
+        assert!(error.contains("reserved"), "{error}");
+    }
+
+    /// `lanekeep/parse` is the engine's own id, not a rule's: claiming it would share severity
+    /// and acknowledgements with the engine's own report and let `Engine::cards()` be
+    /// overwritten. Paired with `..._for_json`, since the two formats validate a rule id through
+    /// the same `build_rule`, but reach it from different loaders.
+    #[test]
+    fn a_rule_cannot_claim_the_reserved_parse_id() {
+        let fixture = Fixture::new(
+            "reserved-parse-id",
+            &[
+                ("rule.ts", &rule("lanekeep/parse")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("claiming lanekeep/parse should be refused")
+            .to_string();
+        assert!(error.contains("lanekeep/parse"), "{error}");
+        assert!(error.contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_cannot_claim_the_reserved_parse_id_for_json() {
+        let fixture = Fixture::new(
+            "reserved-parse-id-json",
+            &[
+                ("rule.ts", &rule("lanekeep/parse")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+
+        let error = fixture
+            .load_json()
+            .expect_err("claiming lanekeep/parse should be refused")
+            .to_string();
+        assert!(error.contains("lanekeep/parse"), "{error}");
         assert!(error.contains("reserved"), "{error}");
     }
 
@@ -6266,6 +6326,7 @@ mod tests {
             &[],
             &SuppressionPolicy::default(),
             types,
+            Severity::Warn,
         )
     }
 
@@ -6278,6 +6339,22 @@ mod tests {
             &[],
             &SuppressionPolicy::default(),
             &TypesConfig::default(),
+            Severity::Warn,
+        )
+    }
+
+    /// Paired with `hash_with_types`/`hash_with_limits`: `hash_config`'s own fold moves for
+    /// `parse_severity`, isolated from every other input `build` also feeds it.
+    fn hash_with_parse_severity(parse_severity: Severity) -> Hash {
+        hash_config(
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &Limits::default(),
+            &[],
+            &SuppressionPolicy::default(),
+            &TypesConfig::default(),
+            parse_severity,
         )
     }
 
@@ -6317,6 +6394,16 @@ mod tests {
         let tighter =
             hash_with_limits(&Limits::default().with_analysis_timeout(Duration::from_secs(5)));
         assert_ne!(hex(&default), hex(&tighter));
+    }
+
+    /// `parse_severity` is folded as the resolved value, the same as `limits` and the
+    /// suppression policy: a config that never names `lanekeep/parse` still has to move this
+    /// key when the id's *default* severity changes, or a warm run would replay the old one.
+    #[test]
+    fn changing_the_parse_severity_changes_the_config_hash() {
+        let warn = hash_with_parse_severity(Severity::Warn);
+        let error = hash_with_parse_severity(Severity::Error);
+        assert_ne!(hex(&warn), hex(&error));
     }
 
     #[test]
