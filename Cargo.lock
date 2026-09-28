@@ -62,7 +62,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -73,7 +73,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -525,7 +525,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-cache"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-config"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "globset",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-engine"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-cache",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-js"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-core",
  "lanekeep-lang",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "thiserror",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-go"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-js"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-python"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-rust"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-languages"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-lang",
  "lanekeep-lang-go",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-nodes"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-query"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-core",
  "lanekeep-lang",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-report"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "insta",
  "lanekeep-core",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-rules"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-server"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-core",
  "serde",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-testkit"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-config",
  "lanekeep-core",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-types"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-wasm"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -1375,18 +1375,18 @@ dependencies = [
 
 [[package]]
 name = "rquickjs"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7d96fb23e8ff51c8d4772ea84e44b5238543b7d81e9cc23c0219511a8f16482"
+checksum = "a0a22bf72f515cc4189dd7c63d016f6de92a11eee98ddf7dd64794198f6eb34e"
 dependencies = [
  "rquickjs-core",
 ]
 
 [[package]]
 name = "rquickjs-core"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c6dbfedfbf458dc119c21ccd032c7527d185210b11a1ae796cd04106e6db280"
+checksum = "6657979a24d543e5fc66f32cef2f47ca82ce8eb55cec5f7d59a12b7b570bbf24"
 dependencies = [
  "hashbrown 0.17.1",
  "relative-path",
@@ -1395,9 +1395,9 @@ dependencies = [
 
 [[package]]
 name = "rquickjs-sys"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53d0aaff245bed1c6f3c39e477fb6b98d710d9d298bfec7c8dfc589bed0e5cef"
+checksum = "cee271d0eeba64f0915b846cb7ae02e16faf3dfdffdca91731101d9d30fe3423"
 dependencies = [
  "cc",
 ]
@@ -1424,7 +1424,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1602,7 +1602,7 @@ dependencies = [
  "getrandom",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1989,7 +1989,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
