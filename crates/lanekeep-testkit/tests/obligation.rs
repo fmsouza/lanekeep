@@ -504,6 +504,49 @@ fn a_different_origin_still_reports_under_keyby_binding() {
         .expect("clientId and otherId are two distinct parameters with no shared origin");
 }
 
+/// A release keyed on a shorthand property. `return { seed }` is `return { seed: seed }`, so its
+/// `@key` — a `shorthand_property_identifier`, not an `identifier` — reads `seed` and must resolve
+/// to the value `seed` was bound to, the call the acquire keyed. `flow.rs`'s
+/// `origin_of_a_shorthand_property_is_the_binding_it_names` proves the origins intersect; this is
+/// its `RuleTester` equivalent.
+const KEYBY_SHORTHAND: &str = "import { defineRule } from 'lanekeep';\n\
+    export default defineRule({\n\
+      id: 'local/acquired-is-returned-by-origin',\n\
+      requires: ['dataflow'],\n\
+      obligation: {\n\
+        acquire: ['(call_expression function: (identifier) @f (#eq? @f \"acquire\")) @acquire @key'],\n\
+        release: ['(return_statement (object (shorthand_property_identifier) @key)) @release'],\n\
+        scope: 'function',\n\
+        keyBy: 'binding',\n\
+      },\n\
+      card: { message: 'not returned', remediation: 'return the acquired value',\n\
+              examples: { bad: 'acquire();', good: 'const a = acquire(); return { a };' } },\n\
+      checkObligation(ctx, u) {\n\
+        ctx.report(u.exit, u.partial ? 'missed on some path' : 'never returned');\n\
+      },\n\
+    });\n";
+
+fn keyby_shorthand() -> RuleTester {
+    RuleTester::new("keyby-shorthand", KEYBY_SHORTHAND).expect("builds")
+}
+
+#[test]
+fn a_shorthand_property_releases_the_binding_it_names() {
+    keyby_shorthand()
+        .accepts("function f() { const seed = acquire(); return { seed }; }\n")
+        .expect("`{ seed }` returns seed, which holds the acquired value");
+}
+
+#[test]
+fn a_shorthand_property_of_another_value_still_reports() {
+    keyby_shorthand()
+        .reports_messages(
+            "function f() { const seed = acquire(); const other = make(); return { other }; }\n",
+            &["never returned"],
+        )
+        .expect("`{ other }` returns a different value than the one acquired");
+}
+
 /// `keyBy: 'text'` regression: the identical rule shape and the identical acquire/release
 /// queries as `KEYBY_BINDING` above, differing only in `keyBy`. Pins that adding `'binding'`
 /// left `'text'`'s pre-existing meaning — exact captured-text equality, nothing more —
