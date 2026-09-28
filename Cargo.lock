@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-cache"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-config"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "globset",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-engine"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-cache",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-js"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-core",
  "lanekeep-lang",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "thiserror",
@@ -914,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-go"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-js"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-python"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-lang-rust"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-languages"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-lang",
  "lanekeep-lang-go",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-nodes"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-query"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-core",
  "lanekeep-lang",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-report"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "insta",
  "lanekeep-core",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-rules"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-server"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-core",
  "serde",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-testkit"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "lanekeep-config",
  "lanekeep-core",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-types"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "lanekeep-wasm"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-core",
