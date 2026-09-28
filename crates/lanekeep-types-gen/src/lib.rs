@@ -1006,7 +1006,10 @@ export interface Config {
   exclude?: string[]
   /** Rule-id namespaces this project uses beyond `local`. */
   namespaces?: string[]
-  /** Override a rule's own severity, by id. */
+  /**
+   * Override a rule's own severity, by id. `lanekeep/parse` sets the level of lanekeep's own
+   * report on a file its parser could not read whole: `warn` unless named here.
+   */
   severity?: Record<string, Severity>
   /** Execution budgets, in milliseconds. */
   timeouts?: {

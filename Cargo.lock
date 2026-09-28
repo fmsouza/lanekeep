@@ -909,6 +909,7 @@ dependencies = [
  "blake3",
  "thiserror",
  "tree-sitter",
+ "tree-sitter-typescript",
 ]
 
 [[package]]

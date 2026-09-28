@@ -28,7 +28,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use lanekeep_core::{Capability, Examples, Gates, Namespace, RuleCard, RuleId, Severity};
+use lanekeep_core::{
+    Capability, Examples, Gates, Namespace, PARSE_RULE, RuleCard, RuleId, Severity,
+};
 use lanekeep_js::{Limits, ResolveError, RuleRoot, RunClock, Sandbox};
 use lanekeep_wasm::{RuleSet, WasmEngine, WasmRuntime};
 use serde::Deserialize;
@@ -386,6 +388,10 @@ pub struct Config {
     pub limits: Limits,
     /// The project's policy for which shapes of valid directive it accepts.
     pub suppressions: SuppressionPolicy,
+    /// Severity of the engine's `lanekeep/parse` report on a file its parser could not read
+    /// whole: `warn` unless the `severity` map names it. Read from the same map as every
+    /// rule's override, so it reaches `config_hash` through the fold that map already has.
+    pub parse_severity: Severity,
     /// Which type oracle answers `ctx.types`, and how to reach it.
     pub types: TypesConfig,
     /// Hash of every module in the rule import graph.
@@ -1256,6 +1262,14 @@ fn build(
 ) -> Result<Config, ConfigError> {
     let overrides = parse_severity_overrides(&raw.severity, display)?;
 
+    // No `RuleSpec` carries `lanekeep/parse` — the engine emits it — so its override is read
+    // here rather than when rules are built. `hash_config` already folds the whole map.
+    let parse_severity = PARSE_RULE
+        .parse::<RuleId>()
+        .ok()
+        .and_then(|id| overrides.get(&id).copied())
+        .unwrap_or(Severity::Warn);
+
     // Namespaces this project claims, beyond the two lanekeep defines. Validated for shape
     // here so a malformed one is reported against `namespaces` rather than against whichever
     // rule happened to use it first.
@@ -1385,6 +1399,7 @@ fn build(
         resolved,
         &suppressions,
         &types,
+        parse_severity,
     );
 
     Ok(Config {
@@ -1393,6 +1408,7 @@ fn build(
         rules,
         limits,
         suppressions,
+        parse_severity,
         types,
         ruleset_hash,
         config_hash,
@@ -2547,6 +2563,17 @@ fn build_rule(
         .parse::<RuleId>()
         .map_err(|e| fail(e.to_string()))?;
 
+    // `lanekeep/parse` is the engine's own id, not a namespace-membership question: refusing
+    // it here, before the namespace check below, keeps a rule from sharing severity and
+    // acknowledgements with the engine's own report and from overwriting its card in
+    // `Engine::cards()`.
+    if id.to_string() == PARSE_RULE {
+        return Err(fail(format!(
+            "`{PARSE_RULE}` is reserved for lanekeep's own report on a file its parser could \
+             not read whole; a rule cannot claim it"
+        )));
+    }
+
     // A namespace nobody declared is a typo, and this is the only layer that can tell.
     // Parsing accepts any well-formed namespace so a team can use its own; declaring it is
     // what keeps `lanekep/foo` from becoming a valid ID that quietly matches nothing.
@@ -3028,6 +3055,10 @@ fn length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 /// analysis budget changes the answers a run gives, and a value a config can say that reaches
 /// no hash lets a warm run keep answering the previous configuration.
 ///
+/// `parse_severity` is folded as the resolved value, defaults included, the same as `limits`
+/// and the suppression policy: a config that never names `lanekeep/parse` still has to move
+/// this key when that id's *default* severity changes, or a warm run would replay the old one.
+///
 /// `resolved` is a JSON config's rule references and their options, and is empty for a
 /// TypeScript one — where the same information lives inside the config module's own source
 /// and reaches the key through `ruleset_hash` instead. `docs/architecture.md` §8.1 lists
@@ -3037,6 +3068,11 @@ fn length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 /// so it is not among the modules `hash_ruleset` walks. Editing an option in a
 /// `lanekeep.json` therefore invalidated nothing, and a warm run kept answering the previous
 /// configuration.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every one is a distinct configuration input with no natural grouping, the same \
+              shape `Engine::prepare` already carries this reason for"
+)]
 fn hash_config(
     include: &[String],
     exclude: &[String],
@@ -3045,6 +3081,7 @@ fn hash_config(
     resolved: &[ResolvedRule],
     suppressions: &SuppressionPolicy,
     types: &TypesConfig,
+    parse_severity: Severity,
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lanekeep-config-v1");
@@ -3071,6 +3108,9 @@ fn hash_config(
         hasher.update(level.as_str().as_bytes());
         hasher.update(&[0]);
     }
+
+    hasher.update(b"parse_severity");
+    hasher.update(parse_severity.as_str().as_bytes());
 
     hasher.update(b"limits");
     for value in [
@@ -3539,6 +3579,46 @@ mod tests {
             .load_config()
             .expect_err("claiming the reserved namespace should be refused")
             .to_string();
+        assert!(error.contains("reserved"), "{error}");
+    }
+
+    /// `lanekeep/parse` is the engine's own id, not a rule's: claiming it would share severity
+    /// and acknowledgements with the engine's own report and let `Engine::cards()` be
+    /// overwritten. Paired with `..._for_json`, since the two formats validate a rule id through
+    /// the same `build_rule`, but reach it from different loaders.
+    #[test]
+    fn a_rule_cannot_claim_the_reserved_parse_id() {
+        let fixture = Fixture::new(
+            "reserved-parse-id",
+            &[
+                ("rule.ts", &rule("lanekeep/parse")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+
+        let error = fixture
+            .load_config()
+            .expect_err("claiming lanekeep/parse should be refused")
+            .to_string();
+        assert!(error.contains("lanekeep/parse"), "{error}");
+        assert!(error.contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_cannot_claim_the_reserved_parse_id_for_json() {
+        let fixture = Fixture::new(
+            "reserved-parse-id-json",
+            &[
+                ("rule.ts", &rule("lanekeep/parse")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        );
+
+        let error = fixture
+            .load_json()
+            .expect_err("claiming lanekeep/parse should be refused")
+            .to_string();
+        assert!(error.contains("lanekeep/parse"), "{error}");
         assert!(error.contains("reserved"), "{error}");
     }
 
@@ -6251,6 +6331,7 @@ mod tests {
             &[],
             &SuppressionPolicy::default(),
             types,
+            Severity::Warn,
         )
     }
 
@@ -6263,6 +6344,22 @@ mod tests {
             &[],
             &SuppressionPolicy::default(),
             &TypesConfig::default(),
+            Severity::Warn,
+        )
+    }
+
+    /// Paired with `hash_with_types`/`hash_with_limits`: `hash_config`'s own fold moves for
+    /// `parse_severity`, isolated from every other input `build` also feeds it.
+    fn hash_with_parse_severity(parse_severity: Severity) -> Hash {
+        hash_config(
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &Limits::default(),
+            &[],
+            &SuppressionPolicy::default(),
+            &TypesConfig::default(),
+            parse_severity,
         )
     }
 
@@ -6302,6 +6399,16 @@ mod tests {
         let tighter =
             hash_with_limits(&Limits::default().with_analysis_timeout(Duration::from_secs(5)));
         assert_ne!(hex(&default), hex(&tighter));
+    }
+
+    /// `parse_severity` is folded as the resolved value, the same as `limits` and the
+    /// suppression policy: a config that never names `lanekeep/parse` still has to move this
+    /// key when the id's *default* severity changes, or a warm run would replay the old one.
+    #[test]
+    fn changing_the_parse_severity_changes_the_config_hash() {
+        let warn = hash_with_parse_severity(Severity::Warn);
+        let error = hash_with_parse_severity(Severity::Error);
+        assert_ne!(hex(&warn), hex(&error));
     }
 
     #[test]
@@ -6353,6 +6460,119 @@ mod tests {
             hex(&make("", "none")),
             hex(&make(", severity: { 'local/example': 'warn' }", "warn")),
             "changing a severity must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_parse_severity_defaults_to_warn() {
+        let config = Fixture::new(
+            "parse-severity-default",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        )
+        .load_config()
+        .expect("loads");
+        assert_eq!(config.parse_severity, Severity::Warn);
+    }
+
+    #[test]
+    fn the_parse_severity_defaults_to_warn_for_json() {
+        let config = Fixture::new(
+            "json-parse-severity-default",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.json", r#"{"rules": ["./rule"]}"#),
+            ],
+        )
+        .load_json()
+        .expect("loads");
+        assert_eq!(config.parse_severity, Severity::Warn);
+    }
+
+    #[test]
+    fn the_severity_map_sets_the_parse_severity() {
+        let config = Fixture::new(
+            "parse-severity-set",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("rules: [rule], severity: { 'lanekeep/parse': 'error' }"),
+                ),
+            ],
+        )
+        .load_config()
+        .expect("loads");
+        assert_eq!(config.parse_severity, Severity::Error);
+    }
+
+    #[test]
+    fn the_severity_map_sets_the_parse_severity_for_json() {
+        let config = Fixture::new(
+            "json-parse-severity-set",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./rule"], "severity": {"lanekeep/parse": "off"}}"#,
+                ),
+            ],
+        )
+        .load_json()
+        .expect("loads");
+        assert_eq!(config.parse_severity, Severity::Off);
+    }
+
+    /// Paired with `…_for_json`. The `severity` map is folded whole, including ids no rule
+    /// claims, so this holds before any change here. Skipping `PARSE_RULE` in `hash_config`'s
+    /// severity loop makes both hash tests fail.
+    #[test]
+    fn the_config_hash_changes_with_the_parse_severity() {
+        let make = |extra: &str, tag: &str| {
+            Fixture::new(
+                &format!("parse-severity-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.config.ts",
+                        &config_with(&format!("rules: [rule]{extra}")),
+                    ),
+                ],
+            )
+            .load_config()
+            .expect("loads")
+            .config_hash
+        };
+        assert_ne!(
+            hex(&make("", "none")),
+            hex(&make(", severity: { 'lanekeep/parse': 'error' }", "error")),
+            "changing the parse severity must invalidate"
+        );
+    }
+
+    #[test]
+    fn the_config_hash_changes_with_the_parse_severity_for_json() {
+        let make = |severity: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-parse-severity-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "severity": {severity}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+        assert_ne!(
+            hex(&make("{}", "none")),
+            hex(&make(r#"{"lanekeep/parse": "off"}"#, "off")),
+            "changing the parse severity must invalidate"
         );
     }
 

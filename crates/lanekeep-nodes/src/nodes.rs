@@ -192,15 +192,7 @@ impl NodeArena {
     #[must_use]
     pub fn position(&self, handle: Handle) -> Option<(u32, u32)> {
         let node = self.node(handle)?;
-        let start = node.start_position();
-        Some((
-            u32::try_from(start.row)
-                .unwrap_or(u32::MAX)
-                .saturating_add(1),
-            u32::try_from(start.column)
-                .unwrap_or(u32::MAX)
-                .saturating_add(1),
-        ))
+        Some(lanekeep_lang::position::one_based(node.start_position()))
     }
 
     /// The node's byte range in the source.
