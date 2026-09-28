@@ -3068,6 +3068,11 @@ fn length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 /// so it is not among the modules `hash_ruleset` walks. Editing an option in a
 /// `lanekeep.json` therefore invalidated nothing, and a warm run kept answering the previous
 /// configuration.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every one is a distinct configuration input with no natural grouping, the same \
+              shape `Engine::prepare` already carries this reason for"
+)]
 fn hash_config(
     include: &[String],
     exclude: &[String],
