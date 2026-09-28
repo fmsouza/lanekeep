@@ -6434,7 +6434,8 @@ mod tests {
     }
 
     /// Paired with `…_for_json`. The `severity` map is folded whole, including ids no rule
-    /// claims, so this holds before any change here. Watch it fail by mutation (Step 4).
+    /// claims, so this holds before any change here. Skipping `PARSE_RULE` in `hash_config`'s
+    /// severity loop makes both hash tests fail.
     #[test]
     fn the_config_hash_changes_with_the_parse_severity() {
         let make = |extra: &str, tag: &str| {

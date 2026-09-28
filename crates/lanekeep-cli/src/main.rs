@@ -637,8 +637,8 @@ fn write_gate_profile(
         w,
         "  faulted counts parsed files whose tree carries a parse error — a subset of parsed,\n  \
          outside the six-column sum; a rule reporting nothing with faulted above 0 may have\n  \
-         missed what the parser could not read, and lanekeep/parse says where unless its\n  \
-         severity is off\n"
+         missed what the parser could not read, and lanekeep/parse says where, unless it is\n  \
+         off or a directive acknowledges it\n"
     )?;
     writeln!(
         w,

@@ -862,8 +862,9 @@ impl std::fmt::Debug for Engine {
 /// in differs by rule, so "identical rows warm" is false as well. The reconciliation above
 /// is what still holds warm: the six counters sum to `files_discovered` in every state.
 ///
-/// `faulted` and `dropped` sit outside this reconciliation on purpose — each counts something
-/// *within* files already `parsed`.
+/// `faulted` and `dropped` sit outside this reconciliation on purpose, and neither is a
+/// disposition of its own: `faulted` counts a subset of the `parsed` files, and `dropped`
+/// counts constructs within them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuleTiming {
     /// Time matching this rule's query, in Rust.
@@ -8533,6 +8534,52 @@ export default defineRule({
         )
     }
 
+    /// Grammar-independent: hand-built `Summary` values rather than a parsed tree, so the root
+    /// and region wording keeps a fixture even after tree-sitter/tree-sitter-typescript#367 is
+    /// fixed and the grammar-derived fixtures above have to change.
+    #[test]
+    fn parse_fault_message_is_worded_from_the_summary_alone() {
+        assert_eq!(
+            parse_fault_message(
+                "typescript",
+                &lanekeep_lang::faults::Summary {
+                    root_is_error: true,
+                    line: 3,
+                    column: 1,
+                    last_line: 8,
+                    regions: 1,
+                }
+            ),
+            ROOT_MESSAGE
+        );
+        assert_eq!(
+            parse_fault_message(
+                "typescript",
+                &lanekeep_lang::faults::Summary {
+                    root_is_error: false,
+                    line: 2,
+                    column: 9,
+                    last_line: 2,
+                    regions: 1,
+                }
+            ),
+            region_message("line 2", "")
+        );
+        assert_eq!(
+            parse_fault_message(
+                "typescript",
+                &lanekeep_lang::faults::Summary {
+                    root_is_error: false,
+                    line: 4,
+                    column: 24,
+                    last_line: 13,
+                    regions: 3,
+                }
+            ),
+            region_message("lines 4 to 13", "; 2 more regions after it")
+        );
+    }
+
     #[test]
     fn a_root_the_parser_could_not_build_is_reported_and_blinds_a_root_anchor() {
         let project = Project::new(
@@ -8757,10 +8804,20 @@ export default defineRule({
             ],
         );
         let cold = project.run().expect("runs");
-        let warm = project.run().expect("runs");
+        let warm = project
+            .build()
+            .expect("prepares")
+            .profiling()
+            .run()
+            .expect("runs");
         assert_eq!(parse_faults(&cold).len(), 1);
         assert_eq!(cold.violations, warm.violations);
         assert_eq!(project.cache().len(), 1, "the entry was written and served");
+        assert_eq!(
+            timing_for(&warm, "local/anchor").cached,
+            1,
+            "the warm run was served from the cache"
+        );
     }
 
     #[test]
@@ -8799,6 +8856,47 @@ export default defineRule({
                 "{tag}: `faulted` stays outside the six-column sum: {timing:?}"
             );
         }
+    }
+
+    /// `faulted` is a subset of `parsed`, never a count on top of it: a rule that declares a
+    /// language other than the faulted file's never reaches `faulted_timings` at all, because
+    /// it was already `language_gated` in `parsed_or_language_gated_timings`.
+    ///
+    /// `local/member` alone, with no rule admitted for `typescript`, would never reach
+    /// `parse_once` at all — the file would never be parsed and `faulted_timings` would never
+    /// run, so the assertions below would hold trivially whether or not its language filter is
+    /// there. `local/anchor` (`PROGRAM_ANCHOR_RULE`, with no `language` of its own and so
+    /// admitted for `typescript`) is what makes the file actually parse, so `local/member`'s
+    /// exclusion is the filter doing real work.
+    #[test]
+    fn a_language_gated_rule_is_not_counted_faulted() {
+        let config = "import { defineConfig } from 'lanekeep';\n\
+            import anchor from './anchor';\n\
+            import member from './member';\n\
+            export default defineConfig({ include: ['src/**/*.ts'], rules: [anchor, member] });\n";
+        let project = Project::new(
+            "parse-fault-language-gated",
+            &[
+                ("anchor.ts", PROGRAM_ANCHOR_RULE),
+                ("member.ts", &member_rule_for("['tsx']")),
+                ("lanekeep.config.ts", config),
+                ("src/repro.ts", REPRO),
+            ],
+        );
+        let outcome = project
+            .build()
+            .expect("prepares")
+            .without_cache()
+            .profiling()
+            .run()
+            .expect("runs");
+        let timing = timing_for(&outcome, "local/member");
+        assert_eq!(timing.language_gated, 1, "{timing:?}");
+        assert_eq!(timing.parsed, 0, "{timing:?}");
+        assert_eq!(
+            timing.faulted, 0,
+            "faulted is a subset of parsed: {timing:?}"
+        );
     }
 
     #[test]

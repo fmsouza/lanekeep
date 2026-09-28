@@ -404,8 +404,11 @@ mod tests {
             assert!(
                 tree.root_node().has_error(),
                 "{name}: tree-sitter/tree-sitter-typescript#367 looks fixed — update AGENTS.md's \
-                 entry and the `lanekeep/parse` docs, and give the grammar bump its own cache \
-                 invalidation"
+                 entry and the `lanekeep/parse` docs, give the grammar bump its own cache \
+                 invalidation, and replace the `REPRO` fixtures built on this idiom in \
+                 crates/lanekeep-lang/src/faults.rs, crates/lanekeep-engine/src/lib.rs and \
+                 crates/lanekeep-cli/tests/parse_faults.rs, along with the tests asserting the \
+                 root wording through them"
             );
         }
     }

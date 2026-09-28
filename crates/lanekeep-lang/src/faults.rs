@@ -57,6 +57,8 @@ pub struct Summary {
 
 /// Summarize a tree's faults, or `None` for a tree the parser read whole.
 ///
+/// `Some` exactly when `root.has_error()`.
+///
 /// The position is where the first region's code begins: its first child that is not an extra
 /// (a comment), or the region itself when it has none. For an `ERROR` root that is the file's
 /// first code token, which a next-line directive can precede. The root's own start could not
@@ -67,7 +69,13 @@ pub fn summarize(root: Node<'_>) -> Option<Summary> {
         return None;
     }
     let all = regions(root);
-    let first = *all.first()?;
+    // `regions` can come back empty while `root.has_error()` still holds: a `MISSING` leaf for
+    // a hidden token is one such case — tree-sitter's missing-token insertion tries every
+    // terminal, hidden external ones included, and `Node::children` never yields an invisible
+    // leaf, so the walk in `regions` never sees it. Summarize at the root rather than returning
+    // `None`, so `faulted` in `--profile` (counted from `has_error()`) never disagrees with
+    // whether a fault was reported.
+    let first = all.first().copied().unwrap_or(root);
     let begins = code_start(first);
     let (line, column) = one_based(begins);
     Some(Summary {
@@ -75,7 +83,7 @@ pub fn summarize(root: Node<'_>) -> Option<Summary> {
         line,
         column,
         last_line: last_line(begins, first.end_position()),
-        regions: all.len(),
+        regions: all.len().max(1),
     })
 }
 
