@@ -16,6 +16,16 @@
 //! query does not compile against the language it named, or its card fails validation. A
 //! harness that skipped those would pass rules that do nothing.
 //!
+//! # A snippet the parser cannot read
+//!
+//! A tester runs the whole engine, so a snippet with a syntax error, or one the bundled grammar
+//! misreads, reports `lanekeep/parse` beside whatever the rule found: `accepts` fails, and
+//! `reports_at` sees one position more than it expected. That is deliberate. A rule "accepting"
+//! code it could not see is the vacuous pass the diagnostic exists to expose. A test that means
+//! to feed broken input acknowledges it in the snippet with a next-line directive naming
+//! `lanekeep/parse` — assembled from pieces, not written out, when the test file is one lanekeep
+//! checks.
+//!
 //! # Usage
 //!
 //! ```no_run
@@ -732,6 +742,22 @@ mod tests {
         tester("accepts")
             .accepts("const a = 1;\n")
             .expect("should accept");
+    }
+
+    #[test]
+    fn a_snippet_the_parser_cannot_read_is_not_accepted() {
+        // The rule under test cannot "accept" code the parser did not read: `lanekeep/parse`
+        // comes through like any violation (#271).
+        let err = tester("parse-fault")
+            .accepts("const x = ;\n")
+            .expect_err("a faulted snippet does not pass");
+        let TestError::Mismatch(message) = err else {
+            panic!("expected a mismatch, got {err:?}");
+        };
+        assert!(
+            message.contains("the typescript parser recovered from an error across line 1"),
+            "{message}"
+        );
     }
 
     #[test]

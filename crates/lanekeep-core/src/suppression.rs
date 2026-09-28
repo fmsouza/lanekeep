@@ -51,8 +51,10 @@ use crate::rule_id::RuleId;
 /// The token introducing a directive that covers the following line.
 ///
 /// Assembled rather than written, per the module documentation. The value is byte-for-byte
-/// what the scanner looks for; only this file's own source differs.
-const NEXT_LINE: &str = concat!("lanekeep", "-ignore-next-line");
+/// what the scanner looks for; only this file's own source differs. Public so that anything
+/// outside this crate that must write a directive, such as the engine's `lanekeep/parse`
+/// remediation, builds it from here rather than spelling it.
+pub const NEXT_LINE: &str = concat!("lanekeep", "-ignore-next-line");
 
 /// The token introducing a directive that covers the whole file. Assembled for the same
 /// reason as `NEXT_LINE`.

@@ -56,6 +56,7 @@ discover paths (globs, gitignore-aware)
                                   read bytes
                                   └─> cheap pre-parse reject (path + raw-text gates, §7.1)
                                       └─> tree-sitter parse
+                                          ├─> any ERROR/MISSING node → one lanekeep/parse report (§11)
                                           └─> run compiled queries (one pass)
                                               └─> for each match: invoke the TS handler
                                                   └─> emit violations + facts + read-deps
@@ -258,6 +259,18 @@ with no query entry (the rule would run on nothing there, silently), and a query
 language the rule does not target (the query could never run, silently). A rule that targets
 several languages must name every one of them in the object — the string form expands to every
 declared language by construction.
+
+**A query anchored at the root runs only on a file whose root parsed.** When tree-sitter's error
+recovery cannot fit a file under the grammar's start symbol, the root itself is `ERROR`, so
+`(program) @file` never matches and the rule never runs there — tree-sitter-typescript 0.23.2
+can do this to a file using Vitest's `importOriginal<typeof import('./m')>()` idiom
+(tree-sitter/tree-sitter-typescript#367), depending on what follows the call: in #271's
+reproduction a trailing `1` does it and a trailing `const z = 2` does not. A file with only
+nested faults still matches, and its tree is still partly misread, so the anchor firing says
+nothing about whether the file was read whole: `lanekeep/parse` (§11) is what says that. A rule
+that must run once per file anchors at `[(program) (ERROR)] @root` and keeps the match whose
+`ctx.parent(root) === undefined` — compared against `undefined`, because the root's handle is
+`0`. `checkFile` requires `flow`, so it is no alternative today.
 
 `check` is ordinary TypeScript. It may loop, accumulate state, build data structures, read other files through `ctx.readFile`, and call any helper the author writes — including code imported from sibling rule modules. There is no expressiveness ceiling and no escape hatch needed, because the hatch is the whole floor.
 
@@ -705,7 +718,7 @@ A warm run with no changes executes **no JavaScript at all** — every file is a
 ```rust
 key = blake3(
     "lanekeep-cache",             // domain separator
-    format_version,               // the on-disk encoding
+    format_version,               // the on-disk encoding, and what an entry records
     engine_version_major_minor,   // bump breaks cache intentionally
     host_api_hash,                // what a rule may reach: the ctx surface, the WIT world,
                                   //   and anything bound beside that world
@@ -716,8 +729,9 @@ key = blake3(
                                   //   own identity() and the programs term its begin_run
                                   //   answered, and every registered language's
     ruleset_hash,                 // rule module sources in the graph, and component bytes
-    config_hash,                  // severity, include/exclude, options, the types block
-                                  //   and timeouts.analysis
+    config_hash,                  // severity, the resolved lanekeep/parse severity,
+                                  //   include/exclude, options, the types block and
+                                  //   timeouts.analysis
     every (grammar_id, grammar_digest) in the registry, sorted and count-prefixed
     file_relative_path,           // path gates exist — path is an input
     file_content_hash,            // blake3 of bytes
@@ -866,6 +880,11 @@ A `lanekeep.config.ts` is a rule module like any other: same loader, same sandbo
 
 `severity` is applied last and overrides whatever a rule declares.
 
+It also sets `lanekeep/parse` (§11), which no rule declares: `warn` unless the map names it. The
+map is folded into `config_hash` whole, ids no rule claims included, which is what makes that
+key reach the cache. The resolved severity is folded as well, defaults included, so a change of
+`lanekeep/parse`'s default reaches the cache even for a config that never names the id.
+
 ### 9.1 `lanekeep.json`, and why it no longer shares a mechanism
 
 A project that does not write TypeScript can say which rules it wants in `lanekeep.json`, listing rules as `"lanekeep/no-package-init"` or `{ "rule": "...", "options": { ... } }`. It is what `lanekeep init` scaffolds.
@@ -919,6 +938,13 @@ All three default off, so an existing config changes nothing. `maxExpiryDays` mu
 
 **`lanekeep/suppression` cannot be suppressed.** The violations about directives themselves are emitted after the pass that applies directives, so nothing a file's own directives name can silence a malformed, expired or policy-violating directive's report — the policy polices, or it is not a policy.
 
+**`lanekeep/parse` can be.** It is emitted before directives are applied, because it reports a
+limitation of the tool rather than a policy: a team whose code is valid and misread by the
+grammar acknowledges the file with a directive naming `lanekeep/parse` and a reason. The report
+sits at the file's first code token even when the whole file failed to parse, so that a
+next-line directive can precede it — under `forbidFileScope` that is the only acknowledgement
+there is.
+
 The policy is a `config_hash` input, like every other setting: changing it invalidates the cache the way any config change does. `maxExpiryDays` compares against the run's `today`, so its verdict is date-dependent — and the dated cache key already covers exactly the affected files, since a file whose bytes contain `expires:` gets a one-day key. `requireExpiry` and `forbidFileScope` are date-independent and cache under the plain key.
 
 ### Suppressions and the cache
@@ -970,6 +996,21 @@ The `agent` format is a different document from the human one, not a terser rend
 `sarif` emits the required properties plus what GitHub actually reads. It describes each rule once and references it by index, and deliberately omits a rule-level `problem.severity`: severity is per violation here, since the same rule is an error in one config and a warning in another, and inventing a rule-level default to fill a field nothing requires is how a report starts lying.
 
 Violations sorted `(ruleId, file, line, column)` always. Deterministic output matters more than usual here: an agent reads it twice and must not see reordering as change. This is also why the sandbox withholds randomness and clock access (§6.6) — a rule cannot introduce nondeterminism even by accident.
+
+**A file lanekeep could not read whole says so.** tree-sitter always returns a tree; a source
+it could not read comes back with `ERROR` and `MISSING` nodes, or with an `ERROR` root no query
+anchored at the root can match. The engine checks every tree it parses and reports a faulted one
+once, as `lanekeep/parse`, at the start of its first fault region, with the grammar and the lines
+recovery took over. `--profile` counts the same files in its `faulted` column. Without either, a
+rule over such a file reports "parsed, 0 matches", which reads exactly like conforming code.
+
+It is a warning by default because the usual cause is a grammar gap in valid code rather than a
+defect in the file: set `"severity": { "lanekeep/parse": "error" }` to fail the run on one, or
+`"off"` to skip the check. Its remediation says not to rewrite valid code to satisfy the parser,
+because an agent told only "parse error" will. A misparse that produces no error node at all —
+tree-sitter-typescript reads `f<typeof import('m')>(1)` as two comparisons, and
+tree-sitter-javascript 0.25 reads a bare `export` as an identifier — is invisible to this check
+and to anything built on the tree.
 
 **Exit codes:** `0` clean or `--warn-only`; `1` violations; `2` runtime error, which includes a cancelled run — a breached timeout or memory ceiling (§6.8) never exits `0` or `1`, because a checker that could not finish must not be mistaken for one that found nothing.
 

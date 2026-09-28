@@ -385,6 +385,34 @@ mod tests {
         assert!(tree.root_node().has_error());
     }
 
+    /// tree-sitter-typescript 0.23.2 reads `f<typeof import('x')>()` as `f < typeof import('x')`
+    /// followed by a stray `()` (tree-sitter/tree-sitter-typescript#367). That is the Vitest
+    /// `importOriginal` idiom behind lanekeep#271. A grammar bump that fixes it fails here, and
+    /// the failure is the reminder of what moves with it: the AGENTS.md entry, the
+    /// `lanekeep/parse` docs that cite the idiom, and the cache. The grammar key cannot see a fix
+    /// that keeps the grammar's shape (architecture §8.1).
+    ///
+    /// Asserted on the minimal form rather than on a larger file's root kind, because error
+    /// recovery can change shape while the bug stays.
+    #[test]
+    fn the_type_argument_import_misparse_is_still_present() {
+        for (name, language) in [
+            ("typescript", &TypeScript as &dyn Language),
+            ("tsx", &Tsx as &dyn Language),
+        ] {
+            let tree = parse(language, "f<typeof import('x')>()\n");
+            assert!(
+                tree.root_node().has_error(),
+                "{name}: tree-sitter/tree-sitter-typescript#367 looks fixed — update AGENTS.md's \
+                 entry and the `lanekeep/parse` docs, give the grammar bump its own cache \
+                 invalidation, and replace the `REPRO` fixtures built on this idiom in \
+                 crates/lanekeep-lang/src/faults.rs, crates/lanekeep-engine/src/lib.rs and \
+                 crates/lanekeep-cli/tests/parse_faults.rs, along with the tests asserting the \
+                 root wording through them"
+            );
+        }
+    }
+
     #[test]
     fn parsing_empty_source_is_not_an_error() {
         let tree = parse(&TypeScript, "");

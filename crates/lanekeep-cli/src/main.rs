@@ -589,7 +589,7 @@ fn write_gate_profile(
     writeln!(w, "\nprofile — what each rule looked at\n")?;
     writeln!(
         w,
-        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7}",
+        "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7} {:>7}",
         "rule",
         "path-gated",
         "unread",
@@ -597,13 +597,14 @@ fn write_gate_profile(
         "content-gated",
         "lang-gated",
         "parsed",
+        "faulted",
         "dropped"
     )?;
 
     for (id, timing) in timings {
         writeln!(
             w,
-            "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7}",
+            "  {:<40} {:>10} {:>6} {:>6} {:>13} {:>10} {:>6} {:>7} {:>7}",
             id.to_string(),
             timing.path_gated,
             timing.unread,
@@ -611,6 +612,7 @@ fn write_gate_profile(
             timing.content_gated,
             timing.language_gated,
             timing.parsed,
+            timing.faulted,
             timing.dropped
         )?;
     }
@@ -630,6 +632,13 @@ fn write_gate_profile(
          files parse with, or an `include` admitting files no\n  grammar claims at all\n  \
          a rule reporting nothing with parsed above 0 did run — some files reached its\n  \
          query and it found nothing in them\n"
+    )?;
+    writeln!(
+        w,
+        "  faulted counts parsed files whose tree carries a parse error — a subset of parsed,\n  \
+         outside the six-column sum; a rule reporting nothing with faulted above 0 may have\n  \
+         missed what the parser could not read, and lanekeep/parse says where, unless it is\n  \
+         off or a directive acknowledges it\n"
     )?;
     writeln!(
         w,
@@ -1394,10 +1403,7 @@ impl lanekeep_server::mcp::Tools for Project<'_> {
         .map_err(|e| e.to_string())?;
         let outcome = engine.run().map_err(|e| e.to_string())?;
 
-        let cards: lanekeep_report::Cards = engine
-            .rules()
-            .map(|spec| (spec.id.clone(), spec.card.clone()))
-            .collect();
+        let cards: lanekeep_report::Cards = engine.cards().collect();
 
         // The `agent` format, which exists for exactly this consumer — grouped by rule, with
         // the remediation stated once and an example either way. Never colored: escape codes
@@ -1689,13 +1695,11 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         std::io::stdout().is_terminal(),
         std::env::var("NO_COLOR").ok().as_deref(),
     );
-    // Cards for every configured rule. The agent and SARIF reporters describe a rule as
-    // well as its violations, and a `Violation` carries the message and remediation but not
-    // the examples.
-    let cards: lanekeep_report::Cards = engine
-        .rules()
-        .map(|spec| (spec.id.clone(), spec.card.clone()))
-        .collect();
+    // Cards for every configured rule, and the engine's own for `lanekeep/parse`, the only id
+    // it reports itself — `lanekeep/suppression` has none yet. The agent and SARIF reporters
+    // describe a rule as well as its violations, and a `Violation` carries the message and
+    // remediation but not the examples.
+    let cards: lanekeep_report::Cards = engine.cards().collect();
 
     let rendered = lanekeep_report::render(
         format,
@@ -1914,6 +1918,47 @@ mod tests {
         assert!(
             row.trim_end().ends_with('3'),
             "the row's last column is the drop count, 3"
+        );
+    }
+
+    /// `faulted` sits between `parsed` and `dropped`, outside the six file-disposition columns.
+    #[test]
+    fn gate_profile_renders_the_faulted_column() {
+        let mut timings: BTreeMap<lanekeep_core::RuleId, lanekeep_engine::RuleTiming> =
+            BTreeMap::new();
+        let id: lanekeep_core::RuleId = "local/demo".parse().expect("valid id");
+        timings.insert(
+            id,
+            lanekeep_engine::RuleTiming {
+                parsed: 5,
+                faulted: 2,
+                dropped: 3,
+                ..Default::default()
+            },
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_gate_profile(&mut buf, &timings, 5).expect("writes");
+        let out = String::from_utf8(buf).expect("utf8");
+
+        let header = out
+            .lines()
+            .find(|l| l.contains("path-gated"))
+            .expect("a header row");
+        let columns: Vec<&str> = header.split_whitespace().collect();
+        assert_eq!(&columns[6..], ["parsed", "faulted", "dropped"], "{header}");
+        let row = out
+            .lines()
+            .find(|l| l.contains("local/demo"))
+            .expect("a data row");
+        let values: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(&values[6..], ["5", "2", "3"], "{row}");
+        assert!(
+            out.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("faulted counts parsed files whose tree carries a parse error"),
+            "the footer explains the column: {out}"
         );
     }
 

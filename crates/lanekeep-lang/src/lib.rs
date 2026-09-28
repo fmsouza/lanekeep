@@ -8,13 +8,21 @@
 //! it, and two copies would drift into answering plausibly and differently for the same
 //! file — which no test on either side would catch.
 //!
+//! And it owns `faults` and `position`: the one walk deciding where a parse went wrong, and the
+//! one conversion from a tree-sitter point to a reported position. `lanekeep-js` checks a rule's
+//! own stripped source with the first, the engine checks every file it parses with it, and
+//! every reported position goes through the second — two copies of either would disagree
+//! quietly.
+//!
 //! This abstraction exists before it has a second implementor on purpose. Retrofitting it
 //! after a second language arrives is the expensive version of the same work.
 
 pub mod binding;
+pub mod faults;
 pub mod flow;
 pub mod grammar;
 pub mod obligation;
+pub mod position;
 
 pub use flow::{FlowAnalysis, FlowAnalyzer, FlowPath};
 pub use grammar::grammar_digest;

@@ -33,12 +33,15 @@
     },
     "severity": {
       "type": "object",
-      "description": "Override the severity a rule declares for itself, by rule id.",
+      "description": "Override the severity a rule declares for itself, by rule id. `lanekeep/parse` sets the level of lanekeep's own report on a file its parser could not read whole: `warn` unless named here, `error` to fail the run on one, `off` to skip the check.",
       "additionalProperties": {
         "type": "string",
         "enum": ["error", "warn", "off"]
       },
-      "examples": [{ "lanekeep/no-default-export": "warn" }]
+      "examples": [
+        { "lanekeep/no-default-export": "warn" },
+        { "lanekeep/parse": "error" }
+      ]
     },
     "suppressions": {
       "type": "object",

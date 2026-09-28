@@ -13,13 +13,20 @@ use lanekeep_core::ContentHash;
 
 /// The on-disk format's version.
 ///
-/// Bumped when the encoding changes. Because it feeds the key, an old file simply misses
+/// Bumped when the encoding changes, or when what an entry records changes. Because it feeds
+/// the key, an old file simply misses
 /// rather than being misread — the cache is disposable, so a format change costs one cold
 /// run and needs no migration.
 ///
 /// 4 → 5 widened a dependency's presence flag from two values to three, so that a read
 /// refused for leaving the root is recorded as itself rather than as an absence.
-pub const FORMAT_VERSION: u32 = 5;
+///
+/// 5 → 6 changed what an entry is complete with rather than how it is encoded: a file's
+/// violations now include the engine's own `lanekeep/parse` report when its tree carries a
+/// parse fault. An entry written before could not carry one, and would replay a faulted file as
+/// clean, so it has to miss. The engine's major.minor in the key does not guarantee that
+/// (architecture §8.1): in this repository a `feat` on 0.x can ship as a patch.
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Everything about a run that every file's key shares.
 ///

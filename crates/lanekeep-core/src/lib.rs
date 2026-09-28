@@ -58,7 +58,7 @@ pub use limits::{
     DEFAULT_RULE_TIMEOUT, Limits, Paused, RunClock, analysis_overrun_fallback,
 };
 pub use location::{FilePath, Location, Position};
-pub use rule_id::{Namespace, ParseRuleIdError, RuleId};
+pub use rule_id::{Namespace, PARSE_RULE, ParseRuleIdError, RuleId};
 pub use severity::{ParseSeverityError, Severity};
 pub use suppression::{Suppression, Suppressions};
 pub use tracked::{ContentHash, ReadOutcome, TrackedRead};
