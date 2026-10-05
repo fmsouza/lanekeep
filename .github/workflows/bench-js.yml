@@ -76,7 +76,7 @@ jobs:
       # Rust compile of the bench harness, not the measured path). A cache here would only
       # speed up compiling wasmtime, at the cost of a license the repo's dependency-review
       # allow-list does not carry; the weekly cadence can absorb the cold compile.
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: just,cargo-binstall
 
