@@ -114,7 +114,7 @@ mod tests {
     fn tree(source: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .set_language(&lanekeep_tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
             .expect("grammar loads");
         parser.parse(source, None).expect("parser returns a tree")
     }
@@ -144,22 +144,29 @@ mod tests {
         })
     }
 
-    /// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads
-    /// (tree-sitter/tree-sitter-typescript#367), followed by the expression statement `1`, which
-    /// turns the root itself into `ERROR` (a following declaration does not).
+    /// The shape of Vitest's `importOriginal<typeof import('vitest')>()` idiom, which upstream
+    /// tree-sitter-typescript 0.23.2 misread (tree-sitter/tree-sitter-typescript#367) until
+    /// lanekeep vendored a grammar that reads it (lanekeep#286). The fixtures keep that shape with
+    /// a type argument that is invalid TypeScript — neither `typeof await` nor `typeof 1` is a
+    /// type query — so they fault for a reason no grammar fix will remove. Which of the two
+    /// each uses is chosen by where recovery puts the fault, which differs between them.
+    ///
+    /// Followed by the expression statement `1`, recovery turns the root itself into `ERROR` (a
+    /// following declaration does not).
     const REPRO: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
-                         await importOriginal<typeof import('vitest')>()\n})\n\n1\n";
+                         await importOriginal<typeof await>()\n})\n\n1\n";
 
-    /// The same without the trailing statement: the root survives, the declaration does not.
+    /// Without the trailing statement: the root survives, the declaration does not.
     const NO_TRAILING: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
-                               await importOriginal<typeof import('vitest')>()\n})\n";
+                               await importOriginal<typeof 1>()\n})\n";
 
-    /// A realistic test file: everything after the mock is lost, under a `program` root.
+    /// A realistic test file around an invalid type argument: everything after the mock is lost,
+    /// under a `program` root.
     const REALISTIC: &str = "import { describe, expect, it, vi } from 'vitest'\n\
                              import { fetchUser } from './api'\n\
                              \n\
                              vi.mock('./api', async importOriginal => {\n    \
-                             const actual = await importOriginal<typeof import('./api')>()\n    \
+                             const actual = await importOriginal<typeof 1>()\n    \
                              return { ...actual, fetchUser: vi.fn() }\n\
                              })\n\
                              \n\
@@ -173,9 +180,21 @@ mod tests {
     fn a_clean_tree_has_no_faults() {
         assert_eq!(summary_of("const a = 1;\n"), None);
         assert_eq!(
-            summary_of(&REPRO.replace("<typeof import('vitest')>", "<number>")),
+            summary_of(&REPRO.replace("<typeof await>", "<number>")),
             None,
             "the same shape with a plain type argument parses clean"
+        );
+    }
+
+    /// The idiom itself, which upstream tree-sitter-typescript 0.23.2 could not read and which
+    /// cost one downstream project a rewrite of about 170 spec files (lanekeep#286).
+    #[test]
+    fn the_vitest_mock_idiom_parses_clean() {
+        let idiom = REALISTIC.replace("<typeof 1>", "<typeof import('./api')>");
+        assert_eq!(summary_of(&idiom), None);
+        assert_eq!(
+            summary_of(&REPRO.replace("<typeof await>", "<typeof import('vitest')>")),
+            None
         );
     }
 

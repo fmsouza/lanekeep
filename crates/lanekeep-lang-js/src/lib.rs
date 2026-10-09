@@ -81,11 +81,32 @@ static OBLIGATION: std::sync::LazyLock<Arc<dyn ObligationAnalyzer>> =
 ///
 /// Shared by every language this crate registers, which is correct — they share one resolver,
 /// so a change to it changes what all of them answer.
+///
+/// It also folds [`lanekeep_tree_sitter_typescript::SOURCE_DIGEST`], the bytes the TypeScript
+/// and TSX parsers are compiled from. The grammar term of the cache key reads only a grammar's
+/// shape, and a regeneration of the vendored grammar can change the parse tables — and so every
+/// tree — without changing the shape. JavaScript is over-invalidated by it, which costs a
+/// recompute.
 #[must_use]
 pub fn analysis_identity() -> [u8; 32] {
+    *IDENTITY
+}
+
+static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
     // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot be
     // a silent gap.
-    lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_JS_ANALYSIS_HASH"))
+    let own = lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_JS_ANALYSIS_HASH"));
+    fold_identity(&own, lanekeep_tree_sitter_typescript::SOURCE_DIGEST)
+});
+
+/// This crate's own source digest and the vendored grammar's, length-prefixed together.
+fn fold_identity(own: &[u8; 32], grammar_sources: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lanekeep-lang-js-analysis-with-grammar-v1");
+    hasher.update(own);
+    hasher.update(&(grammar_sources.len() as u64).to_le_bytes());
+    hasher.update(grammar_sources.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 /// TypeScript without JSX: `.ts`, `.mts`, `.cts`.
@@ -123,7 +144,7 @@ impl Language for TypeScript {
     }
 
     fn grammar(&self) -> tree_sitter::Language {
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        lanekeep_tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     }
 
     fn analysis_identity(&self) -> [u8; 32] {
@@ -153,7 +174,7 @@ impl Language for Tsx {
     }
 
     fn grammar(&self) -> tree_sitter::Language {
-        tree_sitter_typescript::LANGUAGE_TSX.into()
+        lanekeep_tree_sitter_typescript::LANGUAGE_TSX.into()
     }
 
     fn analysis_identity(&self) -> [u8; 32] {
@@ -385,32 +406,115 @@ mod tests {
         assert!(tree.root_node().has_error());
     }
 
-    /// tree-sitter-typescript 0.23.2 reads `f<typeof import('x')>()` as `f < typeof import('x')`
-    /// followed by a stray `()` (tree-sitter/tree-sitter-typescript#367). That is the Vitest
-    /// `importOriginal` idiom behind lanekeep#271. A grammar bump that fixes it fails here, and
-    /// the failure is the reminder of what moves with it: the AGENTS.md entry, the
-    /// `lanekeep/parse` docs that cite the idiom, and the cache. The grammar key cannot see a fix
-    /// that keeps the grammar's shape (architecture §8.1).
-    ///
-    /// Asserted on the minimal form rather than on a larger file's root kind, because error
-    /// recovery can change shape while the bug stays.
+    /// Both TypeScript grammars, for the forms that must read the same in either.
+    fn both() -> [(&'static str, &'static dyn Language); 2] {
+        [("typescript", &TypeScript), ("tsx", &Tsx)]
+    }
+
+    /// The tree, asserted clean, as an S-expression.
+    fn clean_sexp(name: &str, language: &dyn Language, source: &str) -> String {
+        let tree = parse(language, source);
+        let sexp = tree.root_node().to_sexp();
+        assert!(
+            !tree.root_node().has_error(),
+            "{name}: `{source}` should parse clean, got {sexp}"
+        );
+        sexp
+    }
+
+    /// TypeScript 5.0's type-only star re-exports, which upstream tree-sitter-typescript 0.23.2
+    /// reads as an `ERROR` at the `*` (tree-sitter/tree-sitter-typescript#348; lanekeep#286).
+    /// They read as the value forms do, `type` keyword and all.
     #[test]
-    fn the_type_argument_import_misparse_is_still_present() {
-        for (name, language) in [
-            ("typescript", &TypeScript as &dyn Language),
-            ("tsx", &Tsx as &dyn Language),
-        ] {
-            let tree = parse(language, "f<typeof import('x')>()\n");
-            assert!(
-                tree.root_node().has_error(),
-                "{name}: tree-sitter/tree-sitter-typescript#367 looks fixed — update AGENTS.md's \
-                 entry and the `lanekeep/parse` docs, give the grammar bump its own cache \
-                 invalidation, and replace the `REPRO` fixtures built on this idiom in \
-                 crates/lanekeep-lang/src/faults.rs, crates/lanekeep-engine/src/lib.rs and \
-                 crates/lanekeep-cli/tests/parse_faults.rs, along with the tests asserting the \
-                 root wording through them"
+    fn type_only_star_reexports_parse() {
+        for (name, language) in both() {
+            assert_eq!(
+                clean_sexp(name, language, "export type * from './types';\n"),
+                "(program (export_statement source: (string (string_fragment))))"
+            );
+            assert_eq!(
+                clean_sexp(name, language, "export type * as ns from './types';\n"),
+                "(program (export_statement (namespace_export (identifier)) source: (string \
+                 (string_fragment))))"
             );
         }
+    }
+
+    /// `typeof import(...)` as the first type argument of a call: Vitest's
+    /// `importOriginal<typeof import('./m')>()` idiom. Upstream 0.23.2 read it as
+    /// `f < typeof import('x')` followed by a stray `()` (tree-sitter/tree-sitter-typescript#367;
+    /// lanekeep#271, #286) because a static precedence discarded the type-argument reading before
+    /// the `>` that decides it.
+    #[test]
+    fn a_typeof_import_type_argument_is_a_call() {
+        let call = "(call_expression function: (identifier) type_arguments: (type_arguments \
+                    (type_query (call_expression function: (import) arguments: (arguments \
+                    (string (string_fragment)))))) arguments: (arguments))";
+        for (name, language) in both() {
+            assert_eq!(
+                clean_sexp(name, language, "f<typeof import('x')>();\n"),
+                format!("(program (expression_statement {call}))")
+            );
+            let idiom = clean_sexp(
+                name,
+                language,
+                "async () => {\n  const actual = await importOriginal<typeof import('./dep')>();\n};\n",
+            );
+            assert!(
+                idiom.contains(
+                    "(call_expression function: (await_expression (identifier)) \
+                                type_arguments: (type_arguments (type_query"
+                ),
+                "{name}: {idiom}"
+            );
+        }
+    }
+
+    /// With an argument the upstream misreading was silent: `f<typeof import('m')>(1)` parsed
+    /// clean as `(f < typeof import('m')) > (1)`, so no `lanekeep/parse` could flag it. It is the
+    /// call TypeScript itself reads.
+    #[test]
+    fn a_typeof_import_type_argument_with_an_argument_is_not_two_comparisons() {
+        for (name, language) in both() {
+            let sexp = clean_sexp(name, language, "f<typeof import('m')>(1);\n");
+            assert!(
+                sexp.starts_with("(program (expression_statement (call_expression"),
+                "{name}: {sexp}"
+            );
+            assert!(!sexp.contains("binary_expression"), "{name}: {sexp}");
+        }
+    }
+
+    /// The fix keeps both readings alive until the parser can tell; where the source really is a
+    /// comparison it must stay one.
+    #[test]
+    fn a_comparison_against_typeof_import_stays_a_comparison() {
+        for (name, language) in both() {
+            let sexp = clean_sexp(name, language, "x < typeof import('m') > y;\n");
+            assert!(
+                sexp.starts_with(
+                    "(program (expression_statement (binary_expression left: (binary_expression"
+                ),
+                "{name}: {sexp}"
+            );
+        }
+    }
+
+    /// The grammar key folds a grammar's shape — node kinds, fields, counts — and a regeneration
+    /// that changes only the parse tables moves none of it, so a warm cache would replay trees
+    /// the shipped grammar no longer builds. For the vendored TypeScript grammars the bytes are
+    /// in this workspace, so the identity folds them.
+    #[test]
+    fn the_analysis_identity_folds_the_vendored_grammar_sources() {
+        let own = lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_JS_ANALYSIS_HASH"));
+        let sources = lanekeep_tree_sitter_typescript::SOURCE_DIGEST;
+        assert_eq!(analysis_identity(), fold_identity(&own, sources));
+        assert_ne!(
+            fold_identity(&own, sources),
+            fold_identity(&own, &"0".repeat(sources.len())),
+            "the grammar sources reach the identity"
+        );
+        assert_ne!(analysis_identity(), own);
     }
 
     #[test]

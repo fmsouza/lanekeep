@@ -8482,20 +8482,24 @@ export default defineRule({
           check(ctx, m) { ctx.report(m.file); },\n\
         });\n";
 
-    /// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads
-    /// (tree-sitter/tree-sitter-typescript#367), followed by the expression statement `1`, which
-    /// turns the root itself into `ERROR` (a following declaration does not).
+    /// The shape of Vitest's `importOriginal<typeof import('vitest')>()` idiom, which upstream
+    /// tree-sitter-typescript 0.23.2 misread (tree-sitter/tree-sitter-typescript#367) until
+    /// lanekeep vendored a grammar that reads it (lanekeep#286), with an invalid type argument in
+    /// its place so the fixture faults for a reason no grammar fix will remove. Followed by the
+    /// expression statement `1`, recovery turns the root itself into `ERROR` (a following
+    /// declaration does not). `crates/lanekeep-lang/src/faults.rs` says why its two neighbors use
+    /// `typeof 1` instead.
     const REPRO: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
-                         await importOriginal<typeof import('vitest')>()\n})\n\n1\n";
+                         await importOriginal<typeof await>()\n})\n\n1\n";
 
     const NO_TRAILING: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
-                               await importOriginal<typeof import('vitest')>()\n})\n";
+                               await importOriginal<typeof 1>()\n})\n";
 
     const REALISTIC: &str = "import { describe, expect, it, vi } from 'vitest'\n\
                              import { fetchUser } from './api'\n\
                              \n\
                              vi.mock('./api', async importOriginal => {\n    \
-                             const actual = await importOriginal<typeof import('./api')>()\n    \
+                             const actual = await importOriginal<typeof 1>()\n    \
                              return { ...actual, fetchUser: vi.fn() }\n\
                              })\n\
                              \n\
@@ -8535,8 +8539,8 @@ export default defineRule({
     }
 
     /// Grammar-independent: hand-built `Summary` values rather than a parsed tree, so the root
-    /// and region wording keeps a fixture even after tree-sitter/tree-sitter-typescript#367 is
-    /// fixed and the grammar-derived fixtures above have to change.
+    /// and region wording keeps a fixture whatever a grammar change does to the parsed ones
+    /// above — as fixing tree-sitter/tree-sitter-typescript#367 did (lanekeep#286).
     #[test]
     fn parse_fault_message_is_worded_from_the_summary_alone() {
         assert_eq!(
@@ -8710,7 +8714,7 @@ export default defineRule({
 
     #[test]
     fn a_clean_file_draws_nothing_from_the_parser() {
-        let clean = REPRO.replace("<typeof import('vitest')>", "<number>");
+        let clean = REPRO.replace("<typeof await>", "<number>");
         let project = Project::new(
             "parse-fault-clean",
             &[
@@ -8774,7 +8778,7 @@ export default defineRule({
     #[test]
     fn a_next_line_directive_acknowledges_the_report_and_counts_as_used() {
         let acknowledged =
-            format!("// {NEXT_LINE} lanekeep/parse reason: tree-sitter-typescript#367\n{REPRO}");
+            format!("// {NEXT_LINE} lanekeep/parse reason: invalid on purpose\n{REPRO}");
         let project = Project::new(
             "parse-fault-acknowledged",
             &[

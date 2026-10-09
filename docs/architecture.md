@@ -93,6 +93,8 @@ lanekeep/
     lanekeep-nodes/      # the node arena: handles shared by every rule-execution engine
     lanekeep-lang/       # Language trait + registry
     lanekeep-lang-js/    # TS/TSX/JS/JSX grammars + binding resolution
+    lanekeep-tree-sitter-typescript/ # upstream's TypeScript/TSX grammars, regenerated
+                         #   with two fixes upstream has not shipped (#286)
     lanekeep-lang-python/ # Python grammar + binding resolution
     lanekeep-lang-go/    # Go grammar + binding resolution
     lanekeep-lang-rust/  # Rust grammar + binding resolution
@@ -262,10 +264,11 @@ declared language by construction.
 
 **A query anchored at the root runs only on a file whose root parsed.** When tree-sitter's error
 recovery cannot fit a file under the grammar's start symbol, the root itself is `ERROR`, so
-`(program) @file` never matches and the rule never runs there — tree-sitter-typescript 0.23.2
-can do this to a file using Vitest's `importOriginal<typeof import('./m')>()` idiom
-(tree-sitter/tree-sitter-typescript#367), depending on what follows the call: in #271's
-reproduction a trailing `1` does it and a trailing `const z = 2` does not. A file with only
+`(program) @file` never matches and the rule never runs there — upstream tree-sitter-typescript
+0.23.2 did this to a file using Vitest's `importOriginal<typeof import('./m')>()` idiom
+(tree-sitter/tree-sitter-typescript#367, fixed in lanekeep's vendored grammar by #286), depending
+on what followed the call: in #271's reproduction a trailing `1` did it and a trailing
+`const z = 2` did not. A file with only
 nested faults still matches, and its tree is still partly misread, so the anchor firing says
 nothing about whether the file was read whole: `lanekeep/parse` (§11) is what says that. A rule
 that must run once per file anchors at `[(program) (ERROR)] @root` and keeps the match whose
@@ -788,7 +791,9 @@ Three things people get wrong here, all of which are silent-staleness bugs:
   `Language::metadata()` is `None` on any grammar built for an ABI below 15, which today is
   both `typescript` and `tsx`. Not its bytes either, which tree-sitter's Rust API does not
   expose — so a regeneration preserving every name and count is the one change this term
-  still cannot see.
+  still cannot see. For `typescript` and `tsx` that gap is closed elsewhere: their parsers are
+  vendored (`crates/lanekeep-tree-sitter-typescript`), and a digest of the C they are compiled
+  from is folded into `lanekeep-lang-js`'s `analysis_identity`.
 
 Suppressions live in the entry because directives are parsed during the per-file pass, and a reduce-phase violation may be reported at a site in a file that was not reprocessed this run. An entry without them would drop the directive and report a suppressed violation on the warm path.
 
@@ -1008,9 +1013,9 @@ It is a warning by default because the usual cause is a grammar gap in valid cod
 defect in the file: set `"severity": { "lanekeep/parse": "error" }` to fail the run on one, or
 `"off"` to skip the check. Its remediation says not to rewrite valid code to satisfy the parser,
 because an agent told only "parse error" will. A misparse that produces no error node at all —
-tree-sitter-typescript reads `f<typeof import('m')>(1)` as two comparisons, and
-tree-sitter-javascript 0.25 reads a bare `export` as an identifier — is invisible to this check
-and to anything built on the tree.
+tree-sitter-javascript 0.25 reads a bare `export` as an identifier, and upstream
+tree-sitter-typescript read `f<typeof import('m')>(1)` as two comparisons until lanekeep vendored
+a grammar that does not (#286) — is invisible to this check and to anything built on the tree.
 
 **Exit codes:** `0` clean or `--warn-only`; `1` violations; `2` runtime error, which includes a cancelled run — a breached timeout or memory ceiling (§6.8) never exits `0` or `1`, because a checker that could not finish must not be mistaken for one that found nothing.
 

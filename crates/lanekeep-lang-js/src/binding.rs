@@ -1206,8 +1206,8 @@ mod tests {
                 .collect()
         }
 
-        let typescript = carriers(tree_sitter_typescript::TYPESCRIPT_NODE_TYPES);
-        let tsx = carriers(tree_sitter_typescript::TSX_NODE_TYPES);
+        let typescript = carriers(lanekeep_tree_sitter_typescript::TYPESCRIPT_NODE_TYPES);
+        let tsx = carriers(lanekeep_tree_sitter_typescript::TSX_NODE_TYPES);
         assert_eq!(
             typescript, tsx,
             "the two grammars declare the field on the same kinds"

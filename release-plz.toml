@@ -152,6 +152,7 @@ changelog_include = [
   "lanekeep-server",
   "lanekeep-rules",
   "lanekeep-testkit",
+  "lanekeep-tree-sitter-typescript",
   "lanekeep-types",
   "lanekeep-wasm",
 ]
@@ -258,6 +259,10 @@ version_group = "lanekeep"
 
 [[package]]
 name = "lanekeep-testkit"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-tree-sitter-typescript"
 version_group = "lanekeep"
 
 [[package]]

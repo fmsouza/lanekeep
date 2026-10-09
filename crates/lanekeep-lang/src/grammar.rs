@@ -19,7 +19,9 @@
 //! A regeneration that rearranges the parse table while preserving every node-kind name,
 //! every field name and all three counts. Hashing the grammar's bytes would catch it, and the
 //! tree-sitter Rust API does not expose them. This is strictly better than the bare ABI
-//! version it replaces, under which no change within one ABI moved anything at all.
+//! version it replaces, under which no change within one ABI moved anything at all. For the
+//! TypeScript and TSX grammars, which lanekeep vendors, `lanekeep-lang-js` folds a digest of
+//! the parser sources into its `analysis_identity` instead.
 //!
 //! One of the five terms carries no information for `typescript` and `tsx`, which is exactly
 //! the pair this module exists for. `ts_language_supertypes` is gated on

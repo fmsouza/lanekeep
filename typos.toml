@@ -4,6 +4,13 @@ extend-exclude = [
     "LICENSE-MIT",
     "fixtures/**",
     "*.snap",
+    # Upstream's grammar sources and the parsers generated from them, vendored unchanged except
+    # for what `crates/lanekeep-tree-sitter-typescript/grammar/patch.py` does to `grammar.json`.
+    # Not this project's prose, and not something to respell.
+    "crates/lanekeep-tree-sitter-typescript/common/**",
+    "crates/lanekeep-tree-sitter-typescript/typescript/**",
+    "crates/lanekeep-tree-sitter-typescript/tsx/**",
+    "crates/lanekeep-tree-sitter-typescript/LICENSE",
 ]
 
 [default.extend-words]
