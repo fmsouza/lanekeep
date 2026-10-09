@@ -68,6 +68,10 @@ func wasmimport_CheckContextKind(self0 uint32, n0 uint32, result *cm.Option[stri
 //go:noescape
 func wasmimport_CheckContextLine(self0 uint32, n0 uint32, result *cm.Option[uint32])
 
+//go:wasmimport lanekeep:host/types@0.1.0 [method]check-context.list-dir
+//go:noescape
+func wasmimport_CheckContextListDir(self0 uint32, path0 *uint8, path1 uint32, result *cm.Result[OptionListStringShape, cm.Option[cm.List[string]], ReadError])
+
 //go:wasmimport lanekeep:host/types@0.1.0 [method]check-context.loc
 //go:noescape
 func wasmimport_CheckContextLoc(self0 uint32, n0 uint32, result *cm.Option[NodeLocation])

@@ -937,6 +937,25 @@ func (self CheckContext) Line(n Node) (result cm.Option[uint32]) {
 	return
 }
 
+// ListDir represents the imported method "list-dir".
+//
+// A directory's entries, root-relative: the immediate children's names, sorted, a
+// directory's name ending in `/`. None when no directory is there — absent, or a
+// file.
+// `""` and `"."` list the root, and lanekeep's own `.lanekeep/` is never listed.
+// Tracked
+// as `read-file` is: an entry added, removed or retyped invalidates this file's result.
+//
+//	list-dir: func(path: string) -> result<option<list<string>>, read-error>
+//
+//go:nosplit
+func (self CheckContext) ListDir(path string) (result cm.Result[OptionListStringShape, cm.Option[cm.List[string]], ReadError]) {
+	self0 := cm.Reinterpret[uint32](self)
+	path0, path1 := cm.LowerString(path)
+	wasmimport_CheckContextListDir((uint32)(self0), (*uint8)(path0), (uint32)(path1), &result)
+	return
+}
+
 // Loc represents the imported method "loc".
 //
 // The node's position, for a rule that needs to reason about it rather than report

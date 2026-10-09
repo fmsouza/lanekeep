@@ -58,6 +58,7 @@ function stubContext(overrides = {}) {
       closestAncestor: record('closestAncestor', undefined),
       readFile: record('readFile', undefined),
       fileExists: record('fileExists', false),
+      listDir: record('listDir', undefined),
       emitFact: record('emitFact', undefined),
       loc: record('loc', { file: 'src/a.ts', line: 1, column: 1 }),
       report: record('report', undefined),
@@ -246,6 +247,19 @@ test('a read that found nothing is an ordinary undefined', () => {
   const built = buildCheckContext(stubContext().ctx)
   assert.equal(built.readFile('missing.ts'), undefined)
   assert.equal(built.fileExists('missing.ts'), false)
+  assert.equal(built.listDir('missing'), undefined)
+})
+
+test('a listing crosses as the entries the host answered, and a refusal throws', () => {
+  const stub = stubContext({ listDir: (path) => (path === 'src' ? ['a.ts', 'sub/'] : undefined) })
+  const built = buildCheckContext(stub.ctx)
+  assert.deepEqual(built.listDir('src'), ['a.ts', 'sub/'])
+
+  const refuse = () => {
+    throw { payload: { tag: 'escapes-root', val: '../secrets' } }
+  }
+  const escapes = buildCheckContext(stubContext({ listDir: refuse }).ctx)
+  assert.throws(() => escapes.listDir('../secrets'), /it resolves outside the project root/)
 })
 
 // --- the reduce context -----------------------------------------------------------------------

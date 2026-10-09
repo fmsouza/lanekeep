@@ -22,8 +22,8 @@
 //! test. What replaces it is not a weaker assertion but `tests/reduce.rs`, which asserts what
 //! each of the three now answers.
 //!
-//! **Two refusals below are decisions rather than placeholders, and they stay.** `read-file`
-//! and `file-exists` fail the call on a host with no file access; `reduce-context.report` fails
+//! **Two refusals below are decisions rather than placeholders, and they stay.** `read-file`,
+//! `file-exists` and `list-dir` fail the call on a host with no file access; `reduce-context.report` fails
 //! it on a location with no line or column. Each has its own section, and each was decided on
 //! its own evidence rather than by inheriting the argument above.
 //!
@@ -532,7 +532,8 @@ impl CheckContext {
 
     /// Allow tracked, confined reads of the rest of the project.
     ///
-    /// Without one, `read-file` and `file-exists` fail the call rather than answering — the
+    /// Without one, `read-file`, `file-exists` and `list-dir` fail the call rather than
+    /// answering — the
     /// same refusal `lanekeep-js` expresses by not installing the functions at all. The module
     /// header carries why that is the answer here and what the alternatives cost.
     ///
@@ -1409,7 +1410,7 @@ impl HostCheckContext for HostState {
 
     // --- tracked reads ---------------------------------------------------------------------
     //
-    // Both delegate straight into `FileAccess`, which owns confinement and tracking for every
+    // All three delegate into `FileAccess`, which owns confinement and tracking for every
     // engine rather than for one of them. Nothing about the rules is restated here: a path is
     // refused, read, or found absent by the same code `lanekeep-js` calls, so the question "can
     // a component rule reach a file a TypeScript rule cannot" has no place to be answered
@@ -1450,6 +1451,21 @@ impl HostCheckContext for HostState {
         // `FileAccess::exists` answers the question that was asked — where `false` would claim
         // something untrue about the filesystem.
         Ok(files.exists(&path).map_err(wit_read_error))
+    }
+
+    fn list_dir(
+        &mut self,
+        this: Resource<CheckContext>,
+        path: String,
+    ) -> wasmtime::Result<Result<Option<Vec<String>>, ReadError>> {
+        let context = self.check_context_mut(&this)?;
+        let Some(files) = context.files.as_ref() else {
+            return Err(no_file_access("check-context.list-dir"));
+        };
+
+        // `Ok(None)` is "no directory there", as it is for `read-file`; what a listing holds and
+        // in what order is `lanekeep_core::files::list_directory`'s to decide, for both engines.
+        Ok(files.list(&path).map_err(wit_read_error))
     }
 
     // --- facts -----------------------------------------------------------------------------

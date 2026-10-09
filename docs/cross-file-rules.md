@@ -59,7 +59,7 @@ export default defineRule({
 | `ctx.facts`, `ctx.files` | **no** | yes |
 | the tree — `ctx.text`, `ctx.kind`, `ctx.parent`, … | yes | **no** |
 | `ctx.report` | at a node | at `{ file, line, column }` |
-| `ctx.readFile`, `ctx.fileExists` | yes | **no** |
+| `ctx.readFile`, `ctx.fileExists`, `ctx.listDir` | yes | **no** |
 
 Two rules explain the whole table:
 
@@ -156,7 +156,29 @@ Reading the same path twice in one file returns the same bytes, even if somethin
 in between — a rule that saw a file change under it could report differently on two runs over
 identical input.
 
-`readFile` and `fileExists` exist only in `check`, not in `reduce`. A reduce phase's reads
+### Listing a directory
+
+A layout rule — every component directory has an `index.ts`, no folder is empty — needs to see
+directories that hold no file lanekeep checks. `ctx.listDir` answers what a directory holds:
+
+```ts
+check(ctx, m) {
+  const entries = ctx.listDir('src/components/Button')   // undefined if no directory is there
+  if (entries && !entries.includes('index.ts')) ctx.report(m.p, 'no barrel')
+  // ['Button.tsx', 'index.ts', 'stories/'] — sorted, a directory ending in '/'
+}
+```
+
+The entries are the immediate children's names, sorted, with a directory's name ending in `/`.
+`''` and `'.'` list the project root, and lanekeep's own `.lanekeep/` is never listed — it
+changes during a run, so a listing that saw it would answer differently cold and warm. A path
+that names a file, or nothing, answers `undefined`; the refusals are the ones `readFile` makes.
+
+A listing is tracked exactly as a read is. Adding, removing or retyping an entry invalidates the
+files whose rules listed that directory, and a directory that appears invalidates the files
+that were told it was not there. It is memoized within a file the same way, too.
+
+`readFile`, `fileExists` and `listDir` exist only in `check`, not in `reduce`. A reduce phase's reads
 would be run-level dependencies, and putting them in a per-file cache entry would attribute
 them to whichever file was checked last.
 

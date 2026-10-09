@@ -286,6 +286,14 @@ impl HostCheckContext for StubHost {
         Ok(Ok(false))
     }
 
+    fn list_dir(
+        &mut self,
+        _: Resource<CheckContext>,
+        _: String,
+    ) -> wasmtime::Result<Result<Option<Vec<String>>, ReadError>> {
+        Ok(Ok(None))
+    }
+
     fn emit_fact(
         &mut self,
         _: Resource<CheckContext>,

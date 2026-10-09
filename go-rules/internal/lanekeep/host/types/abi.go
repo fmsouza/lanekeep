@@ -19,6 +19,12 @@ type ReadErrorShape struct {
 	shape [unsafe.Sizeof(ReadError{})]byte
 }
 
+// OptionListStringShape is used for storage in variant or result types.
+type OptionListStringShape struct {
+	_     cm.HostLayout
+	shape [unsafe.Sizeof(cm.Option[cm.List[string]]{})]byte
+}
+
 // OptionStringShape is used for storage in variant or result types.
 type OptionStringShape struct {
 	_     cm.HostLayout

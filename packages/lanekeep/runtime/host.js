@@ -247,6 +247,9 @@ export function buildCheckContext(ctx) {
 
     readFile: (path) => unwrapRead(() => ctx.readFile(path), path),
     fileExists: (path) => unwrapRead(() => ctx.fileExists(path), path),
+    // `option<list<string>>` arrives as an array or `undefined`, which is the shape a rule
+    // compares against; the refusals are the same three a read makes.
+    listDir: (path) => unwrapRead(() => ctx.listDir(path), path),
 
     emitFact: (fact) => {
       if (fact === null || typeof fact !== 'object') {

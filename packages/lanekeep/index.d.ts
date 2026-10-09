@@ -411,6 +411,7 @@ export interface RuleContext {
   closestAncestor(n: Node, query: string): Match | undefined
   readFile(path: string): string | undefined
   fileExists(path: string): boolean
+  listDir(path: string): string[] | undefined
   emitFact(fact: Fact): void
   loc(n: Node): NodeLocation | undefined
   report(at: Node, message?: string | ReportOptions): void
