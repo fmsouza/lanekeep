@@ -109,6 +109,8 @@
           "crates/lanekeep-lang-go/src/lib.rs",
           "crates/lanekeep-lang-js/benches/cfg.rs",
           "crates/lanekeep-lang-js/build.rs",
+          "crates/lanekeep-lang-json/build.rs",
+          "crates/lanekeep-lang-json/src/lib.rs",
           "crates/lanekeep-lang-python/build.rs",
           "crates/lanekeep-lang-python/src/lib.rs",
           "crates/lanekeep-lang-rust/build.rs",

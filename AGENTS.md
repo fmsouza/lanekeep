@@ -138,6 +138,7 @@ crates/
   lanekeep-lang-python  Python grammar, binding resolution
   lanekeep-lang-go      Go grammar, binding resolution
   lanekeep-lang-rust    Rust grammar, binding resolution
+  lanekeep-lang-json    JSON grammar; no resolver, since JSON declares no names
   lanekeep-languages    the set of supported languages, assembled in one place
   lanekeep-types     the bounded type oracle: a node's type and symbol, from the parsed file
                      and the declaration files its imports resolve to, through tracked reads

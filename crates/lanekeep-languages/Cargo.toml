@@ -15,6 +15,7 @@ categories.workspace = true
 lanekeep-lang = { workspace = true }
 lanekeep-lang-js = { workspace = true }
 lanekeep-lang-go = { workspace = true }
+lanekeep-lang-json = { workspace = true }
 lanekeep-lang-python = { workspace = true }
 lanekeep-lang-rust = { workspace = true }
 

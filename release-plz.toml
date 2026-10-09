@@ -143,6 +143,7 @@ changelog_include = [
   "lanekeep-lang",
   "lanekeep-lang-go",
   "lanekeep-lang-js",
+  "lanekeep-lang-json",
   "lanekeep-lang-python",
   "lanekeep-lang-rust",
   "lanekeep-languages",
@@ -227,6 +228,10 @@ version_group = "lanekeep"
 
 [[package]]
 name = "lanekeep-lang-js"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-lang-json"
 version_group = "lanekeep"
 
 [[package]]

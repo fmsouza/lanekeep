@@ -182,6 +182,41 @@ fn since_checks_only_what_changed() {
     assert!(combined.contains("src/a.ts"), "{combined}");
 }
 
+/// A rule over JSON (#283), so the selection is shown to be by path rather than by anything
+/// TypeScript-shaped: the grammar a file is parsed with is chosen after it is selected.
+const JSON_KEY_RULE: &str = "import { defineRule } from 'lanekeep'\n\
+    export default defineRule({\n\
+      id: 'local/no-todo-key',\n\
+      language: ['json'],\n\
+      card: { message: 'a TODO key', remediation: 'name the key', \
+              examples: { bad: '{\"TODO\": 1}', good: '{\"done\": 1}' } },\n\
+      query: '(pair key: (string (string_content) @k) (#eq? @k \"TODO\"))',\n\
+      check(ctx, m) { ctx.report(m.k) },\n\
+    })\n";
+
+#[test]
+fn staged_checks_only_the_staged_json_file() {
+    let repo = Repo::new(
+        "staged-json",
+        r#"{"include": ["locales/**"], "rules": ["./rules/key.ts"]}"#,
+        &[
+            ("rules/key.ts", JSON_KEY_RULE),
+            ("locales/en.json", "{\"TODO\": 1}\n"),
+            ("locales/fr.json", "{\"TODO\": 2}\n"),
+        ],
+    );
+
+    // Both files violate; only one is staged.
+    repo.write("locales/en.json", "{\"TODO\": 3}\n");
+    repo.git(&["add", "locales/en.json"]);
+
+    let output = repo.check(&["--staged"]);
+    let combined = describe(&output);
+    assert_eq!(violation_count(&output), 1, "{combined}");
+    assert!(combined.contains("locales/en.json"), "{combined}");
+    assert!(!combined.contains("locales/fr.json"), "{combined}");
+}
+
 #[test]
 fn no_selection_checks_everything() {
     let repo = Repo::new(

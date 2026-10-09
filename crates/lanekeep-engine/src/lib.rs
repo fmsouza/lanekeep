@@ -4555,7 +4555,7 @@ fn fold_host_api(ctx_version: u32, wasm_world: &[u8]) -> [u8; 32] {
 /// answers *through*, not a per-language concern.
 ///
 /// Per language rather than per crate for the language identities, because the registry is
-/// what knows which languages a run has. Three of the six share one identity, since
+/// what knows which languages a run has. Three of them share one identity, since
 /// `typescript`, `tsx` and `javascript` come from one crate and one resolver; the ids are what
 /// keep those three from folding to the same bytes as one.
 fn analysis_hash(provider: &[u8], programs: &[u8], languages: &[(String, [u8; 32])]) -> [u8; 32] {

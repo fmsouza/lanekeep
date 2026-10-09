@@ -20,7 +20,8 @@ pub fn register_all(registry: &mut LanguageRegistry) -> Result<(), RegistryError
     lanekeep_lang_js::register_all(registry)?;
     lanekeep_lang_python::register_all(registry)?;
     lanekeep_lang_go::register_all(registry)?;
-    lanekeep_lang_rust::register_all(registry)
+    lanekeep_lang_rust::register_all(registry)?;
+    lanekeep_lang_json::register_all(registry)
 }
 
 /// A registry holding every supported language.
@@ -53,7 +54,15 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(
             ids,
-            ["go", "javascript", "python", "rust", "tsx", "typescript"]
+            [
+                "go",
+                "javascript",
+                "json",
+                "python",
+                "rust",
+                "tsx",
+                "typescript"
+            ]
         );
     }
 
@@ -66,6 +75,8 @@ mod tests {
             ("src/a.js", "javascript"),
             ("src/a.py", "python"),
             ("src/a.pyi", "python"),
+            ("locales/en.json", "json"),
+            (".vscode/settings.jsonc", "json"),
         ] {
             assert_eq!(
                 registry.for_path(path).expect("matches").id().as_str(),
@@ -75,17 +86,24 @@ mod tests {
         }
     }
 
+    /// The languages that declare no names, and so have nothing for a resolver to resolve.
+    ///
+    /// Spelled out rather than inferred, so a *programming* language arriving without a
+    /// resolver is still caught by the test below: an absent resolver is honest for JSON and
+    /// a gap for anything with declarations.
+    const RESOLVERLESS: [&str; 1] = ["json"];
+
     #[test]
-    fn every_language_offers_a_resolver() {
-        // A language with none is honest rather than wrong, but every language shipped so
-        // far has one, and a new one arriving without would be worth noticing.
-        for language in registry().languages() {
-            assert!(
-                language.resolver().is_some(),
-                "{} has no binding resolver",
-                language.id().as_str()
-            );
-        }
+    fn every_programming_language_offers_a_resolver() {
+        let without: Vec<&str> = registry()
+            .languages()
+            .filter(|language| language.resolver().is_none())
+            .map(|language| language.id().as_str())
+            .collect();
+        assert_eq!(
+            without, RESOLVERLESS,
+            "only the data-format languages may lack a binding resolver"
+        );
     }
 
     /// Every registered language carries an identity, and it is derived rather than defaulted.
@@ -110,7 +128,7 @@ mod tests {
     /// And the identity is per *crate*, not per language.
     ///
     /// `typescript`, `tsx` and `javascript` all come from `lanekeep-lang-js` and share one
-    /// resolver, so they must share one identity; the other three crates contribute one each.
+    /// resolver, so they must share one identity; the other four crates contribute one each.
     /// Asserting the count rather than only "nonzero" is what would catch every language
     /// returning the same constant.
     #[test]
@@ -119,17 +137,17 @@ mod tests {
             .languages()
             .map(|language| language.analysis_identity())
             .collect();
-        assert_eq!(identities.len(), 6, "six languages are registered");
+        assert_eq!(identities.len(), 7, "seven languages are registered");
         identities.sort_unstable();
         identities.dedup();
         assert_eq!(
             identities.len(),
-            4,
-            "four language crates ship a resolver; js registers three of the six languages"
+            5,
+            "five language crates; js registers three of the seven languages"
         );
     }
 
-    /// Six registered grammars, six digests.
+    /// Seven registered grammars, seven digests.
     ///
     /// The complement of the per-field test in `lanekeep-lang`: that one proves each input
     /// reaches the hash, this one proves the real grammars differ in at least one of them.
@@ -141,9 +159,9 @@ mod tests {
             .languages()
             .map(|language| lanekeep_lang::grammar_digest(&language.grammar()))
             .collect();
-        assert_eq!(digests.len(), 6, "six languages are registered");
+        assert_eq!(digests.len(), 7, "seven languages are registered");
         digests.sort_unstable();
         digests.dedup();
-        assert_eq!(digests.len(), 6, "two grammars share a digest");
+        assert_eq!(digests.len(), 7, "two grammars share a digest");
     }
 }
