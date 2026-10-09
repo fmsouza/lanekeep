@@ -341,6 +341,31 @@ intact.) If a cost is per
 initializer, measure the initializers; `with_min_len` is the lever that makes the count something
 you chose.
 
+**And the same initializer was evaluating the whole ruleset, which is why the engine no longer uses
+`map_init` for its workers.** Each `Worker` built a QuickJS sandbox on first use and evaluated every
+rule module and factory call into it. Architecture §2 said that happened once per worker per run.
+A temporary counter in `build_sandbox` measured 598, 705 and 877 evaluations for three release runs
+over one 2,000-file corpus on fourteen threads, concurrently, against what was then a one-second
+wall-clock budget. That is #293's intermittent failure on a loaded machine. `Engine::check_files`
+now runs one `Worker` per pool thread through `rayon::broadcast` and a shared file cursor, and
+`the_ruleset_is_evaluated_at_most_once_per_pool_thread` holds the bound structurally. Before the
+change it counted 23 evaluations on a two-thread pool over 300 files. Two lessons carry forward.
+A claim of the form "once per worker" is a count, and needs a counter to back it. And a per-call
+budget applied to work that a scheduler multiplies measures the scheduler, not the work.
+
+**And fewer, longer-lived workers turned a memory charge that only grows into a breach the
+scheduler chose.** A component store's `MemoryCeiling` charge is every linear-memory grant it ever
+made, and a linear memory never shrinks. StarlingMonkey's heap does not return between calls, so
+the crossings bench's JavaScript arm grew 2 MiB a file. Under `map_init` its forty files were split
+across two stores and passed; once #293 put them on one, the twenty-seventh file breached the
+64 MiB ceiling and the bench died with "a rule accumulated without bound" about a rule that
+accumulated nothing. QuickJS has the same shape in a milder form: a cycle waits for the collector,
+which runs only when an object allocation crosses a threshold that each collection raises to 1.5×
+the heap. So the engine now drops a worker's store and collects its sandbox at every file
+boundary (`Worker::end_file`, #308). A memory figure that persists across work units is a
+determinism input; reusing a runtime across files is only safe if what a file is charged starts
+from the same place every time.
+
 **A tree-sitter query matches children in tree order.** `(import_statement source: (string)
 (import_clause ...))` can never match, because the grammar puts `import_clause` first — and
 the error is exactly that, "this pattern can never match", which is easy to read as "this
@@ -737,7 +762,9 @@ a worker its remaining files after one fails, and which of several simultaneous 
 reduction surfaces is arbitrary, so a run can be reported against a file that was fine. Nothing
 is rescued by noticing, since every such failure cancels the run either way; the *diagnostic* is.
 `lanekeep-engine`'s `Worker::poison_on` remembers the first failure and hands it back for the
-rest of that worker's share.
+rest of that worker's share. Since #308 the engine's store lives for one file rather than for the
+worker, for the memory reason in the entry about the charge that only grows, so a later file gets
+a fresh store; `poison_on` stays, so the worker keeps reporting what cancelled the run.
 
 **`git log -- <a committed binary>` lists the commits where its bytes changed, and a rebuild
 that produces identical bytes is not one of them.** So "the source commit is newer than the

@@ -119,6 +119,20 @@
 //! counts are not even stable between runs of one corpus — rayon splits on how the work is
 //! going — so this is a distribution rather than a bound.
 //!
+//! **That table describes `map_init`, which the engine no longer uses, and the engine's store is
+//! now per file rather than per worker.** #293 made workers one per pool thread, which put a
+//! thread's whole share of the corpus on one store — and a store's `MemoryCeiling` charge is
+//! every grant it ever made. A guest whose heap does not return between calls then charged each
+//! file for its predecessors: the crossings bench's StarlingMonkey arm grew 2 MiB a file and
+//! breached at the twenty-seventh of forty, a breach that depended on which files shared a
+//! worker. So since #308 `lanekeep-engine` drops a worker's [`WasmRuntime`] at every file
+//! boundary, and "worker" in this module means the owner of one `WasmRuntime`, which is now one
+//! file's dispatch. Instantiation is once per (file, component) the file reaches: files ×
+//! components-reached rather than files × rules, and still nothing for a file that reaches no
+//! component. That is more instantiations than the per-thread bound and fewer than the table's
+//! rows for any file that reaches no component; [`MEMORY_RESERVATION`]'s crossover is restated
+//! for it.
+//!
 //! **The design is not falsified; the arithmetic behind [`MEMORY_RESERVATION`] is.** The
 //! per-worker cache still works, and it is what keeps the count at workers × components instead
 //! of at files × rules, which would be one hundred thousand for the last row. The table was
@@ -171,6 +185,15 @@
 //! when it is proposed rather than assumed cheap: a fresh instance per file per rule is 40,000
 //! instantiations against 280 for the same corpus and ruleset, measured at 331.5 ms
 //! single-threaded — a different cost class by a factor of 143.
+//!
+//! **Since #308 the engine pays a version of that price, for memory rather than for purity.**
+//! It builds a store per file, so an instance lives for one file and its components' rules on
+//! that file, and state a component carries between files is gone by construction rather than by
+//! convention. The bill is per (file, component) rather than per (file, rule), and a file that
+//! reaches no component pays nothing; the crossings bench measured the Rust component arm at
+//! 77.6 ms against 76.1 ms over forty files, one component each. The JavaScript runtime is still
+//! one per worker and collected between files, so for a TypeScript rule this section's
+//! paragraph above stands unchanged.
 //!
 //! # No pooling allocator, and no dividing an instantiation cost by the worker count
 //!
@@ -303,8 +326,10 @@ use crate::sourcemap::SourceMap;
 /// rules and **does not grow with the corpus**". The second half is false. A worker is a rayon
 /// `map_init` initializer and `map_init` runs per *chunk*, so the store count is set by adaptive
 /// splitting rather than by the thread count — 1,038 stores and 10,380 instantiations at ten
-/// thousand files times ten rules, against the 140 that figure assumed. The module header has
-/// the table.
+/// thousand files times ten rules, against the 140 that figure assumed. (Since #308 the engine
+/// builds a store per file, so the count is files × components each file reaches: above the
+/// table's rows for a corpus where most files reach a component, below them where few do. The
+/// crossover below is the arithmetic to redo with that count.) The module header has the table.
 ///
 /// **Both terms were therefore re-measured end to end through `lanekeep-engine`**, 2026-08-06,
 /// Apple M3 Max, release, 14 threads, cache off, best of three.

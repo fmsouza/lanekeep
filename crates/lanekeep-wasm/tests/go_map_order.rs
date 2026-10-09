@@ -17,6 +17,10 @@
 //! `(ruleId, file, line, column)` does not rescue it: a rule choosing *which* node to report by
 //! map order reports a different violation, not the same one in a different place.
 //!
+//! Since #308 `lanekeep-engine` gives each file a fresh store, so the scheduler no longer reaches
+//! the draw count. Within one file it still depends on what the component's other rules and
+//! earlier matches drew, and any other embedder may keep a store longer, so the reset stays.
+//!
 //! `lanekeep.Handlers` answers it by pinning both generators to their initial position at the top
 //! of every host-called path. Nothing about a rule's source shows whether that happened, so the
 //! evidence here is behavioral: drive one instance repeatedly and watch the order hold still.

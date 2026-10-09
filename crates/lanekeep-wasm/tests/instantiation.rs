@@ -3,9 +3,11 @@
 //! `runtime::MEMORY_RESERVATION`'s whole argument rests on that bound — about three hundred
 //! and fifty instantiations for a run, against a 1.6× on guest compute that grows with the
 //! corpus — and until this file existed the bound was a paragraph asking callers to behave.
-//! What is asserted here is that the API makes it true: a [`Worker`] below is the shape
-//! `lanekeep-engine` gives a rayon worker, and it cannot instantiate more than once per
-//! component however many files it is handed and however many of that component's rules run.
+//! What is asserted here is that the API makes it true: a [`Worker`] below is one
+//! `WasmRuntime`'s owner, and it cannot instantiate more than once per component however many
+//! files it is handed and however many of that component's rules run. Since #308
+//! `lanekeep-engine` hands each `WasmRuntime` one file, for memory rather than for this bound;
+//! the bound is what keeps that file's cost per component rather than per rule.
 //!
 //! **Per component and not per rule**, which is the correction this file's `--- what a
 //! component instance is shared by ---` section was added for. A component is a compiled

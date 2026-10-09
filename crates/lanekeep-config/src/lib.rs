@@ -31,7 +31,7 @@ use std::time::Duration;
 use lanekeep_core::{
     Capability, Examples, Gates, Namespace, PARSE_RULE, RuleCard, RuleId, Severity,
 };
-use lanekeep_js::{Limits, ResolveError, RuleRoot, RunClock, Sandbox};
+use lanekeep_js::{Limits, ResolveError, RuleRoot, RunClock, Sandbox, SandboxError};
 use lanekeep_wasm::{RuleSet, WasmEngine, WasmRuntime};
 use serde::Deserialize;
 use thiserror::Error;
@@ -436,6 +436,46 @@ pub enum ConfigError {
         path: String,
         /// The sandbox's account of it.
         detail: String,
+    },
+
+    /// Evaluating the config at load did not finish within its budget.
+    ///
+    /// A variant of its own rather than [`ConfigError::Evaluation`]'s rendered sandbox text,
+    /// because that text is a *handler's* breach and ends "raise it with `timeout` on the rule".
+    /// No rule's handler runs while a config evaluates, and neither a rule's `timeout` nor
+    /// `timeouts.rule` reaches this phase (#293). So the advice it gave could not work, which
+    /// is the `--timeout` failure `AGENTS.md` records, arriving in another phase.
+    #[error(
+        "config `{path}` did not finish evaluating within its {budget:?} budget\n  \
+         evaluating it runs the top level of every module it imports and every factory call — \
+         no rule's handler runs, so neither `timeout` on a rule nor `timeouts.rule` governs it\n  \
+         the budget is wall-clock time, so a busy machine spends it sooner than an idle one\n  \
+         {raise}"
+    )]
+    EvaluationTimeout {
+        /// The path as given.
+        path: String,
+        /// The budget that was spent.
+        budget: Duration,
+        /// What moves the budget, which depends on the config's format: see
+        /// `evaluation_failure`.
+        raise: &'static str,
+    },
+
+    /// The run's own budget was spent while a worker evaluated the ruleset.
+    ///
+    /// Carried as numbers rather than as text so the engine can report it as the run's breach,
+    /// with the same headline every other run-budget breach has, rather than as "could not start
+    /// a worker" (#290, #293).
+    ///
+    /// Rendered by the sandbox's own variant rather than by a fourth copy of the wording, which
+    /// #290 had just reduced to three kept identical by a test.
+    #[error("{}", SandboxError::RunTimeout { budget: *budget, elapsed: *elapsed })]
+    RunTimeout {
+        /// The run's global budget.
+        budget: Duration,
+        /// How long the run had been going.
+        elapsed: Duration,
     },
 
     /// The config evaluated but is not shaped like a config.
@@ -1133,10 +1173,15 @@ fn entry_source(
 /// — a rule's `check` is a function, and a function cannot be moved between runtimes. Each
 /// worker therefore evaluates the same modules rather than receiving extracted values.
 ///
+/// **The bound is the sandbox's own run clock, and nothing else.** That is the run's clock in a
+/// worker, which is the only caller that ships. A sandbox from [`sandbox_for`] carries an
+/// unbounded clock, because it is for [`load_with`], which bounds each call itself. Evaluating
+/// into one of those here is therefore unbounded.
+///
 /// # Errors
 ///
 /// Returns [`ConfigError`] when the config sits outside the rules root or fails to
-/// evaluate.
+/// evaluate, and [`ConfigError::RunTimeout`] when the sandbox's run clock ran out during it.
 pub fn evaluate_into(
     sandbox: &Sandbox,
     root: &RuleRoot,
@@ -1144,14 +1189,64 @@ pub fn evaluate_into(
 ) -> Result<(), ConfigError> {
     let display = config_path.display().to_string();
     let entry = root.path().join(ENTRY);
-    let (source, _) = entry_source(root, config_path, &display)?;
+    let (source, parsed) = entry_source(root, config_path, &display)?;
 
+    // Bounded by the clock this sandbox was built with, which in a worker is the run's. Armed
+    // with that clock's own budget, the per-call bound can never fire first: it lands at
+    // `now + G`, the run's at `start + G`, and `Budget::should_interrupt` asks the run's first.
+    // So a breach here is the run's and reports as the run's, not as "could not start a worker"
+    // around the text of a handler timeout (#290, #293).
+    let budget = sandbox.budget().clock().global_timeout();
     sandbox
-        .eval_module(&entry.display().to_string(), &source)
-        .map_err(|e| ConfigError::Evaluation {
-            path: display,
-            detail: e.to_string(),
-        })
+        .eval_module(&entry.display().to_string(), &source, budget)
+        .map_err(|e| evaluation_failure(&display, e, parsed.is_some()))
+}
+
+/// The budget evaluating a config at load runs under: `--timeout`, then a `lanekeep.json`'s
+/// own `timeouts.global`, then the default.
+///
+/// **This is the run's global number, not the per-invocation one, and that is the whole of
+/// #293.** Evaluation runs the top level of every module and every factory call. It is not a
+/// handler, so there is no single rule for a fast per-invocation limit to name. Bounding it at
+/// the per-invocation `rule_timeout` applied a second nobody could raise: config load's
+/// sandbox is built before the config is read, so it always carried the default. A
+/// hundred-rule project on a loaded machine crossed that second intermittently. The global
+/// budget is the backstop for an aggregate, which is what evaluation is, and both the flag and
+/// the file already reach it.
+///
+/// A `lanekeep.json` is read in Rust before anything evaluates, so its `timeouts.global` can
+/// apply here. A `lanekeep.config.ts` cannot bound its own evaluation, because its `timeouts`
+/// block does not exist until that evaluation has finished. `evaluation_failure` says so
+/// rather than offering it.
+fn evaluation_budget(flag: Option<Duration>, file: Option<u64>) -> Duration {
+    flag.or_else(|| file.map(Duration::from_millis))
+        .unwrap_or(lanekeep_core::limits::DEFAULT_GLOBAL_TIMEOUT)
+}
+
+/// What a failed evaluation means, by what stopped it.
+///
+/// A per-call breach is evaluation's own budget. Its message names what moves that budget,
+/// which depends on the format (`json`): a TypeScript config's `timeouts.global` cannot. A
+/// run-clock breach is the run's, carried as numbers so the engine can report it as one.
+/// Anything else is the sandbox's own account, unchanged.
+fn evaluation_failure(display: &str, error: SandboxError, json: bool) -> ConfigError {
+    match error {
+        SandboxError::RuleTimeout { budget } => ConfigError::EvaluationTimeout {
+            path: display.to_owned(),
+            budget,
+            raise: if json {
+                "raise it with `--timeout` or `timeouts.global`"
+            } else {
+                "raise it with `--timeout` — a `timeouts.global` in a TypeScript config is read \
+                 only once the config has evaluated, so it cannot extend this phase"
+            },
+        },
+        SandboxError::RunTimeout { budget, elapsed } => ConfigError::RunTimeout { budget, elapsed },
+        other => ConfigError::Evaluation {
+            path: display.to_owned(),
+            detail: other.to_string(),
+        },
+    }
 }
 
 /// Load and validate a configuration.
@@ -1238,17 +1333,21 @@ pub fn load_with(
 
     let entry = root.path().join(ENTRY);
     let (source, parsed) = entry_source(root, config_path, &display)?;
-    sandbox
-        .eval_module(&entry.display().to_string(), &source)
-        .map_err(|e| ConfigError::Evaluation {
-            path: display.clone(),
-            detail: e.to_string(),
-        })?;
 
-    let json: String = sandbox.eval(EXTRACT).map_err(|e| ConfigError::Evaluation {
-        path: display.clone(),
-        detail: e.to_string(),
-    })?;
+    // One budget for the evaluation and for the read that follows it, since `JSON.stringify`
+    // over a config can run its getters. See `evaluation_budget` for which number it is and why.
+    let is_json = parsed.is_some();
+    let budget = evaluation_budget(
+        options.global_timeout,
+        parsed.as_ref().and_then(|p| p.config.timeouts.global),
+    );
+    sandbox
+        .eval_module(&entry.display().to_string(), &source, budget)
+        .map_err(|e| evaluation_failure(&display, e, is_json))?;
+
+    let json: String = sandbox
+        .eval_with_timeout(EXTRACT, budget)
+        .map_err(|e| evaluation_failure(&display, e, is_json))?;
 
     let extracted: Option<RawConfig> =
         serde_json::from_str(&json).map_err(|e| ConfigError::Shape {
@@ -3231,10 +3330,13 @@ pub fn sandbox_for(
     typescript: std::sync::Arc<dyn lanekeep_js::Language>,
     javascript: std::sync::Arc<dyn lanekeep_js::Language>,
 ) -> Result<Sandbox, ConfigError> {
-    let limits = Limits::default();
+    // An unbounded clock, because this sandbox is built before the config is read. Any global
+    // budget started here would be a number the config and `--timeout` could not move, and it
+    // would breach under a message telling the user to move it. `load_with` bounds each
+    // evaluation per call, with the number those two resolve to (#293).
     Sandbox::with_modules(
-        limits,
-        RunClock::start(limits.global_timeout),
+        Limits::default(),
+        RunClock::unbounded(),
         root.clone(),
         typescript,
         javascript,
@@ -4318,6 +4420,186 @@ mod tests {
             },
         )
         .expect("a raised budget must reach the phase that breached under the lower one");
+    }
+
+    /// A rule module whose top level spins for `iterations` rounds before it defines its rule.
+    ///
+    /// The rule raises its own `timeout` to an hour, so a breach that still fires proves that
+    /// a rule's budget does not govern evaluation, which is half of #293.
+    fn burning_module(id: &str, iterations: u64) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep';\n\
+             let acc = 0;\n\
+             for (let i = 0; i < {iterations}; i++) {{ acc += i % 7; }}\n\
+             export default defineRule({{\n\
+               id: '{id}',\n\
+               timeout: 3600000,\n\
+               query: '(identifier) @id',\n\
+               card: {{ message: 'no', remediation: 'do this', examples: {{ bad: 'a', good: 'b' }} }},\n\
+               check(ctx, m) {{ if (acc < 0) ctx.report(m.id); }},\n\
+             }});\n"
+        )
+    }
+
+    /// Far more than a second of top-level work on any machine this suite runs on.
+    const LONG_BURN: u64 = 40_000_000;
+
+    /// Far more than fifty milliseconds, and far less than fifteen seconds, even under load.
+    const SHORT_BURN: u64 = 1_500_000;
+
+    /// A budget nothing in this file can come near.
+    const GENEROUS: Duration = Duration::from_mins(10);
+
+    /// Load through `load_with`, with `--timeout` as given.
+    fn load_flagged(
+        fixture: &Fixture,
+        name: &str,
+        flag: Option<Duration>,
+    ) -> Result<Config, ConfigError> {
+        let root = RuleRoot::new(&fixture.dir).expect("canonicalizes");
+        let sandbox =
+            sandbox_for(&root, Arc::new(TypeScript), Arc::new(JavaScript)).expect("sandbox");
+        load_with(
+            &sandbox,
+            &root,
+            &fixture.dir.join(name),
+            LoadOptions {
+                global_timeout: flag,
+                ..LoadOptions::default()
+            },
+        )
+    }
+
+    /// #293: config load evaluated every rule module under a hard-coded one-second budget, which
+    /// nothing a user could set reached. That included `timeouts.rule`, a rule's own `timeout`,
+    /// `timeouts.global` and `--timeout`. A project of a hundred rules on a loaded machine
+    /// crossed it intermittently. Evaluation is now bounded by the global budget, so a module
+    /// whose top level takes longer than a second loads once that budget allows it.
+    ///
+    /// Not a race against the clock: the budget here is ten minutes, and the burn only has to
+    /// exceed one second, which it does by a wide margin on any machine, idle or loaded.
+    #[test]
+    fn evaluating_a_config_is_not_bounded_by_a_one_second_ceiling() {
+        let fixture = Fixture::new(
+            "eval-no-one-second-ceiling",
+            &[
+                ("rule.ts", &burning_module("local/slow", LONG_BURN)),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./rule"],
+                        "timeouts": {"rule": 3600000, "global": 600000}}"#,
+                ),
+            ],
+        );
+        fixture
+            .load_json()
+            .expect("ten minutes of global budget covers a few seconds of top-level work");
+    }
+
+    /// The JSON half of a matched pair. A `lanekeep.json` is read in Rust before anything
+    /// evaluates, so its `timeouts.global` can bound evaluation. The lowered half proves that it
+    /// does, and the raise proves `--timeout` beats it, as it does for the run.
+    #[test]
+    fn a_lowered_global_budget_bounds_evaluation_for_json() {
+        let fixture = Fixture::new(
+            "eval-json-global",
+            &[
+                ("rule.ts", &burning_module("local/slow", SHORT_BURN)),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./rule"], "timeouts": {"rule": 3600000, "global": 50}}"#,
+                ),
+            ],
+        );
+
+        let error = load_flagged(&fixture, "lanekeep.json", None)
+            .expect_err("50 ms cannot cover the module's top level");
+        assert!(
+            matches!(error, ConfigError::EvaluationTimeout { .. }),
+            "the breach is evaluation's budget, not something incidental: {error}"
+        );
+        let text = error.to_string();
+        for phrase in ["`--timeout`", "`timeouts.global`", "`timeouts.rule`"] {
+            assert!(text.contains(phrase), "`{phrase}` is missing from: {text}");
+        }
+        assert!(
+            !text.contains("raise it with `timeout` on the rule"),
+            "a rule's `timeout` does not govern evaluation, so it must not be offered: {text}"
+        );
+
+        load_flagged(&fixture, "lanekeep.json", Some(GENEROUS))
+            .expect("`--timeout` is the more specific statement, and has to reach evaluation");
+    }
+
+    /// The TypeScript half. A `lanekeep.config.ts` cannot bound its own evaluation, because its
+    /// `timeouts` block exists only once it has evaluated, so the flag is the one lever, and
+    /// the message must say so rather than offer `timeouts.global`.
+    #[test]
+    fn a_lowered_flag_bounds_evaluation_for_a_typescript_config() {
+        let fixture = Fixture::new(
+            "eval-ts-flag",
+            &[
+                ("rule.ts", &burning_module("local/slow", SHORT_BURN)),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("rules: [rule], timeouts: { rule: 3600000 }"),
+                ),
+            ],
+        );
+
+        let error = load_flagged(
+            &fixture,
+            "lanekeep.config.ts",
+            Some(Duration::from_millis(50)),
+        )
+        .expect_err("50 ms cannot cover the module's top level");
+        assert!(
+            matches!(error, ConfigError::EvaluationTimeout { .. }),
+            "the breach is evaluation's budget, not something incidental: {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("raise it with `--timeout`"), "{text}");
+        assert!(
+            text.contains("cannot extend this phase"),
+            "a TypeScript config's own `timeouts.global` cannot reach this phase, and the \
+             message has to say so: {text}"
+        );
+
+        load_flagged(&fixture, "lanekeep.config.ts", Some(GENEROUS))
+            .expect("a raised `--timeout` has to reach evaluation");
+    }
+
+    /// A run-budget breach noticed during a worker's evaluation reads exactly as the sandbox's,
+    /// so #290's "worded identically" holds across the crate boundary too.
+    #[test]
+    fn a_run_budget_breach_during_evaluation_reads_as_every_other() {
+        let (budget, elapsed) = (Duration::from_secs(15), Duration::from_secs(16));
+        assert_eq!(
+            ConfigError::RunTimeout { budget, elapsed }.to_string(),
+            SandboxError::RunTimeout { budget, elapsed }.to_string()
+        );
+    }
+
+    /// And what a TypeScript config's own `timeouts.global` does: it governs the run, as it
+    /// always has, and does not bound the evaluation that produced it. That evaluation runs
+    /// under the default instead.
+    #[test]
+    fn a_typescript_configs_own_global_budget_does_not_bound_its_evaluation() {
+        let fixture = Fixture::new(
+            "eval-ts-own-global",
+            &[
+                ("rule.ts", &burning_module("local/slow", SHORT_BURN)),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("rules: [rule], timeouts: { global: 50 }"),
+                ),
+            ],
+        );
+
+        let config = fixture
+            .load_config()
+            .expect("the default budget bounds evaluation, not the value it produces");
+        assert_eq!(config.limits.global_timeout, Duration::from_millis(50));
     }
 
     #[test]

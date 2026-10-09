@@ -141,6 +141,19 @@ impl RunClock {
         })
     }
 
+    /// A clock whose deadline never arrives, for a sandbox whose every bound is set per call.
+    ///
+    /// Config load's sandbox is the one user. It is built before the config is read, so
+    /// whatever global budget it was started with would be a number the config could not move.
+    /// Bounding evaluation per call, with the number the config and `--timeout` resolve to,
+    /// leaves exactly one limit able to breach, and it is the one the message names (#293).
+    /// Saturation in [`Budget::new`] is what makes `Duration::MAX` mean "never", rather than an
+    /// overflow.
+    #[must_use]
+    pub fn unbounded() -> Arc<Self> {
+        Self::start(Duration::MAX)
+    }
+
     /// How long the run has been going.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
@@ -533,6 +546,19 @@ mod tests {
             limits.rule_timeout * 5 < limits.global_timeout,
             "the per-invocation budget must leave room for the global limit to be a backstop"
         );
+    }
+
+    #[test]
+    fn an_unbounded_clock_leaves_only_the_per_call_bound() {
+        // Config load's sandbox relies on this: the bound armed per call is the only one that
+        // can fire, and it fires as itself, never as a run-budget breach.
+        let budget = Budget::new(RunClock::unbounded());
+        assert!(!budget.should_interrupt(), "nothing armed, nothing to fire");
+        assert!(!budget.clock().is_expired());
+
+        budget.arm(Duration::ZERO);
+        assert!(budget.should_interrupt());
+        assert_eq!(budget.take_trip(), Some(Trip::Rule));
     }
 
     #[test]
