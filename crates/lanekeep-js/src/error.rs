@@ -29,7 +29,9 @@ pub enum SandboxError {
     #[error(
         "the run exceeded its {budget:?} budget after {elapsed:?}\n  \
          no single rule necessarily misbehaved — the total simply ran too long\n  \
-         raise it with `--timeout`, or narrow what is being checked"
+         the budget is wall-clock time, so a busy machine spends it sooner than an idle one\n  \
+         raise it with `--timeout` or `timeouts.global`, or narrow what is being checked\n  \
+         rerun with a raised budget and `--profile` to see which rules the time went to"
     )]
     RunTimeout {
         /// The global budget.

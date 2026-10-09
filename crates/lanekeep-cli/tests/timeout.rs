@@ -149,6 +149,18 @@ fn the_flag_lowers_the_budget() {
         "a 200 ms budget should cancel this run: {}",
         describe(&output)
     );
+
+    // #290: the breach is noticed while `local/slow` is executing on `src/a.ts`, and the
+    // headline used to say ``rule `local/slow` failed on `src/a.ts` `` — blame for whatever the
+    // scheduler happened to have running. A spent run budget is the run's failure.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for blame in ["local/slow", "failed on", "src/a.ts"] {
+        assert!(
+            !stderr.contains(blame),
+            "a global breach must not name `{blame}`: {}",
+            describe(&output)
+        );
+    }
 }
 
 #[test]

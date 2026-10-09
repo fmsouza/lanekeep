@@ -1127,6 +1127,17 @@ stranded cold forever the moment the budget started being enforced. The *no-prun
 doctrine this change added to §6.8, and it could not have been there before — an aborted run
 wrote nothing at all, so there was no save whose pruning behavior anyone had to decide.
 
+**A spent run budget noticed inside a handler used to blame that handler, and the blame moved
+between runs.** The engine wrapped both engines' `RunTimeout` in `RunError::Rule`, so the
+headline read ``rule `x` failed on `y` `` for whichever rule and file the scheduler had running
+when the clock ran out. On one corpus under one budget that was a different file every run
+(#290). `RunError::from_sandbox` and `from_component` now turn the breach into the walker's own
+`RunError::RunTimeout`, and every handler call site goes through them. The cost is a lost
+discriminator: tests that said "`RunTimeout` can only come from the walker" are no longer
+true, so a test of the walker's check has to prove it **by construction**. Use a spent budget
+over a corpus no rule's query matches, so that no handler runs and nothing else can stop the
+run.
+
 **A generated module reaches neither hash, and a rule's `options` used to live in one.** For a
 `lanekeep.json` the rules are compiled into an entry module lanekeep writes itself, and
 `hash_ruleset` covers the sources the loader *read* — never that one. `hash_config`
