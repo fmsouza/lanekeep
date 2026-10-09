@@ -10,7 +10,7 @@ import { defineRule } from 'lanekeep'
  *
  * | language | a test is | asserts by default |
  * | --- | --- | --- |
- * | typescript/tsx | an `it(...)`/`test(...)` call, or a modifier form like `test.only(...)`, with a block-bodied callback | `expect*`, `assert*` |
+ * | typescript/tsx | an `it(...)`/`test(...)` call, a modifier form like `test.only(...)`, or a table form like `it.each(table)(...)`, with a block-bodied callback | `expect*`, `assert*` |
  * | python | a `def test*` function, methods included | the `assert` statement, `self.assert*`, `self.fail`, `pytest.raises` |
  * | go | `func Test*` taking `*testing.T` | `t.Error*`, `t.Fatal*`, `t.Fail*`, `assert.*`, `require.*` |
  * | rust | a `fn` under `#[test]` or a `::test` attribute path | `assert*!`, `debug_assert*!`, `panic!` |
@@ -106,7 +106,7 @@ export default function noAssertionlessTest(options) {
       const family = familyOf(ctx.filePath)
 
       if (family === 'typescript') {
-        if (!isTestCallee(normalize(ctx.text(m.fn)))) return
+        if (!isTestCallee(normalize(ctx.text(m.fn)), m.table !== undefined)) return
         if (asserts(ctx, m.body, CALLS.typescript, vocabulary('typescript'))) return
         ctx.report(m.def, 'test asserts nothing')
         return
@@ -153,13 +153,22 @@ export default function noAssertionlessTest(options) {
  * `@fn` is the whole callee — `test`, or `test.only` — not only its object: capturing the
  * object alone made every `test.<member>(...)` a test, Playwright's hooks and steps included
  * (#287). Which callees declare a test is `isTestCallee`'s judgment, made on the text.
+ *
+ * The third shape is a table-driven test, `it.each(table)(name, fn)` or its tagged-template
+ * form with a template-literal table (#288): the callback sits in the *outer* call, whose
+ * callee is itself a call. There `@fn` is that inner call's callee — `it.only.each`, never
+ * the table — and `@table` is captured only for this shape, which is how the handler tells
+ * the forms apart. Matched on its own by the second shape, the inner call is never a test:
+ * its callee ends in `each`, which is not a modifier.
  */
 const TS_QUERY = `
   (call_expression
     function: [
-      (identifier)
-      (member_expression object: (identifier) property: (property_identifier))
-    ] @fn
+      (identifier) @fn
+      (member_expression object: (identifier) property: (property_identifier)) @fn
+      (call_expression
+        function: (member_expression property: (property_identifier)) @fn) @table
+    ]
     arguments: (arguments [
       (arrow_function body: (statement_block) @body)
       (function_expression body: (statement_block) @body)
@@ -180,11 +189,21 @@ const TEST_CALLEES = ['it', 'test']
  */
 const TEST_MODIFIERS = ['only', 'skip', 'concurrent', 'fails', 'failing', 'fail', 'fixme']
 
-/** Whether a normalized callee declares a test: `it`, `test`, or one of them with a modifier. */
-function isTestCallee(callee) {
-  const [base, modifier, ...rest] = callee.split('.')
-  if (rest.length > 0 || !TEST_CALLEES.includes(base)) return false
-  return modifier === undefined || TEST_MODIFIERS.includes(modifier)
+/**
+ * Whether a normalized callee declares a test: `it` or `test`, followed by modifiers only.
+ *
+ * With `table`, the callee is the one a table call was made on, so it must end in `.each`,
+ * and the modifiers are the segments before it — jest documents them chained, as in
+ * `test.concurrent.only.each`. `each` is not a modifier: `it.each(name, fn)` called directly
+ * declares nothing. How many modifiers the plain form can carry is the query's to say; it
+ * admits one.
+ */
+function isTestCallee(callee, table) {
+  const segments = callee.split('.')
+  if (table && segments.pop() !== 'each') return false
+  const [base, ...modifiers] = segments
+  if (!TEST_CALLEES.includes(base)) return false
+  return modifiers.every((modifier) => TEST_MODIFIERS.includes(modifier))
 }
 
 /** What counts as asserting when nothing is configured, per language family. */
