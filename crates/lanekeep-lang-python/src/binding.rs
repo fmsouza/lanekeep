@@ -2,7 +2,7 @@
 //!
 //! The same outward walk the JavaScript resolver uses — innermost enclosing scope that
 //! declares the name wins — over a different set of scopes, because Python's differ from
-//! JavaScript's in two ways that change the answer.
+//! JavaScript's in three ways that change the answer.
 //!
 //! **Python has no block scope.** `if`, `for`, `while` and `try` do not introduce one, so a
 //! name bound inside an `if` is bound for the whole function. Searching a scope therefore
@@ -14,6 +14,11 @@
 //! class-level name without `self` or the class, so a class scope is skipped when resolving
 //! from inside a function nested in it. Treating it as an ordinary enclosing scope would
 //! report a binding Python does not actually provide.
+//!
+//! **A function's header is not inside the function.** Defaults and annotations are
+//! evaluated when the `def` runs, in the scope around it, so a function is a scope only for
+//! its body and its parameters' own names. That is a third difference from JavaScript, where
+//! a default is evaluated with every parameter in scope.
 //!
 //! Deliberately syntactic, on the same terms as §1: nothing here imports a module to see
 //! what it exports, follows `__all__`, or knows a type. The two cases that matter are within
@@ -52,10 +57,13 @@ impl PythonBindingResolver {
     fn scopes(node: Node<'_>) -> Vec<Node<'_>> {
         let mut out = Vec::new();
         let mut crossed_function = false;
+        // The ancestor the walk has just come up through, so that a function can be asked
+        // which of its parts the node is in.
+        let mut below = node;
         let mut current = node.parent();
 
         while let Some(scope) = current {
-            if SCOPE_KINDS.contains(&scope.kind()) {
+            if SCOPE_KINDS.contains(&scope.kind()) && encloses(scope, below, node) {
                 // A class body is visible to code written directly in it and invisible to a
                 // function defined inside it — `def m(self): return CONSTANT` does not see a
                 // class-level `CONSTANT`.
@@ -67,6 +75,7 @@ impl PythonBindingResolver {
                     crossed_function = true;
                 }
             }
+            below = scope;
             current = scope.parent();
         }
         out
@@ -335,6 +344,54 @@ fn comprehension_target(scope: Node<'_>, source: &str, name: &str) -> Option<Bin
     None
 }
 
+/// Whether `scope` is a scope for `node`, which the walk reached through `below`.
+///
+/// Every scope encloses everything under it except a function or a lambda, which encloses
+/// only its body and its parameters' own names. The rest of its header — defaults,
+/// annotations, the return annotation, the function's own name — is evaluated once, when the
+/// `def` or `lambda` runs, in the scope it sits in. Counting the function's scope there
+/// answered `def f(log=log)`'s default as the parameter, shadowed, where it is the global
+/// the idiom exists to pin (#289); let a body-local capture a default the body has not yet
+/// run to bind; and marked a method's class as crossed, hiding a class-level name that a
+/// default *can* read.
+fn encloses(scope: Node<'_>, below: Node<'_>, node: Node<'_>) -> bool {
+    if !matches!(scope.kind(), "function_definition" | "lambda") {
+        return true;
+    }
+    let is = |field| {
+        scope
+            .child_by_field_name(field)
+            .is_some_and(|part| part.id() == below.id())
+    };
+    is("body") || (is("parameters") && is_parameter_name(node, below))
+}
+
+/// Whether `node`, somewhere under a parameter list, is a name that list declares.
+///
+/// It is unless it sits in a `value` (a default) or a `type` (an annotation) on the way up.
+/// `node-types.json` for `tree-sitter-python` 0.25.0 gives those two fields to the parameter
+/// kinds, and nothing else in a parameter is an expression: a bare `identifier`, a
+/// `default_parameter`'s or `typed_default_parameter`'s `name`, and the identifier in a
+/// `typed_parameter` or a `*args` / `**kwargs` splat are all names.
+fn is_parameter_name(node: Node<'_>, parameters: Node<'_>) -> bool {
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        if parent.id() == parameters.id() {
+            return true;
+        }
+        let in_field = |field| {
+            parent
+                .child_by_field_name(field)
+                .is_some_and(|part| part.id() == child.id())
+        };
+        if in_field("value") || in_field("type") {
+            return false;
+        }
+        child = parent;
+    }
+    false
+}
+
 /// Whether a parameter list binds `name`, including defaults, `*args` and `**kwargs`.
 fn parameter_binds(parameters: Node<'_>, source: &str, name: &str) -> bool {
     let mut cursor = parameters.walk();
@@ -388,27 +445,49 @@ mod tests {
     }
 
     fn with_use<T>(source: &str, name: &str, f: impl Fn(&Tree, Node<'_>) -> T) -> T {
+        with_occurrence(source, name, None, f)
+    }
+
+    /// The `n`th occurrence of `name`, zero-based from the start of the file — or the last
+    /// one, given `None` — resolved and asked whether it is shadowed.
+    fn nth(source: &str, name: &str, n: usize) -> (Option<Binding>, bool) {
+        with_occurrence(source, name, Some(n), |tree, node| {
+            (
+                PythonBindingResolver.resolve(tree, source, node),
+                PythonBindingResolver.is_shadowed(tree, source, node),
+            )
+        })
+    }
+
+    fn with_occurrence<T>(
+        source: &str,
+        name: &str,
+        n: Option<usize>,
+        f: impl Fn(&Tree, Node<'_>) -> T,
+    ) -> T {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&Python.grammar())
             .expect("grammar loads");
         let tree = parser.parse(source, None).expect("parses");
 
-        // The last occurrence *by position*: the traversal is a depth-first stack, so "last
-        // visited" is not "last in the file", and the tests mean the latter.
-        let mut found: Option<Node<'_>> = None;
+        // Ordered *by position*: the traversal is a depth-first stack, so "last visited" is
+        // not "last in the file", and the tests mean the latter.
+        let mut found: Vec<Node<'_>> = Vec::new();
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
-            if node.kind() == "identifier"
-                && node_text(node, source) == name
-                && found.is_none_or(|best| node.start_byte() > best.start_byte())
-            {
-                found = Some(node);
+            if node.kind() == "identifier" && node_text(node, source) == name {
+                found.push(node);
             }
             let mut cursor = node.walk();
             stack.extend(node.children(&mut cursor));
         }
-        let node = found.unwrap_or_else(|| panic!("no identifier `{name}` in source"));
+        found.sort_by_key(Node::start_byte);
+        let node = match n {
+            Some(n) => found.get(n).copied(),
+            None => found.last().copied(),
+        };
+        let node = node.unwrap_or_else(|| panic!("no such identifier `{name}` in source"));
         f(&tree, node)
     }
 
@@ -666,6 +745,80 @@ mod tests {
             ),
             local(BindingKind::Assignment)
         );
+    }
+
+    // --- a function's header is evaluated outside it (#289) -----------------------------
+
+    #[test]
+    fn a_default_is_read_in_the_enclosing_scope() {
+        // Python evaluates a default once, when `def` runs, in the scope the `def` sits in.
+        // The `log` in `log=log` is therefore the import — the idiom that pins a global
+        // into a local — and was answered as the parameter, shadowed, because the walk
+        // counted the function's own scope for everything under `function_definition`.
+        for source in [
+            "from app import log\ndef f(log=log):\n    return log\n",
+            "from app import log\ndef f(log: Log = log):\n    return log\n",
+        ] {
+            // Occurrences: the import, the parameter's name, the default, the body's use.
+            assert_eq!(
+                nth(source, "log", 2),
+                (Some(named("app", "log")), false),
+                "{source}"
+            );
+            assert_eq!(
+                nth(source, "log", 1),
+                (local(BindingKind::Param), true),
+                "{source}"
+            );
+            assert_eq!(
+                nth(source, "log", 3),
+                (local(BindingKind::Param), true),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_does_not_see_an_earlier_parameter() {
+        // Where JavaScript puts every parameter in scope in every default, Python puts none:
+        // `def f(x, y=x)` reads the enclosing `x`, and raises `NameError` if there is none.
+        let source = "x = 1\ndef f(x, y=x):\n    return y\n";
+        assert_eq!(nth(source, "x", 2), (local(BindingKind::Assignment), false));
+    }
+
+    #[test]
+    fn a_default_does_not_see_the_function_body() {
+        // The body has not run when the default is evaluated, and its names are not in scope.
+        let source = "from app import log\ndef f(a=log):\n    log = 1\n    return a\n";
+        assert_eq!(nth(source, "log", 1), (Some(named("app", "log")), false));
+    }
+
+    #[test]
+    fn an_annotation_is_read_in_the_enclosing_scope() {
+        // Parameter and return annotations are evaluated where the `def` is, like defaults.
+        let source = "from t import T\ndef f(x: T) -> T:\n    T = 1\n    return x\n";
+        assert_eq!(nth(source, "T", 1), (Some(named("t", "T")), false));
+        assert_eq!(nth(source, "T", 2), (Some(named("t", "T")), false));
+    }
+
+    #[test]
+    fn a_method_default_sees_the_class_body() {
+        // A default in a method is evaluated while the class body runs, so a class-level
+        // name is visible to it — the opposite of the method's body, which
+        // `a_method_does_not_see_class_level_names` pins. The walk used to mark the class as
+        // crossed as soon as it passed the `def`, and skipped it here too.
+        let source = "class C:\n    LIMIT = 10\n    def m(self, n=LIMIT):\n        return n\n";
+        assert_eq!(
+            nth(source, "LIMIT", 1),
+            (local(BindingKind::Assignment), false)
+        );
+    }
+
+    #[test]
+    fn a_lambda_default_is_read_outside_the_lambda() {
+        let source = "from app import log\nf = lambda log=log: log\n";
+        assert_eq!(nth(source, "log", 2), (Some(named("app", "log")), false));
+        assert_eq!(nth(source, "log", 3), (local(BindingKind::Param), true));
     }
 
     // --- shadowing -----------------------------------------------------------------------

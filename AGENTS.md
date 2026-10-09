@@ -406,6 +406,19 @@ wrong for the three declaration kinds — and review caught it before it merged.
 than a fifth instance, and the reason the test exists: a claim about `node-types.json` that a
 test reads off `node-types.json` cannot drift the way a sentence does.
 
+**A binding-pattern walk whose fallback descends every named child turns expressions into
+declarations.** `pattern_binds` in `crates/lanekeep-lang-js/src/binding.rs` named the pattern
+kinds it knew and walked into everything else, and the kinds it did not name were exactly the
+ones that carry an expression beside their pattern: `required_parameter` (its `value`, `type` and
+`decorator` fields) and `assignment_pattern` (its `right`). So `f(deps = { invoke: tauriInvoke })`
+declared `tauriInvoke` as a parameter, and an import read there answered `param`, shadowed (#289).
+Nothing fails: the wrong answer is a confident one, and it only ever hides an import. The walk is
+an allowlist of binding positions now, read off `node-types.json`. `crates/lanekeep-lang-rust`'s
+`pattern_binds` still has the same fallback — `Ordering::Less` or `0..=MAX` in a match arm binds
+the path's segments — and is a separate fix. Python got #289 another way: its walk counted a
+function's scope for the whole `def`, header included, where Python evaluates defaults and
+annotations in the scope around it.
+
 **A raw control character in a rule's source reports a parse failure somewhere else.** A NUL
 written into a template literal made the stripper report an error at the enclosing
 `return`, twenty lines earlier, because that is where the outermost `ERROR` node starts.
