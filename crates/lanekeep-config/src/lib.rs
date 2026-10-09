@@ -355,10 +355,10 @@ impl std::fmt::Debug for ComponentBytes {
 
 /// Policy for suppression directives: which shapes of valid directive a project accepts.
 ///
-/// All three keys default off, so an existing config changes nothing. A policy violation is
+/// Every key defaults off, so an existing config changes nothing. A policy violation is
 /// reported as an ordinary `lanekeep/suppression` violation at the directive's own position;
 /// the directive still silences what it names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SuppressionPolicy {
     /// A valid directive with no `expires:` is reported.
     pub require_expiry: bool,
@@ -366,6 +366,23 @@ pub struct SuppressionPolicy {
     pub max_expiry_days: Option<u32>,
     /// Any whole-file directive is reported.
     pub forbid_file_scope: bool,
+    /// The severity a directive that silenced nothing is reported at, `Off` unless the config
+    /// says otherwise. `--report-unused-suppressions` raises `Off` to `Warn` for one run and
+    /// never lowers a configured `Error` — the flag asks for more, not less.
+    pub unused: Severity,
+}
+
+/// Hand-written because the default for `unused` is `Off`, and `Severity` deliberately has no
+/// default of its own: which level "unset" means differs per setting.
+impl Default for SuppressionPolicy {
+    fn default() -> Self {
+        Self {
+            require_expiry: false,
+            max_expiry_days: None,
+            forbid_file_scope: false,
+            unused: Severity::Off,
+        }
+    }
 }
 
 /// A loaded, validated configuration.
@@ -499,8 +516,12 @@ struct RawTypes {
 ///
 /// Keys are camelCase in both config formats, matching the schema and the TypeScript
 /// interface `lanekeep-types-gen` renders.
+///
+/// Not permissive about a *key*, on [`RawTypes`]' terms: `"unused": "error"` written before
+/// this block had an `unused` loaded, did nothing, and said nothing (#285) — a project
+/// believing it had made stale directives fail the run, with every run passing.
 #[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawSuppressions {
     #[serde(default)]
     require_expiry: bool,
@@ -508,6 +529,10 @@ struct RawSuppressions {
     max_expiry_days: Option<u32>,
     #[serde(default)]
     forbid_file_scope: bool,
+    /// A severity as written, parsed in [`parse_suppressions`] so a bad value is refused
+    /// naming the key rather than as a serde error naming a line.
+    #[serde(default)]
+    unused: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1451,10 +1476,20 @@ fn parse_suppressions(
             detail: "in `suppressions`: `maxExpiryDays` must be at least 1".to_owned(),
         });
     }
+    let unused = match &raw.unused {
+        None => Severity::Off,
+        Some(written) => written
+            .parse::<Severity>()
+            .map_err(|e| ConfigError::Shape {
+                path: display.to_owned(),
+                detail: format!("in `suppressions`: `unused`: {e}"),
+            })?,
+    };
     Ok(SuppressionPolicy {
         require_expiry: raw.require_expiry,
         max_expiry_days: raw.max_expiry_days,
         forbid_file_scope: raw.forbid_file_scope,
+        unused,
     })
 }
 
@@ -3138,6 +3173,11 @@ fn hash_config(
         }
     }
     hasher.update(&[u8::from(suppressions.forbid_file_scope)]);
+    // `unused` is folded always, the default included, on `parse_severity`'s terms. Strictly no
+    // cached entry depends on it — unused-directive reports are computed after the cache, from
+    // the directives and usage each entry records — but a setting that reaches no hash is the
+    // shape `AGENTS.md` warns about, and the cost of folding it is one cold run on upgrade.
+    hasher.update(suppressions.unused.as_str().as_bytes());
 
     // The type provider, folded as the structured data it is. `canonical_bytes` is already
     // length-prefixed per field, so one `update` here is enough — the framing is inside the
@@ -6644,6 +6684,111 @@ mod tests {
             hex(&make(", suppressions: { maxExpiryDays: 31 }", "days31")),
             "changing maxExpiryDays must invalidate"
         );
+
+        // `unused`, every value against every other: a fold that collapsed two of them would
+        // leave a project's switch from `warn` to `error` answering under the old key.
+        let unused = ["off", "warn", "error"].map(|value| {
+            hex(&make(
+                &format!(", suppressions: {{ unused: '{value}' }}"),
+                &format!("unused-{value}"),
+            ))
+        });
+        assert_ne!(unused[0], unused[1], "off → warn must invalidate");
+        assert_ne!(unused[0], unused[2], "off → error must invalidate");
+        assert_ne!(unused[1], unused[2], "warn → error must invalidate");
+    }
+
+    /// The `.ts` half of the `unused` matched pair; its partner is
+    /// `the_unused_suppression_severity_is_read_from_a_json_config`.
+    #[test]
+    fn the_unused_suppression_severity_is_read_from_a_typescript_config() {
+        let fixture = Fixture::new(
+            "suppression-unused-ts",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("rules: [rule], suppressions: { unused: 'error' }"),
+                ),
+            ],
+        );
+        let config = fixture.load_config().expect("loads");
+        assert_eq!(config.suppressions.unused, Severity::Error);
+    }
+
+    #[test]
+    fn the_unused_suppression_severity_defaults_to_off() {
+        let fixture = Fixture::new(
+            "suppression-unused-default",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.config.ts", &config_with("rules: [rule]")),
+            ],
+        );
+        let config = fixture.load_config().expect("loads");
+        assert_eq!(config.suppressions.unused, Severity::Off);
+    }
+
+    /// A value that is not a severity is refused, naming the key — `warning` is the spelling a
+    /// reader reaches for, and accepting it as anything would be guessing.
+    #[test]
+    fn an_unknown_unused_suppression_severity_is_refused() {
+        let fixture = Fixture::new(
+            "suppression-unused-bad",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.config.ts",
+                    &config_with("rules: [rule], suppressions: { unused: 'warning' }"),
+                ),
+            ],
+        );
+        let error = fixture
+            .load_config()
+            .expect_err("`warning` is not a severity");
+        let rendered = format!("{error}");
+        assert!(rendered.contains("unused"), "{rendered}");
+        assert!(rendered.contains("warning"), "{rendered}");
+    }
+
+    /// A misspelled key inside `suppressions` is refused, naming it — the hole #285 reported:
+    /// `"suppressions": { "unused": "error" }` used to load, do nothing, and say nothing.
+    #[test]
+    fn an_unknown_key_in_the_suppressions_block_is_refused() {
+        let fixture = Fixture::new(
+            "suppressions-unknown-key",
+            &[(
+                "lanekeep.json",
+                r#"{"include": ["src/**"], "suppressions": {"requireExpiryy": true}, "rules": []}"#,
+            )],
+        );
+        let error = fixture
+            .load_json()
+            .expect_err("`requireExpiryy` is not a field of `suppressions`");
+        assert!(format!("{error}").contains("requireExpiryy"), "{error}");
+    }
+
+    /// The `.ts` half of the unknown-key pair. The two formats reach `RawSuppressions` by
+    /// different routes — JSON straight through `serde`, `.ts` through `EXTRACT`'s
+    /// `suppressions: c.suppressions ?? {}` — so each is asserted on its own.
+    #[test]
+    fn an_unknown_key_in_the_suppressions_block_of_a_typescript_config_is_refused() {
+        let fixture = Fixture::new(
+            "suppressions-unknown-key-ts",
+            &[(
+                "lanekeep.config.ts",
+                "import { defineConfig } from 'lanekeep';\n\
+                 export default defineConfig({\n\
+                   include: ['src/**'],\n\
+                   suppressions: { requireExpiryy: true },\n\
+                   rules: [],\n\
+                 });\n",
+            )],
+        );
+        let error = fixture
+            .load_config()
+            .expect_err("`requireExpiryy` is not a field of `suppressions`");
+        assert!(format!("{error}").contains("requireExpiryy"), "{error}");
     }
 
     /// The `.ts` half of the `types.provider`-moves-`config_hash` matched pair.
@@ -6697,6 +6842,7 @@ mod tests {
                 require_expiry: true,
                 max_expiry_days: Some(30),
                 forbid_file_scope: true,
+                unused: Severity::Off,
             }
         );
     }
@@ -8364,6 +8510,48 @@ mod tests {
             "changing maxExpiryDays must invalidate"
         );
         assert_eq!(hex(&before.ruleset_hash), hex(&after.ruleset_hash));
+
+        // `unused`, every value against every other, on the one fixture rewritten in place.
+        let fixture = Fixture::new(
+            "json-suppression-hash-unused",
+            &[
+                ("rule.ts", &rule("local/example")),
+                ("lanekeep.json", &config("{}")),
+            ],
+        );
+        let mut seen = Vec::new();
+        for value in ["off", "warn", "error"] {
+            fixture.write_all(&[(
+                "lanekeep.json",
+                &config(&format!(r#"{{"unused": "{value}"}}"#)),
+            )]);
+            let loaded = fixture.load_json().expect("loads");
+            seen.push((value, hex(&loaded.config_hash), hex(&loaded.ruleset_hash)));
+        }
+        for (i, (a, hash_a, ruleset_a)) in seen.iter().enumerate() {
+            for (b, hash_b, ruleset_b) in &seen[i + 1..] {
+                assert_ne!(hash_a, hash_b, "unused {a} → {b} must invalidate");
+                assert_eq!(ruleset_a, ruleset_b);
+            }
+        }
+    }
+
+    /// The `.json` half of the `unused` matched pair. See its partner,
+    /// `the_unused_suppression_severity_is_read_from_a_typescript_config`.
+    #[test]
+    fn the_unused_suppression_severity_is_read_from_a_json_config() {
+        let fixture = Fixture::new(
+            "suppression-unused-json",
+            &[
+                ("rule.ts", &rule("local/example")),
+                (
+                    "lanekeep.json",
+                    r#"{"rules": ["./rule"], "suppressions": {"unused": "error"}}"#,
+                ),
+            ],
+        );
+        let config = fixture.load_json().expect("loads");
+        assert_eq!(config.suppressions.unused, Severity::Error);
     }
 
     /// The `.json` half of the `types.provider`-moves-`config_hash` matched pair. See its
@@ -8409,6 +8597,7 @@ mod tests {
                 require_expiry: true,
                 max_expiry_days: Some(30),
                 forbid_file_scope: true,
+                unused: Severity::Off,
             }
         );
     }

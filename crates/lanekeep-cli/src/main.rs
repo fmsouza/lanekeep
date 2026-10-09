@@ -125,7 +125,9 @@ enum Command {
         /// Also report suppressions that silenced nothing.
         ///
         /// Hygiene: a suppression whose violation no longer exists documents a decision
-        /// about code that has changed, and nothing else will ever say so.
+        /// about code that has changed, and nothing else will ever say so. Reported as a
+        /// warning; set `suppressions.unused` to `"error"` in the config to fail the run on
+        /// one instead. This flag never lowers what the config sets.
         #[arg(long)]
         report_unused_suppressions: bool,
 
