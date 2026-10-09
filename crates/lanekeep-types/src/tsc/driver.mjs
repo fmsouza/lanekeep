@@ -154,8 +154,15 @@ const requireFromProject = createRequire(path.join(projectRoot, 'package.json'))
 
 // A package that cannot be loaded, or one without the compiler API this driver is written
 // against, is answered rather than thrown: the Rust side learns *why* from `hello` and refuses
-// with the version and the missing function in the message, instead of a dead pipe. The
-// reference corpus is on TypeScript 7.0.2, whose package need not expose this API at all.
+// with the version and the missing function in the message, instead of a dead pipe.
+//
+// TypeScript 7 exposes no such API at all, and its package cannot even be *loaded* by the
+// default specifier: 7.0.2 is an ES-module package with no `main`, whose `exports["."]` is a
+// CommonJS file carrying only `{ version, versionMajorMinor }`. A path `require` — which
+// `./node_modules/typescript` and any absolute spelling are — ignores `exports`, finds no
+// `main` and no `index.js`, and throws `MODULE_NOT_FOUND` about a package that is plainly
+// there. So a failed load also reports the version the package's own manifest declares,
+// when there is one, and the Rust side names TypeScript 7 instead of guessing at a layout.
 let ts = null
 let loadError = null
 try {
@@ -163,6 +170,23 @@ try {
 } catch (error) {
   loadError = `cannot load the typescript package \`${typescriptSpecifier}\` from ${projectRoot}: ${error?.message ?? error}`
 }
+
+/**
+ * The `version` the package's own `package.json` declares, or `null` where there is no
+ * readable manifest behind the specifier — which is what tells a package that is absent from
+ * one that is present and could not be loaded. Read only after a failed load.
+ */
+function declaredVersion() {
+  try {
+    const manifest = JSON.parse(
+      fs.readFileSync(requireFromProject.resolve(`${typescriptSpecifier}/package.json`), 'utf8'),
+    )
+    return typeof manifest?.version === 'string' ? manifest.version : null
+  } catch {
+    return null
+  }
+}
+const unloadedVersion = loadError ? declaredVersion() : null
 const REQUIRED_API = [
   'createProgram',
   'findConfigFile',
@@ -1281,7 +1305,11 @@ function programListing(contributing) {
 
 const handlers = {
   hello() {
-    if (loadError) return { error: loadError }
+    if (loadError) {
+      return unloadedVersion === null
+        ? { error: loadError }
+        : { error: loadError, typescript: unloadedVersion }
+    }
     if (unsupported.length > 0) return { typescript: ts.version, unsupported }
     return { typescript: ts.version }
   },
