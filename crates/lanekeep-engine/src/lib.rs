@@ -169,22 +169,29 @@ pub enum RunError {
         detail: String,
     },
 
-    /// The run's wall-clock budget was spent, noticed between one file and the next.
+    /// The run's wall-clock budget was spent.
     ///
     /// **The only limit breach that names no rule and no file, because it is about neither.**
-    /// Both engines already report a spent run budget from inside a handler — QuickJS from its
-    /// interrupt handler, wasmtime from an epoch check compiled into guest code — and those
-    /// arrive as [`RunError::Rule`], carrying whichever rule happened to be executing. That is
-    /// the right shape for a breach a rule was at least present for. It is the wrong shape for
-    /// this one: nothing was executing, so there is no culprit to name and naming one would
-    /// send a reader to a rule that is not the problem.
+    /// Three mechanisms notice it: the walker between one file and the next, QuickJS's interrupt
+    /// handler, and wasmtime's epoch check compiled into guest code. All three arrive here.
+    /// The two inside a handler used to arrive as [`RunError::Rule`], carrying whichever rule
+    /// happened to be executing, and that rule was an accident of scheduling rather than a
+    /// culprit: on one corpus under one budget, two runs named two different rules and files
+    /// (#290). The engine's private `from_sandbox` and `from_component` constructors are
+    /// where that stopped.
+    ///
+    /// So the variant no longer says which mechanism noticed. A test that needs to prove the
+    /// walker's own check does it by construction — a corpus no handler runs on — not by
+    /// matching on this.
     ///
     /// The wording is deliberately the same as both engines', because the user-facing fact is
     /// the same and which mechanism noticed is lanekeep's business rather than theirs.
     #[error(
         "the run exceeded its {budget:?} budget after {elapsed:?}\n  \
          no single rule necessarily misbehaved — the total simply ran too long\n  \
-         raise it with `--timeout`, or narrow what is being checked"
+         the budget is wall-clock time, so a busy machine spends it sooner than an idle one\n  \
+         raise it with `--timeout` or `timeouts.global`, or narrow what is being checked\n  \
+         rerun with a raised budget and `--profile` to see which rules the time went to"
     )]
     RunTimeout {
         /// The global budget.
@@ -223,7 +230,9 @@ pub enum RunError {
         detail: String,
     },
 
-    /// The sandbox failed, including on a breached budget.
+    /// The sandbox failed, including on a breached per-invocation budget or memory ceiling.
+    ///
+    /// Never a spent *run* budget, which is [`RunError::RunTimeout`] wherever it was noticed.
     #[error("rule `{rule}` failed on `{file}`\n{detail}")]
     Rule {
         /// Which rule.
@@ -240,6 +249,36 @@ pub enum RunError {
         /// What went wrong.
         detail: String,
     },
+}
+
+impl RunError {
+    /// A TypeScript rule's handler failing on `file` — unless what stopped it was the run's
+    /// budget, which is the run's failure and not the rule's.
+    ///
+    /// Every call site that turns a [`SandboxError`] into a [`RunError`] goes through here, so
+    /// none of them can name a rule for a breach no rule owns. See [`RunError::RunTimeout`].
+    fn from_sandbox(rule: &RuleId, file: &str, error: SandboxError) -> Self {
+        match error {
+            SandboxError::RunTimeout { budget, elapsed } => Self::RunTimeout { budget, elapsed },
+            other => Self::Rule {
+                rule: rule.to_string(),
+                file: file.to_owned(),
+                detail: other.to_string(),
+            },
+        }
+    }
+
+    /// The component counterpart of [`RunError::from_sandbox`], for a [`WasmError`].
+    fn from_component(rule: &RuleId, file: &str, error: WasmError) -> Self {
+        match error {
+            WasmError::RunTimeout { budget, elapsed } => Self::RunTimeout { budget, elapsed },
+            other => Self::Rule {
+                rule: rule.to_string(),
+                file: file.to_owned(),
+                detail: other.to_string(),
+            },
+        }
+    }
 }
 
 /// A rule prepared for execution: metadata plus everything compiled.
@@ -2042,13 +2081,9 @@ impl Engine {
 
             sandbox
                 .eval_with_reduce_host::<()>(&host, &call, timeout)
-                .map_err(|e: SandboxError| RunError::Rule {
-                    rule: rule.spec.id.to_string(),
-                    // No single file is at fault in a reduce phase, and naming one would be
-                    // a lie the reader would then go and look at.
-                    file: "<reduce>".to_owned(),
-                    detail: e.to_string(),
-                })?;
+                // No single file is at fault in a reduce phase, and naming one would be a lie
+                // the reader would then go and look at.
+                .map_err(|e: SandboxError| RunError::from_sandbox(&rule.spec.id, "<reduce>", e))?;
 
             for report in host.take_reports() {
                 // The path is the rule's, normalized but not checked against the corpus. A
@@ -2094,8 +2129,9 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::Rule`] for a trapping guest or a breached budget, and
-    /// [`RunError::Worker`] when the runtime cannot be built.
+    /// Returns [`RunError::Rule`] for a trapping guest or a breached per-invocation budget,
+    /// [`RunError::RunTimeout`] for a spent run budget, and [`RunError::Worker`] when the
+    /// runtime cannot be built.
     fn reduce_components(
         &self,
         clock: &Arc<RunClock>,
@@ -2151,7 +2187,8 @@ impl Engine {
                 .host_mut()
                 .take_reduce_context(resource)
                 .map_err(|e| fail(e.to_string()))?;
-            outcome.map_err(|e: WasmError| fail(e.to_string()))?;
+            outcome
+                .map_err(|e: WasmError| RunError::from_component(&rule.spec.id, "<reduce>", e))?;
 
             for report in taken.take_reports() {
                 // The path is the rule's, normalized but not checked against the corpus — the
@@ -2958,8 +2995,8 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns [`RunError::Rule`] for a trapping guest or a breached budget, both of which
-    /// cancel the run. That is what keeps a poisoned store from being reused: any host refusal
+    /// Returns [`RunError::Rule`] for a trapping guest or a breached per-invocation budget, and
+    /// [`RunError::RunTimeout`] for a spent run budget, all of which cancel the run. That is what keeps a poisoned store from being reused: any host refusal
     /// traps, and `imports: { default: trappable }` marks the whole store unenterable with no
     /// way to reset it — so a store that has trapped must never see another file, and every
     /// error here is propagated rather than skipped.
@@ -3060,7 +3097,9 @@ impl Engine {
             if let Some(started) = handler_started {
                 timing.handler = timing.handler.saturating_add(started.elapsed());
             }
-            outcome.map_err(|e: WasmError| Self::component_failure(rule, path, &e.to_string()))?;
+            outcome.map_err(|e: WasmError| {
+                RunError::from_component(&rule.spec.id, path.as_str(), e)
+            })?;
         }
 
         // Taken per rule rather than per file, which is what attributes a report to the rule
@@ -3368,10 +3407,8 @@ impl Engine {
                 timing.handler = timing.handler.saturating_add(started.elapsed());
             }
 
-            outcome.map_err(|e: SandboxError| RunError::Rule {
-                rule: rule.spec.id.to_string(),
-                file: path.as_str().to_owned(),
-                detail: e.to_string(),
+            outcome.map_err(|e: SandboxError| {
+                RunError::from_sandbox(&rule.spec.id, path.as_str(), e)
             })?;
         }
 
@@ -3602,10 +3639,8 @@ impl Engine {
                     timing.handler = timing.handler.saturating_add(started.elapsed());
                 }
 
-                outcome.map_err(|e: SandboxError| RunError::Rule {
-                    rule: rule.spec.id.to_string(),
-                    file: path.as_str().to_owned(),
-                    detail: e.to_string(),
+                outcome.map_err(|e: SandboxError| {
+                    RunError::from_sandbox(&rule.spec.id, path.as_str(), e)
                 })?;
             }
         }
@@ -3621,10 +3656,8 @@ impl Engine {
             if let Some(started) = handler_started {
                 timing.handler = timing.handler.saturating_add(started.elapsed());
             }
-            outcome.map_err(|e: SandboxError| RunError::Rule {
-                rule: rule.spec.id.to_string(),
-                file: path.as_str().to_owned(),
-                detail: e.to_string(),
+            outcome.map_err(|e: SandboxError| {
+                RunError::from_sandbox(&rule.spec.id, path.as_str(), e)
             })?;
         }
 
@@ -3758,10 +3791,8 @@ impl Engine {
                 handler_time = handler_time.saturating_add(started.elapsed());
             }
 
-            outcome.map_err(|e: SandboxError| RunError::Rule {
-                rule: rule.spec.id.to_string(),
-                file: path.as_str().to_owned(),
-                detail: e.to_string(),
+            outcome.map_err(|e: SandboxError| {
+                RunError::from_sandbox(&rule.spec.id, path.as_str(), e)
             })?;
         }
 
@@ -5305,7 +5336,18 @@ mod tests {
         // opening is what distinguishes this breach from a per-rule one, and the closing is the
         // actionable half — `crates/lanekeep-cli/src/main.rs` records that it was once a lie,
         // printed by the code that had dropped the flag it names.
-        for phrase in ["the run exceeded its", "raise it with `--timeout`"] {
+        //
+        // The other three are #290's: a breach under load has to say the budget is wall-clock
+        // time, which is why a busy machine runs out of it; name the config key as well as the
+        // flag, since a CI job usually sets the former; and say how to find out where the time
+        // went, since the message itself names no rule.
+        for phrase in [
+            "the run exceeded its",
+            "raise it with `--timeout`",
+            "wall-clock time",
+            "`timeouts.global`",
+            "`--profile`",
+        ] {
             assert!(walker.contains(phrase), "`{phrase}` is gone from: {walker}");
         }
     }
@@ -9834,13 +9876,15 @@ export default defineRule({
                 .run_cold()
                 .expect_err("a run whose budget is spent must not finish the corpus");
 
-            // The variant, not the wording, and that is what makes this discriminating. A
-            // breach the interrupt handler noticed arrives as `RunError::Rule`, naming a rule
-            // and a file; this one is the walker's own, and it names neither because neither
-            // is at fault.
+            // The variant says the run was blamed rather than a rule. It no longer says *which*
+            // mechanism noticed: since #290 the interrupt handler's breach is reported the same
+            // way as the walker's. The handlers here are cheap enough that on an idle machine
+            // only the walker is in a position to notice. The case that proves the walker's
+            // check by construction, whatever the load, is
+            // `a_run_no_handler_runs_in_is_stopped_by_a_spent_budget`.
             assert!(
                 matches!(error, RunError::RunTimeout { .. }),
-                "the run had to be stopped between files rather than inside a handler: {error}"
+                "a spent run budget is the run's failure, not a rule's: {error}"
             );
         }
 
@@ -9861,6 +9905,141 @@ export default defineRule({
                 FILES,
                 "every file has to have been checked, or the case above stopped nothing"
             );
+        }
+
+        /// A file with no `debugger` statement, so `no-debugger`'s query matches nothing in it.
+        const UNMATCHED: &str = "export function a() {\n  return 1;\n}\n";
+
+        /// `FILES` files `no-debugger` never matches, under one global budget.
+        fn matchless_corpus(name: &str, global_ms: u64) -> Project {
+            let config = config(&format!(", timeouts: {{ global: {global_ms} }}"));
+            let mut owned: Vec<(String, String)> = vec![
+                ("rule.ts".to_owned(), DEBUGGER_RULE.to_owned()),
+                ("lanekeep.config.ts".to_owned(), config),
+            ];
+            for i in 0..FILES {
+                owned.push((format!("src/f{i}.ts"), UNMATCHED.to_owned()));
+            }
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            Project::new(name, &borrowed)
+        }
+
+        #[test]
+        fn a_run_no_handler_runs_in_is_stopped_by_a_spent_budget() {
+            // The walker's own check, isolated by construction rather than told apart by the
+            // variant. Every mechanism that notices a spent run budget now reports the same
+            // `RunError::RunTimeout` (#290), so the variant no longer says *which* noticed. What
+            // does is the corpus: no file matches the rule's query, so no handler is invoked and
+            // no worker sandbox is ever built — the interrupt handler has nothing to interrupt.
+            // A zero budget is spent before the first file. If `check_file` stopped asking the
+            // clock, this run would complete, and `expect_err` is what would say so — on an idle
+            // machine and a saturated one alike.
+            let project = matchless_corpus("run-budget-matchless-spent", 0);
+
+            let error = project
+                .run_cold()
+                .expect_err("a spent budget must stop a run even when no handler ever runs");
+            assert!(matches!(error, RunError::RunTimeout { .. }), "{error}");
+        }
+
+        #[test]
+        fn the_same_matchless_corpus_completes_under_a_real_budget() {
+            // The control. Without it, the case above is equally consistent with a corpus that
+            // cannot be checked at all.
+            let project = matchless_corpus("run-budget-matchless-raised", 60_000);
+
+            let outcome = project.run_cold().expect("a minute is ample");
+            assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+        }
+
+        /// A rule whose handler burns bytecode for seconds, with a rule budget it cannot reach.
+        ///
+        /// `local/burn`'s `check` runs about two seconds in a debug build. Its own budget is an
+        /// hour, so the only limit that can bind is the run's.
+        const BURNING_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/burn',\n\
+              query: '(debugger_statement) @stmt',\n\
+              card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) {\n\
+                let n = 0;\n\
+                for (let i = 0; i < 6000000; i++) { n += i % 7; }\n\
+                if (n < 0) ctx.report(m.stmt);\n\
+              },\n\
+            });\n";
+
+        /// The same burn, in a `reduce` phase. `check` only emits the fact that makes a
+        /// reduce phase run at all.
+        const BURNING_REDUCE_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/burn-reduce',\n\
+              query: '(debugger_statement) @stmt',\n\
+              card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) { ctx.emitFact({ kind: 'seen' }); },\n\
+              reduce(ctx) {\n\
+                let n = 0;\n\
+                for (let i = 0; i < 6000000; i++) { n += i % 7; }\n\
+                if (n < 0) ctx.report({ file: 'src/a.ts', line: 1, column: 1 }, 'never');\n\
+              },\n\
+            });\n";
+
+        /// One matched file under `rule`, with an hour's rule budget and a 50 ms run budget.
+        fn burning(name: &str, rule: &str) -> Project {
+            Project::new(
+                name,
+                &[
+                    ("rule.ts", rule),
+                    (
+                        "lanekeep.config.ts",
+                        &config(", timeouts: { rule: 3600000, global: 50 }"),
+                    ),
+                    ("src/a.ts", MATCHED),
+                ],
+            )
+        }
+
+        /// The run's breach, rendered: what a user would read.
+        fn assert_names_the_run(error: &RunError, absent: &[&str]) {
+            assert!(
+                matches!(error, RunError::RunTimeout { .. }),
+                "a spent run budget is the run's failure, not a rule's: {error}"
+            );
+            let rendered = error.to_string();
+            for name in absent {
+                assert!(
+                    !rendered.contains(name),
+                    "`{name}` was only running when the clock ran out, and is named: {rendered}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_global_breach_inside_a_handler_names_the_run_not_the_rule() {
+            // #290. QuickJS's interrupt handler notices the spent run budget while `local/burn`
+            // is executing, and the run used to be reported as ``rule `local/burn` failed on
+            // `src/a.ts` `` — blame for whichever rule and file the scheduler happened to have
+            // running, which differs from run to run. Under load the walker may notice first
+            // instead; that is the same variant, so this cannot flake on which one wins.
+            let project = burning("run-budget-in-handler", BURNING_RULE);
+
+            let error = project
+                .run_cold()
+                .expect_err("50 ms cannot cover two seconds of handler");
+            assert_names_the_run(&error, &["local/burn", "src/a.ts"]);
+        }
+
+        #[test]
+        fn a_global_breach_inside_reduce_names_the_run_not_the_rule() {
+            // The reduce phase's version, which named `<reduce>` as the file.
+            let project = burning("run-budget-in-reduce", BURNING_REDUCE_RULE);
+
+            let error = project
+                .run_cold()
+                .expect_err("50 ms cannot cover two seconds of reduce");
+            assert_names_the_run(&error, &["local/burn-reduce", "<reduce>"]);
         }
 
         /// A rule that throws on the one file whose text says `boom`, and nowhere else.
@@ -11381,12 +11560,16 @@ export default defineRule({
 
             let error = project
                 .run_with(vec![burning_rule("local/middle", Duration::from_hours(1))])
-                .expect_err("the run's own budget must stop it")
-                .to_string();
+                .expect_err("the run's own budget must stop it");
             assert!(
-                error.contains("the run exceeded its"),
+                matches!(error, RunError::RunTimeout { .. }),
                 "the global budget must be what is blamed, not the rule's: {error}"
             );
+            // #290: the epoch check notices while `local/middle` is executing, and that is an
+            // accident of scheduling rather than evidence against it.
+            let rendered = error.to_string();
+            assert!(rendered.contains("the run exceeded its"), "{rendered}");
+            assert!(!rendered.contains("local/middle"), "{rendered}");
         }
 
         #[test]
@@ -11396,32 +11579,19 @@ export default defineRule({
             // the `if let Some(slot)` that chooses an engine, so neither engine can be the one
             // that has it.
             //
-            // What makes this discriminating is the *variant*. Measured against the commit
-            // before this one, the same fixture failed with `RunError::Rule` — the epoch
-            // mechanism noticed, mid-instantiation, and blamed `local/middle` for `src/a.ts`.
-            // That is a rule and a file named for a breach that is about neither, and it is
-            // only luck that anything noticed at all: `AGENTS.md` records that epoch checks
-            // live inside guest code, so a tick that lands between two calls is invisible to
-            // them. `RunError::RunTimeout` can only come from the walker.
+            // What used to make this discriminating was the *variant*: the epoch mechanism
+            // reported `RunError::Rule`, so `RunError::RunTimeout` could only come from the
+            // walker. Since #290 every mechanism reports `RunTimeout` — a rule that happened to
+            // be executing is not a culprit — so the discrimination is now structural instead.
+            // The file holds nothing the component's query matches, so the guest is never
+            // entered and no store is built: nothing but the outer check *can* stop this run.
+            // Without it the run completes and `expect_err` says so.
             //
-            // A budget of zero is a run whose clock is spent before the first file, which is
-            // the one arrangement in which nothing but the outer check can fire — the guest is
-            // never entered, so there is no epoch deadline to trip. `lanekeep-wasm`'s own
-            // limit tests avoid a born-expired clock for the opposite reason, that
-            // instantiation is itself a budgeted guest call; here that is exactly what must
-            // not happen.
-            let config = "import { defineConfig } from 'lanekeep';\n\
-                 import r0 from './rule-a';\n\
-                 export default defineConfig({ include: ['src/**/*.ts'], \
-                 namespaces: ['local'], timeouts: { global: 0 }, rules: [r0] });\n";
-            let project = Project::new(
-                "component-spent-budget",
-                &[
-                    ("rule-a.ts", &debugger_rule("local/alpha")),
-                    ("lanekeep.config.ts", config),
-                    ("src/a.ts", "const alpha = 1;\n"),
-                ],
-            );
+            // A budget of zero is a run whose clock is spent before the first file.
+            // `lanekeep-wasm`'s own limit tests avoid a born-expired clock for the opposite
+            // reason, that instantiation is itself a budgeted guest call; here that is exactly
+            // what must not happen.
+            let project = matchless_component_project("component-spent-budget", 0);
 
             let error = project
                 .run_with(vec![component_rule("local/middle", 1, false)])
@@ -11430,6 +11600,36 @@ export default defineRule({
                 matches!(error, RunError::RunTimeout { .. }),
                 "the walker had to stop this before any guest ran: {error}"
             );
+        }
+
+        #[test]
+        fn the_same_matchless_component_corpus_completes_under_a_real_budget() {
+            // The control for the case above: the corpus is checkable, so a stop there is the
+            // budget's doing.
+            let project = matchless_component_project("component-real-budget", 60_000);
+
+            let outcome = project
+                .run_with(vec![component_rule("local/middle", 1, false)])
+                .expect("a minute is ample for one file");
+            assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+        }
+
+        /// One file that neither the component rule's query nor `local/alpha`'s matches.
+        fn matchless_component_project(name: &str, global_ms: u64) -> Project {
+            let config = format!(
+                "import {{ defineConfig }} from 'lanekeep';\n\
+                 import r0 from './rule-a';\n\
+                 export default defineConfig({{ include: ['src/**/*.ts'], \
+                 namespaces: ['local'], timeouts: {{ global: {global_ms} }}, rules: [r0] }});\n"
+            );
+            Project::new(
+                name,
+                &[
+                    ("rule-a.ts", &debugger_rule("local/alpha")),
+                    ("lanekeep.config.ts", &config),
+                    ("src/a.ts", "alpha();\n"),
+                ],
+            )
         }
 
         #[test]

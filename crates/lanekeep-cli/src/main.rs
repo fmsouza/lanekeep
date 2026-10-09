@@ -58,7 +58,12 @@ enum Command {
         #[arg(long)]
         warn_only: bool,
 
-        /// Global wall-clock budget in milliseconds.
+        /// The run's global budget, in milliseconds. Default 15000.
+        ///
+        /// Overrides `timeouts.global` from the config. It is wall-clock time, not CPU time,
+        /// so a large corpus on a busy machine can need more than the default. Spending it
+        /// cancels the whole run with exit code 2 rather than skipping what is left, and the
+        /// message names the run rather than whichever rule happened to be running.
         #[arg(long)]
         timeout: Option<u64>,
 
@@ -1885,6 +1890,31 @@ fn explain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `check --help` states the global budget's default and what kind of time it is (#290).
+    ///
+    /// The default is a literal in a doc comment, because clap cannot interpolate a constant
+    /// into one, so this is what keeps the literal tied to `DEFAULT_GLOBAL_TIMEOUT`.
+    #[test]
+    fn the_timeout_help_states_the_default() {
+        use clap::CommandFactory as _;
+
+        let mut cli = Cli::command();
+        let check = cli
+            .find_subcommand_mut("check")
+            .expect("`check` is a subcommand");
+        let help = check.render_long_help().to_string();
+
+        let default = lanekeep_core::DEFAULT_GLOBAL_TIMEOUT
+            .as_millis()
+            .to_string();
+        assert!(
+            help.contains(&format!("Default {default}")),
+            "--timeout's help must state the {default} ms default:\n{help}"
+        );
+        assert!(help.contains("wall-clock"), "{help}");
+        assert!(help.contains("timeouts.global"), "{help}");
+    }
 
     /// The trailing `dropped` column is a construct count, not a file disposition — it has
     /// to render in the header and on each row without disturbing the six file-disposition
