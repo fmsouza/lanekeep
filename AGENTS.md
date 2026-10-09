@@ -308,6 +308,14 @@ down to single items and every item gets its own. A design that relies on per-wo
 being shared is therefore untestable at small scale and only wrong at large scale. Either
 make the state per item, or accept that a test cannot distinguish the two.
 
+**A JavaScript rule's module-level state is per-worker state of exactly this kind**, since the
+sandbox is what `map_init` builds: under the default pool a small corpus gives every file its
+own sandbox, and a module-level memo that answered for the wrong file passes. One thread is the
+lever that makes it observable — `RAYON_NUM_THREADS=1` leaves nothing to steal, so one sandbox
+sees every file in order. `Corpus::run_on_one_worker` in `crates/lanekeep-cli/tests/corpus/`
+runs that way; `no-assertionless-test`'s quoted-module memo (#292) is tested through it, and a
+mutant memo that never invalidated passed the default run and failed this one.
+
 **And the corollary that reads the other way round: the initializer count grows with the input,
 so any "bounded by threads × N" arithmetic about it is wrong.** The entry above warns about small
 inputs; the more expensive mistake is at large ones. Measured through `lanekeep-engine` on

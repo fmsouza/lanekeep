@@ -1118,6 +1118,15 @@ The TypeScript modifiers are an allow-list. Every other member of `it` or `test`
 hook, a group or configuration rather than a test, and is never reported. The same holds for a
 table: `it.only.each(table)(...)` is a test, `describe.each(table)(...)` is a group.
 
+`it` and `test` are not the only names a test is declared by. An alias of a test framework's
+`it` or `test` export — `import { it as base } from 'vitest'` — is followed through its import
+binding, so a local `base` that shadows it is not a test. The frameworks followed are `vitest`,
+`@jest/globals`, `@playwright/test`, `bun:test`, `node:test` and `mocha`. Any other name — a
+fixture-extended Playwright `test` exported or imported under another name, such as
+`import { test as pw } from './fixtures'` — is listed in `testCallees`. Every name, however it
+was reached, takes the same modifier and table forms and the same allow-list, so `pw.only(...)`
+is a test and `pw.beforeEach(...)` is not.
+
 ```json
 {
   "rules": [
@@ -1126,7 +1135,8 @@ table: `it.only.each(table)(...)` is a test, `describe.each(table)(...)` is a gr
       "options": {
         "tests": ["src/**", "tests/**"],
         "assertions": { "go": ["suite."] },
-        "allowHelpers": ["expectValidResponse"]
+        "allowHelpers": ["expectValidResponse"],
+        "testCallees": ["pw"]
       }
     }
   ]
@@ -1145,6 +1155,7 @@ above applies when it is configured with `{}`.
 | `tests` | `string[]` | Path globs that gate where the rule looks. Omitted means everywhere. |
 | `assertions` | `{ [language]: string[] }` | Per-language additions to the default vocabulary. |
 | `allowHelpers` | `string[]` | Names that count as asserting in every language. |
+| `testCallees` | `string[]` | Further TypeScript names a test is declared by, beside `it` and `test`. Plain identifiers only; anything else fails to load. |
 
 Vocabulary entries are matched as **prefixes** of the normalized callee — whitespace stripped,
 `?.` folded to `.` — so `t.Error` covers `t.Errorf` and `self.assert` covers every
@@ -1160,6 +1171,11 @@ count as asserting. Go's receiver is matched by its conventional name, so a
 `func TestX(tt *testing.T)` asserting through `tt.Error` needs `assertions: { "go": ["tt."] }`.
 A Rust `#[cfg(test)]` attribute gates compilation and does not make a function a test; only
 `#[test]` and `::test` attribute paths do.
+
+An import alias is followed only from the frameworks listed above: the host can ask whether a
+binding is a given export of a given module, but not which export it is from a module it does
+not name, so a project's own fixture module is reached through `testCallees` instead. A
+namespace import (`import * as v from 'vitest'`, then `v.it(...)`) is not followed.
 
 ---
 
