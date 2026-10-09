@@ -789,6 +789,10 @@ mod tests {
         // came onto main: #95 added `language: ['typescript', 'tsx']` to each, which the
         // `rule-declares-language` self-check rule requires. That is a deliberate change to
         // the frozen set — the addition is the point, not a side effect.
+        //
+        // `no-restricted-imports.ts` was re-recorded again for #291, which widened its query
+        // to re-exports, `require` and `import()`. A change to what the rule checks, made on
+        // purpose, rather than anything a migration did to it.
         const FROZEN: &[(&str, &str, &[u8])] = &[
             (
                 "rules/no-circular-imports.ts",
@@ -802,7 +806,7 @@ mod tests {
             ),
             (
                 "rules/no-restricted-imports.ts",
-                "18e3ff58132aa9d17850370de34a976299ad2cc4b27bd6f4f0b5db49fd83dd7d",
+                "2130f01a2e03d51b26a206082bc00edd5d6fc2465d82ce8a8ec829beee74a9e3",
                 include_bytes!("../rules/no-restricted-imports.ts"),
             ),
             (
