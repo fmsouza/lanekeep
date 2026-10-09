@@ -1105,7 +1105,7 @@ is per-language is how a test is recognized and what counts as asserting:
 
 | Language | A test is | Asserts by default |
 | --- | --- | --- |
-| TypeScript/TSX | an `it(...)`/`test(...)` call with a block-bodied callback, its modifier forms included: `.only`, `.skip`, `.concurrent`, `.fails`, `.failing`, `.fail`, `.fixme` | `expect*`, `assert*` |
+| TypeScript/TSX | an `it(...)`/`test(...)` call with a block-bodied callback, its modifier forms included: `.only`, `.skip`, `.concurrent`, `.fails`, `.failing`, `.fail`, `.fixme`; and the table forms `it.each(table)(...)` and `` it.each`...`(...) ``, modifiers before `.each` included | `expect*`, `assert*` |
 | Python | a `def test*` function, methods included | the `assert` statement, `self.assert*`, `self.fail`, `pytest.raises` |
 | Go | `func Test*` taking `*testing.T` | `t.Error*`, `t.Fatal*`, `t.Fail*`, `assert.*`, `require.*` |
 | Rust | a `fn` under `#[test]`, or an attribute path ending `::test` (`#[tokio::test]`) | `assert*!`, `debug_assert*!`, `panic!` |
@@ -1115,7 +1115,8 @@ Rust test under `#[should_panic]` legitimately assert nothing and are never repo
 
 The TypeScript modifiers are an allow-list. Every other member of `it` or `test` — Playwright's
 `test.beforeEach`, `test.afterAll`, `test.describe`, `test.step`, `test.use` and the like — is a
-hook, a group or configuration rather than a test, and is never reported.
+hook, a group or configuration rather than a test, and is never reported. The same holds for a
+table: `it.only.each(table)(...)` is a test, `describe.each(table)(...)` is a group.
 
 ```json
 {

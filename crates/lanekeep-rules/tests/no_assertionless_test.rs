@@ -84,6 +84,66 @@ fn the_test_declaring_modifiers_are_still_tests() {
 }
 
 #[test]
+fn table_driven_tests_are_tests() {
+    // #288's repro: only the plain `it` was reported. `it.each(table)` returns the function
+    // the test is declared with, so the callback is in the *outer* call of a call.
+    tester_for("ts", "{}")
+        .reports_at(
+            "it('plain', () => {\n  void 1;\n});\n\nit.each([[1]])('x %s', (n) => {\n  void n;\n});\n\ntest.each([[1]])('y %s', (n) => {\n  void n;\n});\n",
+            &[(1, 1), (5, 1), (9, 1)],
+        )
+        .expect("the callback handed to what `.each(table)` returns is a test body");
+}
+
+#[test]
+fn a_tagged_template_table_is_a_table_driven_test() {
+    // The template-literal table makes the inner call's arguments a `template_string` rather
+    // than an `arguments` node; both grammars are asserted, since tsx is a separate parse.
+    for extension in ["ts", "tsx"] {
+        tester_for(extension, "{}")
+            .reports_at(
+                "it.each`\n  a    | b\n  ${1} | ${2}\n`('$a and $b', ({ a, b }) => {\n  add(a, b)\n})\n",
+                &[(1, 1)],
+            )
+            .expect("a template-literal table declares the same test");
+    }
+}
+
+#[test]
+fn a_typed_table_is_a_table_driven_test() {
+    // TypeScript suites write the row type on the table call, which puts `type_arguments` on
+    // the inner call; the callee the handler judges is still `test.each`.
+    tester_for("ts", "{}")
+        .reports_at(
+            "test.each<[number, number]>([[1, 2]])('%i and %i', (a, b) => {\n  add(a, b)\n})\n",
+            &[(1, 1)],
+        )
+        .expect("type arguments on the table call do not change the test shape");
+}
+
+#[test]
+fn each_combined_with_a_modifier_is_a_test() {
+    // Modifiers sit before `.each`, and jest documents them chained: `test.concurrent.only.each`.
+    tester_for("ts", "{}")
+        .reports_at(
+            "it.only.each([1])('a %s', (n) => {\n  a(n)\n})\ntest.concurrent.each([1])('b %s', async (n) => {\n  b(n)\n})\nit.skip.each([1])('c %s', (n) => {\n  c(n)\n})\ntest.concurrent.only.each([1])('d %s', async (n) => {\n  d(n)\n})\n",
+            &[(1, 1), (4, 1), (7, 1), (10, 1)],
+        )
+        .expect("a modifier before `.each` still declares a test");
+}
+
+#[test]
+fn table_driven_groups_and_asserting_tables_are_fine() {
+    // The over-widening direction: a describe table is a grouping, an asserting table passes,
+    // and `each` called directly is not a test — `.each` is not a modifier.
+    tester_for("ts", "{}")
+        .accepts(
+            "describe.each([1])('group %s', (n) => {\n  setup(n)\n})\ntest.describe.each([1])('pw %s', (n) => {\n  setup(n)\n})\nit.each([1])('ok %s', (n) => {\n  expect(n).toBe(1)\n})\nit.each('direct', () => {\n  run()\n})\n",
+        )
+        .expect("only a test callee's table declares a test, and asserting bodies pass");
+}
+
+#[test]
 fn an_ordinary_function_call_is_not_a_test() {
     tester_for("ts", "{}")
         .accepts("setup('adds', () => {\n  add(1, 2)\n})\n")
