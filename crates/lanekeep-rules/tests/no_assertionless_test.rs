@@ -144,6 +144,87 @@ fn table_driven_groups_and_asserting_tables_are_fine() {
 }
 
 #[test]
+fn the_test_callees_option_names_more_tests() {
+    // #292: a fixture-extended `test` under another name. A configured name is a base exactly
+    // as `it` and `test` are, so the modifier and table forms come with it — and so does the
+    // allow-list, which keeps its hooks and groups silent.
+    tester_for("ts", "{ testCallees: ['pw'] }")
+        .reports_at(
+            "pw('a', async () => {\n  a()\n})\npw.only('b', () => {\n  b()\n})\npw.each([[1]])('c %s', (n) => {\n  c(n)\n})\npw.beforeEach(() => {\n  seed()\n})\npw.describe('group', () => {\n  setup()\n})\n",
+            &[(1, 1), (4, 1), (7, 1)],
+        )
+        .expect("a configured callee declares tests in every form `test` does");
+}
+
+/// #292's repro: an aliased framework import, an aliased fixture import, and a plain `it`.
+const ALIAS_REPRO: &str = "import { it as base } from 'vitest';\nimport { test as pw } from './fixtures';\n\nbase('aliased vitest', () => {\n  void 1;\n});\n\npw('fixture test', async () => {\n  void 2;\n});\n\nit('plain', () => {\n  void 3;\n});\n";
+
+#[test]
+fn an_aliased_framework_import_is_a_test() {
+    // The framework alias is followed through its binding with no configuration; the fixture
+    // module is not a framework, so its alias needs naming — and once named, all three report.
+    tester_for("ts", "{}")
+        .reports_at(ALIAS_REPRO, &[(4, 1), (12, 1)])
+        .expect("`base` is vitest's `it`, so it declares a test");
+    tester_for("ts", "{ testCallees: ['pw'] }")
+        .reports_at(ALIAS_REPRO, &[(4, 1), (8, 1), (12, 1)])
+        .expect("with `pw` named, every test in the repro is checked");
+}
+
+#[test]
+fn an_alias_takes_modifiers_and_tables() {
+    // An alias is a base like any other: its modifier and table forms are tests, its hooks and
+    // groups are not. Both grammars, since tsx is a separate parse.
+    for extension in ["ts", "tsx"] {
+        tester_for(extension, "{}")
+            .reports_at(
+                "import { test as pwt } from '@playwright/test';\nimport { it as check } from '@jest/globals';\n\npwt.only('a', async () => {\n  a()\n});\npwt.describe('group', () => {\n  setup()\n});\npwt.beforeEach(() => {\n  seed()\n});\ncheck.each([[1]])('b %s', (n) => {\n  b(n)\n});\n",
+                &[(4, 1), (13, 1)],
+            )
+            .expect("an aliased test callee keeps every form and the allow-list");
+    }
+}
+
+#[test]
+fn an_alias_of_a_framework_export_that_is_not_a_test_is_not_a_test() {
+    // Following resolves the *export*, not the module: vitest's `describe` under another name
+    // is still a group.
+    tester_for("ts", "{}")
+        .accepts(
+            "import { describe as group, beforeEach as before } from 'vitest';\n\ngroup('g', () => {\n  setup()\n});\nbefore(() => {\n  seed()\n});\n",
+        )
+        .expect("only `it` and `test` exports declare a test");
+}
+
+#[test]
+fn a_local_binding_shadowing_an_alias_is_not_a_test() {
+    // Binding-exact: inside `run`, `base` is the parameter, not the import.
+    tester_for("ts", "{}")
+        .accepts(
+            "import { it as base } from 'vitest';\n\nfunction run(base) {\n  base('not a test', () => {\n    work()\n  });\n}\n",
+        )
+        .expect("a shadowing local is not vitest's `it`");
+}
+
+#[test]
+fn test_callees_must_be_plain_names() {
+    // A string would make the membership test a substring test, and a dotted entry can never
+    // equal a callee's base: both would be an option silently ignored, so both refuse to load.
+    for options in [
+        "{ testCallees: 'pw' }",
+        "{ testCallees: ['test.describe'] }",
+    ] {
+        let error = tester_for("ts", options)
+            .accepts("pw('a', () => {\n  expect(1).toBe(1)\n})\n")
+            .expect_err("a malformed testCallees does not build");
+        assert!(
+            error.to_string().contains("testCallees"),
+            "the refusal names the option for {options}: {error}"
+        );
+    }
+}
+
+#[test]
 fn an_ordinary_function_call_is_not_a_test() {
     tester_for("ts", "{}")
         .accepts("setup('adds', () => {\n  add(1, 2)\n})\n")

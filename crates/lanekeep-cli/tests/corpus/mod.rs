@@ -118,42 +118,40 @@ impl Corpus {
     /// assert — a cross-file rule that reports the same set in a different order every run
     /// has failed the determinism invariant even though the set is right.
     pub(crate) fn run(&self) -> Vec<String> {
-        let output = self.invoke();
+        violations(&self.invoke())
+    }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.code() != Some(2),
-            "the run failed:\n{stderr}\n{stdout}"
-        );
-
-        let document: serde_json::Value =
-            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("bad json ({e}): {stdout}"));
-
-        document["violations"]
-            .as_array()
-            .unwrap_or_else(|| panic!("no violations array in: {stdout}"))
-            .iter()
-            .map(|v| {
-                let at = &v["location"];
-                format!(
-                    "{}:{}:{} {}",
-                    at["file"].as_str().unwrap_or("?"),
-                    at["position"]["line"].as_u64().unwrap_or(0),
-                    at["position"]["column"].as_u64().unwrap_or(0),
-                    v["message"].as_str().unwrap_or("?"),
-                )
-            })
-            .collect()
+    /// [`Corpus::run`] with the whole corpus checked on one worker, so one sandbox sees every
+    /// file in turn.
+    ///
+    /// rayon's `map_init` builds a worker's state per *chunk*, and at the size of a test corpus
+    /// it splits down to single files — so under the default pool every file can get a fresh
+    /// sandbox, and a rule's module-level state is never carried from one file to the next.
+    /// Behavior that depends on that state reaching a second file is invisible to
+    /// [`Corpus::run`]; with one thread there is nothing to steal, and it is not.
+    pub(crate) fn run_on_one_worker(&self) -> Vec<String> {
+        violations(
+            &self
+                .command()
+                .env("RAYON_NUM_THREADS", "1")
+                .output()
+                .expect("runs the binary"),
+        )
     }
 
     /// One `lanekeep check` over this project, however it turns out.
     ///
-    /// Shared by both readings above so that neither can drift into checking a different run
-    /// from the other — the budgets in particular, which are what keep a loaded machine from
+    /// Shared by every reading above so that none can drift into checking a different run
+    /// from the others — the budgets in particular, which are what keep a loaded machine from
     /// being reported as a misbehaving rule.
     fn invoke(&self) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_lanekeep"))
+        self.command().output().expect("runs the binary")
+    }
+
+    /// The `lanekeep check` every reading of this project runs.
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lanekeep"));
+        command
             .arg("check")
             .arg(&self.dir)
             .arg("--format")
@@ -180,10 +178,38 @@ impl Corpus {
             // The config this helper writes carries the same two budgets, because `--timeout`
             // sets only the global one.
             .arg("--timeout")
-            .arg("600000")
-            .output()
-            .expect("runs the binary")
+            .arg("600000");
+        command
     }
+}
+
+/// Violations as `file:line:column message`, in the order the tool reported them.
+fn violations(output: &std::process::Output) -> Vec<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.code() != Some(2),
+        "the run failed:\n{stderr}\n{stdout}"
+    );
+
+    let document: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("bad json ({e}): {stdout}"));
+
+    document["violations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no violations array in: {stdout}"))
+        .iter()
+        .map(|v| {
+            let at = &v["location"];
+            format!(
+                "{}:{}:{} {}",
+                at["file"].as_str().unwrap_or("?"),
+                at["position"]["line"].as_u64().unwrap_or(0),
+                at["position"]["column"].as_u64().unwrap_or(0),
+                v["message"].as_str().unwrap_or("?"),
+            )
+        })
+        .collect()
 }
 
 impl Drop for Corpus {

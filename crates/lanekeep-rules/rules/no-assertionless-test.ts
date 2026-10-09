@@ -24,6 +24,11 @@ import { defineRule } from 'lanekeep'
  * function the test calls is invisible here, which is the same limit `expect-expect` has —
  * name such helpers in `allowHelpers` and they count as asserting in every language.
  *
+ * A typescript test callee is `it`, `test`, a name listed in `testCallees` — a fixture-extended
+ * `test` exported under another name — or an alias of a test framework's `it`/`test`, followed
+ * through its import binding (`import { it as base } from 'vitest'`); every one of them takes
+ * the modifier and table forms.
+ *
  * Known limits, deliberate for v1: go's receiver is matched by its conventional name (a
  * `func TestX(tt *testing.T)` calling `tt.Error` needs `assertions: { go: ['tt.'] }`), and
  * table-driven tests whose assertion lives in a loop body are covered only because the
@@ -39,6 +44,7 @@ import { defineRule } from 'lanekeep'
  *       tests: ['tests/**', 'src/**'],
  *       assertions: { go: ['suite.'] },
  *       allowHelpers: ['expectValidResponse'],
+ *       testCallees: ['authTest'],
  *     }),
  *   ],
  * })
@@ -49,6 +55,7 @@ export default function noAssertionlessTest(options) {
   const tests = options?.tests
   const extra = options?.assertions ?? {}
   const helpers = options?.allowHelpers ?? []
+  const callees = [...TEST_CALLEES, ...testCalleesOf(options)]
 
   const vocabulary = (family) => [
     ...DEFAULT_ASSERTIONS[family],
@@ -106,7 +113,9 @@ export default function noAssertionlessTest(options) {
       const family = familyOf(ctx.filePath)
 
       if (family === 'typescript') {
-        if (!isTestCallee(normalize(ctx.text(m.fn)), m.table !== undefined)) return
+        const base = testShapeBase(normalize(ctx.text(m.fn)), m.table !== undefined)
+        if (base === undefined) return
+        if (!callees.includes(base) && !isFrameworkAlias(ctx, m.fn, base)) return
         if (asserts(ctx, m.body, CALLS.typescript, vocabulary('typescript'))) return
         ctx.report(m.def, 'test asserts nothing')
         return
@@ -175,7 +184,7 @@ const TS_QUERY = `
     ])) @def
 `
 
-/** The names a typescript test is declared by. */
+/** The names a typescript test is declared by, before `testCallees` adds a project's own. */
 const TEST_CALLEES = ['it', 'test']
 
 /**
@@ -190,7 +199,11 @@ const TEST_CALLEES = ['it', 'test']
 const TEST_MODIFIERS = ['only', 'skip', 'concurrent', 'fails', 'failing', 'fail', 'fixme']
 
 /**
- * Whether a normalized callee declares a test: `it` or `test`, followed by modifiers only.
+ * The base a normalized callee would declare a test with, when its shape is a test's: the
+ * first segment, followed by modifiers only. `undefined` when the shape is not.
+ *
+ * Whether the base is a test callee is the caller's question — by name, against `it`, `test`
+ * and `testCallees` — so every name gets every modifier and the table form at no cost.
  *
  * With `table`, the callee is the one a table call was made on, so it must end in `.each`,
  * and the modifiers are the segments before it — jest documents them chained, as in
@@ -198,12 +211,124 @@ const TEST_MODIFIERS = ['only', 'skip', 'concurrent', 'fails', 'failing', 'fail'
  * declares nothing. How many modifiers the plain form can carry is the query's to say; it
  * admits one.
  */
-function isTestCallee(callee, table) {
+function testShapeBase(callee, table) {
   const segments = callee.split('.')
-  if (table && segments.pop() !== 'each') return false
+  if (table && segments.pop() !== 'each') return undefined
   const [base, ...modifiers] = segments
-  if (!TEST_CALLEES.includes(base)) return false
-  return modifiers.every((modifier) => TEST_MODIFIERS.includes(modifier))
+  if (!modifiers.every((modifier) => TEST_MODIFIERS.includes(modifier))) return undefined
+  return base
+}
+
+/**
+ * The modules whose `it` and `test` exports declare a test under whatever local name they are
+ * imported as — `import { it as base } from 'vitest'`.
+ *
+ * A fixed list because the host answers "is this the export `name` of module `m`" only for an
+ * exact `m`; nothing asks which export a binding is without naming its module. A fixture
+ * module's `test` (`import { test as pw } from './fixtures'`) is therefore not followed — name
+ * it in `testCallees`.
+ */
+const TEST_MODULES = [
+  'vitest',
+  '@jest/globals',
+  '@playwright/test',
+  'bun:test',
+  'node:test',
+  'mocha',
+]
+
+/**
+ * Whether the callee's base binds to a test framework's `it` or `test`, under another name.
+ *
+ * Asked last, since it is the only part of the judgment that crosses into the host, and only
+ * for a test-shaped callee whose base is no known name — every `useEffect(() => {...})` in a
+ * React file is one. So the modules are first narrowed in the sandbox, with no crossing, by
+ * `quotedTestModules`. Most files quote none, and stop there. Only then is the base's binding
+ * resolved, once per module the text names, and the export asked about only for the module it
+ * is from. Binding-exact: a local `base` shadowing the import resolves to the local and is not
+ * a test.
+ */
+function isFrameworkAlias(ctx, callee, base) {
+  if (!isIdentifier(base)) return false
+  const quoted = quotedTestModules(ctx.fileText)
+  if (quoted.length === 0) return false
+  const node = baseIdentifier(ctx, callee)
+  if (node === undefined) return false
+  return quoted.some(
+    (module) =>
+      ctx.resolvesToImport(node, module) &&
+      TEST_CALLEES.some((name) => ctx.resolvesToImport(node, module, name)),
+  )
+}
+
+/**
+ * The framework modules a file's text quotes — the only ones an import in it can bind from,
+ * since a static import spells its specifier as a string literal.
+ *
+ * Remembered for the last text asked about, because it is asked once per candidate and is the
+ * same answer for every candidate in a file. On a hook-heavy TSX corpus both alternatives made
+ * the whole run several times slower — scanning the text once per candidate, and asking the host
+ * instead, one binding resolution per module for every hook call; the pull request that added
+ * this has the measurements.
+ *
+ * The memo is not state in the sense the determinism invariant forbids: its value is a pure
+ * function of its key, and the key is the whole text, compared by content. Two files with the
+ * same text share an answer because they have the same answer; no order of files, workers or
+ * runs can change what it returns.
+ */
+function quotedTestModules(text) {
+  if (text !== lastQuoted.text) {
+    lastQuoted = {
+      text,
+      modules: TEST_MODULES.filter(
+        (module) => text.includes(`'${module}'`) || text.includes(`"${module}"`),
+      ),
+    }
+  }
+  return lastQuoted.modules
+}
+
+let lastQuoted = { text: undefined, modules: [] }
+
+/**
+ * The identifier a callee starts with — `pw` in `pw`, `pw.only` and `pw.only.each` — reached
+ * through each `member_expression`'s object, its first named child that is not a comment.
+ * Compared with `undefined`, never truthiness: a handle is an integer and may be `0`.
+ */
+function baseIdentifier(ctx, callee) {
+  let node = callee
+  for (;;) {
+    const kind = ctx.kind(node)
+    if (kind === 'identifier') return node
+    if (kind !== 'member_expression') return undefined
+    node = ctx.namedChildren(node).find((child) => ctx.kind(child) !== 'comment')
+    if (node === undefined) return undefined
+  }
+}
+
+/**
+ * The `testCallees` option, refused when it could not mean anything.
+ *
+ * Each entry is a plain identifier because it is compared with a callee's *base*: a dotted
+ * entry (`test.describe`) could never equal one, and a string in place of the array would turn
+ * the membership test into a substring test. Either would be an option silently ignored —
+ * lowering what the rule sees with no sign — so both refuse to load instead.
+ */
+function testCalleesOf(options) {
+  const names = options?.testCallees
+  if (names === undefined) return []
+  if (!Array.isArray(names) || !names.every(isIdentifier)) {
+    throw new Error(
+      'no-assertionless-test: `testCallees` must be an array of plain identifiers, like ' +
+        `['pw'] — got ${JSON.stringify(names)}`,
+    )
+  }
+  return names
+}
+
+/** A string that could be a callee's base; `RegExp#test` alone would coerce `true` to one. */
+function isIdentifier(name) {
+  return typeof name === 'string' && /^[A-Za-z_$][\w$]*$/.test(name)
 }
 
 /** What counts as asserting when nothing is configured, per language family. */
