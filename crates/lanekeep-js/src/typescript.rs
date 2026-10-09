@@ -617,10 +617,10 @@ mod tests {
                 .collect()
         }
 
-        let typescript = declarations(tree_sitter_typescript::TYPESCRIPT_NODE_TYPES);
+        let typescript = declarations(lanekeep_tree_sitter_typescript::TYPESCRIPT_NODE_TYPES);
         assert_eq!(
             typescript,
-            declarations(tree_sitter_typescript::TSX_NODE_TYPES),
+            declarations(lanekeep_tree_sitter_typescript::TSX_NODE_TYPES),
             "the two grammars declare the same declaration kinds"
         );
 

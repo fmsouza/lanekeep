@@ -13,9 +13,9 @@ categories.workspace = true
 
 [dependencies]
 lanekeep-lang = { workspace = true }
+lanekeep-tree-sitter-typescript = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-javascript = { workspace = true }
-tree-sitter-typescript = { workspace = true }
 
 [[bench]]
 name = "cfg"

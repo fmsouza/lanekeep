@@ -114,7 +114,7 @@ mod tests {
     fn tree(source: &str) -> tree_sitter::Tree {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .set_language(&lanekeep_tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
             .expect("grammar loads");
         parser.parse(source, None).expect("parser returns a tree")
     }

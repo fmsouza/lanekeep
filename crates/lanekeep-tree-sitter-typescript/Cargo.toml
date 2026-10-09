@@ -1,0 +1,48 @@
+[package]
+name = "lanekeep-tree-sitter-typescript"
+description = "tree-sitter-typescript 0.23.2's TypeScript and TSX grammars, regenerated with two fixes lanekeep needs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Upstream's license, not the workspace's `MIT OR Apache-2.0`: nearly every byte here is
+# tree-sitter-typescript's, and its authors released it under MIT alone. `LICENSE` is theirs,
+# unchanged.
+license = "MIT"
+repository.workspace = true
+homepage.workspace = true
+authors = [
+    "Max Brunsfeld <maxbrunsfeld@gmail.com>",
+    "Amaan Qureshi <amaanq12@gmail.com>",
+    "Fred Souza <1396615+fmsouza@users.noreply.github.com>",
+]
+keywords = ["tree-sitter", "typescript", "tsx", "parser", "lanekeep"]
+categories = ["parsing"]
+# The generated parsers are what a build compiles; `grammar/` is how they were produced, shipped
+# so the published crate says what it is a patch of.
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "build.rs",
+    "src/**",
+    "common/scanner.h",
+    "typescript/src/**",
+    "tsx/src/**",
+    "grammar/**",
+]
+
+[dependencies]
+tree-sitter-language = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
+
+[dev-dependencies]
+tree-sitter = { workspace = true }
+
+[lints]
+workspace = true
+
+# `cc` is used only by `build.rs`, which cargo-machete does not scan.
+# `crates/lanekeep-lang-js/Cargo.toml` carries the same stanza for `blake3`.
+[package.metadata.cargo-machete]
+ignored = ["cc"]

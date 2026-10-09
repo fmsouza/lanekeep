@@ -44,6 +44,7 @@ lanekeep-server = { version = "0.12.0", path = "crates/lanekeep-server" }
 lanekeep-types = { version = "0.12.0", path = "crates/lanekeep-types" }
 lanekeep-rules = { version = "0.12.0", path = "crates/lanekeep-rules" }
 lanekeep-testkit = { version = "0.12.0", path = "crates/lanekeep-testkit" }
+lanekeep-tree-sitter-typescript = { version = "0.12.0", path = "crates/lanekeep-tree-sitter-typescript" }
 lanekeep-wasm = { version = "0.12.0", path = "crates/lanekeep-wasm" }
 
 # External dependencies are versioned once here so two crates cannot disagree, which
@@ -70,7 +71,12 @@ thiserror = { version = "2" }
 notify = { version = "8.2" }
 notify-debouncer-mini = { version = "0.7" }
 tree-sitter = { version = "0.27" }
-tree-sitter-typescript = { version = "0.23" }
+# The TypeScript and TSX grammars are not `tree-sitter-typescript` from crates.io but
+# `lanekeep-tree-sitter-typescript` above: its 0.23.2 regenerated with two fixes, because upstream
+# has shipped no grammar change since 2024-11 and two valid forms parse as `ERROR` there. Read
+# that crate's `lib.rs` before bumping anything here.
+tree-sitter-language = { version = "0.1" }
+cc = { version = "1" }
 tree-sitter-javascript = { version = "0.25" }
 tree-sitter-python = { version = "0.25" }
 tree-sitter-go = { version = "0.25" }
