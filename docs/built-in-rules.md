@@ -1105,13 +1105,17 @@ is per-language is how a test is recognized and what counts as asserting:
 
 | Language | A test is | Asserts by default |
 | --- | --- | --- |
-| TypeScript/TSX | an `it(...)`/`test(...)` call (`.only`/`.skip` forms included) with a block-bodied callback | `expect*`, `assert*` |
+| TypeScript/TSX | an `it(...)`/`test(...)` call with a block-bodied callback, its modifier forms included: `.only`, `.skip`, `.concurrent`, `.fails`, `.failing`, `.fail`, `.fixme` | `expect*`, `assert*` |
 | Python | a `def test*` function, methods included | the `assert` statement, `self.assert*`, `self.fail`, `pytest.raises` |
 | Go | `func Test*` taking `*testing.T` | `t.Error*`, `t.Fatal*`, `t.Fail*`, `assert.*`, `require.*` |
 | Rust | a `fn` under `#[test]`, or an attribute path ending `::test` (`#[tokio::test]`) | `assert*!`, `debug_assert*!`, `panic!` |
 
 Two exemptions are correctness rather than convenience: a Go test that calls `t.Skip*` and a
 Rust test under `#[should_panic]` legitimately assert nothing and are never reported.
+
+The TypeScript modifiers are an allow-list. Every other member of `it` or `test` — Playwright's
+`test.beforeEach`, `test.afterAll`, `test.describe`, `test.step`, `test.use` and the like — is a
+hook, a group or configuration rather than a test, and is never reported.
 
 ```json
 {
