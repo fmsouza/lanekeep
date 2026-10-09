@@ -1,5 +1,5 @@
 import { defineRule } from 'lanekeep'
-import { resolveImport } from 'lanekeep/paths'
+import { aliasTargets, resolveImport } from 'lanekeep/paths'
 
 /**
  * Import cycles.
@@ -49,9 +49,14 @@ export default function noCircularImports(options) {
     `,
 
     check(ctx, m) {
+      const to = ctx.text(m.source).slice(1, -1)
       ctx.emitFact({
         kind: 'edge',
-        to: ctx.text(m.source).slice(1, -1),
+        to,
+        // What the tsconfig's `paths` and `baseUrl` map a bare specifier to. Worked out
+        // here because only this phase can read the tsconfig, and reading it here makes it
+        // a tracked dependency of this file — see `lanekeep/paths`.
+        aliases: aliasTargets(ctx, to),
         line: ctx.line(m.stmt),
         column: ctx.column(m.stmt),
       })
@@ -64,7 +69,7 @@ export default function noCircularImports(options) {
       // Everything downstream inherits that determinism.
       const edges = new Map()
       for (const e of ctx.facts('edge')) {
-        const target = resolveImport(e.file, e.to, files)
+        const target = resolveImport(e.file, e.to, files, e.aliases)
         if (!target || target === e.file) continue
 
         if (!edges.has(e.file)) edges.set(e.file, [])

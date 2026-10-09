@@ -245,6 +245,48 @@ fn an_aliased_export_is_reported_under_the_name_it_publishes() {
     );
 }
 
+/// What `tsc --init`-style projects alias: `~/x` for `src/x`.
+const TILDE_PATHS: (&str, &str) = (
+    "tsconfig.json",
+    r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "~/*": ["src/*"] } } }"#,
+);
+
+#[test]
+fn an_import_through_a_tsconfig_alias_counts_as_a_use() {
+    // Without `paths` support the import below resolves to nothing, and `used` — imported,
+    // by name, from exactly this module — is reported as dead code.
+    let found = corpus(
+        "{}",
+        &[
+            TILDE_PATHS,
+            (
+                "src/a.ts",
+                "export function used() {}\nexport function orphan() {}\n",
+            ),
+            ("src/b.ts", "import { used } from '~/a';\nused();\n"),
+        ],
+    )
+    .run();
+    assert_eq!(
+        found,
+        vec!["src/a.ts:2:1 'orphan' is exported but nothing imports it"]
+    );
+}
+
+#[test]
+fn a_star_re_export_through_a_tsconfig_alias_covers_the_target() {
+    let found = corpus(
+        "{}",
+        &[
+            TILDE_PATHS,
+            ("src/a.ts", "export const x = 1;\nexport const y = 2;\n"),
+            ("src/index.ts", "export * from '~/a';\n"),
+        ],
+    )
+    .run();
+    assert_eq!(found, Vec::<String>::new());
+}
+
 #[test]
 fn the_same_corpus_reports_the_same_thing_every_run() {
     let corpus = corpus(

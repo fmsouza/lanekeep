@@ -640,9 +640,11 @@ with common names, which is every codebase.
   ignored rather than guessed at.
 
 Relative specifiers resolve without extensions (`./a` finds `a.ts`), through directories
-(`./thing` finds `thing/index.ts`), and across `..`. There is no `node_modules` lookup and
-no `tsconfig` path mapping: a specifier that does not start with `.` names something outside
-the corpus, and a rule reasoning about the corpus has nothing to say about it.
+(`./thing` finds `thing/index.ts`), and across `..`. A bare specifier resolves through the
+nearest `tsconfig.json`'s `compilerOptions.paths` and `baseUrl` — see
+[Module resolution](#module-resolution-and-tsconfig-paths) below. There is no `node_modules`
+lookup: a specifier no alias maps names something outside the corpus, and a rule reasoning
+about the corpus has nothing to say about it.
 
 ---
 
@@ -680,6 +682,10 @@ through one fails at runtime the same way.
 
 A module importing itself is not reported. It is a different mistake, and "extract what both
 modules need into a third" is not advice that applies to it.
+
+Imports resolve the way `no-unused-exports`'s do, `tsconfig` aliases included — see
+[Module resolution](#module-resolution-and-tsconfig-paths) below. A cycle written through
+`~/a` and `~/b` is the same cycle as one written through `./a` and `./b`.
 
 ---
 
@@ -1361,13 +1367,53 @@ The two cross-file rules share their module resolution, which is exported as
 `lanekeep/patterns`:
 
 ```ts
-import { resolveImport, dirname, join } from 'lanekeep/paths'
+import { aliasTargets, resolveImport, dirname, join } from 'lanekeep/paths'
 import { appliesTo, matches } from 'lanekeep/patterns'
 ```
 
 Two rules resolving `./a` differently would not look like a bug — each would be individually
 plausible — so the resolution has one definition. The same holds for a `*` glob or a `from`
 list: two rules interpreting one differently would each be individually plausible.
+
+### Module resolution and tsconfig `paths`
+
+A bare specifier — `~/b`, `@app/b`, `lib/b` — resolves through the `tsconfig.json` nearest the
+importing file, walking up from its directory to the project root. It takes two phases,
+because each half of the work is only allowed in one of them:
+
+```ts
+check(ctx, m) {
+  const to = ctx.text(m.source).slice(1, -1)
+  // Reads the tsconfig through ctx.readFile: a tracked dependency of this file.
+  ctx.emitFact({ kind: 'edge', to, aliases: aliasTargets(ctx, to) })
+},
+reduce(ctx) {
+  const files = new Set(ctx.files)
+  for (const e of ctx.facts('edge')) {
+    const target = resolveImport(e.file, e.to, files, e.aliases)
+  }
+},
+```
+
+`aliasTargets` needs `ctx.readFile`, which only `check` has; choosing a file needs the corpus,
+which only `reduce` has. The candidates travel between them in the fact. Because the tsconfig
+is read through `ctx.readFile`, it is a tracked dependency of every file whose answer used it
+— and so is every `tsconfig.json` it looked for and did not find — so editing `paths`, or
+adding a nearer config, invalidates exactly those files' cached facts
+([`architecture.md`](architecture.md) §8.2). A relative specifier reads nothing.
+
+What is followed, and it is TypeScript's own resolution: an exact `paths` key before any
+wildcard, then the wildcard with the longest prefix; its substitutions in order, the first
+that names a file in the corpus winning; substitutions relative to `baseUrl`, or to the
+directory of the config declaring `paths` when there is none; then `<baseUrl>/<specifier>`
+when a `baseUrl` is set. A relative `extends` — a string or an array — is followed, merging
+`compilerOptions` key by key, so an extending config's `paths` replaces its base's. Comments
+and trailing commas are accepted, as `tsc` accepts them.
+
+What is not: a package-name `extends` (`@tsconfig/node20`), `jsconfig.json`, `rootDirs`, and
+anything in `node_modules`. A `tsconfig.json` that is not valid JSON cancels the run with an
+error naming it, rather than leaving every aliased import silently unresolved. The three-argument
+`resolveImport(fromFile, specifier, files)` keeps its old meaning: relative specifiers only.
 
 ---
 

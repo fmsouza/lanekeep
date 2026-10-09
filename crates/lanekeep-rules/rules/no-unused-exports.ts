@@ -1,5 +1,5 @@
 import { defineRule } from 'lanekeep'
-import { resolveImport } from 'lanekeep/paths'
+import { aliasTargets, resolveImport } from 'lanekeep/paths'
 
 /**
  * Exports nobody in the corpus imports.
@@ -79,20 +79,26 @@ export default function noUnusedExports(options) {
     `,
 
     check(ctx, m) {
+      // A source's `aliases` are what the tsconfig's `paths` and `baseUrl` map it to. Worked
+      // out here because only this phase can read the tsconfig, and reading it here makes it
+      // a tracked dependency of this file — see `lanekeep/paths`.
       if (m.wildcard) {
         // `import * as ns from './a'` and `export * from './a'` both consume the whole
         // module, and neither names what it takes. Treating them as covering everything in
         // the target is the only sound reading — the alternative is reporting exports that
         // are demonstrably reachable.
-        ctx.emitFact({ kind: 'wildcard', from: unquote(ctx.text(m.source)) })
+        const from = unquote(ctx.text(m.source))
+        ctx.emitFact({ kind: 'wildcard', from, aliases: aliasTargets(ctx, from) })
         return
       }
 
       if (m.imported) {
+        const from = unquote(ctx.text(m.source))
         ctx.emitFact({
           kind: 'import',
           symbol: ctx.text(m.imported),
-          from: unquote(ctx.text(m.source)),
+          from,
+          aliases: aliasTargets(ctx, from),
         })
         return
       }
@@ -111,7 +117,7 @@ export default function noUnusedExports(options) {
       // Anything a wildcard reaches is used, whatever its name.
       const consumedWhole = new Set()
       for (const w of ctx.facts('wildcard')) {
-        const target = resolveImport(w.file, w.from, files)
+        const target = resolveImport(w.file, w.from, files, w.aliases)
         if (target) consumedWhole.add(target)
       }
 
@@ -121,7 +127,7 @@ export default function noUnusedExports(options) {
       // the parser report a failure lines away from the character that caused it.
       const used = new Set()
       for (const i of ctx.facts('import')) {
-        const target = resolveImport(i.file, i.from, files)
+        const target = resolveImport(i.file, i.from, files, i.aliases)
         if (target) used.add(`${target}\u0000${i.symbol}`)
       }
 
