@@ -122,13 +122,19 @@ impl Entry {
                 // an unlucky file collide with absence. Three tags rather than two, because a
                 // refusal is checked against the filesystem differently from an absence — see
                 // `lanekeep_core::tracked::ReadOutcome` — and a reader that could not tell
-                // them apart would have to guess.
+                // them apart would have to guess. And two more for a directory listing, which
+                // is a different question about a path and is rechecked by asking it again.
                 ReadOutcome::Absent => out.push(0),
                 ReadOutcome::Found(hash) => {
                     out.push(1);
                     out.extend_from_slice(hash.as_bytes());
                 }
                 ReadOutcome::Refused => out.push(2),
+                ReadOutcome::Listed(hash) => {
+                    out.push(3);
+                    out.extend_from_slice(hash.as_bytes());
+                }
+                ReadOutcome::Unlisted => out.push(4),
             }
         }
     }
@@ -232,6 +238,8 @@ impl Entry {
                 0 => ReadOutcome::Absent,
                 1 => ReadOutcome::Found(ContentHash::new(cursor.read_hash()?)),
                 2 => ReadOutcome::Refused,
+                3 => ReadOutcome::Listed(ContentHash::new(cursor.read_hash()?)),
+                4 => ReadOutcome::Unlisted,
                 _ => return None,
             };
             dependencies.push(TrackedRead { path, outcome });
@@ -531,8 +539,29 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_survives_as_a_listing() {
+        // A directory listing and a file reading carrying the same digest are different
+        // answers, and a directory that was not there is not a file that was not there: each
+        // has to come back as the question it was, or the validator asks the wrong one.
+        let entry = Entry {
+            dependencies: vec![
+                TrackedRead::listed(FilePath::new("src"), ContentHash::new([7; 32])),
+                TrackedRead::unlisted(FilePath::new("src/missing")),
+            ],
+            ..Entry::default()
+        };
+        let decoded = round_trip(&entry).expect("decodes");
+        assert_eq!(decoded, entry);
+        assert_eq!(
+            decoded.dependencies[0].outcome,
+            ReadOutcome::Listed(ContentHash::new([7; 32]))
+        );
+        assert_eq!(decoded.dependencies[1].outcome, ReadOutcome::Unlisted);
+    }
+
+    #[test]
     fn an_unknown_dependency_tag_is_rejected() {
-        // Three tags are defined. A fourth was written by something else, and guessing which
+        // Five tags are defined. A sixth was written by something else, and guessing which
         // outcome it meant would put an invented dependency into a validated entry.
         let mut bytes = Vec::new();
         Entry {
@@ -543,7 +572,7 @@ mod tests {
 
         let tag = bytes.len() - 1;
         assert_eq!(bytes[tag], 0, "the absent tag is the last byte written");
-        bytes[tag] = 3;
+        bytes[tag] = 5;
         assert_eq!(Entry::decode(&bytes), None);
     }
 

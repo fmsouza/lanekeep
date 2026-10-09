@@ -31,6 +31,7 @@ pub mod store;
 
 use std::path::Path;
 
+use lanekeep_core::files::{Listing, list_directory, listing_hash, normalize};
 use lanekeep_core::{ContentHash, ReadOutcome};
 
 pub use entry::Entry;
@@ -77,10 +78,35 @@ pub fn validate(entry: &Entry, root: &Path) -> bool {
     // case a cache is wrong without; or it left the root through a symlink and still does, so
     // a rule would be refused again. Everything else — appeared, vanished, became unreadable,
     // stopped escaping, started escaping — is a change, and every one of those is a `!=`.
-    entry
-        .dependencies
-        .iter()
-        .all(|read| read.outcome == current(&root, read.path.as_str()))
+    //
+    // A listing is the same equality over a different question: the recorded outcome says
+    // which one the rule asked, and `current_listing` asks it again.
+    entry.dependencies.iter().all(|read| {
+        let now = match read.outcome {
+            ReadOutcome::Listed(_) | ReadOutcome::Unlisted => {
+                current_listing(&root, read.path.as_str())
+            }
+            ReadOutcome::Found(_) | ReadOutcome::Absent | ReadOutcome::Refused => {
+                current(&root, read.path.as_str())
+            }
+        };
+        read.outcome == now
+    })
+}
+
+/// What listing `path` under `root` would answer now.
+///
+/// Through `lanekeep_core::files::list_directory`, the function the rule's own listing went
+/// through, rather than a second reading of what a listing is — so an unchanged directory cannot
+/// invalidate on a difference between two implementations. A recorded refusal is not routed
+/// here: refusal is decided by `canonicalize` alone, identically for a file and a directory, so
+/// [`current`] already answers it.
+fn current_listing(root: &Path, path: &str) -> ReadOutcome {
+    match list_directory(root, &normalize(Path::new(path))) {
+        Listing::Listed(entries) => ReadOutcome::Listed(listing_hash(&entries)),
+        Listing::Unlisted => ReadOutcome::Unlisted,
+        Listing::Refused => ReadOutcome::Refused,
+    }
 }
 
 /// What reading `path` under `root` would answer now, confined as a rule's read is.
@@ -351,6 +377,87 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&outside);
+    }
+
+    // --- listings ----------------------------------------------------------------------------
+
+    /// What a rule's `listDir(path)` would record over `project` now.
+    fn listing_of(project: &Project, path: &str) -> TrackedRead {
+        let access = lanekeep_core::files::FileAccess::new(&project.dir);
+        let _ = access.list(path);
+        access
+            .dependencies()
+            .into_iter()
+            .next()
+            .expect("a listing is always recorded")
+    }
+
+    #[test]
+    fn an_unchanged_listing_holds() {
+        let project = Project::new("list-unchanged", &[("src/a.ts", ""), ("src/sub/b.ts", "")]);
+        let entry = entry_depending_on(vec![listing_of(&project, "src")]);
+        assert!(validate(&entry, &project.dir));
+    }
+
+    #[test]
+    fn an_entry_added_to_a_listed_directory_invalidates() {
+        // The issue's own case: a rule that listed `src/dir` and saw no `index.ts` has to be
+        // reconsidered once one is added, though nothing about the checked file changed.
+        let project = Project::new("list-added", &[("src/dir/note.md", "")]);
+        let entry = entry_depending_on(vec![listing_of(&project, "src/dir")]);
+        project.write("src/dir/index.ts", "");
+        assert!(!validate(&entry, &project.dir));
+    }
+
+    #[test]
+    fn an_entry_removed_from_a_listed_directory_invalidates() {
+        let project = Project::new("list-removed", &[("src/a.ts", ""), ("src/b.ts", "")]);
+        let entry = entry_depending_on(vec![listing_of(&project, "src")]);
+        std::fs::remove_file(project.dir.join("src/b.ts")).expect("removes");
+        assert!(!validate(&entry, &project.dir));
+    }
+
+    #[test]
+    fn an_entry_retyped_from_file_to_directory_invalidates() {
+        let project = Project::new("list-retyped", &[("src/thing", "")]);
+        let entry = entry_depending_on(vec![listing_of(&project, "src")]);
+        std::fs::remove_file(project.dir.join("src/thing")).expect("removes");
+        project.write("src/thing/index.ts", "");
+        assert!(!validate(&entry, &project.dir));
+    }
+
+    #[test]
+    fn a_directory_that_appeared_invalidates_a_listing_that_found_none() {
+        // A listing recorded as an absent *file* would hold here: the validator's file read of a
+        // directory fails, which reads as absent. That is why a listing is its own outcome.
+        let project = Project::new("list-appeared", &[]);
+        let entry = entry_depending_on(vec![listing_of(&project, "src/dir")]);
+        assert_eq!(entry.dependencies[0].outcome, ReadOutcome::Unlisted);
+        assert!(validate(&entry, &project.dir), "still absent");
+
+        project.write("src/dir/index.ts", "");
+        assert!(!validate(&entry, &project.dir));
+    }
+
+    #[test]
+    fn a_directory_replacing_a_listed_file_invalidates() {
+        let project = Project::new("list-file-to-dir", &[("thing", "")]);
+        let entry = entry_depending_on(vec![listing_of(&project, "thing")]);
+        assert_eq!(entry.dependencies[0].outcome, ReadOutcome::Unlisted);
+        std::fs::remove_file(project.dir.join("thing")).expect("removes");
+        std::fs::create_dir_all(project.dir.join("thing")).expect("creates dir");
+        assert!(!validate(&entry, &project.dir));
+    }
+
+    #[test]
+    fn lanekeep_writing_its_cache_does_not_invalidate_a_root_listing() {
+        // A cold run creates `.lanekeep/`; the warm run after it validates the entries that
+        // cold run wrote. Were the directory visible, every root listing would miss once and
+        // answer differently the second time.
+        let project = Project::new("list-cache-dir", &[("a.ts", "")]);
+        let entry = entry_depending_on(vec![listing_of(&project, ".")]);
+        project.write(".lanekeep/cache", "bytes");
+        assert!(validate(&entry, &project.dir));
     }
 
     #[test]
