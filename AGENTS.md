@@ -1608,6 +1608,17 @@ renamed `lanekeep_typescript` and `lanekeep_tsx` so their C symbols cannot meet 
 binary: a symbol defined in two static archives is not a link error, the linker takes whichever
 it reads first. Delete the crate when upstream ships a grammar with both fixes.
 
+**A *path* `require` ignores a package's `exports`, so a package with no `main` cannot be found by
+the spelling that names exactly where it is.** `typescript@7.0.2` is `"type": "module"` with no
+`main` and an `exports["."]` of `./lib/version.cjs`. The tsc driver's default
+`types.typescript`, `./node_modules/typescript`, is a path, so Node skips `exports`, looks for
+`main` and then `index.js`, and throws `MODULE_NOT_FOUND`; an absolute path does the same; the
+bare `typescript` loads `{ version, versionMajorMinor }` through `exports` and nothing else. The
+refusal used to say "Cannot find module" and blame a pnpm layout (#282). `<spec>/package.json`
+still resolves by every spelling, which is how the driver now tells a package that is absent
+from one that is present and could not be loaded, and why its handshake reports the declared
+version beside a load error.
+
 ## What not to do
 
 - Do not add a dependency without checking `deny.toml`. Network crates are banned
