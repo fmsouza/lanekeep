@@ -1674,6 +1674,45 @@ test('hello answers on the protocol when the typescript specifier resolves to no
     const response = await session.ask('hello')
     assert.equal(response.ok, true, JSON.stringify(response))
     assert.match(response.value.error, /definitely-not-typescript/)
+    // No manifest behind the specifier, so no version to report: the Rust side keys its
+    // "this is TypeScript 7" message off this field, and an absent package must not reach it.
+    assert.equal(response.value.typescript, undefined)
+  } finally {
+    session.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('hello reports the declared version of a typescript it found and could not load', TIMEOUT, async (t) => {
+  if (!available) return t.skip('no packages/lanekeep/node_modules/typescript')
+  // Laid out exactly as `typescript@7.0.2` is published: an ES-module package with no `main`,
+  // whose `exports["."]` is a CommonJS file carrying only the version. A *path* `require` —
+  // which is what the default `./node_modules/typescript` is — ignores `exports`, finds no
+  // `main` and no `index.js`, and throws `MODULE_NOT_FOUND`, so without the manifest read the
+  // driver could only say "cannot find module" about a package that is plainly there.
+  const dir = mkdtempSync(path.join(tmpdir(), 'lanekeep-driver-ts7-'))
+  writeFileSync(path.join(dir, 'package.json'), '{"name":"ts7","private":true}\n')
+  const stub = path.join(dir, 'node_modules/typescript')
+  mkdirSync(path.join(stub, 'lib'), { recursive: true })
+  writeFileSync(
+    path.join(stub, 'package.json'),
+    JSON.stringify({
+      name: 'typescript',
+      version: '7.0.2',
+      type: 'module',
+      exports: { './package.json': './package.json', '.': './lib/version.cjs' },
+    }),
+  )
+  writeFileSync(
+    path.join(stub, 'lib/version.cjs'),
+    'exports.version = require("../package.json").version\nexports.versionMajorMinor = "7.0"\n',
+  )
+  const session = spawnDriver(dir, './node_modules/typescript')
+  try {
+    const response = await session.ask('hello')
+    assert.equal(response.ok, true, JSON.stringify(response))
+    assert.equal(typeof response.value.error, 'string', JSON.stringify(response.value))
+    assert.equal(response.value.typescript, '7.0.2', JSON.stringify(response.value))
   } finally {
     session.close()
     rmSync(dir, { recursive: true, force: true })

@@ -347,7 +347,7 @@ quietly answering `undefined` — which would read as a codebase with nothing to
 ```
 the type provider could not be used
 `acme/typed` requires the `types` analysis, which this build does not provide — the implemented capabilities are `dataflow`
-  the configured `tsc` command (`definitely-not-node`) could not be started: cannot start the type provider: No such file or directory (os error 2)
+  the configured `tsc` command (`definitely-not-node`) failed: cannot start the type provider: No such file or directory (os error 2)
   `types.provider` is `tsc`, which runs the project's own toolchain, so it needs `types.command` on PATH
 ```
 
@@ -355,8 +355,36 @@ the type provider could not be used
 (`createProgram` and its neighbors), measured against 5.9.3, and its tests run against 6.0.3 —
 the devDependency in `packages/lanekeep`, which still ships that API. It probes for it in its
 handshake and refuses, naming the version and the missing function, when the package does not
-provide it — the reference corpus is on TypeScript 7.0.2, whose package need not, and this
-provider was not measured against it. Two layouts to know about: a pnpm workspace has no root
+provide it.
+
+**TypeScript 7 is refused, by name.** 7.x is the native port: its `typescript` package carries
+the version and an `unstable/` API that talks to a separate process, and none of the JavaScript
+compiler API this provider drives. That is by design, so the tsc provider needs a 5.x or 6.x
+install. A TypeScript 7 project can keep one beside its compiler under an npm alias and point
+the provider at it:
+
+```bash
+npm install -D typescript6@npm:typescript@6
+```
+
+```json
+{ "types": { "provider": "tsc", "typescript": "./node_modules/typescript6" } }
+```
+
+The project's own `tsc` stays 7; only lanekeep's sidecar loads 6. Or use `types.provider:
+'builtin'`, which needs no compiler at all. Without either, a rule declaring `requires:
+['types']` stops the run at prepare with:
+
+```
+the type provider could not be used
+`acme/typed` requires the `types` analysis, which this build does not provide — the implemented capabilities are `dataflow`
+  the configured `tsc` command (`node`) failed: the type provider started but could not use the project's `typescript`: typescript 7.0.2 at `./node_modules/typescript` is TypeScript 7, the native port, which has no JavaScript compiler API for the driver to load; the tsc provider needs TypeScript 5.x or 6.x (tested through 6.0.3) — install one beside it under an alias (`npm install -D typescript6@npm:typescript@6`) and point `types.typescript` at `./node_modules/typescript6`, or set `types.provider` to `builtin`
+  point `types.typescript` at the package to load
+```
+
+A driver for TypeScript 7's own API does not exist yet.
+
+Two layouts to know about: a pnpm workspace has no root
 `node_modules/typescript`, so `types.typescript` names a workspace package's copy; and a
 project using `compilerOptions.paths` needs nothing from lanekeep under this provider, since
 the project's own compiler resolves them — the builtin provider is the one that does not.

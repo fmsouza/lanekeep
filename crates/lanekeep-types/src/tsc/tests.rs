@@ -559,17 +559,19 @@ fn a_typescript_without_the_compiler_api_is_unloadable_naming_what_is_missing() 
         eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
         return;
     }
+    // A pre-7 version on purpose: TypeScript 7 gets its own refusal, asserted below, and this
+    // is the message for anything else that lacks the API — which names what is missing.
     let root = fixture("unsupported-api");
     let stub = root.join("stub-typescript");
     std::fs::create_dir_all(stub.join("lib")).expect("creates the stub");
     std::fs::write(
         stub.join("package.json"),
-        "{\"name\":\"typescript\",\"version\":\"7.0.2\",\"main\":\"lib/typescript.js\"}\n",
+        "{\"name\":\"typescript\",\"version\":\"5.0.0-fixture\",\"main\":\"lib/typescript.js\"}\n",
     )
     .expect("writes the stub manifest");
     std::fs::write(
         stub.join("lib/typescript.js"),
-        "module.exports = { version: '7.0.2' }\n",
+        "module.exports = { version: '5.0.0-fixture' }\n",
     )
     .expect("writes the stub module");
     let error = TscProvider::spawn(
@@ -589,10 +591,132 @@ fn a_typescript_without_the_compiler_api_is_unloadable_naming_what_is_missing() 
         matches!(error, ProviderError::Unloadable(_)),
         "got: {error:?}"
     );
-    assert!(text.contains("7.0.2"), "{text}");
+    assert!(text.contains("5.0.0-fixture"), "{text}");
     assert!(text.contains("createProgram"), "{text}");
+    assert!(!text.contains("TypeScript 7"), "{text}");
     assert!(text.contains("point `types.typescript`"), "{text}");
     assert!(!text.contains("`types.command` on PATH"), "{text}");
+}
+
+/// A `typescript` laid out exactly as 7.0.2 is published, at the fixture's
+/// `node_modules/typescript`: an ES-module package with no `main`, whose `exports["."]` is a
+/// CommonJS file carrying only the version.
+fn typescript_7_fixture(name: &str) -> PathBuf {
+    let root = fixture(name);
+    let stub = root.join("node_modules/typescript");
+    std::fs::create_dir_all(stub.join("lib")).expect("creates the stub");
+    std::fs::write(
+        stub.join("package.json"),
+        "{\"name\":\"typescript\",\"version\":\"7.0.2\",\"type\":\"module\",\
+         \"exports\":{\"./package.json\":\"./package.json\",\".\":\"./lib/version.cjs\"}}\n",
+    )
+    .expect("writes the stub manifest");
+    std::fs::write(
+        stub.join("lib/version.cjs"),
+        "exports.version = require(\"../package.json\").version\n\
+         exports.versionMajorMinor = \"7.0\"\n",
+    )
+    .expect("writes the stub entry");
+    root
+}
+
+#[test]
+fn typescript_7_as_published_is_named_as_typescript_7_however_it_is_spelled() {
+    if !tsc_available() {
+        eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+        return;
+    }
+    // Issue #282. The default spelling is a *path* `require`, which ignores `exports` and so
+    // could not load 7.0.2 at all: the refusal said "Cannot find module" and blamed a pnpm
+    // layout, about a package sitting exactly where it was configured. The bare spelling
+    // loads `{ version }` through `exports` and took the missing-API path instead. Both, and
+    // an absolute path, have to say the same plain thing.
+    let root = typescript_7_fixture("typescript-7");
+    let absolute = root
+        .join("node_modules/typescript")
+        .to_string_lossy()
+        .replace('\\', "/");
+    for specifier in ["./node_modules/typescript", absolute.as_str(), "typescript"] {
+        let error = TscProvider::spawn(
+            &root,
+            &TypesConfig {
+                typescript: specifier.to_owned(),
+                ..tsc_config()
+            },
+            AnalysisBudget::start(Duration::from_mins(2)),
+        )
+        .expect_err("TypeScript 7 has no compiler API for the driver");
+        let text = error.to_string();
+        assert!(
+            matches!(error, ProviderError::Unloadable(_)),
+            "{specifier}: got {error:?}"
+        );
+        assert!(text.contains("7.0.2"), "{specifier}: {text}");
+        assert!(text.contains("TypeScript 7"), "{specifier}: {text}");
+        assert!(
+            text.contains("no JavaScript compiler API"),
+            "{specifier}: {text}"
+        );
+        assert!(
+            text.contains("typescript6@npm:typescript@6"),
+            "{specifier}: {text}"
+        );
+        assert!(text.contains("`builtin`"), "{specifier}: {text}");
+        assert!(!text.contains("pnpm"), "{specifier}: {text}");
+        assert!(!text.contains("Cannot find module"), "{specifier}: {text}");
+    }
+}
+
+#[test]
+fn a_found_typescript_that_fails_to_load_names_its_version_without_the_pnpm_hint() {
+    if !tsc_available() {
+        eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+        return;
+    }
+    // The pnpm hint is about a package that is not there. One that is there and throws while
+    // loading is a broken install, and a layout hint would send the reader to the wrong place.
+    let root = fixture("broken-typescript");
+    let stub = root.join("node_modules/typescript");
+    std::fs::create_dir_all(stub.join("lib")).expect("creates the stub");
+    std::fs::write(
+        stub.join("package.json"),
+        "{\"name\":\"typescript\",\"version\":\"5.9.3\",\"main\":\"lib/typescript.js\"}\n",
+    )
+    .expect("writes the stub manifest");
+    std::fs::write(
+        stub.join("lib/typescript.js"),
+        "throw new Error('broken install')\n",
+    )
+    .expect("writes the stub module");
+    let error = TscProvider::spawn(
+        &root,
+        &TypesConfig {
+            typescript: "./node_modules/typescript".to_owned(),
+            ..tsc_config()
+        },
+        AnalysisBudget::start(Duration::from_mins(2)),
+    )
+    .expect_err("the package throws on load");
+    let text = error.to_string();
+    assert!(
+        matches!(error, ProviderError::Unloadable(_)),
+        "got: {error:?}"
+    );
+    assert!(text.contains("5.9.3"), "{text}");
+    assert!(text.contains("broken install"), "{text}");
+    assert!(!text.contains("pnpm"), "{text}");
+    assert!(!text.contains("TypeScript 7"), "{text}");
+}
+
+#[test]
+fn a_typescript_major_is_read_off_the_declared_version() {
+    assert_eq!(typescript_major("7.0.2"), Some(7));
+    assert_eq!(typescript_major("7.1.0-dev.20261009.1"), Some(7));
+    assert_eq!(typescript_major("6.0.3"), Some(6));
+    assert_eq!(typescript_major("10.0.0"), Some(10));
+    assert_eq!(typescript_major("0.0.0-fixture"), Some(0));
+    assert_eq!(typescript_major(""), None);
+    assert_eq!(typescript_major("seven"), None);
 }
 
 #[test]

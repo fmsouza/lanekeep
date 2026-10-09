@@ -401,37 +401,14 @@ impl TscProvider {
         // The handshake, before anything else and before `run_key`. Its answer is a cache-key
         // input, so a run that has not had it cannot key anything.
         let hello = provider.request("hello", &serde_json::json!({}))?;
-        if let Some(error) = hello.get("error").and_then(serde_json::Value::as_str) {
-            // The package could not be loaded at all. Named with the specifier as configured,
-            // because the usual cause is a layout, not a typo: a pnpm workspace has no root
-            // `node_modules/typescript`, and the remedy is `types.typescript` naming a
-            // workspace package's copy.
-            return Err(ProviderError::Unloadable(format!(
-                "{error}; a pnpm workspace has no root `node_modules/typescript` — point \
-                 `types.typescript` at a workspace package's copy"
-            )));
+        if let Some(refusal) = refusal_in_hello(&hello, &config.typescript) {
+            return Err(refusal);
         }
         let version = hello
             .get("typescript")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| provider.refused("`hello` carried no version", Sidecar::Live))?
             .to_owned();
-        if let Some(missing) = hello
-            .get("unsupported")
-            .and_then(serde_json::Value::as_array)
-        {
-            let missing: Vec<&str> = missing
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .collect();
-            return Err(ProviderError::Unloadable(format!(
-                "typescript {version} at `{}` does not provide the compiler API the driver \
-                 needs ({}); the tsc provider is written against the TypeScript 5.x compiler \
-                 API and tested through 6.0.3",
-                config.typescript,
-                missing.join(", "),
-            )));
-        }
 
         provider.identity = fold_identity(&version, DRIVER, config);
         provider.typescript_version = version;
@@ -1136,6 +1113,76 @@ fn write_driver(root: &Path) -> Result<PathBuf, ProviderError> {
     std::fs::write(&temporary, DRIVER).map_err(|e| unwritable(&e))?;
     std::fs::rename(&temporary, &final_path).map_err(|e| unwritable(&e))?;
     Ok(final_path)
+}
+
+/// What a `hello` answer refuses with, if it refuses: a package that could not be loaded, or
+/// one loaded without the compiler API the driver is written against.
+///
+/// Three shapes of load failure, told apart by whether the driver found a manifest behind the
+/// specifier and what version it declares — see `declaredVersion` in `driver.mjs`. A `hello`
+/// that refuses nothing and carries no version is the caller's to refuse, because only it can
+/// read the sidecar's stderr.
+fn refusal_in_hello(hello: &serde_json::Value, specifier: &str) -> Option<ProviderError> {
+    let declared = hello.get("typescript").and_then(serde_json::Value::as_str);
+    let native = declared.is_some_and(|v| typescript_major(v).is_some_and(|major| major >= 7));
+    if let Some(error) = hello.get("error").and_then(serde_json::Value::as_str) {
+        return Some(match declared {
+            // Found, and TypeScript 7: a path `require` cannot load 7.0.2 at all, and the load
+            // error it gives — "Cannot find module" — is about a package that is plainly
+            // there. Issue #282.
+            Some(version) if native => native_port_refusal(version, specifier),
+            // Found, and it threw while loading: a broken install, which a layout hint would
+            // misdirect.
+            Some(version) => ProviderError::Unloadable(format!(
+                "{error}; its package.json declares typescript {version}"
+            )),
+            // Not found at all. Named with the specifier as configured, because the usual cause
+            // is a layout, not a typo: a pnpm workspace has no root `node_modules/typescript`,
+            // and the remedy is `types.typescript` naming a workspace package's copy.
+            None => ProviderError::Unloadable(format!(
+                "{error}; a pnpm workspace has no root `node_modules/typescript` — point \
+                 `types.typescript` at a workspace package's copy"
+            )),
+        });
+    }
+    let version = declared?;
+    let missing = hello.get("unsupported")?.as_array()?;
+    if native {
+        return Some(native_port_refusal(version, specifier));
+    }
+    let missing: Vec<&str> = missing
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    Some(ProviderError::Unloadable(format!(
+        "typescript {version} at `{specifier}` does not provide the compiler API the driver \
+         needs ({}); the tsc provider is written against the TypeScript 5.x compiler API and \
+         tested through 6.0.3",
+        missing.join(", "),
+    )))
+}
+
+/// The major version a `typescript` package declares, or `None` for a version that does not
+/// start with one. A pre-release such as `7.1.0-dev.20261009.1` is major 7.
+fn typescript_major(version: &str) -> Option<u64> {
+    version.split('.').next()?.parse().ok()
+}
+
+/// The refusal for TypeScript 7 and later, whichever way the handshake met it.
+///
+/// TypeScript 7 is the native port: its package carries the version and an `unstable/` API
+/// over a separate process, and none of the JavaScript compiler API this driver is written
+/// against. That is by design rather than a broken install, so the message says so and gives
+/// the two remedies that work — a 5.x/6.x install beside it under an npm alias, or the builtin
+/// provider — rather than the layout hint a package that could not be *found* gets.
+fn native_port_refusal(version: &str, specifier: &str) -> ProviderError {
+    ProviderError::Unloadable(format!(
+        "typescript {version} at `{specifier}` is TypeScript 7, the native port, which has no \
+         JavaScript compiler API for the driver to load; the tsc provider needs TypeScript 5.x \
+         or 6.x (tested through 6.0.3) — install one beside it under an alias \
+         (`npm install -D typescript6@npm:typescript@6`) and point `types.typescript` at \
+         `./node_modules/typescript6`, or set `types.provider` to `builtin`"
+    ))
 }
 
 /// The provider's identity: what it is, not what it has answered.

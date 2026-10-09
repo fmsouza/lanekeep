@@ -1297,13 +1297,17 @@ impl Engine {
                     if let Some(spawn_error) = &tsc_spawn_error {
                         // The inner detail, not the variant's rendering: the outer error
                         // already says "could not be used" once.
+                        //
+                        // "failed", not "could not be started": the inner detail says which
+                        // it was, and for a package the driver could not use it opens with
+                        // "the type provider started but…" — so the wrapper claiming the
+                        // opposite contradicted it in the same line (#282).
                         let why = match spawn_error {
                             RunError::Provider { detail } => detail.clone(),
                             other => other.to_string(),
                         };
                         detail = format!(
-                            "{detail}\n  the configured `tsc` command (`{}`) could not be \
-                             started: {why}",
+                            "{detail}\n  the configured `tsc` command (`{}`) failed: {why}",
                             config.types.command.join(" "),
                         );
                     }
@@ -10469,6 +10473,53 @@ export default defineRule({
                     ("src/a.ts", "export function a() {\n  debugger;\n}\n"),
                 ],
             )
+        }
+
+        /// Issue #282, through the engine: a TypeScript 7 install is refused by name, and the
+        /// line the capability gate wraps it in does not contradict it.
+        ///
+        /// The wrapper used to say the command "could not be started" for every spawn failure,
+        /// directly ahead of a provider error reading "the type provider started but…" — two
+        /// claims about one process in one sentence, only one of them true.
+        #[test]
+        fn a_typescript_7_install_is_refused_by_name_without_claiming_node_never_started() {
+            if typescript_package().is_none() {
+                eprintln!("skipped: no packages/lanekeep/node_modules/typescript (CI covers this)");
+                return;
+            }
+            let project = Project::new(
+                "tsc-typescript-7",
+                &[
+                    ("rule.ts", TYPED_RULE),
+                    (
+                        "lanekeep.config.ts",
+                        &config(", types: { provider: 'tsc' }"),
+                    ),
+                    ("package.json", "{\"name\":\"f\",\"private\":true}\n"),
+                    // Laid out as `typescript@7.0.2` is published: no `main`, and an
+                    // `exports["."]` carrying only the version.
+                    (
+                        "node_modules/typescript/package.json",
+                        "{\"name\":\"typescript\",\"version\":\"7.0.2\",\"type\":\"module\",\
+                         \"exports\":{\"./package.json\":\"./package.json\",\
+                         \".\":\"./lib/version.cjs\"}}\n",
+                    ),
+                    (
+                        "node_modules/typescript/lib/version.cjs",
+                        "exports.version = require(\"../package.json\").version\n",
+                    ),
+                    ("src/a.ts", "const a = 1;\n"),
+                ],
+            );
+            let error = project
+                .prepare_with("lanekeep.config.ts")
+                .expect_err("TypeScript 7 has no compiler API for the driver");
+            let rendered = error.to_string();
+            assert!(rendered.contains("local/typed"), "{rendered}");
+            assert!(rendered.contains("TypeScript 7"), "{rendered}");
+            assert!(rendered.contains("`node`"), "{rendered}");
+            assert!(!rendered.contains("could not be started"), "{rendered}");
+            assert!(!rendered.contains("pnpm"), "{rendered}");
         }
 
         /// A budget spent during the handshake is a budget breach, not a missing toolchain.
