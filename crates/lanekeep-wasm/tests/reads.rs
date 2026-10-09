@@ -565,7 +565,11 @@ fn a_directory_lists_its_entries_sorted_with_directories_marked() {
     let mut harness = Harness::new(Some(project.access()));
 
     assert_eq!(harness.probe("list", &["src"]), ["list=[a.md,b.ts,sub/]"]);
-    assert_eq!(harness.probe("list", &["src/a.md"]), ["list=none"], "a file lists as none");
+    assert_eq!(
+        harness.probe("list", &["src/a.md"]),
+        ["list=none"],
+        "a file lists as none"
+    );
     assert_eq!(harness.probe("list", &["nowhere"]), ["list=none"]);
     assert_eq!(
         harness.probe("list", &["../outside"]),

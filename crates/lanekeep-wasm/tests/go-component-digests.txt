@@ -17,7 +17,7 @@
 # tool wasm-opt 131
 # tool wasm-tools 1.255.0
 crates/lanekeep-wasm/tests/fixtures/go-maporder.wasm da424231bc7bbbff860716dd34deaf9beed3aa3c6aacb905354690db9422dc70
-crates/lanekeep-wasm/wit/world.wit a95c47c21f5babecd1914bf2dd8b86344e06745a576feaabe30292139096c59e
+crates/lanekeep-wasm/wit/world.wit 37a9837da24595366d16e0eecb70d11b2c7704237e497fe9363bf28e9f38b575
 go-rules/.gitignore 02af855e1226375a64521b31bd8994a45c665fbe93ea55dfdb4b38f062d98c36
 go-rules/fixtures/maporder/main.go 2e1705b14c8762d6b372589acd571b2904eacf9815b8cf898c4dcf1db2d3e244
 go-rules/go.mod 25d0033f110d1e59cc9e59ecc9b2bda4102adaa59f0414844df1d8e17c889e4c
@@ -26,10 +26,10 @@ go-rules/internal/lanekeep/host/rule/empty.s cedeeff551bb1e50bfc4ab8c6299a62fb7b
 go-rules/internal/lanekeep/host/rule/rule.exports.go ad1086deeed3d6cb82e7ae501f28cfe6d929028a1908e965c69dd7784f663668
 go-rules/internal/lanekeep/host/rule/rule.wasm.go e2911fb4bd0b4eaea97ad9e787aee0399a2fda7b8e6c0b3c548c5fc7784bd6dc
 go-rules/internal/lanekeep/host/rule/rule.wit.go f47c483fb11996d57aa45be9e100a23028166498aeb1ab8f73ee6a3448321dc0
-go-rules/internal/lanekeep/host/types/abi.go b44aee505b74f4d3c1bac2e2b4c83bca694f9c1647ba6842f6db9e6d89a597fe
+go-rules/internal/lanekeep/host/types/abi.go c46dee617ec80bdf6a8c5b0f8121474e07fbd9874efb3c04288e7be144f8cc9c
 go-rules/internal/lanekeep/host/types/empty.s cedeeff551bb1e50bfc4ab8c6299a62fb7b25cae79805253a45adc7dc18696c9
-go-rules/internal/lanekeep/host/types/types.wasm.go 86d08384b477c23d56eafd91ec4db12939f4d333778d9e96f4fad7ba01091797
-go-rules/internal/lanekeep/host/types/types.wit.go a10b74625401e8e4720dcda4f2f656e14fa927a4784558e9339947e95bf240a1
+go-rules/internal/lanekeep/host/types/types.wasm.go 879847d591fc934ca42dbcf85e1b18c75b70d71927f3aaa2945dd6b44eb8637b
+go-rules/internal/lanekeep/host/types/types.wit.go e8bf2cc7cfea28fb22f2ba3f3e0f4549c1979acbc4981779eb71ff4bba98bc5f
 go-rules/lanekeep/capture.go 1204297483bd9bd43df742286a173f52361271c22930fb35b24380972dd42310
 go-rules/lanekeep/capture_test.go 630b58245ba6ccf889823a8f089df580eae2885eb72ef4cc16f7849f5a1401d0
 go-rules/lanekeep/doc.go 69f2a5853e8ed6ba291dcc6df03b8ef28765bdde3a9b4ddbc56adc22de78c991

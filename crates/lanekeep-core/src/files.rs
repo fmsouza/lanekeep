@@ -23,8 +23,8 @@
 //! # Listings are tracked the same way
 //!
 //! [`FileAccess::list`] answers what a directory holds, under the same confinement, memoized the
-//! same way, and recorded as [`tracked::ReadOutcome::Listed`] or
-//! [`tracked::ReadOutcome::Unlisted`]. What a listing *is* — the order, the `/` marking a
+//! same way, and recorded as [`crate::tracked::ReadOutcome::Listed`] or
+//! [`crate::tracked::ReadOutcome::Unlisted`]. What a listing *is* — the order, the `/` marking a
 //! directory, what is hidden — is decided once, in [`list_directory`], which the cache's
 //! validator calls too: a validator that listed a directory by its own rules would invalidate
 //! on a difference between two implementations rather than on a change to the directory.
@@ -41,8 +41,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::FilePath;
 use crate::tracked::{ContentHash, TrackedRead};
-use crate::{FilePath, tracked};
 use thiserror::Error;
 
 /// Why a read was refused.
@@ -143,8 +143,8 @@ pub struct FileAccess {
     /// **Two memos over one file is not a tidiness problem, it is the determinism invariant.**
     /// The memo exists so that a file rewritten mid-run cannot be seen two ways; a second one
     /// beside it reintroduces exactly that, across engines rather than within one. And the
-    /// dependency lists cannot be merged afterwards to repair it: [`tracked::sort`] orders by
-    /// path and does **not** dedupe, so two lists disagreeing about one path's hash concatenate
+    /// dependency lists cannot be merged afterwards to repair it: [`crate::tracked::sort`]
+    /// orders by path and does **not** dedupe, so two lists disagreeing about one path's hash concatenate
     /// into two contradictory entries for it, which is a cache entry that can never be
     /// validated.
     ///
@@ -665,6 +665,7 @@ pub fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tracked;
 
     struct Fixture {
         dir: PathBuf,

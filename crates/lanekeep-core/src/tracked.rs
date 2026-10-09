@@ -241,7 +241,10 @@ mod tests {
             TrackedRead::unlisted(path.clone()),
             TrackedRead::absent(path.clone())
         );
-        assert_eq!(TrackedRead::listed(path.clone(), hash(3)).hash(), Some(hash(3)));
+        assert_eq!(
+            TrackedRead::listed(path.clone(), hash(3)).hash(),
+            Some(hash(3))
+        );
         assert_eq!(TrackedRead::unlisted(path).hash(), None);
     }
 

@@ -7982,15 +7982,6 @@ export default defineRule({{
         )
     }
 
-    /// The messages a run reported, in order.
-    fn messages(outcome: &Outcome) -> Vec<String> {
-        outcome
-            .violations
-            .iter()
-            .map(|v| v.message.clone())
-            .collect()
-    }
-
     #[test]
     fn a_rule_can_list_a_directory_and_the_listing_is_recorded() {
         // #284's own reproduction: `src/dir` holds no file the run checks, and a rule can now
@@ -8005,7 +7996,7 @@ export default defineRule({{
             ],
         );
         let outcome = project.run().expect("runs");
-        assert_eq!(messages(&outcome), vec![r#"["note.md"]"#.to_owned()]);
+        assert_eq!(messages(&outcome), vec![r#"["note.md"]"#]);
 
         let deps = outcome
             .dependencies
@@ -8035,13 +8026,14 @@ export default defineRule({{
         );
         assert_eq!(
             messages(&project.run().expect("runs")),
-            vec![r#"["note.md"]"#.to_owned()]
+            vec![r#"["note.md"]"#]
         );
 
-        project.write("src/dir/index.ts", "export {};\n");
+        // Not a source file, so the only file that reports is still `src/a.ts`.
+        project.write("src/dir/README.md", "readme\n");
         assert_eq!(
             messages(&project.run().expect("runs")),
-            vec![r#"["index.ts","note.md"]"#.to_owned()],
+            vec![r#"["README.md","note.md"]"#],
             "an added entry did not invalidate the listing"
         );
     }
@@ -8056,12 +8048,12 @@ export default defineRule({{
                 ("src/a.ts", "const a = 1;\n"),
             ],
         );
-        assert_eq!(messages(&project.run().expect("runs")), vec!["null".to_owned()]);
+        assert_eq!(messages(&project.run().expect("runs")), vec!["null"]);
 
         project.write("src/dir/note.md", "notes\n");
         assert_eq!(
             messages(&project.run().expect("runs")),
-            vec![r#"["note.md"]"#.to_owned()],
+            vec![r#"["note.md"]"#],
             "a directory that appeared did not invalidate"
         );
     }
@@ -8078,7 +8070,8 @@ export default defineRule({{
                 ("src/a.ts", "const a = 1;\n"),
             ],
         );
-        let cold = messages(&project.run().expect("runs"));
+        let first = project.run().expect("runs");
+        let cold = messages(&first);
         assert!(
             !cold[0].contains(".lanekeep"),
             "lanekeep's own directory is invisible: {cold:?}"
