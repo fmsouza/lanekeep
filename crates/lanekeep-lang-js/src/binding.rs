@@ -385,22 +385,51 @@ fn declaration_kind(node: Node<'_>, source: &str) -> BindingKind {
 ///
 /// Handles destructuring, so `const { a, b: c } = x` binds `a` and `c` — a rule that only
 /// understood plain identifiers would silently miss both.
+///
+/// An allowlist of binding positions, and nothing else binds. It used to fall back to
+/// descending every named child of a kind it did not name, and the kinds it did not name
+/// were the ones that carry *expressions* beside their pattern: a parameter's default,
+/// annotation and decorators, and the default of `[a = b]`. Every identifier in any of them
+/// counted as declared, so `f(deps = { invoke: tauriInvoke })` declared `tauriInvoke` as a
+/// parameter and an import read there answered `param`, shadowed (#289). The fields are
+/// `node-types.json`'s, for `tree-sitter-typescript` 0.23.2 and `tree-sitter-javascript`
+/// 0.25.0 alike.
 fn pattern_binds(pattern: Node<'_>, source: &str, name: &str) -> bool {
     match pattern.kind() {
         "identifier" | "shorthand_property_identifier_pattern" => {
             node_text(pattern, source) == name
         }
-        // `{ b: c }` binds `c`; `[x]` binds `x`; `a = 1` binds `a`; `...rest` binds `rest`.
-        "pair_pattern" | "object_assignment_pattern" => pattern
-            .child_by_field_name("value")
-            .is_some_and(|value| pattern_binds(value, source, name)),
-        _ => {
+        // `a: T = d` and `@D() private a?: T` bind through `pattern` alone; `type`, `value`
+        // and `decorator` are read in scope, they declare nothing.
+        "required_parameter" | "optional_parameter" => {
+            field_binds(pattern, "pattern", source, name)
+        }
+        // `a = d`, in an array pattern or a JavaScript parameter list, and `{ a = d }`: the
+        // target is `left`. `object_assignment_pattern` has no `value` field, which is where
+        // this used to look, so `const { a = 1 } = o` bound nothing at all.
+        "assignment_pattern" | "object_assignment_pattern" => {
+            field_binds(pattern, "left", source, name)
+        }
+        // `{ b: c }` binds `c`; the key is a property name, or a computed expression.
+        "pair_pattern" => field_binds(pattern, "value", source, name),
+        // `{ a, b }`, `[x, y]`, `...rest`: containers of further patterns.
+        "object_pattern" | "array_pattern" | "rest_pattern" => {
             let mut cursor = pattern.walk();
             pattern
-                .children(&mut cursor)
-                .any(|child| child.is_named() && pattern_binds(child, source, name))
+                .named_children(&mut cursor)
+                .any(|child| pattern_binds(child, source, name))
         }
+        // Everything else — an expression, a comment, `this`, an `ERROR` node — binds
+        // nothing. A guess about a faulted tree is not a declaration; `lanekeep/parse`
+        // reports the fault.
+        _ => false,
     }
+}
+
+/// Whether the pattern in `node`'s `field` binds `name`.
+fn field_binds(node: Node<'_>, field: &str, source: &str, name: &str) -> bool {
+    node.child_by_field_name(field)
+        .is_some_and(|pattern| pattern_binds(pattern, source, name))
 }
 
 /// What an import statement binds `name` to.
@@ -536,7 +565,7 @@ mod tests {
     use lanekeep_lang::Language;
 
     use super::*;
-    use crate::TypeScript;
+    use crate::{JavaScript, TypeScript};
 
     /// Resolve the last identifier in the source that reads exactly `name`.
     ///
@@ -564,34 +593,56 @@ mod tests {
     }
 
     fn with_use<T>(source: &str, name: &str, f: impl Fn(&Tree, Node<'_>) -> T) -> T {
+        with_occurrence(&TypeScript, source, name, Occurrence::Last, f)
+    }
+
+    /// Which occurrence of a name a test means, counted by position in the file.
+    #[derive(Clone, Copy)]
+    enum Occurrence {
+        /// The `n`th, zero-based, from the start of the file.
+        Nth(usize),
+        Last,
+    }
+
+    fn with_occurrence<T>(
+        language: &dyn Language,
+        source: &str,
+        name: &str,
+        which: Occurrence,
+        f: impl Fn(&Tree, Node<'_>) -> T,
+    ) -> T {
         let mut parser = tree_sitter::Parser::new();
         parser
-            .set_language(&TypeScript.grammar())
+            .set_language(&language.grammar())
             .expect("grammar loads");
         let tree = parser.parse(source, None).expect("parses");
 
-        // The last occurrence *by position*, not by traversal order — the traversal is
-        // depth-first over a stack, so "last visited" is not "last in the file", and the
-        // tests mean the latter.
+        // Ordered *by position*, not by traversal order — the traversal is depth-first over
+        // a stack, so "last visited" is not "last in the file", and the tests mean the
+        // latter.
         //
         // `type_identifier` alongside `identifier`: a name that lives only in the type
         // namespace, like a type alias, never appears as a plain `identifier` node — the
         // grammar tokenizes both its declaration and its uses as `type_identifier` instead.
         // `resolve`/`declaration_of` read a node's text and walk its parents without caring
         // which of the two kinds it is, so the test helper matches that indifference.
-        let mut found: Option<Node<'_>> = None;
+        let mut found: Vec<Node<'_>> = Vec::new();
         let mut stack = vec![tree.root_node()];
         while let Some(node) = stack.pop() {
             if matches!(node.kind(), "identifier" | "type_identifier")
                 && node_text(node, source) == name
-                && found.is_none_or(|best| node.start_byte() > best.start_byte())
             {
-                found = Some(node);
+                found.push(node);
             }
             let mut cursor = node.walk();
             stack.extend(node.children(&mut cursor));
         }
-        let node = found.unwrap_or_else(|| panic!("no identifier `{name}` in source"));
+        found.sort_by_key(Node::start_byte);
+        let node = match which {
+            Occurrence::Nth(n) => found.get(n).copied(),
+            Occurrence::Last => found.last().copied(),
+        };
+        let node = node.unwrap_or_else(|| panic!("no such identifier `{name}` in source"));
         f(&tree, node)
     }
 
@@ -753,6 +804,187 @@ mod tests {
             resolve_use("const { ...rest } = obj;\nrest;", "rest"),
             Some(Binding::Local(BindingKind::Const))
         );
+    }
+
+    // --- what a parameter list does not declare (#289) -------------------------------
+
+    /// The `n`th occurrence of `name`, resolved and asked whether it is shadowed, in the
+    /// grammar a file with this extension would get.
+    fn nth(language: &dyn Language, source: &str, name: &str, n: usize) -> (Option<Binding>, bool) {
+        with_occurrence(language, source, name, Occurrence::Nth(n), |tree, node| {
+            (
+                JsBindingResolver.resolve(tree, source, node),
+                JsBindingResolver.is_shadowed(tree, source, node),
+            )
+        })
+    }
+
+    #[test]
+    fn a_name_read_in_a_parameter_default_is_not_the_parameter() {
+        // #289's reproduction, verbatim. The default's `tauriInvoke` was answered as a
+        // parameter, shadowed, and not the import: `pattern_binds` read every field of a
+        // `required_parameter`, its `value` among them, so each identifier in the default
+        // expression counted as declared by the parameter list.
+        let source = "import { tauriInvoke } from './bridge';\n\
+                      \n\
+                      export function plain() {\n  return tauriInvoke();\n}\n\
+                      \n\
+                      export function withDefault(deps: Deps = { invoke: tauriInvoke }) {\n  \
+                      return deps.invoke();\n}\n";
+        let bridge = import("./bridge", ImportedName::Named("tauriInvoke".to_owned()));
+        assert_eq!(resolve_use(source, "tauriInvoke"), Some(bridge.clone()));
+        assert!(!shadowed(source, "tauriInvoke"));
+        assert_eq!(
+            declaration_use(source, "tauriInvoke"),
+            Some("import_statement".to_owned())
+        );
+        // The use in `plain` answered correctly before and still does.
+        assert_eq!(
+            nth(&TypeScript, source, "tauriInvoke", 1),
+            (Some(bridge), false)
+        );
+        // And the parameter is still a parameter.
+        assert_eq!(
+            resolve_use(source, "deps"),
+            Some(Binding::Local(BindingKind::Param))
+        );
+    }
+
+    #[test]
+    fn a_javascript_parameter_default_is_not_the_parameter() {
+        // The JavaScript grammar has no `required_parameter`: a defaulted parameter is an
+        // `assignment_pattern` directly in `formal_parameters`, and the old fallback walked
+        // its `right` — the default — just the same. A `.js` file had #289 by another route.
+        let source = "import { tauriInvoke } from './bridge';\n\
+                      function withDefault(deps = { invoke: tauriInvoke }) {\n  \
+                      return deps.invoke();\n}\n";
+        assert_eq!(
+            nth(&JavaScript, source, "tauriInvoke", 1),
+            (
+                Some(import(
+                    "./bridge",
+                    ImportedName::Named("tauriInvoke".to_owned())
+                )),
+                false
+            )
+        );
+        assert_eq!(
+            nth(&JavaScript, source, "deps", 1),
+            (Some(Binding::Local(BindingKind::Param)), false)
+        );
+    }
+
+    #[test]
+    fn a_parameter_read_in_another_parameters_default_is_that_parameter() {
+        // Every parameter is in scope in every default. An earlier one has been
+        // initialized; a later one is in its temporal dead zone, so `f(a = b, b)` throws
+        // rather than reading an outer `b` — and resolving it outward would describe a read
+        // the program never performs. #289 suggested "earlier parameters only"; the
+        // language says otherwise, and the resolver follows the language.
+        let earlier = "import { a } from 'm';\nfunction f(a, b = a) {}\n";
+        assert_eq!(
+            nth(&TypeScript, earlier, "a", 2),
+            (Some(Binding::Local(BindingKind::Param)), true)
+        );
+        let later = "import { b } from 'm';\nfunction f(a = b, b) {}\n";
+        assert_eq!(
+            nth(&TypeScript, later, "b", 1),
+            (Some(Binding::Local(BindingKind::Param)), true)
+        );
+    }
+
+    #[test]
+    fn a_parameter_annotation_or_decorator_declares_nothing() {
+        // Both are fields of `required_parameter` beside `pattern`, and both were read as if
+        // they bound: `typeof x` puts an `identifier` in the annotation, and a decorator's
+        // argument is an ordinary expression.
+        let annotated = "import { x } from 'm';\nfunction f(a: typeof x) {}\n";
+        assert_eq!(
+            nth(&TypeScript, annotated, "x", 1),
+            (
+                Some(import("m", ImportedName::Named("x".to_owned()))),
+                false
+            )
+        );
+        let decorated = "import { TOKEN } from 'm';\n\
+                         class C { constructor(@Inject(TOKEN) svc: S) {} }\n";
+        assert_eq!(
+            nth(&TypeScript, decorated, "TOKEN", 1),
+            (
+                Some(import("m", ImportedName::Named("TOKEN".to_owned()))),
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn a_destructuring_default_binds_its_target_and_not_its_value() {
+        // `object_assignment_pattern` was read through a `value` field it does not have —
+        // `node-types.json` gives it `left` and `right` — so `{ a = 1 }` bound nothing and a
+        // use of `a` walked out of the declaration.
+        assert_eq!(
+            resolve_use("const { a = 1 } = o;\na;", "a"),
+            Some(Binding::Local(BindingKind::Const))
+        );
+        // And the defaults themselves, in every position, declare nothing, while the target
+        // beside each one still binds. Each source ends with a use of `a`, because the
+        // `{ a = b }` target is a `shorthand_property_identifier_pattern` the test helper
+        // does not look for.
+        for source in [
+            "import { b } from 'm';\nconst { a = b } = o;\na;\n",
+            "import { b } from 'm';\nconst [a = b] = o;\na;\n",
+            "import { b } from 'm';\nfunction f({ a = b }) { a; }\n",
+            "import { b } from 'm';\nfunction f([a = b]) { a; }\n",
+        ] {
+            assert_eq!(
+                nth(&TypeScript, source, "b", 1),
+                (
+                    Some(import("m", ImportedName::Named("b".to_owned()))),
+                    false
+                ),
+                "{source}"
+            );
+            assert!(
+                resolve_use(source, "a")
+                    .is_some_and(|binding| matches!(binding, Binding::Local(_))),
+                "the target still binds: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_parameter_shape_still_binds_its_name() {
+        // The allowlist that replaced the descend-into-everything fallback has to cover
+        // every binding position the old walk reached, or a parameter goes missing.
+        for (language, source, name) in [
+            (
+                &TypeScript as &dyn Language,
+                "function f(...r: number[]) { r; }",
+                "r",
+            ),
+            (&TypeScript, "function f(a?: number) { a; }", "a"),
+            (&TypeScript, "function f(a = 1) { a; }", "a"),
+            (&TypeScript, "function f({ k: v }) { v; }", "v"),
+            (&TypeScript, "function f({ k }) { k; }", "k"),
+            (&TypeScript, "function f([, s]) { s; }", "s"),
+            (
+                &TypeScript,
+                "class C { constructor(private svc: S) { svc; } }",
+                "svc",
+            ),
+            (&JavaScript, "function f(...r) { r; }", "r"),
+            (&JavaScript, "function f(a = 1) { a; }", "a"),
+            (&JavaScript, "function f({ k = 1 }) { k; }", "k"),
+            (&JavaScript, "function f([a = 1]) { a; }", "a"),
+        ] {
+            assert_eq!(
+                with_occurrence(language, source, name, Occurrence::Last, |tree, node| {
+                    JsBindingResolver.resolve(tree, source, node)
+                }),
+                Some(Binding::Local(BindingKind::Param)),
+                "{source}"
+            );
+        }
     }
 
     #[test]
