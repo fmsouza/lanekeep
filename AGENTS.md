@@ -133,6 +133,8 @@ crates/
   lanekeep-nodes     the node arena: parsed-tree handles shared by every rule-execution engine
   lanekeep-lang      Language trait and registry
   lanekeep-lang-js   TS/TSX/JS/JSX grammars, binding resolution
+  lanekeep-tree-sitter-typescript  upstream's TypeScript and TSX grammars, regenerated with
+                     two fixes (#286) — generated, never edited; see its lib.rs
   lanekeep-lang-python  Python grammar, binding resolution
   lanekeep-lang-go      Go grammar, binding resolution
   lanekeep-lang-rust    Rust grammar, binding resolution
@@ -1542,11 +1544,14 @@ provider over the TSX grammar folded exactly what one over TypeScript did.
 `the_identity_folds_both_grammar_digests_and_the_resolver` pins the fold byte for byte.
 
 **A rule anchored at `(program)` never runs on a file whose root is `ERROR`, and until #271 the
-only sign was `parsed 1, matches 0`.** tree-sitter-typescript 0.23.2 reads
+only sign was `parsed 1, matches 0`.** Upstream tree-sitter-typescript 0.23.2 reads
 `f<typeof import('m')>()` as `f < typeof import('m')` followed by a stray `()`
 (tree-sitter/tree-sitter-typescript#367, open, with no release of the grammar since 2024-11).
 That is Vitest's `importOriginal<typeof import('./m')>()` idiom, which #271 reports in about 280
-files of one consumer's test suite. How much of a file recovery then takes depends on what
+files of one consumer's test suite. lanekeep stopped parsing with that grammar in #286 (the
+entries below), so the idiom reads as a call now; the parse-fault fixtures keep its shape with an
+invalid type argument in its place, so they fault for a reason no grammar fix removes. How much
+of a file recovery takes depends on what
 surrounds the call, and no general rule about it has held up. In #271's reproduction a trailing
 `1` turns the root itself into `ERROR`, while a trailing `const z = 2` leaves it `program`. In its
 realistic test file, written without semicolons, one `ERROR` runs from the mock to the end of the
@@ -1557,17 +1562,45 @@ on other grammar gaps among the 966 `.ts`, `.tsx`, `.js`, `.mjs` and `.cjs` file
 `packages/lanekeep/node_modules` as `npm ci` installs it at `473004b`. `lanekeep/parse` now
 reports every faulted tree, and `--profile` counts them as `faulted`.
 
-Two things it cannot do. It cannot see a misparse that leaves no error node:
-`f<typeof import('m')>(1)` parses clean as `(f < typeof import('m')) > (1)`. And its answer is
+Two things it cannot do. It cannot see a misparse that leaves no error node: upstream's grammar
+parsed `f<typeof import('m')>(1)` clean as `(f < typeof import('m')) > (1)` until #286, and
+tree-sitter-javascript 0.25 still reads a bare `export` as an identifier. And its answer is
 tree-sitter's error recovery, which two cache-key inputs cannot see. The grammar key hashes a
 grammar's shape, not its parse tables, and nothing hashes the tree-sitter runtime, whose
 `parser.c` decides where recovery puts each `ERROR`. So a bump of either that changes recovery
-without changing the grammar's shape replays old diagnostics from a warm cache. For the grammar,
-`the_type_argument_import_misparse_is_still_present` in `crates/lanekeep-lang-js/src/lib.rs`
-fails when #367 is fixed, and the edit that failure forces is itself the invalidation:
-`crates/lanekeep-lang-js/build.rs` hashes the crate's whole `src/`, tests included, into its
-`analysis_identity`, so keep the canary there. For the runtime there is no such guard yet. A pull
+without changing the grammar's shape replays old diagnostics from a warm cache. The canary that
+used to guard the TypeScript grammar left with the bug it watched: a regeneration of
+`crates/lanekeep-tree-sitter-typescript` is now a deliberate commit, and #286's moved
+`typescript`'s parse-state count from 5870 to 5888, which the grammar key folds — check that a
+later one moves something the key reads. For the runtime there is no such guard yet. A pull
 request that moves `tree-sitter` owns its own invalidation.
+
+**A `precedences` entry decides a conflict when the grammar is generated, and declaring the
+conflict beside it changes nothing.** #367's cause: upstream lists `[call_expression,
+_type_query_call_expression]` in `precedences`, so after `f < typeof import('m')` the
+reduce/reduce between the expression call `import('m')` and the type query's is settled at
+generation time, toward the expression, and the type-argument reading is gone before the `>`
+that would have chosen it. `f<typeof x>()` was fine only because `identifier` has declared
+conflicts, which keep both readings alive in the GLR parser. Adding the pair to `conflicts` with
+the precedence entry left in place was measured to change nothing; removing the entry and
+declaring the conflict is the fix. When a grammar gap looks like the parser committing too early,
+read `precedences` before `conflicts`.
+
+**The vendored TypeScript grammar is regenerated, never edited, and its toolchain is checked
+against upstream before it writes anything.** `crates/lanekeep-tree-sitter-typescript` is
+upstream 0.23.2's `grammar.json`, patched by `grammar/patch.py` and generated by tree-sitter-cli
+0.24.4 through `just typescript-grammar`. That CLI reproduces upstream's `parser.c` and
+`node-types.json` byte for byte from upstream's own `grammar.json`, for both grammars, which is
+what makes the patch a readable diff rather than a fork; the script re-checks it on every run and
+stops if a different CLI does not. #286 measured the patch over 13,009 `.ts`, `.mts`, `.cts` and
+`.tsx` files under 2 MB — microsoft/TypeScript at `c63de15` (`tests/cases/conformance`,
+`tests/cases/compiler`, `src/compiler`), this repository's `packages/` after `npm ci` at
+`9447337`, and `crates/` — and 41 files stopped faulting, none started, and the one file whose
+clean tree changed was `useRef<typeof import("csv-parse")>(null)` turning from two comparisons
+into the call it is. Upstream's own corpus passed 112 of 112 before and after. The grammars are
+renamed `lanekeep_typescript` and `lanekeep_tsx` so their C symbols cannot meet upstream's in one
+binary: a symbol defined in two static archives is not a link error, the linker takes whichever
+it reads first. Delete the crate when upstream ships a grammar with both fixes.
 
 ## What not to do
 

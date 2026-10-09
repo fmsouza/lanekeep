@@ -218,10 +218,7 @@ fn type_only_star_reexports_and_the_vitest_idiom_are_read_whole() {
     let project = Project::new("issue-286", &borrowed);
 
     let (_, json) = project.check_json(&["--no-cache"]);
-    assert!(
-        violations_of(&json, "lanekeep/parse").is_empty(),
-        "{json}"
-    );
+    assert!(violations_of(&json, "lanekeep/parse").is_empty(), "{json}");
     assert_eq!(
         violations_of(&json, "local/anchor").len(),
         sources.len() * 2,
@@ -332,8 +329,7 @@ fn an_off_parse_severity_reports_nothing_ts() {
 fn the_root_case_is_acknowledged_line_by_line_under_forbid_file_scope() {
     // Under `forbidFileScope` every whole-file directive is itself an error, so the next-line
     // form is the only acknowledgement. It has to land on the line the report names.
-    let acknowledged =
-        format!("// {NEXT_LINE} lanekeep/parse reason: invalid on purpose\n{REPRO}");
+    let acknowledged = format!("// {NEXT_LINE} lanekeep/parse reason: invalid on purpose\n{REPRO}");
     let project = Project::new(
         "forbid-file-scope",
         &[
@@ -383,8 +379,7 @@ fn a_whole_file_acknowledgement_under_require_expiry_still_silences() {
 
 #[test]
 fn an_acknowledgement_of_an_off_report_is_unused() {
-    let acknowledged =
-        format!("// {NEXT_LINE} lanekeep/parse reason: invalid on purpose\n{REPRO}");
+    let acknowledged = format!("// {NEXT_LINE} lanekeep/parse reason: invalid on purpose\n{REPRO}");
     let project = Project::new(
         "unused-when-off",
         &[

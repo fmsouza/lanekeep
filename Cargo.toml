@@ -74,7 +74,8 @@ tree-sitter = { version = "0.27" }
 # The TypeScript and TSX grammars are not `tree-sitter-typescript` from crates.io but
 # `lanekeep-tree-sitter-typescript` above: its 0.23.2 regenerated with two fixes, because upstream
 # has shipped no grammar change since 2024-11 and two valid forms parse as `ERROR` there. Read
-# that crate's `lib.rs` before bumping anything here.
+# that crate's `lib.rs` before bumping anything here. `tree-sitter-language` and `cc` are what
+# that crate needs to expose and compile the generated parsers, as upstream's crate does.
 tree-sitter-language = { version = "0.1" }
 cc = { version = "1" }
 tree-sitter-javascript = { version = "0.25" }

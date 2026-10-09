@@ -440,8 +440,10 @@ mod tests {
                 "async () => {\n  const actual = await importOriginal<typeof import('./dep')>();\n};\n",
             );
             assert!(
-                idiom.contains("(call_expression function: (await_expression (identifier)) \
-                                type_arguments: (type_arguments (type_query"),
+                idiom.contains(
+                    "(call_expression function: (await_expression (identifier)) \
+                                type_arguments: (type_arguments (type_query"
+                ),
                 "{name}: {idiom}"
             );
         }
