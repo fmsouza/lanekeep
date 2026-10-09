@@ -60,6 +60,10 @@
         "forbidFileScope": {
           "type": "boolean",
           "description": "Any whole-file directive is reported."
+        },
+        "unused": {
+          "enum": ["off", "warn", "error"],
+          "description": "Severity of a directive that silenced nothing, reported under lanekeep/suppression. off by default; error fails the run. --report-unused-suppressions raises off to warn and never lowers error."
         }
       }
     },

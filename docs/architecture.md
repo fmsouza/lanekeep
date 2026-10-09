@@ -366,7 +366,7 @@ Mechanically, a sanitizer and an ordinary clean reassignment are one mechanism: 
 - `sanitizers` is the primary, project-wide lever. Widening it — teaching the analysis about another call that produces a clean value — fixes a class of finding rather than one instance, the same way a query change always beats a suppression comment.
 - A finding is always anchored at its sink node, so a genuine false positive is suppressed there with `lanekeep-ignore-next-line <id> reason: ...` (§10). The mandatory `reason:` carries more weight here than on an ordinary per-line finding, because nobody re-reading the suppression later can reconstruct why a multi-step flow was judged acceptable without it.
 - Turn on `suppressions.requireExpiry` and set a `maxExpiryDays` (§10, "Suppression policy") for a dataflow rule specifically. Refactoring the steps between a source and a sink is exactly the kind of change that silently removes the path a suppression was written against — more often than it removes an ordinary single-node finding — and an expiry forces a second look rather than letting the comment outlive the flow it was about.
-- `--report-unused-suppressions` (§10) is what actually catches that case once it happens: a suppression whose flow no longer exists is exactly a suppression whose violation no longer fires, which is what that flag surfaces.
+- `--report-unused-suppressions`, or `suppressions.unused` in the config (§10), is what actually catches that case once it happens: a suppression whose flow no longer exists is exactly a suppression whose violation no longer fires, which is what both surface.
 
 **No `--fix`.** A reduce-phase violation cannot carry one because there is no parse-tree node left to replace by the time `reduce` runs (§10.1); a flow finding is not in that position — it has a real node, `path.sink`, and `ctx.report` could technically be handed a replacement. It is deliberately not: the only thing a fix could mechanically insert at a sink is a `redact(...)` call, and inserting one silences the finding without addressing why the value reached a string in the first place. The actual remedy is to restructure the code so it does not, which is not a template substitution any rule can compute — an unreviewed auto-fix here is worse than the unfixed violation, which at least keeps saying so.
 
@@ -927,7 +927,7 @@ minWidth: 44,
 - Rule IDs whitespace- or comma-separated, and **namespaced** — a bare id is rejected rather than silently matching nothing.
 - `reason:` mandatory. A suppression is a decision to accept a violation, and the next person to read it cannot tell whether that decision still holds without one.
 - Directive must be a standalone token, so prose mentioning it doesn't match.
-- `--report-unused-suppressions` — hygiene. A suppression whose violation no longer exists documents a decision about code that has changed, and nothing else will ever say so. Reported as a **warning**: turning on a hygiene report must not fail a build that was passing. Off by default, because debt is worth surfacing on request rather than in everyone's inner loop.
+- `--report-unused-suppressions` — hygiene. A suppression whose violation no longer exists documents a decision about code that has changed, and nothing else will ever say so. Reported as a **warning**: turning on a hygiene report must not fail a build that was passing. Off by default, because debt is worth surfacing on request rather than in everyone's inner loop. A project that wants stale directives to fail the run says so in its config with `suppressions.unused: "error"` (below); the flag raises an unset `off` to `warn` and never lowers a configured `error`, so typing it on one run cannot turn a failing policy into a passing one.
 - Optional `expires: YYYY-MM-DD` — surfaces as a violation past the date. Makes "temporary" suppressions actually temporary.
 
 **A directive that does not work says so.** A missing `reason:`, a bare rule id, an unreadable `expires:`, a directive naming no rules — each is reported as a violation of `lanekeep/suppression` rather than skipped. The failure this guards against is a comment that looks like it silences something, does not, and never says so: the author moves on believing the violation is handled.
@@ -945,12 +945,15 @@ The only policy the tool itself can state is "give a reason" — which an agent 
   "suppressions": {
     "requireExpiry": true,     // a valid directive with no `expires:` is reported
     "maxExpiryDays": 90,       // an expiry more than 90 days after today is reported
-    "forbidFileScope": true    // any lanekeep-ignore-file directive is reported
+    "forbidFileScope": true,   // any lanekeep-ignore-file directive is reported
+    "unused": "error"          // a directive that silenced nothing: "off" | "warn" | "error"
   }
 }
 ```
 
-All three default off, so an existing config changes nothing. `maxExpiryDays` must be at least 1.
+All four default off, so an existing config changes nothing. `maxExpiryDays` must be at least 1. An unknown key in the block is refused rather than ignored: `unused` written before the key existed loaded, did nothing, and said nothing (#285).
+
+`unused` reports under `lanekeep/suppression`, with the same message and position the flag produces, so a consumer of `--format json` sees one shape whichever turned it on. A run that skipped the reduce phase — `--since`, `--staged`, `--file` — gives no verdict on a directive naming a cross-file rule, because whether it would have fired is a question about a phase that did not run; under `"error"` the alternative is a pre-commit hook failing on every such directive in the files it was shown. The full run still judges it.
 
 **A policy violation is reported, never un-suppressed.** The directive still silences what it names, and the violation is an ordinary `lanekeep/suppression` violation at the directive's own position. Un-suppressing would turn enabling a policy into an avalanche of previously-accepted violations; the policy violation itself makes the run exit `1`, so an agent cannot buy a green run with a directive the policy forbids.
 
@@ -963,7 +966,7 @@ sits at the file's first code token even when the whole file failed to parse, so
 next-line directive can precede it — under `forbidFileScope` that is the only acknowledgement
 there is.
 
-The policy is a `config_hash` input, like every other setting: changing it invalidates the cache the way any config change does. `maxExpiryDays` compares against the run's `today`, so its verdict is date-dependent — and the dated cache key already covers exactly the affected files, since a file whose bytes contain `expires:` gets a one-day key. `requireExpiry` and `forbidFileScope` are date-independent and cache under the plain key.
+The policy is a `config_hash` input, like every other setting: changing it invalidates the cache the way any config change does. `unused` is folded too, although no cache entry depends on it — the unused-directive report is computed after the cache, from the directives and usage each entry records — because a setting that reaches no hash is a shape not worth having to reason about case by case. `maxExpiryDays` compares against the run's `today`, so its verdict is date-dependent — and the dated cache key already covers exactly the affected files, since a file whose bytes contain `expires:` gets a one-day key. `requireExpiry` and `forbidFileScope` are date-independent and cache under the plain key.
 
 ### Suppressions and the cache
 

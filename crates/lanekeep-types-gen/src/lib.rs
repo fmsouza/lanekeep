@@ -1033,6 +1033,11 @@ export interface Config {
     maxExpiryDays?: number
     /** Any whole-file directive is reported. */
     forbidFileScope?: boolean
+    /**
+     * Severity of a directive that silenced nothing. `error` fails the run;
+     * `--report-unused-suppressions` raises `off` to `warn` and never lowers `error`.
+     */
+    unused?: 'off' | 'warn' | 'error'
   }
   /** Which type oracle answers `ctx.types`. */
   types?: {

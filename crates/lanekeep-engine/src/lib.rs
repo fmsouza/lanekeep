@@ -720,8 +720,12 @@ pub struct Engine {
     caching: bool,
     /// Whether reduce phases run.
     reducing: bool,
-    /// Whether directives that silenced nothing are reported.
-    reporting_unused: bool,
+    /// The severity a directive that silenced nothing is reported at; `Off` reports nothing.
+    ///
+    /// Read from the config's `suppressions.unused`, and raised from `Off` to `Warn` by
+    /// [`Self::reporting_unused_suppressions`]. Not a cache-entry input: the report is computed
+    /// after the cache, from the directives and usage every entry already records.
+    unused_severity: Severity,
     /// Whether per-rule timings are collected.
     profiling: bool,
     /// The date `expires:` is compared against.
@@ -1618,7 +1622,7 @@ impl Engine {
             caching,
             components,
             reducing: true,
-            reporting_unused: false,
+            unused_severity: config.suppressions.unused,
             profiling: false,
             today: suppression::today(),
             // Canonicalized here so every tracked read compares against the same absolute
@@ -1747,14 +1751,18 @@ impl Engine {
         self
     }
 
-    /// Report suppressions that silenced nothing.
+    /// Report suppressions that silenced nothing, at least as warnings.
     ///
     /// Off by default because it is hygiene rather than correctness: a suppression whose
     /// violation no longer exists is debt, and debt is worth surfacing on request rather
-    /// than in everyone's inner loop.
+    /// than in everyone's inner loop. A floor, not an override: a config that already says
+    /// `suppressions.unused: "error"` stays `Error`, because asking for a report on one run
+    /// must not turn a project's failing policy into a passing one.
     #[must_use]
     pub const fn reporting_unused_suppressions(mut self) -> Self {
-        self.reporting_unused = true;
+        if matches!(self.unused_severity, Severity::Off) {
+            self.unused_severity = Severity::Warn;
+        }
         self
     }
 
@@ -1999,8 +2007,24 @@ impl Engine {
             }
         }
 
-        if self.reporting_unused {
-            violations.extend(unused_violations(&directives));
+        if self.unused_severity.is_enabled() {
+            // A run that skipped the reduce phase cannot know whether a directive naming a
+            // cross-file rule would have fired, so it gives no verdict on one — `--staged` under
+            // `unused: "error"` would otherwise fail on every such directive in the files it saw.
+            let unjudged: Vec<&RuleId> = if self.reducing {
+                Vec::new()
+            } else {
+                self.rules
+                    .iter()
+                    .filter(|rule| rule.spec.has_reduce)
+                    .map(|rule| &rule.spec.id)
+                    .collect()
+            };
+            violations.extend(unused_violations(
+                &directives,
+                self.unused_severity,
+                &unjudged,
+            ));
         }
 
         lanekeep_core::sort(&mut violations);
@@ -4097,10 +4121,18 @@ fn covering_elsewhere(
 /// A suppression whose violation no longer exists is debt: it documents a decision about
 /// code that has changed, and the next person to read it has no way to tell it is stale.
 ///
-/// Reported as warnings rather than errors. Turning on a hygiene report should not fail a
-/// build that was passing — the point is to show the debt, not to refuse to proceed until it
-/// is paid.
-fn unused_violations(directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Violation> {
+/// Reported at `severity`: a warning when `--report-unused-suppressions` turned it on, because
+/// turning on a hygiene report should not fail a build that was passing, and an error only when
+/// the project's config says `suppressions.unused: "error"` (#285).
+///
+/// A directive naming any rule in `unjudged` is passed over: those are cross-file rules on a run
+/// that skipped the reduce phase, where "silenced nothing" would be a claim about a phase that
+/// never ran.
+fn unused_violations(
+    directives: &BTreeMap<FilePath, FileDirectives>,
+    severity: Severity,
+    unjudged: &[&RuleId],
+) -> Vec<Violation> {
     let Ok(rule_id) = SUPPRESSION_RULE.parse::<RuleId>() else {
         return Vec::new();
     };
@@ -4109,7 +4141,12 @@ fn unused_violations(directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Vio
     for (file, found) in directives {
         for (index, suppression) in found.suppressions.iter().enumerate() {
             let index = u32::try_from(index).unwrap_or(u32::MAX);
-            if found.used.contains(&index) {
+            if found.used.contains(&index)
+                || suppression
+                    .rules
+                    .iter()
+                    .any(|rule| unjudged.contains(&rule))
+            {
                 continue;
             }
 
@@ -4123,7 +4160,7 @@ fn unused_violations(directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Vio
                 remediation: String::from(
                     "remove it: whatever it was accepting is no longer reported",
                 ),
-                severity: Severity::Warn,
+                severity,
                 fix: None,
             });
         }
@@ -9175,6 +9212,145 @@ export default defineRule({
             "{:?}",
             messages(&outcome)
         );
+    }
+
+    /// A project with one stale directive, `suppressions` set as `extra` says.
+    fn stale_directive(name: &str, extra: &str) -> Project {
+        Project::new(
+            name,
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                ("lanekeep.config.ts", &config(extra)),
+                (
+                    "src/a.ts",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: stale\nconst a = 1;\n"),
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_unused_suppression_is_an_error_when_the_config_says_so() {
+        // #285: the way to make a stale directive fail the run, with no flag on the command
+        // line — the config is what CI, the editor and the agent all read.
+        let project = stale_directive("unused-config-error", ", suppressions: { unused: 'error' }");
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        let violation = &outcome.violations[0];
+        assert_eq!(violation.rule_id.to_string(), "lanekeep/suppression");
+        assert!(
+            violation.message.contains("silenced nothing"),
+            "{}",
+            violation.message
+        );
+        assert_eq!(violation.severity, Severity::Error);
+        assert!(lanekeep_core::any_failing(&outcome.violations));
+    }
+
+    #[test]
+    fn an_unused_suppression_is_a_warning_when_the_config_says_warn() {
+        let project = stale_directive("unused-config-warn", ", suppressions: { unused: 'warn' }");
+        let outcome = project.run().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert_eq!(outcome.violations[0].severity, Severity::Warn);
+        assert!(!lanekeep_core::any_failing(&outcome.violations));
+    }
+
+    #[test]
+    fn the_flag_does_not_lower_a_configured_error() {
+        // The flag means "also report". Typing it on one run must not turn a project's
+        // failing policy into a passing one.
+        let project = stale_directive("unused-flag-floor", ", suppressions: { unused: 'error' }");
+        let outcome = project.run_reporting_unused().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert_eq!(outcome.violations[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn an_explicit_off_is_quiet() {
+        let project = stale_directive("unused-config-off", ", suppressions: { unused: 'off' }");
+        assert!(project.run().expect("runs").violations.is_empty());
+    }
+
+    // The JSON path carries the setting into enforcement too.
+    #[test]
+    fn an_unused_suppression_is_an_error_when_a_json_config_says_so() {
+        let project = Project::new(
+            "unused-config-error-json",
+            &[
+                ("rule.ts", DEBUGGER_RULE),
+                (
+                    "lanekeep.json",
+                    r#"{"include": ["src/**/*.ts"], "rules": ["./rule"],
+                       "suppressions": {"unused": "error"}}"#,
+                ),
+                (
+                    "src/a.ts",
+                    &format!("// {NEXT_LINE} local/no-debugger reason: stale\nconst a = 1;\n"),
+                ),
+            ],
+        );
+        let outcome = project.run_json().expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert_eq!(outcome.violations[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn a_run_without_reduce_does_not_judge_a_directive_naming_a_cross_file_rule() {
+        // `--staged`, `--since` and `--file` skip the reduce phase, so a directive whose only
+        // job is to silence a cross-file violation fires nothing there. Calling it unused would
+        // be wrong — and under `unused: 'error'` would fail every pre-commit run.
+        let project = Project::new(
+            "unused-cross-file-narrowed",
+            &[
+                ("rule.ts", UNUSED_EXPORTS_RULE),
+                (
+                    "lanekeep.config.ts",
+                    &config(", suppressions: { unused: 'error' }"),
+                ),
+                (
+                    "src/a.ts",
+                    &format!(
+                        "export function used() {{}}\n\
+                         // {NEXT_LINE} local/no-unused-exports reason: public API\n\
+                         export function spare() {{}}\n"
+                    ),
+                ),
+                ("src/b.ts", "import { used } from './a';\nused();\n"),
+            ],
+        );
+
+        // The flag as well as the config, so the verdict is asked for whichever way it is
+        // turned on — exactly what `lanekeep check --staged --report-unused-suppressions` does.
+        let outcome = project
+            .build()
+            .map(Engine::without_reduce)
+            .map(Engine::reporting_unused_suppressions)
+            .expect("builds")
+            .run()
+            .expect("runs");
+        assert!(
+            outcome.violations.is_empty(),
+            "a run that skipped reduce judged a cross-file directive: {:?}",
+            messages(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_run_without_reduce_still_judges_a_per_file_directive() {
+        // The skip is for cross-file rules only: a per-file rule ran, so its verdict stands.
+        let project = stale_directive(
+            "unused-per-file-narrowed",
+            ", suppressions: { unused: 'error' }",
+        );
+        let outcome = project
+            .build()
+            .map(Engine::without_reduce)
+            .expect("builds")
+            .run()
+            .expect("runs");
+        assert_eq!(outcome.violations.len(), 1, "{:?}", messages(&outcome));
+        assert_eq!(outcome.violations[0].severity, Severity::Error);
     }
 
     // --- the suppression policy ------------------------------------------------------------

@@ -593,7 +593,7 @@ mod tests {
                 "namespaces": ["acme"], "severity": {"acme/a": "warn"},
                 "timeouts": {"rule": 100, "global": 5000},
                 "suppressions": {"requireExpiry": true, "maxExpiryDays": 30,
-                                 "forbidFileScope": true},
+                                 "forbidFileScope": true, "unused": "error"},
                 "rules": ["lanekeep/no-default-export"]}"#,
         )
         .expect("compiles");
@@ -609,6 +609,7 @@ mod tests {
             "requireExpiry",
             "maxExpiryDays",
             "forbidFileScope",
+            "unused",
             "include",
             "exclude",
         ] {
@@ -933,7 +934,7 @@ mod tests {
             "types": {"provider": "tsc", "command": ["node"],
                       "typescript": "./node_modules/typescript"},
             "suppressions": {"requireExpiry": true, "maxExpiryDays": 30,
-                             "forbidFileScope": true},
+                             "forbidFileScope": true, "unused": "error"},
             "rules": ["lanekeep/no-default-export"]
         }"#;
         compile("schema-agreement", everything)
