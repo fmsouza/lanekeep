@@ -49,6 +49,41 @@ fn the_test_name_and_the_only_variant_are_covered() {
 }
 
 #[test]
+fn playwright_hooks_steps_and_describe_are_not_tests() {
+    // #287: every `test.<member>(...)` used to be a test, because the query captured only the
+    // member's object. Hooks and steps are not expected to assert, and a describe holding an
+    // asserting test is not itself a test.
+    tester_for("ts", "{}")
+        .accepts(
+            "test.beforeEach(async ({ page }) => {\n  await page.goto('/')\n})\n\ntest.afterAll(async () => {\n  await cleanup()\n})\n\ntest.describe('group', () => {\n  test.beforeAll(() => {\n    seed()\n  })\n  test('works', async ({ page }) => {\n    await test.step('open', async () => {\n      await page.goto('/')\n    })\n    await expect(page).toHaveTitle('x')\n  })\n})\n",
+        )
+        .expect("hooks, steps and describe blocks are not tests and need not assert");
+}
+
+#[test]
+fn a_describe_holding_no_assertion_is_not_a_test() {
+    // The other half of #287's second repro: the enclosing describe was reported too when
+    // nothing inside it asserted. Whether a describe holds a test is not this rule's business.
+    tester_for("ts", "{}")
+        .accepts(
+            "test.describe('group', () => {\n  test.beforeEach(() => {\n    seed()\n  })\n  test.afterEach(() => {\n    reset()\n  })\n})\n",
+        )
+        .expect("a describe block is a grouping, not a test");
+}
+
+#[test]
+fn the_test_declaring_modifiers_are_still_tests() {
+    // The allow-list is what fixes #287, so it must not narrow past the modifier forms that do
+    // declare a test: jest/vitest `concurrent`, Playwright `fixme`, jest `failing`.
+    tester_for("ts", "{}")
+        .reports_at(
+            "test.skip('a', () => {\n  a()\n})\ntest.concurrent('b', async () => {\n  b()\n})\ntest.fixme('c', () => {\n  c()\n})\nit.failing('d', () => {\n  d()\n})\n",
+            &[(1, 1), (4, 1), (7, 1), (10, 1)],
+        )
+        .expect("each modifier form declares a test, so an empty one is reported");
+}
+
+#[test]
 fn an_ordinary_function_call_is_not_a_test() {
     tester_for("ts", "{}")
         .accepts("setup('adds', () => {\n  add(1, 2)\n})\n")

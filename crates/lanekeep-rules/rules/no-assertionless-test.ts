@@ -10,7 +10,7 @@ import { defineRule } from 'lanekeep'
  *
  * | language | a test is | asserts by default |
  * | --- | --- | --- |
- * | typescript/tsx | an `it(...)`/`test(...)` call with a block-bodied callback | `expect*`, `assert*` |
+ * | typescript/tsx | an `it(...)`/`test(...)` call, or a modifier form like `test.only(...)`, with a block-bodied callback | `expect*`, `assert*` |
  * | python | a `def test*` function, methods included | the `assert` statement, `self.assert*`, `self.fail`, `pytest.raises` |
  * | go | `func Test*` taking `*testing.T` | `t.Error*`, `t.Fatal*`, `t.Fail*`, `assert.*`, `require.*` |
  * | rust | a `fn` under `#[test]` or a `::test` attribute path | `assert*!`, `debug_assert*!`, `panic!` |
@@ -106,8 +106,7 @@ export default function noAssertionlessTest(options) {
       const family = familyOf(ctx.filePath)
 
       if (family === 'typescript') {
-        const callee = normalize(ctx.text(m.fn))
-        if (callee !== 'it' && callee !== 'test') return
+        if (!isTestCallee(normalize(ctx.text(m.fn)))) return
         if (asserts(ctx, m.body, CALLS.typescript, vocabulary('typescript'))) return
         ctx.report(m.def, 'test asserts nothing')
         return
@@ -148,15 +147,45 @@ export default function noAssertionlessTest(options) {
   })
 }
 
-/** The typescript grammar's test shape; tsx shares the vocabulary, so both entries use it. */
+/**
+ * The typescript grammar's test shape; tsx shares the vocabulary, so both entries use it.
+ *
+ * `@fn` is the whole callee — `test`, or `test.only` — not only its object: capturing the
+ * object alone made every `test.<member>(...)` a test, Playwright's hooks and steps included
+ * (#287). Which callees declare a test is `isTestCallee`'s judgment, made on the text.
+ */
 const TS_QUERY = `
   (call_expression
-    function: [(identifier) @fn (member_expression object: (identifier) @fn)]
+    function: [
+      (identifier)
+      (member_expression object: (identifier) property: (property_identifier))
+    ] @fn
     arguments: (arguments [
       (arrow_function body: (statement_block) @body)
       (function_expression body: (statement_block) @body)
     ])) @def
 `
+
+/** The names a typescript test is declared by. */
+const TEST_CALLEES = ['it', 'test']
+
+/**
+ * The members of a test callee that still declare a test: jest and vitest's `only`, `skip`,
+ * `concurrent`, jest's `failing`, vitest's `fails`, Playwright's `fail` and `fixme`.
+ *
+ * An allow-list, so an unknown member is not a test. Every other `test.<member>` —
+ * `beforeEach`, `afterAll`, `describe`, `step`, `use`, `extend` — is a hook, a group or
+ * configuration, none of which is expected to assert. A miss here is a test the rule does
+ * not see; a deny-list's miss would be correct code reported.
+ */
+const TEST_MODIFIERS = ['only', 'skip', 'concurrent', 'fails', 'failing', 'fail', 'fixme']
+
+/** Whether a normalized callee declares a test: `it`, `test`, or one of them with a modifier. */
+function isTestCallee(callee) {
+  const [base, modifier, ...rest] = callee.split('.')
+  if (rest.length > 0 || !TEST_CALLEES.includes(base)) return false
+  return modifier === undefined || TEST_MODIFIERS.includes(modifier)
+}
 
 /** What counts as asserting when nothing is configured, per language family. */
 const DEFAULT_ASSERTIONS = {
