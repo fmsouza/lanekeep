@@ -7757,7 +7757,8 @@ export default defineRule({
   card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },
   check() {},
   reduce(ctx) {
-    const absent = ctx.readFile === undefined && ctx.fileExists === undefined;
+    const absent =
+      ctx.readFile === undefined && ctx.fileExists === undefined && ctx.listDir === undefined;
     ctx.report({ file: 'probe.ts', line: absent ? 1 : 2, column: 1 });
   },
 });
@@ -7963,6 +7964,125 @@ export default defineRule({
             1,
             "a changed dependency did not invalidate"
         );
+    }
+
+    /// A rule that reports what `ctx.listDir` answered for a directory, as its message.
+    fn listing_rule(directory: &str) -> String {
+        format!(
+            r"import {{ defineRule }} from 'lanekeep';
+export default defineRule({{
+  id: 'local/lists',
+  query: '(program) @p',
+  card: {{ message: 'x', remediation: 'y', examples: {{ bad: 'a', good: 'b' }} }},
+  check(ctx, m) {{
+    ctx.report(m.p, JSON.stringify(ctx.listDir('{directory}') ?? null));
+  }},
+}});
+"
+        )
+    }
+
+    #[test]
+    fn a_rule_can_list_a_directory_and_the_listing_is_recorded() {
+        // #284's own reproduction: `src/dir` holds no file the run checks, and a rule can now
+        // see what it does hold rather than guessing names to probe.
+        let project = Project::new(
+            "list-dir",
+            &[
+                ("rule.ts", &listing_rule("src/dir")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+                ("src/dir/note.md", "notes\n"),
+            ],
+        );
+        let outcome = project.run().expect("runs");
+        assert_eq!(messages(&outcome), vec![r#"["note.md"]"#]);
+
+        let deps = outcome
+            .dependencies
+            .get(&FilePath::new("src/a.ts"))
+            .expect("the listing is a dependency");
+        assert_eq!(
+            deps,
+            &vec![TrackedRead::listed(
+                FilePath::new("src/dir"),
+                lanekeep_core::files::listing_hash(&["note.md".to_owned()]),
+            )]
+        );
+    }
+
+    #[test]
+    fn an_entry_added_to_a_listed_directory_invalidates() {
+        // The issue's "adding or removing an entry invalidates exactly the files that listed
+        // that directory": nothing about `src/a.ts` changed, and its answer has to.
+        let project = Project::new(
+            "cache-list-added",
+            &[
+                ("rule.ts", &listing_rule("src/dir")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+                ("src/dir/note.md", "notes\n"),
+            ],
+        );
+        assert_eq!(
+            messages(&project.run().expect("runs")),
+            vec![r#"["note.md"]"#]
+        );
+
+        // Not a source file, so the only file that reports is still `src/a.ts`.
+        project.write("src/dir/README.md", "readme\n");
+        assert_eq!(
+            messages(&project.run().expect("runs")),
+            vec![r#"["README.md","note.md"]"#],
+            "an added entry did not invalidate the listing"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_appears_invalidates_a_listing_that_found_none() {
+        let project = Project::new(
+            "cache-list-appeared",
+            &[
+                ("rule.ts", &listing_rule("src/dir")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+            ],
+        );
+        assert_eq!(messages(&project.run().expect("runs")), vec!["null"]);
+
+        project.write("src/dir/note.md", "notes\n");
+        assert_eq!(
+            messages(&project.run().expect("runs")),
+            vec![r#"["note.md"]"#],
+            "a directory that appeared did not invalidate"
+        );
+    }
+
+    #[test]
+    fn a_root_listing_answers_the_same_cold_and_warm() {
+        // The cold run creates `.lanekeep/` for its cache. A root listing that saw it would
+        // answer one thing on the cold run and another on every run after, over identical input.
+        let project = Project::new(
+            "cache-list-root",
+            &[
+                ("rule.ts", &listing_rule(".")),
+                ("lanekeep.config.ts", &config("")),
+                ("src/a.ts", "const a = 1;\n"),
+            ],
+        );
+        let first = project.run().expect("runs");
+        let cold = messages(&first);
+        assert!(
+            !cold[0].contains(".lanekeep"),
+            "lanekeep's own directory is invisible: {cold:?}"
+        );
+        for attempt in 0..3 {
+            assert_eq!(
+                messages(&project.run().expect("runs")),
+                cold,
+                "attempt {attempt}"
+            );
+        }
     }
 
     #[test]

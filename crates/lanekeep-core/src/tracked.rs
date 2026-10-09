@@ -22,6 +22,17 @@
 //! absent, a validator asks the filesystem whether it is still absent, follows the link, finds
 //! the file and invalidates — every run, forever, for every importer of a pnpm-linked package.
 //! See [`ReadOutcome::Refused`].
+//!
+//! # A listing is a second kind of question about a path
+//!
+//! `ctx.listDir` asks what a directory holds rather than what a file holds, and its answers are
+//! two more outcomes: [`ReadOutcome::Listed`], carrying a digest of the entries, and
+//! [`ReadOutcome::Unlisted`], when nothing listable was there. They are their own variants rather
+//! than a reuse of `Found` and `Absent`, because the validator has to ask the filesystem the
+//! *same* question the rule asked: an absent *file* rechecked against a path that has since
+//! become a directory still reads as absent, so a listing recorded as `Absent` would hold after
+//! the directory appeared — a stale answer with nothing to say so. A refusal is shared between
+//! the two kinds, because it is decided by `canonicalize` alone and rechecked identically.
 
 use crate::location::FilePath;
 
@@ -78,6 +89,16 @@ pub enum ReadOutcome {
     /// Still a dependency: the answer that rested on the refusal has to be reconsidered the
     /// day the path becomes a real in-root file.
     Refused,
+    /// A directory was listed, and its rendered entries hashed to this.
+    ///
+    /// See `files::listing_hash` for what is hashed: names in order, a directory's carrying
+    /// its trailing `/`, so a file replaced by a same-named directory is a change.
+    Listed(ContentHash),
+    /// A listing found no directory there — nothing at the path, or a file.
+    ///
+    /// Distinct from [`Self::Absent`] for the reason the module documentation gives: the two are
+    /// rechecked by asking two different questions.
+    Unlisted,
 }
 
 /// One file a rule reached for while checking another.
@@ -118,7 +139,27 @@ impl TrackedRead {
         }
     }
 
-    /// The hash of what was read, or `None` for either answer that read nothing.
+    /// A listing that found a directory, whose entries hashed to `hash`.
+    #[must_use]
+    pub const fn listed(path: FilePath, hash: ContentHash) -> Self {
+        Self {
+            path,
+            outcome: ReadOutcome::Listed(hash),
+        }
+    }
+
+    /// A listing that found no directory.
+    #[must_use]
+    pub const fn unlisted(path: FilePath) -> Self {
+        Self {
+            path,
+            outcome: ReadOutcome::Unlisted,
+        }
+    }
+
+    /// The hash of what was read, or `None` for every answer that read nothing.
+    ///
+    /// For a listing, the digest of its entries.
     ///
     /// For the callers that only ever asked "same bytes as before?". Anything deciding what
     /// to *do* about a dependency has to match on [`Self::outcome`] instead: absence and
@@ -126,8 +167,8 @@ impl TrackedRead {
     #[must_use]
     pub const fn hash(&self) -> Option<ContentHash> {
         match self.outcome {
-            ReadOutcome::Found(hash) => Some(hash),
-            ReadOutcome::Absent | ReadOutcome::Refused => None,
+            ReadOutcome::Found(hash) | ReadOutcome::Listed(hash) => Some(hash),
+            ReadOutcome::Absent | ReadOutcome::Refused | ReadOutcome::Unlisted => None,
         }
     }
 }
@@ -184,6 +225,27 @@ mod tests {
         assert_eq!(refused.hash(), None, "nothing was read");
         assert_ne!(refused, TrackedRead::absent(path.clone()));
         assert_ne!(refused, TrackedRead::found(path, hash(0)));
+    }
+
+    #[test]
+    fn a_listing_is_neither_a_reading_nor_an_absence() {
+        // The same digest found as a file and as a listing are two different answers, and a
+        // directory that was not there is not a file that was not there: each is rechecked by
+        // asking the filesystem the question that was originally asked.
+        let path = FilePath::new("src");
+        assert_ne!(
+            TrackedRead::listed(path.clone(), hash(0)),
+            TrackedRead::found(path.clone(), hash(0))
+        );
+        assert_ne!(
+            TrackedRead::unlisted(path.clone()),
+            TrackedRead::absent(path.clone())
+        );
+        assert_eq!(
+            TrackedRead::listed(path.clone(), hash(3)).hash(),
+            Some(hash(3))
+        );
+        assert_eq!(TrackedRead::unlisted(path).hash(), None);
     }
 
     #[test]

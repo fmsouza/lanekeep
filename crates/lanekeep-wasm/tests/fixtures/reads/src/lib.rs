@@ -1,4 +1,4 @@
-//! A guest that calls the two tracked-read methods and reports exactly what came back.
+//! A guest that calls the three tracked-read methods and reports exactly what came back.
 //!
 //! **It is a probe, not a rule and not an assertion**, on the terms
 //! `tests/fixtures/queries/src/lib.rs` sets out: every observation is encoded into the message
@@ -99,6 +99,7 @@ impl Guest for Component {
         match m.first().map_or("", |entry| entry.name.as_str()) {
             "read" => read(ctx, &args),
             "exists" => exists(ctx, &args),
+            "list" => list(ctx, &args),
             "sweep" => sweep(ctx, &args),
             other => say(ctx, &format!("unknown probe `{other}`")),
         }
@@ -139,6 +140,18 @@ fn exists_outcome(outcome: Result<bool, ReadError>) -> String {
     }
 }
 
+/// What `list-dir` answered: the entries in the order the host gave them, or `none`.
+///
+/// `[]` and `none` must never be confusable — an empty directory and no directory are the two
+/// answers a "no empty folder" rule exists to tell apart.
+fn list_outcome(outcome: Result<Option<Vec<String>>, ReadError>) -> String {
+    match outcome {
+        Ok(Some(entries)) => format!("[{}]", entries.join(",")),
+        Ok(None) => "none".to_owned(),
+        Err(problem) => refusal(&problem),
+    }
+}
+
 /// Which `read-error` case came back, and the path it carried.
 ///
 /// The case *and* the payload, because they fail independently: a host that mapped every
@@ -175,7 +188,15 @@ fn exists(ctx: &CheckContext, args: &[&str]) {
     );
 }
 
-/// Both methods over every path the host passed, one report each.
+/// One `list-dir`, reported.
+fn list(ctx: &CheckContext, args: &[&str]) {
+    let Some(path) = args.first() else {
+        return say(ctx, "shape: no path argument");
+    };
+    say(ctx, &format!("list={}", list_outcome(ctx.list_dir(path))));
+}
+
+/// Both file methods over every path the host passed, one report each.
 ///
 /// The loop does not stop at the first refusal, which is the part that shows a refusal is a
 /// value rather than the end of the invocation: the paths after a rejected one are still

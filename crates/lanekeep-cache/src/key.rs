@@ -26,7 +26,12 @@ use lanekeep_core::ContentHash;
 /// parse fault. An entry written before could not carry one, and would replay a faulted file as
 /// clean, so it has to miss. The engine's major.minor in the key does not guarantee that
 /// (architecture §8.1): in this repository a `feat` on 0.x can ship as a patch.
-pub const FORMAT_VERSION: u32 = 6;
+///
+/// 6 → 7 widened a dependency's outcome tag from three values to five, for `ctx.listDir`: a
+/// directory listing is recorded as `listed(hash)` or `unlisted`, so validation asks the
+/// filesystem the question the rule asked. An older binary reading the new tags would refuse
+/// the entry anyway; the bump makes it miss by key rather than by a decode failure.
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Everything about a run that every file's key shares.
 ///

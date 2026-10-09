@@ -95,7 +95,10 @@ use lanekeep_types::{Query, Symbol, Type, TypeProvider};
 ///   discharge is value-keyed, with a new `module` scope discharging by existence of a
 ///   matching-key release anywhere in the file. A build with `key` reaches verdicts a build
 ///   without it cannot.
-pub const HOST_API_VERSION: u32 = 9;
+/// - `10` — `ctx.listDir` (#284). A per-file rule can list a directory's entries, tracked as a
+///   dependency like `readFile` and confined the same way. A rule that could not list a
+///   directory reached its verdict without evidence a build with `listDir` hands it.
+pub const HOST_API_VERSION: u32 = 10;
 
 /// A fact a rule emitted, before the engine attaches the file and rule it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,7 +332,8 @@ impl HostContext {
 
     /// Allow tracked reads of other files in the project.
     ///
-    /// Without one, `readFile` and `fileExists` are absent rather than present-and-failing.
+    /// Without one, `readFile`, `fileExists` and `listDir` are absent rather than
+    /// present-and-failing.
     /// A rule reaching for them then gets a `TypeError` naming the function, which is the
     /// truthful answer — where a stub returning `undefined` would look like an empty project
     /// and produce a rule that silently checks nothing.
@@ -889,6 +893,20 @@ impl HostContext {
                     reader
                         .exists(&path)
                         .map_err(|e| throw(&ctx, &e.to_string()))
+                },
+            )?,
+        )?;
+
+        // An array of entry names, or `undefined` when no directory is there — the same
+        // "absence is an answer, a refusal is a throw" split `readFile` makes. What a listing
+        // holds, and in what order, is `lanekeep_core::files::list_directory`'s to decide.
+        let reader = Arc::clone(&files);
+        object.set(
+            "listDir",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, path: String| -> rquickjs::Result<Option<Vec<String>>> {
+                    reader.list(&path).map_err(|e| throw(&ctx, &e.to_string()))
                 },
             )?,
         )?;

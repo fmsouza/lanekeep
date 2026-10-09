@@ -1,4 +1,4 @@
-//! `check-context`'s two tracked-read methods, driven by a real component.
+//! `check-context`'s three tracked-read methods, driven by a real component.
 //!
 //! The host here is the host: `lanekeep_wasm::host` over a real [`FileAccess`] rooted at a
 //! real directory. What is under test is that a rule running as a WebAssembly component
@@ -237,6 +237,15 @@ fn exists_outcome(outcome: Result<bool, ReadError>) -> String {
     match outcome {
         Ok(true) => "yes".to_owned(),
         Ok(false) => "no".to_owned(),
+        Err(problem) => refusal(&problem),
+    }
+}
+
+/// What `list-dir` answered, rendered exactly as the guest renders it.
+fn list_outcome(outcome: Result<Option<Vec<String>>, ReadError>) -> String {
+    match outcome {
+        Ok(Some(entries)) => format!("[{}]", entries.join(",")),
+        Ok(None) => "none".to_owned(),
         Err(problem) => refusal(&problem),
     }
 }
@@ -548,6 +557,63 @@ fn the_component_path_refuses_exactly_what_file_access_refuses() {
 }
 
 #[test]
+fn a_directory_lists_its_entries_sorted_with_directories_marked() {
+    let project = Project::new(
+        "list",
+        &[("src/b.ts", ""), ("src/a.md", ""), ("src/sub/x.ts", "")],
+    );
+    let mut harness = Harness::new(Some(project.access()));
+
+    assert_eq!(harness.probe("list", &["src"]), ["list=[a.md,b.ts,sub/]"]);
+    assert_eq!(
+        harness.probe("list", &["src/a.md"]),
+        ["list=none"],
+        "a file lists as none"
+    );
+    assert_eq!(harness.probe("list", &["nowhere"]), ["list=none"]);
+    assert_eq!(
+        harness.probe("list", &["../outside"]),
+        ["list=escapes-root(../outside)"],
+        "refused as a value, like a read"
+    );
+    let absolute = absolute_path();
+    assert_eq!(
+        harness.probe("list", &[&absolute]),
+        [format!("list=absolute({absolute})")]
+    );
+}
+
+#[test]
+fn a_listing_is_recorded_exactly_as_a_direct_listing_records_it() {
+    // The parity that matters for the cache: a component rule and a TypeScript rule listing the
+    // same directory leave the same dependency behind, so an entry means one thing whichever
+    // engine wrote it.
+    let project = Project::new("list-recorded", &[("src/a.ts", ""), ("src/dir/b.ts", "")]);
+    let mut harness = Harness::new(Some(project.access()));
+    harness.probe("list", &["src"]);
+    harness.probe("list", &["src/missing"]);
+    harness.probe("list", &["."]);
+
+    let direct = project.access();
+    for path in ["src", "src/missing", "."] {
+        let answer = direct.list(path);
+        assert_eq!(
+            harness.probe("list", &[path]),
+            [format!("list={}", list_outcome(answer))],
+            "`{path}` answers what `FileAccess::list` answers"
+        );
+    }
+    let recorded = harness.dependencies();
+    assert_eq!(recorded, direct.dependencies());
+    assert!(
+        recorded
+            .iter()
+            .any(|read| matches!(read.outcome, lanekeep_core::tracked::ReadOutcome::Listed(_))),
+        "{recorded:?}"
+    );
+}
+
+#[test]
 fn a_host_with_no_file_access_refuses_the_call() {
     // WIT has no absent export, so the absence `lanekeep-js` expresses by not installing the
     // functions cannot cross. Failing the call is the same refusal by the only means the
@@ -556,7 +622,11 @@ fn a_host_with_no_file_access_refuses_the_call() {
     // the file is not there and `false` would say it does not exist.
     let project = Project::new("no-access", &[("a.json", "{}")]);
 
-    for (probe, method) in [("read", "read-file"), ("exists", "file-exists")] {
+    for (probe, method) in [
+        ("read", "read-file"),
+        ("exists", "file-exists"),
+        ("list", "list-dir"),
+    ] {
         let mut harness = Harness::new(None);
         let error = harness
             .call(probe, &["a.json"])

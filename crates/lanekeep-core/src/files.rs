@@ -20,6 +20,15 @@
 //! identical input, which is the determinism invariant — and the cache would record one of
 //! the two hashes with no way to say which was used.
 //!
+//! # Listings are tracked the same way
+//!
+//! [`FileAccess::list`] answers what a directory holds, under the same confinement, memoized the
+//! same way, and recorded as [`crate::tracked::ReadOutcome::Listed`] or
+//! [`crate::tracked::ReadOutcome::Unlisted`]. What a listing *is* — the order, the `/` marking a
+//! directory, what is hidden — is decided once, in [`list_directory`], which the cache's
+//! validator calls too: a validator that listed a directory by its own rules would invalidate
+//! on a difference between two implementations rather than on a change to the directory.
+//!
 //! # Why this lives in `lanekeep-core` rather than in an engine crate
 //!
 //! Every engine that runs a rule needs the same confinement and the same tracking — a read
@@ -32,8 +41,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::FilePath;
 use crate::tracked::{ContentHash, TrackedRead};
-use crate::{FilePath, tracked};
 use thiserror::Error;
 
 /// Why a read was refused.
@@ -134,8 +143,8 @@ pub struct FileAccess {
     /// **Two memos over one file is not a tidiness problem, it is the determinism invariant.**
     /// The memo exists so that a file rewritten mid-run cannot be seen two ways; a second one
     /// beside it reintroduces exactly that, across engines rather than within one. And the
-    /// dependency lists cannot be merged afterwards to repair it: [`tracked::sort`] orders by
-    /// path and does **not** dedupe, so two lists disagreeing about one path's hash concatenate
+    /// dependency lists cannot be merged afterwards to repair it: [`crate::tracked::sort`]
+    /// orders by path and does **not** dedupe, so two lists disagreeing about one path's hash concatenate
     /// into two contradictory entries for it, which is a cache entry that can never be
     /// validated.
     ///
@@ -145,6 +154,27 @@ pub struct FileAccess {
     /// panic, and refusing to read a memo because an unrelated thread died would turn a rule's
     /// read into a failure for a reason that has nothing to do with it.
     seen: Mutex<BTreeMap<String, Outcome>>,
+    /// Every directory listed so far this file, keyed by project-relative path.
+    ///
+    /// A second memo rather than a second kind of key in `seen`, because one path can be asked
+    /// both questions — `fileExists('src')` and `listDir('src')` — and the two answers are
+    /// different dependencies. Every reason `seen` is a `Mutex` applies here unchanged.
+    listed: Mutex<BTreeMap<String, Listing>>,
+}
+
+/// What listing a directory answered.
+///
+/// The three answers a listing can give, decided by [`list_directory`] for both the rule's call
+/// and the cache's revalidation of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listing {
+    /// A directory, and its entries: sorted, a directory's name carrying a trailing `/`.
+    Listed(Vec<String>),
+    /// No directory there — nothing at the path, a file, or lanekeep's own `.lanekeep/`.
+    Unlisted,
+    /// It resolved outside the root through a symlink, so it was refused unlisted. Recorded,
+    /// for the reason a refused file read is.
+    Refused,
 }
 
 /// One access can be shared by both engines, checked at compile time rather than believed.
@@ -184,6 +214,7 @@ impl FileAccess {
         Self {
             root,
             seen: Mutex::new(BTreeMap::new()),
+            listed: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -193,6 +224,13 @@ impl FileAccess {
     /// must not fail because of something that happened elsewhere.
     fn memo(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Outcome>> {
         self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The listing memo, on the same terms as [`Self::memo`].
+    fn listings(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Listing>> {
+        self.listed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -272,7 +310,52 @@ impl FileAccess {
         Ok(!matches!(self.resolve(path)?, Outcome::Absent))
     }
 
-    /// Everything read so far, in path order.
+    /// What a directory holds, or `None` if no directory is there.
+    ///
+    /// The immediate entries' names, sorted by byte order, a directory's name carrying a
+    /// trailing `/` — see [`list_directory`] for the rest of what a listing is. `None` covers
+    /// absence and a path that names a file, which is the same contract [`Self::read`] gives:
+    /// "nothing to list" is an ordinary answer a rule handles.
+    ///
+    /// `""` and `"."` list the root, recorded under `.`. The listing is recorded as a dependency
+    /// whatever it answered, so an entry added, removed or retyped invalidates exactly the files
+    /// that listed the directory, and a directory that appears invalidates the files that were
+    /// told it was not there. Memoized like a read: a second listing of one directory in one
+    /// file answers what the first did.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError`] if the path escapes the root or is absolute — the refusals [`Self::read`]
+    /// makes, on the same grounds and with the same recording: a symlink out of the root is
+    /// recorded as refused, a lexical escape or an absolute path is not recorded at all.
+    pub fn list(&self, path: &str) -> Result<Option<Vec<String>>, ReadError> {
+        let key = match normalize_key(path) {
+            key if key.is_empty() => ".".to_owned(),
+            key => key,
+        };
+        let cached = self.listings().get(&key).cloned();
+        let listing = if let Some(listing) = cached {
+            listing
+        } else {
+            let listing = self.load_listing(path)?;
+            self.listings().insert(key, listing.clone());
+            listing
+        };
+        match listing {
+            Listing::Listed(entries) => Ok(Some(entries)),
+            Listing::Unlisted => Ok(None),
+            // Recorded, then refused — the order `Self::answer` explains for a file read.
+            Listing::Refused => Err(ReadError::EscapesRoot {
+                path: path.to_owned(),
+            }),
+        }
+    }
+
+    /// Everything read and listed so far, in path order.
+    ///
+    /// File reads and listings together, sorted by path and then by outcome, so one path asked
+    /// both questions yields its two records in a fixed order. Deduplicated, so a path refused
+    /// both as a file and as a directory is one record rather than two identical ones.
     #[must_use]
     pub fn dependencies(&self) -> Vec<TrackedRead> {
         let mut reads: Vec<TrackedRead> = self
@@ -302,7 +385,18 @@ impl FileAccess {
                 }
             })
             .collect();
-        tracked::sort(&mut reads);
+        reads.extend(self.listings().iter().map(|(path, listing)| {
+            let directory = FilePath::new(path);
+            match listing {
+                Listing::Listed(entries) => TrackedRead::listed(directory, listing_hash(entries)),
+                Listing::Unlisted => TrackedRead::unlisted(directory),
+                Listing::Refused => TrackedRead::refused(directory),
+            }
+        }));
+        // A full sort rather than `tracked::sort`, which orders by path alone: one path's two
+        // records would otherwise come back in whichever order they were collected.
+        reads.sort();
+        reads.dedup();
         reads
     }
 
@@ -313,6 +407,7 @@ impl FileAccess {
     /// half-populated access is not.
     pub fn clear(&self) {
         self.memo().clear();
+        self.listings().clear();
     }
 
     /// Resolve, read and record a path, or return what was already recorded.
@@ -354,6 +449,26 @@ impl FileAccess {
             }),
             other => Ok(other),
         }
+    }
+
+    /// Refuse what may never be listed, then list. The listing half of [`Self::load`].
+    fn load_listing(&self, path: &str) -> Result<Listing, ReadError> {
+        let relative = Path::new(path);
+        if relative.is_absolute() || relative.has_root() {
+            return Err(ReadError::Absolute {
+                path: path.to_owned(),
+            });
+        }
+        let normalized = normalize(relative);
+        if normalized
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(ReadError::EscapesRoot {
+                path: path.to_owned(),
+            });
+        }
+        Ok(list_directory(&self.root, &normalized))
     }
 
     /// Do the actual filesystem work, having decided the path is allowed.
@@ -408,6 +523,102 @@ impl FileAccess {
     }
 }
 
+/// The directory lanekeep writes its own state into, which no listing sees.
+const LANEKEEP_DIRECTORY: &str = ".lanekeep";
+
+/// List `relative` under `root`, confined as a rule's read is.
+///
+/// The one definition of what a listing answers, called by [`FileAccess::list`] for the rule and
+/// by `lanekeep_cache::validate` to recheck what the rule was told — so the two cannot disagree
+/// about a directory that did not change.
+///
+/// `root` must be canonical and `relative` lexically normalized with no `..` left in it; both
+/// callers guarantee it. A `..` reaching here anyway would be resolved by `canonicalize` and then
+/// caught by the containment check rather than listed.
+///
+/// - Entries are the immediate children's names, sorted by byte order, because `read_dir`'s
+///   order is the filesystem's and differs between machines.
+/// - A directory's name carries a trailing `/`. So does a symlink whose canonical target is a
+///   directory *inside the root*; one that escapes the root or dangles is named without one,
+///   because classifying it would observe something confinement withholds.
+/// - A name that is not UTF-8 is rendered lossily: deterministic, and a rule could not read such
+///   a file by name anyway.
+/// - **`.lanekeep` at the root is invisible**: left out of the root's listing, and itself and
+///   everything under it answer [`Listing::Unlisted`]. lanekeep writes its cache there during a
+///   run, so a listing that saw it would differ between a cold run and the warm run after it,
+///   over identical input. The leading-component rule discovery applies, so a project's own
+///   `vendor/.lanekeep/` is listed like anything else.
+/// - Anything that cannot be listed — absent, a file, unreadable — is [`Listing::Unlisted`],
+///   deliberately not distinguished, for the reason an unreadable file reads as absent: a rule
+///   that branched on the difference would answer differently on different machines.
+#[must_use]
+pub fn list_directory(root: &Path, relative: &Path) -> Listing {
+    if relative
+        .components()
+        .next()
+        .is_some_and(|first| first.as_os_str() == LANEKEEP_DIRECTORY)
+    {
+        return Listing::Unlisted;
+    }
+    let Ok(canonical) = root.join(relative).canonicalize() else {
+        return Listing::Unlisted;
+    };
+    if !canonical.starts_with(root) {
+        return Listing::Refused;
+    }
+    // Checked again on the resolved path, because a link inside the root back to the root
+    // reaches `.lanekeep/` by a spelling whose leading component is not `.lanekeep`.
+    if canonical.starts_with(root.join(LANEKEEP_DIRECTORY)) {
+        return Listing::Unlisted;
+    }
+    let Ok(read) = std::fs::read_dir(&canonical) else {
+        // A file, or a directory that cannot be read.
+        return Listing::Unlisted;
+    };
+    let at_root = canonical == root;
+    let mut entries: Vec<String> = read
+        .filter_map(Result::ok)
+        .filter(|entry| !(at_root && entry.file_name() == LANEKEEP_DIRECTORY))
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_directory_in(root, &entry) {
+                format!("{name}/")
+            } else {
+                name
+            }
+        })
+        .collect();
+    entries.sort();
+    Listing::Listed(entries)
+}
+
+/// Whether a directory entry is a directory, following a symlink only as far as the root.
+fn is_directory_in(root: &Path, entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(kind) if kind.is_dir() => true,
+        Ok(kind) if kind.is_symlink() => entry
+            .path()
+            .canonicalize()
+            .is_ok_and(|target| target.starts_with(root) && target.is_dir()),
+        _ => false,
+    }
+}
+
+/// The digest a listing is recorded with.
+///
+/// blake3 over each entry followed by a NUL byte. NUL cannot occur in a file name, so the
+/// framing is unambiguous — `["ab"]` and `["a", "b"]` hash apart — and the entries carry their
+/// `/` marker, so a file replaced by a same-named directory is a change.
+#[must_use]
+pub fn listing_hash(entries: &[String]) -> ContentHash {
+    let mut hasher = blake3::Hasher::new();
+    for entry in entries {
+        hasher.update(entry.as_bytes());
+        hasher.update(&[0]);
+    }
+    ContentHash::new(*hasher.finalize().as_bytes())
+}
+
 /// The key a path is recorded under, so `./a.json` and `a.json` are one dependency.
 fn normalize_key(path: &str) -> String {
     normalize(Path::new(path))
@@ -459,6 +670,7 @@ pub fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tracked;
 
     struct Fixture {
         dir: PathBuf,
@@ -848,5 +1060,245 @@ mod tests {
     fn traversal_that_returns_is_collapsed() {
         assert_eq!(normalize(Path::new("pkg/../a.json")), Path::new("a.json"));
         assert_eq!(normalize(Path::new("./a/./b")), Path::new("a/b"));
+    }
+
+    // --- listings ----------------------------------------------------------------------------
+
+    /// The entries a listing answered, for asserting against literals.
+    fn listed(access: &FileAccess, path: &str) -> Option<Vec<String>> {
+        access.list(path).expect("allowed")
+    }
+
+    #[test]
+    fn lists_a_directory_sorted_with_directories_marked() {
+        // Sorted, because `read_dir`'s order is the filesystem's and two machines disagree about
+        // it. Marked, because a layout rule's first question about an entry is whether it is a
+        // folder, and a second call per entry to find out would be a dependency per entry.
+        let fixture = Fixture::new(
+            "list-sorted",
+            &[("src/b.ts", ""), ("src/a.md", ""), ("src/sub/x.ts", "")],
+        );
+        let access = fixture.access();
+        assert_eq!(
+            listed(&access, "src"),
+            Some(vec![
+                "a.md".to_owned(),
+                "b.ts".to_owned(),
+                "sub/".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn an_empty_directory_lists_as_empty_rather_than_absent() {
+        // "No empty folder" is one of the rules this exists for, so an empty directory and a
+        // missing one have to be two different answers.
+        let fixture = Fixture::new("list-empty", &[]);
+        std::fs::create_dir_all(fixture.dir.join("empty")).expect("creates dir");
+        let access = fixture.access();
+        assert_eq!(listed(&access, "empty"), Some(Vec::new()));
+        assert_eq!(listed(&access, "missing"), None);
+    }
+
+    #[test]
+    fn listing_a_file_answers_none() {
+        // A file holds no entries, and an empty list would claim it is an empty directory.
+        let fixture = Fixture::new("list-file", &[("a.json", "{}")]);
+        let access = fixture.access();
+        assert_eq!(listed(&access, "a.json"), None);
+    }
+
+    #[test]
+    fn a_listing_out_of_the_root_is_refused() {
+        let fixture = Fixture::new("list-traversal", &[]);
+        let access = fixture.access();
+        for attempt in ["..", "../outside", "src/../../x"] {
+            let error = access.list(attempt).expect_err("is refused");
+            assert!(
+                matches!(error, ReadError::EscapesRoot { .. }),
+                "`{attempt}` gave {error:?}"
+            );
+        }
+        let outside = std::env::temp_dir();
+        let error = access
+            .list(&outside.display().to_string())
+            .expect_err("is refused");
+        assert!(matches!(error, ReadError::Absolute { .. }), "{error:?}");
+        assert!(
+            access.dependencies().is_empty(),
+            "a path that can never be in the root is not a dependency: {:?}",
+            access.dependencies()
+        );
+    }
+
+    #[test]
+    fn the_root_lists_under_one_key_however_it_is_spelled() {
+        let fixture = Fixture::new("list-root", &[("a.ts", "")]);
+        let access = fixture.access();
+        for spelling in ["", ".", "./", "src/.."] {
+            assert_eq!(
+                listed(&access, spelling),
+                Some(vec!["a.ts".to_owned()]),
+                "`{spelling}`"
+            );
+        }
+        let deps = access.dependencies();
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].path.as_str(), ".");
+    }
+
+    #[test]
+    fn the_lanekeep_directory_is_invisible_to_a_listing() {
+        // lanekeep writes its cache there during a run, so a root listing that saw it would
+        // answer differently on a cold run and on the warm run after it — identical input, two
+        // outputs. Only the root's own `.lanekeep`: a project's `vendor/.lanekeep/` is theirs.
+        let fixture = Fixture::new(
+            "list-lanekeep",
+            &[
+                ("a.ts", ""),
+                (".lanekeep/cache", "x"),
+                ("vendor/.lanekeep/keep.ts", ""),
+            ],
+        );
+        let access = fixture.access();
+        assert_eq!(
+            listed(&access, "."),
+            Some(vec!["a.ts".to_owned(), "vendor/".to_owned()])
+        );
+        assert_eq!(listed(&access, ".lanekeep"), None);
+        assert_eq!(listed(&access, "./.lanekeep/"), None);
+        assert_eq!(
+            listed(&access, "vendor"),
+            Some(vec![".lanekeep/".to_owned()])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_lanekeep_directory_stays_invisible_through_a_symlink_in_the_root() {
+        // A link inside the root back to the root is an in-root path like any other, so
+        // following it must not reach `.lanekeep/` by a spelling the leading-component check
+        // cannot see.
+        let fixture = Fixture::new("list-lanekeep-link", &[(".lanekeep/cache", "x")]);
+        std::fs::create_dir_all(fixture.dir.join("src")).expect("creates dir");
+        std::os::unix::fs::symlink(&fixture.dir, fixture.dir.join("src/up")).expect("links");
+        let access = fixture.access();
+        assert_eq!(listed(&access, "src/up/.lanekeep"), None);
+        assert_eq!(
+            listed(&access, "src/up"),
+            Some(vec!["src/".to_owned()]),
+            "the root, reached through the link, still hides it"
+        );
+    }
+
+    #[test]
+    fn a_listing_is_recorded_as_a_dependency() {
+        let fixture = Fixture::new("list-recorded", &[("src/a.ts", "")]);
+        let access = fixture.access();
+        let entries = listed(&access, "src").expect("is a directory");
+        assert_eq!(listed(&access, "nowhere"), None);
+
+        let deps = access.dependencies();
+        assert_eq!(
+            deps,
+            vec![
+                TrackedRead::unlisted(FilePath::new("nowhere")),
+                TrackedRead::listed(FilePath::new("src"), listing_hash(&entries)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_listing_returns_what_the_first_one_saw() {
+        // The memo's reason, applied to directories: a rule that listed twice and saw an entry
+        // appear between the two could report differently over identical input.
+        let fixture = Fixture::new("list-memoized", &[("src/a.ts", "")]);
+        let access = fixture.access();
+        let first = listed(&access, "src");
+        std::fs::write(fixture.dir.join("src/b.ts"), "").expect("writes");
+        assert_eq!(listed(&access, "./src"), first);
+        assert_eq!(access.dependencies().len(), 1);
+    }
+
+    #[test]
+    fn a_file_read_and_a_listing_of_one_path_are_two_dependencies() {
+        // Two different questions about one path, validated independently: whether a file is
+        // there, and what a directory holds.
+        let fixture = Fixture::new("list-and-read", &[("src/a.ts", "")]);
+        let access = fixture.access();
+        assert!(
+            !access.exists("src").expect("allowed"),
+            "a directory is not a file"
+        );
+        listed(&access, "src").expect("is a directory");
+
+        let deps = access.dependencies();
+        assert_eq!(deps.len(), 2, "{deps:?}");
+        assert!(deps.iter().all(|read| read.path.as_str() == "src"));
+        assert!(deps.contains(&TrackedRead::absent(FilePath::new("src"))));
+    }
+
+    #[test]
+    fn the_listing_hash_covers_names_and_kinds() {
+        // A file replaced by a directory of the same name changes the answer, and the framing
+        // keeps `["ab"]` and `["a", "b"]` apart.
+        let file = listing_hash(&["a".to_owned()]);
+        let dir = listing_hash(&["a/".to_owned()]);
+        assert_ne!(file, dir);
+        assert_ne!(
+            listing_hash(&["ab".to_owned()]),
+            listing_hash(&["a".to_owned(), "b".to_owned()])
+        );
+        assert_ne!(listing_hash(&[]), listing_hash(&[String::new()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlinked_out_of_the_root_is_refused_and_recorded() {
+        let fixture = Fixture::new("list-symlink-out", &[]);
+        let outside =
+            std::env::temp_dir().join(format!("lanekeep-list-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).expect("creates target");
+        std::os::unix::fs::symlink(&outside, fixture.dir.join("linked")).expect("links");
+
+        let access = fixture.access();
+        let error = access.list("linked").expect_err("is refused");
+        assert!(matches!(error, ReadError::EscapesRoot { .. }), "{error:?}");
+        assert_eq!(
+            access.dependencies(),
+            vec![TrackedRead::refused(FilePath::new("linked"))]
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_entry_is_a_directory_only_when_it_stays_in_the_root() {
+        // Classifying an entry is observing its target. In the root that is ordinary — pnpm's
+        // `node_modules/pkg` is a link to a directory inside the tree — and outside it is
+        // exactly what confinement withholds, so an escaping link is named and not classified.
+        let fixture = Fixture::new("list-symlink-entries", &[("real/x.ts", "")]);
+        let outside =
+            std::env::temp_dir().join(format!("lanekeep-list-entry-out-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).expect("creates target");
+        std::fs::create_dir_all(fixture.dir.join("dir")).expect("creates dir");
+        std::os::unix::fs::symlink(fixture.dir.join("real"), fixture.dir.join("dir/inside"))
+            .expect("links");
+        std::os::unix::fs::symlink(&outside, fixture.dir.join("dir/outside")).expect("links");
+        std::os::unix::fs::symlink(fixture.dir.join("gone"), fixture.dir.join("dir/dangling"))
+            .expect("links");
+
+        let access = fixture.access();
+        assert_eq!(
+            listed(&access, "dir"),
+            Some(vec![
+                "dangling".to_owned(),
+                "inside/".to_owned(),
+                "outside".to_owned()
+            ])
+        );
+
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

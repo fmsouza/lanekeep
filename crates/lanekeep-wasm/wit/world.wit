@@ -400,6 +400,11 @@ interface types {
     read-file: func(path: string) -> result<option<string>, read-error>;
     /// Whether another file exists, root-relative. Tracked exactly as `read-file` is.
     file-exists: func(path: string) -> result<bool, read-error>;
+    /// A directory's entries, root-relative: the immediate children's names, sorted, a
+    /// directory's name ending in `/`. None when no directory is there — absent, or a file.
+    /// `""` and `"."` list the root, and lanekeep's own `.lanekeep/` is never listed. Tracked
+    /// as `read-file` is: an entry added, removed or retyped invalidates this file's result.
+    list-dir: func(path: string) -> result<option<list<string>>, read-error>;
 
     /// Emit a fact for the reduce phase. `data` must be a JSON object.
     emit-fact: func(kind: string, data: string) -> result<_, fact-error>;
