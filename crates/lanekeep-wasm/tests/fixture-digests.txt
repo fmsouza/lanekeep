@@ -14,7 +14,7 @@
 # tool jco 1.27.0
 # tool node 24.18.0
 # tool rustc 1.95.0
-../../packages/lanekeep/package-lock.json 8b6a4f446526e9c1299a3cccb0c402970542531546dbea76c5a1b4aff51b6f3e
+../../packages/lanekeep/package-lock.json 2c1d1d5d3e45b0d3d540a2f1c9731a9f7383d9aad6683ef3cfc6e08c81dbff72
 ../../packages/lanekeep/runtime/entry.js e3d460c571195e44491a06a1deffecdae145f6c0231d30b6c44f02b02ad13bdf
 ../../packages/lanekeep/runtime/host.js 78a8bb5217e7069ce9fc3c1b0ae743ef1f049f7ef88f90f853a717124aefab67
 tests/fixtures/bindings.wasm 42680a909442bda1fad4051f953d6976632571ed98a1907ea784478d30b3a429
