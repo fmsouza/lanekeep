@@ -566,6 +566,11 @@ pub fn list_directory(root: &Path, relative: &Path) -> Listing {
     if !canonical.starts_with(root) {
         return Listing::Refused;
     }
+    // Checked again on the resolved path, because a link inside the root back to the root
+    // reaches `.lanekeep/` by a spelling whose leading component is not `.lanekeep`.
+    if canonical.starts_with(root.join(LANEKEEP_DIRECTORY)) {
+        return Listing::Unlisted;
+    }
     let Ok(read) = std::fs::read_dir(&canonical) else {
         // A file, or a directory that cannot be read.
         return Listing::Unlisted;
@@ -1165,6 +1170,24 @@ mod tests {
         assert_eq!(
             listed(&access, "vendor"),
             Some(vec![".lanekeep/".to_owned()])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_lanekeep_directory_stays_invisible_through_a_symlink_in_the_root() {
+        // A link inside the root back to the root is an in-root path like any other, so
+        // following it must not reach `.lanekeep/` by a spelling the leading-component check
+        // cannot see.
+        let fixture = Fixture::new("list-lanekeep-link", &[(".lanekeep/cache", "x")]);
+        std::fs::create_dir_all(fixture.dir.join("src")).expect("creates dir");
+        std::os::unix::fs::symlink(&fixture.dir, fixture.dir.join("src/up")).expect("links");
+        let access = fixture.access();
+        assert_eq!(listed(&access, "src/up/.lanekeep"), None);
+        assert_eq!(
+            listed(&access, "src/up"),
+            Some(vec!["src/".to_owned()]),
+            "the root, reached through the link, still hides it"
         );
     }
 
