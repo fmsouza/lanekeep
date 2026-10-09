@@ -9,9 +9,11 @@
 //! reading its import list, before instantiation and independently of what the host happens
 //! to link — and where its compiled form comes from, which is a mapped `.cwasm` in lanekeep's
 //! own cache directory whenever there is one. [`runtime::RuleSet`] resolves each admitted
-//! component against the host world once for the run. [`runtime::WasmRuntime`] is one store
-//! per worker, holding one lazily built instance per component — several rules of one component
-//! share it, which is what the rule index every export takes is for.
+//! component against the host world once for the run. [`runtime::WasmRuntime`] is one store,
+//! holding one lazily built instance per component — several rules of one component share it,
+//! which is what the rule index every export takes is for. `lanekeep-engine` builds one per file
+//! that reaches a component and drops it when the file ends, because a store's memory charge
+//! never goes down (#308).
 //!
 //! A fourth module answers to a different owner. [`key`] holds the two values a run folds into
 //! its cache key before any of that happens: what a rule may reach, and what a component was

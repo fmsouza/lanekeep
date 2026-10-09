@@ -79,6 +79,8 @@ One worker per rayon pool thread, built by `rayon::broadcast`. Each takes files 
 
 That bound was claimed here long before it held. Workers used to be `par_iter().map_init(..)` initializers, and `map_init` runs per rayon *chunk*. So every chunk evaluated the whole ruleset again: 598 to 877 evaluations per run, measured over 2,000 files on fourteen threads, all of them concurrent (#293). A per-file cursor balances load as well as work-stealing did: a file is milliseconds of work, so the one 4k-line file that would stall a shard only holds the thread that took it.
 
+**What a worker carries from one file to the next must not include memory.** Which files share a worker is the scheduler's choice, so a file charged against the memory ceiling (§6.7) for what its predecessors left would breach or not depending on it. So at every file boundary a worker collects its JavaScript runtime — a full collection, and the collector's threshold put back to its starting value — and drops its component store, if the file built one. The store cannot be collected instead: its charge is every linear-memory grant it ever made, a linear memory never shrinks, and a guest whose heap does not return between calls grows it per file. StarlingMonkey's grew by 2 MiB a file, which is how #308 found this: once one worker held a thread's whole share, forty files on one store breached a ceiling no file approached. A component is therefore instantiated once per (file, component) the file reaches, not once per worker — tens of microseconds for a Rust component, and nothing for a file that reaches none. The runtime is collected rather than rebuilt because rebuilding would evaluate the ruleset per file, and its heap can be returned to the ruleset's own reachable state from the host side.
+
 ---
 
 ## 3. Crate layout
@@ -553,7 +555,7 @@ Turing-complete rules can fail to terminate. Three limits, all mandatory, all on
 | `timeouts.rule` | 1 s | One handler invocation — a single `check` call, or a single `reduce` call |
 | `timeouts.global` | 15 s | Wall clock for one phase of guest execution — see below |
 | `timeouts.analysis` | 60 s | Host-side type-provider service time, summed across the whole run |
-| `limits.memory` | 64 MiB | Per JavaScript runtime, so per rayon worker |
+| `limits.memory` | 64 MiB | Per JavaScript runtime, and per component store; each file starts from the loaded ruleset's own footprint (§2, Concurrency) |
 
 All three timeouts are configurable in `lanekeep.config.ts`, and `timeouts.global` also via `--timeout`. `timeouts.analysis` is refused at load when it is zero, on the same reasoning `--timeout 0` is: a zero budget is spent before the sidecar has finished starting, so every run under it would fail with a message about analysis being slow. An individual rule may raise its own invocation budget with a `timeout` field in `defineRule` — the escape valve for a `reduce` that legitimately processes a large corpus, without loosening the default for every rule.
 
@@ -605,7 +607,7 @@ Measured 2026-08-11, on the shipped ceiling: `typescript-builtins.wasm` declares
 - It takes the headroom a rule's own allocations run in from 54.9 MiB to 27.8 MiB, since linear memories never shrink and every grant counts against the same ceiling.
 - **It does not scale, and the margin is four rules wide.** Seven instances fit and eight do not, so a per-rule bound would refuse a component hosting eight rules outright — and a shared component hosting several rules is the shipped arrangement: `go-builtins.wasm` hosts both Go built-ins, and the JavaScript component hosted four while it shipped. The one case that cannot share is two rules naming the same *index* of one component, because a guest holds one configuration per index and the second `configure` would overwrite the first; a config may legitimately do that — `["./r.wasm", {"rule": "./r.wasm", "options": {…}}]` is how a rule is used bare and configured in one run — so those get an instance each.
 
-**Sharing an instance shares everything the guest keeps beyond its per-index configuration, and an author has to be told so.** A rule authored alone is a program with its own memory; a rule sharing a component with three others is a program those three are also running in. Module-level mutable state — a cache keyed on a path, a counter, a lazily built table — is therefore visible across the rules of one component, and *when* each rule sees it depends on the order rayon happened to hand a worker its files. That is not a bug in the arrangement; it is what one instance means. But it is a way to write a rule whose output depends on scheduling, which §11's ordering guarantee forbids, and neither the world nor `docs/authoring-rust-rules.md` warned about it for the first two components because both hosted exactly one rule.
+**Sharing an instance shares everything the guest keeps beyond its per-index configuration, and an author has to be told so.** A rule authored alone is a program with its own memory; a rule sharing a component with three others is a program those three are also running in. Module-level mutable state — a cache keyed on a path, a counter, a lazily built table — is therefore visible across the rules of one component. A store lives for one file (§2, Concurrency), so it is visible to the rules that run after it on that file and gone by the next; while a store lived for a worker, *when* each rule saw it depended on the order rayon happened to hand that worker its files. That is not a bug in the arrangement; it is what one instance means. But it is a way to write a rule whose output depends on scheduling, which §11's ordering guarantee forbids, and neither the world nor `docs/authoring-rust-rules.md` warned about it for the first two components because both hosted exactly one rule.
 
 The rule to write against is narrow and worth stating as a rule rather than as advice: **state that outlives a `check` call must be derivable from that call's inputs.** A memo keyed on the file path is fine — recomputing it gives the same answer, so being handed a populated one is indistinguishable from being handed an empty one. A counter of how many files have been seen is not, and neither is anything a rule reads in `reduce` that `check` wrote to a variable rather than emitting as a fact. Facts exist for exactly that hand-off and are per file by construction; the `two-rules` fixture in `lanekeep-wasm/tests/fixtures/` models the pattern that stays correct when one instance serves several rules.
 
@@ -1190,7 +1192,10 @@ Re-run 2026-08-25 on this tree (wasmtime 47.0.4): 17 passed, 0 failed. The 82–
 measurement behind it — eager instantiation against lazy at twenty rules and fourteen
 workers, taken 2026-08-05 — is recorded in `crates/lanekeep-wasm/src/runtime.rs` and remains
 the record: the mechanism did not change, and the laziness `MEMORY_RESERVATION`'s arithmetic
-rests on is asserted rather than assumed.
+rests on is asserted rather than assumed. Since #308 the engine builds a store per file rather
+than per worker (§2, Concurrency), so "one instance serves every file a rule matches" holds per
+`WasmRuntime` and no longer per worker; the laziness is unchanged, and a file that reaches no
+component still instantiates nothing.
 
 **The earlier numbers in this table were stale, and understated the gap by about half.** They
 were taken before Python, Go and Rust support existed; three more grammars means more rules

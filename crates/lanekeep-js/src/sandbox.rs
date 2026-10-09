@@ -57,6 +57,13 @@ const BOOTSTRAP: &str = r"
     delete globalThis.Atomics;
 ";
 
+/// The heap size at which QuickJS first runs its cycle collector, and the value
+/// [`Sandbox::reclaim`] puts it back to.
+///
+/// QuickJS's own initial value (`JS_NewRuntime` sets 256 KiB). The collector raises it after
+/// every automatic collection, which is the history [`Sandbox::reclaim`] exists to erase.
+const GC_THRESHOLD: usize = 256 * 1024;
+
 /// A JavaScript runtime that rule code executes in.
 ///
 /// Not `Sync`: the underlying engine runtime is single-threaded, so each rayon worker owns
@@ -88,6 +95,9 @@ impl Sandbox {
     pub fn new(limits: Limits, clock: Arc<RunClock>) -> Result<Self, SandboxError> {
         let runtime = Runtime::new().map_err(|e| SandboxError::Engine(e.to_string()))?;
         runtime.set_memory_limit(limits.memory_bytes);
+        // Stated rather than inherited, so the value `reclaim` resets to is this one by
+        // construction rather than by agreeing with the engine's default.
+        runtime.set_gc_threshold(GC_THRESHOLD);
 
         let context = Context::custom::<SandboxedIntrinsics>(&runtime)
             .map_err(|e| SandboxError::Engine(e.to_string()))?;
@@ -188,6 +198,36 @@ impl Sandbox {
     pub fn with_limits(limits: Limits) -> Result<Self, SandboxError> {
         let clock = RunClock::start(limits.global_timeout);
         Self::new(limits, clock)
+    }
+
+    /// Return the heap to what is still reachable, and the collector to its starting threshold.
+    ///
+    /// **For a caller that reuses one sandbox across independent pieces of work, between them.**
+    /// The memory ceiling is absolute, so what one piece of work is charged includes whatever the
+    /// runtime still holds from earlier ones. Reference counting frees acyclic garbage at once,
+    /// but a cycle waits for the collector, and QuickJS runs that only when an *object*
+    /// allocation takes the heap past `malloc_gc_threshold`, and the allocator's limit check
+    /// never collects. After each automatic collection the threshold becomes one and a half
+    /// times the heap at that moment, so one file with a large live peak leaves it high —
+    /// past the ceiling, if the peak was two thirds of it, after which nothing collects again.
+    /// Later files' cycles then pile up under it, and whether a file breaches depends on which
+    /// files the same sandbox ran before it.
+    ///
+    /// A full collection followed by resetting the threshold to 256 KiB, the value
+    /// [`Sandbox::new`] sets, makes the next piece of work start from the loaded ruleset's
+    /// reachable state rather than from the previous one's leftovers.
+    pub fn reclaim(&self) {
+        self.runtime.run_gc();
+        self.runtime.set_gc_threshold(GC_THRESHOLD);
+    }
+
+    /// Bytes the runtime currently holds, as its memory ceiling counts them.
+    ///
+    /// The same `malloc_size` the memory-breach classifier compares against the ceiling, exposed
+    /// so a caller can assert that [`Sandbox::reclaim`] returned the heap to a baseline.
+    #[must_use]
+    pub fn heap_bytes(&self) -> u64 {
+        u64::try_from(self.runtime.memory_usage().malloc_size).unwrap_or(u64::MAX)
     }
 
     /// The budgets in force.

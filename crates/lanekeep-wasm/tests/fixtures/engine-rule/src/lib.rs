@@ -79,6 +79,20 @@ const BURN: &str = "burn";
 /// assertion about how fast the machine is.
 const BURN_ITERATIONS: u64 = 400_000_000;
 
+/// A capture name asking this rule to keep [`HOLD_BYTES`] of its linear memory for good.
+///
+/// Stands in for a guest runtime whose heap does not return to where it started between
+/// calls — StarlingMonkey's does not, by 2 MiB a file on the crossings bench. A linear memory
+/// never shrinks, so to the host the two look the same: a store that has run more files holds
+/// more memory. What it is for is the engine's half, that the memory one file is charged does
+/// not include what an earlier file on the same worker left behind (#308).
+const HOLD: &str = "hold";
+
+/// What one invocation keeps when [`HOLD`] asks it to: a sixteenth of the shipped 64 MiB
+/// ceiling, so one store breaches it within the first twenty files it runs, and one file
+/// running alone stays far under it.
+const HOLD_BYTES: usize = 4 * 1024 * 1024;
+
 /// Somewhere the burn's result has to go, so nothing above it can be folded away.
 static SINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -157,6 +171,9 @@ impl Guest for Component {
         only(rule);
         if m.iter().any(|entry| entry.name == BURN) {
             burn();
+        }
+        if m.iter().any(|entry| entry.name == HOLD) {
+            hold();
         }
 
         let Some(target) = m
@@ -239,6 +256,16 @@ fn burn() {
         acc = core::hint::black_box(acc.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(i));
     }
     SINK.store(acc, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Keep [`HOLD_BYTES`] of memory for the life of the instance.
+///
+/// Written to rather than only reserved, and passed through `black_box`, so the allocation is
+/// neither elided nor left as a reservation the allocator never asks the host to back.
+#[inline(never)]
+fn hold() {
+    let held: &'static mut [u8] = Vec::leak(vec![0xA5; HOLD_BYTES]);
+    core::hint::black_box(held);
 }
 
 /// A refusal, as a name the host can compare against.

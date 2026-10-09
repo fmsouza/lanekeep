@@ -1873,8 +1873,10 @@ impl Engine {
     /// `rayon::broadcast` runs the closure once on every thread of the current pool. Each one
     /// owns one `Worker` and takes files off a shared cursor until none are left. So the
     /// ruleset is evaluated at most once per thread, and still lazily: a thread whose files all
-    /// hit the cache, or match nothing, builds no sandbox. The same bound now holds for each
-    /// worker's component store. Load balancing is per file rather than by adaptive splitting,
+    /// hit the cache, or match nothing, builds no sandbox. A component store is not kept that
+    /// long: it lives for one file, and the sandbox is collected between files, so the memory a
+    /// file is charged does not depend on which files shared its thread ([`Worker::end_file`],
+    /// #308). Load balancing is per file rather than by adaptive splitting,
     /// and one atomic increment per file is noise beside reading and parsing it.
     ///
     /// Nothing inside [`Self::check_file`] uses rayon, so no nested job can be stolen onto a
@@ -2321,7 +2323,23 @@ impl Engine {
     }
 
     /// Check one file. Returns its violations, facts and tracked reads.
+    ///
+    /// The worker is handed back as the next file needs to find it: with no component store
+    /// and a collected sandbox, whatever this file did. See [`Worker::end_file`] for why the
+    /// memory a file is charged must not depend on the files before it (#308).
     fn check_file(
+        &self,
+        worker: &mut Worker<'_>,
+        cache: &Store,
+        path: &FilePath,
+    ) -> Result<FileOutcome, RunError> {
+        let outcome = self.check_file_in(worker, cache, path);
+        worker.end_file();
+        outcome
+    }
+
+    /// [`Engine::check_file`]'s work, without the file boundary.
+    fn check_file_in(
         &self,
         worker: &mut Worker<'_>,
         cache: &Store,
@@ -3911,26 +3929,36 @@ struct Worker<'a> {
     /// A failure to build, remembered so it is reported once per worker rather than
     /// retried for every remaining file.
     failed: Option<RunError>,
-    /// This worker's component store, built on first use exactly as the sandbox is.
+    /// The current file's component store, built on first use exactly as the sandbox is, and
+    /// dropped when the file ends.
     ///
-    /// **One store per worker holding one instance per component, and so one per pool thread.**
+    /// **One store per file that reaches a component, not one per worker.** A store's charge
+    /// against the memory ceiling is every linear-memory grant it has made, and a linear memory
+    /// never shrinks. A guest whose own heap does not return to where it started between calls
+    /// therefore charged each file for every file its store had run before: StarlingMonkey's
+    /// does not, and the crossings bench's JavaScript arm measured 2 MiB more per file, every
+    /// file. Whether a file breached the ceiling then depended on which files shared its worker,
+    /// which is the scheduler's choice, not the input's. #293 made it visible by putting forty
+    /// files on one store where `map_init` had split them across two. See [`Worker::end_file`].
+    ///
     /// `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it allocates one `None` per
     /// component instance the ruleset needs). Instantiation happens in `WasmRuntime::rule`, at
-    /// most once per component instance per store. Several rules of one component share one,
-    /// which is the point of the rule index the world's exports take.
-    ///
-    /// While a `Worker` was a `map_init` initializer, the store count followed rayon's
-    /// adaptive splitting rather than the thread count: **1,038 stores and 10,380 instantiations
-    /// at fourteen threads**, measured through this engine at ten thousand files times ten rules.
-    /// `lanekeep_wasm::runtime::MEMORY_RESERVATION`'s documentation carries the re-derivation it
-    /// forced, and that reasoning still bounds the worst case. Since #293 the count is at most the
-    /// pool's thread count, which those figures far exceed.
+    /// most once per component instance per store, so a file instantiates each component it
+    /// reaches once, and several rules of one component still share that instance. A file that
+    /// reaches no component builds no store.
     wasm: Option<WasmRuntime>,
+    /// Whether the sandbox has run anything since the last file boundary, so
+    /// [`Worker::end_file`] collects only after a file that could have allocated in it.
+    sandbox_used: bool,
+    /// What the stores this worker has already dropped did, for a test to read.
+    ///
+    /// The stores themselves are gone by the time a test can look, which is the point of them.
+    #[cfg(test)]
+    retired: RetiredStores,
     /// The first component failure this worker saw, if it saw one.
     ///
-    /// A trapped store cannot be entered again, so every file after the first failure would
-    /// otherwise be reported with wasmtime's own bookkeeping message rather than with what
-    /// actually went wrong. See [`Worker::poison_on`].
+    /// Handed back for every later file, so the worker stops working on a run that is already
+    /// cancelled and keeps reporting what cancelled it. See [`Worker::poison_on`].
     poisoned: Option<RunError>,
 }
 
@@ -3942,21 +3970,61 @@ impl<'a> Worker<'a> {
             sandbox: None,
             failed: None,
             wasm: None,
+            sandbox_used: false,
+            #[cfg(test)]
+            retired: RetiredStores::default(),
             poisoned: None,
+        }
+    }
+
+    /// Put this worker back where a fresh one would be, as far as the next file's memory is
+    /// concerned.
+    ///
+    /// **The memory a file is charged must not depend on what the same worker ran before it.**
+    /// Which files share a worker is the scheduler's decision, so anything a file inherits from
+    /// its predecessors breaks the invariant that output is a function of the input alone, and
+    /// turns "limits cancel the run" into "limits cancel some runs". Two different repairs,
+    /// because the two engines hold memory differently:
+    ///
+    /// - **The component store is dropped.** Its charge is monotonic by construction and what a
+    ///   guest does with its own heap is beyond the host's reach, so only a store that starts
+    ///   empty makes the next file's charge its own. The cost is an instantiation per file per
+    ///   component reached, against one per worker before: tens of microseconds for a Rust
+    ///   instance (`MEMORY_RESERVATION` has the measurements), on a path that has just read and
+    ///   parsed the file.
+    /// - **The sandbox is collected, not rebuilt.** Rebuilding it would evaluate the whole
+    ///   ruleset again per file, the cost #293 removed. QuickJS's heap *can* be returned to its
+    ///   baseline from the host side, which a guest's linear memory cannot: a full collection
+    ///   frees the cycles reference counting left, and resetting the collector's threshold
+    ///   removes the one piece of allocator history that decides when the next collection runs.
+    ///   See `Sandbox::reclaim`. What survives is what the ruleset itself keeps reachable, and a
+    ///   rule that keeps state reachable across files is already outside the determinism
+    ///   invariant (architecture §4).
+    fn end_file(&mut self) {
+        if let Some(runtime) = self.wasm.take() {
+            #[cfg(test)]
+            self.retired.record(&runtime);
+            drop(runtime);
+        }
+        if std::mem::take(&mut self.sandbox_used)
+            && let Some(sandbox) = &self.sandbox
+        {
+            sandbox.reclaim();
         }
     }
 
     /// Remember a component failure, and hand it straight back.
     ///
-    /// **A trap poisons the whole store, and the store outlives the file.** `bindgen!` is
-    /// configured with `imports: { default: trappable }`, so any host refusal — and any guest
-    /// trap — sets a store-wide flag with no public reset: a later, unrelated call on the same
-    /// store fails with wasmtime's own `cannot enter component instance`, which names nothing
-    /// that went wrong. Every such failure already cancels the run, so nothing is *rescued* by
-    /// noticing; what is rescued is the diagnostic. rayon keeps handing this worker its
-    /// remaining files, and which of several failures surfaces from the reduction is arbitrary,
-    /// so without this the run can be reported against a file that was fine and a message that
-    /// describes the runtime's bookkeeping rather than the rule.
+    /// **A trap poisons the whole store.** `bindgen!` is configured with
+    /// `imports: { default: trappable }`, so any host refusal — and any guest trap — sets a
+    /// store-wide flag with no public reset: a later, unrelated call on the same store fails
+    /// with wasmtime's own `cannot enter component instance`, which names nothing that went
+    /// wrong. The store used to outlive the file, and that is what made this a diagnostic hazard
+    /// rather than a curiosity. Since #308 it is dropped at every file boundary
+    /// ([`Worker::end_file`]), so a later file would get a fresh one. The first failure is still
+    /// remembered and handed back for the rest of this worker's share: every such failure
+    /// cancels the run, so nothing is rescued by running on, and what the worker reports stays
+    /// the failure that cancelled it.
     fn poison_on<T>(&mut self, outcome: &Result<T, RunError>) -> Result<T, RunError>
     where
         T: Clone,
@@ -4022,9 +4090,31 @@ impl<'a> Worker<'a> {
             }
         }
 
+        self.sandbox_used = true;
         self.sandbox.as_ref().ok_or_else(|| RunError::Worker {
             detail: "sandbox was not built".to_owned(),
         })
+    }
+}
+
+/// What a worker's dropped component stores did, accumulated for a test.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RetiredStores {
+    /// How many stores were dropped at a file boundary.
+    stores: usize,
+    /// Instances those stores built, summed.
+    instantiations: usize,
+    /// Whether any of them still held a check context when it was dropped.
+    held_a_context: bool,
+}
+
+#[cfg(test)]
+impl RetiredStores {
+    fn record(&mut self, runtime: &WasmRuntime) {
+        self.stores += 1;
+        self.instantiations += runtime.instantiations();
+        self.held_a_context |= !runtime.host().holds_no_contexts();
     }
 }
 
@@ -10512,6 +10602,74 @@ export default defineRule({
             );
         }
 
+        /// A rule that leaves cyclic garbage behind on every match: pairs of objects pointing at
+        /// each other, which reference counting cannot free and only the collector can.
+        const CYCLES_RULE: &str = "import { defineRule } from 'lanekeep';\n\
+            export default defineRule({\n\
+              id: 'local/cycles',\n\
+              query: '(debugger_statement) @stmt',\n\
+              card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },\n\
+              check(ctx, m) {\n\
+                for (let i = 0; i < 3000; i++) { const a = { i }; const b = { a }; a.b = b; }\n\
+                ctx.report(m.stmt);\n\
+              },\n\
+            });\n";
+
+        /// #308. Since #293 one sandbox serves a pool thread's whole share of the corpus, so
+        /// what a file is charged against the memory ceiling must not include what earlier
+        /// files on the same thread left behind. Which files share a thread is the scheduler's
+        /// choice, so anything inherited would make a breach depend on it.
+        ///
+        /// QuickJS frees acyclic garbage at once, so a rule that leaves cycles is the case that
+        /// shows it: without a collection at the file boundary the heap a file starts from grows
+        /// with the files before it, until an object allocation happens to cross the
+        /// collector's threshold. Measured as the heap after each file, which is what the next
+        /// file starts from, and asserted equal, which is what "starts from the baseline" means.
+        #[test]
+        fn a_workers_javascript_heap_returns_to_its_baseline_between_files() {
+            const FILES: usize = 12;
+            let mut owned: Vec<(String, String)> = vec![
+                ("rule.ts".to_owned(), CYCLES_RULE.to_owned()),
+                ("lanekeep.config.ts".to_owned(), config("")),
+            ];
+            for i in 0..FILES {
+                owned.push((format!("src/f{i:02}.ts"), MATCHED.to_owned()));
+            }
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            let project = Project::new("heap-baseline", &borrowed);
+            let engine = project
+                .prepare_with("lanekeep.config.ts")
+                .expect("prepares")
+                .without_cache();
+
+            let clock = RunClock::start(engine.limits.global_timeout);
+            let cache = Store::empty();
+            let mut worker = Worker::new(&engine, &clock);
+            let mut paths = engine.discover();
+            paths.sort();
+            let mut after_each = Vec::new();
+            for path in &paths {
+                engine
+                    .check_file(&mut worker, &cache, path)
+                    .expect("checks");
+                let sandbox = worker
+                    .sandbox
+                    .as_ref()
+                    .expect("the rule ran in the sandbox");
+                after_each.push(sandbox.heap_bytes());
+            }
+
+            assert_eq!(after_each.len(), FILES);
+            assert!(
+                after_each.iter().all(|bytes| *bytes == after_each[0]),
+                "the heap each file left for the next must be the same, whatever ran before \
+                 it: {after_each:?}"
+            );
+        }
+
         /// A rule that throws on the one file whose text says `boom`, and nowhere else.
         const SELECTIVE_RULE: &str = "import { defineRule } from 'lanekeep';\n\
             export default defineRule({\n\
@@ -12356,10 +12514,12 @@ export default defineRule({
         }
 
         #[test]
-        fn a_worker_instantiates_a_component_rule_once_however_many_files_it_handles() {
-            // The bound `MEMORY_RESERVATION` is chosen on: one instance per (worker, component).
-            // Driven through one `Worker` directly rather than through `run`, because rayon
-            // decides how many workers exist and the claim is about one of them.
+        fn a_worker_instantiates_a_component_once_per_file_and_keeps_no_store_between_files() {
+            // #308. A store's memory charge only grows, so a store kept across files charged
+            // each one for its predecessors; one per file is what makes a file's charge its own.
+            // Still at most one instance per (file, component), which is what keeps it off
+            // files x rules. Driven through one `Worker` directly rather than through `run`,
+            // because rayon decides how many workers exist and the claim is about one of them.
             let project = Project::new(
                 "component-instantiations",
                 &[
@@ -12384,16 +12544,77 @@ export default defineRule({
                     .expect("checks");
             }
 
-            let runtime = worker.wasm.as_ref().expect("a component rule ran");
+            assert!(
+                worker.wasm.is_none(),
+                "no store may outlive the file it was built for"
+            );
             assert_eq!(
-                runtime.instantiations(),
-                1,
-                "three files sharing one worker must instantiate the rule once"
+                worker.retired.stores, 3,
+                "three files reaching a component must build three stores"
+            );
+            assert_eq!(
+                worker.retired.instantiations, 3,
+                "and instantiate the rule once in each"
             );
             assert!(
-                runtime.host().holds_no_contexts(),
-                "each file's context must be given back, or a worker's store grows with the \
-                 corpus"
+                !worker.retired.held_a_context,
+                "each file's context must be given back before its store is dropped"
+            );
+        }
+
+        /// #308, the regression itself. The crossings bench's JavaScript arm put forty files on
+        /// one store once #293 made workers per thread, StarlingMonkey's heap grew 2 MiB a file
+        /// and never shrank, and the run died at the twenty-seventh file with a memory breach
+        /// no file had caused. Under `map_init` the same corpus had been split across two stores,
+        /// so it had passed: the breach depended on the scheduler, not on the input.
+        ///
+        /// The fixture's `@hold` keeps 4 MiB per invocation for the life of its instance, the
+        /// same shape as a guest heap that does not return. One file is far under the 64 MiB
+        /// ceiling and twenty-four on one store are far over it. So one worker and four must
+        /// both finish, and agree.
+        #[test]
+        fn a_files_component_memory_does_not_include_what_its_worker_ran_before() {
+            const FILES: usize = 24;
+            let mut owned: Vec<(String, String)> = vec![
+                ("rule-a.ts".to_owned(), debugger_rule("local/alpha")),
+                ("lanekeep.config.ts".to_owned(), config_with(&["./rule-a"])),
+            ];
+            for i in 0..FILES {
+                owned.push((format!("src/f{i:02}.ts"), format!("const v{i} = {i};\n")));
+            }
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            let project = Project::new("component-memory-per-file", &borrowed);
+
+            let mut holder = component_rule("local/middle", 1, false);
+            holder.queries.insert(
+                "typescript".to_owned(),
+                "(variable_declarator name: (identifier) @target @hold)".to_owned(),
+            );
+            let engine = project.engine(vec![holder]).without_cache();
+
+            let on = |threads: usize| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("a pool builds")
+                    .install(|| engine.run())
+            };
+            let one = on(1).unwrap_or_else(|error| {
+                panic!("{FILES} files on one worker, each far under the ceiling alone: {error}")
+            });
+            let four = on(4).expect("the same corpus on four workers");
+
+            assert_eq!(
+                one.violations.len(),
+                FILES,
+                "every file reported, by the component"
+            );
+            assert_eq!(
+                one.violations, four.violations,
+                "which files shared a worker must not change the output"
             );
         }
 
@@ -12424,7 +12645,7 @@ export default defineRule({
             }
 
             assert!(
-                worker.wasm.is_none(),
+                worker.wasm.is_none() && worker.retired.stores == 0,
                 "a worker with no component match must not build a store at all"
             );
         }
@@ -12584,15 +12805,14 @@ export default defineRule({
                 "both component rules must report, once each"
             );
 
-            let runtime = worker.wasm.as_ref().expect("a component rule ran");
             assert!(
-                runtime.host().holds_no_contexts(),
+                !worker.retired.held_a_context,
                 "two rules on one file must leave one context behind, and it must be given back"
             );
             assert_eq!(
-                runtime.instantiations(),
-                2,
-                "two rules is two instances, and two rules on one file is still two"
+                (worker.retired.stores, worker.retired.instantiations),
+                (1, 2),
+                "two rules is two instances, and two rules on one file is still two, in one store"
             );
         }
 
