@@ -4622,11 +4622,9 @@ fn engine_version() -> &'static str {
     }
 }
 
-/// The id violations about suppressions are reported under.
-///
-/// A real namespaced id, so it sorts, suppresses and serializes like any other — and so a
-/// consumer parsing output does not meet a special case.
-const SUPPRESSION_RULE: &str = "lanekeep/suppression";
+// The id violations about suppressions are reported under. It lives in `lanekeep-core` now,
+// because a baseline refuses it by the same name.
+use lanekeep_core::SUPPRESSION_RULE;
 
 /// The message a `lanekeep/parse` violation carries: which grammar, and how much of the file
 /// it could not read.

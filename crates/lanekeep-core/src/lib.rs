@@ -29,6 +29,7 @@
 //! drift to happen — unlike the per-engine-instance types above, it is wrong the moment a
 //! second copy exists at all.
 
+pub mod baseline;
 pub mod card;
 pub mod changed;
 pub mod discovery;
@@ -46,6 +47,7 @@ pub mod tracked;
 pub mod types_config;
 pub mod violation;
 
+pub use baseline::Baseline;
 pub use card::{CardProblem, Examples, RuleCard};
 pub use changed::ChangeError;
 pub use discovery::{Discovery, DiscoveryError, Rejection};
@@ -58,7 +60,7 @@ pub use limits::{
     DEFAULT_RULE_TIMEOUT, Limits, Paused, RunClock, analysis_overrun_fallback,
 };
 pub use location::{FilePath, Location, Position};
-pub use rule_id::{Namespace, PARSE_RULE, ParseRuleIdError, RuleId};
+pub use rule_id::{Namespace, PARSE_RULE, ParseRuleIdError, RuleId, SUPPRESSION_RULE};
 pub use severity::{ParseSeverityError, Severity};
 pub use suppression::{Suppression, Suppressions};
 pub use tracked::{ContentHash, ReadOutcome, TrackedRead};

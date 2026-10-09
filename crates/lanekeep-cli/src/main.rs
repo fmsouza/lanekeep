@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
+mod baseline;
 mod session;
 mod watch;
 
@@ -134,6 +135,26 @@ enum Command {
         /// and Ctrl-C ends it. The warm cache is what makes each re-run fast.
         #[arg(long, conflicts_with = "fix")]
         watch: bool,
+
+        /// Report only violations this baseline file does not record.
+        ///
+        /// For landing a rule with a known backlog: the exit code follows the new violations
+        /// only. A recorded violation that moves lines stays recorded; a second copy of one
+        /// is new. Entries that no longer occur are listed on stderr so the file can shrink.
+        /// Resolved against the current directory, like `--config`.
+        #[arg(long, value_name = "FILE")]
+        baseline: Option<PathBuf>,
+
+        /// Record every current violation to this file, then report what it could not record.
+        ///
+        /// Refuses a narrowed selection, which would drop every other file's entries.
+        /// `lanekeep/suppression` is never recorded: a suppression policy cannot be waived.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["since", "staged", "file", "watch", "baseline"]
+        )]
+        write_baseline: Option<PathBuf>,
     },
 
     /// Serve diagnostics to an editor or an agent host, over stdio.
@@ -228,7 +249,10 @@ fn run() -> anyhow::Result<ExitCode> {
             fix,
             profile,
             watch,
+            baseline,
+            write_baseline,
         } => {
+            let baseline = baseline::Mode::from(baseline.as_deref(), write_baseline.as_deref());
             let options = || CheckOptions {
                 project_root: &path,
                 config: config.as_deref(),
@@ -242,6 +266,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     fix,
                     profile,
                 },
+                baseline,
                 dependencies: None,
             };
 
@@ -276,6 +301,7 @@ fn run() -> anyhow::Result<ExitCode> {
                     fix,
                     profile,
                 },
+                baseline,
                 dependencies: None,
             })
         }
@@ -1297,6 +1323,8 @@ struct CheckOptions<'a> {
     /// Four bare booleans in a row is the shape that gets silently transposed, and the
     /// compiler cannot help — every one of them is the same type.
     switches: Switches,
+    /// Whether to compare against, or write, a baseline (`--baseline`, `--write-baseline`).
+    baseline: baseline::Mode<'a>,
     /// Where to record what this run read beyond the files it checked.
     ///
     /// `Some` only under `--watch`, which turns it into the watcher's allowlist. A one-shot
@@ -1617,6 +1645,7 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
                 fix,
                 profile,
             },
+        baseline,
         dependencies,
     } = options;
 
@@ -1670,6 +1699,8 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         engine
     };
 
+    let skipped_rules = baseline_skipped_rules(&engine, &selection);
+
     let engine = if selection.is_narrowed() && !cross_file.is_empty() {
         let mut stderr = std::io::stderr();
         writeln!(
@@ -1685,9 +1716,17 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
 
     note_narrowed_type_aware(&selection, &engine)?;
 
+    // What a baseline may call stale: only files this run checked, and only rules it ran.
+    let scope = lanekeep_core::baseline::Scope {
+        files: selected
+            .as_ref()
+            .map(|files| files.iter().cloned().collect()),
+        skipped_rules,
+    };
+
     let outcome = run_selected(&engine, selected).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let outcome = if fix {
+    let mut outcome = if fix {
         let held = engine.provider();
         fix_and_recheck(project_root, config, !no_cache, timeout, outcome, held)?
     } else {
@@ -1696,26 +1735,49 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
 
     record_dependencies(dependencies, &engine, &outcome);
 
-    let color = Color::resolve(
-        std::io::stdout().is_terminal(),
-        std::env::var("NO_COLOR").ok().as_deref(),
-    );
+    // After `--fix`, so a baseline records and compares what is actually left. Taken rather
+    // than cloned: from here on `outcome` supplies only the counts and the profile.
+    let violations = baseline::apply(
+        baseline,
+        project_root,
+        std::mem::take(&mut outcome.violations),
+        &scope,
+        &mut std::io::stderr(),
+    )?;
+
     // Cards for every configured rule, and the engine's own for `lanekeep/parse`, the only id
     // it reports itself — `lanekeep/suppression` has none yet. The agent and SARIF reporters
     // describe a rule as well as its violations, and a `Violation` carries the message and
     // remediation but not the examples.
     let cards: lanekeep_report::Cards = engine.cards().collect();
+    report(format, &violations, &outcome, warn_only, &cards)
+}
 
+/// Render what a check found to stdout, its profile to stderr, and choose the exit code.
+///
+/// `violations` is what is reported, which under `--baseline` is fewer than `outcome` holds;
+/// the counts and the profile are the whole run's.
+fn report(
+    format: Format,
+    violations: &[lanekeep_core::Violation],
+    outcome: &Outcome,
+    warn_only: bool,
+    cards: &lanekeep_report::Cards,
+) -> anyhow::Result<ExitCode> {
+    let color = Color::resolve(
+        std::io::stdout().is_terminal(),
+        std::env::var("NO_COLOR").ok().as_deref(),
+    );
     let rendered = lanekeep_report::render(
         format,
         color,
-        &outcome.violations,
+        violations,
         Summary {
             files_discovered: outcome.files_discovered,
             files_parsed: outcome.files_parsed,
             warn_only,
         },
-        &cards,
+        cards,
     );
 
     let mut stdout = std::io::stdout();
@@ -1728,10 +1790,29 @@ fn check(options: CheckOptions<'_>) -> anyhow::Result<ExitCode> {
         write_gate_profile(&mut std::io::stderr(), timings, outcome.files_discovered)?;
     }
 
-    let code = lanekeep_report::exit_code(&outcome.violations, warn_only);
+    let code = lanekeep_report::exit_code(violations, warn_only);
     Ok(ExitCode::from(
         u8::try_from(code).unwrap_or(EXIT_RUNTIME_ERROR),
     ))
+}
+
+/// The rules a narrowed run does not run, whose baseline entries it therefore cannot call stale.
+///
+/// The cross-file rules, which a narrowed selection skips (see `check`). Over-approximate on
+/// purpose: a rule with a per-file half as well still runs that half, and its entries in the
+/// selection are simply never called stale by a narrowed run — a full run will say so.
+fn baseline_skipped_rules(
+    engine: &Engine,
+    selection: &Selection,
+) -> BTreeSet<lanekeep_core::RuleId> {
+    if !selection.is_narrowed() {
+        return BTreeSet::new();
+    }
+    engine
+        .rules()
+        .filter(|spec| spec.has_reduce)
+        .map(|spec| spec.id.clone())
+        .collect()
 }
 
 fn rules(project_root: &Path, config: Option<&Path>, as_json: bool) -> anyhow::Result<ExitCode> {
@@ -2054,6 +2135,7 @@ mod tests {
                 fix: false,
                 profile: false,
             },
+            baseline: baseline::Mode::Off,
             dependencies: Some(&sink),
         });
 

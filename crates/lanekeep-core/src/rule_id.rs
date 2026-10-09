@@ -72,6 +72,13 @@ impl fmt::Display for Namespace {
 /// { "lanekeep/parse": … }` is how its level is set.
 pub const PARSE_RULE: &str = "lanekeep/parse";
 
+/// The id violations about suppressions are reported under (architecture §10).
+///
+/// A real namespaced id, so it sorts, suppresses and serializes like any other — and so a
+/// consumer parsing output does not meet a special case. The engine emits it; it lives here
+/// because a baseline has to refuse it too (see [`crate::baseline::is_baselineable`]).
+pub const SUPPRESSION_RULE: &str = "lanekeep/suppression";
+
 /// Why a string is not a valid rule ID.
 ///
 /// Each variant carries what was actually seen. A diagnostic that says only "invalid rule
