@@ -987,6 +987,22 @@ A reduce-phase violation carries no fix: there is no parse tree in that phase, s
 
 An obligation violation (§6.11) is not expected to carry a fix either, for the opposite reason: the tree is right there, and `checkObligation` can attach a `Fix` exactly as `check` can — but the remedy is almost never a replacement at the report site, since it is almost always adding a `finally` that does not exist yet, and a fix is a poor fit for that. `card.remediation` carries the whole remedy instead.
 
+### 10.2 Baselines
+
+A rule adopted over an existing codebase otherwise lands with its whole backlog fixed or every site suppressed. `lanekeep check --write-baseline <file>` records the current violations; `lanekeep check --baseline <file>` reports only the ones it does not record, and the exit code follows those alone. The file is meant to be committed and to shrink.
+
+**An entry is a rule, a file and a fingerprint of the reported line's text**, with a count. A violation carries a position and nothing else — no span, no node — so the line's text, trimmed and with whitespace runs collapsed, is what identifies it independently of where it sits. A violation that moves lines, or is reindented, or crosses a CRLF checkout, stays recorded; editing the reported line itself makes it new, because the violating code changed. The message is not part of the key, so a lanekeep upgrade that rewords one does not turn a baseline into new violations. A renamed file's violations are new.
+
+**Entries count.** Two identical lines with one recorded leave one new, and matching walks violations in canonical order, so it is the later copy that is reported — text cannot say which copy is the old one, and a deterministic answer is the one worth having.
+
+**What no longer occurs is listed, on stderr, and never fails the run** — the same reasoning as unused suppressions (§10). So is the count of what the baseline hid, because a run that hides things silently reads as "clean". Neither reaches stdout, so `--format json` still pipes a clean document. Under `--since`, `--staged` or `--file`, an entry is called stale only if the run checked its file and ran its rule: a narrowed run says nothing about the rest.
+
+**`lanekeep/suppression` is never recorded and never filtered.** It cannot be suppressed, and a baseline that could swallow an expired directive's report would make `expires:` meaningless. `lanekeep/parse` can be suppressed, so it can be baselined.
+
+**`--write-baseline` refuses a narrowed selection**, which would silently drop every other file's entries. Having written, it filters the run against what it wrote, so an adoption exits `0` and a broken directive still fails it. The file is versioned JSON, sorted, with a trailing newline, so rewriting an unchanged baseline yields identical bytes. A missing, malformed or other-version file is a runtime error, not an empty baseline.
+
+**A baseline is not an engine input.** It filters the outcome after the run, in the CLI, so nothing in the cache key, the sandbox or the host API knows it exists, and a cached result is the same with or without one. The CLI re-reads the reported lines after the run, as `--fix` does.
+
 ---
 
 ## 11. Output
@@ -1032,6 +1048,7 @@ lanekeep check [PROJECT_ROOT]
         [--format human|json|sarif|agent]
         [--warn-only] [--profile] [--no-cache]
         [--timeout <ms>]        # global budget, default 15000
+        [--baseline <file> | --write-baseline <file>]   # §10.2
 lanekeep check --watch          # foreground, incremental, re-runs on change
 lanekeep explain <rule-id>      # prints the rule card
 lanekeep rules [--json]
