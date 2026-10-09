@@ -256,11 +256,23 @@ impl Sandbox {
     /// synthetic entry has to sit inside the rules root for relative specifiers in its
     /// source to resolve. Naming it outside would make every import look like an escape.
     ///
+    /// **The budget is the caller's to choose, and there is no default.** This evaluates a
+    /// ruleset's entry module: the top level of every module it imports and every factory call.
+    /// That is not a handler, so the per-invocation `rule_timeout` is the wrong number for it,
+    /// and it used to be the one applied. At config load that meant a hard-coded second nothing a
+    /// user could set reached (#293). The caller knows which phase it is in and which number
+    /// governs that phase.
+    ///
     /// # Errors
     ///
     /// As [`Sandbox::eval`].
-    pub fn eval_module(&self, name: &str, source: &str) -> Result<(), SandboxError> {
-        self.budget.arm(self.limits.rule_timeout);
+    pub fn eval_module(
+        &self,
+        name: &str,
+        source: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), SandboxError> {
+        self.budget.arm(timeout);
         let outcome = self.context.with(|ctx| {
             let promise = match Module::evaluate(ctx.clone(), name, source) {
                 Ok(promise) => promise,
@@ -273,7 +285,7 @@ impl Sandbox {
         });
         self.budget.disarm();
 
-        outcome.map_err(|raw| self.classify(&raw, self.limits.rule_timeout))
+        outcome.map_err(|raw| self.classify(&raw, timeout))
     }
 
     /// Evaluate source with a `ctx` object in scope, the way a rule handler runs.

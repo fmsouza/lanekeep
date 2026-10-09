@@ -794,6 +794,13 @@ pub struct Engine {
     /// A clone of the one the provider holds, sharing its accumulator: what the provider
     /// charges is what [`Self::check_file`] reads.
     analysis: AnalysisBudget,
+    /// How many times this engine has evaluated the ruleset into a sandbox, for a test to read.
+    ///
+    /// The bound `run_files` promises (at most one per pool thread, #293) cannot be seen from
+    /// outside: a sandbox leaves no trace in an `Outcome`, and which one ran a file is
+    /// invisible in its output.
+    #[cfg(test)]
+    evaluations: std::sync::atomic::AtomicUsize,
 }
 
 /// The component half of a run, walled off so its one constructor cannot be gone around.
@@ -1636,6 +1643,8 @@ impl Engine {
             type_languages,
             types_provider: config.types.provider,
             analysis,
+            #[cfg(test)]
+            evaluations: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1849,6 +1858,68 @@ impl Engine {
         self.run_files(files, Coverage::Partial)
     }
 
+    /// Check every file in parallel, with one [`Worker`] per pool thread, and hand the outcomes
+    /// back in input order.
+    ///
+    /// **Per thread, not per rayon chunk, and that is the point of not using `map_init`.**
+    /// A `Worker` builds a QuickJS sandbox on first use and evaluates the whole ruleset into it:
+    /// every rule module's top level and every factory call. `map_init` runs its initializer
+    /// per *chunk*, a trap `AGENTS.md` records, so that evaluation was repeated per chunk.
+    /// Measured on a release binary over 2,000 files on fourteen threads, it ran 598 to 877
+    /// times per run, all concurrently, under a wall-clock budget that was one second at the
+    /// time. That is #293's intermittent failure on a loaded machine. Architecture §2 said "one
+    /// runtime per worker, created once per run" throughout, and nothing made it true.
+    ///
+    /// `rayon::broadcast` runs the closure once on every thread of the current pool. Each one
+    /// owns one `Worker` and takes files off a shared cursor until none are left. So the
+    /// ruleset is evaluated at most once per thread, and still lazily: a thread whose files all
+    /// hit the cache, or match nothing, builds no sandbox. The same bound now holds for each
+    /// worker's component store. Load balancing is per file rather than by adaptive splitting,
+    /// and one atomic increment per file is noise beside reading and parsing it.
+    ///
+    /// Nothing inside [`Self::check_file`] uses rayon, so no nested job can be stolen onto a
+    /// thread mid-file and see its `Worker`.
+    fn check_files(
+        &self,
+        files: &[FilePath],
+        cache: &Store,
+        clock: &Arc<RunClock>,
+    ) -> Vec<Result<FileOutcome, RunError>> {
+        if files.is_empty() {
+            return Vec::new();
+        }
+
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let per_thread: Vec<Vec<(usize, Result<FileOutcome, RunError>)>> = rayon::broadcast(|_| {
+            let mut worker = Worker::new(self, clock);
+            let mut done = Vec::new();
+            loop {
+                let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(path) = files.get(index) else {
+                    break;
+                };
+                let outcome = self
+                    .check_file(&mut worker, cache, path)
+                    .and_then(|outcome| {
+                        // After the file, and before its outcome is handed back to be
+                        // committed. See `provider_failure`: this `?` is what discards it.
+                        self.provider_failure()?;
+                        Ok(outcome)
+                    });
+                done.push((index, outcome));
+            }
+            done
+        });
+
+        // Back into input order, which the fold in `run_files` relies on twice: the first
+        // failure it reports is the first by file order, and nothing downstream may see the
+        // order threads happened to finish in.
+        let mut indexed: Vec<(usize, Result<FileOutcome, RunError>)> =
+            per_thread.into_iter().flatten().collect();
+        indexed.sort_unstable_by_key(|(index, _)| *index);
+        indexed.into_iter().map(|(_, outcome)| outcome).collect()
+    }
+
     /// The shared body of [`Engine::run`] and [`Engine::run_over`].
     fn run_files(&self, files: &[FilePath], coverage: Coverage) -> Result<Outcome, RunError> {
         let clock = RunClock::start(self.limits.global_timeout);
@@ -1862,28 +1933,7 @@ impl Engine {
             Store::empty()
         };
 
-        let results: Vec<Result<FileOutcome, RunError>> = files
-            .par_iter()
-            .map_init(
-                // One sandbox per worker, created on first use and reused for that
-                // worker's whole share. Building one per file would pay engine startup
-                // thousands of times; sharing one across workers is impossible, since the
-                // runtime is single-threaded by construction.
-                // The sandbox is per worker and built on first use — one engine startup
-                // per thread that needs one, rather than per file, and none at all for a
-                // worker whose files all hit the cache. That last part is what makes a warm
-                // run cheap: starting QuickJS and evaluating every rule module, per worker,
-                // to then execute no JavaScript, was most of a warm run's cost.
-                || Worker::new(self, &clock),
-                |worker, path| {
-                    let outcome = self.check_file(worker, &cache, path)?;
-                    // After the file, and before its outcome is handed back to be committed.
-                    // See `provider_failure`: this `?` is what discards it.
-                    self.provider_failure()?;
-                    Ok(outcome)
-                },
-            )
-            .collect();
+        let results = self.check_files(files, &cache, &clock);
 
         let mut violations = Vec::new();
         let mut facts = Vec::new();
@@ -1895,7 +1945,7 @@ impl Engine {
         // The first failure by *file order*, kept rather than returned, because the entries
         // every other file produced are still owed to the cache — see the save below. Which
         // failure is reported does not change: it is the same one `?` would have taken, since
-        // rayon's `collect` preserves input order.
+        // `check_files` hands outcomes back in input order.
         let mut failure: Option<RunError> = None;
         for result in results {
             let outcome = match result {
@@ -1972,11 +2022,11 @@ impl Engine {
 
         // Into the one order every run will see, before any rule looks at them.
         //
-        // Rayon's `collect` into a `Vec` already preserves input order, so on today's code
-        // path this sort changes nothing — which is exactly why it is easy to delete and
-        // must not be. The ordering guarantee belongs to the engine, not to a property of
-        // whichever collection strategy it happens to use: switching to `for_each` with a
-        // shared sink, or grouping by rule before reducing, would silently lose it. The
+        // `check_files` already hands outcomes back in input order, so on today's code path
+        // this sort changes nothing — which is exactly why it is easy to delete and must not
+        // be. The ordering guarantee belongs to the engine, not to a property of whichever
+        // collection strategy it happens to use: dropping the index sort in `check_files`, or
+        // grouping by rule before reducing, would silently lose it. The
         // cost is one sort of a small vector, once per run.
         lanekeep_core::fact::sort(&mut facts);
 
@@ -2235,6 +2285,9 @@ impl Engine {
 
     /// Build the sandbox a worker uses, evaluating the ruleset into it.
     fn build_sandbox(&self, clock: &Arc<RunClock>) -> Result<Sandbox, RunError> {
+        #[cfg(test)]
+        self.evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sandbox = Sandbox::with_modules(
             self.limits,
             Arc::clone(clock),
@@ -2249,9 +2302,18 @@ impl Engine {
         // Every worker evaluates the ruleset into its own engine. A rule's `check` is a
         // function, and a function cannot cross between runtimes — so the modules are
         // loaded per worker rather than the handlers being extracted and shared.
+        //
+        // The evaluation is bounded by the run's clock, so a breach there is the run's and is
+        // reported as one, with the headline every other run-budget breach has, rather than as a
+        // worker that could not start (#290, #293).
         lanekeep_config::evaluate_into(&sandbox, &self.rules_root, &self.config_path).map_err(
-            |e: ConfigError| RunError::Worker {
-                detail: e.to_string(),
+            |e: ConfigError| match e {
+                ConfigError::RunTimeout { budget, elapsed } => {
+                    RunError::RunTimeout { budget, elapsed }
+                }
+                other => RunError::Worker {
+                    detail: other.to_string(),
+                },
             },
         )?;
 
@@ -3832,7 +3894,11 @@ enum Coverage {
     Partial,
 }
 
-/// One rayon worker's reusable state.
+/// One pool thread's reusable state, for the whole of one run.
+///
+/// One per thread, built in [`Engine::check_files`]'s broadcast. It used to be a `map_init`
+/// initializer, and so one per rayon *chunk*: hundreds per run rather than one per thread, each
+/// evaluating the whole ruleset again (#293).
 ///
 /// The sandbox is built on first use rather than up front. Starting QuickJS and evaluating
 /// every rule module into it costs real time, and a worker whose files all hit the cache —
@@ -3847,27 +3913,18 @@ struct Worker<'a> {
     failed: Option<RunError>,
     /// This worker's component store, built on first use exactly as the sandbox is.
     ///
-    /// **One store per worker holding one instance per component — and rayon decides how many
-    /// workers there are.** `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it
-    /// allocates one `None` per component instance the ruleset needs), which is what makes it
-    /// safe to build from rayon's initializer, since `map_init` runs that per *chunk* rather than
-    /// per thread. Instantiation then happens in `WasmRuntime::rule`, at most once per component
-    /// instance per store — several rules of one component share one, which is the point of the
-    /// rule index the world's exports take.
+    /// **One store per worker holding one instance per component, and so one per pool thread.**
+    /// `lanekeep_wasm::WasmRuntime::for_rules` instantiates nothing (it allocates one `None` per
+    /// component instance the ruleset needs). Instantiation happens in `WasmRuntime::rule`, at
+    /// most once per component instance per store. Several rules of one component share one,
+    /// which is the point of the rule index the world's exports take.
     ///
-    /// That is a bound per `Worker`, not per thread, and the difference is not small: measured
-    /// through this engine at ten thousand files times ten rules, **1,038 stores and 10,380
-    /// instantiations at fourteen threads**, varying between runs because rayon splits on how the
-    /// work is going. `lanekeep_wasm::runtime::MEMORY_RESERVATION` used to be justified on
-    /// "roughly three hundred and fifty instantiations, and it does not grow with the corpus";
-    /// that half is false and its documentation now carries the re-derivation, the crossover, and
-    /// why the constant is left where it is anyway.
-    ///
-    /// **The lever, if this ever needs bounding, is here rather than there.** `with_min_len` on
-    /// `run_files`'s `par_iter` would cap the store count directly — and it is a bigger change
-    /// than it looks, because this same initializer builds the QuickJS sandbox and one sandbox
-    /// per chunk is the more expensive of the two. It would move the JavaScript path's measured
-    /// behavior, so it needs a benchmark rather than an argument.
+    /// While a `Worker` was a `map_init` initializer, the store count followed rayon's
+    /// adaptive splitting rather than the thread count: **1,038 stores and 10,380 instantiations
+    /// at fourteen threads**, measured through this engine at ten thousand files times ten rules.
+    /// `lanekeep_wasm::runtime::MEMORY_RESERVATION`'s documentation carries the re-derivation it
+    /// forced, and that reasoning still bounds the worst case. Since #293 the count is at most the
+    /// pool's thread count, which those figures far exceed.
     wasm: Option<WasmRuntime>,
     /// The first component failure this worker saw, if it saw one.
     ///
@@ -10330,6 +10387,129 @@ export default defineRule({
                 .run_cold()
                 .expect_err("50 ms cannot cover two seconds of reduce");
             assert_names_the_run(&error, &["local/burn-reduce", "<reduce>"]);
+        }
+
+        /// #293, and #305's note for it. A worker evaluates the whole ruleset into its sandbox
+        /// before it can run a handler, and that evaluation is bounded by the run's clock. A
+        /// clock that ran out there used to surface as "could not start a worker", wrapped
+        /// around a handler-timeout message telling the user to raise a rule's `timeout`, which
+        /// governs nothing in that phase. It is the run's budget, and it reads as the run's.
+        ///
+        /// Deterministic rather than raced: the clock handed to `build_sandbox` is spent before
+        /// evaluation starts, and the module's top level runs long enough that the interrupt
+        /// handler is certainly polled. Config load evaluates the same module under its own,
+        /// generous, budget first, so that part only has to finish.
+        #[test]
+        fn a_spent_run_budget_while_evaluating_the_ruleset_names_the_run() {
+            const RULE: &str = "import { defineRule } from 'lanekeep';\n\
+                 let acc = 0;\n\
+                 for (let i = 0; i < 1500000; i++) { acc += i % 7; }\n\
+                 export default defineRule({\n\
+                   id: 'local/top-level',\n\
+                   query: '(debugger_statement) @stmt',\n\
+                   card: { message: 'x', remediation: 'y', examples: { bad: 'a', good: 'b' } },\n\
+                   check(ctx, m) { if (acc < 0) ctx.report(m.stmt); },\n\
+                 });\n";
+            let project = Project::new(
+                "run-budget-in-evaluation",
+                &[
+                    ("rule.ts", RULE),
+                    ("lanekeep.config.ts", &config("")),
+                    ("src/a.ts", MATCHED),
+                ],
+            );
+            let engine = project
+                .prepare_with("lanekeep.config.ts")
+                .expect("config load has the default budget, far above this module's top level");
+
+            let error = engine
+                .build_sandbox(&RunClock::start(Duration::ZERO))
+                .expect_err("a spent run clock cannot cover any evaluation");
+            assert!(
+                !error.to_string().contains("could not start a worker"),
+                "a spent run budget is not a broken worker: {error}"
+            );
+            assert_names_the_run(&error, &["local/top-level", "`timeout` on the rule"]);
+        }
+
+        /// A corpus of `count` files, every one matched by `local/no-debugger` when `matched`.
+        fn many_files(name: &str, count: usize, matched: bool) -> Project {
+            let body = if matched {
+                MATCHED
+            } else {
+                "export const fine = 1;\n"
+            };
+            let mut owned: Vec<(String, String)> = vec![
+                ("rule.ts".to_owned(), DEBUGGER_RULE.to_owned()),
+                ("lanekeep.config.ts".to_owned(), config("")),
+            ];
+            for i in 0..count {
+                owned.push((format!("src/f{i}.ts"), body.to_owned()));
+            }
+            let borrowed: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            Project::new(name, &borrowed)
+        }
+
+        /// #293's third point, and architecture §2's promise: one JavaScript runtime per worker,
+        /// built once per run. Each worker used to be a rayon `map_init` initializer, which
+        /// rayon runs per *chunk*, so every chunk evaluated the whole ruleset again. A 2,000-file
+        /// release run on fourteen threads measured 598 to 877 evaluations, all of them
+        /// concurrent, against a budget that was one wall-clock second at the time.
+        ///
+        /// Structural, not timed: the bound is the pool's size, which the test chooses, so it
+        /// holds at any machine load. It fails against `map_init`, whose chunk count follows
+        /// adaptive splitting rather than the thread count.
+        #[test]
+        fn the_ruleset_is_evaluated_at_most_once_per_pool_thread() {
+            const FILES: usize = 300;
+            let project = many_files("evaluations-per-thread", FILES, true);
+
+            for threads in [2, 4] {
+                let engine = project
+                    .prepare_with("lanekeep.config.ts")
+                    .expect("prepares")
+                    .without_cache();
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("a pool builds");
+                let outcome = pool.install(|| engine.run()).expect("runs");
+                assert_eq!(
+                    outcome.violations.len(),
+                    FILES,
+                    "every file was checked, by whichever thread took it"
+                );
+
+                let evaluations = engine
+                    .evaluations
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    (1..=threads).contains(&evaluations),
+                    "{FILES} files on {threads} threads evaluated the ruleset {evaluations} \
+                     times; at most one per thread is the bound"
+                );
+            }
+        }
+
+        /// And the bound is a ceiling, not a cost: a run whose queries match nothing executes no
+        /// JavaScript, so it evaluates no ruleset at all, as before.
+        #[test]
+        fn a_run_no_query_matches_in_evaluates_no_ruleset() {
+            let project = many_files("evaluations-none", 50, false);
+            let engine = project
+                .prepare_with("lanekeep.config.ts")
+                .expect("prepares")
+                .without_cache();
+            engine.run().expect("runs");
+            assert_eq!(
+                engine
+                    .evaluations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
         }
 
         /// A rule that throws on the one file whose text says `boom`, and nowhere else.

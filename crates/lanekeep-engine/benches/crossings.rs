@@ -414,9 +414,11 @@ fn main() {
 /// over a fourteen-core run divided by a call count is a throughput, and a reader who compared
 /// it against anything they know about either engine would be out by the width of the machine.
 ///
-/// The other is that `rayon`'s `map_init` runs its initializer per *chunk*, and `AGENTS.md`
+/// The other was that `rayon`'s `map_init` runs its initializer per *chunk*, and `AGENTS.md`
 /// records that the chunk count is a distribution rather than a bound — two runs over one
-/// corpus disagree, because rayon splits on how the work is going. Each initializer builds a
+/// corpus disagree, because rayon splits on how the work is going. Since #293 the engine builds
+/// one worker per pool thread instead, which removes that term from a multi-threaded run too;
+/// one thread is kept because the first reason still holds. Each initializer builds a
 /// QuickJS sandbox or a wasmtime store, which is expensive and which does **not** cancel out of
 /// a hot-minus-cold difference: the two corpora have different per-item costs, so they get
 /// different splits. One thread makes that term a constant, which is what a subtraction needs.

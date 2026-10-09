@@ -119,6 +119,12 @@
 //! counts are not even stable between runs of one corpus — rayon splits on how the work is
 //! going — so this is a distribution rather than a bound.
 //!
+//! **That table describes `map_init`, which the engine no longer uses for its workers.** Since
+//! #293, `lanekeep-engine`'s `Engine::check_files` builds one worker per pool thread through
+//! `rayon::broadcast`. The store count is therefore at most the thread count, fourteen in every
+//! row above. The table stays because it is the measurement the reasoning below was re-derived
+//! from, and that reasoning still bounds a worst case the engine no longer reaches.
+//!
 //! **The design is not falsified; the arithmetic behind [`MEMORY_RESERVATION`] is.** The
 //! per-worker cache still works, and it is what keeps the count at workers × components instead
 //! of at files × rules, which would be one hundred thousand for the last row. The table was
@@ -303,7 +309,9 @@ use crate::sourcemap::SourceMap;
 /// rules and **does not grow with the corpus**". The second half is false. A worker is a rayon
 /// `map_init` initializer and `map_init` runs per *chunk*, so the store count is set by adaptive
 /// splitting rather than by the thread count — 1,038 stores and 10,380 instantiations at ten
-/// thousand files times ten rules, against the 140 that figure assumed. The module header has
+/// thousand files times ten rules, against the 140 that figure assumed. (Since #293 a worker is
+/// one per pool thread rather than a `map_init` initializer, so the engine no longer reaches
+/// those counts; the derivation below stands as the worst case.) The module header has
 /// the table.
 ///
 /// **Both terms were therefore re-measured end to end through `lanekeep-engine`**, 2026-08-06,
