@@ -20,11 +20,13 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 const NEXT_LINE: &str = concat!("lanekeep", "-ignore-next-line");
 const WHOLE_FILE: &str = concat!("lanekeep", "-ignore-file");
 
-/// The Vitest `importOriginal` idiom tree-sitter-typescript 0.23.2 misreads, followed by the
-/// expression statement `1`, which turns the root itself into `ERROR` (a following declaration
-/// does not).
+/// The shape of Vitest's `importOriginal<typeof import('vitest')>()` idiom, which upstream
+/// tree-sitter-typescript 0.23.2 misread until lanekeep vendored a grammar that reads it (#286),
+/// with an invalid type argument in its place so it faults for a reason no grammar fix will
+/// remove. Followed by the expression statement `1`, recovery turns the root itself into `ERROR`
+/// (a following declaration does not).
 const REPRO: &str = "hoist('a', async importOriginal => {\n    const actual =\n        \
-                     await importOriginal<typeof import('vitest')>()\n})\n\n1\n";
+                     await importOriginal<typeof await>()\n})\n\n1\n";
 
 const ANCHOR_RULE: &str = "import { defineRule } from 'lanekeep'\n\
     export default defineRule({\n\
@@ -179,6 +181,54 @@ fn a_faulted_file_warns_and_the_run_passes_ts() {
     assert_warns_and_passes(&project);
 }
 
+/// #286's reproduction: TypeScript 5.0's type-only star re-exports and Vitest's
+/// `importOriginal<typeof import('./dep')>()` idiom, each as `.ts` and `.tsx`. Upstream
+/// tree-sitter-typescript 0.23.2 faulted on all eight; the vendored grammar reads them, so the
+/// anchor reaches every file and nothing reports `lanekeep/parse`.
+#[test]
+fn type_only_star_reexports_and_the_vitest_idiom_are_read_whole() {
+    let sources = [
+        ("a", "export type * from './types';\n"),
+        ("b", "export type * as ns from './types';\n"),
+        ("c", "const a = f<typeof import('./dep')>();\n"),
+        (
+            "d.spec",
+            "vi.mock('./dep', async (importOriginal) => {\n  \
+             const actual = await importOriginal<typeof import('./dep')>();\n  \
+             return { ...actual };\n});\n",
+        ),
+        ("e", "type M = typeof import('./dep');\nconst a = f<M>();\n"),
+    ];
+    let mut files = vec![
+        ("rules/anchor.ts".to_owned(), ANCHOR_RULE.to_owned()),
+        (
+            "lanekeep.json".to_owned(),
+            r#"{"include": ["src/**/*.{ts,tsx}"], "rules": ["./rules/anchor.ts"]}"#.to_owned(),
+        ),
+    ];
+    for (stem, source) in sources {
+        for extension in ["ts", "tsx"] {
+            files.push((format!("src/{stem}.{extension}"), source.to_owned()));
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, contents)| (path.as_str(), contents.as_str()))
+        .collect();
+    let project = Project::new("issue-286", &borrowed);
+
+    let (_, json) = project.check_json(&["--no-cache"]);
+    assert!(
+        violations_of(&json, "lanekeep/parse").is_empty(),
+        "{json}"
+    );
+    assert_eq!(
+        violations_of(&json, "local/anchor").len(),
+        sources.len() * 2,
+        "the anchor reaches every file: {json}"
+    );
+}
+
 #[test]
 fn a_python_file_names_its_grammar() {
     let project = Project::new(
@@ -283,7 +333,7 @@ fn the_root_case_is_acknowledged_line_by_line_under_forbid_file_scope() {
     // Under `forbidFileScope` every whole-file directive is itself an error, so the next-line
     // form is the only acknowledgement. It has to land on the line the report names.
     let acknowledged =
-        format!("// {NEXT_LINE} lanekeep/parse reason: tree-sitter-typescript#367\n{REPRO}");
+        format!("// {NEXT_LINE} lanekeep/parse reason: invalid on purpose\n{REPRO}");
     let project = Project::new(
         "forbid-file-scope",
         &[
@@ -304,7 +354,7 @@ fn the_root_case_is_acknowledged_line_by_line_under_forbid_file_scope() {
 #[test]
 fn a_whole_file_acknowledgement_under_require_expiry_still_silences() {
     let acknowledged =
-        format!("// {WHOLE_FILE} lanekeep/parse reason: tree-sitter-typescript#367\n{REPRO}");
+        format!("// {WHOLE_FILE} lanekeep/parse reason: invalid on purpose\n{REPRO}");
     let project = Project::new(
         "require-expiry",
         &[
@@ -334,7 +384,7 @@ fn a_whole_file_acknowledgement_under_require_expiry_still_silences() {
 #[test]
 fn an_acknowledgement_of_an_off_report_is_unused() {
     let acknowledged =
-        format!("// {NEXT_LINE} lanekeep/parse reason: tree-sitter-typescript#367\n{REPRO}");
+        format!("// {NEXT_LINE} lanekeep/parse reason: invalid on purpose\n{REPRO}");
     let project = Project::new(
         "unused-when-off",
         &[
@@ -351,7 +401,7 @@ fn an_acknowledgement_of_an_off_report_is_unused() {
     assert_eq!(unused.len(), 1, "{json}");
     assert_eq!(
         unused[0]["message"],
-        "suppression silenced nothing — \"tree-sitter-typescript#367\""
+        "suppression silenced nothing — \"invalid on purpose\""
     );
 }
 
