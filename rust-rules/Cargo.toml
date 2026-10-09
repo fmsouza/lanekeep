@@ -37,14 +37,16 @@ publish = false
 # Matches the root `Cargo.toml`'s own value, which is what the code these rules ship beside
 # is actually licensed under.
 license = "MIT OR Apache-2.0"
-# Matches the root `Cargo.toml`'s own floor. Nothing here has a stricter requirement of its own,
-# so there is no reason to diverge — and `just msrv` reads this number rather than assuming it
-# equals the root's, then checks this workspace against it. Two separate promises about two
-# separate workspaces, enforced separately, which is why the number is written here at all.
+# Below the root `Cargo.toml`'s floor, deliberately. The root moved 1.94 → 1.95 because
+# `wasmtime` 48 forced it, and nothing in this workspace depends on `wasmtime` — an MSRV moves
+# when a dependency forces it, and here none did. `just msrv` reads this number rather than
+# assuming it equals the root's, then checks this workspace against it. Two separate promises
+# about two separate workspaces, enforced separately, which is why the number is written here
+# at all.
 rust-version = "1.94"
 
 # `[lints] workspace = true` resolves only within one workspace, so the root Cargo.toml's
-# table does not reach here and this is a copy of its `[workspace.lints.*]` (lines 100-132)
+# table does not reach here and this is a copy of its `[workspace.lints.*]` (lines 104-136)
 # rather than a reference. Kept identical on purpose; a divergence is a finding.
 [workspace.lints.rust]
 unsafe_code = "deny"
