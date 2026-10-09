@@ -27,6 +27,7 @@ doc-valid-idents = [
     "TinyGo",
     "DefinitelyTyped",
     "NestJS",
+    "CommonJS",
     "..",
 ]
 
