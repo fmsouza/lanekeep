@@ -82,19 +82,17 @@ impl RustBindingResolver {
             // The header's pattern reaches the whole expression, including the else branch.
             "if_expression" | "while_expression" => scope
                 .child_by_field_name("condition")
-                .filter(|condition| condition.kind() == "let_condition")
-                .and_then(|condition| condition.child_by_field_name("pattern"))
-                .filter(|pattern| pattern_binds(*pattern, source, name))
+                .filter(|condition| condition_binds(*condition, source, name))
                 .map(|_| Binding::Local(BindingKind::Let)),
 
             "for_expression" => scope
                 .child_by_field_name("pattern")
-                .filter(|pattern| pattern_binds(*pattern, source, name))
+                .filter(|pattern| pattern_binds(*pattern, Irrefutable, source, name))
                 .map(|_| Binding::Local(BindingKind::Loop)),
 
             "match_arm" => scope
                 .child_by_field_name("pattern")
-                .filter(|pattern| pattern_binds(*pattern, source, name))
+                .filter(|pattern| pattern_binds(*pattern, Refutable, source, name))
                 .map(|_| Binding::Local(BindingKind::Let)),
 
             // `impl`, `trait` and `mod` hold their items in a `declaration_list`; a bare
@@ -151,10 +149,17 @@ fn declares(node: Node<'_>, source: &str, name: &str) -> Option<Binding> {
     match node.kind() {
         "use_declaration" => use_binds(node, source, name),
 
-        "let_declaration" => node
-            .child_by_field_name("pattern")
-            .filter(|pattern| pattern_binds(*pattern, source, name))
-            .map(|_| Binding::Local(BindingKind::Let)),
+        // `let PAT = v else { .. }` is the one `let` whose pattern may fail to match.
+        "let_declaration" => {
+            let position = if node.child_by_field_name("alternative").is_some() {
+                Refutable
+            } else {
+                Irrefutable
+            };
+            node.child_by_field_name("pattern")
+                .filter(|pattern| pattern_binds(*pattern, position, source, name))
+                .map(|_| Binding::Local(BindingKind::Let))
+        }
 
         // `static` is a variable that outlives everything, which is what `var` says here.
         // `const` has its own kind because Rust draws the same line the word does.
@@ -191,19 +196,62 @@ fn named_binds(node: Node<'_>, source: &str, name: &str) -> bool {
         .is_some_and(|declared| node_text(declared, source) == name)
 }
 
+/// Whether a pattern sits where it may fail to match.
+///
+/// It decides what a bare identifier means. Rust reads `MAX` in a pattern as a path when a
+/// constant, a unit struct or a unit variant of that name is in scope, and as a fresh binding
+/// otherwise — a judgment made by name resolution, which this resolver does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Position {
+    /// `let` without `else`, a parameter, a `for`: a constant here would not compile, so a
+    /// bare name binds. A unit struct would (`let Unit = Unit;`), and is read as a binding —
+    /// a pattern that binds nothing has nothing to resolve to, so the cost is that one name.
+    Irrefutable,
+    /// A match arm, `if let`, `while let`, `let … else`: a bare capitalized name is taken to
+    /// be the constant or variant the lints say it is.
+    Refutable,
+}
+use Position::{Irrefutable, Refutable};
+
 /// Whether a pattern binds `name`.
 ///
 /// The whole of the difficulty in this file. A pattern is a tree that mixes names being bound
-/// with names being *matched against*, and only the first are bindings.
+/// with names being *matched against*, and only the first are bindings. So this is an
+/// allowlist of binding positions, read off `node-types.json` for `tree-sitter-rust` 0.24.2,
+/// and every kind it does not name binds nothing: a path (`Ordering::Less`, `Self::A`), the
+/// path of a tuple-struct or struct pattern, a range's bounds (`0..=MAX`), a literal, `..`,
+/// a `const` block, a macro invocation, an `ERROR` node. It used to descend into anything it
+/// did not name, so `Ordering::Less` in an arm bound `Ordering` for the arm and `0..=MAX`
+/// bound `MAX` — the Rust half of #289, wrong only ever by hiding an import.
+///
 /// There is deliberately no guard for `_` here, unlike the Go resolver. Go's blank identifier
 /// parses as an ordinary `identifier` and has to be excluded by name; Rust's wildcard is not an
-/// identifier at all — `let _ = x` has no `pattern` field, and a `_` match arm is a leaf with no
-/// named children. A guard would be unreachable, and an unreachable guard implies a case that
-/// does not exist.
-fn pattern_binds(pattern: Node<'_>, source: &str, name: &str) -> bool {
+/// identifier at all — it is an anonymous `_` node, which no arm below names.
+fn pattern_binds(pattern: Node<'_>, position: Position, source: &str, name: &str) -> bool {
     match pattern.kind() {
-        // `let Point { x, y } = p` binds both through the shorthand.
-        "identifier" | "shorthand_field_identifier" => node_text(pattern, source) == name,
+        // A bare name. In a refutable position a capitalized one is read as a path, by the
+        // convention `non_snake_case`, `non_upper_case_globals` and `non_camel_case_types`
+        // enforce between them: bindings are snake_case, constants and variants are not. It
+        // is the only reading available without name resolution, and it covers the names no
+        // declaration in the file could settle — `None` from the prelude, `Less` from a glob.
+        "identifier" => {
+            let text = node_text(pattern, source);
+            text == name && (position == Irrefutable || !is_capitalized(text))
+        }
+
+        // `mut x`, `ref x`, `ref mut x` and `x @ sub` admit only a binding, whatever its case.
+        "mut_pattern" | "ref_pattern" => pattern
+            .named_children(&mut pattern.walk())
+            .filter(|child| child.kind() != "mutable_specifier")
+            .any(|child| binding_binds(child, position, source, name)),
+        "captured_pattern" => {
+            let mut cursor = pattern.walk();
+            let mut children = pattern.named_children(&mut cursor);
+            children
+                .next()
+                .is_some_and(|binding| binding_binds(binding, position, source, name))
+                || children.any(|sub| pattern_binds(sub, position, source, name))
+        }
 
         // The constructor being matched is not a binding. `let Some(v) = opt` binds `v`;
         // treating `Some` as a binding makes every constructor in the file resolve to a
@@ -213,15 +261,74 @@ fn pattern_binds(pattern: Node<'_>, source: &str, name: &str) -> bool {
             pattern
                 .named_children(&mut pattern.walk())
                 .filter(|child| Some(child.id()) != constructor)
-                .any(|child| pattern_binds(child, source, name))
+                .any(|child| pattern_binds(child, position, source, name))
         }
 
-        // Every other pattern shape is a container: tuples, slices, references, `or`
-        // alternatives, struct fields, `mut`/`ref` bindings, ranges.
-        _ => pattern
+        // `S { field: pat }` binds through `pat` alone; `S { x }`, `S { ref mut x }` bind
+        // the shorthand, which is always a binding.
+        "field_pattern" => match pattern.child_by_field_name("pattern") {
+            Some(inner) => pattern_binds(inner, position, source, name),
+            None => pattern
+                .child_by_field_name("name")
+                .is_some_and(|field| node_text(field, source) == name),
+        },
+
+        // Containers of further patterns. A match arm's pattern carries its guard beside
+        // them, which is an expression — unless it is an `if let` guard.
+        "tuple_pattern" | "slice_pattern" | "or_pattern" | "reference_pattern" => pattern
             .named_children(&mut pattern.walk())
-            .any(|child| pattern_binds(child, source, name)),
+            .any(|child| pattern_binds(child, position, source, name)),
+        "match_pattern" => {
+            let guard = pattern.child_by_field_name("condition");
+            pattern
+                .named_children(&mut pattern.walk())
+                .any(|child| match guard {
+                    Some(guard) if guard.id() == child.id() => condition_binds(guard, source, name),
+                    _ => pattern_binds(child, position, source, name),
+                })
+        }
+
+        _ => false,
     }
+}
+
+/// The operand of `mut`, `ref` or `@`, where a bare name is a binding in any position.
+fn binding_binds(node: Node<'_>, position: Position, source: &str, name: &str) -> bool {
+    if node.kind() == "identifier" {
+        node_text(node, source) == name
+    } else {
+        pattern_binds(node, position, source, name)
+    }
+}
+
+/// Whether an `if`/`while` condition, or a match guard, binds `name` through a `let` in it.
+///
+/// A plain condition is an expression and binds nothing; `let` chains bind through each `let`.
+fn condition_binds(condition: Node<'_>, source: &str, name: &str) -> bool {
+    let let_binds = |node: Node<'_>| {
+        node.kind() == "let_condition"
+            && node
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern_binds(pattern, Refutable, source, name))
+    };
+    match condition.kind() {
+        "let_condition" => let_binds(condition),
+        "let_chain" => condition
+            .named_children(&mut condition.walk())
+            .any(let_binds),
+        _ => false,
+    }
+}
+
+/// Whether a name is written the way constants, statics, types and variants are.
+///
+/// Leading underscores carry no case: `_unused` is a binding and `__TAG_A` a constant.
+fn is_capitalized(name: &str) -> bool {
+    name.trim_start_matches("r#")
+        .trim_start_matches('_')
+        .chars()
+        .next()
+        .is_some_and(char::is_uppercase)
 }
 
 /// A function's parameters and generics.
@@ -247,11 +354,19 @@ fn generics_bind(scope: Node<'_>, source: &str, name: &str) -> Option<Binding> {
 }
 
 /// Whether a parameter list binds `name`, through any of its patterns.
+///
+/// A function's `parameters` hold `parameter` nodes; a closure's `closure_parameters` hold
+/// a `parameter` only when it is typed, and the bare pattern otherwise — `|x|`,
+/// `|Point { x, .. }|` — which this once skipped, leaving untyped closure parameters unbound.
 fn parameter_list_binds(list: Node<'_>, source: &str, name: &str) -> Option<Binding> {
+    let closure = list.kind() == "closure_parameters";
     list.named_children(&mut list.walk())
-        .filter(|parameter| parameter.kind() == "parameter")
-        .filter_map(|parameter| parameter.child_by_field_name("pattern"))
-        .any(|pattern| pattern_binds(pattern, source, name))
+        .filter_map(|parameter| match parameter.kind() {
+            "parameter" | "variadic_parameter" => parameter.child_by_field_name("pattern"),
+            _ if closure => Some(parameter),
+            _ => None,
+        })
+        .any(|pattern| pattern_binds(pattern, Irrefutable, source, name))
         .then_some(Binding::Local(BindingKind::Param))
 }
 
@@ -619,6 +734,307 @@ mod tests {
                 "w"
             ),
             local(BindingKind::Let)
+        );
+    }
+
+    // --- what a pattern matches against is not what it binds -----------------------------
+    //
+    // A pattern mixes names it binds with names it is compared against: a path, a range
+    // bound, a constant, a guard. Counting the second kind as declarations made every
+    // `Ordering::Less` arm shadow the `Ordering` import for the rest of the arm — the Rust
+    // half of #289.
+
+    #[test]
+    fn a_path_pattern_binds_none_of_its_segments() {
+        let source = "use std::cmp::Ordering;\nfn f(o: Ordering) {\n    match o {\n        Ordering::Less => { let _ = Ordering::Greater; }\n        _ => {}\n    }\n}\n";
+        assert_eq!(
+            resolve_use(source, "Ordering"),
+            Some(imported("std::cmp", "Ordering"))
+        );
+        assert!(!shadowed(source, "Ordering"));
+    }
+
+    #[test]
+    fn a_range_bound_is_read_not_bound() {
+        for source in [
+            "const MAX: u8 = 9;\nfn f(v: u8) {\n    match v {\n        0..=MAX => { let _ = MAX; }\n        _ => {}\n    }\n}\n",
+            "const MAX: u8 = 9;\nfn f(v: u8) {\n    match v {\n        MAX.. => { let _ = MAX; }\n        _ => {}\n    }\n}\n",
+        ] {
+            assert_eq!(
+                resolve_use(source, "MAX"),
+                local(BindingKind::Const),
+                "{source}"
+            );
+            assert!(!shadowed(source, "MAX"), "{source}");
+        }
+        let source = "use limits::{LOW, HIGH};\nfn f(c: u8) {\n    match c {\n        LOW..=HIGH => { let _ = (LOW, HIGH); }\n        _ => {}\n    }\n}\n";
+        assert_eq!(resolve_use(source, "LOW"), Some(imported("limits", "LOW")));
+        assert_eq!(
+            resolve_use(source, "HIGH"),
+            Some(imported("limits", "HIGH"))
+        );
+    }
+
+    #[test]
+    fn a_match_guard_is_an_expression() {
+        // `n if n > LIMIT` binds `n`; the guard reads `LIMIT`.
+        let source = "use config::LIMIT;\nfn f(v: u8) {\n    match v {\n        n if n > LIMIT => { let _ = (n, LIMIT); }\n        _ => {}\n    }\n}\n";
+        assert_eq!(
+            resolve_use(source, "LIMIT"),
+            Some(imported("config", "LIMIT"))
+        );
+        assert_eq!(resolve_use(source, "n"), local(BindingKind::Let));
+    }
+
+    #[test]
+    fn a_tuple_struct_pattern_binds_its_fields_not_its_path() {
+        let source = "fn f(o: Option<u8>) {\n    match o {\n        Some(x) => { let _ = Some(x); }\n        None => {}\n    }\n}\n";
+        assert_eq!(resolve_use(source, "x"), local(BindingKind::Let));
+        assert_eq!(resolve_use(source, "Some"), None);
+        let source = "use std::cmp::Ordering;\nfn f(r: Result<Ordering, ()>) {\n    if let Ok(Ordering::Less) = r { let _ = Ordering::Equal; }\n}\n";
+        assert_eq!(
+            resolve_use(source, "Ordering"),
+            Some(imported("std::cmp", "Ordering"))
+        );
+    }
+
+    #[test]
+    fn a_struct_pattern_binds_the_pattern_beside_a_field_name_not_the_name() {
+        let source = "fn f(s: S) {\n    let S { field: y } = s;\n    let _ = (y, field);\n}\n";
+        assert_eq!(resolve_use(source, "y"), local(BindingKind::Let));
+        assert_eq!(resolve_use(source, "field"), None);
+        let source = "use std::cmp::Ordering;\nfn f(s: S) {\n    let S { order: Ordering::Less, .. } = s else { return };\n    let _ = Ordering::Equal;\n}\n";
+        assert_eq!(
+            resolve_use(source, "Ordering"),
+            Some(imported("std::cmp", "Ordering"))
+        );
+    }
+
+    #[test]
+    fn a_shorthand_field_binds_its_name_however_it_is_qualified() {
+        for source in [
+            "fn f(s: S) {\n    let S { x } = s;\n    let _ = x;\n}\n",
+            "fn f(s: S) {\n    let S { ref mut x } = s;\n    let _ = x;\n}\n",
+            "fn f(s: S) {\n    let S { mut x, .. } = s;\n    let _ = x;\n}\n",
+        ] {
+            assert_eq!(
+                resolve_use(source, "x"),
+                local(BindingKind::Let),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_at_binding_binds_its_name_and_its_subpattern() {
+        let source = "fn f(o: Option<u8>) {\n    match o {\n        whole @ Some(inner) => { let _ = (whole, inner); }\n        _ => {}\n    }\n}\n";
+        assert_eq!(resolve_use(source, "whole"), local(BindingKind::Let));
+        assert_eq!(resolve_use(source, "inner"), local(BindingKind::Let));
+    }
+
+    #[test]
+    fn a_bare_capitalized_name_is_a_constant_or_variant_not_a_binding() {
+        // Rust reads a bare identifier pattern as a path when it names a constant, a unit
+        // struct or a unit variant in scope, and as a fresh binding otherwise. The syntax
+        // alone cannot tell, so the convention every lint enforces decides: bindings are
+        // snake_case, constants and variants are capitalized.
+        let source = "use std::cmp::Ordering::{Less, Greater};\nfn f(o: Ordering) {\n    match o {\n        Less => { let _ = Less; }\n        _ => {}\n    }\n}\n";
+        assert_eq!(
+            resolve_use(source, "Less"),
+            Some(imported("std::cmp::Ordering", "Less"))
+        );
+        assert!(!shadowed(source, "Less"));
+        let source = "const MAX: u8 = 9;\nfn f(v: u8) {\n    match v {\n        MAX => { let _ = MAX; }\n        _ => {}\n    }\n}\n";
+        assert_eq!(resolve_use(source, "MAX"), local(BindingKind::Const));
+        // Leading underscores are not a case: generated code names constants `__TAG_A`.
+        let source = "const __TAG_A: u8 = 0;\nfn f(v: u8) {\n    match v {\n        __TAG_A => { let _ = __TAG_A; }\n        _unused => {}\n    }\n}\n";
+        assert_eq!(resolve_use(source, "__TAG_A"), local(BindingKind::Const));
+        assert_eq!(
+            resolve_use(
+                "fn f(v: u8) {\n    match v { _unused => { let _ = _unused; } }\n}\n",
+                "_unused"
+            ),
+            local(BindingKind::Let)
+        );
+    }
+
+    #[test]
+    fn mut_ref_and_at_always_bind_whatever_the_case() {
+        // These positions admit only a binding, so the convention above does not apply.
+        for (source, name) in [
+            (
+                "fn f(v: u8) {\n    match v {\n        mut Total => { let _ = Total; }\n    }\n}\n",
+                "Total",
+            ),
+            (
+                "fn f(v: u8) {\n    match v {\n        ref Total => { let _ = Total; }\n    }\n}\n",
+                "Total",
+            ),
+            (
+                "fn f(v: u8) {\n    match v {\n        Hit @ 1..=3 => { let _ = Hit; }\n        _ => {}\n    }\n}\n",
+                "Hit",
+            ),
+        ] {
+            assert_eq!(
+                resolve_use(source, name),
+                local(BindingKind::Let),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn if_let_while_let_and_let_else_bind_only_their_bindings() {
+        let use_ordering = "use std::cmp::Ordering;\n";
+        for body in [
+            "fn f(o: Ordering) {\n    if let Ordering::Less = o { let _ = Ordering::Equal; }\n}\n",
+            "fn f(mut it: I) {\n    while let Some(Ordering::Less) = it.next() { let _ = Ordering::Equal; }\n}\n",
+            "fn f(o: Ordering) {\n    let Ordering::Less = o else { return };\n    let _ = Ordering::Equal;\n}\n",
+        ] {
+            let source = format!("{use_ordering}{body}");
+            assert_eq!(
+                resolve_use(&source, "Ordering"),
+                Some(imported("std::cmp", "Ordering")),
+                "{body}"
+            );
+            assert!(!shadowed(&source, "Ordering"), "{body}");
+        }
+        assert_eq!(
+            resolve_use(
+                "fn f(o: Option<u8>) {\n    let Some(v) = o else { return };\n    let _ = v;\n}\n",
+                "v"
+            ),
+            local(BindingKind::Let)
+        );
+    }
+
+    #[test]
+    fn a_let_chain_binds_through_each_let() {
+        let source = "fn f(a: Option<u8>, b: Option<u8>) {\n    if let Some(x) = a && let Some(y) = b { let _ = (x, y); }\n}\n";
+        assert_eq!(resolve_use(source, "x"), local(BindingKind::Let));
+        assert_eq!(resolve_use(source, "y"), local(BindingKind::Let));
+    }
+
+    #[test]
+    fn a_closure_binds_its_untyped_and_destructured_parameters() {
+        for (source, name) in [
+            ("fn f() {\n    let g = |arg| arg + 1;\n}\n", "arg"),
+            ("fn f() {\n    let g = |Point { x, .. }| x + 1;\n}\n", "x"),
+            ("fn f() {\n    let g = |(a, b)| a + b;\n}\n", "b"),
+            (
+                "fn f() {\n    let g = |&(a, b): &(u8, u8)| a + b;\n}\n",
+                "a",
+            ),
+        ] {
+            assert_eq!(
+                resolve_use(source, name),
+                local(BindingKind::Param),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            resolve_use(
+                "struct Point { x: u8 }\nfn f() {\n    let g = |Point { x, .. }| Point { x };\n}\n",
+                "Point"
+            ),
+            local(BindingKind::Type)
+        );
+    }
+
+    #[test]
+    fn a_function_parameter_pattern_binds_only_its_bindings() {
+        let source = "struct Wrapper(u8);\nfn f(Wrapper(inner): Wrapper, &(a, b): &(u8, u8)) {\n    let _ = (inner, a, b, Wrapper(1));\n}\n";
+        assert_eq!(resolve_use(source, "inner"), local(BindingKind::Param));
+        assert_eq!(resolve_use(source, "b"), local(BindingKind::Param));
+        assert_eq!(resolve_use(source, "Wrapper"), local(BindingKind::Type));
+    }
+
+    /// The pattern kinds `pattern_binds` decides about, read off the grammar's declaration.
+    ///
+    /// `pattern_binds` names every kind it binds through and treats the rest as binding
+    /// nothing, so a kind a grammar bump adds would bind nothing in silence. Pinning the
+    /// `_pattern` subtypes and the kinds that hold a pattern here makes that bump fail
+    /// instead, at the place the decision is made.
+    #[test]
+    fn every_pattern_kind_the_grammar_declares_is_decided() {
+        let kinds: Vec<serde_json::Value> =
+            serde_json::from_str(tree_sitter_rust::NODE_TYPES).expect("node-types.json parses");
+        let names = |types: &serde_json::Value| -> Vec<String> {
+            types
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["type"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        let subtypes = kinds
+            .iter()
+            .find(|kind| kind["type"] == "_pattern")
+            .map(|kind| names(&kind["subtypes"]))
+            .expect("the grammar declares `_pattern`");
+        assert_eq!(
+            subtypes,
+            [
+                "_",
+                "_literal_pattern",
+                "captured_pattern",
+                "const_block",
+                "generic_pattern",
+                "identifier",
+                "macro_invocation",
+                "mut_pattern",
+                "or_pattern",
+                "range_pattern",
+                "ref_pattern",
+                "reference_pattern",
+                "remaining_field_pattern",
+                "scoped_identifier",
+                "slice_pattern",
+                "struct_pattern",
+                "tuple_pattern",
+                "tuple_struct_pattern",
+            ],
+            "a new pattern kind: decide in `pattern_binds` whether it binds"
+        );
+
+        let mut holders: Vec<String> = kinds
+            .iter()
+            .filter(|kind| {
+                let in_children = names(&kind["children"]["types"])
+                    .iter()
+                    .any(|t| t == "_pattern");
+                let in_fields = kind["fields"].as_object().is_some_and(|fields| {
+                    fields
+                        .values()
+                        .any(|field| names(&field["types"]).iter().any(|t| t == "_pattern"))
+                });
+                in_children || in_fields
+            })
+            .filter_map(|kind| kind["type"].as_str().map(str::to_owned))
+            .collect();
+        holders.sort();
+        assert_eq!(
+            holders,
+            [
+                "captured_pattern",
+                "closure_parameters",
+                "field_pattern",
+                "for_expression",
+                "let_condition",
+                "let_declaration",
+                "match_pattern",
+                "mut_pattern",
+                "or_pattern",
+                "parameter",
+                "ref_pattern",
+                "reference_pattern",
+                "slice_pattern",
+                "tuple_pattern",
+                "tuple_struct_pattern",
+                "variadic_parameter",
+            ],
+            "a new kind holding a pattern: decide where its pattern binds"
         );
     }
 
