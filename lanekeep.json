@@ -116,6 +116,7 @@
           "crates/lanekeep-lang/build.rs",
           "crates/lanekeep-languages/src/lib.rs",
           "crates/lanekeep-rules/build.rs",
+          "crates/lanekeep-tree-sitter-typescript/build.rs",
           "crates/lanekeep-types-gen/src/lib.rs",
           "crates/lanekeep-types/benches/construction.rs",
           "crates/lanekeep-types/build.rs",
