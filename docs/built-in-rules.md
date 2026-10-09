@@ -161,6 +161,25 @@ Each restriction:
 is deliberate: a restriction is written against what an author types, and resolving first
 would make `lodash/*` fail to match `lodash/merge`.
 
+Every spelling of a dependency whose specifier is static is checked, because a ban that read
+only one of them could be bypassed by respelling the line:
+
+| Spelling | Reported at |
+| --- | --- |
+| `import x from 'm'`, `import type { T } from 'm'`, `import 'm'` | the statement |
+| `export * from 'm'`, `export * as ns from 'm'`, `export { x } from 'm'`, `export type { T } from 'm'` | the statement |
+| `import x = require('m')` | the statement |
+| `require('m')` | the call |
+| `import('m')`, with or without an attributes argument | the call |
+
+`require` and `import()` are checked when the specifier is a string literal or a template
+literal with no substitution. A computed specifier — `import(name)`, `` require(`./${x}`) ``,
+`require(base + '/x')` — cannot be matched against a pattern and is not reported. `require` is
+recognized by name, whatever binds it, so `const require = createRequire(import.meta.url)` is
+covered; a call to `require` with more than one argument is not a module load and is not.
+Type-position imports (`type T = import('m').X`) and calls that name a module without loading
+it (`require.resolve('m')`) are not checked.
+
 An entry in `from` beginning with `!` is a carve-out — the restriction applies everywhere
 *except* there, and a carve-out beats an inclusion. That inversion is what makes "nothing
 may import Stripe outside `packages/payments`" one restriction rather than an enumeration of
