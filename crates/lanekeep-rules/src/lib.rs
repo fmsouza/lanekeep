@@ -793,10 +793,16 @@ mod tests {
         // `no-restricted-imports.ts` was re-recorded again for #291, which widened its query
         // to re-exports, `require` and `import()`. A change to what the rule checks, made on
         // purpose, rather than anything a migration did to it.
+        //
+        // `no-circular-imports`, `no-unused-exports` and `paths.ts` were re-recorded again for
+        // #281, which taught module resolution tsconfig `paths` and `baseUrl`: `paths.ts` gained
+        // `aliasTargets` and an optional fourth argument to `resolveImport`, and the two graph
+        // rules carry its answer from `check` to `reduce` in their facts. A deliberate change
+        // to what the rules do, made long after the migration — not a migration side effect.
         const FROZEN: &[(&str, &str, &[u8])] = &[
             (
                 "rules/no-circular-imports.ts",
-                "9a55c43c16b5e20d490ddd5ac38ee677975b5ee6f78c1cef34f7c64747cc662c",
+                "94137b39cec87def84447ee045d249155ff95049479a70a059c4ef7cfda1bce5",
                 include_bytes!("../rules/no-circular-imports.ts"),
             ),
             (
@@ -811,12 +817,12 @@ mod tests {
             ),
             (
                 "rules/no-unused-exports.ts",
-                "dd34f6b1a528559abc58605e2362011e3030b90b0fdfd1d3e0dd2accc1b5c136",
+                "ccc10e2830124c933197ea85550955c3714346f8edcb1f5499ff6a1b84c54b20",
                 include_bytes!("../rules/no-unused-exports.ts"),
             ),
             (
                 "modules/paths.ts",
-                "92e6793d4d5640229a938b38514863691a63f9bd245a015d6bb581bb49cae65c",
+                "961fd155bd12195b74a12bce9191fb40dafaebd46fa2f5ebad396a18c460f98a",
                 include_bytes!("../modules/paths.ts"),
             ),
         ];
@@ -874,7 +880,7 @@ mod tests {
     /// test proves nothing on the platform where that thing differs.
     #[test]
     fn a_crlf_checkout_still_matches_the_frozen_digest() {
-        const RECORDED: &str = "9a55c43c16b5e20d490ddd5ac38ee677975b5ee6f78c1cef34f7c64747cc662c";
+        const RECORDED: &str = "94137b39cec87def84447ee045d249155ff95049479a70a059c4ef7cfda1bce5";
         let canonical = fold(include_bytes!("../rules/no-circular-imports.ts"));
 
         let mut crlf = Vec::with_capacity(canonical.len());

@@ -84,7 +84,8 @@ impl Corpus {
         corpus
     }
 
-    fn write(&self, path: &str, contents: &str) {
+    /// Write — or rewrite, between two runs over a warm cache — one file of the project.
+    pub(crate) fn write(&self, path: &str, contents: &str) {
         let full = self.dir.join(path);
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).expect("creates parent");

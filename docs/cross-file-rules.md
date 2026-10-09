@@ -128,6 +128,12 @@ check(ctx, m) {
 Use it for the files that are not source: `package.json`, `tsconfig.json`, a generated
 manifest, a codeowners file.
 
+A cross-file rule that needs such a file in `reduce` reads it in `check` and carries what it
+learned in a fact. `lanekeep/paths`' `aliasTargets` is the worked instance: it reads the
+nearest `tsconfig.json` during `check`, emits the paths an aliased import maps to, and
+`resolveImport` picks among them in `reduce` — see
+[`built-in-rules.md`](built-in-rules.md#module-resolution-and-tsconfig-paths).
+
 Reads are **tracked**. Every one is recorded as `(path, content_hash)` and becomes part of
 the cache entry for the file being checked, so editing `package.json` reinvalidates exactly
 the files whose rules read it. That is what lets a rule depend on another file without giving
