@@ -633,14 +633,6 @@ fn combine_queries(rules: &[Prepared]) -> BTreeMap<String, CombinedQuery> {
 }
 
 /// Everything a run needs, built once and shared across workers.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "four independent run modes — caching, reducing, unused reporting, profiling — \
-              every combination of which is meaningful and reachable from the CLI. The lint \
-              is aimed at a type where a pile of bools stands in for a missing enum; these \
-              are orthogonal switches, and an enum over their sixteen combinations would be \
-              strictly worse to read and to set."
-)]
 pub struct Engine {
     rules: Vec<Prepared>,
     /// One multi-pattern query per language, over every rule that declares it.
@@ -2007,25 +1999,7 @@ impl Engine {
             }
         }
 
-        if self.unused_severity.is_enabled() {
-            // A run that skipped the reduce phase cannot know whether a directive naming a
-            // cross-file rule would have fired, so it gives no verdict on one — `--staged` under
-            // `unused: "error"` would otherwise fail on every such directive in the files it saw.
-            let unjudged: Vec<&RuleId> = if self.reducing {
-                Vec::new()
-            } else {
-                self.rules
-                    .iter()
-                    .filter(|rule| rule.spec.has_reduce)
-                    .map(|rule| &rule.spec.id)
-                    .collect()
-            };
-            violations.extend(unused_violations(
-                &directives,
-                self.unused_severity,
-                &unjudged,
-            ));
-        }
+        violations.extend(self.unused_report(&directives));
 
         lanekeep_core::sort(&mut violations);
         Ok(Outcome {
@@ -2035,6 +2009,28 @@ impl Engine {
             timings: self.profiling.then_some(timings),
             dependencies,
         })
+    }
+
+    /// The directives that silenced nothing, at the run's `unused_severity`; none when it is
+    /// `Off`.
+    ///
+    /// A run that skipped the reduce phase cannot know whether a directive naming a cross-file
+    /// rule would have fired, so it gives no verdict on one — `--staged` under
+    /// `unused: "error"` would otherwise fail on every such directive in the files it saw.
+    fn unused_report(&self, directives: &BTreeMap<FilePath, FileDirectives>) -> Vec<Violation> {
+        if !self.unused_severity.is_enabled() {
+            return Vec::new();
+        }
+        let unjudged: Vec<&RuleId> = if self.reducing {
+            Vec::new()
+        } else {
+            self.rules
+                .iter()
+                .filter(|rule| rule.spec.has_reduce)
+                .map(|rule| &rule.spec.id)
+                .collect()
+        };
+        unused_violations(directives, self.unused_severity, &unjudged)
     }
 
     /// Run the reduce phase for every rule that has one.
