@@ -7,7 +7,7 @@
 [![PyPI](https://img.shields.io/pypi/v/lanekeep?label=pypi)](https://pypi.org/project/lanekeep/)
 [![CI](https://github.com/fmsouza/lanekeep/actions/workflows/ci.yml/badge.svg)](https://github.com/fmsouza/lanekeep/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.94-blue.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 
 lanekeep enforces the conventions that live in your team's heads and your reviewers' comments —
 the ones a language model cannot infer from the code it is shown. Every rule is a codified answer
