@@ -6,7 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 # Upstream's license, not the workspace's `MIT OR Apache-2.0`: nearly every byte here is
 # tree-sitter-typescript's, and its authors released it under MIT alone. `LICENSE` is theirs,
-# unchanged.
+# unchanged, from the upstream repository at tag v0.23.2 — the published 0.23.2 crate does not
+# ship one, so `grammar/regenerate.sh` does not touch it.
 license = "MIT"
 repository.workspace = true
 homepage.workspace = true
@@ -34,15 +35,18 @@ include = [
 tree-sitter-language = { workspace = true }
 
 [build-dependencies]
+blake3 = { workspace = true }
 cc = { workspace = true }
 
 [dev-dependencies]
+blake3 = { workspace = true }
+sha2 = { workspace = true }
 tree-sitter = { workspace = true }
 
 [lints]
 workspace = true
 
-# `cc` is used only by `build.rs`, which cargo-machete does not scan.
-# `crates/lanekeep-lang-js/Cargo.toml` carries the same stanza for `blake3`.
+# `cc` and the build-time `blake3` are used only by `build.rs`, which cargo-machete does not
+# scan. `crates/lanekeep-lang-js/Cargo.toml` carries the same stanza for `blake3`.
 [package.metadata.cargo-machete]
-ignored = ["cc"]
+ignored = ["blake3", "cc"]

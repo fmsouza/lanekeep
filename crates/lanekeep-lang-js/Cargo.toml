@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 lanekeep-lang = { workspace = true }
 lanekeep-tree-sitter-typescript = { workspace = true }
 tree-sitter = { workspace = true }
@@ -32,9 +33,10 @@ serde_json = { workspace = true }
 [lints]
 workspace = true
 
-# `blake3` is used only by `build.rs`, which hashes this crate's own `src/` into
-# `analysis_identity`. cargo-machete does not scan build scripts, so it sees a
-# `[build-dependencies]` entry nothing in `src/` or `tests/` references and calls it unused.
-# `crates/lanekeep-types/Cargo.toml` carries the same stanza for the same reason.
+# `blake3` is used both in `src/`, which folds the vendored grammar's digest into
+# `analysis_identity`, and by `build.rs`, which hashes this crate's own `src/` into
+# `analysis_identity`. cargo-machete does not scan build scripts, so it sees the
+# `[build-dependencies]` entry as unused regardless of the `[dependencies]` one satisfying it in
+# `src/`. `crates/lanekeep-lang/Cargo.toml` carries the same stanza for the same reason.
 [package.metadata.cargo-machete]
 ignored = ["blake3"]

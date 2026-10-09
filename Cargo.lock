@@ -1049,7 +1049,9 @@ dependencies = [
 name = "lanekeep-tree-sitter-typescript"
 version = "0.12.0"
 dependencies = [
+ "blake3",
  "cc",
+ "sha2",
  "tree-sitter",
  "tree-sitter-language",
 ]

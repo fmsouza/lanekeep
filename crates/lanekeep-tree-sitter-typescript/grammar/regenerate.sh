@@ -8,8 +8,15 @@
 # patch and the CLI, so it stops there. tree-sitter-cli 0.24.4 reproduces 0.23.2 exactly, both
 # grammars, parser.c and node-types.json alike.
 #
+# Nothing in the crate is touched until both grammars have reproduced and regenerated, so a
+# failure partway leaves the committed tree as it was rather than one new grammar beside an old
+# one. Last, it writes `digests.txt`, which `src/lib.rs`'s
+# `the_committed_grammar_is_the_last_regeneration` checks against the committed files — the
+# two `parser.c` files are left out of diffs, so that test is where a hand edit shows.
+#
 # Not in any gate: it needs the network and a CLI the gate does not install.
 set -euo pipefail
+unset CDPATH
 
 UPSTREAM_VERSION="0.23.2"
 # The checksum `Cargo.lock` recorded for this version while lanekeep depended on it directly.
@@ -81,19 +88,36 @@ for language in typescript tsx; do
     "${upstream}/${language}/src/grammar.json" "${work}/${language}.grammar.json"
   generate "${work}/${language}.grammar.json" "${work}/patched/${language}"
 
-  destination="${crate}/${language}/src"
-  rm -rf "${destination}"
-  mkdir -p "${destination}/tree_sitter"
-  cp "${work}/${language}.grammar.json" "${destination}/grammar.json"
-  cp "${work}/patched/${language}/src/parser.c" "${destination}/parser.c"
-  cp "${work}/patched/${language}/src/node-types.json" "${destination}/node-types.json"
-  cp "${work}/patched/${language}/src/tree_sitter/"*.h "${destination}/tree_sitter/"
+  staged="${work}/staged/${language}/src"
+  mkdir -p "${staged}/tree_sitter"
+  cp "${work}/${language}.grammar.json" "${staged}/grammar.json"
+  cp "${work}/patched/${language}/src/parser.c" "${staged}/parser.c"
+  cp "${work}/patched/${language}/src/node-types.json" "${staged}/node-types.json"
+  cp "${work}/patched/${language}/src/tree_sitter/"*.h "${staged}/tree_sitter/"
   # The external scanner's entry points carry the grammar's name, so they follow the rename.
   sed "s/tree_sitter_${language}_external_scanner/tree_sitter_lanekeep_${language}_external_scanner/g" \
-    "${upstream}/${language}/src/scanner.c" >"${destination}/scanner.c"
+    "${upstream}/${language}/src/scanner.c" >"${staged}/scanner.c"
 done
 
+for language in typescript tsx; do
+  rm -rf "${crate:?}/${language}/src"
+  mkdir -p "${crate}/${language}"
+  cp -R "${work}/staged/${language}/src" "${crate}/${language}/src"
+done
 mkdir -p "${crate}/common"
 cp "${upstream}/common/scanner.h" "${crate}/common/scanner.h"
+
+# Sorted with LC_ALL=C so the manifest does not depend on the locale it was written under.
+manifest="${crate}/grammar/digests.txt"
+{
+  echo "# Written by grammar/regenerate.sh. Checked by src/lib.rs; do not edit by hand."
+  (
+    cd "${crate}"
+    find common grammar/patch.py typescript/src tsx/src -type f | LC_ALL=C sort |
+      while IFS= read -r file; do
+        echo "$(sha256 "${file}")  ${file}"
+      done
+  )
+} >"${manifest}"
 
 echo "regenerated ${crate}/typescript and ${crate}/tsx from tree-sitter-typescript ${UPSTREAM_VERSION}"

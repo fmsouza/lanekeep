@@ -81,11 +81,32 @@ static OBLIGATION: std::sync::LazyLock<Arc<dyn ObligationAnalyzer>> =
 ///
 /// Shared by every language this crate registers, which is correct — they share one resolver,
 /// so a change to it changes what all of them answer.
+///
+/// It also folds [`lanekeep_tree_sitter_typescript::SOURCE_DIGEST`], the bytes the TypeScript
+/// and TSX parsers are compiled from. The grammar term of the cache key reads only a grammar's
+/// shape, and a regeneration of the vendored grammar can change the parse tables — and so every
+/// tree — without changing the shape. JavaScript is over-invalidated by it, which costs a
+/// recompute.
 #[must_use]
 pub fn analysis_identity() -> [u8; 32] {
+    *IDENTITY
+}
+
+static IDENTITY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
     // Written by `build.rs`, which walks `src/` so that a file added but not listed cannot be
     // a silent gap.
-    lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_JS_ANALYSIS_HASH"))
+    let own = lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_JS_ANALYSIS_HASH"));
+    fold_identity(&own, lanekeep_tree_sitter_typescript::SOURCE_DIGEST)
+});
+
+/// This crate's own source digest and the vendored grammar's, length-prefixed together.
+fn fold_identity(own: &[u8; 32], grammar_sources: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lanekeep-lang-js-analysis-with-grammar-v1");
+    hasher.update(own);
+    hasher.update(&(grammar_sources.len() as u64).to_le_bytes());
+    hasher.update(grammar_sources.as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 /// TypeScript without JSX: `.ts`, `.mts`, `.cts`.
@@ -477,6 +498,23 @@ mod tests {
                 "{name}: {sexp}"
             );
         }
+    }
+
+    /// The grammar key folds a grammar's shape — node kinds, fields, counts — and a regeneration
+    /// that changes only the parse tables moves none of it, so a warm cache would replay trees
+    /// the shipped grammar no longer builds. For the vendored TypeScript grammars the bytes are
+    /// in this workspace, so the identity folds them.
+    #[test]
+    fn the_analysis_identity_folds_the_vendored_grammar_sources() {
+        let own = lanekeep_lang::decode_hex32(env!("LANEKEEP_LANG_JS_ANALYSIS_HASH"));
+        let sources = lanekeep_tree_sitter_typescript::SOURCE_DIGEST;
+        assert_eq!(analysis_identity(), fold_identity(&own, sources));
+        assert_ne!(
+            fold_identity(&own, sources),
+            fold_identity(&own, &"0".repeat(sources.len())),
+            "the grammar sources reach the identity"
+        );
+        assert_ne!(analysis_identity(), own);
     }
 
     #[test]

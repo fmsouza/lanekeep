@@ -182,9 +182,10 @@ fn a_faulted_file_warns_and_the_run_passes_ts() {
 }
 
 /// #286's reproduction: TypeScript 5.0's type-only star re-exports and Vitest's
-/// `importOriginal<typeof import('./dep')>()` idiom, each as `.ts` and `.tsx`. Upstream
-/// tree-sitter-typescript 0.23.2 faulted on all eight; the vendored grammar reads them, so the
-/// anchor reaches every file and nothing reports `lanekeep/parse`.
+/// `importOriginal<typeof import('./dep')>()` idiom, each as `.ts` and `.tsx`, beside the issue's
+/// control — the same type through an alias. Upstream tree-sitter-typescript 0.23.2 faulted on
+/// all eight non-control files; the vendored grammar reads them, so the anchor reaches all ten
+/// and nothing reports `lanekeep/parse`.
 #[test]
 fn type_only_star_reexports_and_the_vitest_idiom_are_read_whole() {
     let sources = [

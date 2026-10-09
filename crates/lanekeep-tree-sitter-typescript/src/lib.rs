@@ -57,6 +57,13 @@ pub const TYPESCRIPT_NODE_TYPES: &str = include_str!("../typescript/src/node-typ
 /// The TSX grammar's `node-types.json`.
 pub const TSX_NODE_TYPES: &str = include_str!("../tsx/src/node-types.json");
 
+/// A blake3 digest, as lowercase hex, of every file the two parsers are compiled from.
+///
+/// A cache key input: `lanekeep-lang-js` folds it into its `analysis_identity`, because the
+/// grammar term of the key reads only a grammar's shape and a regeneration can change the parse
+/// tables without changing the shape.
+pub const SOURCE_DIGEST: &str = env!("LANEKEEP_TREE_SITTER_TYPESCRIPT_SOURCE_HASH");
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +74,97 @@ mod tests {
             .set_language(&language.into())
             .expect("grammar loads");
         parser.parse(source, None).expect("parser returns a tree")
+    }
+
+    /// Every file `build.rs` compiles or includes, in its order and framing. Restated rather
+    /// than shared, so a file added to the build and not to the digest fails here.
+    #[test]
+    fn the_source_digest_covers_every_compiled_input() {
+        let inputs: [(&str, &[u8]); 11] = [
+            ("common/scanner.h", include_bytes!("../common/scanner.h")),
+            ("tsx/src/parser.c", include_bytes!("../tsx/src/parser.c")),
+            ("tsx/src/scanner.c", include_bytes!("../tsx/src/scanner.c")),
+            (
+                "tsx/src/tree_sitter/alloc.h",
+                include_bytes!("../tsx/src/tree_sitter/alloc.h"),
+            ),
+            (
+                "tsx/src/tree_sitter/array.h",
+                include_bytes!("../tsx/src/tree_sitter/array.h"),
+            ),
+            (
+                "tsx/src/tree_sitter/parser.h",
+                include_bytes!("../tsx/src/tree_sitter/parser.h"),
+            ),
+            (
+                "typescript/src/parser.c",
+                include_bytes!("../typescript/src/parser.c"),
+            ),
+            (
+                "typescript/src/scanner.c",
+                include_bytes!("../typescript/src/scanner.c"),
+            ),
+            (
+                "typescript/src/tree_sitter/alloc.h",
+                include_bytes!("../typescript/src/tree_sitter/alloc.h"),
+            ),
+            (
+                "typescript/src/tree_sitter/array.h",
+                include_bytes!("../typescript/src/tree_sitter/array.h"),
+            ),
+            (
+                "typescript/src/tree_sitter/parser.h",
+                include_bytes!("../typescript/src/tree_sitter/parser.h"),
+            ),
+        ];
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"lanekeep-tree-sitter-typescript-sources-v1");
+        for (path, bytes) in inputs {
+            hasher.update(&(path.len() as u64).to_le_bytes());
+            hasher.update(path.as_bytes());
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        assert_eq!(SOURCE_DIGEST, hasher.finalize().to_hex().as_str());
+    }
+
+    /// `grammar/digests.txt` is what `regenerate.sh` last wrote. A file edited by hand, or a
+    /// `patch.py` edited without regenerating, disagrees with it — and since the two `parser.c`
+    /// files are 8 MB each and left out of diffs, this is where such an edit shows.
+    #[test]
+    fn the_committed_grammar_is_the_last_regeneration() {
+        use sha2::Digest as _;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::fs::read_to_string(root.join("grammar/digests.txt"))
+            .expect("grammar/digests.txt exists");
+        let mut listed = Vec::new();
+        for line in manifest.lines().filter(|line| !line.starts_with('#')) {
+            let (digest, path) = line.split_once("  ").expect("`<sha256>  <path>`");
+            let bytes = std::fs::read(root.join(path)).expect("a listed file exists");
+            let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+            assert_eq!(
+                actual, digest,
+                "{path} is not what `just typescript-grammar` last wrote — regenerate it rather \
+                 than editing it"
+            );
+            listed.push(path.to_owned());
+        }
+        let mut expected = vec!["common/scanner.h".to_owned(), "grammar/patch.py".to_owned()];
+        for language in ["tsx", "typescript"] {
+            for file in [
+                "grammar.json",
+                "node-types.json",
+                "parser.c",
+                "scanner.c",
+                "tree_sitter/alloc.h",
+                "tree_sitter/array.h",
+                "tree_sitter/parser.h",
+            ] {
+                expected.push(format!("{language}/src/{file}"));
+            }
+        }
+        expected.sort();
+        assert_eq!(listed, expected, "the manifest covers every generated file");
     }
 
     #[test]

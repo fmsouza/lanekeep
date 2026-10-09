@@ -791,7 +791,9 @@ Three things people get wrong here, all of which are silent-staleness bugs:
   `Language::metadata()` is `None` on any grammar built for an ABI below 15, which today is
   both `typescript` and `tsx`. Not its bytes either, which tree-sitter's Rust API does not
   expose — so a regeneration preserving every name and count is the one change this term
-  still cannot see.
+  still cannot see. For `typescript` and `tsx` that gap is closed elsewhere: their parsers are
+  vendored (`crates/lanekeep-tree-sitter-typescript`), and a digest of the C they are compiled
+  from is folded into `lanekeep-lang-js`'s `analysis_identity`.
 
 Suppressions live in the entry because directives are parsed during the per-file pass, and a reduce-phase violation may be reported at a site in a file that was not reprocessed this run. An entry without them would drop the directive and report a suppressed violation on the warm path.
 
