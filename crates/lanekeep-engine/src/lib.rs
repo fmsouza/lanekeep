@@ -1924,7 +1924,10 @@ impl Engine {
 
     /// The shared body of [`Engine::run`] and [`Engine::run_over`].
     fn run_files(&self, files: &[FilePath], coverage: Coverage) -> Result<Outcome, RunError> {
-        let clock = RunClock::start(self.limits.global_timeout);
+        // Every file the run was handed, cache hits included, so a cold and a warm run over
+        // identical input get one budget: the default grows with the corpus, and an explicit
+        // budget does not (#290, architecture §6.7).
+        let clock = RunClock::start(self.limits.run_budget(files.len()));
 
         // Loaded once, before any worker starts. Shared read-only across the pool: a cache
         // that workers wrote to concurrently would need a lock on the hot path, and the
@@ -10390,6 +10393,51 @@ export default defineRule({
 
             let outcome = project.run_cold().expect("a minute is ample");
             assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+        }
+
+        /// The matchless corpus's engine with its run budget reduced to a zero floor and
+        /// `per_file` for each file — limits no config can say, since an explicit budget
+        /// carries no allowance, so they are set on the engine directly. The project is
+        /// returned beside it because dropping it deletes the corpus.
+        fn zero_floor(name: &str, per_file: Duration) -> (Project, Engine) {
+            let project = matchless_corpus(name, 60_000);
+            let mut engine = project
+                .build()
+                .map(Engine::without_cache)
+                .expect("prepares");
+            engine.limits = Limits {
+                global_timeout: Duration::ZERO,
+                global_timeout_per_file: per_file,
+                ..engine.limits
+            };
+            (project, engine)
+        }
+
+        #[test]
+        fn the_run_budget_grows_with_the_files_the_run_is_given() {
+            // #290. A zero floor alone is spent before the first file, as the case above
+            // shows; with an allowance per file the same run has a budget, and completes. If
+            // `run_files` started its clock from `global_timeout` rather than from
+            // `run_budget`, this would be stopped exactly like its control below.
+            let (_project, engine) = zero_floor("run-budget-per-file", Duration::from_hours(1));
+
+            let outcome = engine
+                .run()
+                .expect("an hour per file is ample, whatever the floor");
+            assert_eq!(outcome.files_discovered, FILES, "the corpus has to have been there");
+            assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+        }
+
+        #[test]
+        fn the_same_zero_floor_with_no_allowance_is_stopped() {
+            // The control: the allowance, and nothing else about the fixture, is what lets
+            // the case above finish.
+            let (_project, engine) = zero_floor("run-budget-no-allowance", Duration::ZERO);
+
+            let error = engine
+                .run()
+                .expect_err("a zero budget with no allowance is spent before the first file");
+            assert!(matches!(error, RunError::RunTimeout { .. }), "{error}");
         }
 
         /// A rule whose handler burns bytecode for seconds, with a rule budget it cannot reach.
