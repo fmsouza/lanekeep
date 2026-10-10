@@ -412,8 +412,9 @@ module exports it.
 **`undefined` produces false negatives and never false positives.** The oracle would rather say
 nothing than accuse code it could not read, so a value it cannot type is never reported — even
 when the name matches and the value really is a raw `number`. That silence is bounded by what
-the oracle can read: the parsed file, and the declaration files its imports resolve to — no
-`tsconfig.json`, no path mapping, no compiler. "No violations" from this rule is a narrower
+the oracle can read: the parsed file, and the declaration files its imports resolve to — relative,
+through `node_modules`, or through the nearest `tsconfig.json`'s `paths` and `baseUrl` — with
+no compiler. "No violations" from this rule is a narrower
 claim than "every governed value conforms," and a reader who conflates the two is trusting a
 report that never looked.
 
@@ -576,8 +577,9 @@ positive is the one failure this design forbids.
 
 The rule declares `requires: ['types']`, which is what puts `ctx.types` on its context at all —
 see [`architecture.md`](architecture.md) §6.10. Everything it can say is bounded by what the
-oracle can read: the parsed file, and the declaration files its imports resolve to — no
-`tsconfig.json`, no path mapping, no compiler. A clean run means the governed positions this
+oracle can read: the parsed file, and the declaration files its imports resolve to — relative,
+through `node_modules`, or through the nearest `tsconfig.json`'s `paths` and `baseUrl` — with
+no compiler. A clean run means the governed positions this
 rule could type were fine, which is a narrower claim than "no forbidden value reaches that
 callee".
 
@@ -1414,6 +1416,11 @@ What is not: a package-name `extends` (`@tsconfig/node20`), `jsconfig.json`, `ro
 anything in `node_modules`. A `tsconfig.json` that is not valid JSON cancels the run with an
 error naming it, rather than leaving every aliased import silently unresolved. The three-argument
 `resolveImport(fromFile, specifier, files)` keeps its old meaning: relative specifiers only.
+
+The builtin type provider behind `ctx.types` resolves the same aliases the same way, from its
+own copy in Rust, so a value imported through `~/money` is typed as one imported through
+`./money` is. Where the two differ is written down in
+[`type-aware-rules.md`](type-aware-rules.md#tsconfig-paths-and-baseurl).
 
 ---
 

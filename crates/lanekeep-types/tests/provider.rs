@@ -4003,3 +4003,626 @@ fn a_tsx_file_is_unread_without_a_tsx_grammar_whatever_its_parse() {
         "the nameless arm agrees"
     );
 }
+
+// --- tsconfig `paths` and `baseUrl` (#281) -------------------------------------------------
+//
+// A bare specifier is tried against the nearest `tsconfig.json`'s `paths`, then its `baseUrl`,
+// and only then against `node_modules` — TypeScript's own order. Each candidate a substitution
+// produces is probed exactly as a relative specifier is.
+
+/// Resolve `specifier` from `from` in a project built of `files`.
+fn resolve_in(test: &str, files: &[(&str, &str)], from: &str, specifier: &str) -> Option<String> {
+    let project = Project::new(test, files);
+    let access = project.files();
+    resolve_specifier(&access, &FilePath::new(from), specifier).map(|f| f.as_str().to_owned())
+}
+
+#[test]
+fn a_paths_wildcard_resolves_a_bare_specifier() {
+    assert_eq!(
+        resolve_in(
+            "paths-wildcard",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": ".", "paths": {"~/*": ["src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", "export const rate = 1;\n"),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        Some("src/money.ts".to_owned())
+    );
+}
+
+/// The emitted-JavaScript spelling works through an alias as it does relatively.
+#[test]
+fn an_aliased_specifier_naming_the_emitted_javascript_reaches_the_source() {
+    assert_eq!(
+        resolve_in(
+            "paths-js-spelling",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"~/*": ["./src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", "export const rate = 1;\n"),
+            ],
+            "src/a.ts",
+            "~/money.js",
+        ),
+        Some("src/money.ts".to_owned())
+    );
+}
+
+#[test]
+fn an_exact_paths_key_wins_over_a_wildcard() {
+    assert_eq!(
+        resolve_in(
+            "paths-exact",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": ".", "paths": {"~/*": ["src/*"], "~/money": ["exact/money"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+                ("exact/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        Some("exact/money.ts".to_owned())
+    );
+}
+
+#[test]
+fn the_longest_matching_prefix_wins() {
+    assert_eq!(
+        resolve_in(
+            "paths-longest",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": ".", "paths": {"~/*": ["src/*"], "~/lib/*": ["lib/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/lib/money.ts", ""),
+                ("lib/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/lib/money",
+        ),
+        Some("lib/money.ts".to_owned())
+    );
+}
+
+/// Substitutions are tried in order, and the first that names a file wins.
+///
+/// Both halves: with only the second present it is the answer, and with both present the
+/// first is — which an implementation trying them in reverse would get wrong.
+#[test]
+fn the_first_substitution_that_exists_wins() {
+    let config = r#"{"compilerOptions": {"baseUrl": ".", "paths": {"~/*": ["gen/*", "src/*"]}}}"#;
+    assert_eq!(
+        resolve_in(
+            "paths-fallback-second",
+            &[
+                ("tsconfig.json", config),
+                ("src/a.ts", ""),
+                ("src/money.ts", "")
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        Some("src/money.ts".to_owned())
+    );
+    assert_eq!(
+        resolve_in(
+            "paths-fallback-first",
+            &[
+                ("tsconfig.json", config),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+                ("gen/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        Some("gen/money.ts".to_owned())
+    );
+}
+
+/// A substitution naming a TypeScript file is tried as written.
+#[test]
+fn a_substitution_naming_a_file_resolves_as_written() {
+    assert_eq!(
+        resolve_in(
+            "paths-as-written",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"@app": ["./src/main.ts"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/main.ts", ""),
+            ],
+            "src/a.ts",
+            "@app",
+        ),
+        Some("src/main.ts".to_owned())
+    );
+}
+
+/// `<baseUrl>/<specifier>` is a candidate on its own, and it comes before `node_modules`.
+#[test]
+fn a_base_url_candidate_comes_before_node_modules() {
+    assert_eq!(
+        resolve_in(
+            "base-url-alone",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": "src"}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+                ("node_modules/money/index.d.ts", ""),
+            ],
+            "src/a.ts",
+            "money",
+        ),
+        Some("src/money.ts".to_owned())
+    );
+}
+
+/// Without a `baseUrl`, substitutions are relative to the config that declared `paths`.
+#[test]
+fn paths_without_base_url_resolve_against_the_config_directory() {
+    assert_eq!(
+        resolve_in(
+            "paths-no-base-url",
+            &[
+                (
+                    "app/tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"~/*": ["./src/*"]}}}"#
+                ),
+                ("app/src/a.ts", ""),
+                ("app/src/money.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "app/src/a.ts",
+            "~/money",
+        ),
+        Some("app/src/money.ts".to_owned())
+    );
+}
+
+/// `paths` inherited through a relative `extends` resolve against the base's own directory.
+#[test]
+fn paths_from_an_extended_config_resolve_against_its_own_directory() {
+    assert_eq!(
+        resolve_in(
+            "paths-extends",
+            &[
+                ("tsconfig.json", r#"{"extends": "./config/base"}"#),
+                (
+                    "config/base.json",
+                    r#"{"compilerOptions": {"paths": {"~/*": ["../src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        Some("src/money.ts".to_owned())
+    );
+}
+
+/// An extending config's `paths` replaces its base's wholesale, as TypeScript merges it.
+#[test]
+fn an_extending_config_replaces_the_base_paths_wholesale() {
+    assert_eq!(
+        resolve_in(
+            "paths-extends-replace",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"extends": ["./base.json"], "compilerOptions": {"paths": {"~/*": ["src/*"]}}}"#
+                ),
+                (
+                    "base.json",
+                    r#"{"compilerOptions": {"paths": {"@b/*": ["src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "src/a.ts",
+            "@b/money",
+        ),
+        None
+    );
+}
+
+/// A cycle in `extends` stops at the repeat rather than recursing.
+#[test]
+fn an_extends_cycle_terminates() {
+    assert_eq!(
+        resolve_in(
+            "paths-extends-cycle",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"extends": "./base.json", "compilerOptions": {"baseUrl": "."}}"#
+                ),
+                (
+                    "base.json",
+                    r#"{"extends": "./tsconfig.json", "compilerOptions": {"paths": {"~/*": ["src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        Some("src/money.ts".to_owned())
+    );
+}
+
+/// The `tsconfig.json` nearest the importing file governs it, not the root's.
+#[test]
+fn the_nearest_tsconfig_wins() {
+    assert_eq!(
+        resolve_in(
+            "paths-nearest",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": ".", "paths": {"~/*": ["src/*"]}}}"#
+                ),
+                (
+                    "apps/web/tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"~/*": ["./lib/*"]}}}"#
+                ),
+                ("apps/web/a.ts", ""),
+                ("apps/web/lib/money.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "apps/web/a.ts",
+            "~/money",
+        ),
+        Some("apps/web/lib/money.ts".to_owned())
+    );
+}
+
+/// What `tsc` accepts: a byte-order mark, both comment forms, trailing commas, and a `//`
+/// inside a string that is not a comment.
+#[test]
+fn a_jsonc_tsconfig_is_read() {
+    let config = "\u{feff}{\n  \"$schema\": \"https://json.schemastore.org/tsconfig\",\n  // aliases\n  \"compilerOptions\": {\n    /* the root */ \"baseUrl\": \".\",\n    \"paths\": { \"~/*\": [\"src/*\",], },\n  },\n}\n";
+    assert_eq!(
+        resolve_in(
+            "paths-jsonc",
+            &[
+                ("tsconfig.json", config),
+                ("src/a.ts", ""),
+                ("src/money.ts", "")
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        Some("src/money.ts".to_owned())
+    );
+}
+
+/// An alias wins over an installed package of the same name, as it does in TypeScript.
+#[test]
+fn an_alias_shadows_a_package_of_the_same_name() {
+    assert_eq!(
+        resolve_in(
+            "paths-shadow",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"money": ["./src/money"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+                ("node_modules/money/index.d.ts", ""),
+            ],
+            "src/a.ts",
+            "money",
+        ),
+        Some("src/money.ts".to_owned())
+    );
+}
+
+/// A bare name no alias maps, under a `baseUrl` that names nothing for it, still reaches
+/// `node_modules` — the ordinary package import in a project that sets `baseUrl`.
+#[test]
+fn an_unmatched_bare_specifier_still_reaches_node_modules() {
+    assert_eq!(
+        resolve_in(
+            "paths-unmatched",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": ".", "paths": {"~/*": ["src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("node_modules/money/index.d.ts", ""),
+            ],
+            "src/a.ts",
+            "money",
+        ),
+        Some("node_modules/money/index.d.ts".to_owned())
+    );
+}
+
+/// A tsconfig that cannot be read answers nothing for a bare specifier — not the package of
+/// the same name, which the config, had it parsed, might have mapped somewhere else entirely.
+/// A relative specifier needs no tsconfig and is unaffected.
+#[test]
+fn an_unreadable_tsconfig_answers_nothing_for_a_bare_specifier() {
+    let project = Project::new(
+        "paths-unreadable",
+        &[
+            ("tsconfig.json", "{ \"compilerOptions\": { "),
+            ("src/a.ts", ""),
+            ("src/money.ts", ""),
+            ("node_modules/money/index.d.ts", ""),
+        ],
+    );
+    let files = project.files();
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/a.ts"), "money"),
+        None
+    );
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/a.ts"), "./money"),
+        Some(FilePath::new("src/money.ts"))
+    );
+}
+
+/// So is an unreadable link of the `extends` chain.
+#[test]
+fn an_unreadable_extended_config_answers_nothing_for_a_bare_specifier() {
+    assert_eq!(
+        resolve_in(
+            "paths-unreadable-base",
+            &[
+                ("tsconfig.json", r#"{"extends": "./base.json"}"#),
+                ("base.json", "[1, 2"),
+                ("src/a.ts", ""),
+                ("node_modules/money/index.d.ts", ""),
+            ],
+            "src/a.ts",
+            "money",
+        ),
+        None
+    );
+}
+
+/// A package's own declaration files resolve their bare imports through `node_modules` only:
+/// the project's aliases are not the package's, and the walk does not look for a tsconfig.
+#[test]
+fn a_file_under_node_modules_ignores_the_project_tsconfig() {
+    let project = Project::new(
+        "paths-node-modules",
+        &[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions": {"paths": {"dep": ["./src/dep"]}}}"#,
+            ),
+            ("src/dep.ts", ""),
+            ("node_modules/money/index.d.ts", ""),
+            ("node_modules/dep/index.d.ts", ""),
+        ],
+    );
+    let files = project.files();
+    assert_eq!(
+        resolve_specifier(
+            &files,
+            &FilePath::new("node_modules/money/index.d.ts"),
+            "dep"
+        ),
+        Some(FilePath::new("node_modules/dep/index.d.ts"))
+    );
+    assert!(
+        files
+            .dependencies()
+            .iter()
+            .all(|read| !read.path.as_str().ends_with("tsconfig.json")),
+        "no tsconfig was looked for: {:?}",
+        files.dependencies()
+    );
+}
+
+/// Every tsconfig probe is a tracked read — the one found and each one looked for and not —
+/// and a relative specifier makes none.
+///
+/// This is the half of #281 the cache stands on: editing `paths`, or adding a nearer config,
+/// can only invalidate a file that recorded reading them.
+#[test]
+fn every_tsconfig_probe_is_recorded() {
+    let project = Project::new(
+        "paths-recorded",
+        &[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions": {"paths": {"~/*": ["./src/*"]}}}"#,
+            ),
+            ("src/deep/a.ts", ""),
+            ("src/money.ts", ""),
+        ],
+    );
+    let files = project.files();
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/deep/a.ts"), "../money"),
+        Some(FilePath::new("src/money.ts"))
+    );
+    assert!(
+        files
+            .dependencies()
+            .iter()
+            .all(|read| !read.path.as_str().ends_with("tsconfig.json")),
+        "a relative specifier consults no tsconfig"
+    );
+
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/deep/a.ts"), "~/money"),
+        Some(FilePath::new("src/money.ts"))
+    );
+    let tsconfigs: Vec<(String, bool)> = files
+        .dependencies()
+        .into_iter()
+        .filter(|read| read.path.as_str().ends_with("tsconfig.json"))
+        .map(|read| (read.path.as_str().to_owned(), read.hash().is_some()))
+        .collect();
+    assert_eq!(
+        tsconfigs,
+        vec![
+            ("src/deep/tsconfig.json".to_owned(), false),
+            ("src/tsconfig.json".to_owned(), false),
+            ("tsconfig.json".to_owned(), true),
+        ]
+    );
+}
+
+/// An `extends` target is a tracked read too, so editing the base invalidates.
+#[test]
+fn an_extended_config_is_recorded() {
+    let project = Project::new(
+        "paths-extends-recorded",
+        &[
+            ("tsconfig.json", r#"{"extends": "./base"}"#),
+            (
+                "base.json",
+                r#"{"compilerOptions": {"paths": {"~/*": ["./src/*"]}}}"#,
+            ),
+            ("src/a.ts", ""),
+            ("src/money.ts", ""),
+        ],
+    );
+    let files = project.files();
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/a.ts"), "~/money"),
+        Some(FilePath::new("src/money.ts"))
+    );
+    let recorded: Vec<(String, bool)> = files
+        .dependencies()
+        .into_iter()
+        .filter(|read| read.path.as_str().starts_with("base"))
+        .map(|read| (read.path.as_str().to_owned(), read.hash().is_some()))
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![("base".to_owned(), false), ("base.json".to_owned(), true)],
+        "as written first, then with `.json` — TypeScript's order, each one a dependency"
+    );
+}
+
+/// A `baseUrl` above the root is not the same as no `baseUrl`.
+///
+/// `tsc` resolves `@ui/x` against `<root>/../ui/x`, which this provider cannot read. Treating
+/// the out-of-root `baseUrl` as unset instead rebased the substitution onto the config's own
+/// directory and answered `<root>/ui/x.ts` — a file `tsc` never reaches, and so a confidently
+/// wrong type. The decoy at `ui/x.ts` is what makes that mistake observable.
+#[test]
+fn a_base_url_above_the_root_does_not_rebase_paths_onto_the_config_directory() {
+    assert_eq!(
+        resolve_in(
+            "paths-escape-rebase",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": "..", "paths": {"@ui/*": ["ui/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("ui/x.ts", ""),
+            ],
+            "src/a.ts",
+            "@ui/x",
+        ),
+        None
+    );
+}
+
+/// A substitution that resolves above the root stops the resolution there.
+///
+/// `tsc` tries `../outside/money` before `src/money`, and if it exists there that is the
+/// answer — which this provider cannot see. Going on to `src/money.ts` would answer with a file
+/// `tsc` may never have reached; answering nothing is the honest result.
+#[test]
+fn a_substitution_above_the_root_stops_before_later_ones() {
+    assert_eq!(
+        resolve_in(
+            "paths-escape-order",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"~/*": ["../outside/*", "./src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        None
+    );
+}
+
+/// And an out-of-root `baseUrl` still overrides an inherited in-root one, as any `baseUrl`
+/// an extending config declares does.
+#[test]
+fn an_out_of_root_base_url_overrides_an_inherited_one() {
+    assert_eq!(
+        resolve_in(
+            "paths-escape-override",
+            &[
+                ("base.json", r#"{"compilerOptions": {"baseUrl": "."}}"#),
+                (
+                    "tsconfig.json",
+                    r#"{"extends": "./base.json", "compilerOptions": {"baseUrl": "..", "paths": {"~/*": ["src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        None
+    );
+}
+
+/// A `baseUrl` or substitution leaving the project root is not probed at all.
+#[test]
+fn a_base_url_above_the_root_probes_nothing_there() {
+    let project = Project::new(
+        "paths-escape",
+        &[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions": {"baseUrl": "..", "paths": {"~/*": ["../*"]}}}"#,
+            ),
+            ("src/a.ts", ""),
+        ],
+    );
+    let files = project.files();
+    assert_eq!(
+        resolve_specifier(&files, &FilePath::new("src/a.ts"), "~/money"),
+        None
+    );
+    for read in files.dependencies() {
+        assert!(
+            !read.path.as_str().starts_with(".."),
+            "probed outside the root: {}",
+            read.path
+        );
+    }
+}

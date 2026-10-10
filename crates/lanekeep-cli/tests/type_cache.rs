@@ -369,3 +369,76 @@ fn two_runs_over_one_tree_are_byte_identical() {
         "two runs over identical input disagreed"
     );
 }
+
+/// The importer reaches its declaration through a `tsconfig.json` alias rather than a relative
+/// path — the issue #281 shape, under a type-aware rule rather than a cross-file one.
+fn aliased_project(name: &str) -> Project {
+    Project::new(
+        name,
+        &[
+            ("rule.ts", RULE),
+            ("lanekeep.config.ts", CONFIG),
+            (
+                "tsconfig.json",
+                r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "~/*": ["lib/*"] } } }"#,
+            ),
+            (
+                "src/a.ts",
+                "import { id } from '~/ids';\nconst mine = id;\n",
+            ),
+            ("lib/ids.d.ts", "export declare const id: bigint;\n"),
+            ("other/ids.d.ts", "export declare const id: string;\n"),
+        ],
+    )
+}
+
+/// An import through `compilerOptions.paths` is typed exactly as a relative one is.
+///
+/// Before #281 the builtin provider resolved a bare specifier only through `node_modules`, so
+/// `~/ids` named nothing, `typeOf` answered `undefined`, and a rule reporting `bigint`
+/// was silent on a file that holds one.
+#[test]
+fn an_aliased_import_is_typed_like_a_relative_one() {
+    let project = aliased_project("aliased-import");
+    let output = project.check_profiled();
+    let combined = describe(&output);
+    assert_eq!(output.status.code(), Some(1), "{combined}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("src/a.ts"),
+        "the aliased declaration types `mine` as a bigint: {combined}"
+    );
+}
+
+/// Editing `paths` invalidates a warm cache, with nothing else touched.
+///
+/// `src/a.ts`'s bytes and the declaration it first reached do not move; only the tsconfig
+/// does. So only the tsconfig having been recorded as a tracked read of `src/a.ts` can make
+/// the warm run recompute it — and the recomputed answer reaches a `string`, so the rule must
+/// fall silent.
+#[test]
+fn editing_tsconfig_paths_invalidates_a_warm_cache() {
+    let project = aliased_project("aliased-edit");
+
+    let cold = project.check_profiled();
+    assert_eq!(cold.status.code(), Some(1), "{}", describe(&cold));
+
+    let warm = project.check_profiled();
+    let warm_stderr = String::from_utf8_lossy(&warm.stderr).into_owned();
+    assert!(
+        warm_stderr.contains(&zero_work_row("local/no-bigint")),
+        "an unchanged run should be a full cache hit: {}",
+        describe(&warm)
+    );
+
+    project.write(
+        "tsconfig.json",
+        r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "~/*": ["other/*"] } } }"#,
+    );
+    let edited = project.check_profiled();
+    assert_eq!(
+        edited.status.code(),
+        Some(0),
+        "the alias now reaches a `string`, so nothing should report: {}",
+        describe(&edited)
+    );
+}
