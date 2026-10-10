@@ -59,7 +59,7 @@ enum Command {
         #[arg(long)]
         warn_only: bool,
 
-        /// The run's global budget, in milliseconds. Default 15000, plus 100 per file checked.
+        /// The run's global budget, in milliseconds. Default 15000, plus 100 per file given.
         ///
         /// Overrides `timeouts.global` from the config. A budget set either way is exact; only
         /// the default grows with the corpus, by 100 ms for every file the run is given,

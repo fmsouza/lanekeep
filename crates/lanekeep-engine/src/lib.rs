@@ -10432,6 +10432,32 @@ export default defineRule({
         }
 
         #[test]
+        fn files_answered_from_the_cache_still_count_toward_the_budget() {
+            // A cold and a warm run over identical input get one budget (architecture §6.7):
+            // the allowance counts every file the run is given, not only the cache misses. The
+            // warm run below answers every file from the cache, so under a count of misses its
+            // budget would be the zero floor alone and it would be stopped before the first.
+            let project = matchless_corpus("run-budget-per-file-warm", 60_000);
+            let mut engine = project.build().map(Engine::profiling).expect("prepares");
+            engine.limits = Limits {
+                global_timeout: Duration::ZERO,
+                global_timeout_per_file: Duration::from_hours(1),
+                ..engine.limits
+            };
+
+            let cold = engine.run().expect("the cold run has an hour per file");
+            assert_eq!(timing_for(&cold, "local/no-debugger").cached, 0);
+            let warm = engine
+                .run()
+                .expect("a warm run counts its cached files toward the budget too");
+            assert_eq!(
+                timing_for(&warm, "local/no-debugger").cached,
+                u64::try_from(FILES).expect("fits"),
+                "the warm run must answer every file from the cache, or it proves nothing"
+            );
+        }
+
+        #[test]
         fn the_same_zero_floor_with_no_allowance_is_stopped() {
             // The control: the allowance, and nothing else about the fixture, is what lets
             // the case above finish.
