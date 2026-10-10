@@ -89,14 +89,16 @@ Three things follow from who reads the output:
   reason.
   [`docs/architecture.md`](docs/architecture.md) §15 has the ledger.
 
-**Rules are authored in TypeScript whatever language they check** — that is the form to start
-from, and it is the one most teams already have someone who writes. A rule may also be a
-WebAssembly component, which is how four of the sixteen built-ins ship — two written in Rust
-and two written in Go; the other twelve run as QuickJS modules, three of them checking every
-programming language but JavaScript — TypeScript, TSX, Python, Go and Rust — from a single source. Every form reaches the same host API and is held to
-the same limits, and a config names a rule rather than its implementation. **Configuration is neither** — `lanekeep.json` is
-plain data, so a Go, Python or Rust team never writes a `.ts` file except when authoring an
-actual rule.
+**A rule can be authored in TypeScript, or as a WebAssembly component in Rust, Go or Python.**
+TypeScript is the form to start from — it can check any target language, and it is the one most
+teams already have someone who writes. The component lanes are how four of the sixteen built-ins
+ship — two written in Rust and two in Go (no shipped built-in uses the Python lane yet); the other
+twelve run as QuickJS modules, three of them checking every programming language but JavaScript —
+TypeScript, TSX, Python, Go and Rust — from a single source. Every form reaches the same host API
+and is held to the same limits, and a config names a rule rather than its implementation.
+**Configuration, by contrast, is not code** — `lanekeep.json` is plain data, so a Go, Python or
+Rust team touches a rule source file only when it authors an actual rule — and then it can write
+that rule in its own language.
 
 ## Using it
 
