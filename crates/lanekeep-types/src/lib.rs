@@ -3,10 +3,12 @@
 //! This is the "bounded oracle" of the type-aware rules design, and the bound is *depth*
 //! rather than the file. [`TypeScriptOracle`] answers from one parse and nothing else;
 //! [`BuiltinProvider`] wraps it and follows an import out of that file — to a sibling source,
-//! to a `.d.ts`, into `node_modules` — through the caller's [`lanekeep_core::FileAccess`], so
-//! every file it opens is a recorded dependency of the answer. What it still has no notion of
-//! is a *program*: no `tsconfig.json`, no path mapping, no compiler, and a fixed number of
-//! hops rather than a transitive closure.
+//! to a `.d.ts`, into `node_modules`, or wherever the nearest `tsconfig.json`'s `paths` and
+//! `baseUrl` map a bare specifier — through the caller's [`lanekeep_core::FileAccess`], so
+//! every file it opens, that config included, is a recorded dependency of the answer. What it
+//! still has no notion of is a *program*: the tsconfig is read for module resolution and
+//! nothing else, there is no compiler, and a fixed number of hops rather than a transitive
+//! closure.
 //!
 //! It answers `None` whenever it cannot be sure. That is the whole contract: a rule choosing
 //! to be silent on `None` is sound, and one choosing to report on it is the author's decision

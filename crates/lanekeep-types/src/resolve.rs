@@ -5,6 +5,13 @@
 //! cross-file rules' `resolveImport` resolves only into the discovered corpus, which never
 //! contains `node_modules` because discovery honors gitignore.
 //!
+//! # A bare specifier, in TypeScript's order
+//!
+//! The nearest `tsconfig.json`'s `paths`, then its `baseUrl`, then `node_modules` — see
+//! [`crate::tsconfig`] for how the config is read and what of it is followed. Each candidate an
+//! alias produces is probed exactly as a relative specifier is. A config that cannot be read
+//! makes every bare specifier beneath it unresolved, rather than resolved around it.
+//!
 //! # Every probe is a tracked read
 //!
 //! Hit or miss, through the caller's [`FileAccess`], so an absent `dist/index.d.ts` is

@@ -78,7 +78,7 @@ pub(crate) fn nearest(files: &FileAccess, directory: &str) -> Lookup {
             }
             Ok(None) => {}
             // Not text, or a symlink out of the root: there is a config here and it cannot be
-            // read, which is exactly the case an unparseable one is.
+            // read, which is exactly the case an unparsable one is.
             Err(_) => return Lookup::Unreadable,
         }
         if at.is_empty() {

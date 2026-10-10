@@ -142,14 +142,59 @@ The file under check, and the declaration files its imports resolve to:
    `x/index.tsx`, `x/index.d.ts`, in that order. A specifier naming the emitted JavaScript —
    `./money.js`, TypeScript's own ESM spelling, or `./Button.jsx` for a `.tsx` module — is
    tried at the same stem.
-2. A **bare** specifier walks `node_modules` upward from the importing file's directory. In a
+2. A **bare** specifier is tried first against the `tsconfig.json` nearest the importing
+   file, walking up from its directory to the project root: its `compilerOptions.paths`, then
+   its `baseUrl` (see below).
+3. Then it walks `node_modules` upward from the importing file's directory. In a
    package it reads `package.json`: `exports` under the `types` condition (subpath maps and
    `*` patterns included), then `types`, then `typings`, then `index.d.ts`; then the same for
    `@types/<name>`, with a scoped package flattened as `@types/scope__name`.
 
 Every one of those probes is a **tracked read**, hit or miss, so an absent file is recorded
 with a null hash and its later appearance recomputes exactly the files that noticed it was
-missing.
+missing. That includes the tsconfig: the one found, every `tsconfig.json` looked for and not
+found on the way up, and each link of its `extends` chain. Editing `paths`, or adding a nearer
+config, recomputes exactly the files that resolved a bare specifier under it. A file whose
+imports are all relative reads no tsconfig at all.
+
+### tsconfig `paths` and `baseUrl`
+
+The same resolution `lanekeep/paths` gives the cross-file rules (see
+[`built-in-rules.md`](built-in-rules.md#module-resolution-and-tsconfig-paths)), which is
+TypeScript's own: an exact `paths` key before any wildcard, then the wildcard with the longest
+prefix; its substitutions in the order written, the first that names a file winning, each
+probed exactly as a relative specifier is; substitutions relative to `baseUrl`, or to the
+directory of the config declaring `paths` when there is none; then `<baseUrl>/<specifier>` when
+a `baseUrl` is set; and only then `node_modules`. So an alias that shares a package's name wins
+over the package, as it does under `tsc`. A relative `extends` — a string or an array, as
+written and then with `.json` appended — is followed, merging `compilerOptions` key by key, so
+an extending config's `paths` replaces its base's. Comments, trailing commas and a byte-order
+mark are accepted.
+
+What is not followed, each skipped as though it were absent: a package-name `extends`
+(`@tsconfig/node20`), an `extends` leaving the project root, `jsconfig.json`,
+`tsconfig.*.json`, `rootDirs`, and a directory's `package.json` reached through an alias — which
+a relative import does not consult either. Two things differ from `tsc` on purpose:
+
+- **A declaration file under `node_modules` resolves its own bare imports through
+  `node_modules` alone.** `tsc` applies the program's `paths` there too; a published `.d.ts`
+  that resolves only through a consumer's alias is not a real shape, and skipping it saves a
+  tsconfig walk on every hop through a package.
+- **Two wildcard keys with equally long prefixes that both match break their tie by key order**
+  rather than by the order they were written, which `tsc` uses: the JSON reader does not keep
+  key order.
+
+**A `tsconfig.json` that cannot be read answers nothing for a bare specifier.** Not valid JSON,
+not an object, or a link of its `extends` chain in the same state: every bare specifier from a
+file beneath it resolves to nothing, every name it brings in answers `undefined`, and
+`complete()` is `false`. Falling back to `node_modules` instead could resolve an alias to a
+different file than the one the config names — a confidently wrong type, where this oracle
+answers nothing when it cannot be sure. `lanekeep/paths`, which has an error channel this
+oracle lacks, cancels the run on the same config instead.
+
+A `baseUrl` costs probes: with one set, every package import first tries
+`<baseUrl>/<name>` with the eight relative suffixes, and each miss is recorded — the same
+probes `tsc` makes.
 
 **The walk stops at the project root, and nothing above it is ever read.** The two ways past
 the root fail differently, and both are unresolvable rather than an error:
@@ -387,7 +432,8 @@ A driver for TypeScript 7's own API does not exist yet.
 Two layouts to know about: a pnpm workspace has no root
 `node_modules/typescript`, so `types.typescript` names a workspace package's copy; and a
 project using `compilerOptions.paths` needs nothing from lanekeep under this provider, since
-the project's own compiler resolves them — the builtin provider is the one that does not.
+the project's own compiler resolves them. The builtin provider resolves them too, with the
+differences listed under [tsconfig `paths` and `baseUrl`](#tsconfig-paths-and-baseurl).
 
 **Where the two providers agree, and where they do not.** Both answer the same primitives from
 the same annotations. Where they part is reduction, not correctness: on a generic or a wrapped
