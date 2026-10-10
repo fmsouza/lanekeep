@@ -43,7 +43,7 @@ use std::path::Path;
 use lanekeep_core::FilePath;
 use lanekeep_core::files::{FileAccess, normalize};
 
-use crate::tsconfig::{self, Lookup};
+use crate::tsconfig::{self, Candidate, Lookup};
 
 /// Extensions tried for a relative specifier, in order.
 ///
@@ -185,8 +185,9 @@ fn within_root(path: &str) -> Option<String> {
 /// A file under `node_modules` skips the tsconfig. Its bare imports are the package's own, and
 /// the config nearest it is the package's development config or the project's, neither of
 /// which a published declaration file was written against. TypeScript does apply the
-/// program's `paths` there; a `.d.ts` that resolves only through a consumer's alias is not a
-/// shape worth a tsconfig walk on every package hop. See `docs/type-aware-rules.md`.
+/// program's `paths` there, and a project aliasing `react` to `preact/compat` relies on it;
+/// here such an import reaches `@types/react` instead. The trade is a tsconfig walk on every
+/// hop through a package, for every importer. See `docs/type-aware-rules.md`.
 fn bare(files: &FileAccess, from: &FilePath, specifier: &str) -> Option<FilePath> {
     let in_a_package = from
         .as_str()
@@ -199,8 +200,14 @@ fn bare(files: &FileAccess, from: &FilePath, specifier: &str) -> Option<FilePath
             Lookup::Unreadable => return None,
             Lookup::Found(options) => {
                 for candidate in options.candidates(specifier) {
-                    if let Some(found) = alias_target(files, &candidate) {
-                        return Some(found);
+                    match candidate {
+                        Candidate::At(path) => {
+                            if let Some(found) = alias_target(files, &path) {
+                                return Some(found);
+                            }
+                        }
+                        // `tsc` would look above the root before anything later; this cannot.
+                        Candidate::Unreachable => return None,
                     }
                 }
             }

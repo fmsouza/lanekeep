@@ -395,7 +395,7 @@ fn aliased_project(name: &str) -> Project {
 /// An import through `compilerOptions.paths` is typed exactly as a relative one is.
 ///
 /// Before #281 the builtin provider resolved a bare specifier only through `node_modules`, so
-/// `~/dist/ids` named nothing, `typeOf` answered `undefined`, and a rule reporting `bigint`
+/// `~/ids` named nothing, `typeOf` answered `undefined`, and a rule reporting `bigint`
 /// was silent on a file that holds one.
 #[test]
 fn an_aliased_import_is_typed_like_a_relative_one() {

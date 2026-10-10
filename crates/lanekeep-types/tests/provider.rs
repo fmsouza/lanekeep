@@ -4526,6 +4526,80 @@ fn an_extended_config_is_recorded() {
     );
 }
 
+/// A `baseUrl` above the root is not the same as no `baseUrl`.
+///
+/// `tsc` resolves `@ui/x` against `<root>/../ui/x`, which this provider cannot read. Treating
+/// the out-of-root `baseUrl` as unset instead rebased the substitution onto the config's own
+/// directory and answered `<root>/ui/x.ts` — a file `tsc` never reaches, and so a confidently
+/// wrong type. The decoy at `ui/x.ts` is what makes that mistake observable.
+#[test]
+fn a_base_url_above_the_root_does_not_rebase_paths_onto_the_config_directory() {
+    assert_eq!(
+        resolve_in(
+            "paths-escape-rebase",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"baseUrl": "..", "paths": {"@ui/*": ["ui/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("ui/x.ts", ""),
+            ],
+            "src/a.ts",
+            "@ui/x",
+        ),
+        None
+    );
+}
+
+/// A substitution that resolves above the root stops the resolution there.
+///
+/// `tsc` tries `../outside/money` before `src/money`, and if it exists there that is the
+/// answer — which this provider cannot see. Going on to `src/money.ts` would answer with a file
+/// `tsc` may never have reached; answering nothing is the honest result.
+#[test]
+fn a_substitution_above_the_root_stops_before_later_ones() {
+    assert_eq!(
+        resolve_in(
+            "paths-escape-order",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions": {"paths": {"~/*": ["../outside/*", "./src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        None
+    );
+}
+
+/// And an out-of-root `baseUrl` still overrides an inherited in-root one, as any `baseUrl`
+/// an extending config declares does.
+#[test]
+fn an_out_of_root_base_url_overrides_an_inherited_one() {
+    assert_eq!(
+        resolve_in(
+            "paths-escape-override",
+            &[
+                ("base.json", r#"{"compilerOptions": {"baseUrl": "."}}"#),
+                (
+                    "tsconfig.json",
+                    r#"{"extends": "./base.json", "compilerOptions": {"baseUrl": "..", "paths": {"~/*": ["src/*"]}}}"#
+                ),
+                ("src/a.ts", ""),
+                ("src/money.ts", ""),
+            ],
+            "src/a.ts",
+            "~/money",
+        ),
+        None
+    );
+}
+
 /// A `baseUrl` or substitution leaving the project root is not probed at all.
 #[test]
 fn a_base_url_above_the_root_probes_nothing_there() {

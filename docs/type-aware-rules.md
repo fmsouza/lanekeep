@@ -172,20 +172,30 @@ an extending config's `paths` replaces its base's. Comments, trailing commas and
 mark are accepted.
 
 What is not followed, each skipped as though it were absent: a package-name `extends`
-(`@tsconfig/node20`), an `extends` leaving the project root, `jsconfig.json`,
-`tsconfig.*.json`, `rootDirs`, and a directory's `package.json` reached through an alias — which
-a relative import does not consult either. Two things differ from `tsc` on purpose:
+(`@tsconfig/node20`), an `extends` that leaves the project root by its path, `jsconfig.json`,
+`tsconfig.*.json`, `rootDirs`, the `${configDir}` template TypeScript 5.5 added (it is read as
+a literal directory name, so an alias written with it names nothing), and a directory's
+`package.json` reached through an alias — which a relative import does not consult either.
+Three things differ from `tsc` on purpose:
 
 - **A declaration file under `node_modules` resolves its own bare imports through
-  `node_modules` alone.** `tsc` applies the program's `paths` there too; a published `.d.ts`
-  that resolves only through a consumer's alias is not a real shape, and skipping it saves a
-  tsconfig walk on every hop through a package.
+  `node_modules` alone.** `tsc` applies the program's `paths` there too, and that is a real
+  shape: a project aliasing `react` to `preact/compat` through `paths` has every package's
+  `import 'react'` follow the alias under `tsc`, where here it reaches `@types/react` when that
+  is installed — a different file, and a different answer. The trade is cost: honoring it would
+  walk for a tsconfig on every hop through a package, for every importer.
+- **What lies above the root is not guessed at.** A `paths` substitution that resolves above the
+  project root — directly, or because `baseUrl` points there — ends the resolution with no
+  answer, since `tsc` would look there before any later candidate. An out-of-root `baseUrl`'s
+  own `<baseUrl>/<name>` candidate is skipped instead, so that a project rooted below its
+  `baseUrl` still resolves its packages.
 - **Two wildcard keys with equally long prefixes that both match break their tie by key order**
-  rather than by the order they were written, which `tsc` uses: the JSON reader does not keep
-  key order.
+  rather than by the order they were written, which `tsc` uses: the JSON reader, as this
+  workspace builds it, does not keep key order.
 
 **A `tsconfig.json` that cannot be read answers nothing for a bare specifier.** Not valid JSON,
-not an object, or a link of its `extends` chain in the same state: every bare specifier from a
+not an object, not text, a symlink out of the root, or a link of its `extends` chain in any of
+those states: every bare specifier from a
 file beneath it resolves to nothing, every name it brings in answers `undefined`, and
 `complete()` is `false`. Falling back to `node_modules` instead could resolve an alias to a
 different file than the one the config names — a confidently wrong type, where this oracle

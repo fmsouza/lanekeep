@@ -21,9 +21,14 @@
 //! effective `baseUrl`, or to the directory of the config declaring `paths` when there is none.
 //!
 //! Not followed: a package-name `extends` (`@tsconfig/node20`), an `extends` that leaves the
-//! project root, `jsconfig.json`, `tsconfig.*.json` and `rootDirs`. Each is skipped as though
-//! absent rather than refused, so a project whose base config lives above the root still
+//! project root, `jsconfig.json`, `tsconfig.*.json`, `rootDirs`, and TypeScript 5.5's
+//! `${configDir}` template, which is read as a literal directory name. Each is skipped as
+//! though absent rather than refused, so a project whose base config lives above the root still
 //! resolves its packages through `node_modules` the way it did before any of this existed.
+//!
+//! A `baseUrl` or `paths` substitution that points above the root is a different matter: `tsc`
+//! would look there, so a matched substitution that does ends the resolution with no answer —
+//! see [`Candidate::Unreachable`].
 //!
 //! # An unreadable config answers nothing
 //!
@@ -56,10 +61,35 @@ pub(crate) enum Lookup {
 /// The two options module resolution reads, made project-relative.
 #[derive(Debug, Default)]
 pub(crate) struct Options {
-    /// `compilerOptions.baseUrl`, relative to the project root; `""` is the root itself.
-    base_url: Option<String>,
+    /// `compilerOptions.baseUrl`; `None` when no config in the chain sets one.
+    base_url: Option<BaseUrl>,
     /// `compilerOptions.paths`, and the directory of the config that declared it.
     paths: Option<(Map<String, Value>, String)>,
+}
+
+/// Where a `baseUrl` points.
+///
+/// Three states rather than an `Option<String>`, because "above the root" and "unset" mean
+/// different things and folding one into the other was a bug: `paths` resolve against the
+/// config's own directory only when there is *no* `baseUrl`, so an out-of-root one read as
+/// unset rebased every substitution onto a directory `tsc` never looks in.
+#[derive(Debug)]
+enum BaseUrl {
+    /// Relative to the project root; `""` is the root itself.
+    At(String),
+    /// Above the project root, where nothing may be read.
+    Outside,
+}
+
+/// One place TypeScript would look for a bare specifier.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Candidate {
+    /// A project-relative base path, probed like a relative specifier.
+    At(String),
+    /// A `paths` substitution that resolves above the project root. `tsc` would look there
+    /// before any later candidate, and this provider cannot, so the resolution stops with no
+    /// answer rather than going on to one `tsc` might never have reached.
+    Unreachable,
 }
 
 /// The options in force for a file in `directory`, from the nearest `tsconfig.json`.
@@ -89,20 +119,29 @@ pub(crate) fn nearest(files: &FileAccess, directory: &str) -> Lookup {
 }
 
 impl Options {
-    /// The project-relative base paths TypeScript would try for a bare `specifier`, in order.
+    /// Where TypeScript would look for a bare `specifier`, in order.
     ///
     /// An exact `paths` key wins; otherwise the wildcard key with the longest prefix that
     /// matches. Its substitutions come in the order written, `*` replaced by what it matched,
-    /// and then `<baseUrl>/<specifier>` when a `baseUrl` is set. A candidate that would leave
-    /// the project root is dropped, so it is never probed and never recorded.
-    pub(crate) fn candidates(&self, specifier: &str) -> Vec<String> {
+    /// and then `<baseUrl>/<specifier>` when a `baseUrl` is set. Nothing above the root is ever
+    /// a path here, so nothing above it is probed or recorded; but a matched substitution that
+    /// resolves there is [`Candidate::Unreachable`] rather than dropped, because the answer
+    /// `tsc` gives may be the file it names. The `<baseUrl>/<specifier>` candidate of an
+    /// out-of-root `baseUrl` is dropped instead: it is tried for every package import, and
+    /// stopping there would leave a project rooted below its `baseUrl` with no package
+    /// resolving at all.
+    pub(crate) fn candidates(&self, specifier: &str) -> Vec<Candidate> {
         let mut out = Vec::new();
 
         if let Some((paths, declared_in)) = &self.paths
             && let Some((key, star)) = match_pattern(paths, specifier)
             && let Some(Value::Array(substitutions)) = paths.get(key)
         {
-            let base = self.base_url.as_deref().unwrap_or(declared_in);
+            let base = match &self.base_url {
+                Some(BaseUrl::At(base)) => Some(base.as_str()),
+                Some(BaseUrl::Outside) => None,
+                None => Some(declared_in.as_str()),
+            };
             for substitution in substitutions {
                 let Value::String(substitution) = substitution else {
                     continue;
@@ -113,12 +152,24 @@ impl Options {
                     Some(star) if !star.is_empty() => replace_star(substitution, star),
                     _ => substitution.clone(),
                 };
-                out.extend(within(base, &path).filter(|c| !c.is_empty()));
+                match base.and_then(|base| within(base, &path)) {
+                    // The root itself names no module.
+                    Some(candidate) if candidate.is_empty() => {}
+                    Some(candidate) => out.push(Candidate::At(candidate)),
+                    None => {
+                        out.push(Candidate::Unreachable);
+                        return out;
+                    }
+                }
             }
         }
 
-        if let Some(base) = &self.base_url {
-            out.extend(within(base, specifier).filter(|c| !c.is_empty()));
+        if let Some(BaseUrl::At(base)) = &self.base_url {
+            out.extend(
+                within(base, specifier)
+                    .filter(|c| !c.is_empty())
+                    .map(Candidate::At),
+            );
         }
 
         out
@@ -154,10 +205,11 @@ fn load(files: &FileAccess, path: &str, text: &str, chain: &[String]) -> Option<
     }
 
     if let Some(Value::Object(own)) = config.get("compilerOptions") {
-        if let Some(Value::String(base_url)) = own.get("baseUrl")
-            && let Some(base_url) = within(directory, base_url)
-        {
-            options.base_url = Some(base_url);
+        if let Some(Value::String(base_url)) = own.get("baseUrl") {
+            options.base_url = Some(match within(directory, base_url) {
+                Some(base_url) => BaseUrl::At(base_url),
+                None => BaseUrl::Outside,
+            });
         }
         if let Some(Value::Object(paths)) = own.get("paths") {
             options.paths = Some((paths.clone(), directory.to_owned()));
