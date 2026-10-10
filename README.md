@@ -13,7 +13,7 @@ lanekeep enforces the conventions that live in your team's heads and your review
 the ones a language model cannot infer from the code it is shown. Every rule is a codified answer
 to **"the agent keeps doing this wrong."**
 
-It ships as a single static binary with no runtime dependency.
+It ships as a single self-contained binary — no language runtime to install.
 
 ---
 
@@ -43,9 +43,9 @@ them, and a suppression directive goes in the language's own comment:
 Not claimed: `.scss`, `.sass`, `.less` and `.json5`, which are different grammars, and TOML files
 named without the extension, such as `Cargo.lock` — a language is chosen by extension.
 
-`brew install fmsouza/tap/lanekeep` works anywhere, as does a binary from the
-[releases page](https://github.com/fmsouza/lanekeep/releases). Every channel delivers the same
-build, so the bytes are identical whichever you pick.
+`brew install fmsouza/tap/lanekeep` (macOS on Apple silicon, and Linux) and the binaries on the
+[releases page](https://github.com/fmsouza/lanekeep/releases) are the same prebuilt build, so the
+bytes are identical whichever prebuilt channel you pick; `cargo install` builds from source.
 
 Whatever the project, the first two commands are the same:
 
@@ -66,7 +66,8 @@ linter nor your formatter.
 A rule is a **program**, not a configuration entry. It declares a
 [tree-sitter query](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/1-syntax.html)
 that Rust matches at native speed, and a handler that runs only on matches — where it can loop,
-accumulate state, read other files and ask where a name came from.
+accumulate state, read other files, ask where a name came from, follow a value's flow, or require a
+resource released on every path out of a scope.
 
 That matters because the conventions worth enforcing are the ones specific enough that nobody
 else would ever write them, which is exactly the population a fixed vocabulary of predicates
@@ -83,16 +84,16 @@ Three things follow from who reads the output:
   byte-identical output. An agent reading it twice must not see reordering as change.
 - **It runs in the inner loop.** Agents and developers invoke it after every edit, so a warm run
   is measured in tens of milliseconds. The built-ins that ship as WebAssembly components are all
-  under 115 KB, so loading them is noise — a 12.4 MiB compiled-TypeScript component that once
-  cost new TypeScript projects ~6.5 seconds on their first run was reverted for exactly that
+  under 120 KB, so loading them is noise — a 12.4 MiB compiled-TypeScript component that once
+  cost new TypeScript projects ~6.4 seconds on their first run was reverted for exactly that
   reason.
   [`docs/architecture.md`](docs/architecture.md) §15 has the ledger.
 
 **Rules are authored in TypeScript whatever language they check** — that is the form to start
 from, and it is the one most teams already have someone who writes. A rule may also be a
 WebAssembly component, which is how four of the sixteen built-ins ship — two written in Rust
-and two written in Go; the other twelve run as QuickJS modules, three of them checking five of
-the ten supported languages from a single source (every programming language but JavaScript). Every form reaches the same host API and is held to
+and two written in Go; the other twelve run as QuickJS modules, three of them checking every
+programming language but JavaScript — TypeScript, TSX, Python, Go and Rust — from a single source. Every form reaches the same host API and is held to
 the same limits, and a config names a rule rather than its implementation. **Configuration is neither** — `lanekeep.json` is
 plain data, so a Go, Python or Rust team never writes a `.ts` file except when authoring an
 actual rule.
@@ -114,7 +115,7 @@ lanekeep explain <rule-id>      # one rule's card, without opening its source
 lanekeep server                 # LSP for an editor, or --protocol mcp for an agent host
 ```
 
-**Exit codes:** `0` clean, `1` violations found, `2` the checker could not run. A caller has to be
+**Exit codes:** `0` clean, `1` error-level violations found, `2` the checker could not run. A caller has to be
 able to tell "your code has problems" from "the tool is broken". `--warn-only` reports violations
 but exits `0`, for a phased rollout.
 
@@ -157,8 +158,9 @@ Prebuilt for macOS on Apple silicon, Linux on x86-64 and arm64, and Windows on x
 binaries are built against **glibc 2.17**, so they run on anything from RHEL 7 onwards.
 
 **No runtime is required to run lanekeep.** Node, Python or Go is needed only to install it from
-that ecosystem, where it picks which binary to fetch. Nothing is pulled in as a dependency any of
-those ways.
+that ecosystem, where it picks which binary to fetch — nothing is pulled in as a dependency any of
+those ways. The one exception is opt-in: a rule set that enables `types.provider: 'tsc'` drives
+your project's own TypeScript compiler through Node.
 
 Intel macOS is not prebuilt — `cargo install lanekeep-cli` builds it from source, and both the npm
 launcher and the Homebrew formula say so rather than failing obscurely.
@@ -174,9 +176,9 @@ Rules are executable code, so the posture is about confinement rather than absen
   the context. A component imports one interface and is refused at load if it imports another.
 - **No network access.** Ever, in any mode, with no configuration that enables it.
 - **Filesystem confinement.** Reads go through a tracked host call, confined to the project root.
-  Writes happen only under `--fix`, only to matched files, only within reported ranges.
-- **Bounded execution.** A per-invocation timeout, a global run budget and a per-runtime memory
-  ceiling, none disableable — a rule that hangs a pre-commit hook is indistinguishable from a
+  Source files are written only under `--fix`, only where a rule matched, within the ranges it reported.
+- **Bounded execution.** A per-invocation timeout, a global run budget, a type-analysis budget and
+  a per-runtime memory ceiling, none disableable — a rule that hangs a pre-commit hook is indistinguishable from a
   broken tool. Breaching any of them cancels the run and exits `2`, rather than reporting a partial
   result as a clean one.
 - **Deterministic by construction.** The sandbox withholds the clock and randomness, so a rule
@@ -200,8 +202,9 @@ Known gaps, stated rather than implied:
   §15 are not met.** The cold budget is; they are targets, and that section says by how much
   and where the remaining time goes.
 - **No general type inference**, by design. Name resolution is syntactic; a rule that opts in
-  (`requires: ['types']`) gets a bounded within-file oracle that answers `undefined` rather than
-  guess — see §1 non-goals and §6.10.
+  (`requires: ['types']`) gets a bounded oracle — the file's own annotations plus the declaration
+  files its imports resolve to, or, opt-in, the project's compiler via `types.provider: 'tsc'` —
+  that answers `undefined` rather than guess. See §1 non-goals and §6.10.
 
 ## Documentation
 
@@ -222,7 +225,7 @@ In-repo, versioned with the code:
 | [`docs/architecture.md`](docs/architecture.md) | The full design: execution model, host API, cache, milestones |
 | [`docs/built-in-rules.md`](docs/built-in-rules.md) | The rules lanekeep ships with, and their options |
 | [`docs/cross-file-rules.md`](docs/cross-file-rules.md) | Writing a rule that needs a whole-corpus view |
-| [`docs/obligation-rules.md`](docs/obligation-rules.md) | Writing a rule that needs a resource released on every path |
+| [`docs/obligation-rules.md`](docs/obligation-rules.md) | Writing a rule that needs a resource released on every path out of a function, block, class, component or module |
 | [`docs/type-aware-rules.md`](docs/type-aware-rules.md) | Writing a rule that needs to know what a value's type is |
 | [`docs/authoring-rust-rules.md`](docs/authoring-rust-rules.md) | Writing a rule in Rust, shipped as a WebAssembly component |
 | [`docs/authoring-go-rules.md`](docs/authoring-go-rules.md) | Writing a rule in Go |
