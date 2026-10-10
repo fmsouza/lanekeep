@@ -29,9 +29,19 @@ apply, a worked custom rule, and the name-resolution behavior specific to that l
 | Rust | `.rs` | `cargo install lanekeep-cli` | **[Rust](https://github.com/fmsouza/lanekeep/wiki/Rust)** |
 | TypeScript / JavaScript | `.ts`, `.mts`, `.cts`, `.tsx`, `.js`, `.mjs`, `.cjs`, `.jsx` | `npm install --save-dev lanekeep` | **[TypeScript and JavaScript](https://github.com/fmsouza/lanekeep/wiki/TypeScript-and-JavaScript)** |
 
-Rules can also target **JSON** (`language: ['json']`, for `.json` and `.jsonc`) — locale catalogs,
-manifests, settings. JSON declares no names, so there is no name resolution for it; JSON has no
-comments either, so a suppression directive works in a JSONC comment and not in strict JSON.
+Rules can also target stylesheets and data files — locale catalogs, manifests, CI workflows.
+None of these declares names a lexical scope could resolve, so there is no name resolution for
+them, and a suppression directive goes in the language's own comment:
+
+| Language | `language` | Extensions | Directive in |
+| --- | --- | --- | --- |
+| CSS | `'css'` | `.css` | `/* */` — CSS's only comment; `expires:` may be the last thing before the `*/` |
+| JSON | `'json'` | `.json`, `.jsonc` | a JSONC comment (`//` or `/* */`). Strict JSON has no comments, so there a violation is accepted through the rule's options or an `exclude` instead |
+| TOML | `'toml'` | `.toml` | `#` |
+| YAML | `'yaml'` | `.yaml`, `.yml` | `#` |
+
+Not claimed: `.scss`, `.sass`, `.less` and `.json5`, which are different grammars, and TOML files
+named without the extension, such as `Cargo.lock` — a language is chosen by extension.
 
 `brew install fmsouza/tap/lanekeep` works anywhere, as does a binary from the
 [releases page](https://github.com/fmsouza/lanekeep/releases). Every channel delivers the same
@@ -82,7 +92,7 @@ Three things follow from who reads the output:
 from, and it is the one most teams already have someone who writes. A rule may also be a
 WebAssembly component, which is how four of the sixteen built-ins ship — two written in Rust
 and two written in Go; the other twelve run as QuickJS modules, three of them checking five of
-the seven supported languages from a single source (every one but JavaScript and JSON). Every form reaches the same host API and is held to
+the ten supported languages from a single source (every programming language but JavaScript). Every form reaches the same host API and is held to
 the same limits, and a config names a rule rather than its implementation. **Configuration is neither** — `lanekeep.json` is
 plain data, so a Go, Python or Rust team never writes a `.ts` file except when authoring an
 actual rule.
