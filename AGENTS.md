@@ -448,10 +448,24 @@ ones that carry an expression beside their pattern: `required_parameter` (its `v
 declared `tauriInvoke` as a parameter, and an import read there answered `param`, shadowed (#289).
 Nothing fails: the wrong answer is a confident one, and it only ever hides an import. The walk is
 an allowlist of binding positions now, read off `node-types.json`. `crates/lanekeep-lang-rust`'s
-`pattern_binds` still has the same fallback — `Ordering::Less` or `0..=MAX` in a match arm binds
-the path's segments — and is a separate fix. Python got #289 another way: its walk counted a
-function's scope for the whole `def`, header included, where Python evaluates defaults and
-annotations in the scope around it.
+`pattern_binds` had the same fallback — `Ordering::Less` or `0..=MAX` in a match arm bound the
+path's segments, and a match guard's expression bound everything in it — and is an allowlist
+too now, with a test pinning the grammar's `_pattern` subtypes and the kinds that hold one.
+Python got #289 another way: its walk counted a function's scope for the whole `def`, header
+included, where Python evaluates defaults and annotations in the scope around it.
+
+Rust leaves one case no syntax can settle: a bare `MAX` or `None` in a pattern is a path when a
+constant, unit struct or unit variant of that name is in scope and a fresh binding otherwise.
+The resolver reads it by case — capitalized, leading underscores aside, is a path — and only in
+a refutable position (an arm, `if let`, `while let`, `let … else`); where a pattern cannot fail,
+a constant would not compile, so the name binds. Measured 2026-10-10 over the 40,617 `.rs`
+files of a local cargo registry and this repository at `00281e2`, the case reading and an
+in-file `const`, `static` or unit struct of the same name disagreed on 27 of 198,708 bare names
+in refutable positions, every one an Apple FFI constant spelled `kCF…` or `kCGL…`; no
+capitalized name matched a `let` or parameter in its file. Before leading underscores were
+skipped it was 45, the other 18 underscore-prefixed constants such as `___ZEROCOPY_TAG_…`. That
+is why there is no in-file lookup: it would buy those 27, and an imported lowercase constant
+stays out of reach of either.
 
 **A raw control character in a rule's source reports a parse failure somewhere else.** A NUL
 written into a template literal made the stripper report an error at the enclosing

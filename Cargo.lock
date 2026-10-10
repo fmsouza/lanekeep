@@ -960,6 +960,7 @@ version = "0.12.0"
 dependencies = [
  "blake3",
  "lanekeep-lang",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-rust",
 ]

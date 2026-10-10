@@ -19,6 +19,9 @@ tree-sitter-rust = { workspace = true }
 [build-dependencies]
 blake3 = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
 
