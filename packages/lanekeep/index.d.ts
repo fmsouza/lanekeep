@@ -50,7 +50,17 @@ export type BindingKind =
   | 'trait'
 
 /** A language lanekeep can parse. */
-export type LanguageId = 'typescript' | 'tsx' | 'javascript' | 'python' | 'go' | 'rust' | 'json'
+export type LanguageId =
+  | 'typescript'
+  | 'tsx'
+  | 'javascript'
+  | 'python'
+  | 'go'
+  | 'rust'
+  | 'json'
+  | 'css'
+  | 'toml'
+  | 'yaml'
 
 /** How serious a violation is. */
 export type Severity = 'error' | 'warn' | 'off'

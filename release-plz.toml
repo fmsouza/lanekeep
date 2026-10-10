@@ -141,11 +141,14 @@ changelog_include = [
   "lanekeep-engine",
   "lanekeep-js",
   "lanekeep-lang",
+  "lanekeep-lang-css",
   "lanekeep-lang-go",
   "lanekeep-lang-js",
   "lanekeep-lang-json",
   "lanekeep-lang-python",
   "lanekeep-lang-rust",
+  "lanekeep-lang-toml",
+  "lanekeep-lang-yaml",
   "lanekeep-languages",
   "lanekeep-nodes",
   "lanekeep-query",
@@ -223,6 +226,10 @@ name = "lanekeep-lang"
 version_group = "lanekeep"
 
 [[package]]
+name = "lanekeep-lang-css"
+version_group = "lanekeep"
+
+[[package]]
 name = "lanekeep-lang-go"
 version_group = "lanekeep"
 
@@ -240,6 +247,14 @@ version_group = "lanekeep"
 
 [[package]]
 name = "lanekeep-lang-rust"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-lang-toml"
+version_group = "lanekeep"
+
+[[package]]
+name = "lanekeep-lang-yaml"
 version_group = "lanekeep"
 
 [[package]]
