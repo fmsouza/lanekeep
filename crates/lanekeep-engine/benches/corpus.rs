@@ -368,8 +368,9 @@ fn rule_source(index: usize) -> String {
 ///
 /// Not a relaxed gate — [`COLD_CEILING`] is this file's assertion about a run taking absurdly
 /// long, and it is unchanged. This is about *which* failure a slow machine gets. The default
-/// budget is fifteen seconds, and the walker checks it between files, which is a limit this
-/// corpus can genuinely reach: it is 2,000 files against 20 rules, only every twentieth of
+/// budget was a fixed fifteen seconds when this was written — it now grows by 100 ms a file,
+/// #290 — and the walker checks it between files, which is a limit this corpus could genuinely
+/// reach: it is 2,000 files against 20 rules, only every twentieth of
 /// which runs a handler, so almost all of a cold pass is Rust-side work under one clock. The
 /// cold pass measures 783 ms here and this suite's first hosted run measured 10.9 s, which is
 /// margin thin enough to lose on a throttled runner. Losing it would replace the number a human

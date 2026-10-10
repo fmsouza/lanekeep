@@ -10424,7 +10424,10 @@ export default defineRule({
             let outcome = engine
                 .run()
                 .expect("an hour per file is ample, whatever the floor");
-            assert_eq!(outcome.files_discovered, FILES, "the corpus has to have been there");
+            assert_eq!(
+                outcome.files_discovered, FILES,
+                "the corpus has to have been there"
+            );
             assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
         }
 

@@ -59,12 +59,14 @@ enum Command {
         #[arg(long)]
         warn_only: bool,
 
-        /// The run's global budget, in milliseconds. Default 15000.
+        /// The run's global budget, in milliseconds. Default 15000, plus 100 per file checked.
         ///
-        /// Overrides `timeouts.global` from the config. It is wall-clock time, not CPU time,
-        /// so a large corpus on a busy machine can need more than the default. Spending it
-        /// cancels the whole run with exit code 2 rather than skipping what is left, and the
-        /// message names the run rather than whichever rule happened to be running.
+        /// Overrides `timeouts.global` from the config. A budget set either way is exact; only
+        /// the default grows with the corpus, by 100 ms for every file the run is given,
+        /// cached files included. It is wall-clock time, not CPU time, so a busy machine
+        /// spends it sooner than an idle one. Spending it cancels the whole run with exit
+        /// code 2 rather than skipping what is left, and the message names the run rather
+        /// than whichever rule happened to be running.
         #[arg(long)]
         timeout: Option<u64>,
 
@@ -1974,7 +1976,8 @@ fn explain(
 mod tests {
     use super::*;
 
-    /// `check --help` states the global budget's default and what kind of time it is (#290).
+    /// `check --help` states the global budget's default, how it grows with the corpus, and
+    /// what kind of time it is (#290).
     ///
     /// The default is a literal in a doc comment, because clap cannot interpolate a constant
     /// into one, so this is what keeps the literal tied to `DEFAULT_GLOBAL_TIMEOUT`.
@@ -1995,6 +1998,15 @@ mod tests {
             help.contains(&format!("Default {default}")),
             "--timeout's help must state the {default} ms default:\n{help}"
         );
+        // And the allowance the default grows by (#290), tied to its constant the same way.
+        let per_file = lanekeep_core::DEFAULT_GLOBAL_TIMEOUT_PER_FILE
+            .as_millis()
+            .to_string();
+        assert!(
+            help.contains(&format!("plus {per_file} per file")),
+            "--timeout's help must state the {per_file} ms per-file allowance:\n{help}"
+        );
+        assert!(help.contains("exact"), "{help}");
         assert!(help.contains("wall-clock"), "{help}");
         assert!(help.contains("timeouts.global"), "{help}");
     }

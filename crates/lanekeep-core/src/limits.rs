@@ -40,10 +40,10 @@ pub const DEFAULT_GLOBAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// spends it faster than an idle one, and a large corpus needs more of it. Measured on
 /// 2026-10-10 at `f41f91a`, `--no-cache` on a fourteen-core machine other work was loading:
 /// lanekeep's own self-check, 236 files under 17 rules, took 9.2 s of wall clock and 27 s of
-/// CPU; a 7,327-file React Native app under 27 rules took 22.1 s and 99.6 s. The second failed
-/// the old default outright. A hundred milliseconds a file lets either run at the speed of a
-/// single core — the worst a contended machine degrades a parallel run to — while staying two
-/// hundred times under the aggregate the global budget exists to stop, a thousand rules at
+/// CPU; a 7,327-file React Native app under 32 rules took 22.1 s and 99.6 s. The second would
+/// have failed the old default outright. A hundred milliseconds a file lets either finish at
+/// the speed of one idle core — about where heavy contention leaves a parallel run — while
+/// staying two hundred times under the aggregate the global budget exists to stop, a thousand rules at
 /// twenty milliseconds each.
 ///
 /// The allowance depends on nothing but the length of the file list, which is a function of
