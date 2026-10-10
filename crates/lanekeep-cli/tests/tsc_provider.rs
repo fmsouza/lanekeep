@@ -231,6 +231,77 @@ fn the_enumerated_divergences_are_the_only_ones() {
     );
 }
 
+/// A value imported through a `tsconfig.json` alias, typed by each provider.
+///
+/// The rule asks about the *imported value*, not an annotation naming its type: the built-in
+/// oracle names an annotation's type from the annotation alone, so a fixture anchored on one
+/// would agree whether or not the alias resolved. Here the type is only reachable by reading
+/// the declaration the alias names.
+fn aliased_fixture(name: &str, provider: Provider) -> Vec<Violation> {
+    let rule = r"
+        import { defineRule } from 'lanekeep';
+        export default defineRule({
+          id: 'local/aliased',
+          severity: 'error',
+          requires: ['types'],
+          card: {
+            message: 'this value is an Amount',
+            remediation: 'use a plain number',
+            examples: { bad: 'const a = amount', good: 'const a = 1' },
+          },
+          query: '(variable_declarator name: (identifier) @name value: (identifier) @value)',
+          check(ctx, m) {
+            const type = ctx.types.typeOf(m.value);
+            if (type !== undefined && type.text.includes('Amount')) ctx.report(m.name);
+          },
+        });
+    ";
+    let tester = RuleTester::new(name, rule)
+        .expect("writes the fixture project")
+        .with_config_extra(&types_block(provider))
+        .expect("rewrites the config with a types block");
+    tester
+        .write_fixture(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "strict": true, "baseUrl": ".", "paths": { "~/*": ["lib/*"] } } }"#,
+        )
+        .expect("writes the tsconfig");
+    tester
+        .write_fixture(
+            "lib/money.ts",
+            "export interface Amount { readonly cents: number }\n\
+             export declare const amount: Amount\n",
+        )
+        .expect("writes the library");
+    tester
+        .run(
+            "import { amount } from '~/money'\n\
+             const viaAlias = amount\n\
+             export { viaAlias }\n",
+        )
+        .expect("the run completes")
+}
+
+/// Both providers resolve an import through `compilerOptions.paths` (#281).
+///
+/// `tsc` always did — it is the compiler. The built-in one resolved a bare specifier through
+/// `node_modules` alone, so `~/money` named nothing and this rule was silent under it.
+#[test]
+fn both_providers_agree_through_a_tsconfig_alias() {
+    if !tsc_available() {
+        eprintln!("skipped: no packages/lanekeep/node_modules/typescript (the gate job covers it)");
+        return;
+    }
+    let builtin = aliased_fixture("alias-builtin", Provider::Builtin);
+    let tsc = aliased_fixture("alias-tsc", Provider::Tsc);
+    assert_eq!(
+        lines(&tsc),
+        vec![PLAIN_LINE],
+        "the compiler types the aliased value: {tsc:?}"
+    );
+    assert_eq!(lines(&builtin), lines(&tsc), "{builtin:?}");
+}
+
 #[test]
 fn two_runs_under_tsc_are_byte_identical() {
     if !tsc_available() {
