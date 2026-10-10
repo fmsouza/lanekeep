@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/fmsouza/lanekeep/compare/v0.13.0...v0.14.0) - 2026-10-10
+
+### Added
+
+- *(lang)* support CSS, TOML and YAML ([#315](https://github.com/fmsouza/lanekeep/pull/315))
+
+### Fixed
+
+- *(engine)* [**breaking**] grow the default run budget with the corpus ([#312](https://github.com/fmsouza/lanekeep/pull/312))
+- *(types)* resolve tsconfig paths and baseUrl in the builtin provider ([#314](https://github.com/fmsouza/lanekeep/pull/314))
+
 ## [0.13.0](https://github.com/fmsouza/lanekeep/compare/v0.12.0...v0.13.0) - 2026-10-10
 
 ### Added
