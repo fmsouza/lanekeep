@@ -33,11 +33,14 @@ lanekeep-engine = { version = "0.13.0", path = "crates/lanekeep-engine" }
 lanekeep-js = { version = "0.13.0", path = "crates/lanekeep-js" }
 lanekeep-lang = { version = "0.13.0", path = "crates/lanekeep-lang" }
 lanekeep-languages = { version = "0.13.0", path = "crates/lanekeep-languages" }
+lanekeep-lang-css = { version = "0.13.0", path = "crates/lanekeep-lang-css" }
 lanekeep-lang-js = { version = "0.13.0", path = "crates/lanekeep-lang-js" }
 lanekeep-lang-go = { version = "0.13.0", path = "crates/lanekeep-lang-go" }
 lanekeep-lang-json = { version = "0.13.0", path = "crates/lanekeep-lang-json" }
 lanekeep-lang-python = { version = "0.13.0", path = "crates/lanekeep-lang-python" }
 lanekeep-lang-rust = { version = "0.13.0", path = "crates/lanekeep-lang-rust" }
+lanekeep-lang-toml = { version = "0.13.0", path = "crates/lanekeep-lang-toml" }
+lanekeep-lang-yaml = { version = "0.13.0", path = "crates/lanekeep-lang-yaml" }
 lanekeep-nodes = { version = "0.13.0", path = "crates/lanekeep-nodes" }
 lanekeep-query = { version = "0.13.0", path = "crates/lanekeep-query" }
 lanekeep-report = { version = "0.13.0", path = "crates/lanekeep-report" }
@@ -87,6 +90,9 @@ tree-sitter-python = { version = "0.25" }
 tree-sitter-go = { version = "0.25" }
 tree-sitter-rust = { version = "0.24" }
 tree-sitter-json = { version = "0.24" }
+tree-sitter-css = { version = "0.25" }
+tree-sitter-toml-ng = { version = "0.7" }
+tree-sitter-yaml = { version = "0.7" }
 streaming-iterator = { version = "0.1" }
 rquickjs = { version = "0.14", features = ["loader"] }
 # The WebAssembly component runtime rules execute on. `default-features = false` and an

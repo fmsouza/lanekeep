@@ -21,7 +21,10 @@ pub fn register_all(registry: &mut LanguageRegistry) -> Result<(), RegistryError
     lanekeep_lang_python::register_all(registry)?;
     lanekeep_lang_go::register_all(registry)?;
     lanekeep_lang_rust::register_all(registry)?;
-    lanekeep_lang_json::register_all(registry)
+    lanekeep_lang_json::register_all(registry)?;
+    lanekeep_lang_css::register_all(registry)?;
+    lanekeep_lang_toml::register_all(registry)?;
+    lanekeep_lang_yaml::register_all(registry)
 }
 
 /// A registry holding every supported language.
@@ -55,13 +58,16 @@ mod tests {
         assert_eq!(
             ids,
             [
+                "css",
                 "go",
                 "javascript",
                 "json",
                 "python",
                 "rust",
+                "toml",
                 "tsx",
-                "typescript"
+                "typescript",
+                "yaml"
             ]
         );
     }
@@ -77,6 +83,10 @@ mod tests {
             ("src/a.pyi", "python"),
             ("locales/en.json", "json"),
             (".vscode/settings.jsonc", "json"),
+            ("src/a.css", "css"),
+            ("Cargo.toml", "toml"),
+            (".github/workflows/ci.yml", "yaml"),
+            ("deploy/values.yaml", "yaml"),
         ] {
             assert_eq!(
                 registry.for_path(path).expect("matches").id().as_str(),
@@ -90,8 +100,10 @@ mod tests {
     ///
     /// Spelled out rather than inferred, so a *programming* language arriving without a
     /// resolver is still caught by the test below: an absent resolver is honest for JSON and
-    /// a gap for anything with declarations.
-    const RESOLVERLESS: [&str; 1] = ["json"];
+    /// a gap for anything with declarations. CSS is on it for a different reason than the
+    /// three data formats: its names are scoped by the cascade rather than lexically, so a
+    /// resolver would answer a question CSS does not ask (see `lanekeep-lang-css`).
+    const RESOLVERLESS: [&str; 4] = ["css", "json", "toml", "yaml"];
 
     #[test]
     fn every_programming_language_offers_a_resolver() {
@@ -102,7 +114,7 @@ mod tests {
             .collect();
         assert_eq!(
             without, RESOLVERLESS,
-            "only the data-format languages may lack a binding resolver"
+            "only the data-format and stylesheet languages may lack a binding resolver"
         );
     }
 
@@ -128,7 +140,7 @@ mod tests {
     /// And the identity is per *crate*, not per language.
     ///
     /// `typescript`, `tsx` and `javascript` all come from `lanekeep-lang-js` and share one
-    /// resolver, so they must share one identity; the other four crates contribute one each.
+    /// resolver, so they must share one identity; the other seven crates contribute one each.
     /// Asserting the count rather than only "nonzero" is what would catch every language
     /// returning the same constant.
     #[test]
@@ -137,17 +149,17 @@ mod tests {
             .languages()
             .map(|language| language.analysis_identity())
             .collect();
-        assert_eq!(identities.len(), 7, "seven languages are registered");
+        assert_eq!(identities.len(), 10, "ten languages are registered");
         identities.sort_unstable();
         identities.dedup();
         assert_eq!(
             identities.len(),
-            5,
-            "five language crates; js registers three of the seven languages"
+            8,
+            "eight language crates; js registers three of the ten languages"
         );
     }
 
-    /// Seven registered grammars, seven digests.
+    /// Ten registered grammars, ten digests.
     ///
     /// The complement of the per-field test in `lanekeep-lang`: that one proves each input
     /// reaches the hash, this one proves the real grammars differ in at least one of them.
@@ -159,9 +171,9 @@ mod tests {
             .languages()
             .map(|language| lanekeep_lang::grammar_digest(&language.grammar()))
             .collect();
-        assert_eq!(digests.len(), 7, "seven languages are registered");
+        assert_eq!(digests.len(), 10, "ten languages are registered");
         digests.sort_unstable();
         digests.dedup();
-        assert_eq!(digests.len(), 7, "two grammars share a digest");
+        assert_eq!(digests.len(), 10, "two grammars share a digest");
     }
 }
