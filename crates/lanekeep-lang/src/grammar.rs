@@ -11,8 +11,9 @@
 //! grammar was generated with and it is `None` on any grammar built for an ABI below 15.
 //! Measured over the six languages registered when this was written: `go`, `javascript`,
 //! `python` and `rust` are ABI 15 and answer `Some`; `typescript` and `tsx` are ABI 14 and
-//! answer `None`, as does `name()`. `json`, registered since, is ABI 14 as well. So the two grammars this project reads most could not be identified that way at
-//! all.
+//! answer `None`, as does `name()`. Of the four registered since, `css` is ABI 15 and `json`,
+//! `toml` and `yaml` are ABI 14, so they answer `None` too. So the two grammars this project
+//! reads most could not be identified that way at all.
 //!
 //! # What this does not catch
 //!

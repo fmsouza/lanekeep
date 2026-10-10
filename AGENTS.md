@@ -139,6 +139,9 @@ crates/
   lanekeep-lang-go      Go grammar, binding resolution
   lanekeep-lang-rust    Rust grammar, binding resolution
   lanekeep-lang-json    JSON grammar; no resolver, since JSON declares no names
+  lanekeep-lang-css     CSS grammar; no resolver, since CSS scopes names by the cascade
+  lanekeep-lang-toml    TOML grammar; no resolver
+  lanekeep-lang-yaml    YAML grammar; no resolver
   lanekeep-languages    the set of supported languages, assembled in one place
   lanekeep-types     the bounded type oracle: a node's type and symbol, from the parsed file
                      and the declaration files its imports resolve to, through tracked reads
@@ -576,6 +579,15 @@ cargo nextest run -p lanekeep-cli --all-features --no-tests=warn -E 'binary(type
 
 `-p <crate>` in place of `--workspace` because a filterset that names one binary has no reason
 to build the other ninety-two. The count in the summary is the thing to read.
+
+**And calling cargo directly leaves behind what the `justfile` exports, so on a fresh checkout it
+can fail in a crate you did not name.** The `justfile` exports `GOTOOLCHAIN = go1.26.5` for every
+recipe, because TinyGo 0.41.1 refuses a newer host `go`. `go-builtins.wasm` is not committed, so
+the first build of `lanekeep-rules` on a checkout runs TinyGo from `crates/lanekeep-rules/build.rs`
+— and `lanekeep-cli` depends on it, so the command above, with a host go1.27 and no `GOTOOLCHAIN`
+in the shell, failed on 2026-10-10 with `failed to run custom build command for lanekeep-rules`
+over `requires go version 1.19 through 1.26, got go1.27`, about a crate the filterset never named.
+Export `GOTOOLCHAIN=go1.26.5` in the shell that runs it, or build once through `just test` first.
 
 **nextest runs with `--no-tests=warn`.** Crate skeletons exist ahead of their milestones.
 Tighten this to `fail` once M0 lands and every crate has behavior to assert.

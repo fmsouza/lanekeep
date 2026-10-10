@@ -218,7 +218,7 @@ pub fn parse(source: &str) -> Suppressions {
             Scope::NextLine => NEXT_LINE,
             Scope::File => WHOLE_FILE,
         };
-        let rest = text.get(at + token.len()..).unwrap_or_default();
+        let rest = body_of(text, at, token.len());
 
         match parse_body(scope, rest, line, column) {
             Ok(suppression) => found.valid.push(suppression),
@@ -268,6 +268,45 @@ fn standalone(text: &str, token: &str) -> Option<usize> {
         from = at + token.len();
     }
     None
+}
+
+/// The text after the token at `at` that belongs to the directive: the rest of its comment.
+///
+/// A line comment runs to the end of the line, so that is the whole of it. A block comment
+/// does not, and in a language whose only comment is `/* */` — CSS — every directive is in
+/// one (#283). Read to the end of the line, its closer became part of the body: the reason
+/// ended in `*/`, and an expiry read as `2026-12-31 */` was unreadable, so the directive was
+/// malformed.
+///
+/// Two cases, by what can be seen on this line:
+///
+/// - **The directive opens its own block comment** — the token follows `/*` with nothing
+///   between them but whitespace and the opener's own decoration (`/**`, `/*!`): the body ends
+///   at the first `*/` after the token, and anything after it on the line is code.
+/// - **Otherwise**, a `*/` ending the line is dropped. That is the closing line of a block
+///   comment opened on an earlier one.
+///
+/// Not "end at the first `*/`" everywhere. In a line comment `*/` is just text, and a reason
+/// mentioning a glob like `src/**/x` would take an `expires:` after it along — a directive
+/// whose expiry vanished never expires, which is the one outcome an expiry exists to prevent.
+/// For the same reason an earlier `/*` on the line is not enough on its own: in
+/// `exclude = ["target/*"] # …` it is a glob in a value, and the comment holding the directive
+/// is the `#` one.
+fn body_of(text: &str, at: usize, token_len: usize) -> &str {
+    let rest = text.get(at + token_len..).unwrap_or_default();
+    let before = text.get(..at).unwrap_or_default();
+    let own_block = before.rfind("/*").is_some_and(|open| {
+        before
+            .get(open + 2..)
+            .unwrap_or_default()
+            .trim_start_matches(['*', '!'])
+            .trim()
+            .is_empty()
+    });
+    if own_block && let Some(end) = rest.find("*/") {
+        return rest.get(..end).unwrap_or_default();
+    }
+    rest.trim_end().strip_suffix("*/").unwrap_or(rest)
 }
 
 const fn is_word(c: char) -> bool {
@@ -503,6 +542,101 @@ mod tests {
                 day: 31
             })
         );
+    }
+
+    const DEC_31: Option<Date> = Some(Date {
+        year: 2026,
+        month: 12,
+        day: 31,
+    });
+
+    /// CSS has no line comment, so a directive there sits inside `/* */` (#283). The closer is
+    /// the comment's, not the directive's: read as part of the body it made the expiry
+    /// `2026-12-31 */`, and so the whole directive malformed.
+    #[test]
+    fn a_directive_ends_where_its_block_comment_closes() {
+        let found = only(&format!(
+            "/* {NEXT_LINE} local/a reason: legacy expires: 2026-12-31 */\n.a {{}}\n"
+        ));
+        assert_eq!(found.reason, "legacy");
+        assert_eq!(found.expires, DEC_31);
+
+        let found = only(&format!("/* {NEXT_LINE} local/a reason: legacy */\n"));
+        assert_eq!(
+            found.reason, "legacy",
+            "the closer is not part of the reason"
+        );
+    }
+
+    /// What follows the closer on the same line is code, not the directive's prose.
+    #[test]
+    fn code_after_the_closing_delimiter_is_not_read() {
+        let found = only(&format!(
+            "/* {NEXT_LINE} local/a reason: legacy */ .a {{ color: red; }}\n"
+        ));
+        assert_eq!(found.reason, "legacy");
+        assert_eq!(found.rules, vec![rule("local/a")]);
+    }
+
+    /// The closing line of a block comment opened on an earlier line: no `/*` on this line to
+    /// see, so only a trailing closer is dropped.
+    #[test]
+    fn a_trailing_closer_on_a_continuation_line_is_dropped() {
+        let found = only(&format!(
+            "/*\n   {NEXT_LINE} local/a reason: legacy expires: 2026-12-31 */\n.a {{}}\n"
+        ));
+        assert_eq!(found.reason, "legacy");
+        assert_eq!(found.expires, DEC_31);
+    }
+
+    /// The reason a line comment is not cut at its first `*/`: a glob in the reason would take
+    /// the expiry with it, and a directive whose expiry vanished would never expire.
+    #[test]
+    fn a_closer_inside_a_line_comment_keeps_the_expiry() {
+        let found = only(&format!(
+            "// {NEXT_LINE} local/a reason: matches src/**/x expires: 2026-12-31\n"
+        ));
+        assert_eq!(found.reason, "matches src/**/x");
+        assert_eq!(found.expires, DEC_31);
+    }
+
+    /// A `/*` that is not the directive's own comment — a glob in a value or a call ahead of a
+    /// line comment — must not cut the body at a `*/` in the reason, or the expiry after it is
+    /// lost and the directive never expires.
+    #[test]
+    fn a_glob_before_a_line_comment_does_not_open_a_block() {
+        for prefix in [
+            "exclude = [\"target/*\"] # ",
+            "paths: [\"src/*\"]  # ",
+            "const g = import.meta.glob('./*.ts') // ",
+        ] {
+            let found = only(&format!(
+                "{prefix}{NEXT_LINE} local/a reason: covers src/**/gen expires: 2026-12-31\n"
+            ));
+            assert_eq!(found.reason, "covers src/**/gen", "{prefix}");
+            assert_eq!(found.expires, DEC_31, "{prefix}");
+        }
+    }
+
+    /// The opener is the directive's own when only the comment's own decoration lies between
+    /// them: `/**` and `/*!` open a block comment as `/*` does.
+    #[test]
+    fn a_decorated_opener_is_still_the_directives_own() {
+        for opener in ["/**", "/*!", "/*"] {
+            let found = only(&format!(
+                "{opener} {NEXT_LINE} local/a reason: legacy */ .a {{ color: red; }}\n"
+            ));
+            assert_eq!(found.reason, "legacy", "{opener}");
+        }
+    }
+
+    /// A block comment already closed before the token is not the one the directive is in.
+    #[test]
+    fn a_block_comment_closed_before_the_token_does_not_count() {
+        let found = only(&format!(
+            "/* note */ // {NEXT_LINE} local/a reason: see */ the docs\n"
+        ));
+        assert_eq!(found.reason, "see */ the docs");
     }
 
     #[test]

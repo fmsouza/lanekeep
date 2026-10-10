@@ -217,6 +217,73 @@ fn staged_checks_only_the_staged_json_file() {
     assert!(!combined.contains("locales/fr.json"), "{combined}");
 }
 
+/// One rule per stylesheet and manifest language (#283), each file's grammar decided by its
+/// extension: `--staged` checks the staged file of each language and none of the unstaged ones.
+#[test]
+fn staged_checks_only_the_staged_css_toml_and_yaml_files() {
+    fn rule(id: &str, language: &str, query: &str) -> String {
+        format!(
+            "import {{ defineRule }} from 'lanekeep'\n\
+             export default defineRule({{\n\
+               id: 'local/{id}',\n\
+               language: ['{language}'],\n\
+               card: {{ message: 'not this', remediation: 'something else', \
+                        examples: {{ bad: 'a', good: 'b' }} }},\n\
+               query: {query:?},\n\
+               check(ctx, m) {{ ctx.report(m.n) }},\n\
+             }})\n"
+        )
+    }
+    let css = rule(
+        "no-float",
+        "css",
+        "(declaration (property_name) @n (#eq? @n \"float\"))",
+    );
+    let toml = rule("no-todo", "toml", "(pair (bare_key) @n (#eq? @n \"TODO\"))");
+    let yaml = rule(
+        "no-todo-yaml",
+        "yaml",
+        "(block_mapping_pair key: (flow_node (plain_scalar (string_scalar) @n)) \
+         (#eq? @n \"TODO\"))",
+    );
+    let repo = Repo::new(
+        "staged-data",
+        r#"{"include": ["conf/**"],
+            "rules": ["./rules/css.ts", "./rules/toml.ts", "./rules/yaml.ts"]}"#,
+        &[
+            ("rules/css.ts", &css),
+            ("rules/toml.ts", &toml),
+            ("rules/yaml.ts", &yaml),
+            ("conf/a.css", ".a { float: left; }\n"),
+            ("conf/b.css", ".b { float: left; }\n"),
+            ("conf/a.toml", "TODO = 1\n"),
+            ("conf/b.toml", "TODO = 1\n"),
+            ("conf/a.yaml", "TODO: 1\n"),
+            ("conf/b.yml", "TODO: 1\n"),
+        ],
+    );
+
+    // Every file violates; only the `a` of each language is staged.
+    for (path, contents) in [
+        ("conf/a.css", ".a { float: right; }\n"),
+        ("conf/a.toml", "TODO = 2\n"),
+        ("conf/a.yaml", "TODO: 2\n"),
+    ] {
+        repo.write(path, contents);
+        repo.git(&["add", path]);
+    }
+
+    let output = repo.check(&["--staged"]);
+    let combined = describe(&output);
+    assert_eq!(violation_count(&output), 3, "{combined}");
+    for staged in ["conf/a.css", "conf/a.toml", "conf/a.yaml"] {
+        assert!(combined.contains(staged), "{staged}: {combined}");
+    }
+    for unstaged in ["conf/b.css", "conf/b.toml", "conf/b.yml"] {
+        assert!(!combined.contains(unstaged), "{unstaged}: {combined}");
+    }
+}
+
 #[test]
 fn no_selection_checks_everything() {
     let repo = Repo::new(

@@ -476,7 +476,17 @@ export type Node = number & { readonly __lanekeepNode: unique symbol }
 
 const LANGUAGE_ID: &str = "\
 /** A language lanekeep can parse. */
-export type LanguageId = 'typescript' | 'tsx' | 'javascript' | 'python' | 'go' | 'rust' | 'json'
+export type LanguageId =
+  | 'typescript'
+  | 'tsx'
+  | 'javascript'
+  | 'python'
+  | 'go'
+  | 'rust'
+  | 'json'
+  | 'css'
+  | 'toml'
+  | 'yaml'
 ";
 
 const SEVERITY: &str = "\

@@ -913,6 +913,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lanekeep-lang-css"
+version = "0.13.0"
+dependencies = [
+ "blake3",
+ "lanekeep-lang",
+ "tree-sitter",
+ "tree-sitter-css",
+]
+
+[[package]]
 name = "lanekeep-lang-go"
 version = "0.13.0"
 dependencies = [
@@ -966,15 +976,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "lanekeep-lang-toml"
+version = "0.13.0"
+dependencies = [
+ "blake3",
+ "lanekeep-lang",
+ "tree-sitter",
+ "tree-sitter-toml-ng",
+]
+
+[[package]]
+name = "lanekeep-lang-yaml"
+version = "0.13.0"
+dependencies = [
+ "blake3",
+ "lanekeep-lang",
+ "tree-sitter",
+ "tree-sitter-yaml",
+]
+
+[[package]]
 name = "lanekeep-languages"
 version = "0.13.0"
 dependencies = [
  "lanekeep-lang",
+ "lanekeep-lang-css",
  "lanekeep-lang-go",
  "lanekeep-lang-js",
  "lanekeep-lang-json",
  "lanekeep-lang-python",
  "lanekeep-lang-rust",
+ "lanekeep-lang-toml",
+ "lanekeep-lang-yaml",
 ]
 
 [[package]]
@@ -1671,6 +1704,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-css"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5cbc5e18f29a2c6d6435891f42569525cf95435a3e01c2f1947abcde178686f"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-go"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1721,6 +1764,26 @@ name = "tree-sitter-rust"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-toml-ng"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9adc2c898ae49730e857d75be403da3f92bb81d8e37a2f918a08dd10de5ebb1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-yaml"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53c223db85f05e34794f065454843b0668ebc15d240ada63e2b5939f43ce7c97"
 dependencies = [
  "cc",
  "tree-sitter-language",

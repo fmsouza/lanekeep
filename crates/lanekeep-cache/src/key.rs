@@ -31,7 +31,14 @@ use lanekeep_core::ContentHash;
 /// directory listing is recorded as `listed(hash)` or `unlisted`, so validation asks the
 /// filesystem the question the rule asked. An older binary reading the new tags would refuse
 /// the entry anyway; the bump makes it miss by key rather than by a decode failure.
-pub const FORMAT_VERSION: u32 = 7;
+///
+/// 7 → 8 changed what an entry records for the same bytes, as 5 → 6 did: an entry carries a
+/// file's parsed suppression directives (architecture §10), and a directive inside a block
+/// comment now ends where the comment closes (#283). Before, `/* … expires: 2026-12-31 */`
+/// was recorded as malformed and `reason: legacy */` as a reason ending in the closer; an
+/// entry holding either would replay the old verdict. The language registry growing in the
+/// same change moves every key anyway, but that is a coincidence this does not lean on.
+pub const FORMAT_VERSION: u32 = 8;
 
 /// Everything about a run that every file's key shares.
 ///

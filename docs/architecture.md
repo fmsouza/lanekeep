@@ -101,6 +101,9 @@ lanekeep/
     lanekeep-lang-go/    # Go grammar + binding resolution
     lanekeep-lang-rust/  # Rust grammar + binding resolution
     lanekeep-lang-json/  # JSON grammar, no resolver (#283)
+    lanekeep-lang-css/   # CSS grammar, no resolver (#283)
+    lanekeep-lang-toml/  # TOML grammar, no resolver (#283)
+    lanekeep-lang-yaml/  # YAML grammar, no resolver (#283)
     lanekeep-languages/  # the set of supported languages, assembled in one place
     lanekeep-types/      # the bounded type oracle: a node's type and symbol, from one
                          #   parsed file. Not lanekeep-types-gen below, which renders
@@ -165,11 +168,22 @@ pub trait Language {
 
 Implement this on day one even though only `lanekeep-lang-js` exists. It is cheap now and impossible to retrofit.
 
-### Data-format languages
+### Data-format and stylesheet languages
 
-`json` is the first language with **no binding resolver** (#283). JSON declares no names, so `resolver` keeps its `None` default and `ctx.bindingKind`, `ctx.resolvesToImport` and the type oracle answer nothing for a JSON node — the honest answer, which the trait's doc already allows. `lanekeep-languages` spells out the languages permitted to lack one, so a *programming* language arriving without a resolver still fails a test. The crate still derives an `analysis_identity` from its own sources, because it decides which extensions are JSON (`.json`, `.jsonc`; not `.json5`, a different grammar), and that decides which files a `json` rule runs on.
+`json`, `css`, `toml` and `yaml` are the languages with **no binding resolver** (#283), each its own crate with its own grammar dependency and its own `analysis_identity`, as the programming languages are: a grammar is bumped, audited and published on its own, and one crate for all four would tie CSS — which is not a data format — to three that are. (Not for cache isolation: `analysis_hash` is a global prefix field, so a change to any language crate's sources invalidates every entry either way.) TOML and YAML, like JSON, declare no names. CSS does name things — custom properties, keyframes, layers — but which `--accent` a `var(--accent)` reads is decided by the cascade against a document, not by lexical scope, so a resolver answering "where was this declared" from one file would answer a question CSS does not ask.
 
-Three facts about it a rule author meets:
+| Language | Extensions | Comment, and so where a directive goes | A known parse fault |
+| --- | --- | --- | --- |
+| `css` | `.css` | `/* */` only (the grammar also accepts `//` as `js_comment`, which is not CSS) | Sass syntax, `$x: 1px;` — so `.scss`, `.sass`, `.less` are not claimed |
+| `json` | `.json`, `.jsonc` | none in JSON; `//` and `/* */` in JSONC | a trailing comma |
+| `toml` | `.toml` | `#` | a key with no value |
+| `yaml` | `.yaml`, `.yml` | `#` | an unclosed flow collection |
+
+A language is chosen by extension alone (`LanguageRegistry::for_path`), so `Cargo.lock` and `Pipfile`, TOML by content, are not `toml` files. A YAML file's root is `stream`, with one `document` per `---`-separated document.
+
+`json` was the first of them. JSON declares no names, so `resolver` keeps its `None` default and `ctx.bindingKind`, `ctx.resolvesToImport` and the type oracle answer nothing for a JSON node — the honest answer, which the trait's doc already allows. `lanekeep-languages` spells out the languages permitted to lack one, so a *programming* language arriving without a resolver still fails a test. The crate still derives an `analysis_identity` from its own sources, because it decides which extensions are JSON (`.json`, `.jsonc`; not `.json5`, a different grammar), and that decides which files a `json` rule runs on.
+
+Three facts about JSON a rule author meets — the first holds for all four:
 
 - **Nothing parses JSON unless a rule asks.** A file is parsed only when an admitted rule targets its language, so an existing config whose `include` happens to cover `.json` files gained no parsing, no `lanekeep/parse` reports and no violations when the grammar was registered.
 - **Comments, and so suppressions.** JSON has no comment syntax. `tree-sitter-json` accepts `//` and `/* */` as extras anyway, which is what lets a JSONC file (VS Code settings, a `tsconfig.json`) parse, and since directives are found by a text scan (§10), a directive in such a comment works. In a strict-JSON file a comment would break every other consumer of the file, so a violation there is acknowledged through the rule's options or a path `exclude`, not a directive.
@@ -203,7 +217,7 @@ A rule declares metadata, a tree-sitter query that gates execution — one per l
 
 Neither is privileged. A component is held to the same validation a TypeScript rule is — namespace, card, queries, `has-check` — by the same code, and both engines run in one pass over one corpus. Which form a rule takes is invisible to a config: `lanekeep/no-unwrap` names the rule, not its implementation, so a rule migrating from one to the other requires no config change.
 
-**A component's source language is not part of the arrangement, and four of the sixteen built-ins are components today.** Two are written in Rust and compiled with `cargo component` — `docs/authoring-rust-rules.md` is how one is written. Two are written in Go and compiled with TinyGo into one shared component — `docs/authoring-go-rules.md`, and they are the migration that shows the arrangement holding in the harder direction: their TypeScript is deleted, so a Go rule is the component or it is nothing. The other twelve are QuickJS modules, and three of those — `duplicate-implementation`, `no-restricted-calls`, `no-assertionless-test` — each target five of the seven registered languages (every one but JavaScript and JSON) through the one-query-per-grammar form above, which is that mechanism carrying production weight rather than a toy example. For one release cycle the split read differently: the four TypeScript-inspecting built-ins were compiled ahead of time by `componentize-js` into one shared component (§5.2), sources frozen byte-for-byte and their four test files passing unmodified — which is what proved that which engine runs a rule and which language it was written in are independent questions — and were then reverted to modules by measurement (§15.1, §16 M5). The proof stands; the shipping decision moved.
+**A component's source language is not part of the arrangement, and four of the sixteen built-ins are components today.** Two are written in Rust and compiled with `cargo component` — `docs/authoring-rust-rules.md` is how one is written. Two are written in Go and compiled with TinyGo into one shared component — `docs/authoring-go-rules.md`, and they are the migration that shows the arrangement holding in the harder direction: their TypeScript is deleted, so a Go rule is the component or it is nothing. The other twelve are QuickJS modules, and three of those — `duplicate-implementation`, `no-restricted-calls`, `no-assertionless-test` — each target five of the ten registered languages (every programming language but JavaScript) through the one-query-per-grammar form above, which is that mechanism carrying production weight rather than a toy example. For one release cycle the split read differently: the four TypeScript-inspecting built-ins were compiled ahead of time by `componentize-js` into one shared component (§5.2), sources frozen byte-for-byte and their four test files passing unmodified — which is what proved that which engine runs a rule and which language it was written in are independent questions — and were then reverted to modules by measurement (§15.1, §16 M5). The proof stands; the shipping decision moved.
 
 The TypeScript form is the one everything below is written in, because it is the one a project starts from.
 
@@ -948,7 +962,9 @@ minWidth: 44,
 
 **A directive that does not work says so.** A missing `reason:`, a bare rule id, an unreadable `expires:`, a directive naming no rules — each is reported as a violation of `lanekeep/suppression` rather than skipped. The failure this guards against is a comment that looks like it silences something, does not, and never says so: the author moves on believing the violation is handled.
 
-Directives are found by scanning for a standalone token rather than by walking comments in the parse tree. That is one pass over bytes already in memory and it works on a file that failed to parse. The cost is that a directive inside a string literal counts, which is a strange thing to write and shows up as a suppression that does nothing.
+Directives are found by scanning for a standalone token rather than by walking comments in the parse tree. That is one pass over bytes already in memory and it works on a file that failed to parse — and it is why a directive works in every language's comment syntax with no per-language code: `//`, `#`, or `/* */`. The cost is that a directive inside a string literal counts, which is a strange thing to write and shows up as a suppression that does nothing.
+
+**A directive in a block comment ends where the comment does.** CSS has only `/* */`, so there every directive is in one (#283). When the directive opens its own comment — the token follows `/*` (or `/**`, `/*!`) with only whitespace between — the directive's text stops at the first `*/` after it, and anything after that on the line is code; otherwise a `*/` ending the line — the close of a comment opened on an earlier line — is dropped. Read to the end of the line instead, `expires: 2027-01-01 */` was unreadable and the directive malformed. It is not "stop at the first `*/`" everywhere: in a line comment `*/` is ordinary text, and a reason mentioning `src/**/x` would take a following `expires:` with it — a directive whose expiry vanished never expires. Nor is any earlier `/*` on the line enough: in `exclude = ["target/*"] # …` it is a glob, and the directive's comment is the `#` one. One case stays loud rather than right: a directive on the closing line of a multi-line block comment with code after the `*/` reads that code into its reason, and with an `expires:` is reported malformed.
 
 **An expired directive is reported but still silences.** Suddenly reporting everything it covered would turn a deadline into an avalanche on the day it passed. The expiry is a deadline in the ordinary sense: a directive dated the 31st still holds on the 31st.
 
@@ -1484,7 +1500,7 @@ its wheel is written. The floor survives the runtime.
 
 ## 16. Milestones
 
-**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust, and reads JSON; ships sixteen built-in rules, four of them as WebAssembly components (two Rust, two Go) and twelve as QuickJS modules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
+**Every milestone below is delivered.** lanekeep checks TypeScript, TSX, JavaScript, Python, Go and Rust, and reads CSS, JSON, TOML and YAML; ships sixteen built-in rules, four of them as WebAssembly components (two Rust, two Go) and twelve as QuickJS modules; and is distributed through npm, PyPI, crates.io, Homebrew and as a Go module, one build feeding all five.
 
 Two things named here are still outstanding, and each is stated where it belongs rather than only here: the §15 performance budgets are targets that are not all met, and M5's authoring path compiles no rule that ships today — the four that took it were reverted — and no project's own rules on demand either.
 

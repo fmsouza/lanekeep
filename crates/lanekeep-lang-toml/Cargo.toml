@@ -1,0 +1,32 @@
+[package]
+name = "lanekeep-lang-toml"
+description = "TOML language support for lanekeep."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+lanekeep-lang = { workspace = true }
+tree-sitter = { workspace = true }
+# `-ng`, from tree-sitter-grammars: the unsuffixed `tree-sitter-toml` is a fork last released
+# in 2022.
+tree-sitter-toml-ng = { workspace = true }
+
+[build-dependencies]
+blake3 = { workspace = true }
+
+[lints]
+workspace = true
+
+# `blake3` is used only by `build.rs`, which hashes this crate's own `src/` into
+# `analysis_identity`. cargo-machete does not scan build scripts, so it sees a
+# `[build-dependencies]` entry nothing in `src/` or `tests/` references and calls it unused.
+# `crates/lanekeep-lang-go/Cargo.toml` carries the same stanza for the same reason.
+[package.metadata.cargo-machete]
+ignored = ["blake3"]
