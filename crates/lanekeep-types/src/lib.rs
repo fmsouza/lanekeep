@@ -34,6 +34,7 @@ mod provider;
 mod resolve;
 mod table;
 pub mod tsc;
+mod tsconfig;
 mod types;
 
 pub use builtin::BuiltinProvider;

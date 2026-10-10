@@ -36,6 +36,8 @@ use std::path::Path;
 use lanekeep_core::FilePath;
 use lanekeep_core::files::{FileAccess, normalize};
 
+use crate::tsconfig::{self, Lookup};
+
 /// Extensions tried for a relative specifier, in order.
 ///
 /// The source file before the declaration file: a `.d.ts` beside a `.ts` in one tree is a
@@ -91,6 +93,15 @@ pub fn resolve_specifier(files: &FileAccess, from: &FilePath, specifier: &str) -
 
 /// A specifier resolved against the importing file's own directory.
 fn relative(files: &FileAccess, from: &FilePath, specifier: &str) -> Option<FilePath> {
+    module_at(files, &join(parent_of(from.as_str()), specifier))
+}
+
+/// The module a project-relative path names, probed the way a relative specifier is.
+///
+/// Shared by a relative specifier and by every candidate a tsconfig alias produces, so the
+/// two resolve one path identically — the same eight suffixes, in the same order, recorded the
+/// same way.
+fn module_at(files: &FileAccess, path: &str) -> Option<FilePath> {
     // TypeScript's ESM spelling names the *emitted* file; the declaration sits at the same
     // stem. Stripping the suffix here rather than adding four more probe entries keeps the
     // recorded dependency list short, which is a cache-entry-size decision as much as a
@@ -98,10 +109,10 @@ fn relative(files: &FileAccess, from: &FilePath, specifier: &str) -> Option<File
     // `moduleResolution: node16` requires for one — and it strips like `.js` does.
     let stem = [".js", ".jsx", ".mjs", ".cjs"]
         .iter()
-        .find_map(|suffix| specifier.strip_suffix(suffix))
-        .unwrap_or(specifier);
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .unwrap_or(path);
 
-    let base = within_root(&join(parent_of(from.as_str()), stem))?;
+    let base = within_root(stem)?;
     for suffix in RELATIVE_SUFFIXES {
         let candidate = format!("{base}{suffix}");
         if files.exists(&candidate).unwrap_or(false) {
@@ -111,8 +122,25 @@ fn relative(files: &FileAccess, from: &FilePath, specifier: &str) -> Option<File
     None
 }
 
+/// The module a `paths` or `baseUrl` candidate names.
+///
+/// A candidate already naming a TypeScript file — `"@app": ["./src/main.ts"]` — is tried as
+/// written first, which is what TypeScript does with a substitution carrying an extension; then
+/// it is probed like any relative path. Only a TypeScript extension earns the extra probe: a
+/// `.js` spelling is reached through its stem anyway, and anything else is not a file this
+/// provider reads.
+fn alias_target(files: &FileAccess, candidate: &str) -> Option<FilePath> {
+    let names_a_file = [".ts", ".tsx", ".mts", ".cts"]
+        .iter()
+        .any(|extension| candidate.ends_with(extension));
+    if names_a_file && files.exists(candidate).unwrap_or(false) {
+        return Some(FilePath::new(candidate));
+    }
+    module_at(files, candidate)
+}
+
 /// Everything before the last `/`, or the empty string for a file at the root.
-fn parent_of(path: &str) -> &str {
+pub(crate) fn parent_of(path: &str) -> &str {
     match path.rfind('/') {
         Some(at) => &path[..at],
         None => "",
@@ -120,7 +148,7 @@ fn parent_of(path: &str) -> &str {
 }
 
 /// Join two project-relative fragments with `/`, tolerating an empty left side.
-fn join(left: &str, right: &str) -> String {
+pub(crate) fn join(left: &str, right: &str) -> String {
     if left.is_empty() {
         right.to_owned()
     } else {
@@ -144,8 +172,39 @@ fn within_root(path: &str) -> Option<String> {
     Some(normalized)
 }
 
-/// A bare specifier, resolved by walking `node_modules` upward and stopping at the root.
+/// A bare specifier: through the nearest `tsconfig.json`'s `paths` and `baseUrl`, then
+/// `node_modules` — TypeScript's order.
+///
+/// A file under `node_modules` skips the tsconfig. Its bare imports are the package's own, and
+/// the config nearest it is the package's development config or the project's, neither of
+/// which a published declaration file was written against. TypeScript does apply the
+/// program's `paths` there; a `.d.ts` that resolves only through a consumer's alias is not a
+/// shape worth a tsconfig walk on every package hop. See `docs/type-aware-rules.md`.
 fn bare(files: &FileAccess, from: &FilePath, specifier: &str) -> Option<FilePath> {
+    let in_a_package = from
+        .as_str()
+        .split('/')
+        .any(|segment| segment == "node_modules");
+    if !in_a_package {
+        match tsconfig::nearest(files, parent_of(from.as_str())) {
+            // See the `tsconfig` module: falling through to `node_modules` here could answer
+            // with a different file than the one the alias names.
+            Lookup::Unreadable => return None,
+            Lookup::Found(options) => {
+                for candidate in options.candidates(specifier) {
+                    if let Some(found) = alias_target(files, &candidate) {
+                        return Some(found);
+                    }
+                }
+            }
+            Lookup::Absent => {}
+        }
+    }
+    node_modules(files, from, specifier)
+}
+
+/// A bare specifier, resolved by walking `node_modules` upward and stopping at the root.
+fn node_modules(files: &FileAccess, from: &FilePath, specifier: &str) -> Option<FilePath> {
     let (package, subpath) = split_specifier(specifier)?;
     let types_package = at_types_name(&package);
 
