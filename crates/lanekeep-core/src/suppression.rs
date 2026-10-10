@@ -280,21 +280,30 @@ fn standalone(text: &str, token: &str) -> Option<usize> {
 ///
 /// Two cases, by what can be seen on this line:
 ///
-/// - **A `/*` opened before the token and not yet closed**: the body ends at the first `*/`
-///   after the token, and anything after it on the line is code.
+/// - **The directive opens its own block comment** — the token follows `/*` with nothing
+///   between them but whitespace and the opener's own decoration (`/**`, `/*!`): the body ends
+///   at the first `*/` after the token, and anything after it on the line is code.
 /// - **Otherwise**, a `*/` ending the line is dropped. That is the closing line of a block
 ///   comment opened on an earlier one.
 ///
 /// Not "end at the first `*/`" everywhere. In a line comment `*/` is just text, and a reason
 /// mentioning a glob like `src/**/x` would take an `expires:` after it along — a directive
 /// whose expiry vanished never expires, which is the one outcome an expiry exists to prevent.
+/// For the same reason an earlier `/*` on the line is not enough on its own: in
+/// `exclude = ["target/*"] # …` it is a glob in a value, and the comment holding the directive
+/// is the `#` one.
 fn body_of(text: &str, at: usize, token_len: usize) -> &str {
     let rest = text.get(at + token_len..).unwrap_or_default();
     let before = text.get(..at).unwrap_or_default();
-    let in_open_block = before
-        .rfind("/*")
-        .is_some_and(|open| !before.get(open + 2..).unwrap_or_default().contains("*/"));
-    if in_open_block && let Some(end) = rest.find("*/") {
+    let own_block = before.rfind("/*").is_some_and(|open| {
+        before
+            .get(open + 2..)
+            .unwrap_or_default()
+            .trim_start_matches(['*', '!'])
+            .trim()
+            .is_empty()
+    });
+    if own_block && let Some(end) = rest.find("*/") {
         return rest.get(..end).unwrap_or_default();
     }
     rest.trim_end().strip_suffix("*/").unwrap_or(rest)
@@ -589,6 +598,36 @@ mod tests {
         ));
         assert_eq!(found.reason, "matches src/**/x");
         assert_eq!(found.expires, DEC_31);
+    }
+
+    /// A `/*` that is not the directive's own comment — a glob in a value or a call ahead of a
+    /// line comment — must not cut the body at a `*/` in the reason, or the expiry after it is
+    /// lost and the directive never expires.
+    #[test]
+    fn a_glob_before_a_line_comment_does_not_open_a_block() {
+        for prefix in [
+            "exclude = [\"target/*\"] # ",
+            "paths: [\"src/*\"]  # ",
+            "const g = import.meta.glob('./*.ts') // ",
+        ] {
+            let found = only(&format!(
+                "{prefix}{NEXT_LINE} local/a reason: covers src/**/gen expires: 2026-12-31\n"
+            ));
+            assert_eq!(found.reason, "covers src/**/gen", "{prefix}");
+            assert_eq!(found.expires, DEC_31, "{prefix}");
+        }
+    }
+
+    /// The opener is the directive's own when only the comment's own decoration lies between
+    /// them: `/**` and `/*!` open a block comment as `/*` does.
+    #[test]
+    fn a_decorated_opener_is_still_the_directives_own() {
+        for opener in ["/**", "/*!", "/*"] {
+            let found = only(&format!(
+                "{opener} {NEXT_LINE} local/a reason: legacy */ .a {{ color: red; }}\n"
+            ));
+            assert_eq!(found.reason, "legacy", "{opener}");
+        }
     }
 
     /// A block comment already closed before the token is not the one the directive is in.

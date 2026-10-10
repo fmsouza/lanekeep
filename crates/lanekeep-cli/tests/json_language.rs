@@ -214,7 +214,11 @@ fn an_unknown_language_lists_json_as_known() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown language `scss`"), "{stderr}");
-    for known in ["css", "json", "toml", "yaml"] {
-        assert!(stderr.contains(known), "{known}: {stderr}");
-    }
+    // The whole list, not each name: `css` alone would be found inside `scss` above.
+    assert!(
+        stderr.contains(
+            "known languages: css, go, javascript, json, python, rust, toml, tsx, typescript, yaml"
+        ),
+        "{stderr}"
+    );
 }
