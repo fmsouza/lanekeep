@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(config)* bound ruleset evaluation by the global budget, per thread ([#308](https://github.com/fmsouza/lanekeep/pull/308))
 - *(lang-js)* vendor a TypeScript grammar that reads two valid forms ([#301](https://github.com/fmsouza/lanekeep/pull/301))
 - *(engine)* name the run, not a rule, when the global budget is spent ([#305](https://github.com/fmsouza/lanekeep/pull/305))
+- *(deps)* wasmtime 48.0.4 for five RUSTSEC advisories; MSRV 1.94 -> 1.95 ([#298](https://github.com/fmsouza/lanekeep/pull/298))
 
 ## [0.12.0](https://github.com/fmsouza/lanekeep/compare/v0.11.0...v0.12.0) - 2026-09-28
 
