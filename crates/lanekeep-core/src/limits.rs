@@ -28,8 +28,28 @@ use std::time::{Duration, Instant};
 /// Default budget for a single handler invocation.
 pub const DEFAULT_RULE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Default wall-clock budget for an entire run.
+/// Default wall-clock budget for an entire run, before the per-file allowance.
+///
+/// The floor of [`Limits::run_budget`] when nobody set a budget, and the whole of it for
+/// config load, which runs before any file has been counted.
 pub const DEFAULT_GLOBAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What the default run budget grows by for each file the run is given (#290).
+///
+/// A fixed fifteen seconds had no headroom: the budget is wall-clock time, a loaded machine
+/// spends it faster than an idle one, and a large corpus needs more of it. Measured on
+/// 2026-10-10 at `f41f91a`, `--no-cache` on a fourteen-core machine other work was loading:
+/// lanekeep's own self-check, 236 files under 17 rules, took 9.2 s of wall clock and 27 s of
+/// CPU; a 7,327-file React Native app under 32 rules took 22.1 s and 99.6 s. The second would
+/// have failed the old default outright. A hundred milliseconds a file lets either finish at
+/// the speed of one idle core — about where heavy contention leaves a parallel run — while
+/// staying two hundred times under the aggregate the global budget exists to stop, a thousand rules at
+/// twenty milliseconds each.
+///
+/// The allowance depends on nothing but the length of the file list, which is a function of
+/// the corpus, the config and the selection flags, so identical input gets an identical
+/// budget, and a cold and a warm run get the same one because cache hits are counted too.
+pub const DEFAULT_GLOBAL_TIMEOUT_PER_FILE: Duration = Duration::from_millis(100);
 
 /// Default memory ceiling per JavaScript runtime, which means per worker.
 pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -53,11 +73,19 @@ pub struct Limits {
     /// comes from the level that can identify the cause.
     pub rule_timeout: Duration,
 
-    /// Wall-clock budget for the whole run.
+    /// Wall-clock budget for the whole run — the floor of it, when the default is in force.
     ///
     /// The backstop for when no single invocation is pathological but the aggregate is —
-    /// a thousand rules each taking twenty milliseconds.
+    /// a thousand rules each taking twenty milliseconds. A run's actual budget is
+    /// [`Limits::run_budget`]; config load, which counts no files, uses this alone.
     pub global_timeout: Duration,
+
+    /// What the run budget grows by per file the run is given.
+    ///
+    /// [`DEFAULT_GLOBAL_TIMEOUT_PER_FILE`] by default, and zero once a budget is set
+    /// explicitly through [`Limits::with_global_timeout`] — a number a user wrote down is the
+    /// budget, not a floor under it.
+    pub global_timeout_per_file: Duration,
 
     /// Budget for host-side type-provider work across the whole run.
     ///
@@ -82,6 +110,7 @@ impl Default for Limits {
         Self {
             rule_timeout: DEFAULT_RULE_TIMEOUT,
             global_timeout: DEFAULT_GLOBAL_TIMEOUT,
+            global_timeout_per_file: DEFAULT_GLOBAL_TIMEOUT_PER_FILE,
             analysis_timeout: DEFAULT_ANALYSIS_TIMEOUT,
             memory_bytes: DEFAULT_MEMORY_BYTES,
         }
@@ -99,11 +128,30 @@ impl Limits {
         self
     }
 
-    /// Set the global wall-clock budget.
+    /// Set the global wall-clock budget, exactly.
+    ///
+    /// Drops the per-file allowance: an explicit budget does not grow with the corpus.
     #[must_use]
     pub const fn with_global_timeout(mut self, timeout: Duration) -> Self {
         self.global_timeout = timeout;
+        self.global_timeout_per_file = Duration::ZERO;
         self
+    }
+
+    /// The wall-clock budget for a run over `files` files: the floor plus the per-file
+    /// allowance for each, saturating at [`Duration::MAX`].
+    #[must_use]
+    pub fn run_budget(&self, files: usize) -> Duration {
+        // In nanoseconds, because `Duration` only multiplies by a `u32` and a file count need
+        // not fit one.
+        let nanos = self
+            .global_timeout_per_file
+            .as_nanos()
+            .saturating_mul(u128::try_from(files).unwrap_or(u128::MAX));
+        let secs = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+        let subsec = u32::try_from(nanos % 1_000_000_000).unwrap_or(0);
+        self.global_timeout
+            .saturating_add(Duration::new(secs, subsec))
     }
 
     /// Set the per-runtime memory ceiling.
@@ -569,6 +617,47 @@ mod tests {
             limits.global_timeout, DEFAULT_GLOBAL_TIMEOUT,
             "raising a rule's own budget must not extend the run"
         );
+    }
+
+    #[test]
+    fn the_default_run_budget_grows_by_the_allowance_per_file() {
+        // #290: a fixed fifteen seconds has no headroom for a large corpus on a busy machine.
+        // The default is the floor plus a per-file allowance, and an empty run gets the floor.
+        let limits = Limits::default();
+        assert_eq!(DEFAULT_GLOBAL_TIMEOUT_PER_FILE, Duration::from_millis(100));
+        assert_eq!(
+            limits.global_timeout_per_file,
+            DEFAULT_GLOBAL_TIMEOUT_PER_FILE
+        );
+        assert_eq!(limits.run_budget(0), DEFAULT_GLOBAL_TIMEOUT);
+        assert_eq!(
+            limits.run_budget(236),
+            DEFAULT_GLOBAL_TIMEOUT + Duration::from_millis(23_600)
+        );
+    }
+
+    #[test]
+    fn an_explicit_global_budget_is_exact_whatever_the_corpus() {
+        // A number someone wrote down — `timeouts.global` or `--timeout` — is the budget, not
+        // a floor under it. Scaling it as well would make the documented value a lie.
+        let limits = Limits::default().with_global_timeout(Duration::from_secs(2));
+        assert_eq!(limits.global_timeout_per_file, Duration::ZERO);
+        assert_eq!(limits.run_budget(0), Duration::from_secs(2));
+        assert_eq!(limits.run_budget(1_000_000), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_run_budget_saturates_rather_than_overflowing() {
+        // The largest count there is, at the default allowance, does not overflow: it is
+        // about 1.8e18 seconds, inside `Duration`'s range. An allowance that does overflow
+        // saturates, rather than panicking or wrapping to a tiny budget.
+        let huge = Limits::default().run_budget(usize::MAX);
+        assert!(huge > Duration::from_secs(1 << 60), "{huge:?}");
+        let overflowing = Limits {
+            global_timeout_per_file: Duration::MAX,
+            ..Limits::default()
+        };
+        assert_eq!(overflowing.run_budget(2), Duration::MAX);
     }
 
     #[test]

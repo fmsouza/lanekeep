@@ -626,7 +626,13 @@ export interface Config {
   timeouts?: {
     /** Per rule invocation. */
     rule?: number
-    /** Wall-clock, for the whole run. */
+    /**
+     * Wall-clock, for the whole run.
+     *
+     * Unset, it is 15000 plus 100 for every file the run is given, cached ones included.
+     * Set, it is exactly this number: setting it drops the per-file allowance, so a value
+     * below the default's for a large corpus is a tighter budget than leaving it unset.
+     */
     global?: number
     /**
      * Host-side type-provider work, across the whole run.
