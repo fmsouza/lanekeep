@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/fmsouza/lanekeep/compare/v0.12.0...v0.13.0) - 2026-10-10
+
+### Added
+
+- *(host)* add ctx.listDir, a tracked and confined directory listing ([#299](https://github.com/fmsouza/lanekeep/pull/299))
+- *(no-assertionless-test)* configurable test callees and aliases ([#307](https://github.com/fmsouza/lanekeep/pull/307))
+- *(cli)* add --baseline and --write-baseline for ratchet adoption ([#294](https://github.com/fmsouza/lanekeep/pull/294))
+- *(paths)* resolve imports through tsconfig paths and baseUrl ([#295](https://github.com/fmsouza/lanekeep/pull/295))
+- *(lang)* support JSON ([#297](https://github.com/fmsouza/lanekeep/pull/297))
+- *(config)* make unused suppressions an error with suppressions.unused ([#300](https://github.com/fmsouza/lanekeep/pull/300))
+
+### Fixed
+
+- *(rules)* flag re-exports, require and import() of restricted modules ([#306](https://github.com/fmsouza/lanekeep/pull/306))
+- *(no-assertionless-test)* stop treating playwright hooks as tests ([#302](https://github.com/fmsouza/lanekeep/pull/302))
+- *(no-assertionless-test)* treat it.each and test.each as tests ([#303](https://github.com/fmsouza/lanekeep/pull/303))
+- *(lang-rust)* a path or range bound in a pattern binds nothing ([#311](https://github.com/fmsouza/lanekeep/pull/311))
+- *(binding)* a name read in a parameter default is not the parameter ([#304](https://github.com/fmsouza/lanekeep/pull/304))
+- *(types)* name typescript 7 plainly when the tsc provider meets it ([#296](https://github.com/fmsouza/lanekeep/pull/296))
+- *(config)* bound ruleset evaluation by the global budget, per thread ([#308](https://github.com/fmsouza/lanekeep/pull/308))
+- *(lang-js)* vendor a TypeScript grammar that reads two valid forms ([#301](https://github.com/fmsouza/lanekeep/pull/301))
+- *(engine)* name the run, not a rule, when the global budget is spent ([#305](https://github.com/fmsouza/lanekeep/pull/305))
+- *(deps)* wasmtime 48.0.4 for five RUSTSEC advisories; MSRV 1.94 -> 1.95 ([#298](https://github.com/fmsouza/lanekeep/pull/298))
+
 ## [0.12.0](https://github.com/fmsouza/lanekeep/compare/v0.11.0...v0.12.0) - 2026-09-28
 
 ### Added
