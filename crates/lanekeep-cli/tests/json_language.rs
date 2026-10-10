@@ -196,22 +196,25 @@ fn a_trailing_comma_is_a_parse_fault_under_a_json_rule() {
     );
 }
 
-/// The issue's own reproduction, with a language this slice does not add: still refused, and
-/// the refusal lists `json` among the languages that do exist.
+/// A language that is not registered is still refused, and the refusal lists `json` among the
+/// languages that are. Sass rather than the issue's own `css`, which is registered now: `.scss`
+/// is a different grammar from CSS's and stays unclaimed.
 #[test]
 fn an_unknown_language_lists_json_as_known() {
-    let css_rule = KEY_RULE.replace("['json']", "['css']");
+    let scss_rule = KEY_RULE.replace("['json']", "['scss']");
     let project = Project::new(
         "unknown",
         &[
-            ("rules/key.ts", &css_rule),
+            ("rules/key.ts", &scss_rule),
             ("lanekeep.json", CONFIG),
-            ("src/a.css", "a { color: red; }\n"),
+            ("src/a.scss", "$x: 1px;\n"),
         ],
     );
     let output = project.run(&["check", "--no-cache"]);
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown language `css`"), "{stderr}");
-    assert!(stderr.contains("json"), "{stderr}");
+    assert!(stderr.contains("unknown language `scss`"), "{stderr}");
+    for known in ["css", "json", "toml", "yaml"] {
+        assert!(stderr.contains(known), "{known}: {stderr}");
+    }
 }
