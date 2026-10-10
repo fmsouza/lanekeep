@@ -3250,6 +3250,9 @@ fn hash_config(
     for value in [
         limits.rule_timeout.as_millis(),
         limits.global_timeout.as_millis(),
+        // Its own term rather than a property of the number above: the default and an
+        // explicit value of the same size are different budgets (#290).
+        limits.global_timeout_per_file.as_millis(),
         limits.analysis_timeout.as_millis(),
         limits.memory_bytes as u128,
     ] {
@@ -6922,6 +6925,32 @@ mod tests {
         );
     }
 
+    /// The TypeScript half of the matched pair whose JSON half is
+    /// `the_default_and_an_explicit_fifteen_seconds_hash_differently_for_json`.
+    #[test]
+    fn the_default_and_an_explicit_fifteen_seconds_hash_differently() {
+        let make = |extra: &str, tag: &str| {
+            Fixture::new(
+                &format!("global-allowance-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.config.ts",
+                        &config_with(&format!("rules: [rule]{extra}")),
+                    ),
+                ],
+            )
+            .load_config()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make("", "default")),
+            hex(&make(", timeouts: { global: 15000 }", "explicit"))
+        );
+    }
+
     #[test]
     fn the_config_hash_changes_with_a_suppression_policy() {
         // Every key of the block is a `config_hash` input, asserted separately — a fold that
@@ -8732,6 +8761,67 @@ mod tests {
         };
 
         assert_ne!(hex(&make("{}", "d")), hex(&make(r#"{"rule": 5000}"#, "t")));
+    }
+
+    /// A config silent on `timeouts.global` gets the per-file allowance; one that names it, or
+    /// a `--timeout`, gets exactly the number named (#290).
+    #[test]
+    fn only_the_default_global_budget_grows_with_the_corpus() {
+        let fixture = |tag: &str, timeouts: &str| {
+            Fixture::new(
+                &format!("json-global-allowance-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "timeouts": {timeouts}}}"#),
+                    ),
+                ],
+            )
+        };
+
+        let silent = fixture("silent", "{}");
+        let config = silent.load_json().expect("loads");
+        assert_eq!(
+            config.limits.global_timeout_per_file,
+            lanekeep_core::DEFAULT_GLOBAL_TIMEOUT_PER_FILE
+        );
+
+        let flagged =
+            load_flagged(&silent, "lanekeep.json", Some(Duration::from_secs(20))).expect("loads");
+        assert_eq!(flagged.limits.run_budget(10_000), Duration::from_secs(20));
+
+        let named = fixture("named", r#"{"global": 15000}"#)
+            .load_json()
+            .expect("loads");
+        assert_eq!(named.limits.run_budget(10_000), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn the_default_and_an_explicit_fifteen_seconds_hash_differently_for_json() {
+        // They share a floor and are different budgets: the default grows with the corpus and
+        // `"global": 15000` does not. `hash_config` folds every limit, and a fold that left the
+        // allowance out would give the two one key (#290).
+        let make = |timeouts: &str, tag: &str| {
+            Fixture::new(
+                &format!("json-global-allowance-hash-{tag}"),
+                &[
+                    ("rule.ts", &rule("local/example")),
+                    (
+                        "lanekeep.json",
+                        &format!(r#"{{"rules": ["./rule"], "timeouts": {timeouts}}}"#),
+                    ),
+                ],
+            )
+            .load_json()
+            .expect("loads")
+            .config_hash
+        };
+
+        assert_ne!(
+            hex(&make("{}", "default")),
+            hex(&make(r#"{"global": 15000}"#, "explicit"))
+        );
     }
 
     #[test]
