@@ -56,7 +56,8 @@ pub use files::{FileAccess, ReadError};
 pub use fix::Fix;
 pub use gates::{CompiledGates, GateError, Gates};
 pub use limits::{
-    AnalysisBudget, Charge, DEFAULT_ANALYSIS_TIMEOUT, DEFAULT_GLOBAL_TIMEOUT, DEFAULT_MEMORY_BYTES,
+    AnalysisBudget, Charge, DEFAULT_ANALYSIS_TIMEOUT, DEFAULT_GLOBAL_TIMEOUT,
+    DEFAULT_GLOBAL_TIMEOUT_PER_FILE, DEFAULT_MEMORY_BYTES,
     DEFAULT_RULE_TIMEOUT, Limits, Paused, RunClock, analysis_overrun_fallback,
 };
 pub use location::{FilePath, Location, Position};
