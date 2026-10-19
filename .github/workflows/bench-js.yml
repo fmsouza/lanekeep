@@ -76,7 +76,7 @@ jobs:
       # Rust compile of the bench harness, not the measured path). A cache here would only
       # speed up compiling wasmtime, at the cost of a license the repo's dependency-review
       # allow-list does not carry; the weekly cadence can absorb the cold compile.
-      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: just,cargo-binstall
 
@@ -138,7 +138,7 @@ jobs:
 
       # `just typescript-builtins` and `just bench-js-component` need the pinned jco toolchain,
       # which `npm ci` installs.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
 
