@@ -134,6 +134,7 @@ mod tests {
     #[test]
     fn the_committed_grammar_is_the_last_regeneration() {
         use sha2::Digest as _;
+        use std::fmt::Write as _;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let manifest = std::fs::read_to_string(root.join("grammar/digests.txt"))
             .expect("grammar/digests.txt exists");
@@ -141,7 +142,13 @@ mod tests {
         for line in manifest.lines().filter(|line| !line.starts_with('#')) {
             let (digest, path) = line.split_once("  ").expect("`<sha256>  <path>`");
             let bytes = std::fs::read(root.join(path)).expect("a listed file exists");
-            let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let actual = sha2::Sha256::digest(&bytes).iter().fold(
+                String::with_capacity(64),
+                |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                },
+            );
             assert_eq!(
                 actual, digest,
                 "{path} is not what `just typescript-grammar` last wrote — regenerate it rather \
