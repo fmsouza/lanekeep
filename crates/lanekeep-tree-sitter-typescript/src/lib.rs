@@ -141,7 +141,10 @@ mod tests {
         for line in manifest.lines().filter(|line| !line.starts_with('#')) {
             let (digest, path) = line.split_once("  ").expect("`<sha256>  <path>`");
             let bytes = std::fs::read(root.join(path)).expect("a listed file exists");
-            let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let actual: String = sha2::Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
             assert_eq!(
                 actual, digest,
                 "{path} is not what `just typescript-grammar` last wrote — regenerate it rather \
