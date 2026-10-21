@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/fmsouza/lanekeep/compare/v0.14.0...v0.15.0) - 2026-10-21
+
+### Fixed
+
+- *(deps)* [**breaking**] wasmtime 48.0.7, tree-sitter 0.27.1, sha2 0.11, actions ([#324](https://github.com/fmsouza/lanekeep/pull/324))
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.14.0](https://github.com/fmsouza/lanekeep/compare/v0.13.0...v0.14.0) - 2026-10-10
 
 ### Added
