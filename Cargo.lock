@@ -1154,7 +1154,7 @@ dependencies = [
 name = "lanekeep-types-gen"
 version = "0.0.0"
 dependencies = [
- "wit-parser 0.262.0",
+ "wit-parser 0.263.0",
 ]
 
 [[package]]
@@ -1933,9 +1933,9 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.262.0"
+version = "0.263.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "974d643b125b272607e2fff8012ea14a8328acd7621e4bafa7afb32500052b1b"
+checksum = "4f5fa0a054ae153606df820eb0a84213e28cda41bbe04ba2628e71b6ba100fcb"
 dependencies = [
  "bitflags",
  "semver",
@@ -2218,9 +2218,9 @@ dependencies = [
 
 [[package]]
 name = "wit-parser"
-version = "0.262.0"
+version = "0.263.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00f0dc051466ffe46787721fca3d088536f158ae400be044f1b1c386ba9397ad"
+checksum = "874d6ce9db4261cb66980ab14f3da066b24292497b6f46f988c0d1b9b27913f3"
 dependencies = [
  "anyhow",
  "hashbrown 0.17.1",
@@ -2229,7 +2229,7 @@ dependencies = [
  "log",
  "semver",
  "unicode-ident",
- "wasmparser 0.262.0",
+ "wasmparser 0.263.0",
 ]
 
 [[package]]
